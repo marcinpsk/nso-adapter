@@ -265,6 +265,16 @@ async def seed_bgp_config(
                 await db.flush()
                 for paf_name in peer_def.get("peer_afs", []):
                     db.add(DeviceBgpPeerAddressFamily(peer_id=peer.id, af=paf_name, enabled=True))
+                for paf_def in peer_def.get("peer_af_defs", []):
+                    db.add(DeviceBgpPeerAddressFamily(
+                        peer_id=peer.id,
+                        af=paf_def["af"],
+                        enabled=paf_def.get("enabled", True),
+                        routemap_in=paf_def.get("routemap_in"),
+                        routemap_out=paf_def.get("routemap_out"),
+                        prefixlist_in=paf_def.get("prefixlist_in"),
+                        prefixlist_out=paf_def.get("prefixlist_out"),
+                    ))
         await db.commit()
         await db.refresh(router)
         return router.id

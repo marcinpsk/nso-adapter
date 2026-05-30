@@ -63,7 +63,7 @@ async def _upsert_bgp_data(
                     db.add(DeviceBgpAddressFamily(scope_id=scope.id, af=af_name))
 
             for peer_data in scope_data.get("peer", []):
-                peer_addr = peer_data.get("address", "")
+                peer_addr = peer_data.get("peer-address", "")
                 if not peer_addr:
                     continue
                 peer = DeviceBgpPeer(
@@ -79,14 +79,18 @@ async def _upsert_bgp_data(
                 db.add(peer)
                 await db.flush()
 
-                for paf_data in peer_data.get("address-family", []):
-                    paf_name = paf_data.get("af", "")
+                for paf_data in peer_data.get("peer-address-family", []):
+                    paf_name = paf_data.get("afi", "")
                     if paf_name:
                         db.add(
                             DeviceBgpPeerAddressFamily(
                                 peer_id=peer.id,
                                 af=paf_name,
                                 enabled=bool(paf_data.get("enabled", True)),
+                                routemap_in=paf_data.get("routemap-in") or None,
+                                routemap_out=paf_data.get("routemap-out") or None,
+                                prefixlist_in=paf_data.get("prefixlist-in") or None,
+                                prefixlist_out=paf_data.get("prefixlist-out") or None,
                             )
                         )
 

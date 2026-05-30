@@ -147,3 +147,78 @@ async def test_bgp_config_password_included_when_set(adapter_client):
     assert resp.status_code == 200
     peer = resp.json()["routers"][0]["scopes"][0]["peers"][0]
     assert peer["password"] == "bgpS3cr3t"
+
+
+# ── M17 policy refs ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_bgp_config_peer_af_policy_refs_returned(adapter_client):
+    """Route-map and prefix-list policy refs on a peer AF are included in the response."""
+    device_id = await seed_device(nso_device_name="bgp-policy-dev", netbox_device_id=905)
+    await seed_bgp_config(
+        device_id,
+        asn="65100",
+        scopes=[
+            {
+                "vrf": "",
+                "afs": ["ipv4-unicast"],
+                "peers": [
+                    {
+                        "peer_address": "192.0.2.10",
+                        "remote_as": "65200",
+                        "peer_af_defs": [
+                            {
+                                "af": "ipv4-unicast",
+                                "enabled": True,
+                                "routemap_in": "RM_FROM_PEER",
+                                "routemap_out": "RM_TO_PEER",
+                                "prefixlist_in": "PL_ALLOW_IN",
+                                "prefixlist_out": None,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
+    assert resp.status_code == 200
+    af = resp.json()["routers"][0]["scopes"][0]["peers"][0]["address_families"][0]
+    assert af["af"] == "ipv4-unicast"
+    assert af["routemap_in"] == "RM_FROM_PEER"
+    assert af["routemap_out"] == "RM_TO_PEER"
+    assert af["prefixlist_in"] == "PL_ALLOW_IN"
+    assert af.get("prefixlist_out") is None
+
+
+@pytest.mark.anyio
+async def test_bgp_config_peer_af_policy_refs_omitted_when_null(adapter_client):
+    """Policy ref fields are absent (not null) in the response when all are None."""
+    device_id = await seed_device(nso_device_name="bgp-no-policy-dev", netbox_device_id=906)
+    await seed_bgp_config(
+        device_id,
+        asn="65100",
+        scopes=[
+            {
+                "vrf": "",
+                "afs": ["ipv4-unicast"],
+                "peers": [
+                    {
+                        "peer_address": "192.0.2.11",
+                        "peer_afs": ["ipv4-unicast"],
+                    }
+                ],
+            }
+        ],
+    )
+
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
+    assert resp.status_code == 200
+    af = resp.json()["routers"][0]["scopes"][0]["peers"][0]["address_families"][0]
+    assert af["af"] == "ipv4-unicast"
+    # Null policy fields must not appear in the serialized output
+    for field in ("routemap_in", "routemap_out", "prefixlist_in", "prefixlist_out"):
+        assert field not in af or af[field] is None
+

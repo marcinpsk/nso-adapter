@@ -793,6 +793,11 @@ class DeviceBgpPeerAddressFamily(Base):
     )
     af: Mapped[str] = mapped_column(String(32), nullable=False)  # e.g. "ipv4-unicast"
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # M17 read-path: per-neighbor-AF policy references from device config.
+    routemap_in: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    routemap_out: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    prefixlist_in: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    prefixlist_out: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     peer: Mapped[DeviceBgpPeer] = relationship("DeviceBgpPeer", back_populates="peer_address_families")
 
