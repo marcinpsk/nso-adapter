@@ -8,6 +8,7 @@ Config is split into two layers:
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import yaml
@@ -127,6 +128,11 @@ def get_config() -> AppConfig:
                 f"Config file not found: {path}. Copy config.yaml.example to {path} and edit it."
             )
         raw = yaml.safe_load(path.read_text()) or {}
+        # Allow the deployment environment to override the DB URL without editing
+        # config.yaml — keeps dev/prod DB credentials with the infra (compose/.env).
+        db_url_override = os.environ.get("DATABASE_URL")
+        if db_url_override:
+            raw["database_url"] = db_url_override
         _app_config = AppConfig(**raw)
     return _app_config
 
