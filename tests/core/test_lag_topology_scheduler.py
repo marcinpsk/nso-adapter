@@ -25,7 +25,7 @@ class _FakeScheduler:
     def start(self):
         self.started = True
 
-    def shutdown(self):
+    def shutdown(self, wait=True):
         self.stopped = True
 
 

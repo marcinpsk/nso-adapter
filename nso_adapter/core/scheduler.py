@@ -441,5 +441,8 @@ def start_scheduler() -> None:
 def stop_scheduler() -> None:
     global _scheduler
     if _scheduler:
-        _scheduler.shutdown()
+        # wait=False: don't block shutdown/reload on an in-flight sync (can take
+        # ~30s). The process is going down; the lifespan's orphaned-job cleanup
+        # marks any interrupted job as failed on the next start.
+        _scheduler.shutdown(wait=False)
         _scheduler = None
