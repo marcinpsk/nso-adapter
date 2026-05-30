@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Build
+build/
+dist/
+
+# Test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Secrets / env files (never commit)
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# Runtime config — real internal IPs, Vault paths, service-account refs live here.
+# Use config.yaml.example as the placeholder template; real values stay local.
+config.yaml
+
+# Internal CA bundles — operators install their own; do not commit.
+certs/
+
+# Local SQLite dev databases — contain real device names imported from NSO.
+*.db
+*.sqlite
+*.sqlite3
+
+# Local dev notes — real hostnames, IPs, Vault paths, service-account names
+LOCAL-DEV.md
+
+# Per-developer agent / superpowers staging dir — not part of the project
+docs/superpowers/
