@@ -40,10 +40,17 @@ class NsoClient:
         )
 
     async def list_devices(self) -> list[dict]:
-        """Return list of device objects from tailf-ncs:devices."""
+        """Return list of device objects from tailf-ncs:devices.
+
+        Uses a RESTCONF ``fields`` filter to fetch only inventory metadata
+        (name, address, authgroup, NED type, admin-state) — NOT each device's
+        full ``config`` subtree. The unfiltered query pulls every device's
+        complete config and can take 30s+ on a real NSO with large devices.
+        """
         url = f"{self._base}/restconf/data/tailf-ncs:devices"
+        params = {"fields": "device(name;address;authgroup;device-type;state(admin-state))"}
         async with self._client() as c:
-            resp = await c.get(url)
+            resp = await c.get(url, params=params)
             resp.raise_for_status()
             data = resp.json()
             device_list = data.get("tailf-ncs:devices", {}).get("device", [])
