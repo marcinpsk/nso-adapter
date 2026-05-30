@@ -2,6 +2,7 @@
 """Shared pytest fixtures for all nso-adapter tests."""
 from __future__ import annotations
 
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -10,6 +11,11 @@ from httpx import ASGITransport, AsyncClient
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.main import create_app
 from nso_adapter.nso.client import NsoClient
+
+# Hermetic tests: ignore any ambient DATABASE_URL. The dev container sets one to
+# point at the dev Postgres; without this, get_config()'s env override would make
+# tests run against real dev data instead of their isolated per-test database.
+os.environ.pop("DATABASE_URL", None)
 
 VALID_TOKEN = "test-bearer-token"
 
