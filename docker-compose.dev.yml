@@ -1,0 +1,22 @@
+services:
+  nso-adapter:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "7997:8000"
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    environment:
+      - CONFIG_FILE=/app/config.yaml
+      # NO_PROXY / no_proxy (NSO + Vault + NetBox hosts) are injected from .env
+      # (gitignored) via env_file above. Kept out of this tracked file and out of
+      # the environment: block so the shell environment can't shadow them.
+    networks:
+      - docker_frontend
+
+networks:
+  docker_frontend:
+    external: true

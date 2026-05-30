@@ -1,0 +1,13 @@
+<ncs-package xmlns="http://tail-f.com/ns/ncs-packages">
+  <name>interface-reconciler</name>
+  <package-version>1.0.0</package-version>
+  <description>Thin NSO service that owns interface description/enabled for
+  NetBox-managed devices. Committed in reconcile mode (brownfield adoption).</description>
+  <ncs-min-version>5.1</ncs-min-version>
+  <component>
+    <name>interface-reconciler</name>
+    <application>
+      <python-class-name>interface_reconciler.main.InterfaceReconcilerApp</python-class-name>
+    </application>
+  </component>
+</ncs-package>
