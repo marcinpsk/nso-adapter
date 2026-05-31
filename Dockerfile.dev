@@ -20,6 +20,9 @@ RUN uv sync --all-groups --no-cache --native-tls
 
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Source is volume-mounted at /app — hot reload via watchfiles
+# Source is volume-mounted at /app — hot reload via watchfiles.
+# Entrypoint runs `alembic upgrade head` before uvicorn; the script + alembic
+# tree come from the /app bind mount at runtime.
 EXPOSE 8000
+ENTRYPOINT ["/app/scripts/docker-entrypoint.sh"]
 CMD ["uvicorn", "nso_adapter.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

@@ -24,9 +24,10 @@ services:
       - docker_frontend
       - adapter-db
 
-  # Dedicated dev Postgres — SQLite can't handle the scheduler + API concurrency
-  # (single-writer lock). MVCC here removes the "database is locked" class of bugs.
-  # container_name is host-unique on purpose (several Postgres run on this host).
+  # Dedicated dev Postgres — the scheduler and API run concurrently and need real
+  # MVCC, which removes the "database is locked" class of bugs. Postgres is the only
+  # supported runtime engine. container_name is host-unique on purpose (several
+  # Postgres run on this host).
   adapter-db:
     image: postgres:16-alpine
     container_name: nso-adapter-postgres-dev

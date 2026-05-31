@@ -19,7 +19,14 @@ ENV PYTHONUNBUFFERED=1 \
 COPY --from=builder /build/.venv /app/.venv
 COPY --from=builder /build/nso_adapter /app/nso_adapter
 
+# Migrations run at container start (entrypoint) — ship the alembic tree + ini.
+COPY alembic/ /app/alembic/
+COPY alembic.ini /app/alembic.ini
+COPY scripts/docker-entrypoint.sh /app/scripts/docker-entrypoint.sh
+RUN chmod +x /app/scripts/docker-entrypoint.sh
+
 ENV PATH="/app/.venv/bin:$PATH"
 
 EXPOSE 8000
+ENTRYPOINT ["/app/scripts/docker-entrypoint.sh"]
 CMD ["uvicorn", "nso_adapter.main:app", "--host", "0.0.0.0", "--port", "8000"]

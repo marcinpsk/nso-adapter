@@ -14,10 +14,15 @@ from nso_adapter.store.models import Base  # noqa: E402
 
 target_metadata = Base.metadata
 
-# Use DATABASE_URL env var if set (sync version for alembic)
-_db_url = os.environ.get("DATABASE_URL", "sqlite:///./nso_adapter.db")
-# Convert async driver to sync for alembic
-_db_url = _db_url.replace("sqlite+aiosqlite", "sqlite").replace("postgresql+asyncpg", "postgresql+psycopg2")
+# Alembic targets PostgreSQL only — DATABASE_URL is required (no sqlite fallback).
+_db_url = os.environ.get("DATABASE_URL")
+if not _db_url:
+    raise RuntimeError(
+        "DATABASE_URL must be set for alembic (PostgreSQL). "
+        "Migrations are never run against sqlite."
+    )
+# Convert the async driver to the sync driver alembic uses.
+_db_url = _db_url.replace("postgresql+asyncpg", "postgresql+psycopg2")
 config.set_main_option("sqlalchemy.url", _db_url)
 
 
