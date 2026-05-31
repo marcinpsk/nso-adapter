@@ -2,11 +2,12 @@
 """NSO instances discovery endpoints — GET /api/v1/nso-instances."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
+from nso_adapter.api.errors import api_error
 from nso_adapter.config import get_config
 from nso_adapter.core.importer import get_nso_client
 from nso_adapter.nso.neds import extract_ned_id_from_device_dict, ned_family
@@ -44,13 +45,13 @@ async def list_instance_devices(instance_id: str, db: AsyncSession = Depends(get
     """
     cfg = get_config()
     if not any(inst.name == instance_id for inst in cfg.nso_instances):
-        raise HTTPException(status_code=404, detail=f"NSO instance '{instance_id}' not found")
+        raise api_error(404, "not_found", f"NSO instance '{instance_id}' not found")
 
     try:
         client = get_nso_client(instance_id)
         device_list = await client.list_devices()
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise api_error(502, "nso_unreachable", str(exc)) from exc
 
     # Build onboarded cross-reference in one DB query (not per item)
     rows = await db.execute(

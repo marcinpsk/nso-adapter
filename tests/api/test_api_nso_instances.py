@@ -50,6 +50,7 @@ async def test_list_devices_unknown_instance_returns_404(adapter_client):
     with patch("nso_adapter.api.nso_instances.get_config", return_value=_fake_cfg("other")):
         resp = await adapter_client.get("/api/v1/nso-instances/nso-dev/devices", headers=AUTH)
     assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "not_found"
 
 
 async def test_list_devices_enriched_fields_present(adapter_client):
