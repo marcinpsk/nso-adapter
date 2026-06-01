@@ -236,6 +236,14 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
     device.last_sync_status = LastSyncStatus.succeeded
     await db.commit()
 
+    # Notify the netbox-nso-plugin so it refreshes its NSO*State display cache off
+    # the request path. Best-effort — a callback failure must not fail the sync.
+    if nb_client and device.netbox_device_id:
+        try:
+            await nb_client.notify_sync_complete(device.netbox_device_id)
+        except Exception as exc:
+            logger.warning("netbox.sync_complete_notify_failed", device_id=device_id, error=str(exc) or type(exc).__name__)
+
     summary = {
         "interfaces_written": interfaces_written,
         "interfaces_created": interfaces_created,

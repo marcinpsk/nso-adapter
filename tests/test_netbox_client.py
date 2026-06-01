@@ -256,3 +256,27 @@ async def test_bulk_patch_400_single_non_positional_drops_row(client):
     )
     result = await client.bulk_patch_interfaces([{"id": 7, "description": "x"}])
     assert result == []
+
+
+# ── notify_sync_complete (plugin callback) ───────────────────────────────────
+
+
+@respx.mock
+async def test_notify_sync_complete_posts_netbox_device_id(client):
+    """notify_sync_complete POSTs the device id to the plugin's sync-complete endpoint."""
+    import json
+
+    route = respx.post(f"{BASE}/api/plugins/nso/sync-complete/").mock(
+        return_value=httpx.Response(202, json={"queued": True})
+    )
+    await client.notify_sync_complete(27)
+    assert route.called
+    assert json.loads(route.calls.last.request.content) == {"netbox_device_id": 27}
+
+
+@respx.mock
+async def test_notify_sync_complete_raises_on_http_error(client):
+    """A non-2xx from the plugin propagates (caller in importer swallows it)."""
+    respx.post(f"{BASE}/api/plugins/nso/sync-complete/").mock(return_value=httpx.Response(404))
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.notify_sync_complete(27)

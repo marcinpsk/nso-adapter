@@ -51,6 +51,18 @@ class NetboxClient:
         if self._http is not None and not self._http.is_closed:
             await self._http.aclose()
 
+    async def notify_sync_complete(self, netbox_device_id: int) -> None:
+        """Tell the netbox-nso-plugin a device sync finished so it refreshes its cache.
+
+        The plugin reconciles adapter state into its NSO*State display tables off the
+        request path (a background job) instead of doing it — slowly, with
+        write-on-read — every time an operator opens the NSO tab. Best-effort: the
+        caller swallows errors, since the plugin also reconciles on the next cycle.
+        """
+        url = f"{self._base}/api/plugins/nso/sync-complete/"
+        resp = await self._client().post(url, json={"netbox_device_id": netbox_device_id})
+        resp.raise_for_status()
+
     async def get_interface(self, netbox_device_id: int, interface_name: str) -> dict | None:
         """Return a NetBox interface object or None."""
         url = f"{self._base}/api/dcim/interfaces/"
