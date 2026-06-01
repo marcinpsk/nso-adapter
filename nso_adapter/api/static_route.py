@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """GET /api/v1/devices/{id}/static-routes and PUT /api/v1/devices/{id}/static-route-intent."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -92,9 +93,7 @@ class StaticRouteIntentUpdate(BaseModel):
 
 
 @router.put("/{device_id}/static-route-intent", dependencies=[Depends(verify_token)])
-async def put_static_route_intent(
-    device_id: int, body: StaticRouteIntentUpdate, db: AsyncSession = Depends(get_db)
-):
+async def put_static_route_intent(device_id: int, body: StaticRouteIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's static-route intent mirror for this device atomically.
 
     Full-replace semantics: rows not present in the request body are deleted.
@@ -105,9 +104,7 @@ async def put_static_route_intent(
     if not device:
         raise api_error(404, "not_found", "Device not found")
 
-    existing_result = await db.execute(
-        select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)
-    )
+    existing_result = await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id))
     existing_rows: dict[tuple, StaticRouteIntent] = {
         (r.vrf, r.prefix, r.next_hop): r for r in existing_result.scalars().all()
     }
@@ -154,6 +151,7 @@ async def put_static_route_intent(
     settings = settings_result.scalar_one_or_none()
     if settings and settings.auto_apply and count > 0:
         from nso_adapter.core.apply import enqueue_apply
+
         await enqueue_apply(db, device_id, force=True)
 
     await db.commit()

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared pytest fixtures for all nso-adapter tests."""
+
 from __future__ import annotations
 
 import os
@@ -52,16 +53,19 @@ database_url: sqlite+aiosqlite:///{tmp_path}/test.db
     monkeypatch.setenv("NETBOX_TOKEN", "nb-test-token")
 
     from nso_adapter.config import reset_config
+
     reset_config()
 
     app = create_app()
 
-    with patch("nso_adapter.main.make_provider", return_value=_mock_provider()), \
-         patch("nso_adapter.bindings.netbox.client.NetboxClient") as MockNb, \
-         patch("nso_adapter.main.set_netbox_client"), \
-         patch("nso_adapter.main.start_scheduler"), \
-         patch("nso_adapter.main.stop_scheduler"), \
-         patch("nso_adapter.main.persistent_subscriber", new=AsyncMock()):
+    with (
+        patch("nso_adapter.main.make_provider", return_value=_mock_provider()),
+        patch("nso_adapter.bindings.netbox.client.NetboxClient") as MockNb,
+        patch("nso_adapter.main.set_netbox_client"),
+        patch("nso_adapter.main.start_scheduler"),
+        patch("nso_adapter.main.stop_scheduler"),
+        patch("nso_adapter.main.persistent_subscriber", new=AsyncMock()),
+    ):
         MockNb.return_value = MagicMock()
         # ASGITransport does not call lifespan — run it manually so init_db() fires.
         async with app.router.lifespan_context(app):
@@ -100,16 +104,19 @@ database_url: sqlite+aiosqlite:///{tmp_path}/test.db
     monkeypatch.setenv("NSO_PASSWORD", "admin")
 
     from nso_adapter.config import reset_config
+
     reset_config()
 
     app = create_app()
 
-    with patch("nso_adapter.main.make_provider", return_value=_mock_provider()), \
-         patch("nso_adapter.bindings.netbox.client.NetboxClient") as MockNb, \
-         patch("nso_adapter.main.set_netbox_client"), \
-         patch("nso_adapter.main.start_scheduler"), \
-         patch("nso_adapter.main.stop_scheduler"), \
-         patch("nso_adapter.main.persistent_subscriber", new=AsyncMock()):
+    with (
+        patch("nso_adapter.main.make_provider", return_value=_mock_provider()),
+        patch("nso_adapter.bindings.netbox.client.NetboxClient") as MockNb,
+        patch("nso_adapter.main.set_netbox_client"),
+        patch("nso_adapter.main.start_scheduler"),
+        patch("nso_adapter.main.stop_scheduler"),
+        patch("nso_adapter.main.persistent_subscriber", new=AsyncMock()),
+    ):
         MockNb.return_value = MagicMock()
         async with app.router.lifespan_context(app):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -127,22 +134,24 @@ def fake_nso_client():
                             lambda *_: fake_nso_client)
     """
     m = MagicMock(spec=NsoClient)
-    m.list_devices = AsyncMock(return_value=[
-        {
-            "name": "core-rtr-01",
-            "address": "10.0.0.1",
-            "authgroup": "default",
-            "device-type": {"cli": {"ned-id": "cisco-ios-cli-6.95"}},
-            "state": {"admin-state": "unlocked"},
-        },
-        {
-            "name": "edge-rtr-02",
-            "address": "10.0.0.2",
-            "authgroup": "default",
-            "device-type": {"netconf": {"ned-id": "juniper-junos-nc-4.1"}},
-            "state": {"admin-state": "locked"},
-        },
-    ])
+    m.list_devices = AsyncMock(
+        return_value=[
+            {
+                "name": "core-rtr-01",
+                "address": "10.0.0.1",
+                "authgroup": "default",
+                "device-type": {"cli": {"ned-id": "cisco-ios-cli-6.95"}},
+                "state": {"admin-state": "unlocked"},
+            },
+            {
+                "name": "edge-rtr-02",
+                "address": "10.0.0.2",
+                "authgroup": "default",
+                "device-type": {"netconf": {"ned-id": "juniper-junos-nc-4.1"}},
+                "state": {"admin-state": "locked"},
+            },
+        ]
+    )
     m.get_device_ned_id = AsyncMock(return_value="cisco-ios-cli-6.95")
     return m
 
@@ -198,7 +207,7 @@ async def seed_device(
         )
         db.add(d)
         await db.flush()
-        for attr in (["description"] if attributes is None else attributes):
+        for attr in ["description"] if attributes is None else attributes:
             db.add(ManagedScope(device_id=d.id, attribute=attr))
         await db.commit()
         await db.refresh(d)
@@ -266,15 +275,17 @@ async def seed_bgp_config(
                 for paf_name in peer_def.get("peer_afs", []):
                     db.add(DeviceBgpPeerAddressFamily(peer_id=peer.id, af=paf_name, enabled=True))
                 for paf_def in peer_def.get("peer_af_defs", []):
-                    db.add(DeviceBgpPeerAddressFamily(
-                        peer_id=peer.id,
-                        af=paf_def["af"],
-                        enabled=paf_def.get("enabled", True),
-                        routemap_in=paf_def.get("routemap_in"),
-                        routemap_out=paf_def.get("routemap_out"),
-                        prefixlist_in=paf_def.get("prefixlist_in"),
-                        prefixlist_out=paf_def.get("prefixlist_out"),
-                    ))
+                    db.add(
+                        DeviceBgpPeerAddressFamily(
+                            peer_id=peer.id,
+                            af=paf_def["af"],
+                            enabled=paf_def.get("enabled", True),
+                            routemap_in=paf_def.get("routemap_in"),
+                            routemap_out=paf_def.get("routemap_out"),
+                            prefixlist_in=paf_def.get("prefixlist_in"),
+                            prefixlist_out=paf_def.get("prefixlist_out"),
+                        )
+                    )
         await db.commit()
         await db.refresh(router)
         return router.id

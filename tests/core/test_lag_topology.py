@@ -90,9 +90,7 @@ async def test_refresh_lag_topology_happy(adapter_client):
         members = member_result.scalars().all()
         assert len(lags) == 2
         assert {lag.name for lag in lags} == {"Port-channel1", "Port-channel2"}
-        assert {(member.interface_name, member.mode) for member in members} == {
-            ("GigabitEthernet0/1", "active")
-        }
+        assert {(member.interface_name, member.mode) for member in members} == {("GigabitEthernet0/1", "active")}
 
 
 @pytest.mark.anyio
@@ -140,11 +138,7 @@ async def test_handle_netconf_config_change_dispatches(adapter_client):
         nso_client.get_lag_topology.return_value = {"device-name": "sw03", "lag": []}
         event = {
             "netconf-config-change": {
-                "edit": [
-                    {
-                        "target": "/ncs:devices/device[name='sw03']/config/ios:interface/GigabitEthernet1"
-                    }
-                ]
+                "edit": [{"target": "/ncs:devices/device[name='sw03']/config/ios:interface/GigabitEthernet1"}]
             }
         }
 
@@ -158,13 +152,7 @@ async def test_handle_netconf_config_change_unknown_device(adapter_client):
     async for db in get_session():
         nso_client = AsyncMock()
         event = {
-            "netconf-config-change": {
-                "edit": [
-                    {
-                        "target": "/ncs:devices/device[name='unknown-device']/config/..."
-                    }
-                ]
-            }
+            "netconf-config-change": {"edit": [{"target": "/ncs:devices/device[name='unknown-device']/config/..."}]}
         }
 
         await handle_netconf_config_change(event, db, {"nso-dev": nso_client})

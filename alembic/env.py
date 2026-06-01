@@ -17,10 +17,7 @@ target_metadata = Base.metadata
 # Alembic targets PostgreSQL only — DATABASE_URL is required (no sqlite fallback).
 _db_url = os.environ.get("DATABASE_URL")
 if not _db_url:
-    raise RuntimeError(
-        "DATABASE_URL must be set for alembic (PostgreSQL). "
-        "Migrations are never run against sqlite."
-    )
+    raise RuntimeError("DATABASE_URL must be set for alembic (PostgreSQL). Migrations are never run against sqlite.")
 # Convert the async driver to the sync driver alembic uses.
 _db_url = _db_url.replace("postgresql+asyncpg", "postgresql+psycopg2")
 config.set_main_option("sqlalchemy.url", _db_url)
@@ -64,9 +61,7 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-        context.configure(
-            connection=connection, target_metadata=target_metadata
-        )
+        context.configure(connection=connection, target_metadata=target_metadata)
 
         with context.begin_transaction():
             context.run_migrations()

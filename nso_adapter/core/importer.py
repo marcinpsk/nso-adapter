@@ -8,6 +8,7 @@ Sync flow (docs/nso-adapter.md §7):
   4. NetBox binding writes NSO value onto dcim.Interface
   5. Persist interface_attr_state, update device.last_sync_*
 """
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -62,7 +63,6 @@ def _attrs_to_interface_list(data: dict | None) -> list[Interface]:
             )
         )
     return result
-
 
 
 def register_nso_client(instance_name: str, client: NsoClient) -> None:
@@ -153,12 +153,8 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
 
         # Step 3: compute per-attribute compliance
         # Load existing attr_states
-        attr_result = await db.execute(
-            select(InterfaceAttrState).where(InterfaceAttrState.interface_id == db_iface.id)
-        )
-        existing_attrs: dict[str, InterfaceAttrState] = {
-            row.attribute: row for row in attr_result.scalars().all()
-        }
+        attr_result = await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id == db_iface.id))
+        existing_attrs: dict[str, InterfaceAttrState] = {row.attribute: row for row in attr_result.scalars().all()}
 
         for attr in ("description", "enabled"):
             if attr not in scope_attrs:

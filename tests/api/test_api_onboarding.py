@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for onboarding endpoints: POST, PATCH, DELETE /api/v1/devices."""
+
 from __future__ import annotations
 
 from tests.conftest import VALID_TOKEN, seed_device

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """GET /api/v1/devices/{id}/snmp-config and PUT /api/v1/devices/{id}/snmp-intent endpoints."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -37,24 +38,16 @@ async def get_snmp_config(device_id: int, db: AsyncSession = Depends(get_db)):
     if not device:
         raise api_error(404, "not_found", "Device not found")
 
-    communities_result = await db.execute(
-        select(SnmpCommunity).where(SnmpCommunity.device_id == device_id)
-    )
+    communities_result = await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device_id))
     communities = communities_result.scalars().all()
 
-    v3_users_result = await db.execute(
-        select(SnmpV3User).where(SnmpV3User.device_id == device_id)
-    )
+    v3_users_result = await db.execute(select(SnmpV3User).where(SnmpV3User.device_id == device_id))
     v3_users = v3_users_result.scalars().all()
 
-    hosts_result = await db.execute(
-        select(SnmpHost).where(SnmpHost.device_id == device_id)
-    )
+    hosts_result = await db.execute(select(SnmpHost).where(SnmpHost.device_id == device_id))
     hosts = hosts_result.scalars().all()
 
-    system_info_result = await db.execute(
-        select(SnmpSystemInfo).where(SnmpSystemInfo.device_id == device_id)
-    )
+    system_info_result = await db.execute(select(SnmpSystemInfo).where(SnmpSystemInfo.device_id == device_id))
     system_info = system_info_result.scalar_one_or_none()
 
     all_rows = list(communities) + list(v3_users) + list(hosts)
@@ -78,10 +71,7 @@ async def get_snmp_config(device_id: int, db: AsyncSession = Depends(get_db)):
         "device_id": device_id,
         "last_refreshed_at": latest.last_refreshed_at.isoformat() + "Z",
         "refresh_source": latest.refresh_source,
-        "communities": [
-            {"community_hash": c.community_hash, "access": c.access, "acl": c.acl}
-            for c in communities
-        ],
+        "communities": [{"community_hash": c.community_hash, "access": c.access, "acl": c.acl} for c in communities],
         "v3_users": [
             {
                 "username": u.username,
@@ -99,11 +89,7 @@ async def get_snmp_config(device_id: int, db: AsyncSession = Depends(get_db)):
             }
             for h in hosts
         ],
-        "system_info": (
-            {"location": system_info.location, "contact": system_info.contact}
-            if system_info
-            else None
-        ),
+        "system_info": ({"location": system_info.location, "contact": system_info.contact} if system_info else None),
     }
 
 
@@ -166,9 +152,7 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
     existing_comms_result = await db.execute(
         select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)
     )
-    existing_comms: dict[str, SnmpCommunityIntent] = {
-        r.label: r for r in existing_comms_result.scalars().all()
-    }
+    existing_comms: dict[str, SnmpCommunityIntent] = {r.label: r for r in existing_comms_result.scalars().all()}
     new_comm_labels = {e.label for e in body.communities}
     for label, row in existing_comms.items():
         if label not in new_comm_labels:
@@ -197,12 +181,8 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
         comm_count += 1
 
     # ── V3 Users ─────────────────────────────────────────────────────────────
-    existing_users_result = await db.execute(
-        select(SnmpV3UserIntent).where(SnmpV3UserIntent.device_id == device_id)
-    )
-    existing_users: dict[str, SnmpV3UserIntent] = {
-        r.username: r for r in existing_users_result.scalars().all()
-    }
+    existing_users_result = await db.execute(select(SnmpV3UserIntent).where(SnmpV3UserIntent.device_id == device_id))
+    existing_users: dict[str, SnmpV3UserIntent] = {r.username: r for r in existing_users_result.scalars().all()}
     new_usernames = {e.username for e in body.v3_users}
     for username, row in existing_users.items():
         if username not in new_usernames:
@@ -229,12 +209,8 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
         user_count += 1
 
     # ── Hosts ─────────────────────────────────────────────────────────────────
-    existing_hosts_result = await db.execute(
-        select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id)
-    )
-    existing_hosts: dict[str, SnmpHostIntent] = {
-        r.address: r for r in existing_hosts_result.scalars().all()
-    }
+    existing_hosts_result = await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))
+    existing_hosts: dict[str, SnmpHostIntent] = {r.address: r for r in existing_hosts_result.scalars().all()}
     new_addresses = {e.address for e in body.hosts}
     for address, row in existing_hosts.items():
         if address not in new_addresses:
@@ -272,11 +248,7 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
         if existing_sysinfo:
             await db.delete(existing_sysinfo)
     else:
-        accepted = (
-            body.system_info.accepted_at.replace(tzinfo=None)
-            if body.system_info.accepted_at
-            else now
-        )
+        accepted = body.system_info.accepted_at.replace(tzinfo=None) if body.system_info.accepted_at else now
         if existing_sysinfo:
             existing_sysinfo.location = body.system_info.location
             existing_sysinfo.contact = body.system_info.contact
@@ -293,13 +265,12 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
 
     await db.flush()
 
-    settings_result = await db.execute(
-        select(DeviceSettings).where(DeviceSettings.device_id == device_id)
-    )
+    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
     settings = settings_result.scalar_one_or_none()
     total_count = comm_count + user_count + host_count + (1 if body.system_info else 0)
     if settings and settings.auto_apply and total_count > 0:
         from nso_adapter.core.apply import enqueue_apply
+
         await enqueue_apply(db, device_id, force=True)
 
     await db.commit()

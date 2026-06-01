@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """NSO instances discovery endpoints — GET /api/v1/nso-instances."""
+
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
@@ -55,8 +56,7 @@ async def list_instance_devices(instance_id: str, db: AsyncSession = Depends(get
 
     # Build onboarded cross-reference in one DB query (not per item)
     rows = await db.execute(
-        select(Device.nso_device_name, Device.id, Device.netbox_device_id)
-        .where(Device.nso_instance == instance_id)
+        select(Device.nso_device_name, Device.id, Device.netbox_device_id).where(Device.nso_instance == instance_id)
     )
     by_name: dict[str, tuple[int, int | None]] = {}
     for r in rows:
@@ -70,17 +70,19 @@ async def list_instance_devices(instance_id: str, db: AsyncSession = Depends(get
         name = d["name"]
         raw_ned_id = extract_ned_id_from_device_dict(d)
         onboarded_row = by_name.get(name)
-        out.append({
-            "name": name,
-            "address": d.get("address") or None,
-            "ned_id": raw_ned_id,
-            "platform": ned_family(raw_ned_id) if raw_ned_id else None,
-            "auth_group": d.get("authgroup") or None,
-            "admin_state": (d.get("state") or {}).get("admin-state") or None,  # "" → None
-            "onboarded": onboarded_row is not None,
-            "onboarded_device_id": onboarded_row[0] if onboarded_row else None,
-            "onboarded_netbox_device_id": onboarded_row[1] if onboarded_row else None,
-        })
+        out.append(
+            {
+                "name": name,
+                "address": d.get("address") or None,
+                "ned_id": raw_ned_id,
+                "platform": ned_family(raw_ned_id) if raw_ned_id else None,
+                "auth_group": d.get("authgroup") or None,
+                "admin_state": (d.get("state") or {}).get("admin-state") or None,  # "" → None
+                "onboarded": onboarded_row is not None,
+                "onboarded_device_id": onboarded_row[0] if onboarded_row else None,
+                "onboarded_netbox_device_id": onboarded_row[1] if onboarded_row else None,
+            }
+        )
 
     out.sort(key=lambda x: x["name"])
     return out

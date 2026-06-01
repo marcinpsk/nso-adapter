@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for scope endpoints: GET/PUT /api/v1/devices/{id}/scope."""
+
 from __future__ import annotations
 
 from tests.conftest import VALID_TOKEN, seed_device

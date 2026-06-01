@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for nso/actions.py — sync_from, compare_config, check_sync, connect."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock

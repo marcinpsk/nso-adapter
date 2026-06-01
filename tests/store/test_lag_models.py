@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for LagInterface + LagMember ORM models."""
+
 from datetime import UTC, datetime
 
 import pytest

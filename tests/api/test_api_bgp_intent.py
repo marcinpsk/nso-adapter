@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for PUT /api/v1/devices/{id}/bgp-intent (M16 B2)."""
+
 from __future__ import annotations
 
 import pytest
@@ -92,41 +93,21 @@ async def test_put_bgp_intent_persists_rows(adapter_client):
     assert resp.status_code == 200
 
     async for db in get_session():
-        router = (
-            await db.execute(
-                select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id)
-            )
-        ).scalar_one()
+        router = (await db.execute(select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))).scalar_one()
         assert router.asn == "65100"
         assert router.accepted_at is not None
 
-        scope = (
-            await db.execute(
-                select(BgpScopeIntent).where(BgpScopeIntent.router_id == router.id)
-            )
-        ).scalar_one()
+        scope = (await db.execute(select(BgpScopeIntent).where(BgpScopeIntent.router_id == router.id))).scalar_one()
         assert scope.vrf == ""
 
-        af = (
-            await db.execute(
-                select(BgpAfIntent).where(BgpAfIntent.scope_id == scope.id)
-            )
-        ).scalar_one()
+        af = (await db.execute(select(BgpAfIntent).where(BgpAfIntent.scope_id == scope.id))).scalar_one()
         assert af.af == "ipv4-unicast"
 
-        peer = (
-            await db.execute(
-                select(BgpPeerIntent).where(BgpPeerIntent.scope_id == scope.id)
-            )
-        ).scalar_one()
+        peer = (await db.execute(select(BgpPeerIntent).where(BgpPeerIntent.scope_id == scope.id))).scalar_one()
         assert peer.peer_address == "192.0.2.1"
         assert peer.remote_as == "65200"
 
-        peer_af = (
-            await db.execute(
-                select(BgpPeerAfIntent).where(BgpPeerAfIntent.peer_id == peer.id)
-            )
-        ).scalar_one()
+        peer_af = (await db.execute(select(BgpPeerAfIntent).where(BgpPeerAfIntent.peer_id == peer.id))).scalar_one()
         assert peer_af.af == "ipv4-unicast"
         assert peer_af.enabled is True
         break
@@ -156,10 +137,8 @@ async def test_put_bgp_intent_full_replace(adapter_client):
 
     async for db in get_session():
         routers = (
-            await db.execute(
-                select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id)
-            )
-        ).scalars().all()
+            (await db.execute(select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))).scalars().all()
+        )
         assert len(routers) == 1
         assert routers[0].asn == "65300"
         break
@@ -188,11 +167,7 @@ async def test_put_bgp_intent_empty_routers_clears_intent(adapter_client):
 
     async for db in get_session():
         count = len(
-            (
-                await db.execute(
-                    select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id)
-                )
-            ).scalars().all()
+            (await db.execute(select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))).scalars().all()
         )
         assert count == 0
         break
@@ -225,27 +200,13 @@ async def test_put_bgp_intent_with_password(adapter_client):
             }
         ]
     }
-    resp = await adapter_client.put(
-        f"/api/v1/devices/{device_id}/bgp-intent", json=payload, headers=AUTH
-    )
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/bgp-intent", json=payload, headers=AUTH)
     assert resp.status_code == 200
 
     async for db in get_session():
-        router = (
-            await db.execute(
-                select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id)
-            )
-        ).scalar_one()
-        scope = (
-            await db.execute(
-                select(BgpScopeIntent).where(BgpScopeIntent.router_id == router.id)
-            )
-        ).scalar_one()
-        peer = (
-            await db.execute(
-                select(BgpPeerIntent).where(BgpPeerIntent.scope_id == scope.id)
-            )
-        ).scalar_one()
+        router = (await db.execute(select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))).scalar_one()
+        scope = (await db.execute(select(BgpScopeIntent).where(BgpScopeIntent.router_id == router.id))).scalar_one()
+        peer = (await db.execute(select(BgpPeerIntent).where(BgpPeerIntent.scope_id == scope.id))).scalar_one()
         assert peer.password == "s3cr3t"
         break
 
@@ -274,9 +235,7 @@ async def test_put_bgp_intent_auto_apply_enqueues_job(adapter_client):
 
     async for db in get_session():
         job = (
-            await db.execute(
-                select(Job).where(Job.device_id == device_id, Job.job_type == JobType.apply)
-            )
+            await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.apply))
         ).scalar_one_or_none()
         assert job is not None
         break
@@ -306,9 +265,7 @@ async def test_put_bgp_intent_no_auto_apply_when_disabled(adapter_client):
 
     async for db in get_session():
         job = (
-            await db.execute(
-                select(Job).where(Job.device_id == device_id, Job.job_type == JobType.apply)
-            )
+            await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.apply))
         ).scalar_one_or_none()
         assert job is None
         break

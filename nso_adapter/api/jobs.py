@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Jobs API — list and get job status."""
+
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends

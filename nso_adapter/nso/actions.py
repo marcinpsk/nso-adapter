@@ -4,6 +4,7 @@
 Each function is a thin wrapper around the RESTCONF POST calls documented in
 docs/nso-adapter.md §3.
 """
+
 from __future__ import annotations
 
 import structlog

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """GET /api/v1/devices/{id}/lag-topology endpoint."""
+
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
@@ -22,9 +23,7 @@ async def get_lag_topology(device_id: int, db: AsyncSession = Depends(get_db)):
         raise api_error(404, "not_found", "Device not found")
 
     result = await db.execute(
-        select(LagInterface)
-        .where(LagInterface.device_id == device_id)
-        .options(selectinload(LagInterface.members))
+        select(LagInterface).where(LagInterface.device_id == device_id).options(selectinload(LagInterface.members))
     )
     lags = result.scalars().all()
 
@@ -46,10 +45,7 @@ async def get_lag_topology(device_id: int, db: AsyncSession = Depends(get_db)):
             {
                 "name": lag.name,
                 "id": lag.lag_id,
-                "members": [
-                    {"interface": m.interface_name, "mode": m.mode}
-                    for m in lag.members
-                ],
+                "members": [{"interface": m.interface_name, "mode": m.mode} for m in lag.members],
             }
             for lag in lags
         ],

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for core/snmp.py — refresh and SSE event handler."""
+
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
@@ -42,9 +43,7 @@ async def test_refresh_inserts_communities(adapter_client):
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
 
         nso_client.get_snmp_config.assert_awaited_once_with("snmp-insert-sw01")
-        result = await db.execute(
-            select(SnmpCommunity).where(SnmpCommunity.device_id == device.id)
-        )
+        result = await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device.id))
         rows = result.scalars().all()
         assert len(rows) == 2
         hashes = {r.community_hash for r in rows}
@@ -71,9 +70,7 @@ async def test_refresh_inserts_v3_users(adapter_client):
 
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
 
-        result = await db.execute(
-            select(SnmpV3User).where(SnmpV3User.device_id == device.id)
-        )
+        result = await db.execute(select(SnmpV3User).where(SnmpV3User.device_id == device.id))
         rows = result.scalars().all()
         assert len(rows) == 2
         by_name = {r.username: r for r in rows}
@@ -97,9 +94,7 @@ async def test_refresh_inserts_hosts(adapter_client):
 
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
 
-        result = await db.execute(
-            select(SnmpHost).where(SnmpHost.device_id == device.id)
-        )
+        result = await db.execute(select(SnmpHost).where(SnmpHost.device_id == device.id))
         rows = result.scalars().all()
         assert len(rows) == 1
         h = rows[0]
@@ -123,9 +118,7 @@ async def test_refresh_inserts_system_info(adapter_client):
 
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
 
-        result = await db.execute(
-            select(SnmpSystemInfo).where(SnmpSystemInfo.device_id == device.id)
-        )
+        result = await db.execute(select(SnmpSystemInfo).where(SnmpSystemInfo.device_id == device.id))
         info = result.scalar_one_or_none()
         assert info is not None
         assert info.location == "ITC-Lab"
@@ -157,9 +150,7 @@ async def test_refresh_full_replaces_existing_rows(adapter_client):
         }
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
 
-        result = await db.execute(
-            select(SnmpCommunity).where(SnmpCommunity.device_id == device.id)
-        )
+        result = await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device.id))
         rows = result.scalars().all()
         assert len(rows) == 1
         assert rows[0].community_hash == "hash_new1_mnop9012"
@@ -185,9 +176,7 @@ async def test_refresh_handles_nso_error_gracefully(adapter_client):
 
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
 
-        result = await db.execute(
-            select(SnmpCommunity).where(SnmpCommunity.device_id == device.id)
-        )
+        result = await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device.id))
         assert result.scalars().all() == []
 
 
@@ -201,9 +190,7 @@ async def test_refresh_handles_nso_none_gracefully(adapter_client):
 
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
 
-        result = await db.execute(
-            select(SnmpCommunity).where(SnmpCommunity.device_id == device.id)
-        )
+        result = await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device.id))
         assert result.scalars().all() == []
 
 
@@ -240,9 +227,7 @@ async def test_handle_snmp_config_change_dispatches_to_affected_devices(adapter_
     nso_client.get_snmp_config.assert_awaited_once_with("snmp-sse-sw01")
 
     async for db in get_session():
-        result = await db.execute(
-            select(SnmpCommunity).where(SnmpCommunity.device_id == device_id)
-        )
+        result = await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device_id))
         rows = result.scalars().all()
         assert len(rows) == 1
         assert rows[0].community_hash == "aaabbbccc1112233"

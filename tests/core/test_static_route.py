@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for core/static_route.py — refresh and SSE event handler."""
+
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
@@ -42,9 +43,7 @@ async def test_refresh_inserts_routes(adapter_client):
         await refresh_static_routes_for_device(db, device, nso_client, refresh_source="poll")
 
         nso_client.get_static_routes.assert_awaited_once_with("sr-insert-sw01")
-        result = await db.execute(
-            select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id)
-        )
+        result = await db.execute(select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id))
         rows = result.scalars().all()
         assert len(rows) == 2
         prefixes = {r.prefix for r in rows}
@@ -71,9 +70,7 @@ async def test_refresh_replaces_existing_rows(adapter_client):
         }
         await refresh_static_routes_for_device(db, device, nso_client)
 
-        result = await db.execute(
-            select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id)
-        )
+        result = await db.execute(select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id))
         rows = result.scalars().all()
         assert len(rows) == 1
         assert rows[0].prefix == "172.16.0.0/12"
@@ -87,9 +84,14 @@ async def test_refresh_nso_returns_none_clears_rows(adapter_client):
 
     device_id = await seed_device(nso_device_name="sr-none-sw01", netbox_device_id=982)
     async for db in get_session():
-        db.add(DeviceStaticRoute(
-            device_id=device_id, vrf="", prefix="10.0.0.0/8", next_hop="1.1.1.1",
-        ))
+        db.add(
+            DeviceStaticRoute(
+                device_id=device_id,
+                vrf="",
+                prefix="10.0.0.0/8",
+                next_hop="1.1.1.1",
+            )
+        )
         await db.commit()
         break
 
@@ -98,9 +100,7 @@ async def test_refresh_nso_returns_none_clears_rows(adapter_client):
         nso_client.get_static_routes.return_value = None
         await refresh_static_routes_for_device(db, device, nso_client)
 
-        result = await db.execute(
-            select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id)
-        )
+        result = await db.execute(select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id))
         assert result.scalars().all() == []
 
 
@@ -112,9 +112,14 @@ async def test_refresh_nso_error_skips_update(adapter_client):
 
     device_id = await seed_device(nso_device_name="sr-error-sw01", netbox_device_id=983)
     async for db in get_session():
-        db.add(DeviceStaticRoute(
-            device_id=device_id, vrf="", prefix="10.0.0.0/8", next_hop="1.1.1.1",
-        ))
+        db.add(
+            DeviceStaticRoute(
+                device_id=device_id,
+                vrf="",
+                prefix="10.0.0.0/8",
+                next_hop="1.1.1.1",
+            )
+        )
         await db.commit()
         break
 
@@ -123,9 +128,7 @@ async def test_refresh_nso_error_skips_update(adapter_client):
         nso_client.get_static_routes.side_effect = RuntimeError("NSO unreachable")
         await refresh_static_routes_for_device(db, device, nso_client)
 
-        result = await db.execute(
-            select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id)
-        )
+        result = await db.execute(select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id))
         rows = result.scalars().all()
         # rows preserved because we never deleted them
         assert len(rows) == 1
@@ -153,9 +156,7 @@ async def test_handle_sse_event_refreshes_device(adapter_client):
         }
         await handle_static_route_change(db, "sr-sse-sw01", nso_client)
 
-        result = await db.execute(
-            select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device_id)
-        )
+        result = await db.execute(select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device_id))
         rows = result.scalars().all()
         assert len(rows) == 1
         assert rows[0].prefix == "10.100.0.0/24"

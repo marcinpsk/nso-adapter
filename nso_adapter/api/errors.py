@@ -4,6 +4,7 @@
 All non-2xx responses use:
   {"error": {"code": "snake_case", "message": "...", "detail": {}}}
 """
+
 from __future__ import annotations
 
 from fastapi import HTTPException, Request

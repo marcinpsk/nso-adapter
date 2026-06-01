@@ -7,6 +7,7 @@ Entry points:
 - handle_netconf_config_change() — called by the SSE on_event handler
 - parse_changed_nso_devices() — pure function; extracted for testability
 """
+
 from __future__ import annotations
 
 import re
@@ -27,9 +28,8 @@ _DEVICE_RE = re.compile(r"devices/device\[name='([^']+)'\]")
 def parse_changed_nso_devices(event_data: dict) -> set[str]:
     """Extract NSO device names from a netconf-config-change event payload."""
     notification = event_data.get("ietf-restconf:notification", event_data)
-    change = (
-        notification.get("netconf-config-change")
-        or notification.get("ietf-netconf-notifications:netconf-config-change")
+    change = notification.get("netconf-config-change") or notification.get(
+        "ietf-netconf-notifications:netconf-config-change"
     )
     if not change:
         return set()

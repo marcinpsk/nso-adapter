@@ -10,6 +10,7 @@ Usage (env-based):
 
 Falls back to config.yaml when NSO_URL is not set (reads first nso_instances entry).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -29,9 +30,7 @@ async def main() -> int:  # noqa: C901
     duration = float(os.environ.get("PROBE_DURATION", "30"))
 
     if not base_url:
-        config_file = os.environ.get(
-            "CONFIG_FILE", str(Path(__file__).parent.parent / "config.yaml")
-        )
+        config_file = os.environ.get("CONFIG_FILE", str(Path(__file__).parent.parent / "config.yaml"))
         try:
             import yaml  # noqa: PLC0415
 

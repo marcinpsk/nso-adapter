@@ -10,6 +10,7 @@ Phase 2 (intent deployed via apply action):
   in_sync  — device matches deployed intent.
   drifted  — device has changed since intent was deployed.
 """
+
 from __future__ import annotations
 
 from nso_adapter.domain.models import Interface

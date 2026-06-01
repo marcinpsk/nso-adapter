@@ -5,6 +5,7 @@
 Calls endpoint functions directly to guarantee coverage.py tracks all async
 function bodies (bypasses the Python 3.12 async tracing gap with ASGITransport).
 """
+
 from __future__ import annotations
 
 import pytest
@@ -54,8 +55,10 @@ async def _seed_with_interface(db: AsyncSession, nso_device_name: str, netbox_id
     db.add(iface)
     await db.flush()
     attr = InterfaceAttrState(
-        interface_id=iface.id, attribute="description",
-        nso_value="nso", netbox_value="netbox",
+        interface_id=iface.id,
+        attribute="description",
+        nso_value="nso",
+        netbox_value="netbox",
         compliance_status=ComplianceStatus.imported,
     )
     db.add(attr)

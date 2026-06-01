@@ -1205,6 +1205,7 @@ class OspfInterfaceIntent(Base):
 
 # M20 Redistribution ──────────────────────────────────────────────────────────
 
+
 class DeviceRedistribution(Base):
     """Read mirror of one redistribute statement from network-state-export.
 
@@ -1218,7 +1219,11 @@ class DeviceRedistribution(Base):
     __tablename__ = "device_redistribution"
     __table_args__ = (
         UniqueConstraint(
-            "device_id", "dest_protocol", "dest_ref", "source_protocol", "source_ref",
+            "device_id",
+            "dest_protocol",
+            "dest_ref",
+            "source_protocol",
+            "source_ref",
             name="uq_deviceredistribution_identity",
         ),
     )
@@ -1246,7 +1251,11 @@ class RedistributionIntent(Base):
     __tablename__ = "redistribution_intent"
     __table_args__ = (
         UniqueConstraint(
-            "device_id", "dest_protocol", "dest_ref", "source_protocol", "source_ref",
+            "device_id",
+            "dest_protocol",
+            "dest_ref",
+            "source_protocol",
+            "source_ref",
             name="uq_redistributionintent_identity",
         ),
     )

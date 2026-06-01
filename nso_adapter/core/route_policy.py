@@ -6,6 +6,7 @@ Entry points:
 - refresh_route_policy_for_device() — called on-demand by scheduler
 - handle_route_policy_change()      — placeholder for future SSE hook
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -34,9 +35,7 @@ logger = structlog.get_logger(__name__)
 
 def _content_hash(obj: object) -> str:
     """Stable SHA-256 of the canonical JSON representation of *obj*."""
-    return hashlib.sha256(
-        json.dumps(obj, sort_keys=True, default=str).encode()
-    ).hexdigest()[:16]
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 async def _upsert_route_policy_data(
@@ -46,18 +45,12 @@ async def _upsert_route_policy_data(
     refresh_source: str,
 ) -> None:
     """Full-replace: delete existing route-policy rows for *device*, then insert."""
-    await db.execute(
-        delete(DeviceRoutePolicyPrefixList).where(DeviceRoutePolicyPrefixList.device_id == device.id)
-    )
+    await db.execute(delete(DeviceRoutePolicyPrefixList).where(DeviceRoutePolicyPrefixList.device_id == device.id))
     await db.execute(
         delete(DeviceRoutePolicyCommunityList).where(DeviceRoutePolicyCommunityList.device_id == device.id)
     )
-    await db.execute(
-        delete(DeviceRoutePolicyASPath).where(DeviceRoutePolicyASPath.device_id == device.id)
-    )
-    await db.execute(
-        delete(DeviceRoutePolicyRouteMap).where(DeviceRoutePolicyRouteMap.device_id == device.id)
-    )
+    await db.execute(delete(DeviceRoutePolicyASPath).where(DeviceRoutePolicyASPath.device_id == device.id))
+    await db.execute(delete(DeviceRoutePolicyRouteMap).where(DeviceRoutePolicyRouteMap.device_id == device.id))
 
     now = datetime.now(UTC).replace(tzinfo=None)
 
@@ -156,9 +149,7 @@ async def refresh_route_policy_for_device(
 ) -> None:
     """Read route-policy oper-data for *device* from NSO and upsert DB rows."""
     if not device.nso_device_name:
-        logger.debug(
-            "route_policy.refresh.skipped", device_id=device.id, reason="no_nso_device_name"
-        )
+        logger.debug("route_policy.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
         return
 
     try:
@@ -174,26 +165,12 @@ async def refresh_route_policy_for_device(
 
     if nso_data is None:
         # Device has no route-policy objects — clear any stale rows.
+        await db.execute(delete(DeviceRoutePolicyPrefixList).where(DeviceRoutePolicyPrefixList.device_id == device.id))
         await db.execute(
-            delete(DeviceRoutePolicyPrefixList).where(
-                DeviceRoutePolicyPrefixList.device_id == device.id
-            )
+            delete(DeviceRoutePolicyCommunityList).where(DeviceRoutePolicyCommunityList.device_id == device.id)
         )
-        await db.execute(
-            delete(DeviceRoutePolicyCommunityList).where(
-                DeviceRoutePolicyCommunityList.device_id == device.id
-            )
-        )
-        await db.execute(
-            delete(DeviceRoutePolicyASPath).where(
-                DeviceRoutePolicyASPath.device_id == device.id
-            )
-        )
-        await db.execute(
-            delete(DeviceRoutePolicyRouteMap).where(
-                DeviceRoutePolicyRouteMap.device_id == device.id
-            )
-        )
+        await db.execute(delete(DeviceRoutePolicyASPath).where(DeviceRoutePolicyASPath.device_id == device.id))
+        await db.execute(delete(DeviceRoutePolicyRouteMap).where(DeviceRoutePolicyRouteMap.device_id == device.id))
         await db.commit()
         return
 

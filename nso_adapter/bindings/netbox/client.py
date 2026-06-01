@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """NetBox async client."""
+
 from __future__ import annotations
 
 import httpx

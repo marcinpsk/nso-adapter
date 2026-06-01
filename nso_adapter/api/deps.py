@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """FastAPI dependency injectors."""
+
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator

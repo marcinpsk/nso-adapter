@@ -26,6 +26,7 @@ Environment variables (from .env or container env):
   ADAPTER_TOKEN    — Bearer token for adapter (optional)
   SECRETS_BACKEND  — "vault" (default) or "local"
 """
+
 from __future__ import annotations
 
 import os

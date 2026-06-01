@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Unit tests for core/jobs.py — enqueue_job, _run_with_db, _run_connect, runners."""
+
 from __future__ import annotations
 
 import asyncio
@@ -232,8 +233,10 @@ async def test_run_connect_success(adapter_client):
     job_id = await _seed_job(device_id)
 
     mock_client = MagicMock()
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client), \
-         patch("nso_adapter.nso.actions.connect", new_callable=AsyncMock, return_value={"status": "ok"}):
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.actions.connect", new_callable=AsyncMock, return_value={"status": "ok"}),
+    ):
         await _run_connect(job_id, device_id)
 
     async for db in get_session():
@@ -286,8 +289,10 @@ async def test_run_connect_timeout(adapter_client):
         raise TimeoutError
 
     mock_client = MagicMock()
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client), \
-         patch("asyncio.wait_for", side_effect=mock_wait_for):
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("asyncio.wait_for", side_effect=mock_wait_for),
+    ):
         await _run_connect(job_id, device_id)
 
     async for db in get_session():

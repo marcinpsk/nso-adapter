@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """RESTCONF SSE subscriber for NSO notification streams."""
+
 from __future__ import annotations
 
 import asyncio
@@ -61,12 +62,11 @@ class SSESubscriber:
         *parsed* is None when the data field is not valid JSON.
         Raises httpx.HTTPStatusError / httpx.RequestError on transport failure.
         """
+
         async def _run() -> None:
             streaming_timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
             async with self._client(timeout=streaming_timeout) as c:
-                async with c.stream(
-                    "GET", stream_url, headers={"Accept": "text/event-stream"}
-                ) as response:
+                async with c.stream("GET", stream_url, headers={"Accept": "text/event-stream"}) as response:
                     response.raise_for_status()
                     current_block: list[str] = []
                     async for line in response.aiter_lines():

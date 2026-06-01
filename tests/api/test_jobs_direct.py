@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Direct unit tests for jobs.py endpoint functions."""
+
 from __future__ import annotations
 
 import pytest

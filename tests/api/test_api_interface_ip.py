@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for GET /api/v1/devices/{id}/interface-ips."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -135,10 +136,20 @@ async def test_interface_ips_uses_most_recent_timestamp(adapter_client):
     device_id = await seed_device(nso_device_name="ip-ts-dev", netbox_device_id=855)
     older_ts = datetime(2026, 5, 1, 0, 0, 0, tzinfo=UTC)
     newer_ts = datetime(2026, 5, 27, 9, 41, 12, tzinfo=UTC)
-    await _seed_ip(device_id, interface_name="GigabitEthernet0/1", address="10.0.1.1/24",
-                   refresh_source="poll", last_refreshed_at=older_ts)
-    await _seed_ip(device_id, interface_name="GigabitEthernet0/2", address="10.0.2.1/24",
-                   refresh_source="notification", last_refreshed_at=newer_ts)
+    await _seed_ip(
+        device_id,
+        interface_name="GigabitEthernet0/1",
+        address="10.0.1.1/24",
+        refresh_source="poll",
+        last_refreshed_at=older_ts,
+    )
+    await _seed_ip(
+        device_id,
+        interface_name="GigabitEthernet0/2",
+        address="10.0.2.1/24",
+        refresh_source="notification",
+        last_refreshed_at=newer_ts,
+    )
 
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/interface-ips", headers=AUTH)
     assert resp.status_code == 200
@@ -225,9 +236,7 @@ async def test_put_ip_intent_full_replace(adapter_client):
     assert resp.json()["address_count"] == 1
 
     async for db in get_session():
-        result = await db.execute(
-            select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface_id)
-        )
+        result = await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface_id))
         rows = result.scalars().all()
         break
     # Old 10.0.0.2 row should be gone

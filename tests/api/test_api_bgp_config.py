@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for GET /api/v1/devices/{id}/bgp-config (M15 A3)."""
+
 from __future__ import annotations
 
 import pytest
@@ -106,9 +107,11 @@ async def test_bgp_config_multiple_vrf_scopes(adapter_client):
         asn="65100",
         scopes=[
             {"vrf": "", "afs": ["ipv4-unicast"], "peers": []},
-            {"vrf": "ASPAN", "afs": ["ipv4-unicast"], "peers": [
-                {"peer_address": "10.0.0.1", "remote_as": "65200", "peer_afs": ["ipv4-unicast"]}
-            ]},
+            {
+                "vrf": "ASPAN",
+                "afs": ["ipv4-unicast"],
+                "peers": [{"peer_address": "10.0.0.1", "remote_as": "65200", "peer_afs": ["ipv4-unicast"]}],
+            },
             {"vrf": "MTI", "afs": ["ipv4-unicast"], "peers": []},
         ],
     )
@@ -221,4 +224,3 @@ async def test_bgp_config_peer_af_policy_refs_omitted_when_null(adapter_client):
     # Null policy fields must not appear in the serialized output
     for field in ("routemap_in", "routemap_out", "prefixlist_in", "prefixlist_out"):
         assert field not in af or af[field] is None
-

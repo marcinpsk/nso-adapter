@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """GET /api/v1/devices/{id}/ospf and PUT /api/v1/devices/{id}/ospf-intent."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -141,9 +142,7 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
     now = datetime.now(UTC).replace(tzinfo=None)
 
     # Full-replace instance intents
-    existing_inst = await db.execute(
-        select(OspfInstanceIntent).where(OspfInstanceIntent.device_id == device_id)
-    )
+    existing_inst = await db.execute(select(OspfInstanceIntent).where(OspfInstanceIntent.device_id == device_id))
     existing_inst_map = {row.process_id: row for row in existing_inst.scalars().all()}
     incoming_inst_pids = {e.process_id for e in payload.instances}
 
@@ -161,9 +160,7 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
         row.areas = entry.areas
 
     # Full-replace interface intents
-    existing_iface = await db.execute(
-        select(OspfInterfaceIntent).where(OspfInterfaceIntent.device_id == device_id)
-    )
+    existing_iface = await db.execute(select(OspfInterfaceIntent).where(OspfInterfaceIntent.device_id == device_id))
     existing_iface_map = {row.interface_name: row for row in existing_iface.scalars().all()}
     incoming_iface_names = {e.interface_name for e in payload.interfaces}
 
@@ -192,10 +189,7 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
             RedistributionIntent.dest_protocol == "ospf",
         )
     )
-    existing_redist_map = {
-        (r.dest_ref, r.source_protocol, r.source_ref): r
-        for r in existing_redist.scalars().all()
-    }
+    existing_redist_map = {(r.dest_ref, r.source_protocol, r.source_ref): r for r in existing_redist.scalars().all()}
     incoming_redist_keys: set[tuple] = set()
     for inst_entry in payload.instances:
         dest_ref = str(inst_entry.process_id)

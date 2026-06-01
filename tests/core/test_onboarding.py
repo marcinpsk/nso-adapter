@@ -6,6 +6,7 @@ These tests exercise the DB-layer logic directly via the store's get_session(),
 bypassing the HTTP layer.  The `adapter_client` fixture is still required to
 ensure init_db() has run (creating schema) before any DB call.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -146,8 +147,6 @@ async def test_rekey_changes_nso_instance(adapter_client_with_nso):
         assert updated.nso_instance == "nso-dev"
         break
 
-
-
     """rekey_device with no fields provided returns the device unchanged."""
     from nso_adapter.core.onboarding import rekey_device
     from nso_adapter.store.db import get_session
@@ -223,7 +222,9 @@ async def test_set_scope_adds_attributes(adapter_client_with_nso):
     from nso_adapter.store.db import get_session
     from tests.conftest import seed_device
 
-    device_id = await seed_device(nso_instance="nso-dev", nso_device_name="scope-add", netbox_device_id=500, attributes=[])
+    device_id = await seed_device(
+        nso_instance="nso-dev", nso_device_name="scope-add", netbox_device_id=500, attributes=[]
+    )
 
     async for db in get_session():
         device = await db.get(Device, device_id)

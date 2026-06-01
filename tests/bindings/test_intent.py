@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for bindings/netbox/intent.py — fetch_all_intent."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
@@ -38,8 +39,14 @@ def _mock_http_ctx(responses):
     return ctx
 
 
-def _intent_item(device_id=10, iface_name="ge-0/0/0", attribute="description", status="accepted",
-                 intent_value="test-desc", accepted_at="2025-01-01T00:00:00Z"):
+def _intent_item(
+    device_id=10,
+    iface_name="ge-0/0/0",
+    attribute="description",
+    status="accepted",
+    intent_value="test-desc",
+    accepted_at="2025-01-01T00:00:00Z",
+):
     return {
         "interface": {"device": {"id": device_id}, "name": iface_name},
         "attribute": attribute,
@@ -98,10 +105,12 @@ async def test_fetch_all_intent_pagination():
         "next": None,
     }
     client = _make_nb_client()
-    client._client.return_value = _mock_http_ctx([
-        _mock_httpx_response(page1),
-        _mock_httpx_response(page2),
-    ])
+    client._client.return_value = _mock_http_ctx(
+        [
+            _mock_httpx_response(page1),
+            _mock_httpx_response(page2),
+        ]
+    )
 
     records = await fetch_all_intent(client)
 

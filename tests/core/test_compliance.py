@@ -37,6 +37,7 @@ def test_no_drift_when_netbox_attrs_none():
 
 # ── compute_compliance_status ─────────────────────────────────────────────────
 
+
 def test_compliance_unknown_when_no_netbox():
     assert compute_compliance_status("uplink", None) == ComplianceStatus.unknown
 

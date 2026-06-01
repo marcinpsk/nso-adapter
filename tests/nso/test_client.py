@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for nso/client.py — NsoClient constructor and _client() helper."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock

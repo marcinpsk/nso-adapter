@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for BGP config read-mirror ORM models (M15 A2)."""
+
 import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.exc import IntegrityError
@@ -112,7 +113,11 @@ def test_create_peer_with_peer_afs(db):
     assert p.ttl == 2
     assert p.password == "s3cr3t"
 
-    pafs = db.execute(select(DeviceBgpPeerAddressFamily).where(DeviceBgpPeerAddressFamily.peer_id == peer.id)).scalars().all()
+    pafs = (
+        db.execute(select(DeviceBgpPeerAddressFamily).where(DeviceBgpPeerAddressFamily.peer_id == peer.id))
+        .scalars()
+        .all()
+    )
     assert len(pafs) == 1
     assert pafs[0].af == "ipv4-unicast"
 

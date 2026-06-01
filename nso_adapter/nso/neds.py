@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """NED helpers — platform family lookup and device-dict NED extraction."""
+
 from __future__ import annotations
 
 # Maps NED ID prefix → human-readable platform family string.

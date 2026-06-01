@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for bindings/netbox/writer.py — write_interfaces."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -74,7 +75,7 @@ async def test_write_skips_empty_payload():
     client = _make_nb_client()
     iface = _domain_iface()
     iface.nso.description = None  # no description
-    iface.nso.enabled = None      # no enabled
+    iface.nso.enabled = None  # no enabled
 
     with patch("nso_adapter.bindings.netbox.writer.resolve_or_create_interface", AsyncMock(return_value=5)):
         result = await write_interfaces(client, 42, [iface], ["description", "enabled"])

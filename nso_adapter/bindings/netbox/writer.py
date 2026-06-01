@@ -3,6 +3,7 @@
 
 Implements the NetBox write step of the sync flow (docs/nso-adapter.md §7 step 4).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass

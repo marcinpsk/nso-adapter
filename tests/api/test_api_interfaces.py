@@ -5,6 +5,7 @@
 GET /api/v1/devices/{id}/interfaces
 GET /api/v1/devices/{id}/compliance
 """
+
 from __future__ import annotations
 
 from nso_adapter.store.models import ComplianceStatus, DbInterface, InterfaceAttrState

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """GET /api/v1/devices/{id}/interface-ips and PUT /api/v1/devices/{id}/ip-intent endpoints."""
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -37,9 +38,7 @@ async def get_interface_ips(device_id: int, db: AsyncSession = Depends(get_db)):
     if not device:
         raise api_error(404, "not_found", "Device not found")
 
-    result = await db.execute(
-        select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device_id)
-    )
+    result = await db.execute(select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device_id))
     rows = result.scalars().all()
 
     if not rows:
@@ -117,9 +116,7 @@ async def put_ip_intent(device_id: int, body: IpIntentUpdate, db: AsyncSession =
     ifaces = {iface.name: iface for iface in ifaces_result.scalars().all()}
 
     existing_result = await db.execute(
-        select(InterfaceIpIntent).where(
-            InterfaceIpIntent.interface_id.in_([i.id for i in ifaces.values()])
-        )
+        select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id.in_([i.id for i in ifaces.values()]))
     )
     existing_rows: dict[tuple, InterfaceIpIntent] = {
         (r.interface_id, r.address, r.vrf): r for r in existing_result.scalars().all()
@@ -168,6 +165,7 @@ async def put_ip_intent(device_id: int, body: IpIntentUpdate, db: AsyncSession =
     settings = settings_result.scalar_one_or_none()
     if settings and settings.auto_apply and count > 0:
         from nso_adapter.core.apply import enqueue_apply
+
         await enqueue_apply(db, device_id, force=True)
 
     await db.commit()

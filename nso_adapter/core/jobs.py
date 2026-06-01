@@ -4,6 +4,7 @@
 One job per device runs at a time — a second request while a job is
 queued/running returns the existing job id for 409 handling in the API layer.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -78,9 +79,7 @@ async def _run_with_db(job_id: int, device_id: int, coro_factory) -> None:
             job.status = JobStatus.succeeded
             job.result = result
         except TimeoutError:
-            logger.error(
-                "job.timeout", job_id=job_id, device_id=device_id, timeout=_JOB_TIMEOUT
-            )
+            logger.error("job.timeout", job_id=job_id, device_id=device_id, timeout=_JOB_TIMEOUT)
             job.status = JobStatus.failed
             job.error = {
                 "code": "timeout",

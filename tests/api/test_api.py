@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """API integration tests — health, auth, devices, actions, interfaces, jobs."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
@@ -9,8 +10,10 @@ from tests.conftest import VALID_TOKEN
 
 async def test_healthz_no_auth(adapter_client):
     """Health endpoint must NOT require auth."""
-    with patch("nso_adapter.api.health.get_nso_client", side_effect=KeyError("none")), \
-         patch("nso_adapter.api.health.get_config") as mc:
+    with (
+        patch("nso_adapter.api.health.get_nso_client", side_effect=KeyError("none")),
+        patch("nso_adapter.api.health.get_config") as mc,
+    ):
         mc.return_value = MagicMock(nso_instances=[])
         resp = await adapter_client.get("/healthz")
     assert resp.status_code == 200

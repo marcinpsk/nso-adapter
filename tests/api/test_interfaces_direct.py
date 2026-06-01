@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Direct unit tests for interfaces.py endpoint functions."""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -89,7 +90,8 @@ async def test_list_interfaces_with_intent(adapter_client):
     device_id, iface_id = await _seed_full("iface-dev-02", 1120)
     async for db in get_session():
         intent = InterfaceIntent(
-            interface_id=iface_id, attribute="description",
+            interface_id=iface_id,
+            attribute="description",
             intent_value="my-intent",
             accepted_at=datetime(2025, 6, 1, 0, 0, 0),
         )

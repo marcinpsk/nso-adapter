@@ -15,6 +15,7 @@ migrations have run. Parity between the two is asserted by
 The Alembic CLI console-script is not reliably on PATH in the image, so we drive
 Alembic programmatically.
 """
+
 from __future__ import annotations
 
 from pathlib import Path

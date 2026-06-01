@@ -6,6 +6,7 @@ These tests call get_scope() / update_scope() directly with a real
 SQLAlchemy session, bypassing FastAPI's HTTP layer.  This approach
 guarantees coverage.py tracks all lines in async function bodies.
 """
+
 from __future__ import annotations
 
 import pytest

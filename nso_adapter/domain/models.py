@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Domain models — pure dataclasses, no DB dependency."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

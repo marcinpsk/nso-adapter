@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """GET /api/v1/devices/{id}/isis-interfaces and PUT /api/v1/devices/{id}/isis-interface-intent."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -166,9 +167,7 @@ async def put_isis_interface_intent(
     now = datetime.now(UTC).replace(tzinfo=None)
 
     # ── Interface intent (full-replace) ──────────────────────────────────────
-    existing_result = await db.execute(
-        select(IsisInterfaceIntent).where(IsisInterfaceIntent.device_id == device_id)
-    )
+    existing_result = await db.execute(select(IsisInterfaceIntent).where(IsisInterfaceIntent.device_id == device_id))
     existing_rows: dict[tuple, IsisInterfaceIntent] = {
         (r.interface_name, r.af): r for r in existing_result.scalars().all()
     }
@@ -210,12 +209,8 @@ async def put_isis_interface_intent(
     await db.flush()
 
     # ── Process intent (full-replace) ────────────────────────────────────────
-    existing_proc_result = await db.execute(
-        select(IsisProcessIntent).where(IsisProcessIntent.device_id == device_id)
-    )
-    existing_proc_rows: dict[str, IsisProcessIntent] = {
-        r.process_tag: r for r in existing_proc_result.scalars().all()
-    }
+    existing_proc_result = await db.execute(select(IsisProcessIntent).where(IsisProcessIntent.device_id == device_id))
+    existing_proc_rows: dict[str, IsisProcessIntent] = {r.process_tag: r for r in existing_proc_result.scalars().all()}
 
     new_proc_tags: set[str] = {item.process_tag for item in body.processes}
 
@@ -264,10 +259,7 @@ async def put_isis_interface_intent(
             RedistributionIntent.dest_protocol == "isis",
         )
     )
-    existing_redist_map = {
-        (r.dest_ref, r.source_protocol, r.source_ref): r
-        for r in existing_redist.scalars().all()
-    }
+    existing_redist_map = {(r.dest_ref, r.source_protocol, r.source_ref): r for r in existing_redist.scalars().all()}
     incoming_redist_keys: set[tuple] = set()
     for proc_entry in body.processes:
         dest_ref = proc_entry.process_tag
@@ -299,12 +291,11 @@ async def put_isis_interface_intent(
 
     from nso_adapter.store.models import DeviceSettings
 
-    settings_result = await db.execute(
-        select(DeviceSettings).where(DeviceSettings.device_id == device_id)
-    )
+    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
     settings = settings_result.scalar_one_or_none()
     if settings and settings.auto_apply and (iface_count > 0 or proc_count > 0):
         from nso_adapter.core.apply import enqueue_apply
+
         await enqueue_apply(db, device_id, force=True)
 
     await db.commit()

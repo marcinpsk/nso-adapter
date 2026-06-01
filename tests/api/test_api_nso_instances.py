@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for GET /api/v1/nso-instances/{id}/devices — enriched device list."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -55,23 +56,35 @@ async def test_list_devices_unknown_instance_returns_404(adapter_client):
 
 async def test_list_devices_enriched_fields_present(adapter_client):
     """Response includes all nullable fields; no key omitted."""
-    with patch("nso_adapter.api.nso_instances.get_config", return_value=_fake_cfg()), \
-         patch("nso_adapter.api.nso_instances.get_nso_client", return_value=_fake_nso()):
+    with (
+        patch("nso_adapter.api.nso_instances.get_config", return_value=_fake_cfg()),
+        patch("nso_adapter.api.nso_instances.get_nso_client", return_value=_fake_nso()),
+    ):
         resp = await adapter_client.get("/api/v1/nso-instances/nso-dev/devices", headers=AUTH)
     assert resp.status_code == 200
     items = resp.json()
     # All items must carry every key (nullable fields must be present, not omitted)
     for item in items:
-        for key in ("name", "address", "ned_id", "platform", "auth_group",
-                    "admin_state", "onboarded", "onboarded_device_id",
-                    "onboarded_netbox_device_id"):
+        for key in (
+            "name",
+            "address",
+            "ned_id",
+            "platform",
+            "auth_group",
+            "admin_state",
+            "onboarded",
+            "onboarded_device_id",
+            "onboarded_netbox_device_id",
+        ):
             assert key in item, f"Key '{key}' missing in {item}"
 
 
 async def test_list_devices_cisco_ned_derives_platform(adapter_client):
     """ned_id from Cisco IOS NED → platform='ios'."""
-    with patch("nso_adapter.api.nso_instances.get_config", return_value=_fake_cfg()), \
-         patch("nso_adapter.api.nso_instances.get_nso_client", return_value=_fake_nso()):
+    with (
+        patch("nso_adapter.api.nso_instances.get_config", return_value=_fake_cfg()),
+        patch("nso_adapter.api.nso_instances.get_nso_client", return_value=_fake_nso()),
+    ):
         resp = await adapter_client.get("/api/v1/nso-instances/nso-dev/devices", headers=AUTH)
     items = {d["name"]: d for d in resp.json()}
     assert items["core-rtr-01"]["ned_id"] == "cisco-ios-cli-6.95"
@@ -82,8 +95,10 @@ async def test_list_devices_cisco_ned_derives_platform(adapter_client):
 
 async def test_list_devices_null_fields_for_minimal_payload(adapter_client):
     """Device without address/ned/state → all nullable fields are null, not omitted."""
-    with patch("nso_adapter.api.nso_instances.get_config", return_value=_fake_cfg()), \
-         patch("nso_adapter.api.nso_instances.get_nso_client", return_value=_fake_nso()):
+    with (
+        patch("nso_adapter.api.nso_instances.get_config", return_value=_fake_cfg()),
+        patch("nso_adapter.api.nso_instances.get_nso_client", return_value=_fake_nso()),
+    ):
         resp = await adapter_client.get("/api/v1/nso-instances/nso-dev/devices", headers=AUTH)
     items = {d["name"]: d for d in resp.json()}
     minimal = items["aaa-switch-03"]
@@ -101,8 +116,10 @@ async def test_list_devices_onboarded_cross_reference(adapter_client):
         nso_device_name="core-rtr-01",
         netbox_device_id=42,
     )
-    with patch("nso_adapter.api.nso_instances.get_config", return_value=_fake_cfg()), \
-         patch("nso_adapter.api.nso_instances.get_nso_client", return_value=_fake_nso()):
+    with (
+        patch("nso_adapter.api.nso_instances.get_config", return_value=_fake_cfg()),
+        patch("nso_adapter.api.nso_instances.get_nso_client", return_value=_fake_nso()),
+    ):
         resp = await adapter_client.get("/api/v1/nso-instances/nso-dev/devices", headers=AUTH)
     items = {d["name"]: d for d in resp.json()}
     assert items["core-rtr-01"]["onboarded"] is True
@@ -116,8 +133,10 @@ async def test_list_devices_onboarded_cross_reference(adapter_client):
 
 async def test_list_devices_sorted_by_name(adapter_client):
     """Response is sorted by name ascending."""
-    with patch("nso_adapter.api.nso_instances.get_config", return_value=_fake_cfg()), \
-         patch("nso_adapter.api.nso_instances.get_nso_client", return_value=_fake_nso()):
+    with (
+        patch("nso_adapter.api.nso_instances.get_config", return_value=_fake_cfg()),
+        patch("nso_adapter.api.nso_instances.get_nso_client", return_value=_fake_nso()),
+    ):
         resp = await adapter_client.get("/api/v1/nso-instances/nso-dev/devices", headers=AUTH)
     names = [d["name"] for d in resp.json()]
     assert names == sorted(names)
@@ -126,17 +145,20 @@ async def test_list_devices_sorted_by_name(adapter_client):
 async def test_list_devices_onboarded_no_netbox_match(adapter_client):
     """Device in DB with netbox_device_id=None → onboarded=True, netbox ids correct."""
     from tests.conftest import seed_device
+
     device_id = await seed_device(
         nso_instance="nso-dev",
         nso_device_name="core-rtr-01",
         netbox_device_id=None,
     )
     nso_devices = [{"name": "core-rtr-01"}]
-    with patch("nso_adapter.api.nso_instances.get_config", return_value=_fake_cfg()), \
-         patch(
-             "nso_adapter.api.nso_instances.get_nso_client",
-             return_value=AsyncMock(**{"list_devices.return_value": nso_devices}),
-         ):
+    with (
+        patch("nso_adapter.api.nso_instances.get_config", return_value=_fake_cfg()),
+        patch(
+            "nso_adapter.api.nso_instances.get_nso_client",
+            return_value=AsyncMock(**{"list_devices.return_value": nso_devices}),
+        ),
+    ):
         resp = await adapter_client.get(
             "/api/v1/nso-instances/nso-dev/devices",
             headers={"Authorization": f"Bearer {VALID_TOKEN}"},
@@ -152,17 +174,20 @@ async def test_list_devices_onboarded_no_netbox_match(adapter_client):
 async def test_list_devices_cross_instance_isolation(adapter_client):
     """Device in a different NSO instance must not appear as onboarded for nso-dev."""
     from tests.conftest import seed_device
+
     await seed_device(
         nso_instance="nso-prod",
         nso_device_name="core-rtr-01",
         netbox_device_id=99,
     )
     nso_devices = [{"name": "core-rtr-01"}]
-    with patch("nso_adapter.api.nso_instances.get_config", return_value=_fake_cfg()), \
-         patch(
-             "nso_adapter.api.nso_instances.get_nso_client",
-             return_value=AsyncMock(**{"list_devices.return_value": nso_devices}),
-         ):
+    with (
+        patch("nso_adapter.api.nso_instances.get_config", return_value=_fake_cfg()),
+        patch(
+            "nso_adapter.api.nso_instances.get_nso_client",
+            return_value=AsyncMock(**{"list_devices.return_value": nso_devices}),
+        ),
+    ):
         resp = await adapter_client.get(
             "/api/v1/nso-instances/nso-dev/devices",
             headers={"Authorization": f"Bearer {VALID_TOKEN}"},

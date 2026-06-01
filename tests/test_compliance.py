@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Unit tests for core/compliance.py — compliance status logic."""
+
 from __future__ import annotations
 
 from nso_adapter.core.compliance import compute_compliance_status, compute_drift
@@ -50,8 +51,10 @@ def test_phase2_in_sync_takes_priority_over_netbox():
 
 
 def _make_interface(
-    nso_desc: str | None, nb_desc: str | None,
-    nso_enabled: bool | None = None, nb_enabled: bool | None = None,
+    nso_desc: str | None,
+    nb_desc: str | None,
+    nso_enabled: bool | None = None,
+    nb_enabled: bool | None = None,
 ) -> Interface:
     return Interface(
         name="Gi0/0",

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for nso/apply.py — apply_interface_attribute."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
@@ -43,9 +44,10 @@ async def test_apply_description_success():
 
     mock_http = client._client.return_value.__aenter__.return_value
     mock_http.patch.assert_called_once()
-    url, = mock_http.patch.call_args[0]
+    (url,) = mock_http.patch.call_args[0]
     assert "interface-reconciler" in url
     import json
+
     payload = json.loads(mock_http.patch.call_args[1]["content"])
     entries = payload["interface-reconciler:interface-config"]
     assert entries[0]["description"] == "uplink"
@@ -63,6 +65,7 @@ async def test_apply_enabled_true():
 
     mock_http = client._client.return_value.__aenter__.return_value
     import json
+
     payload = json.loads(mock_http.patch.call_args[1]["content"])
     assert payload["interface-reconciler:interface-config"][0]["enabled"] is True
 
@@ -77,6 +80,7 @@ async def test_apply_enabled_false():
 
     mock_http = client._client.return_value.__aenter__.return_value
     import json
+
     payload = json.loads(mock_http.patch.call_args[1]["content"])
     assert payload["interface-reconciler:interface-config"][0]["enabled"] is False
 
@@ -91,6 +95,7 @@ async def test_apply_description_none_uses_empty_string():
 
     mock_http = client._client.return_value.__aenter__.return_value
     import json
+
     payload = json.loads(mock_http.patch.call_args[1]["content"])
     assert payload["interface-reconciler:interface-config"][0]["description"] == ""
 
@@ -172,6 +177,7 @@ async def test_apply_interface_ips_ipv4_primary():
     await apply_interface_ips(client, "rtr-a", "GigabitEthernet0/1", [row])
 
     import json
+
     call_kwargs = client._client.return_value.__aenter__.return_value.patch.call_args
     body = json.loads(call_kwargs.kwargs["content"])
     entry = body["interface-reconciler:interface-config"][0]
@@ -192,6 +198,7 @@ async def test_apply_interface_ips_ipv6():
     await apply_interface_ips(client, "rtr-b", "GigabitEthernet0/2", [row])
 
     import json
+
     call_kwargs = client._client.return_value.__aenter__.return_value.patch.call_args
     body = json.loads(call_kwargs.kwargs["content"])
     entry = body["interface-reconciler:interface-config"][0]
@@ -210,6 +217,7 @@ async def test_apply_interface_ips_sets_vrf():
     await apply_interface_ips(client, "rtr-c", "GigabitEthernet0/3", [row])
 
     import json
+
     call_kwargs = client._client.return_value.__aenter__.return_value.patch.call_args
     body = json.loads(call_kwargs.kwargs["content"])
     entry = body["interface-reconciler:interface-config"][0]

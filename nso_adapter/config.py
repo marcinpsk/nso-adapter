@@ -6,6 +6,7 @@ Config is split into two layers:
 - AppConfig    — loaded from config.yaml; holds all non-secret settings and
                  secret *references* (never secret values).
 """
+
 from __future__ import annotations
 
 import os
@@ -124,9 +125,7 @@ def get_config() -> AppConfig:
         env = get_env_settings()
         path = Path(env.config_file)
         if not path.exists():
-            raise FileNotFoundError(
-                f"Config file not found: {path}. Copy config.yaml.example to {path} and edit it."
-            )
+            raise FileNotFoundError(f"Config file not found: {path}. Copy config.yaml.example to {path} and edit it.")
         raw = yaml.safe_load(path.read_text()) or {}
         # Allow the deployment environment to override the DB URL without editing
         # config.yaml — keeps dev/prod DB credentials with the infra (compose/.env).
@@ -142,4 +141,3 @@ def reset_config() -> None:
     global _app_config, _env_settings
     _app_config = None
     _env_settings = None
-

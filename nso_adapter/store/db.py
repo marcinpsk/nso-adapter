@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """SQLAlchemy async engine and session factory."""
+
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
@@ -19,6 +20,7 @@ def init_db(database_url: str) -> None:
     _engine = create_async_engine(database_url, connect_args=connect_args, echo=False)
 
     if database_url.startswith("sqlite"):
+
         @event.listens_for(_engine.sync_engine, "connect")
         def set_sqlite_pragma(dbapi_connection, connection_record):
             cursor = dbapi_connection.cursor()

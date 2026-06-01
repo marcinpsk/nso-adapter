@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for core/interface_ip.py — refresh, upsert, and SSE event handler."""
+
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
@@ -40,9 +41,7 @@ async def test_refresh_inserts_addresses(adapter_client):
             "interface": [
                 {
                     "interface-name": "GigabitEthernet0/1",
-                    "address": [
-                        {"address": "10.0.1.1/24", "vrf": "", "family": "ipv4", "secondary": False}
-                    ],
+                    "address": [{"address": "10.0.1.1/24", "vrf": "", "family": "ipv4", "secondary": False}],
                 },
                 {
                     "interface-name": "Loopback0",
@@ -57,9 +56,7 @@ async def test_refresh_inserts_addresses(adapter_client):
         await refresh_interface_ips_for_device(db, device, nso_client, refresh_source="poll")
 
         nso_client.get_interface_ips.assert_awaited_once_with("ip-sw01")
-        result = await db.execute(
-            select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id)
-        )
+        result = await db.execute(select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id))
         rows = result.scalars().all()
         assert len(rows) == 3
         addrs = {r.address for r in rows}
@@ -97,9 +94,7 @@ async def test_refresh_full_replaces_existing_rows(adapter_client):
         }
         await refresh_interface_ips_for_device(db, device, nso_client)
 
-        result = await db.execute(
-            select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id)
-        )
+        result = await db.execute(select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id))
         rows = result.scalars().all()
         assert len(rows) == 1
         assert rows[0].address == "10.0.99.1/24"
@@ -131,9 +126,7 @@ async def test_refresh_clears_on_404(adapter_client):
 
         await refresh_interface_ips_for_device(db, device, nso_client)
 
-        result = await db.execute(
-            select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id)
-        )
+        result = await db.execute(select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id))
         assert result.scalars().all() == []
 
 
@@ -163,9 +156,7 @@ async def test_refresh_transport_error_leaves_existing_rows(adapter_client):
 
         await refresh_interface_ips_for_device(db, device, nso_client)
 
-        result = await db.execute(
-            select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id)
-        )
+        result = await db.execute(select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id))
         # Existing row must still be there — error path does NOT wipe
         assert len(result.scalars().all()) == 1
 
@@ -179,11 +170,7 @@ async def test_handle_interface_ip_change_dispatches(adapter_client):
         nso_client.get_interface_ips.return_value = {"name": "ip-sw05", "interface": []}
         event = {
             "netconf-config-change": {
-                "edit": [
-                    {
-                        "target": "/ncs:devices/device[name='ip-sw05']/config/ios:interface/GigabitEthernet0/1"
-                    }
-                ]
+                "edit": [{"target": "/ncs:devices/device[name='ip-sw05']/config/ios:interface/GigabitEthernet0/1"}]
             }
         }
 
@@ -197,11 +184,7 @@ async def test_handle_interface_ip_change_unknown_device_no_dispatch(adapter_cli
     """SSE handler silently skips events for unrecognised device names."""
     async for db in get_session():
         nso_client = AsyncMock()
-        event = {
-            "netconf-config-change": {
-                "edit": [{"target": "/ncs:devices/device[name='ghost-device']/config/..."}]
-            }
-        }
+        event = {"netconf-config-change": {"edit": [{"target": "/ncs:devices/device[name='ghost-device']/config/..."}]}}
 
         await handle_interface_ip_change(event, db, {"nso-dev": nso_client})
 

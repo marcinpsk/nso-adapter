@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for core/redistribution.py — refresh_redistribution_for_device."""
+
 from __future__ import annotations
 
 from contextlib import asynccontextmanager

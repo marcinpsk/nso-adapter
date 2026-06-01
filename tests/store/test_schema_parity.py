@@ -13,6 +13,7 @@ role may CREATE/DROP DATABASE (e.g. the CI ``postgres`` service:
 creates two throwaway databases, builds one with create_all and one with
 ``alembic upgrade head``, diffs the reflected schema, and drops both.
 """
+
 from __future__ import annotations
 
 import os
@@ -103,15 +104,13 @@ def test_alembic_baseline_matches_create_all():
         )
         for table in sorted(ca_snap):
             assert ca_snap[table] == al_snap[table], (
-                f"schema mismatch in {table!r}:\n"
-                f"  create_all={ca_snap[table]}\n  alembic   ={al_snap[table]}"
+                f"schema mismatch in {table!r}:\n  create_all={ca_snap[table]}\n  alembic   ={al_snap[table]}"
             )
     finally:
         with admin.connect() as conn:
             for dbname in (ca_db, al_db):
                 conn.exec_driver_sql(
-                    f'SELECT pg_terminate_backend(pid) FROM pg_stat_activity '
-                    f"WHERE datname = '{dbname}'"
+                    f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{dbname}'"
                 )
                 conn.exec_driver_sql(f'DROP DATABASE IF EXISTS "{dbname}"')
         admin.dispose()

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """BGP endpoints: GET /bgp-config (read mirror) + PUT /bgp-intent (write path)."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -42,12 +43,14 @@ async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_db)):
         raise api_error(404, "not_found", "Device not found")
 
     bgp_routers = (
-        await db.execute(
-            select(DeviceBgpRouter)
-            .where(DeviceBgpRouter.device_id == device_id)
-            .order_by(DeviceBgpRouter.asn)
+        (
+            await db.execute(
+                select(DeviceBgpRouter).where(DeviceBgpRouter.device_id == device_id).order_by(DeviceBgpRouter.asn)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     if not bgp_routers:
         return {
@@ -61,12 +64,14 @@ async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_db)):
 
     scopes_by_router: dict[int, list[DeviceBgpScope]] = {r.id: [] for r in bgp_routers}
     for scope in (
-        await db.execute(
-            select(DeviceBgpScope)
-            .where(DeviceBgpScope.router_id.in_(router_ids))
-            .order_by(DeviceBgpScope.vrf)
+        (
+            await db.execute(
+                select(DeviceBgpScope).where(DeviceBgpScope.router_id.in_(router_ids)).order_by(DeviceBgpScope.vrf)
+            )
         )
-    ).scalars().all():
+        .scalars()
+        .all()
+    ):
         scopes_by_router[scope.router_id].append(scope)
 
     scope_ids = [s.id for scopes in scopes_by_router.values() for s in scopes]
@@ -76,21 +81,29 @@ async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_db)):
 
     if scope_ids:
         for af in (
-            await db.execute(
-                select(DeviceBgpAddressFamily)
-                .where(DeviceBgpAddressFamily.scope_id.in_(scope_ids))
-                .order_by(DeviceBgpAddressFamily.af)
+            (
+                await db.execute(
+                    select(DeviceBgpAddressFamily)
+                    .where(DeviceBgpAddressFamily.scope_id.in_(scope_ids))
+                    .order_by(DeviceBgpAddressFamily.af)
+                )
             )
-        ).scalars().all():
+            .scalars()
+            .all()
+        ):
             afs_by_scope[af.scope_id].append(af)
 
         for peer in (
-            await db.execute(
-                select(DeviceBgpPeer)
-                .where(DeviceBgpPeer.scope_id.in_(scope_ids))
-                .order_by(DeviceBgpPeer.peer_address)
+            (
+                await db.execute(
+                    select(DeviceBgpPeer)
+                    .where(DeviceBgpPeer.scope_id.in_(scope_ids))
+                    .order_by(DeviceBgpPeer.peer_address)
+                )
             )
-        ).scalars().all():
+            .scalars()
+            .all()
+        ):
             peers_by_scope[peer.scope_id].append(peer)
 
     peer_ids = [p.id for peers in peers_by_scope.values() for p in peers]
@@ -98,12 +111,16 @@ async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_db)):
 
     if peer_ids:
         for paf in (
-            await db.execute(
-                select(DeviceBgpPeerAddressFamily)
-                .where(DeviceBgpPeerAddressFamily.peer_id.in_(peer_ids))
-                .order_by(DeviceBgpPeerAddressFamily.af)
+            (
+                await db.execute(
+                    select(DeviceBgpPeerAddressFamily)
+                    .where(DeviceBgpPeerAddressFamily.peer_id.in_(peer_ids))
+                    .order_by(DeviceBgpPeerAddressFamily.af)
+                )
             )
-        ).scalars().all():
+            .scalars()
+            .all()
+        ):
             peer_afs_by_peer[paf.peer_id].append(paf)
 
     latest_ts = max((r.last_refreshed_at for r in bgp_routers if r.last_refreshed_at), default=None)
@@ -143,11 +160,13 @@ async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_db)):
                     peer_entry["password"] = peer.password
                 peers_out.append(peer_entry)
 
-            scopes_out.append({
-                "vrf": scope.vrf,
-                "address_families": [af.af for af in afs_by_scope.get(scope.id, [])],
-                "peers": peers_out,
-            })
+            scopes_out.append(
+                {
+                    "vrf": scope.vrf,
+                    "address_families": [af.af for af in afs_by_scope.get(scope.id, [])],
+                    "peers": peers_out,
+                }
+            )
 
         routers_out.append({"asn": bgp_router.asn, "scopes": scopes_out})
 
@@ -213,9 +232,7 @@ class BgpIntentUpdate(BaseModel):
 
 
 @router.put("/{device_id}/bgp-intent", dependencies=[Depends(verify_token)])
-async def put_bgp_intent(
-    device_id: int, body: BgpIntentUpdate, db: AsyncSession = Depends(get_db)
-):
+async def put_bgp_intent(device_id: int, body: BgpIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's BGP intent mirror for this device atomically.
 
     Full-replace semantics per device: all existing intent rows for the device
@@ -266,15 +283,17 @@ async def put_bgp_intent(
                 await db.flush()
 
                 for paf_data in peer_data.address_families:
-                    db.add(BgpPeerAfIntent(
-                        peer_id=peer_row.id,
-                        af=paf_data.af,
-                        enabled=paf_data.enabled,
-                        routemap_in=paf_data.routemap_in,
-                        routemap_out=paf_data.routemap_out,
-                        prefixlist_in=paf_data.prefixlist_in,
-                        prefixlist_out=paf_data.prefixlist_out,
-                    ))
+                    db.add(
+                        BgpPeerAfIntent(
+                            peer_id=peer_row.id,
+                            af=paf_data.af,
+                            enabled=paf_data.enabled,
+                            routemap_in=paf_data.routemap_in,
+                            routemap_out=paf_data.routemap_out,
+                            prefixlist_in=paf_data.prefixlist_in,
+                            prefixlist_out=paf_data.prefixlist_out,
+                        )
+                    )
 
     await db.flush()
 
@@ -285,10 +304,7 @@ async def put_bgp_intent(
             RedistributionIntent.dest_protocol == "bgp",
         )
     )
-    existing_redist_map = {
-        (r.dest_ref, r.source_protocol, r.source_ref): r
-        for r in existing_redist.scalars().all()
-    }
+    existing_redist_map = {(r.dest_ref, r.source_protocol, r.source_ref): r for r in existing_redist.scalars().all()}
     incoming_redist_keys: set[tuple] = set()
     for router_data in body.routers:
         for scope_data in router_data.scopes:
@@ -327,6 +343,7 @@ async def put_bgp_intent(
         settings = settings_result.scalar_one_or_none()
         if settings and settings.auto_apply:
             from nso_adapter.core.apply import enqueue_apply
+
             await enqueue_apply(db, device_id, force=True)
 
     await db.commit()

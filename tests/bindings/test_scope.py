@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for bindings/netbox/scope.py — fetch_all_scope."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock

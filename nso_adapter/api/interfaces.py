@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Interfaces and compliance endpoints."""
+
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
@@ -37,17 +38,10 @@ async def list_interfaces(device_id: int, db: AsyncSession = Depends(get_db)):
 
     out = []
     for iface in ifaces:
-        attrs_result = await db.execute(
-            select(InterfaceAttrState).where(InterfaceAttrState.interface_id == iface.id)
-        )
-        intent_result = await db.execute(
-            select(InterfaceIntent).where(InterfaceIntent.interface_id == iface.id)
-        )
+        attrs_result = await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id == iface.id))
+        intent_result = await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface.id))
         intent_by_attr = {r.attribute: r for r in intent_result.scalars().all()}
-        attrs = {
-            a.attribute: _attr_out(a, intent_by_attr.get(a.attribute))
-            for a in attrs_result.scalars().all()
-        }
+        attrs = {a.attribute: _attr_out(a, intent_by_attr.get(a.attribute)) for a in attrs_result.scalars().all()}
         out.append(
             {
                 "name": iface.name,
@@ -68,16 +62,21 @@ async def get_compliance(device_id: int, db: AsyncSession = Depends(get_db)):
     ifaces = ifaces_result.scalars().all()
 
     by_status: dict[str, int] = {
-        "unknown": 0, "imported": 0, "changed": 0, "error": 0,
-        "accepted": 0, "deploying": 0, "in_sync": 0, "apply_failed": 0, "drifted": 0,
+        "unknown": 0,
+        "imported": 0,
+        "changed": 0,
+        "error": 0,
+        "accepted": 0,
+        "deploying": 0,
+        "in_sync": 0,
+        "apply_failed": 0,
+        "drifted": 0,
     }
     managed = 0
     last_checked_at = None
 
     for iface in ifaces:
-        attrs_result = await db.execute(
-            select(InterfaceAttrState).where(InterfaceAttrState.interface_id == iface.id)
-        )
+        attrs_result = await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id == iface.id))
         attrs = attrs_result.scalars().all()
         if attrs:
             managed += 1
@@ -93,6 +92,3 @@ async def get_compliance(device_id: int, db: AsyncSession = Depends(get_db)):
         "by_status": by_status,
         "last_checked_at": last_checked_at.isoformat() + "Z" if last_checked_at else None,
     }
-
-
-

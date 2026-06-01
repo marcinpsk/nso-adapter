@@ -5,6 +5,7 @@
 PUT /api/v1/devices/{id}/intent  — full snapshot replace (idempotent)
 GET /api/v1/devices/{id}/intent  — read current mirror
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -72,7 +73,8 @@ async def put_intent(device_id: int, body: IntentUpdate, db: AsyncSession = Depe
     for item in body.attributes:
         if item.attribute not in managed_attrs:
             raise api_error(
-                422, "validation_error",
+                422,
+                "validation_error",
                 f"Attribute {item.attribute!r} is not in the managed scope for device {device_id}",
             )
 
@@ -82,9 +84,7 @@ async def put_intent(device_id: int, body: IntentUpdate, db: AsyncSession = Depe
 
     # Delete all existing intent rows for this device (full replace)
     existing_intent = await db.execute(
-        select(InterfaceIntent).where(
-            InterfaceIntent.interface_id.in_([i.id for i in ifaces.values()])
-        )
+        select(InterfaceIntent).where(InterfaceIntent.interface_id.in_([i.id for i in ifaces.values()]))
     )
     for row in existing_intent.scalars().all():
         await db.delete(row)
@@ -131,6 +131,7 @@ async def put_intent(device_id: int, body: IntentUpdate, db: AsyncSession = Depe
     settings = settings_result.scalar_one_or_none()
     if settings and settings.auto_apply and count > 0:
         from nso_adapter.core.apply import enqueue_apply
+
         await enqueue_apply(db, device_id, force=True)
 
     await db.commit()
@@ -153,9 +154,7 @@ async def get_intent(device_id: int, db: AsyncSession = Depends(get_db)):
 
     rows = []
     for iface in ifaces.values():
-        intent_result = await db.execute(
-            select(InterfaceIntent).where(InterfaceIntent.interface_id == iface.id)
-        )
+        intent_result = await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface.id))
         for row in intent_result.scalars().all():
             rows.append(_intent_row_out(row, iface.name))
 

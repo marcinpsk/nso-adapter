@@ -58,9 +58,7 @@ async def test_persistent_subscriber_reconnects_after_clean_eof(monkeypatch: pyt
     monkeypatch.setattr(module.asyncio, "wait_for", fake_wait_for)
     subscriber.subscribe = AsyncMock(side_effect=subscribe_side_effect)
 
-    task = asyncio.create_task(
-        persistent_subscriber(subscriber, STREAM_URL, lambda *_: None, stop_event=stop_event)
-    )
+    task = asyncio.create_task(persistent_subscriber(subscriber, STREAM_URL, lambda *_: None, stop_event=stop_event))
     await second_call_started.wait()
     stop_event.set()
     await task
@@ -170,9 +168,7 @@ async def test_persistent_subscriber_returns_after_stop_event_during_active_stre
 
     subscriber.subscribe = AsyncMock(side_effect=subscribe_side_effect)
 
-    task = asyncio.create_task(
-        persistent_subscriber(subscriber, STREAM_URL, lambda *_: None, stop_event=stop_event)
-    )
+    task = asyncio.create_task(persistent_subscriber(subscriber, STREAM_URL, lambda *_: None, stop_event=stop_event))
     await stream_started.wait()
     stop_event.set()
     await task

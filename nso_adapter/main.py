@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """NSO Adapter — FastAPI application entry point."""
+
 from __future__ import annotations
 
 import asyncio
@@ -49,9 +50,7 @@ async def lifespan(app: FastAPI):
     env = get_env_settings()
 
     structlog.configure(
-        wrapper_class=structlog.make_filtering_bound_logger(
-            __import__("logging").getLevelName(cfg.log_level)
-        ),
+        wrapper_class=structlog.make_filtering_bound_logger(__import__("logging").getLevelName(cfg.log_level)),
     )
 
     # Init secrets provider — all further secret access goes through this
@@ -106,6 +105,7 @@ async def lifespan(app: FastAPI):
 
     # Build NetBox client and register with importer
     from nso_adapter.bindings.netbox.client import NetboxClient
+
     netbox_token = provider.get(cfg.netbox.api_token_ref)
     netbox_client = NetboxClient(
         url=cfg.netbox.base_url,
@@ -207,4 +207,3 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
-

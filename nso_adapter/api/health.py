@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Health check endpoint."""
+
 from __future__ import annotations
 
 from fastapi import APIRouter, Request

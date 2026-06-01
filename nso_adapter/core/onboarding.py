@@ -4,6 +4,7 @@
 Onboarding does NOT pre-flight NSO; if the device name is wrong the first sync
 sets mapping_status = unmatched_device.
 """
+
 from __future__ import annotations
 
 import structlog
@@ -88,9 +89,7 @@ async def rekey_device(
         )
     )
     if dup.scalar_one_or_none():
-        raise LookupError(
-            f"NSO device {target_name!r} on {target_instance!r} is already claimed by another device"
-        )
+        raise LookupError(f"NSO device {target_name!r} on {target_instance!r} is already claimed by another device")
 
     if nso_instance is not None:
         device.nso_instance = nso_instance
@@ -98,9 +97,7 @@ async def rekey_device(
         device.nso_device_name = nso_device_name
 
     # Clear interface attr state, then interfaces, then managed scope — explicit to avoid lazy load
-    iface_ids_result = await db.execute(
-        select(DbInterface.id).where(DbInterface.device_id == device.id)
-    )
+    iface_ids_result = await db.execute(select(DbInterface.id).where(DbInterface.device_id == device.id))
     iface_ids = list(iface_ids_result.scalars().all())
     if iface_ids:
         from nso_adapter.store.models import InterfaceAttrState
@@ -127,9 +124,7 @@ async def offboard_device(db: AsyncSession, device: Device) -> None:
     from nso_adapter.store.models import InterfaceAttrState, Job
 
     # Delete in FK dependency order to avoid cascade-load on lazy="raise" relationships
-    iface_ids_result = await db.execute(
-        select(DbInterface.id).where(DbInterface.device_id == device.id)
-    )
+    iface_ids_result = await db.execute(select(DbInterface.id).where(DbInterface.device_id == device.id))
     iface_ids = list(iface_ids_result.scalars().all())
     if iface_ids:
         await db.execute(delete(InterfaceAttrState).where(InterfaceAttrState.interface_id.in_(iface_ids)))
@@ -146,9 +141,7 @@ async def set_scope(db: AsyncSession, device: Device, attributes: list[str]) -> 
     """Replace the managed-scope attribute list for a device."""
     from sqlalchemy import select
 
-    existing_result = await db.execute(
-        select(ManagedScope).where(ManagedScope.device_id == device.id)
-    )
+    existing_result = await db.execute(select(ManagedScope).where(ManagedScope.device_id == device.id))
     existing = {s.attribute: s for s in existing_result.scalars().all()}
     desired = set(attributes)
 

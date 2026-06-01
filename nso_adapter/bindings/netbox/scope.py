@@ -11,6 +11,7 @@ Returns a list of records each containing netbox_device_id + managed attributes.
 On a NetBox outage (non-200) this function raises so the scheduler can abort
 wholesale — never interpret an outage as "everything deleted".
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass

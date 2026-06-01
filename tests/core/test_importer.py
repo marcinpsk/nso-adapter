@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for sync_device and check_compliance using NSO package oper-data."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, patch
@@ -76,15 +77,13 @@ def test_attrs_to_interface_list_skips_malformed_entry():
     assert result[0].name == "GigabitEthernet0/1"
     assert result[1].name == "GigabitEthernet0/2"
 
+
 def test_attrs_to_interface_list_enabled_absent_yields_none():
     """When NSO package omits 'enabled', the domain object carries None — not True/False."""
     entry = {"interface": [{"interface-name": "GigabitEthernet0/1", "description": "uplink"}]}
     result = _attrs_to_interface_list(entry)
     assert len(result) == 1
     assert result[0].nso.enabled is None
-
-
-
 
 
 async def test_sync_device_creates_interface_rows(db_session: AsyncSession):
@@ -108,6 +107,7 @@ async def test_sync_device_creates_interface_rows(db_session: AsyncSession):
     nso_client = _make_nso_client(iface_entry)
 
     from nso_adapter.core import importer as imp
+
     imp._nso_clients["nso-dev"] = nso_client
     imp._netbox_client = None
 
@@ -135,6 +135,7 @@ async def test_sync_device_calls_get_interface_attributes(db_session: AsyncSessi
     nso_client = _make_nso_client(None)
 
     from nso_adapter.core import importer as imp
+
     imp._nso_clients["nso-dev"] = nso_client
     imp._netbox_client = None
 
@@ -159,6 +160,7 @@ async def test_sync_device_marks_unmatched_interfaces_when_empty(db_session: Asy
     nso_client = _make_nso_client(None)
 
     from nso_adapter.core import importer as imp
+
     imp._nso_clients["nso-dev"] = nso_client
     imp._netbox_client = None
 
@@ -209,6 +211,7 @@ async def test_check_compliance_uses_interface_attributes(db_session: AsyncSessi
     }
     nso_client = _make_nso_client(iface_entry)
     from nso_adapter.core import importer as imp
+
     imp._nso_clients["nso-dev"] = nso_client
 
     with patch("nso_adapter.core.importer.nso_actions.compare_config", new_callable=AsyncMock):

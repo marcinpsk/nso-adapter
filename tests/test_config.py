@@ -69,4 +69,3 @@ def test_env_settings_reads_role_id(monkeypatch):
     env = get_env_settings()
     assert env.vault_role_id == "test-role"
     assert env.vault_secret_id == "test-secret"
-

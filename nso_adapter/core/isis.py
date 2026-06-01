@@ -6,6 +6,7 @@ Entry points:
 - refresh_isis_interfaces_for_device() — called on-demand by scheduler
 - handle_isis_interface_change()       — placeholder for future SSE hook
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime

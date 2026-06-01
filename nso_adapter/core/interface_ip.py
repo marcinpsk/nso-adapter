@@ -6,6 +6,7 @@ Entry points:
 - refresh_interface_ips_for_device() — called on-demand by SSE handler or scheduler
 - handle_interface_ip_change() — called by the SSE on_event handler
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime

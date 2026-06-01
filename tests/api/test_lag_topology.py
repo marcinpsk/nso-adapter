@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for GET /api/v1/devices/{id}/lag-topology."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -34,7 +35,7 @@ async def _seed_lag(
         )
         db.add(lag)
         await db.flush()
-        for iface_name, mode in (members or []):
+        for iface_name, mode in members or []:
             db.add(LagMember(lag_interface_id=lag.id, interface_name=iface_name, mode=mode))
         await db.commit()
         break
@@ -99,7 +100,9 @@ async def test_lag_topology_uses_most_recent_refresh_source(adapter_client):
     older_ts = datetime(2026, 5, 1, 0, 0, 0, tzinfo=UTC)
     newer_ts = datetime(2026, 5, 27, 9, 41, 12, tzinfo=UTC)
     await _seed_lag(device_id, name="Port-channel1", lag_id=1, refresh_source="polled-sync", last_refreshed_at=older_ts)
-    await _seed_lag(device_id, name="Port-channel2", lag_id=2, refresh_source="notification", last_refreshed_at=newer_ts)
+    await _seed_lag(
+        device_id, name="Port-channel2", lag_id=2, refresh_source="notification", last_refreshed_at=newer_ts
+    )
 
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/lag-topology", headers=AUTH)
     assert resp.status_code == 200

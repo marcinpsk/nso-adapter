@@ -7,6 +7,7 @@ Entry points:
 - refresh_redistribution_for_device() — called on-demand after each OSPF/ISIS/BGP
   refresh to pick up any redistribution changes in the same NSO response cycle.
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -97,9 +98,7 @@ async def refresh_redistribution_for_device(
         ospf_entry = await nso_client.get_ospf(device.nso_device_name)
         for inst in (ospf_entry or {}).get("instance", []):
             dest_ref = _ospf_dest_ref(inst)
-            rows.extend(
-                _build_rows(device.id, "ospf", dest_ref, inst.get("redistribute", []), now, refresh_source)
-            )
+            rows.extend(_build_rows(device.id, "ospf", dest_ref, inst.get("redistribute", []), now, refresh_source))
     except Exception as exc:
         logger.warning("redistribution.refresh.ospf_error", device_id=device.id, error=repr(exc))
 
@@ -108,9 +107,7 @@ async def refresh_redistribution_for_device(
         isis_entry = await nso_client.get_isis_interfaces(device.nso_device_name)
         for proc in (isis_entry or {}).get("process", []):
             dest_ref = _isis_dest_ref(proc)
-            rows.extend(
-                _build_rows(device.id, "isis", dest_ref, proc.get("redistribute", []), now, refresh_source)
-            )
+            rows.extend(_build_rows(device.id, "isis", dest_ref, proc.get("redistribute", []), now, refresh_source))
     except Exception as exc:
         logger.warning("redistribution.refresh.isis_error", device_id=device.id, error=repr(exc))
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Unit tests for core/apply.py — enqueue_apply and run_apply."""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -171,8 +172,10 @@ async def test_run_apply_all_succeed(adapter_client):
     )
 
     mock_client = AsyncMock()
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client), \
-         patch("nso_adapter.nso.apply.apply_interface_attribute", new_callable=AsyncMock):
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_interface_attribute", new_callable=AsyncMock),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     async for db in get_session():
@@ -200,8 +203,10 @@ async def test_run_apply_partial_failure(adapter_client):
 
     mock_client = AsyncMock()
     nso_err = NsoApplyError(code="nso_error", message="NSO rejected commit", detail={})
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client), \
-         patch("nso_adapter.nso.apply.apply_interface_attribute", new_callable=AsyncMock, side_effect=nso_err):
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_interface_attribute", new_callable=AsyncMock, side_effect=nso_err),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     async for db in get_session():
@@ -226,15 +231,23 @@ async def test_run_apply_unexpected_exception_on_attribute(adapter_client):
     )
 
     mock_client = AsyncMock()
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client), \
-         patch("nso_adapter.nso.apply.apply_interface_attribute", new_callable=AsyncMock,
-               side_effect=RuntimeError("unexpected internal error")):
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch(
+            "nso_adapter.nso.apply.apply_interface_attribute",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("unexpected internal error"),
+        ),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     async for db in get_session():
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
-        assert "unexpected internal error" in str(job.result) or job.result["attribute_count_by_outcome"]["apply_failed"] == 1
+        assert (
+            "unexpected internal error" in str(job.result)
+            or job.result["attribute_count_by_outcome"]["apply_failed"] == 1
+        )
         break
 
 
@@ -281,6 +294,7 @@ async def test_run_apply_outer_exception(adapter_client):
 
 # ── IP intent apply pass ───────────────────────────────────────────────────
 
+
 async def _seed_iface(device_id: int, iface_name: str) -> int:
     """Create a bare DbInterface row and return its id."""
     async for db in get_session():
@@ -293,7 +307,15 @@ async def _seed_iface(device_id: int, iface_name: str) -> int:
     raise RuntimeError("unreachable")
 
 
-async def _seed_ip_intent(interface_id: int, *, address: str, family: str = "ipv4", secondary: bool = False, vrf: str = "", accepted: bool = True) -> None:
+async def _seed_ip_intent(
+    interface_id: int,
+    *,
+    address: str,
+    family: str = "ipv4",
+    secondary: bool = False,
+    vrf: str = "",
+    accepted: bool = True,
+) -> None:
     """Seed an InterfaceIpIntent row."""
     from datetime import UTC, datetime
 
@@ -329,8 +351,10 @@ async def test_run_apply_ip_intent_success(adapter_client):
     mock_nso._base = "http://fake-nso"
     mock_nso._action_timeout = 30
 
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_nso), \
-         patch("nso_adapter.nso.apply.apply_interface_ips", new_callable=AsyncMock) as mock_ip_apply:
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_nso),
+        patch("nso_adapter.nso.apply.apply_interface_ips", new_callable=AsyncMock) as mock_ip_apply,
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     async for db in get_session():
@@ -340,7 +364,11 @@ async def test_run_apply_ip_intent_success(adapter_client):
         assert result["ip_count_by_outcome"]["in_sync"] == 1
         assert result["ip_count_by_outcome"]["apply_failed"] == 0
         # Verify last_apply_at was stamped
-        ip_rows = (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface_id))).scalars().all()
+        ip_rows = (
+            (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface_id)))
+            .scalars()
+            .all()
+        )
         assert ip_rows[0].last_apply_at is not None
         assert ip_rows[0].last_apply_error is None
         break
@@ -363,19 +391,25 @@ async def test_run_apply_ip_intent_failure_marks_error(adapter_client):
 
     mock_nso = AsyncMock()
 
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_nso), \
-         patch(
-             "nso_adapter.nso.apply.apply_interface_ips",
-             new_callable=AsyncMock,
-             side_effect=NsoApplyError("nso_patch_failed", "NSO returned 500"),
-         ):
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_nso),
+        patch(
+            "nso_adapter.nso.apply.apply_interface_ips",
+            new_callable=AsyncMock,
+            side_effect=NsoApplyError("nso_patch_failed", "NSO returned 500"),
+        ),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     async for db in get_session():
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.result["ip_count_by_outcome"]["apply_failed"] == 1
-        ip_rows = (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface_id))).scalars().all()
+        ip_rows = (
+            (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface_id)))
+            .scalars()
+            .all()
+        )
         assert ip_rows[0].last_apply_error is not None
         assert ip_rows[0].last_apply_error["code"] == "nso_patch_failed"
         break
@@ -391,8 +425,10 @@ async def test_run_apply_ip_intent_not_accepted_skipped(adapter_client):
 
     mock_nso = AsyncMock()
 
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_nso), \
-         patch("nso_adapter.nso.apply.apply_interface_ips", new_callable=AsyncMock) as mock_ip_apply:
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_nso),
+        patch("nso_adapter.nso.apply.apply_interface_ips", new_callable=AsyncMock) as mock_ip_apply,
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     mock_ip_apply.assert_not_awaited()
@@ -414,7 +450,11 @@ async def test_run_apply_ip_already_applied_skipped_without_force(adapter_client
 
     # Stamp last_apply_at to simulate already-applied
     async for db in get_session():
-        rows = (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface_id))).scalars().all()
+        rows = (
+            (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface_id)))
+            .scalars()
+            .all()
+        )
         rows[0].last_apply_at = datetime.now(UTC).replace(tzinfo=None)
         rows[0].last_apply_error = None
         await db.commit()
@@ -422,8 +462,10 @@ async def test_run_apply_ip_already_applied_skipped_without_force(adapter_client
 
     mock_nso = AsyncMock()
 
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_nso), \
-         patch("nso_adapter.nso.apply.apply_interface_ips", new_callable=AsyncMock) as mock_ip_apply:
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_nso),
+        patch("nso_adapter.nso.apply.apply_interface_ips", new_callable=AsyncMock) as mock_ip_apply,
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=False)
 
     mock_ip_apply.assert_not_awaited()

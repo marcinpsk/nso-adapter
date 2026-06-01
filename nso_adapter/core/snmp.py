@@ -6,6 +6,7 @@ Entry points:
 - refresh_snmp_config_for_device() — on-demand refresh (scheduler / SSE handler)
 - handle_snmp_config_change()      — SSE on_event handler (config-change notification)
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime

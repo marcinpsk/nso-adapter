@@ -6,6 +6,7 @@ Entry points:
 - refresh_bgp_config_for_device() — called on-demand by scheduler
 - handle_bgp_config_change()      — SSE hook (placeholder for future use)
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -118,11 +119,7 @@ async def refresh_bgp_config_for_device(
     routers = entry.get("router", []) if entry else []
     await _upsert_bgp_data(db, device, routers, refresh_source)
 
-    peer_count = sum(
-        len(scope_data.get("peer", []))
-        for r in routers
-        for scope_data in r.get("scope", [])
-    )
+    peer_count = sum(len(scope_data.get("peer", [])) for r in routers for scope_data in r.get("scope", []))
     logger.info(
         "bgp.refresh.done",
         device_id=device.id,

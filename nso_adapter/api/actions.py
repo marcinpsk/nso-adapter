@@ -4,6 +4,7 @@
 All actions return 202 with {job_id}.
 409 is returned if a job is already queued/running for the device.
 """
+
 from __future__ import annotations
 
 from fastapi import APIRouter, BackgroundTasks, Depends

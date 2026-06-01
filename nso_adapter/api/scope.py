@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Scope API — manage per-device attribute scope."""
+
 from __future__ import annotations
 
 from datetime import datetime

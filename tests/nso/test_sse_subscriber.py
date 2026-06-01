@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Unit tests for SSESubscriber using mock httpx transports."""
+
 from __future__ import annotations
 
 import contextlib
@@ -12,6 +13,7 @@ import pytest
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
 
 class MockTransport(httpx.AsyncBaseTransport):
     """Returns a pre-canned JSON response."""
@@ -66,6 +68,7 @@ STREAMS_PAYLOAD = {
 
 # ── discover_streams ──────────────────────────────────────────────────────────
 
+
 async def test_discover_streams_returns_list():
     sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
     with patch_subscriber_client(sub, 200, STREAMS_PAYLOAD):
@@ -92,6 +95,7 @@ async def test_discover_streams_raises_on_401():
 
 # ── _client header behaviour ──────────────────────────────────────────────────
 
+
 def test_client_sets_host_header_when_configured():
     sub = SSESubscriber("http://nso:8080", ("admin", "secret"), host_header="nso.example.com")
     client = sub._client()
@@ -105,6 +109,7 @@ def test_client_omits_host_header_when_not_configured():
 
 
 # ── subscribe helpers ─────────────────────────────────────────────────────────
+
 
 class MockSSETransport(httpx.AsyncBaseTransport):
     """Returns a finite SSE body containing pre-canned events."""
@@ -143,6 +148,7 @@ STREAM_URL = "http://nso:8080/restconf/streams/NETCONF/json"
 
 # ── subscribe ─────────────────────────────────────────────────────────────────
 
+
 async def test_subscribe_calls_on_event_for_each_sse_block():
     received: list[tuple[str, dict | None]] = []
 
@@ -165,10 +171,7 @@ async def test_subscribe_delivers_multiple_events():
     def on_event(raw: str, parsed: dict | None) -> None:
         received.append((raw, parsed))
 
-    events = [
-        json.dumps({"ietf-restconf:notification": {"eventTime": f"2026-01-0{i}T00:00:00Z"}})
-        for i in range(1, 4)
-    ]
+    events = [json.dumps({"ietf-restconf:notification": {"eventTime": f"2026-01-0{i}T00:00:00Z"}}) for i in range(1, 4)]
     sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
     with patch_subscriber_sse(sub, events):
         await sub.subscribe(STREAM_URL, on_event, duration=5.0)
@@ -214,12 +217,7 @@ async def test_subscribe_skips_event_type_and_comment_lines():
 
     class SSEWithCommentTransport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-            body = (
-                b"event: notification\n"
-                b": keep-alive\n"
-                b'data: {"msg": "hello"}\n'
-                b"\n"
-            )
+            body = b'event: notification\n: keep-alive\ndata: {"msg": "hello"}\n\n'
             return httpx.Response(
                 200,
                 content=body,

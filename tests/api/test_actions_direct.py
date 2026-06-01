@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Direct unit tests for actions.py endpoint functions."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -139,6 +140,7 @@ async def test_sync_notify_returns_job_id(adapter_client):
 
 
 # ── verify_token (deps.py line 44: wrong token branch) ───────────────────────
+
 
 async def test_wrong_token_raises_401(adapter_client):
     """Sending wrong bearer token → 401."""

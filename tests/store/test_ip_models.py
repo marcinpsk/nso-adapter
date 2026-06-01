@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for InterfaceIpAddress + InterfaceIpIntent ORM models."""
+
 from datetime import UTC, datetime
 
 import pytest
@@ -74,9 +75,7 @@ def test_create_ip_address(db):
     db.add(ip)
     db.commit()
 
-    result = db.execute(
-        select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == dev.id)
-    ).scalars().all()
+    result = db.execute(select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == dev.id)).scalars().all()
     assert len(result) == 1
     assert result[0].address == "192.168.1.1/24"
     assert result[0].vrf == ""
@@ -86,16 +85,18 @@ def test_create_ip_address(db):
 
 def test_ip_address_vrf_stored(db):
     dev = _make_device(db)
-    db.add(InterfaceIpAddress(
-        device_id=dev.id,
-        interface_name="GigabitEthernet0/0",
-        address="10.0.0.1/30",
-        vrf="MGMT",
-        family="ipv4",
-        secondary=False,
-        last_refreshed_at=_ts(),
-        refresh_source="polled-sync",
-    ))
+    db.add(
+        InterfaceIpAddress(
+            device_id=dev.id,
+            interface_name="GigabitEthernet0/0",
+            address="10.0.0.1/30",
+            vrf="MGMT",
+            family="ipv4",
+            secondary=False,
+            last_refreshed_at=_ts(),
+            refresh_source="polled-sync",
+        )
+    )
     db.commit()
     row = db.execute(select(InterfaceIpAddress)).scalars().first()
     assert row.vrf == "MGMT"
@@ -126,16 +127,18 @@ def test_ip_address_same_host_different_vrf_allowed(db):
     dev = _make_device(db)
     ts = _ts()
     for vrf in ("VRF-A", "VRF-B"):
-        db.add(InterfaceIpAddress(
-            device_id=dev.id,
-            interface_name="GigabitEthernet0/0",
-            address="10.1.1.1/24",
-            vrf=vrf,
-            family="ipv4",
-            secondary=False,
-            last_refreshed_at=ts,
-            refresh_source="notification",
-        ))
+        db.add(
+            InterfaceIpAddress(
+                device_id=dev.id,
+                interface_name="GigabitEthernet0/0",
+                address="10.1.1.1/24",
+                vrf=vrf,
+                family="ipv4",
+                secondary=False,
+                last_refreshed_at=ts,
+                refresh_source="notification",
+            )
+        )
     db.commit()
     rows = db.execute(select(InterfaceIpAddress)).scalars().all()
     assert len(rows) == 2
@@ -143,16 +146,18 @@ def test_ip_address_same_host_different_vrf_allowed(db):
 
 def test_cascade_delete_on_device_delete(db):
     dev = _make_device(db)
-    db.add(InterfaceIpAddress(
-        device_id=dev.id,
-        interface_name="GigabitEthernet0/0",
-        address="192.168.1.1/24",
-        vrf="",
-        family="ipv4",
-        secondary=False,
-        last_refreshed_at=_ts(),
-        refresh_source="notification",
-    ))
+    db.add(
+        InterfaceIpAddress(
+            device_id=dev.id,
+            interface_name="GigabitEthernet0/0",
+            address="192.168.1.1/24",
+            vrf="",
+            family="ipv4",
+            secondary=False,
+            last_refreshed_at=_ts(),
+            refresh_source="notification",
+        )
+    )
     db.commit()
     db.delete(dev)
     db.commit()
@@ -177,9 +182,7 @@ def test_create_ip_intent(db):
     db.add(intent)
     db.commit()
 
-    result = db.execute(
-        select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface.id)
-    ).scalars().all()
+    result = db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface.id)).scalars().all()
     assert len(result) == 1
     assert result[0].address == "192.168.1.1/24"
     assert result[0].accepted_at is None
@@ -201,9 +204,7 @@ def test_ip_intent_same_addr_different_vrf_allowed(db):
     dev = _make_device(db)
     iface = _make_interface(db, dev)
     for vrf in ("VRF-A", "VRF-B"):
-        db.add(InterfaceIpIntent(
-            interface_id=iface.id, address="10.0.0.1/30", vrf=vrf, family="ipv4", secondary=False
-        ))
+        db.add(InterfaceIpIntent(interface_id=iface.id, address="10.0.0.1/30", vrf=vrf, family="ipv4", secondary=False))
     db.commit()
     rows = db.execute(select(InterfaceIpIntent)).scalars().all()
     assert len(rows) == 2
@@ -229,9 +230,7 @@ def test_ip_intent_stores_apply_error(db):
 def test_cascade_delete_ip_intent_on_interface_delete(db):
     dev = _make_device(db)
     iface = _make_interface(db, dev)
-    db.add(InterfaceIpIntent(
-        interface_id=iface.id, address="10.0.0.1/30", vrf="", family="ipv4", secondary=False
-    ))
+    db.add(InterfaceIpIntent(interface_id=iface.id, address="10.0.0.1/30", vrf="", family="ipv4", secondary=False))
     db.commit()
     db.delete(iface)
     db.commit()

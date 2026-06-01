@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Direct unit tests for intent.py endpoint functions."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -64,9 +65,11 @@ async def test_put_intent_inserts_known_interface(adapter_client):
     """put_intent() stores intent rows for known interfaces."""
     device_id, _ = await _seed_device_with_interface("intent-dev-02", 1210)
     async for db in get_session():
-        body = IntentUpdate(attributes=[
-            IntentAttribute(interface="GigabitEthernet0/2", attribute="description", intent_value="my-desc")
-        ])
+        body = IntentUpdate(
+            attributes=[
+                IntentAttribute(interface="GigabitEthernet0/2", attribute="description", intent_value="my-desc")
+            ]
+        )
         result = await put_intent(device_id=device_id, body=body, db=db)
         assert result["attribute_count"] == 1
         break
@@ -76,9 +79,9 @@ async def test_put_intent_unknown_interface_logged_and_skipped(adapter_client):
     """put_intent() skips unknown interfaces (warns) and returns count=0."""
     device_id, _ = await _seed_device_with_interface("intent-dev-03", 1220)
     async for db in get_session():
-        body = IntentUpdate(attributes=[
-            IntentAttribute(interface="no-such-iface", attribute="description", intent_value="val")
-        ])
+        body = IntentUpdate(
+            attributes=[IntentAttribute(interface="no-such-iface", attribute="description", intent_value="val")]
+        )
         result = await put_intent(device_id=device_id, body=body, db=db)
         assert result["attribute_count"] == 0
         break
@@ -90,16 +93,20 @@ async def test_put_intent_transitions_imported_to_accepted(adapter_client):
     async for db in get_session():
         # Seed an attr state in 'imported' status
         attr = InterfaceAttrState(
-            interface_id=iface_id, attribute="description",
-            nso_value="old", netbox_value="new",
+            interface_id=iface_id,
+            attribute="description",
+            nso_value="old",
+            netbox_value="new",
             compliance_status=ComplianceStatus.imported,
         )
         db.add(attr)
         await db.commit()
 
-        body = IntentUpdate(attributes=[
-            IntentAttribute(interface="GigabitEthernet0/2", attribute="description", intent_value="new-val")
-        ])
+        body = IntentUpdate(
+            attributes=[
+                IntentAttribute(interface="GigabitEthernet0/2", attribute="description", intent_value="new-val")
+            ]
+        )
         result = await put_intent(device_id=device_id, body=body, db=db)
         assert result["attribute_count"] == 1
         break
@@ -113,9 +120,9 @@ async def test_put_intent_auto_apply_triggers_enqueue(adapter_client):
         await db.commit()
 
     async for db in get_session():
-        body = IntentUpdate(attributes=[
-            IntentAttribute(interface="GigabitEthernet0/2", attribute="description", intent_value="v")
-        ])
+        body = IntentUpdate(
+            attributes=[IntentAttribute(interface="GigabitEthernet0/2", attribute="description", intent_value="v")]
+        )
         with patch("nso_adapter.core.apply.enqueue_apply", new_callable=AsyncMock) as mock_enq:
             result = await put_intent(device_id=device_id, body=body, db=db)
         assert result["attribute_count"] == 1
@@ -127,15 +134,15 @@ async def test_put_intent_replaces_existing_intent(adapter_client):
     """put_intent() deletes old intent rows and inserts fresh ones."""
     device_id, _ = await _seed_device_with_interface("intent-dev-06", 1250)
     async for db in get_session():
-        body1 = IntentUpdate(attributes=[
-            IntentAttribute(interface="GigabitEthernet0/2", attribute="description", intent_value="first")
-        ])
+        body1 = IntentUpdate(
+            attributes=[IntentAttribute(interface="GigabitEthernet0/2", attribute="description", intent_value="first")]
+        )
         await put_intent(device_id=device_id, body=body1, db=db)
 
     async for db in get_session():
-        body2 = IntentUpdate(attributes=[
-            IntentAttribute(interface="GigabitEthernet0/2", attribute="description", intent_value="second")
-        ])
+        body2 = IntentUpdate(
+            attributes=[IntentAttribute(interface="GigabitEthernet0/2", attribute="description", intent_value="second")]
+        )
         result = await put_intent(device_id=device_id, body=body2, db=db)
         assert result["attribute_count"] == 1
         break
@@ -168,13 +175,16 @@ async def test_get_intent_returns_set_intent(adapter_client):
     """get_intent() returns the intent rows set by put_intent."""
     device_id, _ = await _seed_device_with_interface("intent-dev-08", 1270)
     async for db in get_session():
-        body = IntentUpdate(attributes=[
-            IntentAttribute(
-                interface="GigabitEthernet0/2", attribute="description",
-                intent_value="test-val",
-                accepted_at=datetime(2025, 6, 1, 12, 0, tzinfo=UTC),
-            )
-        ])
+        body = IntentUpdate(
+            attributes=[
+                IntentAttribute(
+                    interface="GigabitEthernet0/2",
+                    attribute="description",
+                    intent_value="test-val",
+                    accepted_at=datetime(2025, 6, 1, 12, 0, tzinfo=UTC),
+                )
+            ]
+        )
         await put_intent(device_id=device_id, body=body, db=db)
 
     async for db in get_session():
