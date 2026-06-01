@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Async RESTCONF client for Cisco NSO."""
+
 from __future__ import annotations
 
 import httpx
@@ -71,10 +72,17 @@ class NsoClient:
             return data.get("tailf-ncs:config", data)
 
     async def get_device_ned_id(self, device_name: str) -> str | None:
-        """Return the NED ID for *device_name* or None."""
+        """Return the NED ID for *device_name* or None.
+
+        Uses a RESTCONF ``fields=device-type`` filter so NSO returns only the
+        small device-type subtree. The unfiltered query pulls the device's
+        entire config AND oper-data (e.g. live NETCONF notification replay
+        logs) — on a real device that can be ~900 KB and is streamed without a
+        Content-Length, so it can truncate mid-body and raise a JSONDecodeError.
+        """
         url = f"{self._base}/restconf/data/tailf-ncs:devices/device={device_name}"
         async with self._client() as c:
-            resp = await c.get(url)
+            resp = await c.get(url, params={"fields": "device-type"})
             resp.raise_for_status()
             raw = resp.json().get("tailf-ncs:device", {})
             # NSO returns a list for keyed list entries

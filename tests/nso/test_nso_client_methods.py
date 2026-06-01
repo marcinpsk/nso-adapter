@@ -5,6 +5,7 @@
 These tests exercise list_devices, get_device_config, get_device_ned_id,
 and check_sync without hitting a real NSO instance.
 """
+
 from __future__ import annotations
 
 import json
@@ -161,11 +162,7 @@ async def test_get_device_config_raises_on_404(patch_client):
 async def test_get_device_ned_id_cli(patch_client):
     """get_device_ned_id returns NED ID from CLI device-type."""
     client = _make_client()
-    payload = {
-        "tailf-ncs:device": {
-            "device-type": {"cli": {"ned-id": "cisco-ios-cli-6.95"}}
-        }
-    }
+    payload = {"tailf-ncs:device": {"device-type": {"cli": {"ned-id": "cisco-ios-cli-6.95"}}}}
     with patch_client(client, 200, payload):
         result = await client.get_device_ned_id("core-rtr-01")
     assert result == "cisco-ios-cli-6.95"
@@ -174,11 +171,7 @@ async def test_get_device_ned_id_cli(patch_client):
 async def test_get_device_ned_id_netconf(patch_client):
     """get_device_ned_id returns NED ID from NETCONF device-type."""
     client = _make_client()
-    payload = {
-        "tailf-ncs:device": {
-            "device-type": {"netconf": {"ned-id": "juniper-junos-nc-4.1"}}
-        }
-    }
+    payload = {"tailf-ncs:device": {"device-type": {"netconf": {"ned-id": "juniper-junos-nc-4.1"}}}}
     with patch_client(client, 200, payload):
         result = await client.get_device_ned_id("edge-rtr-02")
     assert result == "juniper-junos-nc-4.1"
@@ -187,11 +180,7 @@ async def test_get_device_ned_id_netconf(patch_client):
 async def test_get_device_ned_id_list_response(patch_client):
     """get_device_ned_id handles NSO returning device as a list (keyed list entry)."""
     client = _make_client()
-    payload = {
-        "tailf-ncs:device": [
-            {"device-type": {"cli": {"ned-id": "cisco-ios-cli-6.95"}}}
-        ]
-    }
+    payload = {"tailf-ncs:device": [{"device-type": {"cli": {"ned-id": "cisco-ios-cli-6.95"}}}]}
     with patch_client(client, 200, payload):
         result = await client.get_device_ned_id("core-rtr-01")
     assert result == "cisco-ios-cli-6.95"
@@ -204,6 +193,36 @@ async def test_get_device_ned_id_returns_none_when_no_type(patch_client):
     with patch_client(client, 200, payload):
         result = await client.get_device_ned_id("mystery-device")
     assert result is None
+
+
+async def test_get_device_ned_id_uses_fields_filter():
+    """get_device_ned_id must send ``fields=device-type`` so NSO returns only the
+    small device-type subtree — the unfiltered node pulls the device's full
+    config + oper-data (~900 KB, streamed) and truncates mid-body, raising
+    JSONDecodeError. Regression test for the device-55 sync failure."""
+    client = _make_client()
+    captured: dict = {}
+
+    class _CapturingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            captured["params"] = dict(request.url.params)
+            body = {"tailf-ncs:device": {"device-type": {"netconf": {"ned-id": "timos-nc-23.10:timos-nc-23.10"}}}}
+            return httpx.Response(
+                200,
+                content=json.dumps(body).encode(),
+                headers={"content-type": "application/yang-data+json"},
+                request=request,
+            )
+
+    def _mock_client(timeout=None):
+        return httpx.AsyncClient(transport=_CapturingTransport(), base_url="http://nso:8080")
+
+    client._client = _mock_client
+    result = await client.get_device_ned_id("prod-lab03c-ra1")
+
+    assert result == "timos-nc-23.10:timos-nc-23.10"
+    assert captured["params"].get("fields") == "device-type", captured
 
 
 # ── check_sync ───────────────────────────────────────────────────────────────
@@ -242,4 +261,3 @@ async def test_check_sync_returns_false_on_missing_result_key(patch_client):
     with patch_client(client, 200, payload):
         result = await client.check_sync("core-rtr-01")
     assert result is False
-
