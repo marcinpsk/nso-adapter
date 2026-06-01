@@ -140,6 +140,10 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
     # Batched NetBox attribute updates (Phase 2), merged per interface id so
     # description+enabled on one interface become a single PATCH row.
     attr_patches: dict[int, dict] = {}
+    # Pending state updates keyed by NetBox interface id: applied ONLY after the
+    # bulk PATCH confirms that id was written, so a failed/timed-out batch does
+    # not falsely mark state as synced (which would skip it forever).
+    pending_by_id: dict[int, list[tuple]] = {}
 
     for iface in interfaces:
         # Upsert DbInterface row
@@ -179,16 +183,23 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
                 if nb_id is not None:
                     if db_iface.netbox_interface_id is None:
                         db_iface.netbox_interface_id = nb_id
-                    field_payload: dict = {}
-                    if attr == "description":
-                        field_payload["description"] = iface.nso.description or ""
-                    elif iface.nso.enabled is not None:
-                        field_payload["enabled"] = iface.nso.enabled
-                    else:
-                        continue  # NSO package didn't report enabled; skip write
-                    attr_patches.setdefault(nb_id, {"id": nb_id}).update(field_payload)
-                    attr_state.netbox_value = nso_str
-                    interfaces_written += 1
+                    # Change detection: only enqueue a NetBox write when the value
+                    # actually differs from what we last successfully wrote. Without
+                    # this, every sync re-patches every interface (thousands of
+                    # no-op writes) — which overwhelms NetBox and breeds lock
+                    # contention. netbox_value is updated AFTER the bulk PATCH
+                    # confirms the write (see Phase 2 flush), never optimistically,
+                    # so a failed batch is safely retried next sync.
+                    if prev_netbox_val != nso_str:
+                        field_payload: dict = {}
+                        if attr == "description":
+                            field_payload["description"] = iface.nso.description or ""
+                        elif iface.nso.enabled is not None:
+                            field_payload["enabled"] = iface.nso.enabled
+                        else:
+                            continue  # NSO package didn't report enabled; skip write
+                        attr_patches.setdefault(nb_id, {"id": nb_id}).update(field_payload)
+                        pending_by_id.setdefault(nb_id, []).append((attr_state, nso_str))
 
             attr_state.nso_value = nso_str
             if attr_state.intent_value is not None:
@@ -197,17 +208,24 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
                 attr_state.compliance_status = status
             else:
                 # Phase 1: no intent yet — mark as "imported" when values match.
+                # Note: netbox_value is only updated after the Phase 2 flush
+                # confirms the write, so a just-written attr stays non-"imported"
+                # until the next reconcile flips it (one-sync lag, self-heals).
                 attr_state.compliance_status = (
                     ComplianceStatus.imported if attr_state.netbox_value == nso_str else status
                 )
             attr_state.last_checked_at = datetime.utcnow()
 
-    # ── Phase 2 flush: push all queued attribute updates in one bulk PATCH ──
+    # ── Phase 2 flush: push queued attribute updates, batched + isolated ──
+    # Mark netbox_value ONLY for ids the bulk PATCH confirms as written, so a
+    # failed/timed-out batch is safely re-attempted on the next sync rather than
+    # falsely recorded as in-sync.
     if nb_client and attr_patches:
-        try:
-            await nb_client.bulk_patch_interfaces(list(attr_patches.values()))
-        except Exception as exc:
-            logger.warning("netbox.bulk_patch_failed", device_id=device_id, error=str(exc))
+        written = await nb_client.bulk_patch_interfaces(list(attr_patches.values()))
+        for obj in written:
+            for attr_state, nso_str in pending_by_id.get(obj["id"], []):
+                attr_state.netbox_value = nso_str
+                interfaces_written += 1
 
     # Update device sync state
     mapping_status = MappingStatus.mapped

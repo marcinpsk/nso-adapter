@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
 from nso_adapter.core.importer import _attrs_to_interface_list, sync_device
-from nso_adapter.store.models import Base, DbInterface, Device, ManagedScope, MappingStatus
+from nso_adapter.store.models import Base, DbInterface, Device, InterfaceAttrState, ManagedScope, MappingStatus
 
 
 @pytest_asyncio.fixture
@@ -219,3 +219,115 @@ async def test_check_compliance_uses_interface_attributes(db_session: AsyncSessi
 
     nso_client.get_interface_attributes.assert_called_once_with("sw03")
     assert summary["changes_detected"] == 1
+
+
+async def test_sync_change_detection_skips_unchanged_on_resync(db_session: AsyncSession):
+    """Second sync with identical NSO values issues ZERO NetBox writes (idempotent)."""
+    from unittest.mock import AsyncMock
+
+    from nso_adapter.core import importer as imp
+
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="sw-idem",
+        ned_id="cisco-ios-cli-6.95",
+        netbox_device_id=7,
+    )
+    db_session.add(device)
+    db_session.add(ManagedScope(device=device, attribute="description"))
+    db_session.add(ManagedScope(device=device, attribute="enabled"))
+    await db_session.commit()
+
+    iface_entry = {
+        "device-name": "sw-idem",
+        "interface": [
+            {"interface-name": "GigabitEthernet0/1", "description": "link", "enabled": True},
+        ],
+    }
+    imp._nso_clients["nso-dev"] = _make_nso_client(iface_entry)
+
+    # Mock NetBox client: bulk_ensure resolves the interface; bulk_patch echoes
+    # the patched rows back (confirming the writes), capturing payloads.
+    nb = AsyncMock()
+    nb.list_interfaces = AsyncMock(return_value=[{"id": 500, "name": "GigabitEthernet0/1", "parent": None}])
+    nb.bulk_create_interfaces = AsyncMock(return_value=[])
+    patched_batches = []
+
+    def _patch(p):
+        rows = list(p)
+        patched_batches.append(rows)
+        return [{"id": r["id"]} for r in rows]  # echo = confirmed written
+
+    nb.bulk_patch_interfaces = AsyncMock(side_effect=_patch)
+    imp._netbox_client = nb
+
+    try:
+        with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+            first = await sync_device(device.id, db_session)
+            assert first["interfaces_written"] > 0  # first run writes
+            patched_batches.clear()
+            second = await sync_device(device.id, db_session)
+    finally:
+        imp._netbox_client = None
+
+    # Second sync: nothing changed → no writes enqueued.
+    assert second["interfaces_written"] == 0
+    assert patched_batches == [] or all(len(b) == 0 for b in patched_batches)
+
+
+async def test_sync_failed_patch_not_marked_synced(db_session: AsyncSession):
+    """If the bulk PATCH does NOT confirm an id, its netbox_value stays old and it
+    is re-enqueued on the next sync (no false 'synced')."""
+    from unittest.mock import AsyncMock
+
+    from nso_adapter.core import importer as imp
+
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="sw-fail",
+        ned_id="cisco-ios-cli-6.95",
+        netbox_device_id=8,
+    )
+    db_session.add(device)
+    db_session.add(ManagedScope(device=device, attribute="description"))
+    await db_session.commit()
+
+    iface_entry = {
+        "device-name": "sw-fail",
+        "interface": [{"interface-name": "GigabitEthernet0/1", "description": "newdesc"}],
+    }
+    imp._nso_clients["nso-dev"] = _make_nso_client(iface_entry)
+
+    nb = AsyncMock()
+    nb.list_interfaces = AsyncMock(return_value=[{"id": 600, "name": "GigabitEthernet0/1", "parent": None}])
+    nb.bulk_create_interfaces = AsyncMock(return_value=[])
+    # Simulate a failed/timed-out batch: confirm NOTHING.
+    nb.bulk_patch_interfaces = AsyncMock(return_value=[])
+    imp._netbox_client = nb
+
+    try:
+        with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+            first = await sync_device(device.id, db_session)
+            assert first["interfaces_written"] == 0  # nothing confirmed
+            # state must NOT be marked synced
+            row = (
+                (await db_session.execute(select(DbInterface).where(DbInterface.device_id == device.id)))
+                .scalars()
+                .first()
+            )
+            attr = (
+                (await db_session.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id == row.id)))
+                .scalars()
+                .first()
+            )
+            assert attr.netbox_value != "newdesc"  # not falsely recorded
+
+            # Next sync re-enqueues it (still a delta).
+            enqueued = []
+            nb.bulk_patch_interfaces = AsyncMock(
+                side_effect=lambda p: enqueued.extend(p) or [{"id": r["id"]} for r in p]
+            )
+            await sync_device(device.id, db_session)
+            assert any(r["id"] == 600 for r in enqueued)
+    finally:
+        imp._netbox_client = None

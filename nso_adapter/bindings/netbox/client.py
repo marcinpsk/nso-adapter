@@ -8,10 +8,15 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-# Max rows per bulk create/patch request. NetBox handles a list body fine, but a
-# single multi-thousand-row request makes the server drop the connection; serial
-# batches of this size are reliable.
-_BULK_CHUNK = 100
+# Max rows per bulk request. A single multi-thousand-row body makes NetBox drop
+# the connection, so requests are split into serial batches. PATCH is much more
+# expensive server-side than POST (per-row change-logging + cable/LAG recompute),
+# so it uses a smaller batch.
+_BULK_CREATE_CHUNK = 100
+_BULK_PATCH_CHUNK = 50
+# Bulk writes can be slow on a busy / DEBUG NetBox; give them headroom beyond the
+# default per-call timeout.
+_BULK_TIMEOUT = 120.0
 
 
 class NetboxClient:
@@ -82,7 +87,7 @@ class NetboxClient:
         return resp.json()
 
     async def bulk_create_interfaces(self, payloads: list[dict]) -> list[dict]:
-        """Bulk-create interfaces, chunked into batches of ``_BULK_CHUNK``.
+        """Bulk-create interfaces, chunked into batches of ``_BULK_CREATE_CHUNK``.
 
         A single huge list body overwhelms NetBox (the server drops the
         connection mid-request), so requests are split into batches sent
@@ -91,29 +96,42 @@ class NetboxClient:
         remainder once, so one rejected name can't strand its batch. Returns the
         concatenated list of created objects (each has ``id`` and ``name``).
         """
-        return await self._bulk_chunked("POST", payloads, label="bulk_create")
+        return await self._bulk_chunked("POST", payloads, chunk=_BULK_CREATE_CHUNK, label="bulk_create")
 
     async def bulk_patch_interfaces(self, payloads: list[dict]) -> list[dict]:
         """Bulk-update interfaces (each item needs ``id``), chunked + serial.
 
         Same batching and all-or-nothing/row-drop semantics as bulk create.
         """
-        return await self._bulk_chunked("PATCH", payloads, label="bulk_patch")
+        return await self._bulk_chunked("PATCH", payloads, chunk=_BULK_PATCH_CHUNK, label="bulk_patch")
 
-    async def _bulk_chunked(self, method: str, payloads: list[dict], *, label: str) -> list[dict]:
-        """Send *payloads* to the interfaces endpoint in serial batches."""
+    async def _bulk_chunked(self, method: str, payloads: list[dict], *, chunk: int, label: str) -> list[dict]:
+        """Send *payloads* in serial batches, isolating failures per batch.
+
+        A batch that errors (timeout, 5xx, unexpected 400 body) is logged and
+        skipped — it must NOT abandon the remaining batches. Returns whatever was
+        successfully written.
+        """
         out: list[dict] = []
-        for start in range(0, len(payloads), _BULK_CHUNK):
-            batch = payloads[start : start + _BULK_CHUNK]
-            out.extend(await self._bulk_one(method, batch, label=label))
+        for start in range(0, len(payloads), chunk):
+            batch = payloads[start : start + chunk]
+            try:
+                out.extend(await self._bulk_one(method, batch, label=label))
+            except Exception as exc:
+                logger.warning(
+                    f"netbox.{label}.batch_failed",
+                    batch_start=start,
+                    batch_size=len(batch),
+                    error=str(exc) or type(exc).__name__,
+                )
         return out
 
     async def _bulk_one(self, method: str, batch: list[dict], *, label: str) -> list[dict]:
-        """Send one batch; on 400, drop the positionally-bad rows and retry once."""
+        """Send one batch; on a 400 with positional errors, drop bad rows and retry once."""
         if not batch:
             return []
         url = f"{self._base}/api/dcim/interfaces/"
-        resp = await self._client().request(method, url, json=batch)
+        resp = await self._client().request(method, url, json=batch, timeout=_BULK_TIMEOUT)
         if resp.status_code == 400:
             errors = resp.json()
             # errors is a positional list aligned to batch; {} == row ok.
@@ -128,6 +146,6 @@ class NetboxClient:
             good = [p for i, p in enumerate(batch) if i not in bad]
             if not good:
                 return []
-            resp = await self._client().request(method, url, json=good)
+            resp = await self._client().request(method, url, json=good, timeout=_BULK_TIMEOUT)
         resp.raise_for_status()
         return resp.json()

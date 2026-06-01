@@ -133,10 +133,10 @@ async def test_bulk_create_empty_is_noop(client):
 
 @respx.mock
 async def test_bulk_create_chunks_large_payload(client):
-    """>_BULK_CHUNK rows are split into multiple serial POSTs and concatenated."""
+    """>_BULK_CREATE_CHUNK rows are split into multiple serial POSTs and concatenated."""
     from nso_adapter.bindings.netbox import client as client_mod
 
-    n = client_mod._BULK_CHUNK * 2 + 5  # 205 → 3 batches (100, 100, 5)
+    n = client_mod._BULK_CREATE_CHUNK * 2 + 5  # 205 → 3 batches (100, 100, 5)
     payloads = [{"name": f"if{i}"} for i in range(n)]
 
     def _echo(request: httpx.Request) -> httpx.Response:
@@ -151,6 +151,32 @@ async def test_bulk_create_chunks_large_payload(client):
     assert route.call_count == 3  # 100 + 100 + 5
     assert len(result) == n
     assert [r["name"] for r in result] == [p["name"] for p in payloads]
+
+
+@respx.mock
+async def test_bulk_patch_one_failed_batch_does_not_abandon_rest(client):
+    """A batch that times out is skipped; remaining batches still apply (no abort)."""
+    from nso_adapter.bindings.netbox import client as client_mod
+
+    n = client_mod._BULK_PATCH_CHUNK * 3  # 3 batches
+    payloads = [{"id": i, "description": "x"} for i in range(n)]
+    calls = {"i": 0}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        calls["i"] += 1
+        if calls["i"] == 2:  # second batch times out
+            raise httpx.ReadTimeout("boom", request=request)
+        body = json.loads(request.content)
+        return httpx.Response(200, json=body)
+
+    respx.patch(f"{BASE}/api/dcim/interfaces/").mock(side_effect=_handler)
+    result = await client.bulk_patch_interfaces(payloads)
+
+    # batches 1 and 3 succeeded (≈2/3 of rows); the timed-out batch was skipped,
+    # NOT allowed to abandon the rest.
+    assert len(result) == 2 * client_mod._BULK_PATCH_CHUNK
 
 
 @respx.mock
