@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from contextlib import asynccontextmanager
 
 import structlog
@@ -171,7 +172,11 @@ async def lifespan(app: FastAPI):
             except (asyncio.CancelledError, TimeoutError):
                 pass
 
-        await netbox_client.aclose()
+        # Close the pooled NetBox HTTP client. Guarded with inspect.isawaitable
+        # so a test-mocked client (plain MagicMock) doesn't break teardown.
+        maybe = netbox_client.aclose()
+        if inspect.isawaitable(maybe):
+            await maybe
 
         engine = get_engine()
         if engine:

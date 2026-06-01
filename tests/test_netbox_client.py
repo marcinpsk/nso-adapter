@@ -132,6 +132,28 @@ async def test_bulk_create_empty_is_noop(client):
 
 
 @respx.mock
+async def test_bulk_create_chunks_large_payload(client):
+    """>_BULK_CHUNK rows are split into multiple serial POSTs and concatenated."""
+    from nso_adapter.bindings.netbox import client as client_mod
+
+    n = client_mod._BULK_CHUNK * 2 + 5  # 205 → 3 batches (100, 100, 5)
+    payloads = [{"name": f"if{i}"} for i in range(n)]
+
+    def _echo(request: httpx.Request) -> httpx.Response:
+        import json
+
+        body = json.loads(request.content)
+        return httpx.Response(201, json=[{"id": i, "name": p["name"]} for i, p in enumerate(body)])
+
+    route = respx.post(f"{BASE}/api/dcim/interfaces/").mock(side_effect=_echo)
+    result = await client.bulk_create_interfaces(payloads)
+
+    assert route.call_count == 3  # 100 + 100 + 5
+    assert len(result) == n
+    assert [r["name"] for r in result] == [p["name"] for p in payloads]
+
+
+@respx.mock
 async def test_bulk_create_400_drops_bad_row_and_retries(client):
     """On a 400 with positional errors, the bad row is dropped and the rest retried."""
     respx.post(f"{BASE}/api/dcim/interfaces/").mock(
