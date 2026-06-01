@@ -4,6 +4,7 @@
 Handles name resolution (NSO interface name → NetBox interface) and auto-creates
 missing interfaces when decision I from docs/00-plan.md applies.
 """
+
 from __future__ import annotations
 
 import structlog
@@ -41,6 +42,64 @@ def _guess_netbox_type(interface_name: str) -> str:
     return "other"
 
 
+def _split_dotted_unit(interface_name: str) -> tuple[str, str] | None:
+    """Return (base, unit) for a dotted logical-unit name, else None.
+
+    Junos/Cisco subinterfaces are ``<base>.<unit>`` — e.g. ``ae98.100``,
+    ``GigabitEthernet0/0.10``. Returns None for non-dotted names and for names
+    whose dot is not a clean unit separator (multiple dots, empty side). Nokia
+    port-ids use ``/`` and LAG members use ``:`` — neither has a ``.`` so they
+    are safe and resolve as plain interfaces.
+    """
+    if interface_name.count(".") != 1:
+        return None
+    base, unit = interface_name.split(".", 1)
+    if not base or not unit:
+        return None
+    return base, unit
+
+
+async def _resolve_or_create_simple(
+    client: NetboxClient,
+    netbox_device_id: int,
+    name: str,
+    *,
+    nb_type: str | None = None,
+    parent_id: int | None = None,
+) -> int | None:
+    """Resolve a NetBox interface by name, creating it if missing.
+
+    If it already exists but lacks a ``parent`` we expect, patch the parent in
+    (re-parents flat units created before subinterface modeling — plan decision 2).
+    """
+    nb_iface = await client.get_interface(netbox_device_id, name)
+    if nb_iface:
+        nb_id = nb_iface["id"]
+        if parent_id is not None and not nb_iface.get("parent"):
+            try:
+                await client.patch_interface(nb_id, {"parent": parent_id})
+                logger.info("netbox.interface.reparented", name=name, netbox_id=nb_id, parent=parent_id)
+            except Exception as exc:
+                logger.warning("netbox.interface.reparent_failed", name=name, error=str(exc))
+        return nb_id
+
+    payload: dict = {
+        "device": netbox_device_id,
+        "name": name,
+        "type": nb_type or _guess_netbox_type(name),
+    }
+    if parent_id is not None:
+        payload["parent"] = parent_id
+    try:
+        created = await client.create_interface(payload)
+        nb_id = created["id"]
+        logger.info("netbox.interface.created", name=name, netbox_id=nb_id, type=payload["type"], parent=parent_id)
+        return nb_id
+    except Exception as exc:
+        logger.warning("netbox.interface.create_failed", name=name, error=str(exc))
+        return None
+
+
 async def resolve_or_create_interface(
     client: NetboxClient,
     netbox_device_id: int,
@@ -48,24 +107,20 @@ async def resolve_or_create_interface(
 ) -> int | None:
     """Return the NetBox interface ID for *iface*, creating it if missing.
 
-    Returns the NetBox interface id, or None if auto-creation fails.
+    Logical units (``<base>.<unit>``, e.g. Junos ``ae98.100``) are modelled as
+    NetBox subinterfaces: the base is ensured first, then the unit is
+    created/looked-up as ``type='virtual'`` with ``parent`` set to the base.
+    Pre-existing flat units get their ``parent`` patched in. Returns the
+    interface id, or None if creation fails. (Decision I + subinterface plan.)
     """
-    nb_iface = await client.get_interface(netbox_device_id, iface.name)
-    if nb_iface:
-        return nb_iface["id"]
+    split = _split_dotted_unit(iface.name)
+    if split is None:
+        return await _resolve_or_create_simple(client, netbox_device_id, iface.name)
 
-    # Auto-create (decision I)
-    nb_type = _guess_netbox_type(iface.name)
-    payload = {
-        "device": netbox_device_id,
-        "name": iface.name,
-        "type": nb_type,
-    }
-    try:
-        created = await client.create_interface(payload)
-        nb_id = created["id"]
-        logger.info("netbox.interface.created", name=iface.name, netbox_id=nb_id, type=nb_type)
-        return nb_id
-    except Exception as exc:
-        logger.warning("netbox.interface.create_failed", name=iface.name, error=str(exc))
-        return None
+    base_name, _unit = split
+    base_id = await _resolve_or_create_simple(client, netbox_device_id, base_name)
+    if base_id is None:
+        logger.warning("netbox.interface.base_unresolved", unit=iface.name, base=base_name)
+        # Don't drop the unit — create it parentless rather than lose it.
+        return await _resolve_or_create_simple(client, netbox_device_id, iface.name, nb_type="virtual")
+    return await _resolve_or_create_simple(client, netbox_device_id, iface.name, nb_type="virtual", parent_id=base_id)
