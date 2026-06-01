@@ -171,6 +171,8 @@ async def lifespan(app: FastAPI):
             except (asyncio.CancelledError, TimeoutError):
                 pass
 
+        await netbox_client.aclose()
+
         engine = get_engine()
         if engine:
             await engine.dispose()

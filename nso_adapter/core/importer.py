@@ -118,9 +118,28 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
     result_rows = await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))
     existing_ifaces: dict[str, DbInterface] = {row.name: row for row in result_rows.scalars().all()}
 
+    # ── Phase 1: bulk interface inventory reconcile (plan Layer A) ──
+    # Ensure every NSO-reported interface (incl. logical units as virtual
+    # subinterfaces parented to their base) exists in NetBox in a few bulk
+    # requests, instead of a GET+POST per interface. Returns name→nb_id.
+    nb_client = get_netbox_client()
+    nb_id_by_name: dict[str, int] = {}
+    if nb_client and device.netbox_device_id:
+        from nso_adapter.bindings.netbox.mapper import bulk_ensure_interfaces
+
+        try:
+            nb_id_by_name = await bulk_ensure_interfaces(
+                nb_client, device.netbox_device_id, [i.name for i in interfaces]
+            )
+        except Exception as exc:
+            logger.warning("netbox.bulk_ensure_failed", device_id=device_id, error=str(exc))
+
     interfaces_created = 0
     interfaces_written = 0
     changes_detected = 0
+    # Batched NetBox attribute updates (Phase 2), merged per interface id so
+    # description+enabled on one interface become a single PATCH row.
+    attr_patches: dict[int, dict] = {}
 
     for iface in interfaces:
         # Upsert DbInterface row
@@ -157,28 +176,23 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
             if status == ComplianceStatus.changed:
                 changes_detected += 1
 
-            # Step 4 & 5: write to NetBox + update state
-            nb_client = get_netbox_client()
+            # Step 4 & 5: queue NetBox write (batched) + update state.
+            # Phase 1 already created the interface; resolve its id by name.
             if nb_client and device.netbox_device_id:
-                from nso_adapter.bindings.netbox.mapper import resolve_or_create_interface
-
-                nb_id = await resolve_or_create_interface(nb_client, device.netbox_device_id, iface)
+                nb_id = nb_id_by_name.get(iface.name)
                 if nb_id is not None:
                     if db_iface.netbox_interface_id is None:
                         db_iface.netbox_interface_id = nb_id
-                    payload: dict = {}
+                    field_payload: dict = {}
                     if attr == "description":
-                        payload["description"] = iface.nso.description or ""
+                        field_payload["description"] = iface.nso.description or ""
                     elif iface.nso.enabled is not None:
-                        payload["enabled"] = iface.nso.enabled
+                        field_payload["enabled"] = iface.nso.enabled
                     else:
                         continue  # NSO package didn't report enabled; skip write
-                    try:
-                        await nb_client.patch_interface(nb_id, payload)
-                        attr_state.netbox_value = nso_str
-                        interfaces_written += 1
-                    except Exception as exc:
-                        logger.warning("netbox.write_failed", iface=iface.name, attr=attr, error=str(exc))
+                    attr_patches.setdefault(nb_id, {"id": nb_id}).update(field_payload)
+                    attr_state.netbox_value = nso_str
+                    interfaces_written += 1
 
             attr_state.nso_value = nso_str
             if attr_state.intent_value is not None:
@@ -191,6 +205,13 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
                     ComplianceStatus.imported if attr_state.netbox_value == nso_str else status
                 )
             attr_state.last_checked_at = datetime.utcnow()
+
+    # ── Phase 2 flush: push all queued attribute updates in one bulk PATCH ──
+    if nb_client and attr_patches:
+        try:
+            await nb_client.bulk_patch_interfaces(list(attr_patches.values()))
+        except Exception as exc:
+            logger.warning("netbox.bulk_patch_failed", device_id=device_id, error=str(exc))
 
     # Update device sync state
     mapping_status = MappingStatus.mapped

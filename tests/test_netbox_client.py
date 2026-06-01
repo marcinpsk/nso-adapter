@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for NetboxClient — get_interface, patch_interface, create_interface."""
+
 from __future__ import annotations
 
 import httpx
@@ -92,3 +93,80 @@ async def test_create_interface_raises_on_http_error(client):
 
     with pytest.raises(httpx.HTTPStatusError):
         await client.create_interface(payload={"name": ""})
+
+
+# ── list_interfaces (paginated bulk fetch) ───────────────────────────────────
+
+
+@respx.mock
+async def test_list_interfaces_follows_pagination(client):
+    """list_interfaces() follows `next` links and concatenates all results."""
+    page2 = f"{BASE}/api/dcim/interfaces/?device_id=1&limit=500&offset=500"
+    respx.get(f"{BASE}/api/dcim/interfaces/").mock(
+        side_effect=[
+            httpx.Response(200, json={"results": [{"id": 1, "name": "a"}], "next": page2}),
+            httpx.Response(200, json={"results": [{"id": 2, "name": "b"}], "next": None}),
+        ]
+    )
+    result = await client.list_interfaces(1)
+    assert [r["name"] for r in result] == ["a", "b"]
+
+
+# ── bulk_create_interfaces ───────────────────────────────────────────────────
+
+
+@respx.mock
+async def test_bulk_create_returns_list(client):
+    created = [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]
+    respx.post(f"{BASE}/api/dcim/interfaces/").mock(return_value=httpx.Response(201, json=created))
+    result = await client.bulk_create_interfaces([{"name": "a"}, {"name": "b"}])
+    assert result == created
+
+
+@respx.mock
+async def test_bulk_create_empty_is_noop(client):
+    route = respx.post(f"{BASE}/api/dcim/interfaces/")
+    result = await client.bulk_create_interfaces([])
+    assert result == []
+    assert not route.called
+
+
+@respx.mock
+async def test_bulk_create_400_drops_bad_row_and_retries(client):
+    """On a 400 with positional errors, the bad row is dropped and the rest retried."""
+    respx.post(f"{BASE}/api/dcim/interfaces/").mock(
+        side_effect=[
+            # first attempt: row 1 is bad ({} == ok, non-empty == error)
+            httpx.Response(400, json=[{}, {"__all__": ["dup"]}]),
+            # retry with only the good row
+            httpx.Response(201, json=[{"id": 1, "name": "a"}]),
+        ]
+    )
+    result = await client.bulk_create_interfaces([{"name": "a"}, {"name": "dup"}])
+    assert result == [{"id": 1, "name": "a"}]
+
+
+@respx.mock
+async def test_bulk_create_400_all_bad_returns_empty(client):
+    respx.post(f"{BASE}/api/dcim/interfaces/").mock(return_value=httpx.Response(400, json=[{"__all__": ["dup"]}]))
+    result = await client.bulk_create_interfaces([{"name": "dup"}])
+    assert result == []
+
+
+# ── bulk_patch_interfaces ────────────────────────────────────────────────────
+
+
+@respx.mock
+async def test_bulk_patch_returns_list(client):
+    updated = [{"id": 1, "description": "x"}]
+    respx.patch(f"{BASE}/api/dcim/interfaces/").mock(return_value=httpx.Response(200, json=updated))
+    result = await client.bulk_patch_interfaces([{"id": 1, "description": "x"}])
+    assert result == updated
+
+
+@respx.mock
+async def test_bulk_patch_empty_is_noop(client):
+    route = respx.patch(f"{BASE}/api/dcim/interfaces/")
+    result = await client.bulk_patch_interfaces([])
+    assert result == []
+    assert not route.called

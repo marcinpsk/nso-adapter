@@ -218,3 +218,89 @@ async def test_nokia_portid_not_treated_as_unit():
     assert result == 7
     client.create_interface.assert_not_called()
     client.patch_interface.assert_not_called()
+
+
+# ── bulk_ensure_interfaces (Layer A two-pass inventory) ───────────────────────
+
+
+def _make_bulk_client():
+    client = MagicMock()
+    client.list_interfaces = AsyncMock(return_value=[])
+    client.bulk_create_interfaces = AsyncMock(return_value=[])
+    client.bulk_patch_interfaces = AsyncMock(return_value=[])
+    return client
+
+
+@pytest.mark.anyio
+async def test_bulk_ensure_two_pass_bases_then_units():
+    """Bases created first, then units as virtual with parent resolved BY NAME."""
+    from nso_adapter.bindings.netbox.mapper import bulk_ensure_interfaces
+
+    client = _make_bulk_client()
+    # Nothing exists yet.
+    client.bulk_create_interfaces.side_effect = [
+        [{"id": 10, "name": "ae98"}],  # pass 1: base
+        [{"id": 11, "name": "ae98.100"}, {"id": 12, "name": "ae98.15"}],  # pass 2: units
+    ]
+
+    result = await bulk_ensure_interfaces(client, 42, ["ae98.100", "ae98.15"])
+
+    assert result == {"ae98": 10, "ae98.100": 11, "ae98.15": 12}
+    # pass 1 payload = the base only
+    base_call = client.bulk_create_interfaces.await_args_list[0][0][0]
+    assert [p["name"] for p in base_call] == ["ae98"]
+    # pass 2 payloads = units, virtual, parented to ae98's id (by name, =10)
+    unit_call = client.bulk_create_interfaces.await_args_list[1][0][0]
+    assert all(p["type"] == "virtual" and p["parent"] == 10 for p in unit_call)
+
+
+@pytest.mark.anyio
+async def test_bulk_ensure_skips_existing():
+    """Already-present interfaces are not re-created; their ids come from list."""
+    from nso_adapter.bindings.netbox.mapper import bulk_ensure_interfaces
+
+    client = _make_bulk_client()
+    client.list_interfaces.return_value = [
+        {"id": 10, "name": "ae98", "parent": None},
+        {"id": 11, "name": "ae98.100", "parent": 10},  # already parented
+    ]
+
+    result = await bulk_ensure_interfaces(client, 42, ["ae98", "ae98.100"])
+
+    assert result == {"ae98": 10, "ae98.100": 11}
+    client.bulk_create_interfaces.assert_not_called()
+    client.bulk_patch_interfaces.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_bulk_ensure_reparents_flat_unit():
+    """A pre-existing flat unit (no parent) is bulk-patched to its base."""
+    from nso_adapter.bindings.netbox.mapper import bulk_ensure_interfaces
+
+    client = _make_bulk_client()
+    client.list_interfaces.return_value = [
+        {"id": 10, "name": "ae98", "parent": None},
+        {"id": 11, "name": "ae98.100", "parent": None},  # flat → needs reparent
+    ]
+
+    await bulk_ensure_interfaces(client, 42, ["ae98.100"])
+
+    client.bulk_create_interfaces.assert_not_called()
+    client.bulk_patch_interfaces.assert_awaited_once_with([{"id": 11, "parent": 10}])
+
+
+@pytest.mark.anyio
+async def test_bulk_ensure_base_auto_added_for_unit_only_request():
+    """Requesting only a unit still ensures its base exists."""
+    from nso_adapter.bindings.netbox.mapper import bulk_ensure_interfaces
+
+    client = _make_bulk_client()
+    client.bulk_create_interfaces.side_effect = [
+        [{"id": 10, "name": "ae98"}],
+        [{"id": 11, "name": "ae98.100"}],
+    ]
+
+    result = await bulk_ensure_interfaces(client, 42, ["ae98.100"])
+
+    assert result["ae98"] == 10
+    assert result["ae98.100"] == 11
