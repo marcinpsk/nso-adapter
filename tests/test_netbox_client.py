@@ -241,7 +241,12 @@ async def test_bulk_patch_400_non_positional_body_bisects_to_isolate_bad_row(cli
         return httpx.Response(200, json=rows)
 
     respx.patch(f"{BASE}/api/dcim/interfaces/").mock(side_effect=_handler)
-    payloads = [{"id": 1, "description": "a"}, {"id": 2, "description": "b"}, {"id": bad_id, "description": "x"}, {"id": 4, "description": "d"}]
+    payloads = [
+        {"id": 1, "description": "a"},
+        {"id": 2, "description": "b"},
+        {"id": bad_id, "description": "x"},
+        {"id": 4, "description": "d"},
+    ]
     result = await client.bulk_patch_interfaces(payloads)
 
     written_ids = sorted(r["id"] for r in result)
@@ -251,9 +256,7 @@ async def test_bulk_patch_400_non_positional_body_bisects_to_isolate_bad_row(cli
 @respx.mock
 async def test_bulk_patch_400_single_non_positional_drops_row(client):
     """A single-row batch that 400s with a non-positional body is dropped, not retried forever."""
-    respx.patch(f"{BASE}/api/dcim/interfaces/").mock(
-        return_value=httpx.Response(400, json={"mtu": ["too big"]})
-    )
+    respx.patch(f"{BASE}/api/dcim/interfaces/").mock(return_value=httpx.Response(400, json={"mtu": ["too big"]}))
     result = await client.bulk_patch_interfaces([{"id": 7, "description": "x"}])
     assert result == []
 

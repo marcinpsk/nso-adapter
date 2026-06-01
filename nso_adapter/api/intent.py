@@ -19,13 +19,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import api_error
 from nso_adapter.store.models import (
-    ComplianceStatus,
     DbInterface,
     Device,
     DeviceSettings,
     InterfaceAttrState,
     InterfaceIntent,
     ManagedScope,
+    SyncState,
 )
 
 logger = structlog.get_logger(__name__)
@@ -117,12 +117,12 @@ async def put_intent(device_id: int, body: IntentUpdate, db: AsyncSession = Depe
             )
         )
         attr_state = attr_result.scalar_one_or_none()
-        if attr_state and attr_state.compliance_status in {
-            ComplianceStatus.imported,
-            ComplianceStatus.changed,
-            ComplianceStatus.unknown,
+        if attr_state and attr_state.sync_state in {
+            SyncState.imported,
+            SyncState.changed,
+            SyncState.unknown,
         }:
-            attr_state.compliance_status = ComplianceStatus.accepted
+            attr_state.sync_state = SyncState.accepted
 
     await db.flush()
 

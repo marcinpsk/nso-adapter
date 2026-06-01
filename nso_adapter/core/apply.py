@@ -26,7 +26,6 @@ from nso_adapter.store.models import (
     BgpPeerIntent,
     BgpRouterIntent,
     BgpScopeIntent,
-    ComplianceStatus,
     DbInterface,
     Device,
     InterfaceAttrState,
@@ -46,22 +45,23 @@ from nso_adapter.store.models import (
     SnmpSystemInfoIntent,
     SnmpV3UserIntent,
     StaticRouteIntent,
+    SyncState,
 )
 
 logger = structlog.get_logger(__name__)
 
 # Statuses eligible for apply (decision Q in plan — force=True pushes all of these)
 _FORCE_ELIGIBLE = {
-    ComplianceStatus.accepted,
-    ComplianceStatus.apply_failed,
-    ComplianceStatus.drifted,
-    ComplianceStatus.in_sync,
+    SyncState.accepted,
+    SyncState.apply_failed,
+    SyncState.drifted,
+    SyncState.in_sync,
 }
 # force=False only pushes these
 _NO_FORCE_ELIGIBLE = {
-    ComplianceStatus.accepted,
-    ComplianceStatus.apply_failed,
-    ComplianceStatus.drifted,
+    SyncState.accepted,
+    SyncState.apply_failed,
+    SyncState.drifted,
 }
 
 
@@ -123,7 +123,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
             for iface in ifaces.values():
                 intent_rows = await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface.id))
                 for intent_row in intent_rows.scalars().all():
-                    # Find the attr_state for compliance check
+                    # Find the attr_state for sync_state check
                     attr_state_result = await db.execute(
                         select(InterfaceAttrState).where(
                             InterfaceAttrState.interface_id == iface.id,
@@ -138,11 +138,11 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                         "attribute": intent_row.attribute,
                         "intent_value": intent_row.intent_value,
                         "accepted_at": intent_row.accepted_at.isoformat() if intent_row.accepted_at else None,
-                        "status_at_snapshot": attr_state.compliance_status.value if attr_state else "unknown",
+                        "status_at_snapshot": attr_state.sync_state.value if attr_state else "unknown",
                     }
                     intent_snapshot.append(snapshot_entry)
 
-                    if attr_state and attr_state.compliance_status in eligible_statuses:
+                    if attr_state and attr_state.sync_state in eligible_statuses:
                         eligible.append((attr_state, intent_row, iface))  # type: ignore[arg-type]
 
             # Snapshot IP intent rows for context
@@ -376,7 +376,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
 
             # ── Step 2: mark attribute states as deploying ───────────────────
             for attr_state, _intent_row, _iface in eligible:
-                attr_state.compliance_status = ComplianceStatus.deploying
+                attr_state.sync_state = SyncState.deploying
             await db.commit()
 
             # ── Step 3–5: commit each attribute ─────────────────────────────
@@ -393,7 +393,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                         attribute=intent_row.attribute,
                         value=intent_row.intent_value,
                     )
-                    attr_state.compliance_status = ComplianceStatus.in_sync
+                    attr_state.sync_state = SyncState.in_sync
                     intent_row.last_apply_at = now
                     intent_row.last_apply_error = None
                     outcome_in_sync += 1
@@ -406,7 +406,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                         attribute=intent_row.attribute,
                         error=exc.message,
                     )
-                    attr_state.compliance_status = ComplianceStatus.apply_failed
+                    attr_state.sync_state = SyncState.apply_failed
                     intent_row.last_apply_error = {
                         "code": exc.code,
                         "message": exc.message,
@@ -427,7 +427,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                         interface=iface.name,
                         attribute=intent_row.attribute,
                     )
-                    attr_state.compliance_status = ComplianceStatus.apply_failed
+                    attr_state.sync_state = SyncState.apply_failed
                     intent_row.last_apply_error = {
                         "code": "internal",
                         "message": repr(exc),

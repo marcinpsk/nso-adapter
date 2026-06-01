@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Interfaces and compliance endpoints."""
+"""Interfaces and sync_state endpoints."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ def _attr_out(attr_state: InterfaceAttrState, intent_row: InterfaceIntent | None
         "nso_value": attr_state.nso_value,
         "netbox_value": attr_state.netbox_value,
         "intent_value": intent_row.intent_value if intent_row else None,
-        "status": attr_state.compliance_status.value,
+        "status": attr_state.sync_state.value,
         "last_apply_at": (
             intent_row.last_apply_at.isoformat() + "Z" if intent_row and intent_row.last_apply_at else None
         ),
@@ -52,8 +52,8 @@ async def list_interfaces(device_id: int, db: AsyncSession = Depends(get_db)):
     return out
 
 
-@router.get("/{device_id}/compliance", dependencies=[Depends(verify_token)])
-async def get_compliance(device_id: int, db: AsyncSession = Depends(get_db)):
+@router.get("/{device_id}/state", dependencies=[Depends(verify_token)])
+async def get_state(device_id: int, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
@@ -81,7 +81,7 @@ async def get_compliance(device_id: int, db: AsyncSession = Depends(get_db)):
         if attrs:
             managed += 1
         for attr in attrs:
-            key = attr.compliance_status.value
+            key = attr.sync_state.value
             by_status[key] = by_status.get(key, 0) + 1
             if attr.last_checked_at and (last_checked_at is None or attr.last_checked_at > last_checked_at):
                 last_checked_at = attr.last_checked_at

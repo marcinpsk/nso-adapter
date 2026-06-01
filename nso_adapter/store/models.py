@@ -38,12 +38,12 @@ class JobStatus(str, enum.Enum):
 
 class JobType(str, enum.Enum):
     sync = "sync"
-    check_compliance = "check-compliance"
+    detect_drift = "detect-drift"
     connect = "connect"
     apply = "apply"  # Phase 2: push accepted intent to NSO
 
 
-class ComplianceStatus(str, enum.Enum):
+class SyncState(str, enum.Enum):
     # Phase 1 statuses (device-config-layer, no intent ownership)
     imported = "imported"  # NetBox value matches last import from NSO
     changed = "changed"  # NSO now reports a value differing from NetBox (out-of-band change)
@@ -194,7 +194,7 @@ class DbInterface(Base):
 
 
 class InterfaceAttrState(Base):
-    """Per-attribute compliance state — one row per (interface, attribute)."""
+    """Per-attribute sync_state state — one row per (interface, attribute)."""
 
     __tablename__ = "interface_attr_state"
     __table_args__ = (UniqueConstraint("interface_id", "attribute"),)
@@ -207,9 +207,7 @@ class InterfaceAttrState(Base):
     # Phase 2: intent_value tracks the last value pushed to NSO (accepted intent).
     # None means no intent has been deployed yet (Phase 1 mode).
     intent_value: Mapped[str | None] = mapped_column(Text, nullable=True)
-    compliance_status: Mapped[ComplianceStatus] = mapped_column(
-        Enum(ComplianceStatus), default=ComplianceStatus.unknown
-    )
+    sync_state: Mapped[SyncState] = mapped_column(Enum(SyncState), default=SyncState.unknown)
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     interface_obj: Mapped[DbInterface] = relationship("DbInterface", back_populates="attr_states")

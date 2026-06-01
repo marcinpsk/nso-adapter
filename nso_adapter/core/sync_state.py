@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Compliance checker — compares NSO vs NetBox interface attributes.
+"""Sync-state checker — compares NSO vs NetBox interface attributes.
 
 Phase 1 (no intent ownership):
   unknown  — not yet synced.
@@ -14,15 +14,15 @@ Phase 2 (intent deployed via apply action):
 from __future__ import annotations
 
 from nso_adapter.domain.models import Interface
-from nso_adapter.store.models import ComplianceStatus
+from nso_adapter.store.models import SyncState
 
 
-def compute_compliance_status(
+def compute_sync_state(
     nso_value: object,
     netbox_value: object,
     intent_value: object = None,
-) -> ComplianceStatus:
-    """Return per-attribute compliance status.
+) -> SyncState:
+    """Return per-attribute sync_state status.
 
     If *intent_value* is set (Phase 2 — intent has been deployed), use the
     Phase 2 states: ``in_sync`` / ``drifted``.
@@ -31,15 +31,15 @@ def compute_compliance_status(
     if intent_value is not None:
         # Phase 2: compare device (via NSO) against deployed intent
         if nso_value == intent_value:
-            return ComplianceStatus.in_sync
-        return ComplianceStatus.drifted
+            return SyncState.in_sync
+        return SyncState.drifted
 
     # Phase 1: compare NSO against what we last wrote to NetBox
     if netbox_value is None:
-        return ComplianceStatus.unknown
+        return SyncState.unknown
     if nso_value == netbox_value:
-        return ComplianceStatus.imported
-    return ComplianceStatus.changed
+        return SyncState.imported
+    return SyncState.changed
 
 
 def compute_drift(interfaces: list[Interface]) -> list[Interface]:

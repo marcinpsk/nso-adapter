@@ -12,7 +12,6 @@ import pytest
 from nso_adapter.core.apply import enqueue_apply, run_apply
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import (
-    ComplianceStatus,
     DbInterface,
     Device,
     InterfaceAttrState,
@@ -20,6 +19,7 @@ from nso_adapter.store.models import (
     Job,
     JobStatus,
     JobType,
+    SyncState,
 )
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -50,7 +50,7 @@ async def _seed_interface_with_intent(
     iface_name: str,
     attribute: str,
     intent_value: str,
-    compliance_status: ComplianceStatus,
+    sync_state: SyncState,
     netbox_id: int = 100,
 ) -> tuple[int, int]:
     """Create DbInterface + InterfaceAttrState + InterfaceIntent, return (iface_id, attr_id)."""
@@ -66,7 +66,7 @@ async def _seed_interface_with_intent(
         attr_state = InterfaceAttrState(
             interface_id=iface.id,
             attribute=attribute,
-            compliance_status=compliance_status,
+            sync_state=sync_state,
         )
         db.add(attr_state)
 
@@ -167,7 +167,7 @@ async def test_run_apply_all_succeed(adapter_client):
         iface_name="GigabitEthernet0/0",
         attribute="description",
         intent_value="uplink",
-        compliance_status=ComplianceStatus.accepted,
+        sync_state=SyncState.accepted,
         netbox_id=200,
     )
 
@@ -197,7 +197,7 @@ async def test_run_apply_partial_failure(adapter_client):
         iface_name="GigabitEthernet0/1",
         attribute="description",
         intent_value="downlink",
-        compliance_status=ComplianceStatus.accepted,
+        sync_state=SyncState.accepted,
         netbox_id=201,
     )
 
@@ -226,7 +226,7 @@ async def test_run_apply_unexpected_exception_on_attribute(adapter_client):
         iface_name="GigabitEthernet0/2",
         attribute="description",
         intent_value="mgmt",
-        compliance_status=ComplianceStatus.drifted,
+        sync_state=SyncState.drifted,
         netbox_id=202,
     )
 
@@ -261,7 +261,7 @@ async def test_run_apply_no_force_filters_eligible(adapter_client):
         iface_name="GigabitEthernet0/3",
         attribute="description",
         intent_value="in-sync-iface",
-        compliance_status=ComplianceStatus.in_sync,
+        sync_state=SyncState.in_sync,
         netbox_id=203,
     )
 

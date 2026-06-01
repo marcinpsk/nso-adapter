@@ -101,11 +101,11 @@ async def _run_sync(job_id: int, device_id: int) -> None:
     await _run_with_db(job_id, device_id, sync_device)
 
 
-async def _run_check_compliance(job_id: int, device_id: int) -> None:
-    from nso_adapter.core.importer import check_compliance
+async def _run_detect_drift(job_id: int, device_id: int) -> None:
+    from nso_adapter.core.importer import detect_drift
 
-    logger.info("job.check_compliance.start", job_id=job_id, device_id=device_id)
-    await _run_with_db(job_id, device_id, check_compliance)
+    logger.info("job.detect_drift.start", job_id=job_id, device_id=device_id)
+    await _run_with_db(job_id, device_id, detect_drift)
 
 
 async def _run_connect(job_id: int, device_id: int) -> None:
@@ -162,7 +162,7 @@ async def _run_apply(job_id: int, device_id: int) -> None:
 
 _JOB_RUNNERS = {
     JobType.sync: _run_sync,
-    JobType.check_compliance: _run_check_compliance,
+    JobType.detect_drift: _run_detect_drift,
     JobType.connect: _run_connect,
     JobType.apply: _run_apply,
 }

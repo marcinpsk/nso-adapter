@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Actions API — async device actions (sync, check-compliance, connect, apply, sync-notify).
+"""Actions API — async device actions (sync, check-sync_state, connect, apply, sync-notify).
 
 All actions return 202 with {job_id}.
 409 is returned if a job is already queued/running for the device.
@@ -43,13 +43,13 @@ async def action_sync(
     return await _trigger(device_id, JobType.sync, db, background_tasks)
 
 
-@router.post("/{device_id}/actions/check-compliance", status_code=202, dependencies=[Depends(verify_token)])
-async def action_check_compliance(
+@router.post("/{device_id}/actions/detect-drift", status_code=202, dependencies=[Depends(verify_token)])
+async def action_detect_drift(
     device_id: int,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
-    return await _trigger(device_id, JobType.check_compliance, db, background_tasks)
+    return await _trigger(device_id, JobType.detect_drift, db, background_tasks)
 
 
 @router.post("/{device_id}/actions/connect", status_code=202, dependencies=[Depends(verify_token)])

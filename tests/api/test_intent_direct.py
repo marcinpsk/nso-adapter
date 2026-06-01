@@ -13,12 +13,12 @@ from nso_adapter.api.errors import ApiError
 from nso_adapter.api.intent import IntentAttribute, IntentUpdate, get_intent, put_intent
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import (
-    ComplianceStatus,
     DbInterface,
     Device,
     DeviceSettings,
     InterfaceAttrState,
     ManagedScope,
+    SyncState,
 )
 
 
@@ -97,7 +97,7 @@ async def test_put_intent_transitions_imported_to_accepted(adapter_client):
             attribute="description",
             nso_value="old",
             netbox_value="new",
-            compliance_status=ComplianceStatus.imported,
+            sync_state=SyncState.imported,
         )
         db.add(attr)
         await db.commit()

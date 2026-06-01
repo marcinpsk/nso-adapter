@@ -5,10 +5,10 @@
 from __future__ import annotations
 
 from nso_adapter.store.models import (
-    ComplianceStatus,
     DbInterface,
     DeviceSettings,
     InterfaceAttrState,
+    SyncState,
 )
 from tests.conftest import VALID_TOKEN, seed_device
 
@@ -24,13 +24,13 @@ async def _seed_interface(db, device_id: int, name: str = "GigabitEthernet0/0") 
 
 
 async def _seed_attr_state(
-    db, interface_id: int, attribute: str = "description", status: ComplianceStatus = ComplianceStatus.imported
+    db, interface_id: int, attribute: str = "description", status: SyncState = SyncState.imported
 ) -> None:
     state = InterfaceAttrState(
         interface_id=interface_id,
         attribute=attribute,
         nso_value="old-value",
-        compliance_status=status,
+        sync_state=status,
     )
     db.add(state)
     await db.flush()
@@ -48,7 +48,7 @@ async def test_put_intent_happy_path(adapter_client):
 
     async for db in get_session():
         iface_id = await _seed_interface(db, device_id, "GigabitEthernet0/0")
-        await _seed_attr_state(db, iface_id, "description", ComplianceStatus.imported)
+        await _seed_attr_state(db, iface_id, "description", SyncState.imported)
         await db.commit()
         break
 
@@ -76,7 +76,7 @@ async def test_put_intent_replaces_existing(adapter_client):
 
     async for db in get_session():
         iface_id = await _seed_interface(db, device_id, "Loopback0")
-        await _seed_attr_state(db, iface_id, "description", ComplianceStatus.imported)
+        await _seed_attr_state(db, iface_id, "description", SyncState.imported)
         await db.commit()
         break
 
@@ -126,7 +126,7 @@ async def test_put_intent_stamps_accepted_on_imported(adapter_client):
 
     async for db in get_session():
         iface_id = await _seed_interface(db, device_id, "eth0")
-        await _seed_attr_state(db, iface_id, "description", ComplianceStatus.imported)
+        await _seed_attr_state(db, iface_id, "description", SyncState.imported)
         await db.commit()
         break
 
@@ -143,7 +143,7 @@ async def test_put_intent_stamps_accepted_on_imported(adapter_client):
     async for db in get_session():
         result = await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.attribute == "description"))
         state = result.scalar_one()
-        assert state.compliance_status == ComplianceStatus.accepted
+        assert state.sync_state == SyncState.accepted
         break
 
 
@@ -155,7 +155,7 @@ async def test_put_intent_does_not_override_in_sync(adapter_client):
 
     async for db in get_session():
         iface_id = await _seed_interface(db, device_id, "eth1")
-        await _seed_attr_state(db, iface_id, "description", ComplianceStatus.in_sync)
+        await _seed_attr_state(db, iface_id, "description", SyncState.in_sync)
         await db.commit()
         break
 
@@ -173,7 +173,7 @@ async def test_put_intent_does_not_override_in_sync(adapter_client):
         result = await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.attribute == "description"))
         state = result.scalar_one()
         # Must remain in_sync, not downgraded to accepted
-        assert state.compliance_status == ComplianceStatus.in_sync
+        assert state.sync_state == SyncState.in_sync
         break
 
 
@@ -185,7 +185,7 @@ async def test_put_intent_auto_apply_enqueues_job(adapter_client):
 
     async for db in get_session():
         iface_id = await _seed_interface(db, device_id, "eth2")
-        await _seed_attr_state(db, iface_id, "description", ComplianceStatus.accepted)
+        await _seed_attr_state(db, iface_id, "description", SyncState.accepted)
         # Enable auto_apply
         settings = DeviceSettings(device_id=device_id, auto_apply=True)
         db.add(settings)
@@ -268,7 +268,7 @@ async def test_get_intent_returns_set_attributes(adapter_client):
 
     async for db in get_session():
         iface_id = await _seed_interface(db, device_id, "GE0/1")
-        await _seed_attr_state(db, iface_id, "description", ComplianceStatus.imported)
+        await _seed_attr_state(db, iface_id, "description", SyncState.imported)
         await db.commit()
         break
 

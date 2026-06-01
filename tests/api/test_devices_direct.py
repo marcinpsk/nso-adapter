@@ -24,11 +24,11 @@ from nso_adapter.api.devices import (
 from nso_adapter.api.errors import ApiError
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import (
-    ComplianceStatus,
     DbInterface,
     Device,
     InterfaceAttrState,
     ManagedScope,
+    SyncState,
 )
 
 
@@ -47,7 +47,7 @@ async def _seed_device(
 
 
 async def _seed_with_interface(db: AsyncSession, nso_device_name: str, netbox_id: int) -> Device:
-    """Seed a device with one interface and one attr state (for _compliance_summary coverage)."""
+    """Seed a device with one interface and one attr state (for _state_summary coverage)."""
     d = Device(nso_instance="nso-dev", nso_device_name=nso_device_name, netbox_device_id=netbox_id)
     db.add(d)
     await db.flush()
@@ -59,7 +59,7 @@ async def _seed_with_interface(db: AsyncSession, nso_device_name: str, netbox_id
         attribute="description",
         nso_value="nso",
         netbox_value="netbox",
-        compliance_status=ComplianceStatus.imported,
+        sync_state=SyncState.imported,
     )
     db.add(attr)
     db.add(ManagedScope(device_id=d.id, attribute="description"))
@@ -79,14 +79,14 @@ async def test_list_devices_empty(adapter_client):
         break
 
 
-async def test_list_devices_with_compliance_summary(adapter_client):
-    """list_devices() aggregates compliance counts via _compliance_summary."""
+async def test_list_devices_with_state_summary(adapter_client):
+    """list_devices() aggregates sync_state counts via _state_summary."""
     async for db in get_session():
         await _seed_with_interface(db, "list-dev-01", 800)
         result = await list_devices(db=db)
         assert len(result) >= 1
         row = next(r for r in result if r["nso_device_name"] == "list-dev-01")
-        summary = row["compliance_summary"]
+        summary = row["sync_state_summary"]
         assert summary["managed_interfaces"] == 1
         assert summary["imported"] == 1
         break

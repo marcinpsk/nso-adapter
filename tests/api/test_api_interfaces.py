@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Tests for interfaces and compliance endpoints.
+"""Tests for interfaces and sync_state endpoints.
 
 GET /api/v1/devices/{id}/interfaces
-GET /api/v1/devices/{id}/compliance
+GET /api/v1/devices/{id}/state
 """
 
 from __future__ import annotations
 
-from nso_adapter.store.models import ComplianceStatus, DbInterface, InterfaceAttrState
+from nso_adapter.store.models import DbInterface, InterfaceAttrState, SyncState
 from tests.conftest import VALID_TOKEN, seed_device
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -20,7 +20,7 @@ async def _seed_interface_with_state(
     attribute: str = "description",
     nso_value: str = "nso-desc",
     netbox_value: str = "nb-desc",
-    status: ComplianceStatus = ComplianceStatus.imported,
+    status: SyncState = SyncState.imported,
 ) -> None:
     """Seed a DbInterface + InterfaceAttrState for a device."""
     from nso_adapter.store.db import get_session
@@ -34,7 +34,7 @@ async def _seed_interface_with_state(
             attribute=attribute,
             nso_value=nso_value,
             netbox_value=netbox_value,
-            compliance_status=status,
+            sync_state=status,
         )
         db.add(state)
         await db.commit()
@@ -63,7 +63,7 @@ async def test_list_interfaces_with_data(adapter_client):
         nso_device_name="iface-full-device",
         netbox_device_id=701,
     )
-    await _seed_interface_with_state(device_id, "GE0/0", "description", "nso-v", "nb-v", ComplianceStatus.imported)
+    await _seed_interface_with_state(device_id, "GE0/0", "description", "nso-v", "nb-v", SyncState.imported)
 
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/interfaces", headers=AUTH)
     assert resp.status_code == 200
@@ -86,8 +86,8 @@ async def test_list_interfaces_multiple(adapter_client):
         nso_device_name="iface-multi-device",
         netbox_device_id=702,
     )
-    await _seed_interface_with_state(device_id, "GE0/1", "description", "v1", "v1", ComplianceStatus.imported)
-    await _seed_interface_with_state(device_id, "GE0/2", "description", "v2", "v2", ComplianceStatus.changed)
+    await _seed_interface_with_state(device_id, "GE0/1", "description", "v1", "v1", SyncState.imported)
+    await _seed_interface_with_state(device_id, "GE0/2", "description", "v2", "v2", SyncState.changed)
 
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/interfaces", headers=AUTH)
     assert resp.status_code == 200
@@ -108,17 +108,17 @@ async def test_list_interfaces_requires_auth(adapter_client):
     assert resp.status_code == 401
 
 
-# ── GET /api/v1/devices/{id}/compliance ─────────────────────────────────────
+# ── GET /api/v1/devices/{id}/state ─────────────────────────────────────
 
 
-async def test_get_compliance_empty_device(adapter_client):
-    """GET compliance for a device with no interfaces → 200 with all-zero counts."""
+async def test_get_state_empty_device(adapter_client):
+    """GET sync_state for a device with no interfaces → 200 with all-zero counts."""
     device_id = await seed_device(
         nso_instance="nso-dev",
         nso_device_name="comp-empty-device",
         netbox_device_id=710,
     )
-    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/compliance", headers=AUTH)
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/state", headers=AUTH)
     assert resp.status_code == 200
     body = resp.json()
     assert body["device_id"] == device_id
@@ -127,17 +127,17 @@ async def test_get_compliance_empty_device(adapter_client):
     assert body["last_checked_at"] is None
 
 
-async def test_get_compliance_counts_by_status(adapter_client):
-    """GET compliance aggregates attr states by compliance_status."""
+async def test_get_state_counts_by_status(adapter_client):
+    """GET sync_state aggregates attr states by sync_state."""
     device_id = await seed_device(
         nso_instance="nso-dev",
         nso_device_name="comp-counts-device",
         netbox_device_id=711,
     )
-    await _seed_interface_with_state(device_id, "GE0/1", "description", "v", "v", ComplianceStatus.imported)
-    await _seed_interface_with_state(device_id, "GE0/2", "description", "v", "v2", ComplianceStatus.changed)
+    await _seed_interface_with_state(device_id, "GE0/1", "description", "v", "v", SyncState.imported)
+    await _seed_interface_with_state(device_id, "GE0/2", "description", "v", "v2", SyncState.changed)
 
-    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/compliance", headers=AUTH)
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/state", headers=AUTH)
     assert resp.status_code == 200
     body = resp.json()
     assert body["managed_interfaces"] == 2
@@ -145,29 +145,29 @@ async def test_get_compliance_counts_by_status(adapter_client):
     assert body["by_status"]["changed"] == 1
 
 
-async def test_get_compliance_includes_phase2_statuses_structure(adapter_client):
-    """GET compliance response includes phase-2 status keys (accepted, deploying, etc.)."""
+async def test_get_state_includes_phase2_statuses_structure(adapter_client):
+    """GET sync_state response includes phase-2 status keys (accepted, deploying, etc.)."""
     device_id = await seed_device(
         nso_instance="nso-dev",
         nso_device_name="comp-phase2-device",
         netbox_device_id=712,
     )
-    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/compliance", headers=AUTH)
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/state", headers=AUTH)
     assert resp.status_code == 200
     by_status = resp.json()["by_status"]
     # All phase-2 status keys must be present
     for key in ("accepted", "deploying", "in_sync", "apply_failed", "drifted"):
-        assert key in by_status, f"Phase-2 status key '{key}' missing from compliance response"
+        assert key in by_status, f"Phase-2 status key '{key}' missing from sync_state response"
 
 
-async def test_get_compliance_unknown_device_returns_404(adapter_client):
-    """GET compliance for non-existent device → 404."""
-    resp = await adapter_client.get("/api/v1/devices/9999/compliance", headers=AUTH)
+async def test_get_state_unknown_device_returns_404(adapter_client):
+    """GET sync_state for non-existent device → 404."""
+    resp = await adapter_client.get("/api/v1/devices/9999/state", headers=AUTH)
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "not_found"
 
 
-async def test_get_compliance_requires_auth(adapter_client):
-    """GET compliance without auth → 401."""
-    resp = await adapter_client.get("/api/v1/devices/1/compliance")
+async def test_get_state_requires_auth(adapter_client):
+    """GET sync_state without auth → 401."""
+    resp = await adapter_client.get("/api/v1/devices/1/state")
     assert resp.status_code == 401

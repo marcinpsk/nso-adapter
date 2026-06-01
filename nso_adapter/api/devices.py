@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import api_error
-from nso_adapter.store.models import ComplianceStatus, DbInterface, Device, InterfaceAttrState, Job, ManagedScope
+from nso_adapter.store.models import DbInterface, Device, InterfaceAttrState, Job, ManagedScope, SyncState
 
 router = APIRouter(prefix="/api/v1/devices", tags=["devices"])
 
@@ -18,12 +18,12 @@ router = APIRouter(prefix="/api/v1/devices", tags=["devices"])
 # ── Response helpers ──────────────────────────────────────────────────────────
 
 
-async def _compliance_summary(device_id: int, db: AsyncSession) -> dict:
-    """Aggregate compliance counts across all managed interfaces."""
+async def _state_summary(device_id: int, db: AsyncSession) -> dict:
+    """Aggregate sync_state counts across all managed interfaces."""
     ifaces_result = await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))
     ifaces = ifaces_result.scalars().all()
 
-    by_status: dict[str, int] = {s.value: 0 for s in ComplianceStatus}
+    by_status: dict[str, int] = {s.value: 0 for s in SyncState}
     managed = 0
     for iface in ifaces:
         attrs_result = await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id == iface.id))
@@ -31,7 +31,7 @@ async def _compliance_summary(device_id: int, db: AsyncSession) -> dict:
         if attrs:
             managed += 1
         for attr in attrs:
-            by_status[attr.compliance_status.value] += 1
+            by_status[attr.sync_state.value] += 1
 
     return {"managed_interfaces": managed, **by_status}
 
@@ -64,7 +64,7 @@ async def list_devices(db: AsyncSession = Depends(get_db)):
     out = []
     for d in devices:
         row = _device_out(d)
-        row["compliance_summary"] = await _compliance_summary(d.id, db)
+        row["sync_state_summary"] = await _state_summary(d.id, db)
         out.append(row)
     return out
 

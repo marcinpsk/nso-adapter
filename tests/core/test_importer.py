@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Tests for sync_device and check_compliance using NSO package oper-data."""
+"""Tests for sync_device and detect_drift using NSO package oper-data."""
 
 from __future__ import annotations
 
@@ -171,12 +171,12 @@ async def test_sync_device_marks_unmatched_interfaces_when_empty(db_session: Asy
     assert device.mapping_status == MappingStatus.unmatched_interfaces
 
 
-# ── check_compliance integration test ────────────────────────────────────────
+# ── detect_drift integration test ────────────────────────────────────────
 
 
-async def test_check_compliance_uses_interface_attributes(db_session: AsyncSession):
-    from nso_adapter.core.importer import check_compliance
-    from nso_adapter.store.models import ComplianceStatus, InterfaceAttrState
+async def test_detect_drift_uses_interface_attributes(db_session: AsyncSession):
+    from nso_adapter.core.importer import detect_drift
+    from nso_adapter.store.models import InterfaceAttrState, SyncState
 
     device = Device(
         nso_instance="nso-dev",
@@ -192,13 +192,13 @@ async def test_check_compliance_uses_interface_attributes(db_session: AsyncSessi
     db_session.add(iface_row)
     await db_session.commit()
 
-    # Pre-existing attr state so compliance can compare
+    # Pre-existing attr state so sync_state can compare
     attr_state = InterfaceAttrState(
         interface_id=iface_row.id,
         attribute="description",
         netbox_value="old-desc",
         nso_value="old-desc",
-        compliance_status=ComplianceStatus.imported,
+        sync_state=SyncState.imported,
     )
     db_session.add(attr_state)
     await db_session.commit()
@@ -215,7 +215,7 @@ async def test_check_compliance_uses_interface_attributes(db_session: AsyncSessi
     imp._nso_clients["nso-dev"] = nso_client
 
     with patch("nso_adapter.core.importer.nso_actions.compare_config", new_callable=AsyncMock):
-        summary = await check_compliance(device.id, db_session)
+        summary = await detect_drift(device.id, db_session)
 
     nso_client.get_interface_attributes.assert_called_once_with("sw03")
     assert summary["changes_detected"] == 1

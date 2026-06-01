@@ -12,8 +12,8 @@ from fastapi import BackgroundTasks
 
 from nso_adapter.core.jobs import (
     _run_apply,
-    _run_check_compliance,
     _run_connect,
+    _run_detect_drift,
     _run_sync,
     _run_with_db,
     enqueue_job,
@@ -198,7 +198,7 @@ async def test_run_with_db_job_not_found(adapter_client):
     await _run_with_db(99999, device_id, success_factory)
 
 
-# ── _run_sync and _run_check_compliance ───────────────────────────────────────
+# ── _run_sync and _run_detect_drift ───────────────────────────────────────
 
 
 async def test_run_sync_calls_run_with_db(adapter_client):
@@ -213,13 +213,13 @@ async def test_run_sync_calls_run_with_db(adapter_client):
         assert mock_run.call_args[0][1] == device_id
 
 
-async def test_run_check_compliance_calls_run_with_db(adapter_client):
-    """_run_check_compliance delegates to _run_with_db."""
+async def test_run_detect_drift_calls_run_with_db(adapter_client):
+    """_run_detect_drift delegates to _run_with_db."""
     device_id = await _seed_device("rtr-21", 31)
     job_id = await _seed_job(device_id)
 
     with patch("nso_adapter.core.jobs._run_with_db", new_callable=AsyncMock) as mock_run:
-        await _run_check_compliance(job_id, device_id)
+        await _run_detect_drift(job_id, device_id)
         mock_run.assert_called_once()
         assert mock_run.call_args[0][0] == job_id
 

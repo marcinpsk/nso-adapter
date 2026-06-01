@@ -87,10 +87,10 @@ async def test_apply_returns_501(adapter_client):
     assert resp.json()["error"]["code"] == "not_found"
 
 
-async def test_compliance_includes_phase2_statuses(adapter_client):
-    """compliance endpoint returns 404 for unknown device without crashing."""
+async def test_sync_state_includes_phase2_statuses(adapter_client):
+    """sync_state endpoint returns 404 for unknown device without crashing."""
     resp = await adapter_client.get(
-        "/api/v1/devices/9999/compliance",
+        "/api/v1/devices/9999/state",
         headers={"Authorization": f"Bearer {VALID_TOKEN}"},
     )
     assert resp.status_code == 404

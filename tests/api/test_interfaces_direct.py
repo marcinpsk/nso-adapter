@@ -9,15 +9,15 @@ from datetime import datetime
 import pytest
 
 from nso_adapter.api.errors import ApiError
-from nso_adapter.api.interfaces import get_compliance, list_interfaces
+from nso_adapter.api.interfaces import get_state, list_interfaces
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import (
-    ComplianceStatus,
     DbInterface,
     Device,
     InterfaceAttrState,
     InterfaceIntent,
     ManagedScope,
+    SyncState,
 )
 
 
@@ -35,7 +35,7 @@ async def _seed_full(nso_device_name: str, netbox_id: int):
             attribute="description",
             nso_value="nso-val",
             netbox_value="nb-val",
-            compliance_status=ComplianceStatus.imported,
+            sync_state=SyncState.imported,
             last_checked_at=datetime(2025, 1, 1, 12, 0, 0),
         )
         db.add(attr)
@@ -105,36 +105,36 @@ async def test_list_interfaces_with_intent(adapter_client):
         break
 
 
-# ── get_compliance ────────────────────────────────────────────────────────────
+# ── get_state ────────────────────────────────────────────────────────────
 
 
-async def test_get_compliance_not_found(adapter_client):
-    """get_compliance() raises 404 for unknown device_id."""
+async def test_get_state_not_found(adapter_client):
+    """get_state() raises 404 for unknown device_id."""
     async for db in get_session():
         with pytest.raises(ApiError) as exc_info:
-            await get_compliance(device_id=99993, db=db)
+            await get_state(device_id=99993, db=db)
         assert exc_info.value.status_code == 404
         break
 
 
-async def test_get_compliance_empty(adapter_client):
-    """get_compliance() returns zero counts for device with no interfaces."""
+async def test_get_state_empty(adapter_client):
+    """get_state() returns zero counts for device with no interfaces."""
     async for db in get_session():
         d = Device(nso_instance="nso-dev", nso_device_name="comp-empty-01", netbox_device_id=1130)
         db.add(d)
         await db.commit()
         await db.refresh(d)
-        result = await get_compliance(device_id=d.id, db=db)
+        result = await get_state(device_id=d.id, db=db)
         assert result["managed_interfaces"] == 0
         assert result["last_checked_at"] is None
         break
 
 
-async def test_get_compliance_with_attrs(adapter_client):
-    """get_compliance() aggregates by_status counts and last_checked_at."""
+async def test_get_state_with_attrs(adapter_client):
+    """get_state() aggregates by_status counts and last_checked_at."""
     device_id, _ = await _seed_full("comp-dev-01", 1140)
     async for db in get_session():
-        result = await get_compliance(device_id=device_id, db=db)
+        result = await get_state(device_id=device_id, db=db)
         assert result["device_id"] == device_id
         assert result["managed_interfaces"] == 1
         assert result["by_status"]["imported"] == 1

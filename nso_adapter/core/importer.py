@@ -4,7 +4,7 @@
 Sync flow (docs/nso-adapter.md §7):
   1. sync-from on NSO (refresh CDB from live device)
   2. Read managed attributes per interface
-  3. Compute per-attribute compliance_status vs stored netbox_value
+  3. Compute per-attribute sync_state vs stored netbox_value
   4. NetBox binding writes NSO value onto dcim.Interface
   5. Persist interface_attr_state, update device.last_sync_*
 """
@@ -18,18 +18,18 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.config import get_config
-from nso_adapter.core.compliance import compute_compliance_status
+from nso_adapter.core.sync_state import compute_sync_state
 from nso_adapter.domain.models import Interface, InterfaceAttr
 from nso_adapter.nso import actions as nso_actions
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import (
-    ComplianceStatus,
     DbInterface,
     Device,
     InterfaceAttrState,
     LastSyncStatus,
     ManagedScope,
     MappingStatus,
+    SyncState,
 )
 
 logger = structlog.get_logger(__name__)
@@ -155,7 +155,7 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
             interfaces_created += 1
         existing_ifaces[iface.name] = db_iface
 
-        # Step 3: compute per-attribute compliance
+        # Step 3: compute per-attribute sync_state
         # Load existing attr_states
         attr_result = await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id == db_iface.id))
         existing_attrs: dict[str, InterfaceAttrState] = {row.attribute: row for row in attr_result.scalars().all()}
@@ -172,8 +172,8 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
                 db.add(attr_state)
 
             prev_netbox_val = attr_state.netbox_value
-            status = compute_compliance_status(nso_str, prev_netbox_val, attr_state.intent_value)
-            if status == ComplianceStatus.changed:
+            status = compute_sync_state(nso_str, prev_netbox_val, attr_state.intent_value)
+            if status == SyncState.changed:
                 changes_detected += 1
 
             # Step 4 & 5: queue NetBox write (batched) + update state.
@@ -203,17 +203,15 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
 
             attr_state.nso_value = nso_str
             if attr_state.intent_value is not None:
-                # Phase 2: intent has been deployed — use in_sync/drifted from compute_compliance_status.
+                # Phase 2: intent has been deployed — use in_sync/drifted from compute_sync_state.
                 # Never downgrade to "imported" even if netbox_value == nso_str.
-                attr_state.compliance_status = status
+                attr_state.sync_state = status
             else:
                 # Phase 1: no intent yet — mark as "imported" when values match.
                 # Note: netbox_value is only updated after the Phase 2 flush
                 # confirms the write, so a just-written attr stays non-"imported"
                 # until the next reconcile flips it (one-sync lag, self-heals).
-                attr_state.compliance_status = (
-                    ComplianceStatus.imported if attr_state.netbox_value == nso_str else status
-                )
+                attr_state.sync_state = SyncState.imported if attr_state.netbox_value == nso_str else status
             attr_state.last_checked_at = datetime.utcnow()
 
     # ── Phase 2 flush: push queued attribute updates, batched + isolated ──
@@ -242,7 +240,9 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
         try:
             await nb_client.notify_sync_complete(device.netbox_device_id)
         except Exception as exc:
-            logger.warning("netbox.sync_complete_notify_failed", device_id=device_id, error=str(exc) or type(exc).__name__)
+            logger.warning(
+                "netbox.sync_complete_notify_failed", device_id=device_id, error=str(exc) or type(exc).__name__
+            )
 
     summary = {
         "interfaces_written": interfaces_written,
@@ -253,8 +253,8 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
     return summary
 
 
-async def check_compliance(device_id: int, db: AsyncSession) -> dict:
-    """Re-read NSO config and recompute compliance WITHOUT writing to NetBox."""
+async def detect_drift(device_id: int, db: AsyncSession) -> dict:
+    """Re-read NSO config and recompute sync_state WITHOUT writing to NetBox."""
     device = await db.get(Device, device_id)
     if not device:
         raise ValueError(f"Device {device_id} not found")
@@ -295,11 +295,11 @@ async def check_compliance(device_id: int, db: AsyncSession) -> dict:
             if attr_state is None:
                 continue
 
-            status = compute_compliance_status(nso_str, attr_state.netbox_value, attr_state.intent_value)
-            if status == ComplianceStatus.changed:
+            status = compute_sync_state(nso_str, attr_state.netbox_value, attr_state.intent_value)
+            if status == SyncState.changed:
                 changes_detected += 1
             attr_state.nso_value = nso_str
-            attr_state.compliance_status = status
+            attr_state.sync_state = status
             attr_state.last_checked_at = datetime.utcnow()
 
     device.last_sync_at = datetime.utcnow()

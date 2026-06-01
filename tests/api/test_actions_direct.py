@@ -11,8 +11,8 @@ from fastapi import BackgroundTasks
 
 from nso_adapter.api.actions import (
     _trigger,
-    action_check_compliance,
     action_connect,
+    action_detect_drift,
     action_sync,
     sync_notify,
 )
@@ -94,8 +94,8 @@ async def test_action_sync_returns_job_id(adapter_client):
         break
 
 
-async def test_action_check_compliance_returns_job_id(adapter_client):
-    """action_check_compliance() calls _trigger with JobType.check_compliance."""
+async def test_action_detect_drift_returns_job_id(adapter_client):
+    """action_detect_drift() calls _trigger with JobType.detect_drift."""
     device_id = await _seed_device("actions-cc-01", 1330)
     async for db in get_session():
         bt = BackgroundTasks()
@@ -104,7 +104,7 @@ async def test_action_check_compliance_returns_job_id(adapter_client):
 
         with patch("nso_adapter.api.actions.enqueue_job", new_callable=AsyncMock) as mock_enq:
             mock_enq.return_value = (fake_job, True)
-            result = await action_check_compliance(device_id=device_id, background_tasks=bt, db=db)
+            result = await action_detect_drift(device_id=device_id, background_tasks=bt, db=db)
         assert result == {"job_id": 11}
         break
 
