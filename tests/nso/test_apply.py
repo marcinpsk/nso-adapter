@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nso_adapter.nso.apply import NsoApplyError, apply_interface_attribute
+from nso_adapter.nso.apply import NsoApplyError, apply_interface_attribute, apply_interface_ips
 
 
 def _make_nso_client(base="http://nso"):
@@ -150,8 +150,6 @@ def test_nso_apply_error_default_detail():
 
 
 # ── apply_interface_ips ──────────────────────────────────────────────────────
-
-from nso_adapter.nso.apply import apply_interface_ips
 
 
 def _make_ip_row(address: str, family: str = "ipv4", secondary: bool = False, vrf: str = "") -> MagicMock:

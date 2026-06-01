@@ -11,7 +11,6 @@ import pytest
 
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
 
-
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 class MockTransport(httpx.AsyncBaseTransport):

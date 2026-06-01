@@ -5,8 +5,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-import pytest
-
 from tests.conftest import VALID_TOKEN, seed_device
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -200,9 +198,10 @@ async def test_put_ip_intent_creates_rows(adapter_client):
 
 async def test_put_ip_intent_full_replace(adapter_client):
     """Second PUT replaces all existing rows."""
+    from sqlalchemy import select
+
     from nso_adapter.store.db import get_session
     from nso_adapter.store.models import InterfaceIpIntent
-    from sqlalchemy import select
 
     device_id = await seed_device(nso_device_name="ip-intent-dev-02", netbox_device_id=901)
     iface_id = await _seed_interface(device_id, "GigabitEthernet0/2")

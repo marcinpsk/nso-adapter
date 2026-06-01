@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from nso_adapter.config import AppConfig, EnvSettings, SecretsConfig, VaultConfig, NetboxConfig, ApiConfig
+from nso_adapter.config import ApiConfig, AppConfig, EnvSettings, NetboxConfig, SecretsConfig, VaultConfig
 from nso_adapter.secrets import make_provider
 from nso_adapter.secrets.local import LocalSecretsProvider
 

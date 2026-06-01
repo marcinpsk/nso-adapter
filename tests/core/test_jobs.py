@@ -91,7 +91,7 @@ async def test_enqueue_job_creates_new_job(adapter_client):
 
     bg = MagicMock(spec=BackgroundTasks)
     async for db in get_session():
-        with patch("nso_adapter.core.jobs._run_sync") as mock_runner:
+        with patch("nso_adapter.core.jobs._run_sync"):
             job, created = await enqueue_job(device_id, JobType.sync, db, bg)
             assert created is True
             assert job.status == JobStatus.queued

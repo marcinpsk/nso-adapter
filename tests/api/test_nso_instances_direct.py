@@ -12,7 +12,6 @@ from nso_adapter.api.nso_instances import list_instance_devices, list_nso_instan
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device
 
-
 # ── list_nso_instances ────────────────────────────────────────────────────────
 
 

@@ -19,8 +19,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from alembic import command
 from alembic.config import Config
+
+from alembic import command
 
 # repo root == parent of the nso_adapter package; alembic.ini + alembic/ live there
 # in both the dev bind-mount (/app) and the prod image (see Dockerfile COPYs).

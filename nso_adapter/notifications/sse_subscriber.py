@@ -86,7 +86,7 @@ class SSESubscriber:
 
         try:
             await asyncio.wait_for(_run(), timeout=duration)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.info("sse_subscribe_complete", stream=stream_url, duration=duration)
         except (httpx.HTTPStatusError, httpx.RequestError) as exc:
             logger.warning("sse_subscribe_error", stream=stream_url, error=str(exc))

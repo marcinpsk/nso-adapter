@@ -11,8 +11,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
-from nso_adapter.store.models import Device, DbInterface, InterfaceAttrState, ManagedScope
-
+from nso_adapter.store.models import DbInterface, Device, InterfaceAttrState, ManagedScope
 
 # ── onboard_device ───────────────────────────────────────────────────────────
 

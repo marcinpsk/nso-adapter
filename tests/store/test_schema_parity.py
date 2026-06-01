@@ -57,7 +57,6 @@ def _db_url(base: str, dbname: str) -> str:
 
 
 def test_alembic_baseline_matches_create_all():
-    base = make_url(_PARITY_URL)
     suffix = uuid.uuid4().hex[:10]
     ca_db = f"parity_ca_{suffix}"
     al_db = f"parity_al_{suffix}"
@@ -79,7 +78,6 @@ def test_alembic_baseline_matches_create_all():
 
         # 2) alembic upgrade head — env.py reads DATABASE_URL
         from alembic import command
-
         from nso_adapter.db_migrate import make_config
 
         prev = os.environ.get("DATABASE_URL")

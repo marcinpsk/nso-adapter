@@ -3,13 +3,13 @@
 """Tests for intent endpoints: PUT/GET /api/v1/devices/{id}/intent."""
 from __future__ import annotations
 
-from tests.conftest import VALID_TOKEN, seed_device
 from nso_adapter.store.models import (
     ComplianceStatus,
     DbInterface,
     DeviceSettings,
     InterfaceAttrState,
 )
+from tests.conftest import VALID_TOKEN, seed_device
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -137,8 +137,9 @@ async def test_put_intent_stamps_accepted_on_imported(adapter_client):
         headers=AUTH,
     )
 
-    from nso_adapter.store.db import get_session
     from sqlalchemy import select
+
+    from nso_adapter.store.db import get_session
     async for db in get_session():
         result = await db.execute(
             select(InterfaceAttrState).where(InterfaceAttrState.attribute == "description")
@@ -167,8 +168,9 @@ async def test_put_intent_does_not_override_in_sync(adapter_client):
         headers=AUTH,
     )
 
-    from nso_adapter.store.db import get_session
     from sqlalchemy import select
+
+    from nso_adapter.store.db import get_session
     async for db in get_session():
         result = await db.execute(
             select(InterfaceAttrState).where(InterfaceAttrState.attribute == "description")
@@ -203,8 +205,9 @@ async def test_put_intent_auto_apply_enqueues_job(adapter_client):
     assert resp.status_code == 200
 
     # Verify an apply job was created
-    from nso_adapter.store.db import get_session
     from sqlalchemy import select
+
+    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
     async for db in get_session():
         result = await db.execute(

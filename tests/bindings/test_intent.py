@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nso_adapter.bindings.netbox.intent import PluginIntentRecord, fetch_all_intent
+from nso_adapter.bindings.netbox.intent import fetch_all_intent
 
 
 def _make_nb_client(base="http://netbox"):

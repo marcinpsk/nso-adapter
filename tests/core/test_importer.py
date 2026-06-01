@@ -5,7 +5,6 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, patch
 
-import pytest
 import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -175,7 +174,7 @@ async def test_sync_device_marks_unmatched_interfaces_when_empty(db_session: Asy
 
 async def test_check_compliance_uses_interface_attributes(db_session: AsyncSession):
     from nso_adapter.core.importer import check_compliance
-    from nso_adapter.store.models import InterfaceAttrState, ComplianceStatus
+    from nso_adapter.store.models import ComplianceStatus, InterfaceAttrState
 
     device = Device(
         nso_instance="nso-dev",

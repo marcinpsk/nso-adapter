@@ -142,8 +142,6 @@ async def test_sync_notify_returns_job_id(adapter_client):
 
 async def test_wrong_token_raises_401(adapter_client):
     """Sending wrong bearer token → 401."""
-    import httpx
-    from tests.conftest import VALID_TOKEN
     resp = await adapter_client.get(
         "/api/v1/devices",
         headers={"Authorization": "Bearer wrong-token"},

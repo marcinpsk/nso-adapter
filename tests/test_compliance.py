@@ -7,7 +7,6 @@ from nso_adapter.core.compliance import compute_compliance_status, compute_drift
 from nso_adapter.domain.models import Interface, InterfaceAttr
 from nso_adapter.store.models import ComplianceStatus
 
-
 # ── Phase 1 paths (intent_value=None) ────────────────────────────────────────
 
 

@@ -53,8 +53,8 @@ def _seed_scope(session: Session, router: DeviceBgpRouter, vrf: str = "") -> Dev
 def test_create_router_and_scopes(db):
     dev = _make_device(db)
     router = _seed_router(db, dev, asn="65100")
-    global_scope = _seed_scope(db, router, vrf="")
-    vrf_scope = _seed_scope(db, router, vrf="ASPAN")
+    _seed_scope(db, router, vrf="")
+    _seed_scope(db, router, vrf="ASPAN")
     db.commit()
 
     routers = db.execute(select(DeviceBgpRouter).where(DeviceBgpRouter.device_id == dev.id)).scalars().all()

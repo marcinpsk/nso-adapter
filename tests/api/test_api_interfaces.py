@@ -7,8 +7,8 @@ GET /api/v1/devices/{id}/compliance
 """
 from __future__ import annotations
 
-from tests.conftest import VALID_TOKEN, seed_device
 from nso_adapter.store.models import ComplianceStatus, DbInterface, InterfaceAttrState
+from tests.conftest import VALID_TOKEN, seed_device
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 

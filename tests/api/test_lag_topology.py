@@ -5,8 +5,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-import pytest
-
 from tests.conftest import VALID_TOKEN, seed_device
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
