@@ -218,3 +218,41 @@ async def test_bulk_patch_empty_is_noop(client):
     result = await client.bulk_patch_interfaces([])
     assert result == []
     assert not route.called
+
+
+@respx.mock
+async def test_bulk_patch_400_non_positional_body_bisects_to_isolate_bad_row(client):
+    """A 400 with a non-positional body (dict) is bisected to isolate the poison row.
+
+    Regression for device-27 'stuck 23': one interface with a pre-existing invalid
+    MTU made NetBox reject the whole batch with a dict error (not a positional list),
+    so the old code dropped every row. Bisection must write all the innocent rows and
+    drop only the genuinely-bad one.
+    """
+    import json
+
+    bad_id = 99
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        rows = json.loads(request.content)
+        if any(r["id"] == bad_id for r in rows):
+            # NetBox returns a non-positional (dict) error for this validation failure.
+            return httpx.Response(400, json={"mtu": ["Ensure this value is less than or equal to 65536."]})
+        return httpx.Response(200, json=rows)
+
+    respx.patch(f"{BASE}/api/dcim/interfaces/").mock(side_effect=_handler)
+    payloads = [{"id": 1, "description": "a"}, {"id": 2, "description": "b"}, {"id": bad_id, "description": "x"}, {"id": 4, "description": "d"}]
+    result = await client.bulk_patch_interfaces(payloads)
+
+    written_ids = sorted(r["id"] for r in result)
+    assert written_ids == [1, 2, 4]  # innocent rows written; only the poison row dropped
+
+
+@respx.mock
+async def test_bulk_patch_400_single_non_positional_drops_row(client):
+    """A single-row batch that 400s with a non-positional body is dropped, not retried forever."""
+    respx.patch(f"{BASE}/api/dcim/interfaces/").mock(
+        return_value=httpx.Response(400, json={"mtu": ["too big"]})
+    )
+    result = await client.bulk_patch_interfaces([{"id": 7, "description": "x"}])
+    assert result == []

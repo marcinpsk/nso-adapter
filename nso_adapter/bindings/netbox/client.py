@@ -132,25 +132,58 @@ class NetboxClient:
         return out
 
     async def _bulk_one(self, method: str, batch: list[dict], *, label: str) -> list[dict]:
-        """Send one batch; on a 400 with positional errors, drop bad rows and retry once."""
+        """Send one batch; on a 400, isolate the offending row(s) and write the rest.
+
+        NetBox returns a *positional* error list for bulk writes ({} == row ok), so
+        the flagged rows are dropped and the good remainder retried. But some 400s
+        come back as a non-positional body (a dict / single error) — e.g. when a row
+        fails model-level validation, such as a pre-existing out-of-range MTU on the
+        target interface that makes NetBox reject ANY PATCH to it (even one that only
+        touches description/enabled). A non-positional body hides *which* row is bad,
+        so the batch is bisected recursively until the culprit is a single row, which
+        is logged and dropped. This keeps one poison row from stranding its innocent
+        batch-mates (the device-27 'stuck 23' bug).
+        """
         if not batch:
             return []
         url = f"{self._base}/api/dcim/interfaces/"
         resp = await self._client().request(method, url, json=batch, timeout=_BULK_TIMEOUT)
-        if resp.status_code == 400:
+        if resp.status_code != 400:
+            resp.raise_for_status()
+            return resp.json()
+
+        # 400 — try to parse a positional error list aligned to the batch.
+        try:
             errors = resp.json()
-            # errors is a positional list aligned to batch; {} == row ok.
-            bad = {i for i, e in enumerate(errors) if e} if isinstance(errors, list) else set(range(len(batch)))
-            for i in bad:
-                logger.warning(
-                    f"netbox.{label}.row_rejected",
-                    name=batch[i].get("name"),
-                    id=batch[i].get("id"),
-                    error=errors[i] if isinstance(errors, list) else "unknown",
-                )
-            good = [p for i, p in enumerate(batch) if i not in bad]
-            if not good:
-                return []
-            resp = await self._client().request(method, url, json=good, timeout=_BULK_TIMEOUT)
-        resp.raise_for_status()
-        return resp.json()
+        except Exception:
+            errors = None
+
+        if isinstance(errors, list) and len(errors) == len(batch):
+            bad = {i for i, e in enumerate(errors) if e}
+            if bad:
+                for i in sorted(bad):
+                    logger.warning(
+                        f"netbox.{label}.row_rejected",
+                        name=batch[i].get("name"),
+                        id=batch[i].get("id"),
+                        error=errors[i],
+                    )
+                good = [p for i, p in enumerate(batch) if i not in bad]
+                return await self._bulk_one(method, good, label=label) if good else []
+            # Positional list but nothing flagged though status==400 — fall through
+            # to bisection rather than re-sending the identical batch (infinite loop).
+
+        # Non-positional 400 (or unflagged): can't tell which row is bad from the body.
+        if len(batch) == 1:
+            logger.warning(
+                f"netbox.{label}.row_rejected",
+                name=batch[0].get("name"),
+                id=batch[0].get("id"),
+                error=errors if errors is not None else resp.text[:200],
+            )
+            return []
+        # Bisect to isolate the culprit; each half is retried independently.
+        mid = len(batch) // 2
+        left = await self._bulk_one(method, batch[:mid], label=label)
+        right = await self._bulk_one(method, batch[mid:], label=label)
+        return left + right
