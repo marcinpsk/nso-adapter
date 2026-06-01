@@ -36,6 +36,11 @@ class NetboxClient:
                     "Authorization": f"Token {self._token}",
                     "Content-Type": "application/json",
                     "Accept": "application/json",
+                    # Marks every write as adapter-origin (an import/apply, never an
+                    # operator intent edit). The netbox-nso-plugin's Decision-G
+                    # post_save signal skips intent promotion/push when it sees this,
+                    # so imports aren't mis-read as operator accepts.
+                    "X-NSO-Adapter-Import": "1",
                 },
                 timeout=self._timeout,
             )
