@@ -351,7 +351,7 @@ def upgrade() -> None:
     op.create_table(
         "jobs",
         sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
-        sa.Column("job_type", sa.Enum("sync", "check_compliance", "connect", "apply", name="jobtype"), nullable=False),
+        sa.Column("job_type", sa.Enum("sync", "detect_drift", "connect", "apply", name="jobtype"), nullable=False),
         sa.Column("status", sa.Enum("queued", "running", "succeeded", "failed", name="jobstatus"), nullable=False),
         sa.Column("device_id", sa.Integer(), nullable=True),
         sa.Column("result", sa.JSON(), nullable=True),
@@ -713,7 +713,7 @@ def upgrade() -> None:
         sa.Column("netbox_value", sa.Text(), nullable=True),
         sa.Column("intent_value", sa.Text(), nullable=True),
         sa.Column(
-            "compliance_status",
+            "sync_state",
             sa.Enum(
                 "imported",
                 "changed",
@@ -724,7 +724,7 @@ def upgrade() -> None:
                 "in_sync",
                 "apply_failed",
                 "drifted",
-                name="compliancestatus",
+                name="syncstate",
             ),
             nullable=False,
         ),
