@@ -94,6 +94,8 @@ async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_db)
             entry["network_type"] = row.network_type
         if row.metric is not None:
             entry["metric"] = row.metric
+        if row.bound_port is not None:
+            entry["bound_port"] = row.bound_port
         entry["passive"] = row.passive
         interfaces.append(entry)
 

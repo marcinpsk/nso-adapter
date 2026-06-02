@@ -648,6 +648,10 @@ class DeviceIsisInterface(Base):
     network_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     metric: Mapped[int | None] = mapped_column(Integer, nullable=True)
     passive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Physical/LAG port a Nokia SR OS logical router-interface binds to (e.g. "lag-99:10").
+    # Lets the plugin correlate a Nokia IS-IS interface to its NetBox dcim.Interface
+    # (named by port-id). Absent (None) for Cisco/Junos and Nokia loopbacks.
+    bound_port: Mapped[str | None] = mapped_column(String(256), nullable=True, default=None)
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
 

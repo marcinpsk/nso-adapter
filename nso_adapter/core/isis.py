@@ -67,6 +67,7 @@ async def _upsert_isis_data(
                 network_type=iface.get("network-type"),
                 metric=iface.get("metric"),
                 passive=bool(iface.get("passive", False)),
+                bound_port=iface.get("bound-port") or None,
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
             )

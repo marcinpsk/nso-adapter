@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+"""Tests for core/isis.py — refresh upserts IS-IS interface rows, incl. bound_port."""
+
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock
+
+import pytest
+from sqlalchemy import select
+
+from nso_adapter.core.isis import refresh_isis_interfaces_for_device
+from nso_adapter.store.db import get_session
+from nso_adapter.store.models import Device, DeviceIsisInterface
+from tests.conftest import seed_device
+
+
+@asynccontextmanager
+async def _device_session(device_id: int):
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        assert device is not None
+        yield db, device
+        return
+    raise RuntimeError("no session")
+
+
+@pytest.mark.anyio
+async def test_refresh_persists_bound_port_for_nokia(adapter_client):
+    """Nokia IS-IS interfaces carry bound-port; it is stored on the read row.
+    Loopback/unbound interfaces (no bound-port) store None."""
+    device_id = await seed_device(nso_device_name="isis-nokia01", netbox_device_id=960)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_isis_interfaces.return_value = {
+            "process": [],
+            "interface": [
+                {"interface-name": "LAG99:10", "af": "ipv4", "bound-port": "lag-99:10"},
+                {"interface-name": "system", "af": "ipv4"},  # loopback, no bound-port
+            ],
+        }
+
+        await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
+
+        result = await db.execute(
+            select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id)
+        )
+        by_name = {r.interface_name: r for r in result.scalars().all()}
+        assert by_name["LAG99:10"].bound_port == "lag-99:10"
+        assert by_name["system"].bound_port is None
+
+
+@pytest.mark.anyio
+async def test_refresh_empty_bound_port_string_stored_as_none(adapter_client):
+    """An empty-string bound-port (defensive) is normalized to None, not ''."""
+    device_id = await seed_device(nso_device_name="isis-nokia02", netbox_device_id=961)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_isis_interfaces.return_value = {
+            "process": [],
+            "interface": [{"interface-name": "LAG99:20", "af": "ipv4", "bound-port": ""}],
+        }
+
+        await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
+
+        result = await db.execute(
+            select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id)
+        )
+        row = result.scalars().one()
+        assert row.bound_port is None
+
+
+@pytest.mark.anyio
+async def test_refresh_cisco_interface_has_no_bound_port(adapter_client):
+    """Cisco/Junos interfaces never emit bound-port → stored None."""
+    device_id = await seed_device(nso_device_name="isis-cisco01", netbox_device_id=962)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_isis_interfaces.return_value = {
+            "process": [],
+            "interface": [{"interface-name": "GigabitEthernet0/1", "af": "ipv4"}],
+        }
+
+        await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
+
+        result = await db.execute(
+            select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id)
+        )
+        row = result.scalars().one()
+        assert row.bound_port is None
