@@ -64,6 +64,8 @@ database_url: sqlite+aiosqlite:///{tmp_path}/test.db
         patch("nso_adapter.main.set_netbox_client"),
         patch("nso_adapter.main.start_scheduler"),
         patch("nso_adapter.main.stop_scheduler"),
+        patch("nso_adapter.main.start_workers", new=AsyncMock()),
+        patch("nso_adapter.main.stop_workers", new=AsyncMock()),
         patch("nso_adapter.main.persistent_subscriber", new=AsyncMock()),
     ):
         MockNb.return_value = MagicMock()
@@ -115,6 +117,8 @@ database_url: sqlite+aiosqlite:///{tmp_path}/test.db
         patch("nso_adapter.main.set_netbox_client"),
         patch("nso_adapter.main.start_scheduler"),
         patch("nso_adapter.main.stop_scheduler"),
+        patch("nso_adapter.main.start_workers", new=AsyncMock()),
+        patch("nso_adapter.main.stop_workers", new=AsyncMock()),
         patch("nso_adapter.main.persistent_subscriber", new=AsyncMock()),
     ):
         MockNb.return_value = MagicMock()

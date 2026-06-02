@@ -15,38 +15,31 @@ _scheduler: AsyncIOScheduler | None = None
 async def _scheduled_sync_all() -> None:
     """Sync every device that has at least one attribute in scope.
 
-    Uses the job runners directly (via asyncio.create_task) so the one-per-device
-    constraint is respected and a proper Job record is created for each scheduled run.
+    Enqueues a ``queued`` sync job per device; the durable worker pool
+    (``core.worker``) drains them.  ``enqueue_job`` enforces the one-per-device
+    constraint, so a device whose previous job is still queued/running is skipped.
     """
-    import asyncio
-
     from sqlalchemy import select
 
-    from nso_adapter.core.jobs import _JOB_RUNNERS, get_active_job
+    from nso_adapter.core.jobs import enqueue_job
     from nso_adapter.store.db import get_session
-    from nso_adapter.store.models import Device, Job, JobStatus, JobType, ManagedScope
+    from nso_adapter.store.models import Device, JobType, ManagedScope
 
     async for db in get_session():
         result = await db.execute(select(Device).where(Device.id.in_(select(ManagedScope.device_id).distinct())))
         devices = result.scalars().all()
         for device in devices:
             try:
-                active = await get_active_job(device.id, db)
-                if active:
+                job, created = await enqueue_job(device.id, JobType.sync, db)
+                if created:
+                    logger.info("scheduler.sync_enqueued", device_id=device.id, job_id=job.id)
+                else:
                     logger.debug(
                         "scheduler.sync_skipped",
                         device_id=device.id,
-                        reason="job_already_running",
-                        job_id=active.id,
+                        reason="job_already_active",
+                        job_id=job.id,
                     )
-                    continue
-                job = Job(job_type=JobType.sync, device_id=device.id, status=JobStatus.queued)
-                db.add(job)
-                await db.commit()
-                await db.refresh(job)
-                runner = _JOB_RUNNERS[JobType.sync]
-                asyncio.create_task(runner(job.id, device.id))
-                logger.info("scheduler.sync_enqueued", device_id=device.id, job_id=job.id)
             except Exception as exc:
                 logger.error("scheduler.sync_error", device_id=device.id, error=repr(exc))
 

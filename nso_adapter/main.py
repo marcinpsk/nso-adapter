@@ -34,6 +34,7 @@ from nso_adapter.core.interface_ip import handle_interface_ip_change
 from nso_adapter.core.lag_topology import handle_netconf_config_change
 from nso_adapter.core.scheduler import start_scheduler, stop_scheduler
 from nso_adapter.core.snmp import handle_snmp_config_change
+from nso_adapter.core.worker import start_workers, stop_workers
 from nso_adapter.notifications.persistent_subscriber import persistent_subscriber
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
 from nso_adapter.nso.client import NsoClient
@@ -64,31 +65,6 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)  # pragma: no cover
     logger.info("db.ready", url=cfg.database_url)
-
-    # Clean up any jobs that were left in running/queued state from a previous
-    # process (e.g. adapter container restarted mid-job).  Must run before the
-    # scheduler starts so get_active_job() doesn't block on stale entries.
-    from sqlalchemy import update as sa_update
-
-    from nso_adapter.store.db import get_session
-    from nso_adapter.store.models import Job, JobStatus
-
-    async for db in get_session():
-        result = await db.execute(
-            sa_update(Job)
-            .where(Job.status.in_([JobStatus.running, JobStatus.queued]))
-            .values(
-                status=JobStatus.failed,
-                error={
-                    "code": "orphaned",
-                    "message": "Adapter restarted while job was running",
-                    "detail": {},
-                },
-            )
-        )
-        await db.commit()  # pragma: no cover
-        if result.rowcount:  # pragma: no cover
-            logger.warning("jobs.orphaned_cleanup", count=result.rowcount)  # pragma: no cover
 
     # Build NSO clients — resolve username + password per instance
     from nso_adapter.store.db import get_session
@@ -158,11 +134,17 @@ async def lifespan(app: FastAPI):
             sse_tasks.append(task)
             logger.info("sse.stream.started", instance=inst.name, url=stream_url)
 
+    # Start the durable worker pool first: it reconciles orphaned jobs from a
+    # previous process (requeue idempotent / fail interrupted apply) before the
+    # scheduler begins enqueuing fresh work.
+    await start_workers(cfg.scheduler.worker_concurrency)
+
     start_scheduler()
     try:
         yield
     finally:
         stop_scheduler()
+        await stop_workers()
         sse_stop.set()
         for task in sse_tasks:
             task.cancel()

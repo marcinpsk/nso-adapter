@@ -24,6 +24,8 @@ def _job_out(j: Job) -> dict:
         "error": j.error,
         "created_at": j.created_at.isoformat() + "Z",
         "updated_at": j.updated_at.isoformat() + "Z",
+        "started_at": j.started_at.isoformat() + "Z" if j.started_at else None,
+        "heartbeat_at": j.heartbeat_at.isoformat() + "Z" if j.heartbeat_at else None,
     }
 
 

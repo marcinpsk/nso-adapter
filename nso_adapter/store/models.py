@@ -226,6 +226,11 @@ class Job(Base):
     context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+    # Layer B (durable worker): set when a worker claims the job; heartbeat_at is
+    # refreshed periodically while it runs so a crashed/hung job can be detected
+    # and requeued (or failed) on the next startup.
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     device: Mapped[Device | None] = relationship("Device", back_populates="jobs")
 

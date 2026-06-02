@@ -3,6 +3,9 @@
 
 One job per device runs at a time — a second request while a job is
 queued/running returns the existing job id for 409 handling in the API layer.
+
+Execution is handled by the durable worker pool (``core.worker``): ``enqueue_job``
+only inserts a ``queued`` row; a worker claims and runs it.
 """
 
 from __future__ import annotations
@@ -10,7 +13,6 @@ from __future__ import annotations
 import asyncio
 
 import structlog
-from fastapi import BackgroundTasks
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,13 +36,16 @@ async def enqueue_job(
     device_id: int,
     job_type: JobType,
     db: AsyncSession,
-    background_tasks: BackgroundTasks,
 ) -> tuple[Job, bool]:
-    """Create a job and schedule it.  Returns (job, created).
+    """Create a queued job.  Returns (job, created).
 
     If an active job already exists for the device, returns that job with
-    created=False so the caller can return 409.
+    created=False so the caller can return 409.  The durable worker pool
+    (``core.worker``) claims and runs the job.
     """
+    if job_type not in _JOB_RUNNERS:
+        raise ValueError(f"No runner registered for job type {job_type!r}")
+
     active = await get_active_job(device_id, db)
     if active:
         return active, False
@@ -49,11 +54,6 @@ async def enqueue_job(
     db.add(job)
     await db.commit()
     await db.refresh(job)
-
-    runner = _JOB_RUNNERS.get(job_type)
-    if runner is None:
-        raise ValueError(f"No runner registered for job type {job_type!r}")
-    background_tasks.add_task(runner, job.id, device_id)
     return job, True
 
 

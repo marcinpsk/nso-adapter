@@ -56,6 +56,10 @@ class ApiConfig(BaseModel):
 class SchedulerConfig(BaseModel):
     poll_interval: int = 15
     scope_reconcile_interval: int = 5
+    # Layer B durable worker: number of in-process worker tasks draining the Job
+    # table.  Default 1 (serial) — per-device dedup means cross-device parallelism
+    # is the only thing >1 buys, at the cost of more concurrent NSO/NetBox load.
+    worker_concurrency: int = 1
     enable_nso_streams: bool = True
     lag_topology_poll_interval: int = 60
     enable_interface_ip_sync: bool = True

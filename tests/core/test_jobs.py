@@ -8,7 +8,6 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import BackgroundTasks
 
 from nso_adapter.core.jobs import (
     _run_apply,
@@ -87,16 +86,13 @@ async def test_get_active_job_returns_running_job(adapter_client):
 
 
 async def test_enqueue_job_creates_new_job(adapter_client):
-    """enqueue_job creates a new job and schedules it."""
+    """enqueue_job creates a queued job for the worker pool to drain."""
     device_id = await _seed_device("rtr-04", 14)
 
-    bg = MagicMock(spec=BackgroundTasks)
     async for db in get_session():
-        with patch("nso_adapter.core.jobs._run_sync"):
-            job, created = await enqueue_job(device_id, JobType.sync, db, bg)
-            assert created is True
-            assert job.status == JobStatus.queued
-            bg.add_task.assert_called_once()
+        job, created = await enqueue_job(device_id, JobType.sync, db)
+        assert created is True
+        assert job.status == JobStatus.queued
         break
 
 
@@ -105,25 +101,21 @@ async def test_enqueue_job_returns_existing_when_active(adapter_client):
     device_id = await _seed_device("rtr-05", 15)
     existing_id = await _seed_job(device_id, JobStatus.queued)
 
-    bg = MagicMock(spec=BackgroundTasks)
     async for db in get_session():
-        job, created = await enqueue_job(device_id, JobType.sync, db, bg)
+        job, created = await enqueue_job(device_id, JobType.sync, db)
         assert created is False
         assert job.id == existing_id
-        bg.add_task.assert_not_called()
         break
 
 
 async def test_enqueue_job_raises_on_unknown_type(adapter_client):
     """enqueue_job raises ValueError for unregistered job type."""
     device_id = await _seed_device("rtr-06", 16)
-    bg = MagicMock(spec=BackgroundTasks)
 
     async for db in get_session():
-        # Patch _JOB_RUNNERS to return None for any job type
         with patch("nso_adapter.core.jobs._JOB_RUNNERS", {}):
             with pytest.raises(ValueError, match="No runner registered"):
-                await enqueue_job(device_id, JobType.sync, db, bg)
+                await enqueue_job(device_id, JobType.sync, db)
         break
 
 
