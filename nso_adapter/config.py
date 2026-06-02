@@ -76,6 +76,11 @@ class SchedulerConfig(BaseModel):
     ospf_poll_interval: int = 300
     enable_redistribution_sync: bool = True
     redistribution_poll_interval: int = 300
+    # Topology interface reconcile: ensure NetBox holds the LAG parents, logical
+    # channels/SAPs and loopback/system interfaces that bound_port correlation
+    # needs. Runs after the IS-IS/IP/LAG refreshes have populated the mirror.
+    enable_topology_interface_sync: bool = True
+    topology_interface_poll_interval: int = 120
 
 
 class AppConfig(BaseModel):

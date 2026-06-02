@@ -28,32 +28,50 @@ _IFACE_TYPE_MAP: dict[str, str] = {
     "Port-channel": "lag",
     "Vlan": "virtual",
     "Tunnel": "virtual",
+    "Management-lo": "virtual",  # Nokia mgmt loopback — must out-rank "Management"
     "Management": "other",
     "MgmtEth": "other",
     "Serial": "other",
+    # Nokia SR OS (timos): LAGs and logical loopback/system interfaces.
+    "lag-": "lag",
+    "system": "virtual",
+    "lo": "virtual",
 }
 
 
 def _guess_netbox_type(interface_name: str) -> str:
-    """Best-effort: map an interface name prefix to a NetBox interface type slug."""
-    for prefix, nb_type in _IFACE_TYPE_MAP.items():
+    """Best-effort: map an interface name prefix to a NetBox interface type slug.
+
+    Longest matching prefix wins, so more-specific entries (``Management-lo``)
+    out-rank their shorter relatives (``Management``) regardless of dict order.
+    """
+    for prefix in sorted(_IFACE_TYPE_MAP, key=len, reverse=True):
         if interface_name.startswith(prefix):
-            return nb_type
+            return _IFACE_TYPE_MAP[prefix]
     return "other"
 
 
-def _split_dotted_unit(interface_name: str) -> tuple[str, str] | None:
-    """Return (base, unit) for a dotted logical-unit name, else None.
+def _split_unit(interface_name: str) -> tuple[str, str] | None:
+    """Return (base, unit) for a logical-unit name, else None.
 
-    Junos/Cisco subinterfaces are ``<base>.<unit>`` — e.g. ``ae98.100``,
-    ``GigabitEthernet0/0.10``. Returns None for non-dotted names and for names
-    whose dot is not a clean unit separator (multiple dots, empty side). Nokia
-    port-ids use ``/`` and LAG members use ``:`` — neither has a ``.`` so they
-    are safe and resolve as plain interfaces.
+    Handles two separator styles, exactly one of which may be present:
+    - ``.`` — Junos/Cisco subinterfaces (``ae98.100``, ``GigabitEthernet0/0.10``).
+    - ``:`` — Nokia SR OS LAG channels and SAPs (``lag-99:10``, ``1/1/c22/1:4090``).
+
+    Returns None unless there is exactly one separator with non-empty sides:
+    plain names (``1/1/c8/1``, ``system``), names with multiple/mixed separators,
+    and names with an empty side all resolve as plain interfaces (logged upstream).
+    Nokia port-ids use ``/``, which is never treated as a separator.
     """
-    if interface_name.count(".") != 1:
+    n_dot = interface_name.count(".")
+    n_colon = interface_name.count(":")
+    if n_dot == 1 and n_colon == 0:
+        sep = "."
+    elif n_colon == 1 and n_dot == 0:
+        sep = ":"
+    else:
         return None
-    base, unit = interface_name.split(".", 1)
+    base, unit = interface_name.split(sep, 1)
     if not base or not unit:
         return None
     return base, unit
@@ -71,7 +89,7 @@ async def bulk_ensure_interfaces(
 
     1. One bulk GET of existing interfaces (name→object map).
     2. Bulk-create missing BASE interfaces (a base is either a plain name or the
-       left side of a ``<base>.<unit>``). Merge their ids into the map.
+       left side of a ``<base>.<unit>`` / ``<base>:<unit>``). Merge their ids in.
     3. Bulk-create missing UNIT interfaces as ``type=virtual`` with ``parent``
        resolved by BASE NAME from the map (never positionally).
     4. Bulk-reparent pre-existing flat units that lack a parent.
@@ -87,7 +105,7 @@ async def bulk_ensure_interfaces(
     units: list[tuple[str, str]] = []  # (full_name, base_name)
     all_base_names: set[str] = set()
     for name in wanted:
-        split = _split_dotted_unit(name)
+        split = _split_unit(name)
         if split is None:
             all_base_names.add(name)
         else:
@@ -187,7 +205,7 @@ async def resolve_or_create_interface(
     Pre-existing flat units get their ``parent`` patched in. Returns the
     interface id, or None if creation fails. (Decision I + subinterface plan.)
     """
-    split = _split_dotted_unit(iface.name)
+    split = _split_unit(iface.name)
     if split is None:
         return await _resolve_or_create_simple(client, netbox_device_id, iface.name)
 

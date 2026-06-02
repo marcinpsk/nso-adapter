@@ -61,6 +61,67 @@ class TestGuessNetboxType:
     def test_unknown_falls_back_to_other(self):
         assert _guess_netbox_type("Ethernet1/1") == "other"
 
+    def test_nokia_lag(self):
+        assert _guess_netbox_type("lag-99") == "lag"
+
+    def test_nokia_system(self):
+        assert _guess_netbox_type("system") == "virtual"
+
+    def test_nokia_loopback(self):
+        assert _guess_netbox_type("lo0") == "virtual"
+
+    def test_nokia_mgmt_loopback_outranks_management(self):
+        # "Management-lo" is more specific than "Management" → virtual, not other.
+        assert _guess_netbox_type("Management-lo0") == "virtual"
+
+
+# ---------------------------------------------------------------------------
+# _split_unit — pure function tests
+# ---------------------------------------------------------------------------
+
+
+class TestSplitUnit:
+    def test_dotted_unit(self):
+        from nso_adapter.bindings.netbox.mapper import _split_unit
+
+        assert _split_unit("ae98.100") == ("ae98", "100")
+
+    def test_nokia_lag_channel(self):
+        from nso_adapter.bindings.netbox.mapper import _split_unit
+
+        assert _split_unit("lag-99:10") == ("lag-99", "10")
+
+    def test_nokia_sap_on_channelized_port(self):
+        from nso_adapter.bindings.netbox.mapper import _split_unit
+
+        assert _split_unit("1/1/c22/1:4090") == ("1/1/c22/1", "4090")
+
+    def test_plain_port_id_is_not_a_unit(self):
+        from nso_adapter.bindings.netbox.mapper import _split_unit
+
+        assert _split_unit("1/1/c8/1") is None  # slashes are never separators
+
+    def test_plain_name_is_not_a_unit(self):
+        from nso_adapter.bindings.netbox.mapper import _split_unit
+
+        assert _split_unit("system") is None
+
+    def test_mixed_separators_rejected(self):
+        from nso_adapter.bindings.netbox.mapper import _split_unit
+
+        assert _split_unit("lag-99:10.5") is None
+
+    def test_multiple_colons_rejected(self):
+        from nso_adapter.bindings.netbox.mapper import _split_unit
+
+        assert _split_unit("a:b:c") is None
+
+    def test_empty_side_rejected(self):
+        from nso_adapter.bindings.netbox.mapper import _split_unit
+
+        assert _split_unit("lag-99:") is None
+        assert _split_unit(":10") is None
+
 
 # ---------------------------------------------------------------------------
 # resolve_or_create_interface — async tests
@@ -304,3 +365,41 @@ async def test_bulk_ensure_base_auto_added_for_unit_only_request():
 
     assert result["ae98"] == 10
     assert result["ae98.100"] == 11
+
+
+@pytest.mark.anyio
+async def test_bulk_ensure_nokia_channel_parented_under_lag():
+    """Nokia ``lag-99:10`` is created virtual and parented to its ``lag-99`` base,
+    with the LAG base typed ``lag`` — the bound_port channel modeling path."""
+    from nso_adapter.bindings.netbox.mapper import bulk_ensure_interfaces
+
+    client = _make_bulk_client()
+    client.bulk_create_interfaces.side_effect = [
+        [{"id": 20, "name": "lag-99"}],  # pass 1: base
+        [{"id": 21, "name": "lag-99:10"}],  # pass 2: channel unit
+    ]
+
+    result = await bulk_ensure_interfaces(client, 42, ["lag-99:10"])
+
+    assert result == {"lag-99": 20, "lag-99:10": 21}
+    base_call = client.bulk_create_interfaces.await_args_list[0][0][0]
+    assert base_call == [{"device": 42, "name": "lag-99", "type": "lag"}]
+    unit_call = client.bulk_create_interfaces.await_args_list[1][0][0]
+    assert unit_call == [{"device": 42, "name": "lag-99:10", "type": "virtual", "parent": 20}]
+
+
+@pytest.mark.anyio
+async def test_bulk_ensure_nokia_sap_parented_under_channelized_port():
+    """A SAP ``1/1/c22/1:4090`` parents under the existing channelized port."""
+    from nso_adapter.bindings.netbox.mapper import bulk_ensure_interfaces
+
+    client = _make_bulk_client()
+    client.list_interfaces.return_value = [{"id": 30, "name": "1/1/c22/1", "parent": None}]
+    client.bulk_create_interfaces.side_effect = [[{"id": 31, "name": "1/1/c22/1:4090"}]]
+
+    result = await bulk_ensure_interfaces(client, 42, ["1/1/c22/1", "1/1/c22/1:4090"])
+
+    assert result == {"1/1/c22/1": 30, "1/1/c22/1:4090": 31}
+    # base already existed → only the SAP unit is created, parented by name to 30.
+    unit_call = client.bulk_create_interfaces.await_args_list[0][0][0]
+    assert unit_call == [{"device": 42, "name": "1/1/c22/1:4090", "type": "virtual", "parent": 30}]

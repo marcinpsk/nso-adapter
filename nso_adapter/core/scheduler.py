@@ -356,6 +356,36 @@ async def _scheduled_redistribution_refresh() -> None:
             await refresh_redistribution_for_device(db, device, nso_client, refresh_source="poll")
 
 
+async def _scheduled_topology_interfaces_refresh() -> None:
+    """Periodic reconcile: ensure NetBox holds the LAG/channel/loopback interfaces
+    that bound_port correlation needs (the cfg.port feed never creates them).
+
+    Reads the adapter mirror (IS-IS / interface-IP / lag-topology, already
+    refreshed by their own jobs) plus the attribute-sync DbInterface rows. Runs
+    on its own interval so the source tables are populated first; idempotent.
+    """
+    from sqlalchemy import select
+
+    from nso_adapter.core.importer import get_netbox_client
+    from nso_adapter.core.topology_interfaces import ensure_topology_interfaces
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device
+
+    nb_client = get_netbox_client()
+    if nb_client is None:
+        logger.debug("scheduler.topology_interfaces.skipped", reason="no_netbox_client")
+        return
+
+    async for db in get_session():
+        result = await db.execute(select(Device).where(Device.netbox_device_id.is_not(None)))
+        devices = result.scalars().all()
+        for device in devices:
+            try:
+                await ensure_topology_interfaces(db, device, nb_client)
+            except Exception as exc:
+                logger.error("scheduler.topology_interfaces.error", device_id=device.id, error=repr(exc))
+
+
 def start_scheduler() -> None:
     global _scheduler
     cfg = get_config()
@@ -426,6 +456,13 @@ def start_scheduler() -> None:
             "interval",
             minutes=cfg.scheduler.redistribution_poll_interval,
             id="redistribution_refresh",
+        )
+    if cfg.scheduler.enable_topology_interface_sync and cfg.scheduler.topology_interface_poll_interval > 0:
+        _scheduler.add_job(
+            _scheduled_topology_interfaces_refresh,
+            "interval",
+            minutes=cfg.scheduler.topology_interface_poll_interval,
+            id="topology_interfaces_refresh",
         )
     _scheduler.start()
     logger.info("scheduler.started")
