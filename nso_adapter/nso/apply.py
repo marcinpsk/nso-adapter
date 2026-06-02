@@ -71,7 +71,10 @@ async def apply_interface_attribute(
     if attribute == "description":
         entry["description"] = value if value is not None else ""
     elif attribute == "enabled":
-        entry["enabled"] = value == "True" or value is True
+        # intent_value is stored as a string and its case varies by source ("true"
+        # from a JSON boolean push, "True" from str(bool)); compare case-insensitively
+        # so an enabled interface is never silently written as disabled.
+        entry["enabled"] = value is True or str(value).strip().lower() == "true"
     else:
         raise NsoApplyError(
             "unsupported_attribute",

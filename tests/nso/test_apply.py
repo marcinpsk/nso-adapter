@@ -71,6 +71,25 @@ async def test_apply_enabled_true():
 
 
 @pytest.mark.asyncio
+async def test_apply_enabled_lowercase_true():
+    """Regression: lowercase 'true' (from a JSON-boolean intent push) maps to True.
+
+    Previously the check was `value == "True"`, so a stored 'true' became False and a
+    deliberately-enabled interface was silently written as disabled.
+    """
+    client = _make_nso_client()
+    client._client.return_value = _mock_http_ctx(_mock_httpx_response(200))
+
+    await apply_interface_attribute(client, "rtr", "ge-0/0/0", "enabled", "true")
+
+    mock_http = client._client.return_value.__aenter__.return_value
+    import json
+
+    payload = json.loads(mock_http.patch.call_args[1]["content"])
+    assert payload["interface-reconciler:interface-config"][0]["enabled"] is True
+
+
+@pytest.mark.asyncio
 async def test_apply_enabled_false():
     """enabled != 'True' string maps to boolean False."""
     client = _make_nso_client()
