@@ -359,8 +359,6 @@ def upgrade() -> None:
         sa.Column("context", sa.JSON(), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.Column("updated_at", sa.DateTime(), nullable=False),
-        sa.Column("started_at", sa.DateTime(), nullable=True),
-        sa.Column("heartbeat_at", sa.DateTime(), nullable=True),
         sa.ForeignKeyConstraint(
             ["device_id"],
             ["devices.id"],
