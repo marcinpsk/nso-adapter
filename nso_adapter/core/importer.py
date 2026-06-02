@@ -304,6 +304,18 @@ async def detect_drift(device_id: int, db: AsyncSession) -> dict:
 
     device.last_sync_at = datetime.utcnow()
     await db.commit()
+
+    # Refresh the netbox-nso-plugin display cache so Detect Drift results are
+    # visible immediately (mirrors sync_device). Without this, detect-drift updates
+    # only the adapter's view and the plugin keeps showing stale statuses until the
+    # next full sync reconciles. Best-effort — a callback failure must not fail drift.
+    nb_client = get_netbox_client()
+    if nb_client and device.netbox_device_id:
+        try:
+            await nb_client.notify_sync_complete(device.netbox_device_id)
+        except Exception as exc:
+            logger.warning("netbox.drift_notify_failed", device_id=device_id, error=str(exc) or type(exc).__name__)
+
     return {"changes_detected": changes_detected}
 
 
