@@ -221,6 +221,70 @@ async def test_detect_drift_uses_interface_attributes(db_session: AsyncSession):
     assert summary["changes_detected"] == 1
 
 
+async def test_detect_drift_sees_value_set_directly_in_netbox(db_session: AsyncSession):
+    """A description typed straight into NetBox is caught as drift.
+
+    Reproduces device-27 ae2.0: NSO has no description and the cached netbox_value
+    matches (both empty), so the OLD cache-only comparison reported no drift. The
+    operator set a description directly in NetBox; detect_drift must compare against
+    the LIVE NetBox value and report drift — without persisting netbox_value (which
+    would let the next sync clobber the operator's edit).
+    """
+    from nso_adapter.core import importer as imp
+    from nso_adapter.core.importer import detect_drift
+    from nso_adapter.store.models import InterfaceAttrState, SyncState
+
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="junos01",
+        ned_id="juniper-junos-nc-1.0",
+        netbox_device_id=27,
+    )
+    db_session.add(device)
+    db_session.add(ManagedScope(device=device, attribute="description"))
+    await db_session.commit()
+
+    iface_row = DbInterface(device=device, name="ae2.0")
+    db_session.add(iface_row)
+    await db_session.commit()
+
+    # Cache says empty == empty → the old comparison would NOT flag drift.
+    attr_state = InterfaceAttrState(
+        interface_id=iface_row.id,
+        attribute="description",
+        netbox_value=None,
+        nso_value=None,
+        intent_value=None,
+        sync_state=SyncState.imported,
+    )
+    db_session.add(attr_state)
+    await db_session.commit()
+
+    # NSO still reports no description for ae2.0 (it's a Junos unit).
+    iface_entry = {"device-name": "junos01", "interface": [{"interface-name": "ae2.0", "enabled": True}]}
+    imp._nso_clients["nso-dev"] = _make_nso_client(iface_entry)
+
+    # LIVE NetBox carries a description the device lacks.
+    nb = AsyncMock()
+    nb.list_interfaces = AsyncMock(
+        return_value=[{"id": 1382, "name": "ae2.0", "description": "Core Link", "enabled": True}]
+    )
+    nb.notify_sync_complete = AsyncMock()
+    imp._netbox_client = nb
+
+    try:
+        with patch("nso_adapter.core.importer.nso_actions.compare_config", new_callable=AsyncMock):
+            summary = await detect_drift(device.id, db_session)
+    finally:
+        imp._netbox_client = None
+
+    assert summary["changes_detected"] == 1
+    await db_session.refresh(attr_state)
+    assert attr_state.sync_state == SyncState.changed
+    # Clobber-safety: detect_drift must NOT persist the live NetBox value into the cache.
+    assert attr_state.netbox_value is None
+
+
 async def test_sync_change_detection_skips_unchanged_on_resync(db_session: AsyncSession):
     """Second sync with identical NSO values issues ZERO NetBox writes (idempotent)."""
     from unittest.mock import AsyncMock

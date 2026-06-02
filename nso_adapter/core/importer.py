@@ -65,6 +65,17 @@ def _attrs_to_interface_list(data: dict | None) -> list[Interface]:
     return result
 
 
+def _attr_str(attr: str, value: object) -> str | None:
+    """Normalise an attribute value to the canonical string used for comparison.
+
+    Empty descriptions ("" or None) collapse to None so a blank on either side
+    compares equal; ``enabled`` stays "True"/"False".
+    """
+    if attr == "description":
+        return str(value) if value else None
+    return str(value) if value is not None else None
+
+
 def register_nso_client(instance_name: str, client: NsoClient) -> None:
     _nso_clients[instance_name] = client
 
@@ -271,6 +282,22 @@ async def detect_drift(device_id: int, db: AsyncSession) -> dict:
     scope_attrs = [s.attribute for s in scope_result2.scalars().all()]
     changes_detected = 0
 
+    # Compare against the CURRENT NetBox value, not the cached netbox_value: the cache
+    # only ever holds a value the adapter itself wrote, so a description/enable set
+    # straight into NetBox is otherwise invisible to drift detection. detect_drift is
+    # read-only by contract — we never persist netbox_value here, so sync_device's
+    # change-detection cache stays intact and cannot clobber the operator's edit.
+    nb_client = get_netbox_client()
+    netbox_attrs: dict[str, dict] = {}
+    if nb_client and device.netbox_device_id:
+        try:
+            for nb_iface in await nb_client.list_interfaces(device.netbox_device_id):
+                netbox_attrs[nb_iface["name"]] = nb_iface
+        except Exception as exc:
+            logger.warning(
+                "netbox.drift_read_failed", device_id=device_id, error=str(exc) or type(exc).__name__
+            )
+
     for iface in interfaces:
         result_rows = await db.execute(
             select(DbInterface).where(DbInterface.device_id == device_id, DbInterface.name == iface.name)
@@ -279,11 +306,12 @@ async def detect_drift(device_id: int, db: AsyncSession) -> dict:
         if db_iface is None:
             continue
 
+        nb_iface = netbox_attrs.get(iface.name)
         for attr in ("description", "enabled"):
             if attr not in scope_attrs:
                 continue
             nso_val = iface.nso.description if attr == "description" else iface.nso.enabled
-            nso_str = str(nso_val) if nso_val is not None else None
+            nso_str = _attr_str(attr, nso_val)
 
             attr_result = await db.execute(
                 select(InterfaceAttrState).where(
@@ -295,8 +323,14 @@ async def detect_drift(device_id: int, db: AsyncSession) -> dict:
             if attr_state is None:
                 continue
 
-            status = compute_sync_state(nso_str, attr_state.netbox_value, attr_state.intent_value)
-            if status == SyncState.changed:
+            # Live NetBox value when we could read it; fall back to the cache otherwise.
+            if nb_iface is not None:
+                netbox_str = _attr_str(attr, nb_iface.get(attr))
+            else:
+                netbox_str = attr_state.netbox_value
+
+            status = compute_sync_state(nso_str, netbox_str, attr_state.intent_value)
+            if status in (SyncState.changed, SyncState.drifted):
                 changes_detected += 1
             attr_state.nso_value = nso_str
             attr_state.sync_state = status
@@ -309,7 +343,6 @@ async def detect_drift(device_id: int, db: AsyncSession) -> dict:
     # visible immediately (mirrors sync_device). Without this, detect-drift updates
     # only the adapter's view and the plugin keeps showing stale statuses until the
     # next full sync reconciles. Best-effort — a callback failure must not fail drift.
-    nb_client = get_netbox_client()
     if nb_client and device.netbox_device_id:
         try:
             await nb_client.notify_sync_complete(device.netbox_device_id)
