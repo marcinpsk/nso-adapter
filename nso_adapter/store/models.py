@@ -204,9 +204,9 @@ class InterfaceAttrState(Base):
     attribute: Mapped[str] = mapped_column(String(64))
     nso_value: Mapped[str | None] = mapped_column(Text, nullable=True)
     netbox_value: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # Phase 2: intent_value tracks the last value pushed to NSO (accepted intent).
-    # None means no intent has been deployed yet (Phase 1 mode).
-    intent_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Deployed intent is the single source of truth in InterfaceIntent (read by the
+    # importer to decide Phase 1 vs Phase 2). There is intentionally no intent_value
+    # cache here — a second copy is what caused the Phase-2 split-brain.
     sync_state: Mapped[SyncState] = mapped_column(Enum(SyncState), default=SyncState.unknown)
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 

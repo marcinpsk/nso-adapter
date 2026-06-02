@@ -254,7 +254,6 @@ async def test_detect_drift_sees_value_set_directly_in_netbox(db_session: AsyncS
         attribute="description",
         netbox_value=None,
         nso_value=None,
-        intent_value=None,
         sync_state=SyncState.imported,
     )
     db_session.add(attr_state)

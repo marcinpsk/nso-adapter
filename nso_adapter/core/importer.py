@@ -26,6 +26,7 @@ from nso_adapter.store.models import (
     DbInterface,
     Device,
     InterfaceAttrState,
+    InterfaceIntent,
     LastSyncStatus,
     ManagedScope,
     MappingStatus,
@@ -63,6 +64,17 @@ def _attrs_to_interface_list(data: dict | None) -> list[Interface]:
             )
         )
     return result
+
+
+async def _load_intent_by_attr(db: AsyncSession, interface_id: int) -> dict[str, object]:
+    """Return {attribute: intent_value} for an interface from InterfaceIntent.
+
+    InterfaceIntent is the single source of truth for deployed intent (written by
+    PUT /intent, apply and the scheduler). The importer reads it here to decide
+    Phase 1 vs Phase 2 — there is no separate attr_state.intent_value cache.
+    """
+    result = await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == interface_id))
+    return {row.attribute: row.intent_value for row in result.scalars().all()}
 
 
 def _attr_str(attr: str, value: object) -> str | None:
@@ -167,9 +179,11 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
         existing_ifaces[iface.name] = db_iface
 
         # Step 3: compute per-attribute sync_state
-        # Load existing attr_states
+        # Load existing attr_states + the deployed intent (single source of truth:
+        # InterfaceIntent, written by PUT /intent / apply / scheduler).
         attr_result = await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id == db_iface.id))
         existing_attrs: dict[str, InterfaceAttrState] = {row.attribute: row for row in attr_result.scalars().all()}
+        intent_by_attr = await _load_intent_by_attr(db, db_iface.id)
 
         for attr in ("description", "enabled"):
             if attr not in scope_attrs:
@@ -182,8 +196,9 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
                 attr_state = InterfaceAttrState(interface_id=db_iface.id, attribute=attr)
                 db.add(attr_state)
 
+            intent_val = intent_by_attr.get(attr)
             prev_netbox_val = attr_state.netbox_value
-            status = compute_sync_state(nso_str, prev_netbox_val, attr_state.intent_value)
+            status = compute_sync_state(nso_str, prev_netbox_val, intent_val)
             if status == SyncState.changed:
                 changes_detected += 1
 
@@ -213,7 +228,7 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
                         pending_by_id.setdefault(nb_id, []).append((attr_state, nso_str))
 
             attr_state.nso_value = nso_str
-            if attr_state.intent_value is not None:
+            if intent_val is not None:
                 # Phase 2: intent has been deployed — use in_sync/drifted from compute_sync_state.
                 # Never downgrade to "imported" even if netbox_value == nso_str.
                 attr_state.sync_state = status
@@ -307,6 +322,7 @@ async def detect_drift(device_id: int, db: AsyncSession) -> dict:
             continue
 
         nb_iface = netbox_attrs.get(iface.name)
+        intent_by_attr = await _load_intent_by_attr(db, db_iface.id)
         for attr in ("description", "enabled"):
             if attr not in scope_attrs:
                 continue
@@ -329,7 +345,7 @@ async def detect_drift(device_id: int, db: AsyncSession) -> dict:
             else:
                 netbox_str = attr_state.netbox_value
 
-            status = compute_sync_state(nso_str, netbox_str, attr_state.intent_value)
+            status = compute_sync_state(nso_str, netbox_str, intent_by_attr.get(attr))
             if status in (SyncState.changed, SyncState.drifted):
                 changes_detected += 1
             attr_state.nso_value = nso_str
