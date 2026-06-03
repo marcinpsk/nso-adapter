@@ -28,15 +28,15 @@ def _mock_httpx_response(json_data, status: int = 200):
 
 
 def _mock_http_ctx(responses):
-    """Build a mock context manager whose .get() returns responses in order."""
+    """Mock for client._client(): a pooled http object whose .get() returns responses
+    in order. fetch_all_intent uses the client DIRECTLY (not as a context manager) —
+    entering the reused singleton raises "Cannot open a client instance more than once"
+    — so there is intentionally no __aenter__/__aexit__ here."""
     if not isinstance(responses, (list, tuple)):
         responses = [responses]
     mock_http = AsyncMock()
     mock_http.get.side_effect = responses
-    ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=mock_http)
-    ctx.__aexit__ = AsyncMock(return_value=None)
-    return ctx
+    return mock_http
 
 
 def _intent_item(
@@ -196,3 +196,29 @@ async def test_fetch_all_intent_nso_value_fallback():
 
     records = await fetch_all_intent(client)
     assert records[0].intent_value == "fallback-desc"
+
+
+@pytest.mark.asyncio
+async def test_fetch_all_intent_uses_pooled_client_directly():
+    """Regression: the pooled NetboxClient is a reused singleton; entering it as a
+    context manager raises httpx's RuntimeError('Cannot open a client instance more
+    than once.'), which previously aborted the intent reconcile. fetch_all_intent must
+    use the client directly."""
+    item = {
+        "interface": {"device": {"id": 5}, "name": "ge-0/0/0"},
+        "attribute": "description",
+        "status": "accepted",
+        "intent_value": "desc",
+        "accepted_at": None,
+    }
+    data = {"results": [item], "next": None}
+    mock_http = AsyncMock()
+    mock_http.get.return_value = _mock_httpx_response(data)
+    mock_http.__aenter__.side_effect = RuntimeError("Cannot open a client instance more than once.")
+    client = _make_nb_client()
+    client._client.return_value = mock_http
+
+    records = await fetch_all_intent(client)
+
+    assert len(records) == 1
+    mock_http.__aenter__.assert_not_called()

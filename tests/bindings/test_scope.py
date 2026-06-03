@@ -28,12 +28,13 @@ def _mock_httpx_response(json_data: dict | list, status: int = 200):
 
 
 def _mock_http_ctx(response):
+    # fetch_all_scope uses the shared pooled client DIRECTLY (c = client._client();
+    # await c.get(...)) — it must NOT enter it as a context manager (that raises
+    # "Cannot open a client instance more than once" on the reused singleton). So the
+    # mock for _client() is the http object itself, with no __aenter__/__aexit__.
     mock_http = AsyncMock()
     mock_http.get.return_value = response
-    ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=mock_http)
-    ctx.__aexit__ = AsyncMock(return_value=None)
-    return ctx
+    return mock_http
 
 
 @pytest.mark.asyncio
@@ -126,3 +127,23 @@ async def test_fetch_all_scope_raises_on_http_error():
 
     with pytest.raises(Exception):
         await fetch_all_scope(client)
+
+
+@pytest.mark.asyncio
+async def test_fetch_all_scope_uses_pooled_client_directly():
+    """Regression: NetboxClient._client() is a long-lived pooled singleton, already
+    opened by other requests. Entering it as a context manager raises httpx's
+    RuntimeError('Cannot open a client instance more than once.') — which previously
+    aborted the scope reconcile. fetch_all_scope must use the client directly."""
+    data = {"results": [{"device": {"id": 10}, "managed_attributes": ["description"]}]}
+    mock_http = AsyncMock()
+    mock_http.get.return_value = _mock_httpx_response(data)
+    # Mimic httpx: re-entering an already-opened client raises.
+    mock_http.__aenter__.side_effect = RuntimeError("Cannot open a client instance more than once.")
+    client = _make_nb_client()
+    client._client.return_value = mock_http
+
+    records = await fetch_all_scope(client)
+
+    assert len(records) == 1
+    mock_http.__aenter__.assert_not_called()

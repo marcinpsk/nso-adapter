@@ -37,10 +37,14 @@ async def fetch_all_scope(client: NetboxClient) -> list[PluginScopeRecord]:
     Raises on any error — callers must not interpret errors as empty scope.
     """
     url = f"{client._base}{_PLUGIN_SCOPE_PATH}"
-    async with client._client() as c:
-        resp = await c.get(url)
-        resp.raise_for_status()
-        data = resp.json()
+    # Use the shared pooled client directly — do NOT `async with` it. It is a long-lived
+    # singleton reused across all calls and already opened by other requests, so entering
+    # it as a context manager raises "Cannot open a client instance more than once" (and
+    # on exit would close the pool for everyone). Lifecycle is owned by NetboxClient.aclose().
+    c = client._client()
+    resp = await c.get(url)
+    resp.raise_for_status()
+    data = resp.json()
 
     records: list[PluginScopeRecord] = []
     results = data.get("results", data) if isinstance(data, dict) else data

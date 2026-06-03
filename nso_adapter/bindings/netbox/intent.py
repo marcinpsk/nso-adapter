@@ -47,16 +47,19 @@ async def fetch_all_intent(client: NetboxClient) -> list[PluginIntentRecord]:
     url = f"{client._base}{_PLUGIN_INTENT_PATH}"
     results: list[dict] = []
 
-    async with client._client() as c:
-        # Handle DRF pagination
-        next_url: str | None = url
-        while next_url:
-            resp = await c.get(next_url)
-            resp.raise_for_status()
-            data = resp.json()
-            page = data.get("results", data) if isinstance(data, dict) else data
-            results.extend(page)
-            next_url = data.get("next") if isinstance(data, dict) else None
+    # Shared pooled client — must NOT be entered as a context manager (see fetch_all_scope):
+    # it is a reused singleton, so `async with` raises "Cannot open a client instance more
+    # than once" and would close the pool on exit. Lifecycle is owned by NetboxClient.aclose().
+    c = client._client()
+    # Handle DRF pagination
+    next_url: str | None = url
+    while next_url:
+        resp = await c.get(next_url)
+        resp.raise_for_status()
+        data = resp.json()
+        page = data.get("results", data) if isinstance(data, dict) else data
+        results.extend(page)
+        next_url = data.get("next") if isinstance(data, dict) else None
 
     records: list[PluginIntentRecord] = []
     for item in results:
