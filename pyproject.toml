@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: Apache-2.0
+[build-system]
+requires = ["setuptools>=74"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nso-adapter"
+version = "0.1.0"
+description = "Middleware adapter between Cisco NSO and NetBox"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "httpx>=0.28",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.21",
+    "asyncpg>=0.30",
+    "psycopg2-binary>=2.9",
+    "alembic>=1.14",
+    "apscheduler>=3.10",
+    "hvac>=2.3",
+    "pydantic-settings>=2.7",
+    "structlog>=25.1",
+    "python-dotenv>=1.1",
+    "pyyaml>=6.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "pytest-cov>=7.1.0",
+    "pytest-httpx>=0.35",
+    "respx>=0.21",
+    "ruff>=0.9",
+    "watchfiles>=1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nso_adapter*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--cov=nso_adapter --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["nso_adapter"]
+# Policy (docs/testing-strategy.md §5.1): file-level omits are restricted to
+# auto-generated/test code. The three module-level entries below are
+# GRANDFATHERED pending a paydown pass — do not add new ones, and remove
+# these as part of any change that touches the listed files. Extract pure
+# logic into testable helpers; let the thin lifecycle wrapper carry low
+# coverage as a signal, not hide it.
+omit = [
+    "*/alembic/*",
+    # GRANDFATHERED — scheduler lifecycle requires APScheduler integration.
+    # Test inner functions directly per testing-strategy.md §3.6.
+    "nso_adapter/core/scheduler.py",
+    # GRANDFATHERED — full pipeline importer, currently integration-only.
+    # Pure helpers should be extracted and unit-tested.
+    "nso_adapter/core/importer.py",
+    # GRANDFATHERED — Vault secrets backend, requires a live Vault instance.
+    # Parsing/resolution logic should be extracted and unit-tested.
+    "nso_adapter/secrets/vault.py",
+]
+
+[tool.coverage.report]
+fail_under = 60
+show_missing = true
+exclude_also = [
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501", "D100", "D101", "D102", "D103", "D104", "D105", "D107", "UP042"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["nso_adapter"]
