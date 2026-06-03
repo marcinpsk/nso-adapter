@@ -75,10 +75,14 @@ async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_db)
             entry["area_auth_type"] = row.area_auth_type
         if row.area_auth_present is not None:
             entry["area_auth_present"] = row.area_auth_present
+        if row.area_auth_key is not None:
+            entry["area_auth_key"] = row.area_auth_key
         if row.domain_auth_type is not None:
             entry["domain_auth_type"] = row.domain_auth_type
         if row.domain_auth_present is not None:
             entry["domain_auth_present"] = row.domain_auth_present
+        if row.domain_auth_key is not None:
+            entry["domain_auth_key"] = row.domain_auth_key
         processes.append(entry)
 
     interfaces = []

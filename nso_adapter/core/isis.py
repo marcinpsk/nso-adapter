@@ -45,8 +45,10 @@ async def _upsert_isis_data(
                 overload_bit=proc.get("overload-bit"),
                 area_auth_type=proc.get("area-auth-type"),
                 area_auth_present=proc.get("area-auth-present"),
+                area_auth_key=proc.get("area-auth-key"),
                 domain_auth_type=proc.get("domain-auth-type"),
                 domain_auth_present=proc.get("domain-auth-present"),
+                domain_auth_key=proc.get("domain-auth-key"),
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
             )

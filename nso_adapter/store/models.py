@@ -623,8 +623,11 @@ class DeviceIsisProcess(Base):
     overload_bit: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     area_auth_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     area_auth_present: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Routing-protocol auth keys read from the device (not config-access creds).
+    area_auth_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     domain_auth_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     domain_auth_present: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    domain_auth_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
 
