@@ -356,6 +356,32 @@ async def _scheduled_redistribution_refresh() -> None:
             await refresh_redistribution_for_device(db, device, nso_client, refresh_source="poll")
 
 
+async def _scheduled_route_policy_refresh() -> None:
+    """Periodic fallback: refresh route-policy objects for all managed devices."""
+    from sqlalchemy import select
+
+    from nso_adapter.core.importer import get_nso_client
+    from nso_adapter.core.route_policy import refresh_route_policy_for_device
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device
+
+    async for db in get_session():
+        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
+        devices = result.scalars().all()
+        for device in devices:
+            try:
+                nso_client = get_nso_client(device.nso_instance)
+            except RuntimeError:
+                logger.debug(
+                    "scheduler.route_policy.skipped",
+                    device_id=device.id,
+                    reason="no_nso_client",
+                    instance=device.nso_instance,
+                )
+                continue
+            await refresh_route_policy_for_device(db, device, nso_client, refresh_source="poll")
+
+
 async def _scheduled_topology_interfaces_refresh() -> None:
     """Periodic reconcile: ensure NetBox holds the LAG/channel/loopback interfaces
     that bound_port correlation needs (the cfg.port feed never creates them).
@@ -456,6 +482,13 @@ def start_scheduler() -> None:
             "interval",
             minutes=cfg.scheduler.redistribution_poll_interval,
             id="redistribution_refresh",
+        )
+    if cfg.scheduler.enable_route_policy_sync and cfg.scheduler.route_policy_poll_interval > 0:
+        _scheduler.add_job(
+            _scheduled_route_policy_refresh,
+            "interval",
+            minutes=cfg.scheduler.route_policy_poll_interval,
+            id="route_policy_refresh",
         )
     if cfg.scheduler.enable_topology_interface_sync and cfg.scheduler.topology_interface_poll_interval > 0:
         _scheduler.add_job(

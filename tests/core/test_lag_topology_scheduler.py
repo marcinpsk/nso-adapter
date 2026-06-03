@@ -66,6 +66,8 @@ def test_start_scheduler_registers_lag_refresh_job(monkeypatch: pytest.MonkeyPat
                 ospf_poll_interval=300,
                 enable_redistribution_sync=False,
                 redistribution_poll_interval=300,
+                enable_route_policy_sync=False,
+                route_policy_poll_interval=300,
                 enable_topology_interface_sync=False,
                 topology_interface_poll_interval=120,
             )
@@ -109,6 +111,8 @@ def test_start_scheduler_skips_lag_refresh_when_disabled(monkeypatch: pytest.Mon
                 ospf_poll_interval=300,
                 enable_redistribution_sync=False,
                 redistribution_poll_interval=300,
+                enable_route_policy_sync=False,
+                route_policy_poll_interval=300,
                 enable_topology_interface_sync=False,
                 topology_interface_poll_interval=120,
             )
