@@ -63,10 +63,24 @@ async def _upsert_bgp_data(
                 if af_name:
                     db.add(DeviceBgpAddressFamily(scope_id=scope.id, af=af_name))
 
+            # A BGP neighbor is unique per (router, vrf); but a device may present
+            # the same neighbor IP under more than one group (e.g. inactive config or
+            # NED modeling), which would violate uq_devicebgppeer_identity and roll
+            # back the ENTIRE device refresh. Dedup within the scope (first wins).
+            seen_peers: set[str] = set()
             for peer_data in scope_data.get("peer", []):
                 peer_addr = peer_data.get("peer-address", "")
                 if not peer_addr:
                     continue
+                if peer_addr in seen_peers:
+                    logger.warning(
+                        "bgp.duplicate_peer_skipped",
+                        device_id=device.id,
+                        vrf=vrf,
+                        peer_address=peer_addr,
+                    )
+                    continue
+                seen_peers.add(peer_addr)
                 peer = DeviceBgpPeer(
                     scope_id=scope.id,
                     peer_address=peer_addr,
