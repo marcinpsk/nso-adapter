@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from unittest.mock import AsyncMock, patch
 
 import pytest_asyncio
@@ -394,3 +395,66 @@ async def test_sync_failed_patch_not_marked_synced(db_session: AsyncSession):
             assert any(r["id"] == 600 for r in enqueued)
     finally:
         imp._netbox_client = None
+
+
+async def test_sync_device_fans_out_to_routing_surfaces(db_session: AsyncSession):
+    """sync_device runs the routing-surface fan-out so 'Sync Now' refreshes IS-IS/BGP/
+    OSPF/route-policy/... for the device, not just interface attributes."""
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="sw01",
+        ned_id="cisco-ios-cli-6.95",
+        netbox_device_id=1,
+    )
+    db_session.add(device)
+    db_session.add(ManagedScope(device=device, attribute="description"))
+    await db_session.commit()
+
+    nso_client = _make_nso_client({"device-name": "sw01", "interface": []})
+
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = nso_client
+    imp._netbox_client = None
+
+    with (
+        patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock),
+        patch(
+            "nso_adapter.core.importer.refresh_routing_surfaces_for_device",
+            new_callable=AsyncMock,
+        ) as fanout,
+    ):
+        await sync_device(device.id, db_session)
+
+    fanout.assert_awaited_once()
+    assert fanout.await_args.args[1].id == device.id
+    assert fanout.await_args.kwargs.get("refresh_source") == "sync"
+
+
+async def test_refresh_routing_surfaces_isolates_failures(db_session: AsyncSession):
+    """A surface that raises must not abort the others — the fan-out is best-effort."""
+    from nso_adapter.core.importer import refresh_routing_surfaces_for_device
+
+    device = Device(nso_instance="nso-dev", nso_device_name="sw01", ned_id="x", netbox_device_id=1)
+    db_session.add(device)
+    await db_session.commit()
+
+    nso_client = AsyncMock()
+    targets = {
+        "nso_adapter.core.static_route.refresh_static_routes_for_device": AsyncMock(),
+        "nso_adapter.core.isis.refresh_isis_interfaces_for_device": AsyncMock(side_effect=RuntimeError("boom")),
+        "nso_adapter.core.bgp.refresh_bgp_config_for_device": AsyncMock(),
+        "nso_adapter.core.ospf.refresh_ospf_for_device": AsyncMock(),
+        "nso_adapter.core.redistribution.refresh_redistribution_for_device": AsyncMock(),
+        "nso_adapter.core.route_policy.refresh_route_policy_for_device": AsyncMock(),
+        "nso_adapter.core.snmp.refresh_snmp_config_for_device": AsyncMock(),
+    }
+    with contextlib.ExitStack() as stack:
+        for path, m in targets.items():
+            stack.enter_context(patch(path, m))
+        # must not raise even though the isis surface blows up
+        await refresh_routing_surfaces_for_device(db_session, device, nso_client, refresh_source="sync")
+
+    # every surface was attempted, including the one that raised
+    for m in targets.values():
+        m.assert_awaited_once()

@@ -107,6 +107,66 @@ def get_netbox_client():
     return _netbox_client
 
 
+async def refresh_routing_surfaces_for_device(
+    db: AsyncSession,
+    device: Device,
+    nso_client: NsoClient,
+    *,
+    refresh_source: str = "sync",
+) -> None:
+    """Best-effort fan-out: refresh every enabled routing/extra surface for one device.
+
+    A device "sync" historically only refreshed interface attributes; the routing
+    surfaces (IS-IS / BGP / OSPF / route-policy / redistribution / static / SNMP) were
+    updated solely by their independent poll jobs, so "Sync Now" never moved them. This
+    runs each enabled surface's existing per-device refresh on demand, gated by the same
+    scheduler enable flags. Every surface is isolated — one failing (or a NED that does
+    not serve it) must not abort the others or the sync. The caller commits.
+    """
+    cfg = get_config().scheduler
+
+    surfaces: list[tuple[str, object]] = []
+    if cfg.enable_static_routing_sync:
+        from nso_adapter.core.static_route import refresh_static_routes_for_device
+
+        surfaces.append(("static_route", refresh_static_routes_for_device))
+    if cfg.enable_isis_sync:
+        from nso_adapter.core.isis import refresh_isis_interfaces_for_device
+
+        surfaces.append(("isis", refresh_isis_interfaces_for_device))
+    if cfg.enable_bgp_sync:
+        from nso_adapter.core.bgp import refresh_bgp_config_for_device
+
+        surfaces.append(("bgp", refresh_bgp_config_for_device))
+    if cfg.enable_ospf_sync:
+        from nso_adapter.core.ospf import refresh_ospf_for_device
+
+        surfaces.append(("ospf", refresh_ospf_for_device))
+    if cfg.enable_redistribution_sync:
+        from nso_adapter.core.redistribution import refresh_redistribution_for_device
+
+        surfaces.append(("redistribution", refresh_redistribution_for_device))
+    if cfg.enable_route_policy_sync:
+        from nso_adapter.core.route_policy import refresh_route_policy_for_device
+
+        surfaces.append(("route_policy", refresh_route_policy_for_device))
+    if cfg.enable_snmp_sync:
+        from nso_adapter.core.snmp import refresh_snmp_config_for_device
+
+        surfaces.append(("snmp", refresh_snmp_config_for_device))
+
+    for name, fn in surfaces:
+        try:
+            await fn(db, device, nso_client, refresh_source=refresh_source)
+        except Exception as exc:
+            logger.warning(
+                "sync.surface_refresh_failed",
+                device_id=device.id,
+                surface=name,
+                error=repr(exc),
+            )
+
+
 async def sync_device(device_id: int, db: AsyncSession) -> dict:
     """Full sync: NSO → DB → NetBox. Returns job result summary dict."""
 
@@ -258,6 +318,12 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
     device.mapping_status = mapping_status
     device.last_sync_at = datetime.utcnow()
     device.last_sync_status = LastSyncStatus.succeeded
+    await db.commit()
+
+    # Fan out to the routing/extra surfaces so one sync refreshes everything the device
+    # exposes (IS-IS/BGP/OSPF/route-policy/...), not just interface attributes. Done
+    # before the plugin notify so its reconcile sees the fresh surface state in one pass.
+    await refresh_routing_surfaces_for_device(db, device, client, refresh_source="sync")
     await db.commit()
 
     # Notify the netbox-nso-plugin so it refreshes its NSO*State display cache off
