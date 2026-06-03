@@ -63,51 +63,55 @@ async def _upsert_bgp_data(
                 if af_name:
                     db.add(DeviceBgpAddressFamily(scope_id=scope.id, af=af_name))
 
-            # A BGP neighbor is unique per (router, vrf); but a device may present
-            # the same neighbor IP under more than one group (e.g. inactive config or
-            # NED modeling), which would violate uq_devicebgppeer_identity and roll
-            # back the ENTIRE device refresh. Dedup within the scope (first wins).
-            seen_peers: set[str] = set()
+            # A BGP neighbor is unique per (router, vrf), but a device may list the
+            # same neighbor IP under more than one group — a violation of
+            # uq_devicebgppeer_identity that would roll back the ENTIRE device
+            # refresh. Collapse to one peer per address and MERGE their
+            # address-families (scalar peer fields: first occurrence wins).
+            peers_by_addr: dict[str, DeviceBgpPeer] = {}
+            afis_by_addr: dict[str, set[str]] = {}
             for peer_data in scope_data.get("peer", []):
                 peer_addr = peer_data.get("peer-address", "")
                 if not peer_addr:
                     continue
-                if peer_addr in seen_peers:
-                    logger.warning(
-                        "bgp.duplicate_peer_skipped",
-                        device_id=device.id,
-                        vrf=vrf,
+                peer = peers_by_addr.get(peer_addr)
+                if peer is None:
+                    peer = DeviceBgpPeer(
+                        scope_id=scope.id,
                         peer_address=peer_addr,
+                        enabled=bool(peer_data.get("enabled", True)),
+                        peer_group=peer_data.get("peer-group") or None,
+                        remote_as=str(peer_data["remote-as"]) if peer_data.get("remote-as") is not None else None,
+                        local_as=str(peer_data["local-as"]) if peer_data.get("local-as") is not None else None,
+                        ttl=peer_data.get("ttl"),
+                        password=peer_data.get("password"),
                     )
-                    continue
-                seen_peers.add(peer_addr)
-                peer = DeviceBgpPeer(
-                    scope_id=scope.id,
-                    peer_address=peer_addr,
-                    enabled=bool(peer_data.get("enabled", True)),
-                    peer_group=peer_data.get("peer-group") or None,
-                    remote_as=str(peer_data["remote-as"]) if peer_data.get("remote-as") is not None else None,
-                    local_as=str(peer_data["local-as"]) if peer_data.get("local-as") is not None else None,
-                    ttl=peer_data.get("ttl"),
-                    password=peer_data.get("password"),
-                )
-                db.add(peer)
-                await db.flush()
+                    db.add(peer)
+                    await db.flush()
+                    peers_by_addr[peer_addr] = peer
+                    afis_by_addr[peer_addr] = set()
+                else:
+                    logger.debug(
+                        "bgp.peer_merged_across_groups", device_id=device.id, vrf=vrf, peer_address=peer_addr
+                    )
 
+                seen_afis = afis_by_addr[peer_addr]
                 for paf_data in peer_data.get("peer-address-family", []):
                     paf_name = paf_data.get("afi", "")
-                    if paf_name:
-                        db.add(
-                            DeviceBgpPeerAddressFamily(
-                                peer_id=peer.id,
-                                af=paf_name,
-                                enabled=bool(paf_data.get("enabled", True)),
-                                routemap_in=paf_data.get("routemap-in") or None,
-                                routemap_out=paf_data.get("routemap-out") or None,
-                                prefixlist_in=paf_data.get("prefixlist-in") or None,
-                                prefixlist_out=paf_data.get("prefixlist-out") or None,
-                            )
+                    if not paf_name or paf_name in seen_afis:
+                        continue
+                    seen_afis.add(paf_name)
+                    db.add(
+                        DeviceBgpPeerAddressFamily(
+                            peer_id=peer.id,
+                            af=paf_name,
+                            enabled=bool(paf_data.get("enabled", True)),
+                            routemap_in=paf_data.get("routemap-in") or None,
+                            routemap_out=paf_data.get("routemap-out") or None,
+                            prefixlist_in=paf_data.get("prefixlist-in") or None,
+                            prefixlist_out=paf_data.get("prefixlist-out") or None,
                         )
+                    )
 
     await db.commit()
 
