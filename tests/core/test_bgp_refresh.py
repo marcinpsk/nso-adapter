@@ -75,3 +75,65 @@ async def test_duplicate_peer_merges_address_families(adapter_client):
         afs = (await db.execute(select(DeviceBgpPeerAddressFamily))).scalars().all()
         assert sorted(a.af for a in afs) == ["ipv4-unicast", "ipv6-unicast"]
         break
+
+
+async def test_inactive_peer_stored_disabled(adapter_client):
+    """A deactivated (enabled=false) neighbor is stored with enabled=False."""
+    from nso_adapter.core.bgp import _upsert_bgp_data
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device, DeviceBgpPeer
+
+    device_id = await seed_device(nso_device_name="bgp-inactive", netbox_device_id=882)
+    routers = [
+        {
+            "asn": "65100",
+            "scope": [
+                {
+                    "vrf": "",
+                    "address-family": [{"af": "ipv4-unicast"}],
+                    "peer": [
+                        {"peer-address": "10.0.0.1", "peer-group": "up", "enabled": True},
+                        {"peer-address": "10.0.0.2", "peer-group": "down", "enabled": False},
+                    ],
+                }
+            ],
+        }
+    ]
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        await _upsert_bgp_data(db, device, routers, "test")
+        by_addr = {p.peer_address: p.enabled for p in (await db.execute(select(DeviceBgpPeer))).scalars().all()}
+        assert by_addr == {"10.0.0.1": True, "10.0.0.2": False}
+        break
+
+
+async def test_peer_enabled_in_any_group_wins_on_merge(adapter_client):
+    """Same neighbor in a deactivated and an active group → merged peer is enabled."""
+    from nso_adapter.core.bgp import _upsert_bgp_data
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device, DeviceBgpPeer
+
+    device_id = await seed_device(nso_device_name="bgp-mixed", netbox_device_id=883)
+    routers = [
+        {
+            "asn": "65100",
+            "scope": [
+                {
+                    "vrf": "",
+                    "address-family": [{"af": "ipv4-unicast"}],
+                    "peer": [
+                        # deactivated occurrence first, active second — OR must win.
+                        {"peer-address": "10.0.0.9", "peer-group": "down", "enabled": False},
+                        {"peer-address": "10.0.0.9", "peer-group": "up", "enabled": True},
+                    ],
+                }
+            ],
+        }
+    ]
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        await _upsert_bgp_data(db, device, routers, "test")
+        peers = (await db.execute(select(DeviceBgpPeer))).scalars().all()
+        assert len(peers) == 1
+        assert peers[0].enabled is True
+        break

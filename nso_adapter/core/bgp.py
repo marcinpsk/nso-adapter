@@ -91,6 +91,10 @@ async def _upsert_bgp_data(
                     peers_by_addr[peer_addr] = peer
                     afis_by_addr[peer_addr] = set()
                 else:
+                    # Same peer in multiple groups (e.g. one active, one deactivated):
+                    # the peer is enabled if ANY occurrence is active.
+                    if bool(peer_data.get("enabled", True)):
+                        peer.enabled = True
                     logger.debug(
                         "bgp.peer_merged_across_groups", device_id=device.id, vrf=vrf, peer_address=peer_addr
                     )
