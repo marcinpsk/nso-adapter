@@ -110,8 +110,10 @@ async def _upsert_bgp_data(
                             peer_id=peer.id,
                             af=paf_name,
                             enabled=bool(paf_data.get("enabled", True)),
-                            routemap_in=paf_data.get("routemap-in") or None,
-                            routemap_out=paf_data.get("routemap-out") or None,
+                            # IOS splits route-map vs prefix-list; Junos/Timos use a single
+                            # per-AF policy (policy-in/out) which maps to a route-map.
+                            routemap_in=paf_data.get("routemap-in") or paf_data.get("policy-in") or None,
+                            routemap_out=paf_data.get("routemap-out") or paf_data.get("policy-out") or None,
                             prefixlist_in=paf_data.get("prefixlist-in") or None,
                             prefixlist_out=paf_data.get("prefixlist-out") or None,
                         )

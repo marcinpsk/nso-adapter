@@ -137,3 +137,43 @@ async def test_peer_enabled_in_any_group_wins_on_merge(adapter_client):
         assert len(peers) == 1
         assert peers[0].enabled is True
         break
+
+async def test_peer_af_policy_in_maps_to_routemap(adapter_client):
+    """Junos/Timos per-AF policy-in/out map to routemap_in/out; IOS routemap-in too."""
+    from nso_adapter.core.bgp import _upsert_bgp_data
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device, DeviceBgpPeerAddressFamily
+
+    device_id = await seed_device(nso_device_name="bgp-pol", netbox_device_id=882)
+    routers = [
+        {
+            "asn": "65100",
+            "scope": [
+                {
+                    "vrf": "",
+                    "address-family": [{"af": "ipv4-unicast"}],
+                    "peer": [
+                        {
+                            "peer-address": "10.0.0.1",
+                            "peer-address-family": [
+                                {"afi": "ipv4-unicast", "policy-in": "PIN", "policy-out": "POUT"}
+                            ],
+                        },
+                        {
+                            "peer-address": "10.0.0.2",
+                            "peer-address-family": [
+                                {"afi": "ipv4-unicast", "routemap-in": "RIN", "prefixlist-out": "PLO"}
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+    ]
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        await _upsert_bgp_data(db, device, routers, "test")
+        afs = {(a.routemap_in, a.routemap_out, a.prefixlist_out) for a in (await db.execute(select(DeviceBgpPeerAddressFamily))).scalars().all()}
+        assert ("PIN", "POUT", None) in afs  # policy-in/out -> routemap_in/out
+        assert ("RIN", None, "PLO") in afs   # IOS routemap-in + prefixlist-out
+        break
