@@ -60,6 +60,99 @@ async def onboard_device(
     return device
 
 
+async def provision_nso_device(
+    db: AsyncSession,
+    *,
+    nso_instance: str,
+    device_name: str,
+    address: str,
+    ned_id: str,
+    authgroup: str,
+    netbox_device_id: int | None = None,
+    ned_type: str = "cli",
+    port: int | None = None,
+    admin_state: str = "unlocked",
+    do_sync: bool = True,
+) -> dict:
+    """Provision a device INTO NSO and bring it up, then map it in the adapter.
+
+    Sequence (each step recorded; stops on a failure that blocks the next):
+      1. create the device node (idempotent — skipped if it already exists)
+      2. ssh fetch-host-keys (TOFU) — needs the device reachable
+      3. set admin-state (unlocked)
+      4. sync-from (pull running config into CDB) — non-fatal; normal sync retries
+      5. create the adapter Device mapping row (if ``netbox_device_id`` given)
+
+    On a blocking failure the device is left in NSO as-is for retry (no rollback).
+    Returns ``{"ok": bool, "steps": [...], "device_id": int|None}``.
+    """
+    from nso_adapter.core.importer import get_nso_client
+
+    known = {inst.name for inst in get_config().nso_instances}
+    if nso_instance not in known:
+        raise ValueError(f"NSO instance {nso_instance!r} not found in config")
+
+    client = get_nso_client(nso_instance)
+    steps: list[dict] = []
+
+    def _step(name: str, status: str, detail: str | None = None) -> None:
+        entry = {"step": name, "status": status}
+        if detail:
+            entry["detail"] = detail
+        steps.append(entry)
+
+    def _result(ok: bool, device_id: int | None = None) -> dict:
+        return {"ok": ok, "steps": steps, "device_id": device_id}
+
+    # 1. create node (idempotent)
+    try:
+        if await client.device_exists(device_name):
+            _step("create", "exists")
+        else:
+            await client.create_device(device_name, address, ned_id, authgroup, ned_type=ned_type, port=port)
+            _step("create", "ok")
+    except Exception as exc:
+        _step("create", "failed", repr(exc))
+        return _result(False)
+
+    # 2. fetch host keys (needs reachability) — blocking
+    try:
+        await client.fetch_host_keys(device_name)
+        _step("fetch_host_keys", "ok")
+    except Exception as exc:
+        _step("fetch_host_keys", "failed", repr(exc))
+        return _result(False)
+
+    # 3. admin-state unlocked — blocking
+    try:
+        await client.set_admin_state(device_name, admin_state)
+        _step("admin_state", "ok", admin_state)
+    except Exception as exc:
+        _step("admin_state", "failed", repr(exc))
+        return _result(False)
+
+    # 4. sync-from — non-fatal (the adapter's normal sync will retry)
+    if do_sync:
+        try:
+            ok = await client.sync_from(device_name)
+            _step("sync_from", "ok" if ok else "failed")
+        except Exception as exc:
+            _step("sync_from", "failed", repr(exc))
+
+    # 5. adapter mapping row (so the read pipeline manages it henceforth)
+    device_id = None
+    if netbox_device_id is not None:
+        try:
+            row = await onboard_device(db, nso_instance, device_name, netbox_device_id)
+            device_id = row.id
+            _step("adapter_mapping", "ok")
+        except LookupError as exc:
+            _step("adapter_mapping", "exists", repr(exc))
+
+    logger.info("device.provisioned", nso_device=device_name, instance=nso_instance, steps=steps)
+    return _result(True, device_id)
+
+
 async def rekey_device(
     db: AsyncSession,
     device: Device,

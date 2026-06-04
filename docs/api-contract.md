@@ -221,6 +221,35 @@ Request:
 → `201` device object (as above). `409 conflict` if the NetBox device or NSO
 device is already onboarded.
 
+This onboard only creates the adapter **mapping row**; it assumes the device node
+already exists in NSO. To create the device *in NSO* and bring it up, use
+`/provision` below.
+
+### `POST /api/v1/devices/provision` — create the device in NSO + bring it up
+Request:
+```json
+{ "nso_instance": "nso-prod", "device_name": "core-rtr-01",
+  "address": "10.0.0.1", "ned_id": "cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+  "authgroup": "network", "netbox_device_id": 42,
+  "ned_type": "cli", "port": null, "admin_state": "unlocked", "sync": true }
+```
+Runs the NSO onboarding sequence — **create** the device node (idempotent) →
+**ssh fetch-host-keys** (TOFU; needs the device reachable) → set **admin-state**
+(unlocked) → **sync-from** (non-fatal) → create the adapter **mapping** row (when
+`netbox_device_id` is given). Always `200` (even when a blocking step fails — the
+device is left in NSO for retry); inspect the body:
+```json
+{ "ok": true, "device_id": 17,
+  "steps": [ {"step": "create", "status": "ok"},
+             {"step": "fetch_host_keys", "status": "ok"},
+             {"step": "admin_state", "status": "ok", "detail": "unlocked"},
+             {"step": "sync_from", "status": "ok"},
+             {"step": "adapter_mapping", "status": "ok"} ] }
+```
+Step `status` ∈ `ok | exists | failed`; a `failed` blocking step (create /
+fetch_host_keys / admin_state) sets `ok=false` and stops. `422` if `nso_instance`
+is unknown.
+
 ### `GET /api/v1/devices/{id}` → `200`
 Device object plus `scope` (see below) and `last_job_id`.
 

@@ -293,3 +293,68 @@ class NsoClient:
                 return sync_result == "in-sync"
             except httpx.HTTPStatusError:
                 return False
+
+    # ── Onboarding (write/action) — create the device node + bring it up ──────
+
+    async def device_exists(self, device_name: str) -> bool:
+        """Return True if a device with this name already exists in NSO."""
+        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={device_name}"
+        async with self._client() as c:
+            resp = await c.get(url, params={"fields": "name"})
+            if resp.status_code == 404:
+                return False
+            resp.raise_for_status()
+            return True
+
+    async def create_device(
+        self,
+        device_name: str,
+        address: str,
+        ned_id: str,
+        authgroup: str,
+        *,
+        ned_type: str = "cli",
+        port: int | None = None,
+    ) -> None:
+        """Create (PUT) a device node: address, authgroup, device-type/ned-id, port.
+
+        ``ned_type`` is the transport (cli/netconf/generic). The device is created
+        in its default admin-state; the caller unlocks it explicitly afterwards.
+        """
+        entry: dict = {
+            "name": device_name,
+            "address": address,
+            "authgroup": authgroup,
+            "device-type": {ned_type: {"ned-id": ned_id}},
+        }
+        if port is not None:
+            entry["port"] = port
+        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={device_name}"
+        async with self._client() as c:
+            resp = await c.put(url, json={"tailf-ncs:device": [entry]})
+            resp.raise_for_status()
+
+    async def set_admin_state(self, device_name: str, admin_state: str = "unlocked") -> None:
+        """PATCH the device's admin-state (e.g. ``unlocked``)."""
+        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={device_name}"
+        body = {"tailf-ncs:device": [{"name": device_name, "state": {"admin-state": admin_state}}]}
+        async with self._client() as c:
+            resp = await c.patch(url, json=body)
+            resp.raise_for_status()
+
+    async def _device_action(self, device_name: str, action: str) -> dict:
+        """POST a device action (e.g. ``ssh/fetch-host-keys``, ``sync-from``)."""
+        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={device_name}/{action}"
+        async with self._client(self._action_timeout) as c:
+            resp = await c.post(url)
+            resp.raise_for_status()
+            return resp.json() if resp.content else {}
+
+    async def fetch_host_keys(self, device_name: str) -> dict:
+        """Fetch (TOFU-trust) the device's SSH host keys. Returns the action output."""
+        return await self._device_action(device_name, "ssh/fetch-host-keys")
+
+    async def sync_from(self, device_name: str) -> bool:
+        """Pull the device's running config into NSO's CDB. Returns the result bool."""
+        out = await self._device_action(device_name, "sync-from")
+        return bool(out.get("tailf-ncs:output", {}).get("result", False))

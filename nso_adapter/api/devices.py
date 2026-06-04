@@ -88,6 +88,45 @@ async def onboard_device(body: DeviceCreate, db: AsyncSession = Depends(get_db))
     return _device_out(device)
 
 
+class DeviceProvision(BaseModel):
+    nso_instance: str
+    device_name: str
+    address: str
+    ned_id: str
+    authgroup: str
+    netbox_device_id: int | None = None
+    ned_type: str = "cli"
+    port: int | None = None
+    admin_state: str = "unlocked"
+    sync: bool = True
+
+
+@router.post("/provision", dependencies=[Depends(verify_token)])
+async def provision_device(body: DeviceProvision, db: AsyncSession = Depends(get_db)):
+    """Provision a device INTO NSO: create node → fetch-host-keys → unlock → sync-from,
+    then create the adapter mapping. Returns the step-by-step result (200 even on a
+    blocking step failure — inspect ``ok``/``steps``; the device is left for retry)."""
+    from nso_adapter.core.onboarding import provision_nso_device
+
+    try:
+        result = await provision_nso_device(
+            db,
+            nso_instance=body.nso_instance,
+            device_name=body.device_name,
+            address=body.address,
+            ned_id=body.ned_id,
+            authgroup=body.authgroup,
+            netbox_device_id=body.netbox_device_id,
+            ned_type=body.ned_type,
+            port=body.port,
+            admin_state=body.admin_state,
+            do_sync=body.sync,
+        )
+    except ValueError as exc:
+        raise api_error(422, "validation_error", str(exc))
+    return result
+
+
 @router.get("/by-nso", dependencies=[Depends(verify_token)])
 async def get_device_by_nso(instance: str, name: str, db: AsyncSession = Depends(get_db)):
     """Look up an adapter Device by its NSO coordinates.
