@@ -201,6 +201,21 @@ class NsoClient:
             entries = data.get("network-state-export:device") or data.get("device", [])
             return entries[0] if entries else None
 
+    async def get_logging_config(self, device_name: str) -> dict | None:
+        """Return the logging-config entry for *device_name* from the package oper-data.
+
+        Returns None if the device has no logging config (404).
+        """
+        url = f"{self._base}/restconf/data/network-state-export:logging-config/device={device_name}"
+        async with self._client() as c:
+            resp = await c.get(url)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            entries = data.get("network-state-export:device") or data.get("device", [])
+            return entries[0] if entries else None
+
     async def get_static_routes(self, device_name: str) -> dict | None:
         """Return the static-route entry for *device_name* from the NSO package oper-data.
 

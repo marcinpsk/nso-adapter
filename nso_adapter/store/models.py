@@ -99,6 +99,9 @@ class Device(Base):
     snmp_system_info: Mapped[SnmpSystemInfo | None] = relationship(
         "SnmpSystemInfo", back_populates="device", uselist=False, cascade="all, delete-orphan", lazy="raise"
     )
+    logging_hosts: Mapped[list[DeviceLoggingHost]] = relationship(
+        "DeviceLoggingHost", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
     snmp_community_intents: Mapped[list[SnmpCommunityIntent]] = relationship(
         "SnmpCommunityIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
@@ -442,6 +445,32 @@ class SnmpHost(Base):
     refresh_source: Mapped[str] = mapped_column(String(64), nullable=False)
 
     device: Mapped[Device] = relationship("Device", back_populates="snmp_hosts")
+
+
+class DeviceLoggingHost(Base):
+    """Read mirror of a remote syslog server (logging host) from device config.
+
+    Non-secret fields only: address, port, severity, facility, transport, vrf, source.
+    """
+
+    __tablename__ = "device_logging_host"
+    __table_args__ = (UniqueConstraint("device_id", "address", name="uq_logginghost_device_address"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    address: Mapped[str] = mapped_column(String(256), nullable=False)
+    port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    severity: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    facility: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    transport: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    vrf: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    last_refreshed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    refresh_source: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    device: Mapped[Device] = relationship("Device", back_populates="logging_hosts")
 
 
 class SnmpSystemInfo(Base):

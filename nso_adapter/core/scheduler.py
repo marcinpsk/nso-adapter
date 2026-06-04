@@ -386,6 +386,25 @@ async def _scheduled_snmp_refresh() -> None:
             await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
 
 
+async def _scheduled_logging_refresh() -> None:
+    """Periodic fallback: refresh logging/syslog config for all managed devices."""
+    from sqlalchemy import select
+
+    from nso_adapter.core.importer import get_nso_client
+    from nso_adapter.core.logging_config import refresh_logging_config_for_device
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device
+
+    async for db in get_session():
+        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
+        for device in result.scalars().all():
+            try:
+                nso_client = get_nso_client(device.nso_instance)
+            except RuntimeError:
+                continue
+            await refresh_logging_config_for_device(db, device, nso_client, refresh_source="poll")
+
+
 async def _scheduled_route_policy_refresh() -> None:
     """Periodic fallback: refresh route-policy objects for all managed devices."""
     from sqlalchemy import select
@@ -519,6 +538,13 @@ def start_scheduler() -> None:
             "interval",
             minutes=cfg.scheduler.snmp_poll_interval,
             id="snmp_refresh",
+        )
+    if cfg.scheduler.enable_logging_sync and cfg.scheduler.logging_poll_interval > 0:
+        _scheduler.add_job(
+            _scheduled_logging_refresh,
+            "interval",
+            minutes=cfg.scheduler.logging_poll_interval,
+            id="logging_refresh",
         )
     if cfg.scheduler.enable_route_policy_sync and cfg.scheduler.route_policy_poll_interval > 0:
         _scheduler.add_job(

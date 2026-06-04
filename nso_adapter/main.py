@@ -21,6 +21,7 @@ from nso_adapter.api.interfaces import router as interfaces_router
 from nso_adapter.api.isis import router as isis_router
 from nso_adapter.api.jobs import router as jobs_router
 from nso_adapter.api.lag_topology import router as lag_topology_router
+from nso_adapter.api.logging_config import router as logging_config_router
 from nso_adapter.api.nso_instances import router as nso_instances_router
 from nso_adapter.api.ospf import router as ospf_router
 from nso_adapter.api.redistribution import router as redistribution_router
@@ -178,6 +179,7 @@ def create_app() -> FastAPI:
     app.include_router(lag_topology_router)
     app.include_router(interface_ip_router)
     app.include_router(snmp_router)
+    app.include_router(logging_config_router)
     app.include_router(static_route_router)
     app.include_router(isis_router)
     app.include_router(bgp_router)
