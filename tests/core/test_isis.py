@@ -89,3 +89,29 @@ async def test_refresh_cisco_interface_has_no_bound_port(adapter_client):
         )
         row = result.scalars().one()
         assert row.bound_port is None
+
+
+@pytest.mark.anyio
+async def test_refresh_persists_hello_auth(adapter_client):
+    """Per-interface IS-IS hello auth (type + present) is mirrored secret-safe."""
+    device_id = await seed_device(nso_device_name="isis-hauth01", netbox_device_id=961)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_isis_interfaces.return_value = {
+            "process": [],
+            "interface": [
+                {"interface-name": "ae10.0", "af": "ipv4", "hello-auth-type": "md5", "hello-auth-present": True},
+                {"interface-name": "ae11.0", "af": "ipv4"},  # no hello auth
+            ],
+        }
+
+        await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
+
+        result = await db.execute(
+            select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id)
+        )
+        by_name = {r.interface_name: r for r in result.scalars().all()}
+        assert by_name["ae10.0"].hello_auth_type == "md5"
+        assert by_name["ae10.0"].hello_auth_present is True
+        assert by_name["ae11.0"].hello_auth_type is None
+        assert by_name["ae11.0"].hello_auth_present is None

@@ -684,6 +684,10 @@ class DeviceIsisInterface(Base):
     # Lets the plugin correlate a Nokia IS-IS interface to its NetBox dcim.Interface
     # (named by port-id). Absent (None) for Cisco/Junos and Nokia loopbacks.
     bound_port: Mapped[str | None] = mapped_column(String(256), nullable=True, default=None)
+    # Per-interface IIH (hello) authentication, secret-safe: type normalised to
+    # md5/text + a present flag. The key itself is never mirrored.
+    hello_auth_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    hello_auth_present: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
 
