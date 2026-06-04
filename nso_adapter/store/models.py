@@ -779,6 +779,9 @@ class DeviceBgpScope(Base):
     peers: Mapped[list[DeviceBgpPeer]] = relationship(
         "DeviceBgpPeer", back_populates="scope", cascade="all, delete-orphan", lazy="raise"
     )
+    peer_groups: Mapped[list[DeviceBgpPeerGroup]] = relationship(
+        "DeviceBgpPeerGroup", back_populates="scope", cascade="all, delete-orphan", lazy="raise"
+    )
 
 
 class DeviceBgpAddressFamily(Base):
@@ -840,6 +843,55 @@ class DeviceBgpPeerAddressFamily(Base):
     prefixlist_out: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     peer: Mapped[DeviceBgpPeer] = relationship("DeviceBgpPeer", back_populates="peer_address_families")
+
+
+class DeviceBgpPeerGroup(Base):
+    """Read mirror of a BGP peer-group / template object (shared by member peers).
+
+    IOS ``neighbor-tag``, Junos/Nokia ``group``. Members reference it by name via
+    DeviceBgpPeer.peer_group; this row carries the group's OWN config + per-AF
+    policies so it can be modelled as a shared BGPPeerTemplate in NetBox.
+    """
+
+    __tablename__ = "device_bgp_peer_group"
+    __table_args__ = (UniqueConstraint("scope_id", "name", name="uq_devicebgppeergroup_identity"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scope_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("device_bgp_scope.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    remote_as: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    source: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
+    scope: Mapped[DeviceBgpScope] = relationship("DeviceBgpScope", back_populates="peer_groups")
+    address_families: Mapped[list[DeviceBgpPeerGroupAddressFamily]] = relationship(
+        "DeviceBgpPeerGroupAddressFamily",
+        back_populates="peer_group",
+        cascade="all, delete-orphan",
+        lazy="raise",
+    )
+
+
+class DeviceBgpPeerGroupAddressFamily(Base):
+    """Read mirror of a per-AF policy object configured on a BGP peer-group."""
+
+    __tablename__ = "device_bgp_peer_group_af"
+    __table_args__ = (UniqueConstraint("peer_group_id", "af", name="uq_devicebgppeergroupaf_identity"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    peer_group_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("device_bgp_peer_group.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    af: Mapped[str] = mapped_column(String(32), nullable=False)  # e.g. "ipv4-unicast"
+    routemap_in: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    routemap_out: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    prefixlist_in: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    prefixlist_out: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    peer_group: Mapped[DeviceBgpPeerGroup] = relationship(
+        "DeviceBgpPeerGroup", back_populates="address_families"
+    )
 
 
 # ---------------------------------------------------------------------------

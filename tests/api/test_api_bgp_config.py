@@ -197,6 +197,52 @@ async def test_bgp_config_peer_af_policy_refs_returned(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_bgp_config_peer_groups_returned(adapter_client):
+    """Peer-group objects + their per-AF policies are serialized under the scope (full-B)."""
+    device_id = await seed_device(nso_device_name="bgp-pg-api-dev", netbox_device_id=907)
+    await seed_bgp_config(
+        device_id,
+        asn="65100",
+        scopes=[
+            {
+                "vrf": "",
+                "afs": ["ipv4-unicast"],
+                "peers": [],
+                "peer_groups": [
+                    {
+                        "name": "Arbor-IBGP",
+                        "remote_as": "65100",
+                        "source": "Loopback4",
+                        "af_defs": [
+                            {
+                                "af": "ipv4-unicast",
+                                "routemap_in": "Arbor-IBGP-in",
+                                "routemap_out": "Arbor-IBGP-out",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
+    assert resp.status_code == 200
+    scope = resp.json()["routers"][0]["scopes"][0]
+    assert len(scope["peer_groups"]) == 1
+    pg = scope["peer_groups"][0]
+    assert pg["name"] == "Arbor-IBGP"
+    assert pg["remote_as"] == "65100"
+    assert pg["source"] == "Loopback4"
+    assert len(pg["address_families"]) == 1
+    af = pg["address_families"][0]
+    assert af["af"] == "ipv4-unicast"
+    assert af["routemap_in"] == "Arbor-IBGP-in"
+    assert af["routemap_out"] == "Arbor-IBGP-out"
+    assert "prefixlist_in" not in af  # omitted when None
+
+
+@pytest.mark.anyio
 async def test_bgp_config_peer_af_policy_refs_omitted_when_null(adapter_client):
     """Policy ref fields are absent (not null) in the response when all are None."""
     device_id = await seed_device(nso_device_name="bgp-no-policy-dev", netbox_device_id=906)

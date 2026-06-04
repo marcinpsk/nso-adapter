@@ -21,6 +21,8 @@ from nso_adapter.store.models import (
     DeviceBgpAddressFamily,
     DeviceBgpPeer,
     DeviceBgpPeerAddressFamily,
+    DeviceBgpPeerGroup,
+    DeviceBgpPeerGroupAddressFamily,
     DeviceBgpRouter,
     DeviceBgpScope,
 )
@@ -117,6 +119,39 @@ async def _upsert_bgp_data(
                             routemap_out=paf_data.get("routemap-out") or paf_data.get("policy-out") or None,
                             prefixlist_in=paf_data.get("prefixlist-in") or None,
                             prefixlist_out=paf_data.get("prefixlist-out") or None,
+                        )
+                    )
+
+            # Peer-group / template objects with their own per-AF policies.
+            seen_pg: set[str] = set()
+            for pg_data in scope_data.get("peer-group", []):
+                pg_name = pg_data.get("name", "")
+                if not pg_name or pg_name in seen_pg:
+                    continue
+                seen_pg.add(pg_name)
+                pg = DeviceBgpPeerGroup(
+                    scope_id=scope.id,
+                    name=pg_name,
+                    remote_as=str(pg_data["remote-as"]) if pg_data.get("remote-as") is not None else None,
+                    source=pg_data.get("source") or None,
+                )
+                db.add(pg)
+                await db.flush()
+
+                seen_pg_afis: set[str] = set()
+                for pgaf_data in pg_data.get("peer-group-address-family", []):
+                    pgaf_name = pgaf_data.get("afi", "")
+                    if not pgaf_name or pgaf_name in seen_pg_afis:
+                        continue
+                    seen_pg_afis.add(pgaf_name)
+                    db.add(
+                        DeviceBgpPeerGroupAddressFamily(
+                            peer_group_id=pg.id,
+                            af=pgaf_name,
+                            routemap_in=pgaf_data.get("routemap-in") or pgaf_data.get("policy-in") or None,
+                            routemap_out=pgaf_data.get("routemap-out") or pgaf_data.get("policy-out") or None,
+                            prefixlist_in=pgaf_data.get("prefixlist-in") or None,
+                            prefixlist_out=pgaf_data.get("prefixlist-out") or None,
                         )
                     )
 

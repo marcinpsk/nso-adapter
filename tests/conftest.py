@@ -245,6 +245,8 @@ async def seed_bgp_config(
         DeviceBgpAddressFamily,
         DeviceBgpPeer,
         DeviceBgpPeerAddressFamily,
+        DeviceBgpPeerGroup,
+        DeviceBgpPeerGroupAddressFamily,
         DeviceBgpRouter,
         DeviceBgpScope,
     )
@@ -288,6 +290,26 @@ async def seed_bgp_config(
                             routemap_out=paf_def.get("routemap_out"),
                             prefixlist_in=paf_def.get("prefixlist_in"),
                             prefixlist_out=paf_def.get("prefixlist_out"),
+                        )
+                    )
+            for pg_def in scope_def.get("peer_groups", []):
+                pg = DeviceBgpPeerGroup(
+                    scope_id=scope.id,
+                    name=pg_def.get("name", "PG"),
+                    remote_as=pg_def.get("remote_as"),
+                    source=pg_def.get("source"),
+                )
+                db.add(pg)
+                await db.flush()
+                for pgaf_def in pg_def.get("af_defs", []):
+                    db.add(
+                        DeviceBgpPeerGroupAddressFamily(
+                            peer_group_id=pg.id,
+                            af=pgaf_def["af"],
+                            routemap_in=pgaf_def.get("routemap_in"),
+                            routemap_out=pgaf_def.get("routemap_out"),
+                            prefixlist_in=pgaf_def.get("prefixlist_in"),
+                            prefixlist_out=pgaf_def.get("prefixlist_out"),
                         )
                     )
         await db.commit()

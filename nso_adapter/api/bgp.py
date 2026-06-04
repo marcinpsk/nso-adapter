@@ -24,6 +24,8 @@ from nso_adapter.store.models import (
     DeviceBgpAddressFamily,
     DeviceBgpPeer,
     DeviceBgpPeerAddressFamily,
+    DeviceBgpPeerGroup,
+    DeviceBgpPeerGroupAddressFamily,
     DeviceBgpRouter,
     DeviceBgpScope,
     DeviceSettings,
@@ -123,6 +125,37 @@ async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_db)):
         ):
             peer_afs_by_peer[paf.peer_id].append(paf)
 
+    pgs_by_scope: dict[int, list[DeviceBgpPeerGroup]] = {s_id: [] for s_id in scope_ids}
+    if scope_ids:
+        for pg in (
+            (
+                await db.execute(
+                    select(DeviceBgpPeerGroup)
+                    .where(DeviceBgpPeerGroup.scope_id.in_(scope_ids))
+                    .order_by(DeviceBgpPeerGroup.name)
+                )
+            )
+            .scalars()
+            .all()
+        ):
+            pgs_by_scope[pg.scope_id].append(pg)
+
+    pg_ids = [g.id for pgs in pgs_by_scope.values() for g in pgs]
+    pg_afs_by_pg: dict[int, list[DeviceBgpPeerGroupAddressFamily]] = {g_id: [] for g_id in pg_ids}
+    if pg_ids:
+        for pgaf in (
+            (
+                await db.execute(
+                    select(DeviceBgpPeerGroupAddressFamily)
+                    .where(DeviceBgpPeerGroupAddressFamily.peer_group_id.in_(pg_ids))
+                    .order_by(DeviceBgpPeerGroupAddressFamily.af)
+                )
+            )
+            .scalars()
+            .all()
+        ):
+            pg_afs_by_pg[pgaf.peer_group_id].append(pgaf)
+
     latest_ts = max((r.last_refreshed_at for r in bgp_routers if r.last_refreshed_at), default=None)
     refresh_source = bgp_routers[0].refresh_source
 
@@ -162,11 +195,31 @@ async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_db)):
                     peer_entry["source"] = peer.source
                 peers_out.append(peer_entry)
 
+            peer_groups_out = []
+            for pg in pgs_by_scope.get(scope.id, []):
+                pg_afs_out = [
+                    {
+                        "af": pgaf.af,
+                        **({"routemap_in": pgaf.routemap_in} if pgaf.routemap_in else {}),
+                        **({"routemap_out": pgaf.routemap_out} if pgaf.routemap_out else {}),
+                        **({"prefixlist_in": pgaf.prefixlist_in} if pgaf.prefixlist_in else {}),
+                        **({"prefixlist_out": pgaf.prefixlist_out} if pgaf.prefixlist_out else {}),
+                    }
+                    for pgaf in pg_afs_by_pg.get(pg.id, [])
+                ]
+                pg_entry: dict = {"name": pg.name, "address_families": pg_afs_out}
+                if pg.remote_as is not None:
+                    pg_entry["remote_as"] = pg.remote_as
+                if pg.source is not None:
+                    pg_entry["source"] = pg.source
+                peer_groups_out.append(pg_entry)
+
             scopes_out.append(
                 {
                     "vrf": scope.vrf,
                     "address_families": [af.af for af in afs_by_scope.get(scope.id, [])],
                     "peers": peers_out,
+                    "peer_groups": peer_groups_out,
                 }
             )
 

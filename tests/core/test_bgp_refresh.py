@@ -203,3 +203,56 @@ async def test_peer_source_imported(adapter_client):
         peers = (await db.execute(select(DeviceBgpPeer))).scalars().all()
         assert peers[0].source == "84.116.255.1"
         break
+
+
+async def test_peer_group_object_imported(adapter_client):
+    """Peer-group objects + their per-AF policies are mirrored (M15 B1, full-B)."""
+    from nso_adapter.core.bgp import _upsert_bgp_data
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import (
+        Device,
+        DeviceBgpPeerGroup,
+        DeviceBgpPeerGroupAddressFamily,
+    )
+
+    device_id = await seed_device(nso_device_name="bgp-pg", netbox_device_id=884)
+    routers = [
+        {
+            "asn": "65100",
+            "scope": [
+                {
+                    "vrf": "",
+                    "address-family": [{"af": "ipv4-unicast"}],
+                    "peer": [],
+                    "peer-group": [
+                        {
+                            "name": "Arbor-IBGP",
+                            "remote-as": "65100",
+                            "source": "Loopback4",
+                            "peer-group-address-family": [
+                                {
+                                    "afi": "ipv4-unicast",
+                                    "routemap-in": "Arbor-IBGP-in",
+                                    "routemap-out": "Arbor-IBGP-out",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+    ]
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        await _upsert_bgp_data(db, device, routers, "test")
+        pgs = (await db.execute(select(DeviceBgpPeerGroup))).scalars().all()
+        assert len(pgs) == 1
+        assert pgs[0].name == "Arbor-IBGP"
+        assert pgs[0].remote_as == "65100"
+        assert pgs[0].source == "Loopback4"
+        pgafs = (await db.execute(select(DeviceBgpPeerGroupAddressFamily))).scalars().all()
+        assert len(pgafs) == 1
+        assert pgafs[0].af == "ipv4-unicast"
+        assert pgafs[0].routemap_in == "Arbor-IBGP-in"
+        assert pgafs[0].routemap_out == "Arbor-IBGP-out"
+        break
