@@ -86,3 +86,26 @@ async def list_instance_devices(instance_id: str, db: AsyncSession = Depends(get
 
     out.sort(key=lambda x: x["name"])
     return out
+
+
+@router.get("/{instance_id}/neds", dependencies=[Depends(verify_token)])
+async def list_instance_neds(instance_id: str):
+    """Return the NED packages installed on *instance_id* (the available NEDs).
+
+    Each entry: {ned_id, package, version, oper_status, vendor, operating_systems,
+    product_families, platform}. ``platform`` is the short family label
+    (:func:`ned_family`) when recognised, for matching NetBox platforms.
+
+    404 if the instance is unknown, 502 on NSO connectivity error.
+    """
+    cfg = get_config()
+    if not any(inst.name == instance_id for inst in cfg.nso_instances):
+        raise api_error(404, "not_found", f"NSO instance '{instance_id}' not found")
+    try:
+        client = get_nso_client(instance_id)
+        neds = await client.list_ned_packages()
+    except Exception as exc:
+        raise api_error(502, "nso_unreachable", str(exc)) from exc
+    for n in neds:
+        n["platform"] = ned_family(n["ned_id"]) if n.get("ned_id") else None
+    return neds

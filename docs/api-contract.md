@@ -141,6 +141,36 @@ fields are always present (never omitted).
 `404` if `{id}` is not a configured NSO instance.
 `502` on NSO connectivity error.
 
+### `GET /api/v1/nso-instances/{id}/neds` → `200 | 404 | 502`
+
+Returns the **NED packages installed** on the named NSO instance (the *available*
+NEDs an operator can onboard a device with). Read live from
+`tailf-ncs:packages/package`; only packages exposing a `ned` component are
+returned — service/application packages (the reconcilers, auth, observability)
+are excluded.
+
+```json
+[
+  {
+    "ned_id":            "cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+    "package":           "cisco-ios-cli-6.114",
+    "version":           "6.114",
+    "oper_status":       "up",
+    "vendor":            "Cisco",
+    "operating_systems": ["IOS", "IOS-XE"],
+    "product_families":  ["Cisco ASR 1000 Series Aggregation Services Routers"],
+    "platform":          "ios"
+  }
+]
+```
+
+`platform` is the short family label (same derivation as `/devices`), `null` when
+the NED prefix is unrecognised. `vendor`/`operating_systems`/`product_families`
+come from the NED's `device` metadata and drive NetBox-platform → NED matching.
+
+`404` if `{id}` is not a configured NSO instance.
+`502` on NSO connectivity error.
+
 ## Devices
 
 A *device* is a NetBox device onboarded into the adapter and linked to an NSO

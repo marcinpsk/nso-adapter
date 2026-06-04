@@ -30,6 +30,51 @@ def ned_family(ned_id: str) -> str | None:
 _NED_DEVICE_TYPE_KEYS: tuple[str, ...] = ("cli", "netconf", "generic")
 
 
+def _ned_oper_status(raw) -> str:
+    """Normalise a packages/package oper-status into a short string.
+
+    RESTCONF renders the oper-status choice as a container whose single present
+    child names the state (e.g. ``{"up": [null]}`` / ``{"up": {}}``). Fall back
+    to ``str`` for plain-leaf renderings, else ``"unknown"``.
+    """
+    if isinstance(raw, dict):
+        for key in ("up", "error", "failed", "init"):
+            if key in raw:
+                return key
+        keys = list(raw.keys())
+        return keys[0] if keys else "unknown"
+    return str(raw) if raw else "unknown"
+
+
+def extract_ned_component(component):
+    """Return ``(ned_id, device_meta)`` for a package's NED component, else None.
+
+    A NED component carries a ``ned`` container with a cli/netconf/generic
+    transport (each holding ``ned-id``) plus a ``device`` container (vendor /
+    operating-system / product-family). Application/callback components have no
+    ``ned`` → None, so callers can tell NEDs apart from service packages.
+    """
+    if not isinstance(component, list):
+        return None
+    for comp in component:
+        if not isinstance(comp, dict):
+            continue
+        ned = comp.get("ned")
+        if not isinstance(ned, dict):
+            continue
+        ned_id = None
+        for key in _NED_DEVICE_TYPE_KEYS:
+            sub = ned.get(key)
+            if isinstance(sub, dict) and sub.get("ned-id"):
+                ned_id = sub["ned-id"]
+                break
+        if ned_id is None:
+            continue
+        device_meta = ned.get("device") if isinstance(ned.get("device"), dict) else {}
+        return ned_id, device_meta
+    return None
+
+
 def extract_ned_id_from_device_dict(device: dict) -> str | None:
     """Extract NED ID from a raw NSO device dict's ``device-type`` container.
 

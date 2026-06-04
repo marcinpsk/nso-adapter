@@ -7,6 +7,8 @@ import httpx
 import structlog
 
 from nso_adapter.config import NsoInstanceConfig
+from nso_adapter.nso.neds import _ned_oper_status
+from nso_adapter.nso.neds import extract_ned_component as _extract_ned_component
 
 logger = structlog.get_logger(__name__)
 
@@ -56,6 +58,47 @@ class NsoClient:
             data = resp.json()
             device_list = data.get("tailf-ncs:devices", {}).get("device", [])
             return device_list if isinstance(device_list, list) else []
+
+    async def list_ned_packages(self) -> list[dict]:
+        """Return the installed NED packages from tailf-ncs:packages/package.
+
+        Only packages that expose a ``ned`` component (cli/netconf/generic) are
+        NEDs — service/application packages (our reconcilers, auth, observability)
+        have ``application``/``callback`` components and are excluded. Each entry:
+        {ned_id, package, version, oper_status, vendor, operating_systems,
+        product_families}. Parsing is done in Python (robust against the nested
+        component/ned/device choice that a RESTCONF ``fields`` filter handles poorly).
+        """
+        url = f"{self._base}/restconf/data/tailf-ncs:packages/package"
+        params = {"fields": "name;package-version;oper-status;component(name;ned)"}
+        async with self._client() as c:
+            resp = await c.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+        packages = data.get("tailf-ncs:package") or data.get("package") or []
+        if not isinstance(packages, list):
+            return []
+        out: list[dict] = []
+        for pkg in packages:
+            if not isinstance(pkg, dict):
+                continue
+            ned = _extract_ned_component(pkg.get("component"))
+            if ned is None:
+                continue  # not a NED package
+            ned_id, device_meta = ned
+            out.append(
+                {
+                    "ned_id": ned_id,
+                    "package": pkg.get("name"),
+                    "version": pkg.get("package-version"),
+                    "oper_status": _ned_oper_status(pkg.get("oper-status")),
+                    "vendor": device_meta.get("vendor"),
+                    "operating_systems": device_meta.get("operating-system") or [],
+                    "product_families": device_meta.get("product-family") or [],
+                }
+            )
+        out.sort(key=lambda x: x["ned_id"] or "")
+        return out
 
     async def get_device_config(self, device_name: str) -> dict:
         """Return the full config subtree for *device_name*.
