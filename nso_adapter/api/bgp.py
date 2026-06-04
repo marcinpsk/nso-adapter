@@ -158,6 +158,8 @@ async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_db)):
                     peer_entry["ttl"] = peer.ttl
                 if peer.password is not None:
                     peer_entry["password"] = peer.password
+                if peer.source is not None:
+                    peer_entry["source"] = peer.source
                 peers_out.append(peer_entry)
 
             scopes_out.append(

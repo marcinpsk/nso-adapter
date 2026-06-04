@@ -177,3 +177,29 @@ async def test_peer_af_policy_in_maps_to_routemap(adapter_client):
         assert ("PIN", "POUT", None) in afs  # policy-in/out -> routemap_in/out
         assert ("RIN", None, "PLO") in afs   # IOS routemap-in + prefixlist-out
         break
+
+async def test_peer_source_imported(adapter_client):
+    """Peer 'source' (update-source iface / local-address) is stored on the peer."""
+    from nso_adapter.core.bgp import _upsert_bgp_data
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device, DeviceBgpPeer
+
+    device_id = await seed_device(nso_device_name="bgp-src", netbox_device_id=883)
+    routers = [
+        {
+            "asn": "65100",
+            "scope": [
+                {
+                    "vrf": "",
+                    "address-family": [{"af": "ipv4-unicast"}],
+                    "peer": [{"peer-address": "10.0.0.1", "source": "84.116.255.1"}],
+                }
+            ],
+        }
+    ]
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        await _upsert_bgp_data(db, device, routers, "test")
+        peers = (await db.execute(select(DeviceBgpPeer))).scalars().all()
+        assert peers[0].source == "84.116.255.1"
+        break

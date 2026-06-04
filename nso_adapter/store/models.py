@@ -813,6 +813,7 @@ class DeviceBgpPeer(Base):
     local_as: Mapped[str | None] = mapped_column(String(32), nullable=True)
     ttl: Mapped[int | None] = mapped_column(Integer, nullable=True)
     password: Mapped[str | None] = mapped_column(String(256), nullable=True)  # plaintext by design
+    source: Mapped[str | None] = mapped_column(String(256), nullable=True)  # update-source iface or local-address
 
     scope: Mapped[DeviceBgpScope] = relationship("DeviceBgpScope", back_populates="peers")
     peer_address_families: Mapped[list[DeviceBgpPeerAddressFamily]] = relationship(

@@ -85,6 +85,7 @@ async def _upsert_bgp_data(
                         local_as=str(peer_data["local-as"]) if peer_data.get("local-as") is not None else None,
                         ttl=peer_data.get("ttl"),
                         password=peer_data.get("password"),
+                        source=peer_data.get("source") or None,
                     )
                     db.add(peer)
                     await db.flush()
