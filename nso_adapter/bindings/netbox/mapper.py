@@ -77,74 +77,140 @@ def _split_unit(interface_name: str) -> tuple[str, str] | None:
     return base, unit
 
 
+def _base_type_for(kind: str | None, name: str) -> str:
+    """NetBox type for a BASE (parent-less) interface, from its M27R kind or name.
+
+    Nokia loopback/system + unbound logical interfaces are virtual; LAGs are lag;
+    physical ports and other vendors fall back to the name-prefix guess.
+    """
+    if kind in ("loopback", "logical"):
+        return "virtual"
+    if kind == "lag":
+        return "lag"
+    return _guess_netbox_type(name)
+
+
 async def bulk_ensure_interfaces(
     client: NetboxClient,
     netbox_device_id: int,
-    names: list[str],
+    interfaces: list[str | dict],
 ) -> dict[str, int]:
-    """Ensure every name in *names* exists in NetBox, return a name→id map.
+    """Ensure every requested interface exists in NetBox, return a name→id map.
 
-    Bulk, two-pass, and idempotent — the performant replacement for calling
-    resolve_or_create_interface per interface (plan Layer A):
+    Accepts either plain names (back-compat) or dicts carrying the M27R
+    ``parent_binding``/``kind`` (Nokia logical interfaces). Bulk, idempotent:
 
-    1. One bulk GET of existing interfaces (name→object map).
-    2. Bulk-create missing BASE interfaces (a base is either a plain name or the
-       left side of a ``<base>.<unit>`` / ``<base>:<unit>``). Merge their ids in.
-    3. Bulk-create missing UNIT interfaces as ``type=virtual`` with ``parent``
-       resolved by BASE NAME from the map (never positionally).
-    4. Bulk-reparent pre-existing flat units that lack a parent.
+    1. Bulk GET existing interfaces.
+    2. Resolve each interface's PARENT — explicit ``parent_binding`` (Nokia
+       logical, e.g. ``LAG99:10`` → ``lag-99``) wins; else the ``<base>.<unit>`` /
+       ``<base>:<unit>`` split (Junos/IOS units). The interface keeps its faithful
+       (logical) NAME — we no longer rename Nokia logical interfaces to their bound
+       port, so IS-IS/OSPF/IP correlation matches them by name directly.
+    3. Bulk-create missing bases (incl. implicit LAG parents like ``lag-99``).
+    4. Bulk-create missing children as ``type=virtual`` with their resolved parent.
+    5. Bulk-reparent pre-existing flat children lacking a parent.
 
-    Returns {name: netbox_interface_id} for every requested name that now
-    resolves (rows NetBox rejected outright are omitted and logged).
+    Returns {name: netbox_interface_id} for every requested name that now resolves.
     """
-    wanted = list(dict.fromkeys(names))  # de-dup, preserve order
+    # Normalize input → list of {name, parent_binding, kind}, de-duped by name.
+    norm: list[dict] = []
+    seen: set[str] = set()
+    for it in interfaces:
+        if isinstance(it, str):
+            name, pb, kind = it, None, None
+        else:
+            name, pb, kind = it["name"], (it.get("parent_binding") or None), it.get("kind")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        norm.append({"name": name, "parent_binding": pb, "kind": kind})
+
     existing = {i["name"]: i for i in await client.list_interfaces(netbox_device_id)}
     name_to_id: dict[str, int] = {n: o["id"] for n, o in existing.items()}
+    kind_by_name = {it["name"]: it["kind"] for it in norm}
 
-    # Partition wanted names into bases and units, and collect all base names.
-    units: list[tuple[str, str]] = []  # (full_name, base_name)
-    all_base_names: set[str] = set()
-    for name in wanted:
+    # Resolve parent per interface: explicit parent_binding > name-split base > none.
+    children: list[tuple[str, str]] = []  # (name, parent_name)
+    base_names: set[str] = set()
+    for it in norm:
+        name, pb = it["name"], it["parent_binding"]
+        if pb:
+            children.append((name, pb))
+            base_names.add(pb)
+            continue
         split = _split_unit(name)
-        if split is None:
-            all_base_names.add(name)
+        if split is not None:
+            base, _unit = split
+            children.append((name, base))
+            base_names.add(base)
         else:
-            base_name, _unit = split
-            all_base_names.add(base_name)
-            units.append((name, base_name))
+            base_names.add(name)
 
-    # ── Pass 1: create missing bases ──
-    missing_bases = [b for b in all_base_names if b not in name_to_id]
+    # ── Pass 1: create missing bases (kind-typed; implicit LAG parents → lag) ──
+    missing_bases = [b for b in base_names if b not in name_to_id]
     if missing_bases:
         created = await client.bulk_create_interfaces(
-            [{"device": netbox_device_id, "name": b, "type": _guess_netbox_type(b)} for b in missing_bases]
+            [{"device": netbox_device_id, "name": b, "type": _base_type_for(kind_by_name.get(b), b)} for b in missing_bases]
         )
         for obj in created:
             name_to_id[obj["name"]] = obj["id"]
 
-    # ── Pass 2: create missing units (parent resolved by base NAME) ──
-    missing_units = [(full, base) for full, base in units if full not in name_to_id]
-    unit_payloads = []
-    for full, base in missing_units:
-        payload = {"device": netbox_device_id, "name": full, "type": "virtual"}
-        parent_id = name_to_id.get(base)
+    # ── Pass 2: create missing children (virtual) with resolved parent ──
+    child_payloads = []
+    for name, parent in children:
+        if name in name_to_id:
+            continue
+        payload = {"device": netbox_device_id, "name": name, "type": "virtual"}
+        parent_id = name_to_id.get(parent)
         if parent_id is not None:
             payload["parent"] = parent_id
         else:
-            logger.warning("netbox.bulk_ensure.base_unresolved", unit=full, base=base)
-        unit_payloads.append(payload)
-    if unit_payloads:
-        created = await client.bulk_create_interfaces(unit_payloads)
+            logger.warning("netbox.bulk_ensure.parent_unresolved", child=name, parent=parent)
+        child_payloads.append(payload)
+    if child_payloads:
+        created = await client.bulk_create_interfaces(child_payloads)
         for obj in created:
             name_to_id[obj["name"]] = obj["id"]
 
-    # ── Pass 3: reparent pre-existing flat units lacking a parent ──
+    # ── Pass 3: fix pre-existing children whose parent is missing OR wrong ──
+    # Wrong-parent correction matters during the M27R transition: an interface a
+    # prior (name-split) sync parented to a guessed base (e.g. LAG99:10 → LAG99)
+    # is re-pointed to the real bound port/LAG (lag-99) from parent_binding.
     reparent = []
-    for full, base in units:
-        obj = existing.get(full)
-        parent_id = name_to_id.get(base)
-        if obj is not None and parent_id is not None and not obj.get("parent"):
-            reparent.append({"id": obj["id"], "parent": parent_id})
+    for name, parent in children:
+        obj = existing.get(name)
+        parent_id = name_to_id.get(parent)
+        if obj is None or parent_id is None:
+            continue
+        cur = obj.get("parent")
+        cur_id = cur.get("id") if isinstance(cur, dict) else cur
+        cur_type = obj.get("type")
+        cur_type_val = cur_type.get("value") if isinstance(cur_type, dict) else cur_type
+        patch: dict = {}
+        if cur_id != parent_id:
+            patch["parent"] = parent_id
+        # A child is a sub-interface → must be virtual; NetBox forbids a parent on a
+        # non-virtual interface, so retype any child a prior sync created as a guessed
+        # physical type (e.g. IXIA_CRPD created type=other by the old name-split path).
+        if cur_type_val is not None and cur_type_val != "virtual":
+            patch["type"] = "virtual"
+        if patch:
+            patch["id"] = obj["id"]
+            reparent.append(patch)
+
+    # Retype pre-existing parent-less logical/loopback bases (e.g. an unbound
+    # loopback ``IXIA`` a prior name-split sync created as ``other``) to virtual.
+    for b in base_names:
+        if kind_by_name.get(b) not in ("loopback", "logical"):
+            continue
+        obj = existing.get(b)
+        if obj is None:
+            continue
+        cur_type = obj.get("type")
+        cur_type_val = cur_type.get("value") if isinstance(cur_type, dict) else cur_type
+        if cur_type_val is not None and cur_type_val != "virtual":
+            reparent.append({"id": obj["id"], "type": "virtual"})
+
     if reparent:
         await client.bulk_patch_interfaces(reparent)
 

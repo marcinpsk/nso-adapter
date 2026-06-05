@@ -81,10 +81,14 @@ class SchedulerConfig(BaseModel):
     redistribution_poll_interval: int = 300
     enable_route_policy_sync: bool = True
     route_policy_poll_interval: int = 300
-    # Topology interface reconcile: ensure NetBox holds the LAG parents, logical
-    # channels/SAPs and loopback/system interfaces that bound_port correlation
-    # needs. Runs after the IS-IS/IP/LAG refreshes have populated the mirror.
-    enable_topology_interface_sync: bool = True
+    # Topology interface reconcile: ensured NetBox held the LAG parents, logical
+    # channels/SAPs and loopback/system interfaces that the OLD bound_port-named
+    # correlation needed. M27R supersedes this: interface-attributes now exports
+    # the Nokia logical interfaces with parent-binding/kind, and sync_device's
+    # bulk_ensure_interfaces creates them by their FAITHFUL (logical) name with
+    # the right parent — so this job would now create bound_port-named DUPLICATES.
+    # Default off. (Follow-up: fold members-only LAG creation into the new path.)
+    enable_topology_interface_sync: bool = False
     topology_interface_poll_interval: int = 120
 
 

@@ -227,7 +227,14 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
 
         try:
             nb_id_by_name = await bulk_ensure_interfaces(
-                nb_client, device.netbox_device_id, [i.name for i in interfaces]
+                nb_client,
+                device.netbox_device_id,
+                # M27R: pass parent_binding/kind so Nokia logical interfaces are created
+                # by their faithful name, parented to the bound port/LAG.
+                [
+                    {"name": i.name, "parent_binding": i.parent_binding, "kind": i.kind}
+                    for i in interfaces
+                ],
             )
         except Exception as exc:
             logger.warning("netbox.bulk_ensure_failed", device_id=device_id, error=str(exc))

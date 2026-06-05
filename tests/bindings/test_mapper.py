@@ -403,3 +403,46 @@ async def test_bulk_ensure_nokia_sap_parented_under_channelized_port():
     # base already existed → only the SAP unit is created, parented by name to 30.
     unit_call = client.bulk_create_interfaces.await_args_list[0][0][0]
     assert unit_call == [{"device": 42, "name": "1/1/c22/1:4090", "type": "virtual", "parent": 30}]
+
+
+@pytest.mark.anyio
+async def test_bulk_ensure_m27r_logical_name_explicit_parent():
+    """M27R: dict input with parent_binding keeps the FAITHFUL logical name and
+    parents it to the bound port/LAG — NOT renamed to the bound port.
+
+    ``LAG99:10`` (parent lag-99) and ``IXIA_CRPD`` (parent the physical port) are
+    created virtual under their explicit parents; ``system`` (loopback, no parent)
+    is a virtual base; the implicit ``lag-99`` parent is typed ``lag``.
+    """
+    from nso_adapter.bindings.netbox.mapper import bulk_ensure_interfaces
+
+    client = _make_bulk_client()
+    # The physical port already exists; lag-99 (implicit parent) does not.
+    client.list_interfaces.return_value = [{"id": 5, "name": "1/1/c11/1", "parent": None}]
+    client.bulk_create_interfaces.side_effect = [
+        [{"id": 20, "name": "lag-99"}, {"id": 30, "name": "system"}],  # pass 1: bases
+        [  # pass 2: logical children (faithful names)
+            {"id": 21, "name": "LAG99:10"},
+            {"id": 22, "name": "IXIA_CRPD"},
+        ],
+    ]
+
+    result = await bulk_ensure_interfaces(
+        client,
+        42,
+        [
+            {"name": "1/1/c11/1", "parent_binding": None, "kind": "physical"},
+            {"name": "lag-99", "parent_binding": None, "kind": "lag"},
+            {"name": "LAG99:10", "parent_binding": "lag-99", "kind": "logical"},
+            {"name": "IXIA_CRPD", "parent_binding": "1/1/c11/1", "kind": "logical"},
+            {"name": "system", "parent_binding": None, "kind": "loopback"},
+        ],
+    )
+
+    assert result["LAG99:10"] == 21 and result["IXIA_CRPD"] == 22
+    # bases: lag-99 typed lag, system typed virtual (loopback)
+    base_call = {p["name"]: p["type"] for p in client.bulk_create_interfaces.await_args_list[0][0][0]}
+    assert base_call == {"lag-99": "lag", "system": "virtual"}
+    # children keep their faithful names + parent to the explicit binding (not renamed)
+    child_call = {p["name"]: (p["type"], p.get("parent")) for p in client.bulk_create_interfaces.await_args_list[1][0][0]}
+    assert child_call == {"LAG99:10": ("virtual", 20), "IXIA_CRPD": ("virtual", 5)}
