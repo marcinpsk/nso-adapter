@@ -196,3 +196,44 @@ async def test_refresh_persists_p1_scalars_and_settings(adapter_client):
         assert iface.csnp_interval == 10
         assert iface.mesh_group == "blocked"
         assert iface.settings == {"hello_padding": "true"}
+
+
+async def test_refresh_persists_p2_levels_and_sr(adapter_client):
+    """M33 P2: per-level child lists + segment-routing object are mirrored."""
+    device_id = await seed_device(nso_device_name="isis-p2-01", netbox_device_id=967)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_isis_interfaces.return_value = {
+            "process": [
+                {
+                    "process-tag": "0",
+                    "level": [
+                        {"level": 1, "default-metric": 10},
+                        {"level": 2, "default-metric": 10, "wide-metrics-only": True},
+                    ],
+                    "segment-routing": {"enabled": True, "prefix-sid-range": "global"},
+                },
+            ],
+            "interface": [
+                {
+                    "interface-name": "LAG99:10",
+                    "af": "ipv4",
+                    "level": [{"level": 2, "metric": 10}],
+                },
+            ],
+        }
+        await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
+
+        proc = (
+            await db.execute(select(DeviceIsisProcess).where(DeviceIsisProcess.device_id == device.id))
+        ).scalar_one()
+        assert proc.levels == [
+            {"level": 1, "default-metric": 10},
+            {"level": 2, "default-metric": 10, "wide-metrics-only": True},
+        ]
+        assert proc.segment_routing == {"enabled": True, "prefix-sid-range": "global"}
+
+        iface = (
+            await db.execute(select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id))
+        ).scalar_one()
+        assert iface.levels == [{"level": 2, "metric": 10}]

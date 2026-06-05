@@ -685,6 +685,10 @@ class DeviceIsisProcess(Base):
     reference_bandwidth: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # EAV long-tail mirror: {key: value} for ISISSettingChoices keys.
     settings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # M33 P2: per-level child rows [{level, default-metric, wide-metrics-only, ...}]
+    # and the segment-routing object {enabled, prefix-sid-range, ...}.
+    levels: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    segment_routing: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
 
@@ -724,6 +728,8 @@ class DeviceIsisInterface(Base):
     mesh_group: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # EAV long-tail mirror: {key: value} for ISISSettingChoices keys.
     settings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # M33 P2: per-level child rows [{level, metric, hello-interval, ...}].
+    levels: Mapped[list | None] = mapped_column(JSON, nullable=True)
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
 

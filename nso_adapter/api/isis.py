@@ -28,6 +28,12 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/api/v1/devices", tags=["isis"])
 
 
+def _snake(d: dict) -> dict:
+    """Normalize a dict's hyphenated keys (as stored from NSO) to snake_case so
+    the plugin can map them straight onto netbox_routing model fields."""
+    return {k.replace("-", "_"): v for k, v in d.items()}
+
+
 @router.get("/{device_id}/isis-interfaces", dependencies=[Depends(verify_token)])
 async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, device_id)
@@ -94,6 +100,10 @@ async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_db)
                 entry[col] = val
         if row.settings:
             entry["settings"] = row.settings
+        if row.levels:
+            entry["levels"] = [_snake(lvl) for lvl in row.levels]
+        if row.segment_routing:
+            entry["segment_routing"] = _snake(row.segment_routing)
         processes.append(entry)
 
     interfaces = []
@@ -123,6 +133,8 @@ async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_db)
                 entry[col] = val
         if row.settings:
             entry["settings"] = row.settings
+        if row.levels:
+            entry["levels"] = [_snake(lvl) for lvl in row.levels]
         entry["passive"] = row.passive
         interfaces.append(entry)
 
