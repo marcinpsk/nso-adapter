@@ -104,6 +104,8 @@ async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_db)
             entry["levels"] = [_snake(lvl) for lvl in row.levels]
         if row.segment_routing:
             entry["segment_routing"] = _snake(row.segment_routing)
+        if row.flex_algos:
+            entry["flex_algos"] = [_snake(fa) for fa in row.flex_algos]
         processes.append(entry)
 
     interfaces = []

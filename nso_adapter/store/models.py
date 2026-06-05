@@ -689,6 +689,8 @@ class DeviceIsisProcess(Base):
     # and the segment-routing object {enabled, prefix-sid-range, ...}.
     levels: Mapped[list | None] = mapped_column(JSON, nullable=True)
     segment_routing: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # M33 P2b: flex-algo child rows [{algo-id, metric-type, priority, ...}].
+    flex_algos: Mapped[list | None] = mapped_column(JSON, nullable=True)
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
 
