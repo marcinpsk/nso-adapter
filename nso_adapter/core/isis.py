@@ -20,6 +20,37 @@ from nso_adapter.store.models import Device, DeviceIsisInterface, DeviceIsisProc
 
 logger = structlog.get_logger(__name__)
 
+# Cross-vendor scalar leaves mirrored 1:1 from the network-state-export
+# isis-interface process/interface nodes onto the typed DB columns. Hyphenated
+# export key → snake_case column.
+_PROC_SCALAR_KEYS = (
+    "spf-initial-wait", "spf-max-wait", "lsp-initial-wait", "lsp-max-wait",
+    "lsp-lifetime", "lsp-refresh-interval", "lsp-mtu", "overload-on-startup",
+    "overload-timeout", "te-enabled", "sr-enabled", "sr-node-msd",
+    "distance", "maximum-paths", "reference-bandwidth",
+)
+_IFACE_SCALAR_KEYS = (
+    "csnp-interval", "retransmit-interval", "lsp-interval", "mesh-group",
+)
+
+
+def _scalar_cols(src: dict, keys: tuple[str, ...]) -> dict:
+    """Pick present keys from *src*, returning a {snake_case: value} dict."""
+    out: dict = {}
+    for k in keys:
+        if k in src and src[k] is not None:
+            out[k.replace("-", "_")] = src[k]
+    return out
+
+
+def _settings_dict(src: dict) -> dict | None:
+    """Collapse the export ``setting`` list ([{key,value}]) into a flat dict."""
+    raw = src.get("setting")
+    if not raw:
+        return None
+    out = {s["key"]: s.get("value") for s in raw if isinstance(s, dict) and s.get("key")}
+    return out or None
+
 
 async def _upsert_isis_data(
     db: AsyncSession,
@@ -49,8 +80,10 @@ async def _upsert_isis_data(
                 domain_auth_type=proc.get("domain-auth-type"),
                 domain_auth_present=proc.get("domain-auth-present"),
                 domain_auth_key=proc.get("domain-auth-key"),
+                settings=_settings_dict(proc),
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
+                **_scalar_cols(proc, _PROC_SCALAR_KEYS),
             )
         )
 
@@ -73,8 +106,10 @@ async def _upsert_isis_data(
                 hello_auth_type=iface.get("hello-auth-type") or None,
                 hello_auth_present=iface.get("hello-auth-present"),
                 bfd_enabled=iface.get("bfd-enabled"),
+                settings=_settings_dict(iface),
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
+                **_scalar_cols(iface, _IFACE_SCALAR_KEYS),
             )
         )
 

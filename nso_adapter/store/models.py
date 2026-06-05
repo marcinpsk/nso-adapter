@@ -10,7 +10,7 @@ from __future__ import annotations
 import enum
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -667,6 +667,24 @@ class DeviceIsisProcess(Base):
     domain_auth_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     domain_auth_present: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     domain_auth_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # M33 P1: cross-vendor instance scalars (read mirror of netbox_routing columns).
+    spf_initial_wait: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    spf_max_wait: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    lsp_initial_wait: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    lsp_max_wait: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    lsp_lifetime: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    lsp_refresh_interval: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    lsp_mtu: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    overload_on_startup: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    overload_timeout: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    te_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    sr_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    sr_node_msd: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    distance: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    maximum_paths: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reference_bandwidth: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # EAV long-tail mirror: {key: value} for ISISSettingChoices keys.
+    settings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
 
@@ -699,6 +717,13 @@ class DeviceIsisInterface(Base):
     hello_auth_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     hello_auth_present: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     bfd_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)  # BFD enabled for IS-IS on this iface
+    # M33 P1: per-interface scalars (read mirror of netbox_routing columns).
+    csnp_interval: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    retransmit_interval: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    lsp_interval: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mesh_group: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # EAV long-tail mirror: {key: value} for ISISSettingChoices keys.
+    settings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
 

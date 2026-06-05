@@ -83,6 +83,17 @@ async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_db)
             entry["domain_auth_present"] = row.domain_auth_present
         if row.domain_auth_key is not None:
             entry["domain_auth_key"] = row.domain_auth_key
+        for col in (
+            "spf_initial_wait", "spf_max_wait", "lsp_initial_wait", "lsp_max_wait",
+            "lsp_lifetime", "lsp_refresh_interval", "lsp_mtu", "overload_on_startup",
+            "overload_timeout", "te_enabled", "sr_enabled", "sr_node_msd",
+            "distance", "maximum_paths", "reference_bandwidth",
+        ):
+            val = getattr(row, col)
+            if val is not None:
+                entry[col] = val
+        if row.settings:
+            entry["settings"] = row.settings
         processes.append(entry)
 
     interfaces = []
@@ -106,6 +117,12 @@ async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_db)
             entry["hello_auth_present"] = row.hello_auth_present
         if row.bfd_enabled is not None:
             entry["bfd_enabled"] = row.bfd_enabled
+        for col in ("csnp_interval", "retransmit_interval", "lsp_interval", "mesh_group"):
+            val = getattr(row, col)
+            if val is not None:
+                entry[col] = val
+        if row.settings:
+            entry["settings"] = row.settings
         entry["passive"] = row.passive
         interfaces.append(entry)
 

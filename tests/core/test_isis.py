@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from nso_adapter.core.isis import refresh_isis_interfaces_for_device
 from nso_adapter.store.db import get_session
-from nso_adapter.store.models import Device, DeviceIsisInterface
+from nso_adapter.store.models import Device, DeviceIsisInterface, DeviceIsisProcess
 from tests.conftest import seed_device
 
 
@@ -138,3 +138,61 @@ async def test_refresh_persists_isis_bfd_enabled(adapter_client):
         }
         assert by_name["ae10.0"].bfd_enabled is True
         assert by_name["ae11.0"].bfd_enabled is None
+
+
+@pytest.mark.anyio
+async def test_refresh_persists_p1_scalars_and_settings(adapter_client):
+    """M33 P1: cross-vendor instance/interface scalars + EAV settings are mirrored."""
+    device_id = await seed_device(nso_device_name="isis-p1-01", netbox_device_id=965)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_isis_interfaces.return_value = {
+            "process": [
+                {
+                    "process-tag": "0",
+                    "lsp-lifetime": 65535,
+                    "lsp-refresh-interval": 32767,
+                    "lsp-mtu": 1492,
+                    "spf-initial-wait": 1000,
+                    "spf-max-wait": 10000,
+                    "te-enabled": True,
+                    "sr-enabled": True,
+                    "setting": [
+                        {"key": "spf_second_wait", "value": "1000"},
+                        {"key": "lsp_second_wait", "value": "1000"},
+                    ],
+                },
+            ],
+            "interface": [
+                {
+                    "interface-name": "LAG99:10",
+                    "af": "ipv4",
+                    "network-type": "point-to-point",
+                    "csnp-interval": 10,
+                    "mesh-group": "blocked",
+                    "setting": [{"key": "hello_padding", "value": "true"}],
+                },
+            ],
+        }
+
+        await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
+
+        proc = (
+            await db.execute(select(DeviceIsisProcess).where(DeviceIsisProcess.device_id == device.id))
+        ).scalar_one()
+        assert proc.lsp_lifetime == 65535
+        assert proc.lsp_refresh_interval == 32767
+        assert proc.lsp_mtu == 1492
+        assert proc.spf_initial_wait == 1000
+        assert proc.spf_max_wait == 10000
+        assert proc.te_enabled is True
+        assert proc.sr_enabled is True
+        assert proc.settings == {"spf_second_wait": "1000", "lsp_second_wait": "1000"}
+
+        iface = (
+            await db.execute(select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id))
+        ).scalar_one()
+        assert iface.network_type == "point-to-point"
+        assert iface.csnp_interval == 10
+        assert iface.mesh_group == "blocked"
+        assert iface.settings == {"hello_padding": "true"}
