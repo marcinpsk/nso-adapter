@@ -133,18 +133,24 @@ async def bulk_ensure_interfaces(
     children: list[tuple[str, str]] = []  # (name, parent_name)
     base_names: set[str] = set()
     for it in norm:
-        name, pb = it["name"], it["parent_binding"]
+        name, pb, kind = it["name"], it["parent_binding"], it["kind"]
         if pb:
             children.append((name, pb))
             base_names.add(pb)
             continue
-        split = _split_unit(name)
-        if split is not None:
-            base, _unit = split
-            children.append((name, base))
-            base_names.add(base)
-        else:
-            base_names.add(name)
+        # Name-split parent inference is for Cisco/Junos dotted/colon units ONLY.
+        # Nokia interfaces (kind set) carry an explicit parent_binding; an empty one
+        # is a genuine parent-less base (loopback/system/LAG/IRB) — so never split a
+        # name that may legitimately contain ':' (e.g. a namespaced VPRN interface
+        # "CRPD-VPN:LO7" or a tagged LAG sub-interface "LAG99:10").
+        if kind is None:
+            split = _split_unit(name)
+            if split is not None:
+                base, _unit = split
+                children.append((name, base))
+                base_names.add(base)
+                continue
+        base_names.add(name)
 
     # ── Pass 1: create missing bases (kind-typed; implicit LAG parents → lag) ──
     missing_bases = [b for b in base_names if b not in name_to_id]

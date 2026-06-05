@@ -446,3 +446,25 @@ async def test_bulk_ensure_m27r_logical_name_explicit_parent():
     # children keep their faithful names + parent to the explicit binding (not renamed)
     child_call = {p["name"]: (p["type"], p.get("parent")) for p in client.bulk_create_interfaces.await_args_list[1][0][0]}
     assert child_call == {"LAG99:10": ("virtual", 20), "IXIA_CRPD": ("virtual", 5)}
+
+
+@pytest.mark.anyio
+async def test_bulk_ensure_m27r_namespaced_vprn_loopback_not_split():
+    """A namespaced VPRN loopback (kind set, parent_binding empty) is a virtual BASE.
+
+    Its name contains ':' (CRPD-VPN:LO7) but must NOT be name-split into a
+    'CRPD-VPN' parent — Nokia interfaces rely on explicit parent_binding only.
+    """
+    from nso_adapter.bindings.netbox.mapper import bulk_ensure_interfaces
+
+    client = _make_bulk_client()
+    client.bulk_create_interfaces.side_effect = [[{"id": 70, "name": "CRPD-VPN:LO7"}]]
+
+    result = await bulk_ensure_interfaces(
+        client, 42, [{"name": "CRPD-VPN:LO7", "parent_binding": None, "kind": "loopback"}]
+    )
+
+    assert result == {"CRPD-VPN:LO7": 70}
+    base_call = client.bulk_create_interfaces.await_args_list[0][0][0]
+    # one base, virtual, no parent — NOT split into a CRPD-VPN base + child
+    assert base_call == [{"device": 42, "name": "CRPD-VPN:LO7", "type": "virtual"}]
