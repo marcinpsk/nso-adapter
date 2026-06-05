@@ -72,6 +72,7 @@ async def _upsert_isis_data(
                 bound_port=iface.get("bound-port") or None,
                 hello_auth_type=iface.get("hello-auth-type") or None,
                 hello_auth_present=iface.get("hello-auth-present"),
+                bfd_enabled=iface.get("bfd-enabled"),
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
             )

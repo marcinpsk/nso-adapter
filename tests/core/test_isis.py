@@ -115,3 +115,26 @@ async def test_refresh_persists_hello_auth(adapter_client):
         assert by_name["ae10.0"].hello_auth_present is True
         assert by_name["ae11.0"].hello_auth_type is None
         assert by_name["ae11.0"].hello_auth_present is None
+
+
+async def test_refresh_persists_isis_bfd_enabled(adapter_client):
+    """Per-interface IS-IS bfd-enabled is mirrored."""
+    device_id = await seed_device(nso_device_name="isis-bfd01", netbox_device_id=963)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_isis_interfaces.return_value = {
+            "process": [],
+            "interface": [
+                {"interface-name": "ae10.0", "af": "ipv4", "bfd-enabled": True},
+                {"interface-name": "ae11.0", "af": "ipv4"},
+            ],
+        }
+        await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
+        by_name = {
+            r.interface_name: r
+            for r in (await db.execute(select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id)))
+            .scalars()
+            .all()
+        }
+        assert by_name["ae10.0"].bfd_enabled is True
+        assert by_name["ae11.0"].bfd_enabled is None

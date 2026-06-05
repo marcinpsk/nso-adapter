@@ -104,6 +104,8 @@ async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_db)
             entry["hello_auth_type"] = row.hello_auth_type
         if row.hello_auth_present is not None:
             entry["hello_auth_present"] = row.hello_auth_present
+        if row.bfd_enabled is not None:
+            entry["bfd_enabled"] = row.bfd_enabled
         entry["passive"] = row.passive
         interfaces.append(entry)
 

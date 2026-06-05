@@ -691,6 +691,7 @@ class DeviceIsisInterface(Base):
     # md5/text + a present flag. The key itself is never mirrored.
     hello_auth_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     hello_auth_present: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    bfd_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)  # BFD enabled for IS-IS on this iface
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
 
