@@ -56,6 +56,35 @@ def test_attrs_to_interface_list_description_and_enabled():
     assert ge02.nso.enabled is False
 
 
+def test_attrs_to_interface_list_m27r_logical_fields():
+    """M27R: parent-binding/kind/encap-tag/vrf/service pass through; empty → None."""
+    entry = {
+        "device-name": "ra1",
+        "interface": [
+            {
+                "interface-name": "LAG99:10",
+                "enabled": True,
+                "kind": "logical",
+                "parent-binding": "lag-99",
+                "encap-tag": "10",
+                "vrf": "",
+                "service": "",
+            },
+            {"interface-name": "1/1/c1", "enabled": True, "kind": "physical"},
+        ],
+    }
+    result = _attrs_to_interface_list(entry)
+    logical = next(i for i in result if i.name == "LAG99:10")
+    assert logical.kind == "logical"
+    assert logical.parent_binding == "lag-99"
+    assert logical.encap_tag == "10"
+    assert logical.vrf is None  # empty string collapses to None
+    port = next(i for i in result if i.name == "1/1/c1")
+    assert port.kind == "physical"
+    assert port.parent_binding is None
+    assert port.encap_tag is None
+
+
 def test_attrs_to_interface_list_returns_empty_on_none():
     assert _attrs_to_interface_list(None) == []
 

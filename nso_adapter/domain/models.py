@@ -20,6 +20,12 @@ class Interface:
     netbox: InterfaceAttr
     is_drifted: bool = False
     synced_at: datetime | None = None
+    # M27R: first-class logical-interface modeling (empty for physical ports / other vendors).
+    parent_binding: str | None = None
+    kind: str | None = None
+    encap_tag: str | None = None
+    vrf: str | None = None
+    service: str | None = None
 
 
 @dataclass

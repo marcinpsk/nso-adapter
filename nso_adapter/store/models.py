@@ -189,6 +189,13 @@ class DbInterface(Base):
     name: Mapped[str] = mapped_column(String(256))
     netbox_interface_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     nso_if_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # M27R: first-class logical-interface modeling. Empty/NULL for physical ports
+    # and for Cisco/Junos (which keep the flat interface=physical model).
+    parent_binding: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    encap_tag: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    vrf: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    service: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     device: Mapped[Device] = relationship("Device", back_populates="interfaces")
     attr_states: Mapped[list[InterfaceAttrState]] = relationship(

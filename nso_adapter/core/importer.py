@@ -61,6 +61,13 @@ def _attrs_to_interface_list(data: dict | None) -> list[Interface]:
                     enabled=entry.get("enabled"),
                 ),
                 netbox=InterfaceAttr(description=None, enabled=None),
+                # M27R: pass through the logical-interface modeling fields (empty for
+                # physical ports / Cisco / Junos).
+                parent_binding=entry.get("parent-binding") or None,
+                kind=entry.get("kind") or None,
+                encap_tag=entry.get("encap-tag") or None,
+                vrf=entry.get("vrf") or None,
+                service=entry.get("service") or None,
             )
         )
     return result
@@ -245,6 +252,13 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
             await db.flush()  # get id before upserting attr states
             interfaces_created += 1
         existing_ifaces[iface.name] = db_iface
+        # M27R: keep the logical-interface modeling fields fresh on every sync
+        # (NULL/empty for physical ports and for Cisco/Junos).
+        db_iface.parent_binding = iface.parent_binding
+        db_iface.kind = iface.kind
+        db_iface.encap_tag = iface.encap_tag
+        db_iface.vrf = iface.vrf
+        db_iface.service = iface.service
 
         # Step 3: compute per-attribute sync_state
         # Load existing attr_states + the deployed intent (single source of truth:

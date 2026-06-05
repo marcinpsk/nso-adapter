@@ -47,6 +47,12 @@ async def list_interfaces(device_id: int, db: AsyncSession = Depends(get_db)):
                 "name": iface.name,
                 "netbox_interface_id": iface.netbox_interface_id,
                 "attrs": attrs,
+                # M27R: logical-interface modeling (NULL for physical ports / Cisco / Junos).
+                "parent_binding": iface.parent_binding,
+                "kind": iface.kind,
+                "encap_tag": iface.encap_tag,
+                "vrf": iface.vrf,
+                "service": iface.service,
             }
         )
     return out
