@@ -11,6 +11,7 @@ import structlog
 from fastapi import FastAPI
 
 from nso_adapter.api.actions import router as actions_router
+from nso_adapter.api.bfd import router as bfd_router
 from nso_adapter.api.bgp import router as bgp_router
 from nso_adapter.api.devices import router as devices_router
 from nso_adapter.api.errors import ApiError, api_error_handler
@@ -182,6 +183,7 @@ def create_app() -> FastAPI:
     app.include_router(logging_config_router)
     app.include_router(static_route_router)
     app.include_router(isis_router)
+    app.include_router(bfd_router)
     app.include_router(bgp_router)
     app.include_router(route_policy_router)
     app.include_router(ospf_router)

@@ -126,6 +126,9 @@ class Device(Base):
     isis_interfaces: Mapped[list[DeviceIsisInterface]] = relationship(
         "DeviceIsisInterface", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
+    bfd_interfaces: Mapped[list[DeviceBfdInterface]] = relationship(
+        "DeviceBfdInterface", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
     isis_interface_intents: Mapped[list[IsisInterfaceIntent]] = relationship(
         "IsisInterfaceIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
@@ -694,6 +697,29 @@ class DeviceIsisInterface(Base):
     device: Mapped[Device] = relationship("Device", back_populates="isis_interfaces")
 
 
+class DeviceBfdInterface(Base):
+    """Read mirror of a BFD-configured interface (timers + micro-BFD) from network-state-export."""
+
+    __tablename__ = "device_bfd_interface"
+    __table_args__ = (UniqueConstraint("device_id", "interface_name", name="uq_devicebfdinterface_identity"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    interface_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    bound_port: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    min_tx: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    min_rx: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    multiplier: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    micro_bfd: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
+
+    device: Mapped[Device] = relationship("Device", back_populates="bfd_interfaces")
+
+
 class IsisInterfaceIntent(Base):
     """Write-path intent for an IS-IS interface enablement accepted by the NetBox operator."""
 
@@ -821,6 +847,7 @@ class DeviceBgpPeer(Base):
     ttl: Mapped[int | None] = mapped_column(Integer, nullable=True)
     password: Mapped[str | None] = mapped_column(String(256), nullable=True)  # plaintext by design
     source: Mapped[str | None] = mapped_column(String(256), nullable=True)  # update-source iface or local-address
+    bfd_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)  # BFD fall-over on this peer
 
     scope: Mapped[DeviceBgpScope] = relationship("DeviceBgpScope", back_populates="peers")
     peer_address_families: Mapped[list[DeviceBgpPeerAddressFamily]] = relationship(

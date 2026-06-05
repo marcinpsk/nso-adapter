@@ -88,6 +88,7 @@ async def _upsert_bgp_data(
                         ttl=peer_data.get("ttl"),
                         password=peer_data.get("password"),
                         source=peer_data.get("source") or None,
+                        bfd_enabled=peer_data.get("bfd-enabled"),
                     )
                     db.add(peer)
                     await db.flush()

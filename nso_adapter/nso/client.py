@@ -296,6 +296,21 @@ class NsoClient:
             entries = data.get("network-state-export:device") or data.get("device", [])
             return entries[0] if entries else None
 
+    async def get_bfd_config(self, device_name: str) -> dict | None:
+        """Return the bfd-config entry for *device_name* (per-interface BFD).
+
+        Returns None if the device has no BFD config (404 or empty).
+        """
+        url = f"{self._base}/restconf/data/network-state-export:bfd-config/device={device_name}"
+        async with self._client() as c:
+            resp = await c.get(url)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            entries = data.get("network-state-export:device") or data.get("device", [])
+            return entries[0] if entries else None
+
     async def check_sync(self, device_name: str) -> bool:
         """Return True if device is in-sync with NSO's internal CDB."""
         url = f"{self._base}/restconf/data/tailf-ncs:devices/device={device_name}/check-sync"

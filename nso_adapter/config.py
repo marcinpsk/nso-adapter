@@ -66,6 +66,7 @@ class SchedulerConfig(BaseModel):
     interface_ip_poll_interval: int = 60
     enable_snmp_sync: bool = True
     enable_logging_sync: bool = True
+    enable_bfd_sync: bool = True
     snmp_poll_interval: int = 300
     logging_poll_interval: int = 300
     enable_static_routing_sync: bool = True

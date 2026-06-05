@@ -193,6 +193,8 @@ async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_db)):
                     peer_entry["password"] = peer.password
                 if peer.source is not None:
                     peer_entry["source"] = peer.source
+                if peer.bfd_enabled is not None:
+                    peer_entry["bfd_enabled"] = peer.bfd_enabled
                 peers_out.append(peer_entry)
 
             peer_groups_out = []

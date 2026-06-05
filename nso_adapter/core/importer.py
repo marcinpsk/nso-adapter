@@ -158,6 +158,10 @@ async def refresh_routing_surfaces_for_device(
         from nso_adapter.core.logging_config import refresh_logging_config_for_device
 
         surfaces.append(("logging", refresh_logging_config_for_device))
+    if cfg.enable_bfd_sync:
+        from nso_adapter.core.bfd import refresh_bfd_interfaces_for_device
+
+        surfaces.append(("bfd", refresh_bfd_interfaces_for_device))
 
     for name, fn in surfaces:
         try:
