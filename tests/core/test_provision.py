@@ -101,8 +101,34 @@ async def test_provision_aborts_on_fetch_host_keys_failure(adapter_client_with_n
             break
     assert res["ok"] is False
     s = _steps(res)
-    assert s["create"] == "ok" and s["fetch_host_keys"] == "failed"
-    client.set_admin_state.assert_not_awaited()
+    # admin-state unlock now precedes fetch-host-keys (a southbound-locked device
+    # cannot be reached for fetch), so on a fetch failure the device is already
+    # unlocked and only sync-from is skipped.
+    assert s["create"] == "ok" and s["admin_state"] == "ok" and s["fetch_host_keys"] == "failed"
+    client.set_admin_state.assert_awaited_once()
+    client.sync_from.assert_not_awaited()
+
+
+async def test_provision_unlocks_before_fetch_host_keys(adapter_client_with_nso):
+    """Regression: unlock MUST happen before fetch-host-keys (locked device blocks SSH)."""
+    from unittest.mock import Mock
+
+    from nso_adapter.core.onboarding import provision_nso_device
+    from nso_adapter.store.db import get_session
+
+    client = _mock_client()
+    parent = Mock()
+    parent.attach_mock(client.set_admin_state, "set_admin_state")
+    parent.attach_mock(client.fetch_host_keys, "fetch_host_keys")
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
+        async for db in get_session():
+            await provision_nso_device(
+                db, nso_instance="nso-dev", device_name="ordered", address="1.1.1.1",
+                ned_id="x", authgroup="network",
+            )
+            break
+    order = [c[0] for c in parent.mock_calls]
+    assert order.index("set_admin_state") < order.index("fetch_host_keys")
 
 
 async def test_provision_sync_failure_is_nonfatal(adapter_client_with_nso):

@@ -115,20 +115,22 @@ async def provision_nso_device(
         _step("create", "failed", repr(exc))
         return _result(False)
 
-    # 2. fetch host keys (needs reachability) — blocking
-    try:
-        await client.fetch_host_keys(device_name)
-        _step("fetch_host_keys", "ok")
-    except Exception as exc:
-        _step("fetch_host_keys", "failed", repr(exc))
-        return _result(False)
-
-    # 3. admin-state unlocked — blocking
+    # 2. admin-state unlocked — blocking. MUST precede fetch-host-keys: a newly
+    #    created device defaults to southbound-locked, which blocks ALL southbound
+    #    traffic, so fetch-host-keys (and any connect) fails until it is unlocked.
     try:
         await client.set_admin_state(device_name, admin_state)
         _step("admin_state", "ok", admin_state)
     except Exception as exc:
         _step("admin_state", "failed", repr(exc))
+        return _result(False)
+
+    # 3. fetch host keys (needs the device reachable AND unlocked) — blocking
+    try:
+        await client.fetch_host_keys(device_name)
+        _step("fetch_host_keys", "ok")
+    except Exception as exc:
+        _step("fetch_host_keys", "failed", repr(exc))
         return _result(False)
 
     # 4. sync-from — non-fatal (the adapter's normal sync will retry)
