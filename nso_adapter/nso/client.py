@@ -232,6 +232,22 @@ class NsoClient:
             entries = data.get("network-state-export:device") or data.get("device", [])
             return entries[0] if entries else None
 
+    async def get_l2_services(self, device_name: str) -> dict | None:
+        """Return the l2-service entry for *device_name* from the NSO package oper-data.
+
+        Returns None if the device has no L2 services (404 or empty).
+        Raises httpx.HTTPStatusError on other errors.
+        """
+        url = f"{self._base}/restconf/data/network-state-export:l2-service/device={device_name}"
+        async with self._client() as c:
+            resp = await c.get(url)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            entries = data.get("network-state-export:device") or data.get("device", [])
+            return entries[0] if entries else None
+
     async def get_isis_interfaces(self, device_name: str) -> dict | None:
         """Return the isis-interface entry for *device_name* from the NSO package oper-data.
 

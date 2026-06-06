@@ -21,6 +21,7 @@ from nso_adapter.api.interface_ip import router as interface_ip_router
 from nso_adapter.api.interfaces import router as interfaces_router
 from nso_adapter.api.isis import router as isis_router
 from nso_adapter.api.jobs import router as jobs_router
+from nso_adapter.api.l2_service import router as l2_service_router
 from nso_adapter.api.lag_topology import router as lag_topology_router
 from nso_adapter.api.logging_config import router as logging_config_router
 from nso_adapter.api.nso_instances import router as nso_instances_router
@@ -33,6 +34,7 @@ from nso_adapter.api.static_route import router as static_route_router
 from nso_adapter.config import get_config, get_env_settings
 from nso_adapter.core.importer import register_nso_client, set_netbox_client
 from nso_adapter.core.interface_ip import handle_interface_ip_change
+from nso_adapter.core.l2_service import handle_l2_service_change
 from nso_adapter.core.lag_topology import handle_netconf_config_change
 from nso_adapter.core.scheduler import start_scheduler, stop_scheduler
 from nso_adapter.core.snmp import handle_snmp_config_change
@@ -105,6 +107,7 @@ async def lifespan(app: FastAPI):
             async def _handle() -> None:
                 async for db in get_session():
                     await handle_netconf_config_change(parsed, db, clients)
+                    await handle_l2_service_change(parsed, db, clients)
                     if cfg.scheduler.enable_interface_ip_sync:
                         await handle_interface_ip_change(parsed, db, clients)
                     if cfg.scheduler.enable_snmp_sync:
@@ -182,6 +185,7 @@ def create_app() -> FastAPI:
     app.include_router(snmp_router)
     app.include_router(logging_config_router)
     app.include_router(static_route_router)
+    app.include_router(l2_service_router)
     app.include_router(isis_router)
     app.include_router(bfd_router)
     app.include_router(bgp_router)

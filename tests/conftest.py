@@ -219,6 +219,40 @@ async def seed_device(
     raise RuntimeError("seed_device: no DB session available")
 
 
+async def seed_l2_saps(device_id: int, services: list[dict]):
+    """Insert DeviceL2Sap rows from a list of service dicts.
+
+    Each service: ``{service_name, service_type, service_id?, saps: [{sap_id, port,
+    outer_tag?, inner_tag?}]}``.
+    """
+    from datetime import UTC, datetime
+
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import DeviceL2Sap
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async for db in get_session():
+        for svc in services:
+            for sap in svc.get("saps", []):
+                db.add(
+                    DeviceL2Sap(
+                        device_id=device_id,
+                        service_name=svc["service_name"],
+                        service_type=svc.get("service_type", ""),
+                        service_id=svc.get("service_id"),
+                        sap_id=sap["sap_id"],
+                        port=sap.get("port", ""),
+                        outer_tag=sap.get("outer_tag"),
+                        inner_tag=sap.get("inner_tag"),
+                        last_refreshed_at=now,
+                        refresh_source="test",
+                    )
+                )
+        await db.commit()
+        return
+    raise RuntimeError("seed_l2_saps: no DB session available")
+
+
 async def seed_bgp_config(
     device_id: int,
     *,
