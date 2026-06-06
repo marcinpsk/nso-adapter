@@ -81,6 +81,8 @@ class SchedulerConfig(BaseModel):
     redistribution_poll_interval: int = 300
     enable_route_policy_sync: bool = True
     route_policy_poll_interval: int = 300
+    enable_l2_service_sync: bool = True
+    l2_service_poll_interval: int = 300
     # Topology interface reconcile: ensured NetBox held the LAG parents, logical
     # channels/SAPs and loopback/system interfaces that the OLD bound_port-named
     # correlation needed. M27R supersedes this: interface-attributes now exports

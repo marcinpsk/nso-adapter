@@ -70,6 +70,10 @@ def test_start_scheduler_registers_lag_refresh_job(monkeypatch: pytest.MonkeyPat
                 redistribution_poll_interval=300,
                 enable_route_policy_sync=False,
                 route_policy_poll_interval=300,
+                enable_logging_sync=False,
+                logging_poll_interval=300,
+                enable_l2_service_sync=True,
+                l2_service_poll_interval=300,
                 enable_topology_interface_sync=False,
                 topology_interface_poll_interval=120,
             )
@@ -85,6 +89,7 @@ def test_start_scheduler_registers_lag_refresh_job(monkeypatch: pytest.MonkeyPat
         "intent_reconcile",
         "lag_topology_refresh",
         "interface_ip_refresh",
+        "l2_service_refresh",
     }
     scheduler_module.stop_scheduler()
     assert fake_scheduler.stopped is True
@@ -117,6 +122,10 @@ def test_start_scheduler_skips_lag_refresh_when_disabled(monkeypatch: pytest.Mon
                 redistribution_poll_interval=300,
                 enable_route_policy_sync=False,
                 route_policy_poll_interval=300,
+                enable_logging_sync=False,
+                logging_poll_interval=300,
+                enable_l2_service_sync=False,
+                l2_service_poll_interval=300,
                 enable_topology_interface_sync=False,
                 topology_interface_poll_interval=120,
             )
@@ -152,6 +161,29 @@ async def test_scheduled_lag_topology_refresh_refreshes_all_devices(adapter_clie
     monkeypatch.setattr("nso_adapter.core.lag_topology.refresh_lag_topology_for_device", refresh)
 
     await scheduler_module._scheduled_lag_topology_refresh()
+
+    assert refresh.await_count == 2
+    assert all(call.kwargs["refresh_source"] == "poll" for call in refresh.await_args_list)
+
+
+@pytest.mark.anyio
+async def test_scheduled_l2_service_refresh_refreshes_all_devices(adapter_client, monkeypatch):
+    async for db in get_session():
+        db.add_all(
+            [
+                Device(nso_instance="nso-dev", nso_device_name="ra1", netbox_device_id=2001),
+                Device(nso_instance="nso-dev", nso_device_name="ra2", netbox_device_id=2002),
+            ]
+        )
+        await db.commit()
+        break
+
+    refresh = AsyncMock()
+    nso_client = MagicMock()
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: nso_client)
+    monkeypatch.setattr("nso_adapter.core.l2_service.refresh_l2_services_for_device", refresh)
+
+    await scheduler_module._scheduled_l2_service_refresh()
 
     assert refresh.await_count == 2
     assert all(call.kwargs["refresh_source"] == "poll" for call in refresh.await_args_list)

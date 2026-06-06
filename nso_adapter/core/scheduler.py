@@ -200,6 +200,32 @@ async def _scheduled_lag_topology_refresh() -> None:
             await refresh_lag_topology_for_device(db, device, nso_client, refresh_source="poll")
 
 
+async def _scheduled_l2_service_refresh() -> None:
+    """Periodic fallback: refresh Nokia L2 services (epipe/vpls + SAPs) for all managed devices."""
+    from sqlalchemy import select
+
+    from nso_adapter.core.importer import get_nso_client
+    from nso_adapter.core.l2_service import refresh_l2_services_for_device
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device
+
+    async for db in get_session():
+        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
+        devices = result.scalars().all()
+        for device in devices:
+            try:
+                nso_client = get_nso_client(device.nso_instance)
+            except RuntimeError:
+                logger.debug(
+                    "scheduler.l2_service.skipped",
+                    device_id=device.id,
+                    reason="no_nso_client",
+                    instance=device.nso_instance,
+                )
+                continue
+            await refresh_l2_services_for_device(db, device, nso_client, refresh_source="poll")
+
+
 async def _scheduled_interface_ip_refresh() -> None:
     """Periodic fallback: refresh interface IP addresses for all managed devices."""
     from sqlalchemy import select
@@ -545,6 +571,13 @@ def start_scheduler() -> None:
             "interval",
             minutes=cfg.scheduler.logging_poll_interval,
             id="logging_refresh",
+        )
+    if cfg.scheduler.enable_l2_service_sync and cfg.scheduler.l2_service_poll_interval > 0:
+        _scheduler.add_job(
+            _scheduled_l2_service_refresh,
+            "interval",
+            minutes=cfg.scheduler.l2_service_poll_interval,
+            id="l2_service_refresh",
         )
     if cfg.scheduler.enable_route_policy_sync and cfg.scheduler.route_policy_poll_interval > 0:
         _scheduler.add_job(
