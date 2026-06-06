@@ -324,6 +324,50 @@ class LagMember(Base):
     lag_interface: Mapped[LagInterface] = relationship("LagInterface", back_populates="members")
 
 
+class LagBundleConfig(Base):
+    """Read-mirror of LACP bundle configuration parameters from NSO (M33)."""
+
+    __tablename__ = "lag_bundle_config"
+    __table_args__ = (UniqueConstraint("device_id", "lag_id", name="uq_lag_bundle_config_device_lag"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    lag_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    min_links: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    system_priority: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    system_id: Mapped[str | None] = mapped_column(String(17), nullable=True)
+    timer: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    admin_key: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refresh_source: Mapped[str] = mapped_column(String(64), nullable=False, default="never")
+
+    members: Mapped[list[LagMemberConfig]] = relationship(
+        "LagMemberConfig", back_populates="bundle", cascade="all, delete-orphan", lazy="raise"
+    )
+
+
+class LagMemberConfig(Base):
+    """Read-mirror of LACP member port parameters from NSO (M33)."""
+
+    __tablename__ = "lag_member_config"
+    __table_args__ = (
+        UniqueConstraint("lag_bundle_id", "interface_name", name="uq_lag_member_config_bundle_iface"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    lag_bundle_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("lag_bundle_config.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    interface_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    port_priority: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    bundle: Mapped[LagBundleConfig] = relationship("LagBundleConfig", back_populates="members")
+
+
 class InterfaceIpAddress(Base):
     """Read mirror of per-interface IP addresses from NSO.
 
