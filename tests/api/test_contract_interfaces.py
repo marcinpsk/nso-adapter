@@ -23,7 +23,17 @@ AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 # The contract, as documented in docs/api-contract.md. Keep in lockstep with the
 # plugin mirror.
-EXPECTED_IFACE_KEYS = {"name", "netbox_interface_id", "attrs"}
+# M27R added the logical-interface modeling keys (NULL for physical ports / Cisco / Junos).
+EXPECTED_IFACE_KEYS = {
+    "name",
+    "netbox_interface_id",
+    "attrs",
+    "parent_binding",
+    "kind",
+    "encap_tag",
+    "vrf",
+    "service",
+}
 EXPECTED_ATTR_KEYS = {
     "nso_value",
     "netbox_value",

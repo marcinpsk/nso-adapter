@@ -340,6 +340,8 @@ Same shape as the `PUT` request body, plus `updated_at`.
 ### `GET /api/v1/devices/{id}/interfaces` → `200`
 ```json
 [ { "name": "GigabitEthernet0/0/0/1", "netbox_interface_id": 555,
+    "parent_binding": null, "kind": null, "encap_tag": null,   // M27R logical-iface modeling;
+    "vrf": null, "service": null,                              //   null for physical / Cisco / Junos
     "attrs": {
       "description": {
         "nso_value":    "uplink to spine-1",
