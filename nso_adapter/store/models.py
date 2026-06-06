@@ -117,6 +117,9 @@ class Device(Base):
     static_routes: Mapped[list[DeviceStaticRoute]] = relationship(
         "DeviceStaticRoute", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
+    l2_saps: Mapped[list[DeviceL2Sap]] = relationship(
+        "DeviceL2Sap", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
     static_route_intents: Mapped[list[StaticRouteIntent]] = relationship(
         "StaticRouteIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
@@ -643,6 +646,35 @@ class StaticRouteIntent(Base):
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     device: Mapped[Device] = relationship("Device", back_populates="static_route_intents")
+
+
+class DeviceL2Sap(Base):
+    """Read mirror of one Nokia L2 SAP (epipe/vpls service member) — M37 P1, read-only.
+
+    One flat row per SAP, carrying its parent service. The dot1q tag is per-SAP
+    interface-local encap parsed from the sap-id ``port:tag[.inner]`` (not a device VLAN).
+    """
+
+    __tablename__ = "device_l2_sap"
+    __table_args__ = (
+        UniqueConstraint("device_id", "service_name", "sap_id", name="uq_devicel2sap_identity"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    service_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    service_type: Mapped[str] = mapped_column(String(16), nullable=False)  # epipe | vpls
+    service_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sap_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    port: Mapped[str] = mapped_column(String(64), nullable=False)
+    outer_tag: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    inner_tag: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
+
+    device: Mapped[Device] = relationship("Device", back_populates="l2_saps")
 
 
 class DeviceIsisProcess(Base):
