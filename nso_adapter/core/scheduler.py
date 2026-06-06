@@ -200,6 +200,32 @@ async def _scheduled_lag_topology_refresh() -> None:
             await refresh_lag_topology_for_device(db, device, nso_client, refresh_source="poll")
 
 
+async def _scheduled_lag_config_refresh() -> None:
+    """Periodic fallback: refresh LAG config for all managed devices."""
+    from sqlalchemy import select
+
+    from nso_adapter.core.importer import get_nso_client
+    from nso_adapter.core.lag_config import refresh_lag_config_for_device
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device
+
+    async for db in get_session():
+        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
+        devices = result.scalars().all()
+        for device in devices:
+            try:
+                nso_client = get_nso_client(device.nso_instance)
+            except RuntimeError:
+                logger.debug(
+                    "scheduler.lag_config.skipped",
+                    device_id=device.id,
+                    reason="no_nso_client",
+                    instance=device.nso_instance,
+                )
+                continue
+            await refresh_lag_config_for_device(db, device, nso_client, refresh_source="poll")
+
+
 async def _scheduled_l2_service_refresh() -> None:
     """Periodic fallback: refresh Nokia L2 services (epipe/vpls + SAPs) for all managed devices."""
     from sqlalchemy import select
@@ -515,6 +541,13 @@ def start_scheduler() -> None:
             "interval",
             minutes=cfg.scheduler.lag_topology_poll_interval,
             id="lag_topology_refresh",
+        )
+    if cfg.scheduler.lag_config_poll_interval > 0:
+        _scheduler.add_job(
+            _scheduled_lag_config_refresh,
+            "interval",
+            minutes=cfg.scheduler.lag_config_poll_interval,
+            id="lag_config_refresh",
         )
     if cfg.scheduler.enable_interface_ip_sync and cfg.scheduler.interface_ip_poll_interval > 0:
         _scheduler.add_job(

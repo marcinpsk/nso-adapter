@@ -350,3 +350,49 @@ async def seed_bgp_config(
         await db.refresh(router)
         return router.id
     raise RuntimeError("seed_bgp_config: no DB session available")
+
+
+async def seed_lag_config(
+    device_id: int,
+    *,
+    bundles: list[dict] | None = None,
+    refresh_source: str = "test",
+):
+    """Insert LagBundleConfig + LagMemberConfig rows for a device.
+
+    Each bundle dict: name, lag_id, min_links?, system_priority?, timer?,
+    system_id?, admin_key?, members (list of {interface_name, mode?, port_priority?}).
+    """
+    from datetime import UTC, datetime
+
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import LagBundleConfig, LagMemberConfig
+
+    if bundles is None:
+        bundles = []
+
+    async for db in get_session():
+        now = datetime.now(UTC).replace(tzinfo=None)
+        for b in bundles:
+            bundle = LagBundleConfig(
+                device_id=device_id,
+                name=b["name"],
+                lag_id=b["lag_id"],
+                min_links=b.get("min_links"),
+                system_priority=b.get("system_priority"),
+                system_id=b.get("system_id"),
+                timer=b.get("timer"),
+                admin_key=b.get("admin_key"),
+                last_refreshed_at=now,
+                refresh_source=refresh_source,
+            )
+            db.add(bundle)
+            await db.flush()
+            for m in b.get("members", []):
+                db.add(LagMemberConfig(
+                    lag_bundle_id=bundle.id,
+                    interface_name=m["interface_name"],
+                    mode=m.get("mode"),
+                    port_priority=m.get("port_priority"),
+                ))
+        await db.commit()

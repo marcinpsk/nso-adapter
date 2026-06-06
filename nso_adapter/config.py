@@ -62,6 +62,7 @@ class SchedulerConfig(BaseModel):
     worker_concurrency: int = 1
     enable_nso_streams: bool = True
     lag_topology_poll_interval: int = 60
+    lag_config_poll_interval: int = 60
     enable_interface_ip_sync: bool = True
     interface_ip_poll_interval: int = 60
     enable_snmp_sync: bool = True

@@ -202,6 +202,8 @@ _STATIC_ROUTE_SERVICE_PATH = "/restconf/data/static-route-reconciler:static-rout
 # RESTCONF path to the l2-sap-reconciler service list (M37 P2b)
 _L2_SAP_SERVICE_PATH = "/restconf/data/l2-sap-reconciler:l2-sap-config"
 
+_LAG_SERVICE_PATH = "/restconf/data/lag-reconciler:lag-config"
+
 # RESTCONF path to the isis-reconciler service list
 _ISIS_SERVICE_PATH = "/restconf/data/isis-reconciler:isis-config"
 
@@ -423,6 +425,60 @@ async def apply_l2_saps(
         "nso.apply.l2_sap_ok",
         device=device_name,
         sap_count=len(saps),
+    )
+
+
+async def apply_lag_config(
+    client: NsoClient,
+    device_name: str,
+    bundles: list[dict],
+) -> None:
+    """Write LACP/LAG bundle intent for a single device to NSO (M33).
+
+    Builds a full lag-reconciler PATCH body from the supplied bundle dicts and
+    commits with reconcile option so pre-existing LAGs are adopted. The bundle
+    list is full-replace: FASTMAP removes bundles absent from the payload.
+
+    Each bundle dict uses YANG-style keys: ``name`` (key), ``lag-id``,
+    optional ``min-links``/``system-priority``/``system-id``/``timer``/
+    ``admin-key``, and ``member`` (list of ``interface-name`` + optional
+    ``mode``/``port-priority``).
+
+    Raises NsoApplyError on failure.
+    """
+    payload = json.dumps(
+        {"lag-reconciler:lag-config": [{"device": device_name, "bundle": bundles}]}
+    )
+
+    url = f"{client._base}{_LAG_SERVICE_PATH}"
+
+    async with client._client(timeout=client._action_timeout) as c:
+        resp = await c.patch(
+            url,
+            content=payload,
+            headers={"Content-Type": "application/yang-data+json"},
+        )
+        if resp.status_code not in (200, 201, 204):
+            try:
+                err = resp.json()
+            except Exception:
+                err = {"raw": resp.text}
+            logger.error(
+                "nso.apply.lag_patch_failed",
+                device=device_name,
+                status=resp.status_code,
+                body=err,
+            )
+            raise NsoApplyError(
+                "nso_patch_failed",
+                f"NSO PATCH for LAG intent failed with status {resp.status_code}",
+                detail={"nso_error": err},
+            )
+
+    logger.info(
+        "nso.apply.lag_ok",
+        device=device_name,
+        bundle_count=len(bundles),
     )
 
 

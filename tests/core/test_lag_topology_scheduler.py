@@ -33,6 +33,7 @@ def test_scheduler_config_defaults():
     cfg = SchedulerConfig()
     assert cfg.enable_nso_streams is True
     assert cfg.lag_topology_poll_interval == 60
+    assert cfg.lag_config_poll_interval == 60
     assert cfg.enable_interface_ip_sync is True
     assert cfg.interface_ip_poll_interval == 60
 
@@ -54,6 +55,7 @@ def test_start_scheduler_registers_lag_refresh_job(monkeypatch: pytest.MonkeyPat
                 poll_interval=15,
                 scope_reconcile_interval=5,
                 lag_topology_poll_interval=60,
+                lag_config_poll_interval=60,
                 enable_interface_ip_sync=True,
                 interface_ip_poll_interval=60,
                 enable_snmp_sync=False,
@@ -88,6 +90,7 @@ def test_start_scheduler_registers_lag_refresh_job(monkeypatch: pytest.MonkeyPat
         "scope_reconcile",
         "intent_reconcile",
         "lag_topology_refresh",
+        "lag_config_refresh",
         "interface_ip_refresh",
         "l2_service_refresh",
     }
@@ -106,6 +109,7 @@ def test_start_scheduler_skips_lag_refresh_when_disabled(monkeypatch: pytest.Mon
                 poll_interval=15,
                 scope_reconcile_interval=5,
                 lag_topology_poll_interval=0,
+                lag_config_poll_interval=0,
                 enable_interface_ip_sync=False,
                 interface_ip_poll_interval=60,
                 enable_snmp_sync=False,
