@@ -261,3 +261,46 @@ async def test_check_sync_returns_false_on_missing_result_key(patch_client):
     with patch_client(client, 200, payload):
         result = await client.check_sync("core-rtr-01")
     assert result is False
+
+
+# ── fetch_host_keys (M-onboard: must not report success when no key stored) ────
+
+
+async def test_fetch_host_keys_success_updated(patch_client):
+    """A result of 'updated' with a fingerprint returns the action output."""
+    client = _make_client()
+    payload = {"tailf-ncs:output": {"result": "updated", "fingerprint": {"algorithm": "ssh-rsa", "value": "aa:bb"}}}
+    with patch_client(client, 200, payload):
+        out = await client.fetch_host_keys("core-rtr-01")
+    assert out["tailf-ncs:output"]["result"] == "updated"
+
+
+async def test_fetch_host_keys_success_unchanged(patch_client):
+    """A result of 'unchanged' (key already trusted) is also success."""
+    client = _make_client()
+    payload = {"tailf-ncs:output": {"result": "unchanged", "fingerprint": {"algorithm": "ssh-rsa", "value": "aa:bb"}}}
+    with patch_client(client, 200, payload):
+        out = await client.fetch_host_keys("core-rtr-01")
+    assert out["tailf-ncs:output"]["result"] == "unchanged"
+
+
+async def test_fetch_host_keys_failed_result_raises(patch_client):
+    """NSO returns HTTP 200 + result='failed' with no fingerprint → must raise.
+
+    Regression: a failed fetch was previously swallowed and onboarding recorded
+    a false 'ok' key-fetch step, so the first real connect failed host-key verify.
+    """
+    client = _make_client()
+    payload = {"tailf-ncs:output": {"result": "failed", "info": "connection refused"}}
+    with patch_client(client, 200, payload):  # noqa: SIM117
+        with pytest.raises(RuntimeError, match="did not store a key"):
+            await client.fetch_host_keys("core-rtr-01")
+
+
+async def test_fetch_host_keys_no_fingerprint_raises(patch_client):
+    """A 'success'-looking result without a fingerprint still raises (no key)."""
+    client = _make_client()
+    payload = {"tailf-ncs:output": {"result": "updated"}}
+    with patch_client(client, 200, payload):  # noqa: SIM117
+        with pytest.raises(RuntimeError, match="did not store a key"):
+            await client.fetch_host_keys("core-rtr-01")

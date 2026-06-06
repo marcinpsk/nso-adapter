@@ -397,8 +397,25 @@ class NsoClient:
             return resp.json() if resp.content else {}
 
     async def fetch_host_keys(self, device_name: str) -> dict:
-        """Fetch (TOFU-trust) the device's SSH host keys. Returns the action output."""
-        return await self._device_action(device_name, "ssh/fetch-host-keys")
+        """Fetch (TOFU-trust) the device's SSH host keys. Returns the action output.
+
+        NSO returns HTTP 200 even when the fetch fails to negotiate an SSH
+        connection (``result: failed`` with no ``fingerprint``).  That must be
+        surfaced as an error — otherwise onboarding records a successful
+        key-fetch step while no host key was actually stored, and the first real
+        connect then fails with "could not verify host key".  Mirrors the
+        result-checking ``sync_from`` already does.
+        """
+        out = await self._device_action(device_name, "ssh/fetch-host-keys")
+        body = out.get("tailf-ncs:output", {}) if isinstance(out, dict) else {}
+        result = body.get("result")
+        if result not in ("updated", "unchanged") or not body.get("fingerprint"):
+            info = body.get("info") or body.get("error") or ""
+            raise RuntimeError(
+                f"fetch-host-keys for {device_name!r} did not store a key "
+                f"(result={result!r}){f': {info}' if info else ''}"
+            )
+        return out
 
     async def sync_from(self, device_name: str) -> bool:
         """Pull the device's running config into NSO's CDB. Returns the result bool."""
