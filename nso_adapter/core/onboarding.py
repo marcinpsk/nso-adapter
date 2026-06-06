@@ -7,6 +7,8 @@ sets mapping_status = unmatched_device.
 
 from __future__ import annotations
 
+import asyncio
+
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +17,28 @@ from nso_adapter.config import get_config
 from nso_adapter.store.models import DbInterface, Device, ManagedScope, MappingStatus
 
 logger = structlog.get_logger(__name__)
+
+# Some devices (observed on IOS-XR) reset the FIRST southbound connection right
+# after the node is created/unlocked; a single backed-off retry clears it.
+_ONBOARD_RETRY_BACKOFF_SECONDS = 3.0
+
+
+async def _once_with_retry(action, *, backoff: float = _ONBOARD_RETRY_BACKOFF_SECONDS, ok=None):
+    """Run async *action*; on failure wait *backoff* and run it exactly once more.
+
+    "Failure" = the action raised, or (when *ok* is given) it returned a value
+    for which ``ok(value)`` is falsy — covers both fetch-host-keys (raises) and
+    sync-from (returns a bool). The second attempt's exception/result propagates.
+    """
+    try:
+        result = await action()
+    except Exception:
+        await asyncio.sleep(backoff)
+        return await action()
+    if ok is not None and not ok(result):
+        await asyncio.sleep(backoff)
+        return await action()
+    return result
 
 
 async def onboard_device(
@@ -125,18 +149,20 @@ async def provision_nso_device(
         _step("admin_state", "failed", repr(exc))
         return _result(False)
 
-    # 3. fetch host keys (needs the device reachable AND unlocked) — blocking
+    # 3. fetch host keys (needs the device reachable AND unlocked) — blocking,
+    #    with one backed-off retry for the first-connect reset.
     try:
-        await client.fetch_host_keys(device_name)
+        await _once_with_retry(lambda: client.fetch_host_keys(device_name))
         _step("fetch_host_keys", "ok")
     except Exception as exc:
         _step("fetch_host_keys", "failed", repr(exc))
         return _result(False)
 
-    # 4. sync-from — non-fatal (the adapter's normal sync will retry)
+    # 4. sync-from — non-fatal (the adapter's normal sync will retry), but give
+    #    it one backed-off retry too so onboarding usually lands fully synced.
     if do_sync:
         try:
-            ok = await client.sync_from(device_name)
+            ok = await _once_with_retry(lambda: client.sync_from(device_name), ok=bool)
             _step("sync_from", "ok" if ok else "failed")
         except Exception as exc:
             _step("sync_from", "failed", repr(exc))

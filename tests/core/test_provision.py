@@ -159,3 +159,70 @@ async def test_provision_unknown_instance_raises(adapter_client):
                 ned_id="x", authgroup="network",
             )
         break
+
+
+async def test_provision_retries_fetch_host_keys_once(adapter_client_with_nso):
+    """First fetch-host-keys reset is retried once (with backoff) and then succeeds."""
+    from unittest.mock import AsyncMock
+
+    from nso_adapter.core.onboarding import provision_nso_device
+    from nso_adapter.store.db import get_session
+
+    client = _mock_client()
+    client.fetch_host_keys.side_effect = [RuntimeError("connection reset"), {"result": "updated"}]
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=client), patch(
+        "nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()
+    ):
+        async for db in get_session():
+            res = await provision_nso_device(
+                db, nso_instance="nso-dev", device_name="retry-ok", address="1.1.1.1",
+                ned_id="x", authgroup="network",
+            )
+            break
+    assert res["ok"] is True
+    assert _steps(res)["fetch_host_keys"] == "ok"
+    assert client.fetch_host_keys.await_count == 2
+
+
+async def test_provision_fetch_host_keys_fails_after_one_retry(adapter_client_with_nso):
+    """If both fetch attempts fail, the step fails and provision aborts (exactly 2 tries)."""
+    from unittest.mock import AsyncMock
+
+    from nso_adapter.core.onboarding import provision_nso_device
+    from nso_adapter.store.db import get_session
+
+    client = _mock_client(fetch=RuntimeError("still down"))
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=client), patch(
+        "nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()
+    ):
+        async for db in get_session():
+            res = await provision_nso_device(
+                db, nso_instance="nso-dev", device_name="retry-bad", address="1.1.1.1",
+                ned_id="x", authgroup="network",
+            )
+            break
+    assert res["ok"] is False
+    assert _steps(res)["fetch_host_keys"] == "failed"
+    assert client.fetch_host_keys.await_count == 2
+
+
+async def test_provision_retries_sync_from_once(adapter_client_with_nso):
+    """sync-from returning False on the first attempt is retried once and then succeeds."""
+    from unittest.mock import AsyncMock
+
+    from nso_adapter.core.onboarding import provision_nso_device
+    from nso_adapter.store.db import get_session
+
+    client = _mock_client()
+    client.sync_from.side_effect = [False, True]
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=client), patch(
+        "nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()
+    ):
+        async for db in get_session():
+            res = await provision_nso_device(
+                db, nso_instance="nso-dev", device_name="sync-retry", address="1.1.1.1",
+                ned_id="x", authgroup="network",
+            )
+            break
+    assert _steps(res)["sync_from"] == "ok"
+    assert client.sync_from.await_count == 2
