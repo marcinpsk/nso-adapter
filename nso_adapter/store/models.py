@@ -120,6 +120,9 @@ class Device(Base):
     l2_saps: Mapped[list[DeviceL2Sap]] = relationship(
         "DeviceL2Sap", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
+    l2_sap_intents: Mapped[list[L2SapIntent]] = relationship(
+        "L2SapIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
     static_route_intents: Mapped[list[StaticRouteIntent]] = relationship(
         "StaticRouteIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
@@ -675,6 +678,35 @@ class DeviceL2Sap(Base):
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
 
     device: Mapped[Device] = relationship("Device", back_populates="l2_saps")
+
+
+class L2SapIntent(Base):
+    """Write-path intent for one Nokia L2 SAP accepted by the NetBox operator (M37 P2b).
+
+    Mirrors DeviceL2Sap's identity but carries the apply lifecycle. SAP-only:
+    the apply path adds/adopts the SAP under an EXISTING epipe/vpls service.
+    """
+
+    __tablename__ = "l2_sap_intent"
+    __table_args__ = (
+        UniqueConstraint("device_id", "service_name", "sap_id", name="uq_l2sapintent_identity"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    service_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    service_type: Mapped[str] = mapped_column(String(16), nullable=False)  # epipe | vpls
+    sap_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    port: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    outer_tag: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    inner_tag: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    device: Mapped[Device] = relationship("Device", back_populates="l2_sap_intents")
 
 
 class DeviceIsisProcess(Base):

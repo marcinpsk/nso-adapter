@@ -199,6 +199,9 @@ _SNMP_SERVICE_PATH = "/restconf/data/snmp-reconciler:snmp-config"
 # RESTCONF path to the static-route-reconciler service list
 _STATIC_ROUTE_SERVICE_PATH = "/restconf/data/static-route-reconciler:static-route-config"
 
+# RESTCONF path to the l2-sap-reconciler service list (M37 P2b)
+_L2_SAP_SERVICE_PATH = "/restconf/data/l2-sap-reconciler:l2-sap-config"
+
 # RESTCONF path to the isis-reconciler service list
 _ISIS_SERVICE_PATH = "/restconf/data/isis-reconciler:isis-config"
 
@@ -358,6 +361,68 @@ async def apply_static_routes(
         "nso.apply.static_route_ok",
         device=device_name,
         route_count=len(routes),
+    )
+
+
+async def apply_l2_saps(
+    client: NsoClient,
+    device_name: str,
+    sap_intent_rows: list,
+) -> None:
+    """Write Nokia L2 SAP intent for a single device to NSO (M37 P2b).
+
+    Builds a full l2-sap-reconciler PATCH body from the supplied rows and
+    commits with reconcile option so pre-existing SAPs are adopted. The NSO
+    service adds each SAP under an EXISTING epipe/vpls service (SAP-only).
+
+    Raises NsoApplyError on failure.
+    """
+    saps = []
+    for row in sap_intent_rows:
+        entry: dict = {
+            "service-name": row.service_name,
+            "sap-id": row.sap_id,
+            "service-type": row.service_type,
+        }
+        if row.port:
+            entry["port"] = row.port
+        if row.outer_tag is not None:
+            entry["outer-tag"] = row.outer_tag
+        if row.inner_tag is not None:
+            entry["inner-tag"] = row.inner_tag
+        saps.append(entry)
+
+    payload = json.dumps({"l2-sap-reconciler:l2-sap-config": [{"device": device_name, "sap": saps}]})
+
+    url = f"{client._base}{_L2_SAP_SERVICE_PATH}"
+
+    async with client._client(timeout=client._action_timeout) as c:
+        resp = await c.patch(
+            url,
+            content=payload,
+            headers={"Content-Type": "application/yang-data+json"},
+        )
+        if resp.status_code not in (200, 201, 204):
+            try:
+                err = resp.json()
+            except Exception:
+                err = {"raw": resp.text}
+            logger.error(
+                "nso.apply.l2_sap_patch_failed",
+                device=device_name,
+                status=resp.status_code,
+                body=err,
+            )
+            raise NsoApplyError(
+                "nso_patch_failed",
+                f"NSO PATCH for L2 SAP intent failed with status {resp.status_code}",
+                detail={"nso_error": err},
+            )
+
+    logger.info(
+        "nso.apply.l2_sap_ok",
+        device=device_name,
+        sap_count=len(saps),
     )
 
 

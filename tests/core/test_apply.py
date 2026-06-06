@@ -150,6 +150,7 @@ async def test_run_apply_nothing_eligible(adapter_client):
             "ip_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
             "snmp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
             "static_route_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+            "l2_sap_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
             "isis_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
             "bgp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
             "route_policy_count_by_outcome": {"in_sync": 0, "apply_failed": 0},

@@ -36,6 +36,7 @@ from nso_adapter.store.models import (
     Job,
     JobStatus,
     JobType,
+    L2SapIntent,
     OspfInstanceIntent,
     OspfInterfaceIntent,
     RedistributionIntent,
@@ -88,6 +89,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
         apply_interface_attribute,
         apply_interface_ips,
         apply_isis_interfaces,
+        apply_l2_saps,
         apply_ospf_config,
         apply_route_policy_config,
         apply_snmp_config,
@@ -226,6 +228,16 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 if not force and row.last_apply_at is not None and row.last_apply_error is None:
                     continue
                 sr_eligible.append(row)
+
+            # Collect L2 SAP intent rows (M37 P2b — Nokia SAP write path)
+            l2_eligible: list[L2SapIntent] = []
+            l2_result = await db.execute(select(L2SapIntent).where(L2SapIntent.device_id == device_id))
+            for row in l2_result.scalars().all():
+                if row.accepted_at is None:
+                    continue
+                if not force and row.last_apply_at is not None and row.last_apply_error is None:
+                    continue
+                l2_eligible.append(row)
 
             # Collect IS-IS interface intent rows
             isis_eligible: list[IsisInterfaceIntent] = []
@@ -598,6 +610,42 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     sr_outcome_failed = len(sr_eligible)
                     sr_failed.append({"error": repr(exc)})
 
+            # ── Step 6c2: L2 SAP intent pass (M37 P2b) ───────────────────────
+            l2_outcome_ok = 0
+            l2_outcome_failed = 0
+            l2_failed: list[dict] = []
+
+            if l2_eligible:
+                try:
+                    await apply_l2_saps(
+                        client=client,
+                        device_name=device_name,
+                        sap_intent_rows=l2_eligible,
+                    )
+                    for row in l2_eligible:
+                        row.last_apply_at = now
+                        row.last_apply_error = None
+                    l2_outcome_ok = len(l2_eligible)
+                except NsoApplyError as exc:
+                    logger.error(
+                        "apply.l2_sap_failed",
+                        job_id=job_id,
+                        device=device_name,
+                        error=exc.message,
+                    )
+                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
+                    for row in l2_eligible:
+                        row.last_apply_error = err_payload
+                    l2_outcome_failed = len(l2_eligible)
+                    l2_failed.append({"error": exc.message})
+                except Exception as exc:
+                    logger.exception("apply.l2_sap_unexpected_error", job_id=job_id)
+                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
+                    for row in l2_eligible:
+                        row.last_apply_error = err_payload
+                    l2_outcome_failed = len(l2_eligible)
+                    l2_failed.append({"error": repr(exc)})
+
             # ── Step 6d: IS-IS interface + process intent pass ───────────────
             isis_outcome_ok = 0
             isis_outcome_failed = 0
@@ -788,6 +836,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 and not ip_eligible_by_iface
                 and not snmp_has_eligible
                 and not sr_eligible
+                and not l2_eligible
                 and not isis_eligible
                 and not bgp_eligible
                 and not rp_eligible
@@ -802,6 +851,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     "ip_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "snmp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "static_route_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+                    "l2_sap_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "isis_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "bgp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "route_policy_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
@@ -815,6 +865,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 + ip_outcome_failed
                 + snmp_outcome_failed
                 + sr_outcome_failed
+                + l2_outcome_failed
                 + isis_outcome_failed
                 + bgp_outcome_failed
                 + rp_outcome_failed
@@ -836,6 +887,10 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 "static_route_count_by_outcome": {
                     "in_sync": sr_outcome_ok,
                     "apply_failed": sr_outcome_failed,
+                },
+                "l2_sap_count_by_outcome": {
+                    "in_sync": l2_outcome_ok,
+                    "apply_failed": l2_outcome_failed,
                 },
                 "isis_count_by_outcome": {
                     "in_sync": isis_outcome_ok,
@@ -863,6 +918,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     + [{"type": "ip", **a} for a in failed_ips]
                     + [{"type": "snmp", **a} for a in snmp_failed]
                     + [{"type": "static_route", **a} for a in sr_failed]
+                    + [{"type": "l2_sap", **a} for a in l2_failed]
                     + [{"type": "isis", **a} for a in isis_failed]
                     + [{"type": "bgp", **a} for a in bgp_failed]
                     + [{"type": "route_policy", **a} for a in rp_failed]
@@ -885,6 +941,8 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 snmp_failed=snmp_outcome_failed,
                 sr_in_sync=sr_outcome_ok,
                 sr_failed=sr_outcome_failed,
+                l2_in_sync=l2_outcome_ok,
+                l2_failed=l2_outcome_failed,
                 isis_in_sync=isis_outcome_ok,
                 isis_failed=isis_outcome_failed,
                 bgp_in_sync=bgp_outcome_ok,

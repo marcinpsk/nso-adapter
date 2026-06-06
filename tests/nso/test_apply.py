@@ -159,6 +159,60 @@ async def test_apply_nso_error_non_json_body():
     assert "raw" in exc_info.value.detail.get("nso_error", {})
 
 
+class _SapRow:
+    def __init__(self, service_name, service_type, sap_id, port="", outer_tag=None, inner_tag=None):
+        self.service_name = service_name
+        self.service_type = service_type
+        self.sap_id = sap_id
+        self.port = port
+        self.outer_tag = outer_tag
+        self.inner_tag = inner_tag
+
+
+@pytest.mark.asyncio
+async def test_apply_l2_saps_builds_patch_body():
+    """apply_l2_saps PATCHes the l2-sap-reconciler service with the SAP list."""
+    import json
+
+    from nso_adapter.nso.apply import apply_l2_saps
+
+    client = _make_nso_client()
+    client._client.return_value = _mock_http_ctx(_mock_httpx_response(204))
+
+    rows = [
+        _SapRow("TL", "epipe", "lag-60:3999", port="lag-60", outer_tag=3999),
+        _SapRow("701", "vpls", "1/1/c31/3:701.10", port="1/1/c31/3", outer_tag=701, inner_tag=10),
+    ]
+    await apply_l2_saps(client=client, device_name="ra1", sap_intent_rows=rows)
+
+    mock_http = client._client.return_value.__aenter__.return_value
+    (url,) = mock_http.patch.call_args[0]
+    assert "l2-sap-reconciler" in url
+    payload = json.loads(mock_http.patch.call_args[1]["content"])
+    cfg = payload["l2-sap-reconciler:l2-sap-config"]
+    assert cfg[0]["device"] == "ra1"
+    saps = {s["sap-id"]: s for s in cfg[0]["sap"]}
+    assert saps["lag-60:3999"]["service-type"] == "epipe"
+    assert saps["lag-60:3999"]["outer-tag"] == 3999
+    assert "inner-tag" not in saps["lag-60:3999"]
+    assert saps["1/1/c31/3:701.10"]["inner-tag"] == 10
+
+
+@pytest.mark.asyncio
+async def test_apply_l2_saps_nso_error_raises():
+    """Non-2xx NSO response from the L2 SAP PATCH raises NsoApplyError."""
+    from nso_adapter.nso.apply import apply_l2_saps
+
+    client = _make_nso_client()
+    client._client.return_value = _mock_http_ctx(_mock_httpx_response(409, json_data={"error": {}}))
+
+    with pytest.raises(NsoApplyError) as exc_info:
+        await apply_l2_saps(
+            client=client, device_name="ra1", sap_intent_rows=[_SapRow("TL", "epipe", "lag-60:1")]
+        )
+    assert exc_info.value.code == "nso_patch_failed"
+
+
 def test_nso_apply_error_str():
     """NsoApplyError carries code, message, and optional detail."""
     err = NsoApplyError("test_code", "test message", {"k": "v"})
