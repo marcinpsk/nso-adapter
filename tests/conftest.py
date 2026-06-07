@@ -396,3 +396,72 @@ async def seed_lag_config(
                     port_priority=m.get("port_priority"),
                 ))
         await db.commit()
+
+
+async def seed_vlan_database(device_id: int, vlans: list[dict]):
+    """Insert DeviceVlan rows. Each dict: vlan_id, name?."""
+    from datetime import UTC, datetime
+
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import DeviceVlan
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async for db in get_session():
+        for v in vlans:
+            db.add(DeviceVlan(
+                device_id=device_id, vlan_id=v["vlan_id"], name=v.get("name", ""),
+                last_refreshed_at=now, refresh_source="test",
+            ))
+        await db.commit()
+        return
+
+
+async def seed_switchport(device_id: int, interfaces: list[dict]):
+    """Insert DeviceSwitchport rows (+ DeviceVlan rows for referenced vids + links).
+
+    Each dict: interface_name, mode?, untagged_vlan?, tagged_vlans?.
+    """
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import (
+        DeviceSwitchport,
+        DeviceSwitchportTaggedVlan,
+        DeviceVlan,
+    )
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async for db in get_session():
+        existing = {
+            r.vlan_id: r
+            for r in (
+                await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device_id))
+            ).scalars().all()
+        }
+        vids: set[int] = set()
+        for itf in interfaces:
+            if itf.get("untagged_vlan") is not None:
+                vids.add(itf["untagged_vlan"])
+            vids.update(itf.get("tagged_vlans", []))
+        for vid in vids:
+            if vid not in existing:
+                row = DeviceVlan(device_id=device_id, vlan_id=vid, name="",
+                                 last_refreshed_at=now, refresh_source="test")
+                db.add(row)
+                await db.flush()
+                existing[vid] = row
+        for itf in interfaces:
+            uv = existing.get(itf["untagged_vlan"]) if itf.get("untagged_vlan") is not None else None
+            sp = DeviceSwitchport(
+                device_id=device_id, interface_name=itf["interface_name"], mode=itf.get("mode"),
+                untagged_vlan_id=uv.id if uv is not None else None,
+                last_refreshed_at=now, refresh_source="test",
+            )
+            db.add(sp)
+            await db.flush()
+            for tv in itf.get("tagged_vlans", []):
+                db.add(DeviceSwitchportTaggedVlan(switchport_id=sp.id, vlan_id=existing[tv].id))
+        await db.commit()
+        return

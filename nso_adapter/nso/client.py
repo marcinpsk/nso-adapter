@@ -169,6 +169,30 @@ class NsoClient:
             entries = data.get("network-state-export:device") or data.get("device", [])
             return entries[0] if entries else None
 
+    async def get_vlan_database(self, device_name: str) -> dict | None:
+        """Return the vlan-database entry for *device_name* (None on 404). M34."""
+        url = f"{self._base}/restconf/data/network-state-export:vlan-database/device={device_name}"
+        async with self._client() as c:
+            resp = await c.get(url)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            entries = data.get("network-state-export:device") or data.get("device", [])
+            return entries[0] if entries else None
+
+    async def get_switchport(self, device_name: str) -> dict | None:
+        """Return the switchport entry for *device_name* (None on 404). M34."""
+        url = f"{self._base}/restconf/data/network-state-export:switchport/device={device_name}"
+        async with self._client() as c:
+            resp = await c.get(url)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            entries = data.get("network-state-export:device") or data.get("device", [])
+            return entries[0] if entries else None
+
     async def get_interface_ips(self, device_name: str) -> dict | None:
         """Return the interface-ip entry for *device_name* from the NSO package oper-data.
 

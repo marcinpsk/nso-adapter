@@ -23,6 +23,7 @@ from nso_adapter.api.isis import router as isis_router
 from nso_adapter.api.jobs import router as jobs_router
 from nso_adapter.api.l2_service import router as l2_service_router
 from nso_adapter.api.lag_config import router as lag_config_router
+from nso_adapter.api.vlan import router as vlan_router
 from nso_adapter.api.lag_topology import router as lag_topology_router
 from nso_adapter.api.logging_config import router as logging_config_router
 from nso_adapter.api.nso_instances import router as nso_instances_router
@@ -39,6 +40,7 @@ from nso_adapter.core.l2_service import handle_l2_service_change
 from nso_adapter.core.lag_topology import handle_netconf_config_change
 from nso_adapter.core.scheduler import start_scheduler, stop_scheduler
 from nso_adapter.core.snmp import handle_snmp_config_change
+from nso_adapter.core.vlan import handle_switchport_change, handle_vlan_database_change
 from nso_adapter.core.worker import start_workers, stop_workers
 from nso_adapter.notifications.persistent_subscriber import persistent_subscriber
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
@@ -113,6 +115,8 @@ async def lifespan(app: FastAPI):
                         await handle_interface_ip_change(parsed, db, clients)
                     if cfg.scheduler.enable_snmp_sync:
                         await handle_snmp_config_change(parsed, db, clients)
+                    await handle_vlan_database_change(parsed, db, clients)
+                    await handle_switchport_change(parsed, db, clients)
 
             asyncio.create_task(_handle())
 
@@ -183,6 +187,7 @@ def create_app() -> FastAPI:
     app.include_router(interfaces_router)
     app.include_router(lag_topology_router)
     app.include_router(lag_config_router)
+    app.include_router(vlan_router)
     app.include_router(interface_ip_router)
     app.include_router(snmp_router)
     app.include_router(logging_config_router)
