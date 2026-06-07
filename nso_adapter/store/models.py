@@ -135,6 +135,12 @@ class Device(Base):
     l2_sap_intents: Mapped[list[L2SapIntent]] = relationship(
         "L2SapIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
+    vlan_database: Mapped[list[DeviceVlan]] = relationship(
+        "DeviceVlan", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
+    switchports: Mapped[list[DeviceSwitchport]] = relationship(
+        "DeviceSwitchport", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
     static_route_intents: Mapped[list[StaticRouteIntent]] = relationship(
         "StaticRouteIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
@@ -378,6 +384,63 @@ class LagMemberConfig(Base):
     port_priority: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     bundle: Mapped[LagBundleConfig] = relationship("LagBundleConfig", back_populates="members")
+
+
+class DeviceVlan(Base):
+    """Read mirror of a device's VLAN database (M34). Full-replace per refresh."""
+
+    __tablename__ = "device_vlan"
+    __table_args__ = (UniqueConstraint("device_id", "vlan_id", name="uq_devicevlan_identity"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    vlan_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
+    device: Mapped[Device] = relationship("Device", back_populates="vlan_database")
+
+
+class DeviceSwitchport(Base):
+    """Read mirror of a device's per-interface L2 switchport state (M34)."""
+
+    __tablename__ = "device_switchport"
+    __table_args__ = (UniqueConstraint("device_id", "interface_name", name="uq_deviceswitchport_identity"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    interface_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    untagged_vlan_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("device_vlan.id", ondelete="SET NULL"), nullable=True
+    )
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
+
+    device: Mapped[Device] = relationship("Device", back_populates="switchports")
+    untagged_vlan: Mapped[DeviceVlan | None] = relationship("DeviceVlan", lazy="raise")
+    tagged_vlans: Mapped[list[DeviceVlan]] = relationship(
+        "DeviceVlan", secondary="device_switchport_tagged_vlan", lazy="raise"
+    )
+
+
+class DeviceSwitchportTaggedVlan(Base):
+    """Join table: tagged VLANs on a trunk switchport (M34)."""
+
+    __tablename__ = "device_switchport_tagged_vlan"
+    __table_args__ = (UniqueConstraint("switchport_id", "vlan_id", name="uq_swtaggedvlan_identity"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    switchport_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("device_switchport.id", ondelete="CASCADE"), nullable=False
+    )
+    vlan_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("device_vlan.id", ondelete="CASCADE"), nullable=False
+    )
 
 
 class InterfaceIpAddress(Base):
