@@ -66,6 +66,24 @@ _NO_FORCE_ELIGIBLE = {
 }
 
 
+def _nokia_routed_kind(iface) -> str | None:
+    """Derive the SR OS router context (base|ies|vprn) for a Nokia routed interface (M27).
+
+    The adapter's ``DbInterface.kind`` is the interface *type* (physical/logical/loopback/
+    lag); the router context comes from ``service``/``vrf``:
+      * VPRN — ``service`` set and ``vrf`` == ``service`` (VPRN addrs carry vrf=service-name)
+      * IES  — ``service`` set, global table (vrf empty)
+      * Base — no service
+    Returns None for non-routed interfaces (physical ports, LAGs) and for non-Nokia
+    devices (where ``kind`` is unset) so the IP lands via the normal port/interface path.
+    """
+    if iface.kind not in ("logical", "loopback"):
+        return None
+    if iface.service:
+        return "vprn" if (iface.vrf and iface.vrf == iface.service) else "ies"
+    return "base"
+
+
 async def enqueue_apply(db: AsyncSession, device_id: int, force: bool = True) -> Job | None:
     """Create an apply job if no active job exists.  Returns Job or None if blocked."""
     from nso_adapter.core.jobs import get_active_job
@@ -461,12 +479,17 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
 
             for iface_id, ip_rows in ip_eligible_by_iface.items():
                 iface = ifaces[iface_id]
+                routed_kind = _nokia_routed_kind(iface)
                 try:
                     await apply_interface_ips(
                         client=client,
                         device_name=device_name,
                         interface_name=iface.name,
                         ip_intent_rows=ip_rows,
+                        kind=routed_kind,
+                        service=iface.service if routed_kind in ("ies", "vprn") else None,
+                        parent_binding=iface.parent_binding,
+                        encap_tag=iface.encap_tag,
                     )
                     for row in ip_rows:
                         row.last_apply_at = now

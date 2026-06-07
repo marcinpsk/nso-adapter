@@ -345,6 +345,47 @@ async def test_apply_interface_ips_sets_vrf():
 
 
 @pytest.mark.asyncio
+async def test_apply_interface_ips_nokia_routed_context():
+    """Nokia routed-interface metadata (M27) is included in the PATCH so the reconciler
+    targets the router/service interface, not the port."""
+    client = _make_nso_client()
+    client._client.return_value = _mock_http_ctx(_mock_httpx_response(204))
+
+    row = _make_ip_row("7.7.7.7/32", family="ipv4", vrf="CRPD-VPN")
+    await apply_interface_ips(
+        client, "ra1", "CRPD-VPN:LO7", [row],
+        kind="vprn", service="CRPD-VPN", parent_binding="lag-99", encap_tag="10",
+    )
+
+    import json
+
+    call_kwargs = client._client.return_value.__aenter__.return_value.patch.call_args
+    entry = json.loads(call_kwargs.kwargs["content"])["interface-reconciler:interface-config"][0]
+    assert entry["kind"] == "vprn"
+    assert entry["service"] == "CRPD-VPN"
+    assert entry["parent-binding"] == "lag-99"
+    assert entry["encap-tag"] == "10"
+    assert entry["ipv4-address"] == [{"address": "7.7.7.7", "prefix-length": 32, "secondary": False}]
+
+
+@pytest.mark.asyncio
+async def test_apply_interface_ips_no_kind_omits_routed_fields():
+    """IOS/Junos (no kind) PATCH carries no Nokia routed-interface fields."""
+    client = _make_nso_client()
+    client._client.return_value = _mock_http_ctx(_mock_httpx_response(204))
+
+    row = _make_ip_row("10.0.0.1/24")
+    await apply_interface_ips(client, "rtr-a", "GigabitEthernet0/1", [row])
+
+    import json
+
+    entry = json.loads(
+        client._client.return_value.__aenter__.return_value.patch.call_args.kwargs["content"]
+    )["interface-reconciler:interface-config"][0]
+    assert "kind" not in entry and "parent-binding" not in entry
+
+
+@pytest.mark.asyncio
 async def test_apply_interface_ips_nso_error_raises():
     """Non-2xx response from NSO raises NsoApplyError."""
     client = _make_nso_client()

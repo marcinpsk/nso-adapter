@@ -125,11 +125,22 @@ async def apply_interface_ips(
     device_name: str,
     interface_name: str,
     ip_intent_rows: list,
+    *,
+    kind: str | None = None,
+    service: str | None = None,
+    parent_binding: str | None = None,
+    encap_tag: str | None = None,
 ) -> None:
     """Write IP addresses and VRF for a single interface to NSO.
 
     Builds a full interface-reconciler PATCH body from the supplied rows,
     one PATCH call per interface covering all IPv4, IPv6, and VRF intent.
+
+    ``kind``/``service``/``parent_binding``/``encap_tag`` carry the Nokia M27
+    routed-interface context so the reconciler writes the IP to the SR OS
+    ``configure router Base`` / ``configure service {ies,vprn} <service>``
+    interface (bound to its port) instead of to the port.  They are ignored by
+    the IOS/Junos handlers.
 
     Raises NsoApplyError on failure.
     """
@@ -142,6 +153,17 @@ async def apply_interface_ips(
     vrf = next((r.vrf for r in ip_intent_rows if r.vrf), None)
     if vrf:
         entry["vrf"] = vrf
+
+    # Nokia routed-interface context (M27 apply): route the IP to the router/service
+    # interface, not the port. Only emitted when kind is set (Nokia L3 interfaces).
+    if kind:
+        entry["kind"] = kind
+        if service:
+            entry["service"] = service
+        if parent_binding:
+            entry["parent-binding"] = parent_binding
+        if encap_tag:
+            entry["encap-tag"] = encap_tag
 
     ipv4_entries = []
     ipv6_entries = []
