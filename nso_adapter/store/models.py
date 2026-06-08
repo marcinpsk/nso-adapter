@@ -144,6 +144,9 @@ class Device(Base):
     static_route_intents: Mapped[list[StaticRouteIntent]] = relationship(
         "StaticRouteIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
+    logging_host_intents: Mapped[list[LoggingHostIntent]] = relationship(
+        "LoggingHostIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
     isis_processes: Mapped[list[DeviceIsisProcess]] = relationship(
         "DeviceIsisProcess", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
@@ -768,6 +771,30 @@ class StaticRouteIntent(Base):
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     device: Mapped[Device] = relationship("Device", back_populates="static_route_intents")
+
+
+class LoggingHostIntent(Base):
+    """Write-path intent for a remote syslog server accepted by the NetBox operator."""
+
+    __tablename__ = "logging_host_intent"
+    __table_args__ = (UniqueConstraint("device_id", "address", name="uq_logginghostintent_identity"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    address: Mapped[str] = mapped_column(String(256), nullable=False)
+    port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    severity: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    facility: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    transport: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+    vrf: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    source: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    device: Mapped[Device] = relationship("Device", back_populates="logging_host_intents")
 
 
 class DeviceL2Sap(Base):
