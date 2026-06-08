@@ -1467,7 +1467,7 @@ class DeviceOspfInstance(Base):
     device_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    process_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    process_id: Mapped[str] = mapped_column(String(64), nullable=False)
     router_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     vrf: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     # areas stored as JSON: [{area_id, area_type}]
@@ -1489,7 +1489,7 @@ class DeviceOspfInterface(Base):
         Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
     )
     interface_name: Mapped[str] = mapped_column(String(128), nullable=False)
-    process_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    process_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     area_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     passive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     priority: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -1513,7 +1513,7 @@ class OspfInstanceIntent(Base):
     device_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    process_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    process_id: Mapped[str] = mapped_column(String(64), nullable=False)
     router_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     vrf: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     areas: Mapped[list | None] = mapped_column(JSON, nullable=True)
@@ -1535,7 +1535,7 @@ class OspfInterfaceIntent(Base):
         Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
     )
     interface_name: Mapped[str] = mapped_column(String(128), nullable=False)
-    process_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    process_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     area_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     passive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     priority: Mapped[int | None] = mapped_column(Integer, nullable=True)
