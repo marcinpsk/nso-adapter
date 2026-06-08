@@ -32,6 +32,35 @@ def _now():
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+def _parse_vlan_string(raw) -> list[int]:
+    """Expand the NSO 'tagged-vlans' string ('805,1518-1519,3629') into a sorted int list.
+
+    Also tolerates a list (legacy/test) — returns it as ints.
+    """
+    if not raw:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return sorted(int(v) for v in raw)
+    vlans: set[int] = set()
+    for chunk in str(raw).split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            if "-" in chunk:
+                start, end = (int(x) for x in chunk.split("-", 1))
+            else:
+                start = end = int(chunk)
+        except ValueError:
+            continue
+        # Bound to the legal 802.1Q range so a malformed upstream string
+        # (e.g. "1-999999999") can't blow up memory via range expansion.
+        if not (1 <= start <= end <= 4094):
+            continue
+        vlans.update(range(start, end + 1))
+    return sorted(vlans)
+
+
 async def refresh_vlan_database_for_device(
     db: AsyncSession,
     device: Device,
@@ -134,8 +163,8 @@ async def refresh_switchport_for_device(
                 DeviceSwitchportTaggedVlan.switchport_id == row.id
             )
         )
-        for tv in item.get("tagged-vlan", item.get("tagged_vlans", [])) or []:
-            vlan = vlan_by_vid.get(int(tv))
+        for tv in _parse_vlan_string(item.get("tagged-vlans") or item.get("tagged_vlans")):
+            vlan = vlan_by_vid.get(tv)
             if vlan is not None:
                 db.add(DeviceSwitchportTaggedVlan(switchport_id=row.id, vlan_id=vlan.id))
     for name, row in existing.items():

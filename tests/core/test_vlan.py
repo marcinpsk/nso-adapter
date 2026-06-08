@@ -55,7 +55,7 @@ async def test_refresh_switchport_links_vlans(adapter_client):
             {"vlan-id": 10, "name": "A"}, {"vlan-id": 20, "name": "B"}, {"vlan-id": 99, "name": "N"}]}
         await refresh_vlan_database_for_device(db, device, nso)
         nso.get_switchport.return_value = {"interface": [
-            {"interface-name": "Gi0/1", "mode": "trunk", "untagged-vlan": 99, "tagged-vlan": [10, 20]}]}
+            {"interface-name": "Gi0/1", "mode": "trunk", "untagged-vlan": 99, "tagged-vlans": "10,20"}]}
         await refresh_switchport_for_device(db, device, nso)
 
         sp = (await db.execute(
