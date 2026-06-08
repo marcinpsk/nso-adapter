@@ -398,3 +398,39 @@ async def test_apply_interface_ips_nso_error_raises():
 
     assert exc_info.value.code == "nso_patch_failed"
     assert "500" in exc_info.value.message
+
+
+@pytest.mark.asyncio
+async def test_apply_switchport_config_builds_patch_body():
+    """apply_switchport_config PATCHes switchport-reconciler with the interface list (M34)."""
+    import json
+
+    from nso_adapter.nso.apply import apply_switchport_config
+
+    client = _make_nso_client()
+    client._client.return_value = _mock_http_ctx(_mock_httpx_response(204))
+    ifaces = [
+        {"interface-name": "GigabitEthernet0/1", "mode": "access", "untagged-vlan": 10},
+        {"interface-name": "GigabitEthernet0/2", "mode": "trunk", "untagged-vlan": 99, "tagged-vlan": [20, 30]},
+    ]
+    await apply_switchport_config(client=client, device_name="sw03", interfaces=ifaces)
+
+    mock_http = client._client.return_value.__aenter__.return_value
+    (url,) = mock_http.patch.call_args[0]
+    assert "switchport-reconciler" in url
+    cfg = json.loads(mock_http.patch.call_args[1]["content"])["switchport-reconciler:switchport-config"]
+    assert cfg[0]["device"] == "sw03"
+    by = {i["interface-name"]: i for i in cfg[0]["interface"]}
+    assert by["GigabitEthernet0/1"]["mode"] == "access"
+    assert by["GigabitEthernet0/2"]["tagged-vlan"] == [20, 30]
+
+
+@pytest.mark.asyncio
+async def test_apply_switchport_config_nso_error_raises():
+    from nso_adapter.nso.apply import apply_switchport_config
+
+    client = _make_nso_client()
+    client._client.return_value = _mock_http_ctx(_mock_httpx_response(409, json_data={"error": {}}))
+    with pytest.raises(NsoApplyError) as exc_info:
+        await apply_switchport_config(client=client, device_name="sw03", interfaces=[{"interface-name": "Gi0/1"}])
+    assert exc_info.value.code == "nso_patch_failed"

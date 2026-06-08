@@ -5,15 +5,29 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import api_error
+from nso_adapter.core.importer import get_nso_client
+from nso_adapter.core.switchport_intent import apply_switchport_config as apply_switchport_core
 from nso_adapter.store.models import Device, DeviceSwitchport, DeviceVlan
 
 router = APIRouter(prefix="/api/v1/devices", tags=["vlan"])
+
+
+class SwitchportApply(BaseModel):
+    interface_name: str
+    mode: str | None = None
+    untagged_vlan: int | None = None
+    tagged_vlans: list[int] = []
+
+
+class SwitchportApplyRequest(BaseModel):
+    interfaces: list[SwitchportApply] = []
 
 
 @router.get("/{device_id}/vlan-database", dependencies=[Depends(verify_token)])
@@ -61,3 +75,16 @@ async def get_switchport(device_id: int, db: AsyncSession = Depends(get_db)):
             for r in rows
         ],
     }
+
+
+@router.post("/{device_id}/switchport/apply", dependencies=[Depends(verify_token)])
+async def apply_switchport(
+    device_id: int,
+    payload: SwitchportApplyRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    device = await db.get(Device, device_id)
+    if device is None:
+        raise api_error(404, "not_found", "Device not found")
+    nso_client = get_nso_client(device.nso_instance)
+    return await apply_switchport_core(device, payload, nso_client)

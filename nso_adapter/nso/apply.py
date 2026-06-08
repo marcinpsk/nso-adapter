@@ -226,6 +226,8 @@ _L2_SAP_SERVICE_PATH = "/restconf/data/l2-sap-reconciler:l2-sap-config"
 
 _LAG_SERVICE_PATH = "/restconf/data/lag-reconciler:lag-config"
 
+_SWITCHPORT_SERVICE_PATH = "/restconf/data/switchport-reconciler:switchport-config"
+
 # RESTCONF path to the isis-reconciler service list
 _ISIS_SERVICE_PATH = "/restconf/data/isis-reconciler:isis-config"
 
@@ -501,6 +503,56 @@ async def apply_lag_config(
         "nso.apply.lag_ok",
         device=device_name,
         bundle_count=len(bundles),
+    )
+
+
+async def apply_switchport_config(
+    client: NsoClient,
+    device_name: str,
+    interfaces: list[dict],
+) -> None:
+    """Write L2 switchport intent for a single device to NSO (M34).
+
+    Builds a full switchport-reconciler PATCH body and commits in reconcile mode.
+    Each interface dict uses YANG-style keys: ``interface-name`` (key), optional
+    ``mode`` (access|trunk|trunk-all), ``untagged-vlan``, and ``tagged-vlan``
+    (list of ids). The interface list is full-replace (FASTMAP removes absent).
+
+    Raises NsoApplyError on failure.
+    """
+    payload = json.dumps(
+        {"switchport-reconciler:switchport-config": [{"device": device_name, "interface": interfaces}]}
+    )
+
+    url = f"{client._base}{_SWITCHPORT_SERVICE_PATH}"
+
+    async with client._client(timeout=client._action_timeout) as c:
+        resp = await c.patch(
+            url,
+            content=payload,
+            headers={"Content-Type": "application/yang-data+json"},
+        )
+        if resp.status_code not in (200, 201, 204):
+            try:
+                err = resp.json()
+            except Exception:
+                err = {"raw": resp.text}
+            logger.error(
+                "nso.apply.switchport_patch_failed",
+                device=device_name,
+                status=resp.status_code,
+                body=err,
+            )
+            raise NsoApplyError(
+                "nso_patch_failed",
+                f"NSO PATCH for switchport intent failed with status {resp.status_code}",
+                detail={"nso_error": err},
+            )
+
+    logger.info(
+        "nso.apply.switchport_ok",
+        device=device_name,
+        interface_count=len(interfaces),
     )
 
 
