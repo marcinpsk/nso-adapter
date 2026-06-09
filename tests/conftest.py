@@ -416,6 +416,25 @@ async def seed_vlan_database(device_id: int, vlans: list[dict]):
         return
 
 
+async def seed_svi(device_id: int, interfaces: list[dict]):
+    """Insert DeviceSvi rows. Each dict: interface_name, vlan_id, type?, vrf?."""
+    from datetime import UTC, datetime
+
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import DeviceSvi
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async for db in get_session():
+        for i in interfaces:
+            db.add(DeviceSvi(
+                device_id=device_id, interface_name=i["interface_name"], vlan_id=i["vlan_id"],
+                svi_type=i.get("type", "svi"), vrf=i.get("vrf") or None,
+                last_refreshed_at=now, refresh_source="test",
+            ))
+        await db.commit()
+        return
+
+
 async def seed_switchport(device_id: int, interfaces: list[dict]):
     """Insert DeviceSwitchport rows (+ DeviceVlan rows for referenced vids + links).
 

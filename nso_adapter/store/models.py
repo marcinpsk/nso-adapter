@@ -156,6 +156,9 @@ class Device(Base):
     bfd_interfaces: Mapped[list[DeviceBfdInterface]] = relationship(
         "DeviceBfdInterface", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
+    svis: Mapped[list[DeviceSvi]] = relationship(
+        "DeviceSvi", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
     isis_interface_intents: Mapped[list[IsisInterfaceIntent]] = relationship(
         "IsisInterfaceIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
@@ -771,6 +774,29 @@ class StaticRouteIntent(Base):
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     device: Mapped[Device] = relationship("Device", back_populates="static_route_intents")
+
+
+class DeviceSvi(Base):
+    """Read mirror of one L3 VLAN interface (SVI / IRB) — M35, read-only.
+
+    No IPs (those ride interface-ip). One row per (device, interface-name).
+    """
+
+    __tablename__ = "device_svi"
+    __table_args__ = (UniqueConstraint("device_id", "interface_name", name="uq_devicesvi_identity"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    interface_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    vlan_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    svi_type: Mapped[str] = mapped_column(String(8), nullable=False, default="svi")  # svi | irb
+    vrf: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
+
+    device: Mapped[Device] = relationship("Device", back_populates="svis")
 
 
 class LoggingHostIntent(Base):
