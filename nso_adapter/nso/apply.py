@@ -221,6 +221,9 @@ _SNMP_SERVICE_PATH = "/restconf/data/snmp-reconciler:snmp-config"
 # RESTCONF path to the static-route-reconciler service list
 _STATIC_ROUTE_SERVICE_PATH = "/restconf/data/static-route-reconciler:static-route-config"
 
+# RESTCONF path to the logging-reconciler service list (remote syslog write path)
+_LOGGING_SERVICE_PATH = "/restconf/data/logging-reconciler:logging-config"
+
 # RESTCONF path to the l2-sap-reconciler service list (M37 P2b)
 _L2_SAP_SERVICE_PATH = "/restconf/data/l2-sap-reconciler:l2-sap-config"
 
@@ -388,6 +391,64 @@ async def apply_static_routes(
         device=device_name,
         route_count=len(routes),
     )
+
+
+async def apply_logging_config(
+    client: NsoClient,
+    device_name: str,
+    host_intent_rows: list,
+) -> None:
+    """Write the full remote-syslog intent snapshot for a device to NSO.
+
+    Builds a logging-reconciler PATCH body from the supplied rows; the service
+    adopts pre-existing brownfield logging config (reconcile). No secrets.
+
+    Raises NsoApplyError on failure.
+    """
+    hosts = []
+    for row in host_intent_rows:
+        entry: dict = {"address": row.address}
+        if row.port is not None:
+            entry["port"] = row.port
+        if row.severity:
+            entry["severity"] = row.severity
+        if row.facility:
+            entry["facility"] = row.facility
+        if row.transport:
+            entry["transport"] = row.transport
+        if row.vrf:
+            entry["vrf"] = row.vrf
+        if row.source:
+            entry["source"] = row.source
+        hosts.append(entry)
+
+    payload = json.dumps({"logging-reconciler:logging-config": [{"device": device_name, "host": hosts}]})
+    url = f"{client._base}{_LOGGING_SERVICE_PATH}"
+
+    async with client._client(timeout=client._action_timeout) as c:
+        resp = await c.patch(
+            url,
+            content=payload,
+            headers={"Content-Type": "application/yang-data+json"},
+        )
+        if resp.status_code not in (200, 201, 204):
+            try:
+                err = resp.json()
+            except Exception:
+                err = {"raw": resp.text}
+            logger.error(
+                "nso.apply.logging_patch_failed",
+                device=device_name,
+                status=resp.status_code,
+                body=err,
+            )
+            raise NsoApplyError(
+                "nso_patch_failed",
+                f"NSO PATCH for logging intent failed with status {resp.status_code}",
+                detail={"nso_error": err},
+            )
+
+    logger.info("nso.apply.logging_ok", device=device_name, host_count=len(hosts))
 
 
 async def apply_l2_saps(
