@@ -169,6 +169,22 @@ class NsoClient:
             entries = data.get("network-state-export:device") or data.get("device", [])
             return entries[0] if entries else None
 
+    async def get_subinterface(self, device_name: str) -> dict | None:
+        """Return the subinterface entry for *device_name* from the NSO oper-data (M36).
+
+        Returns None if the device has no dot1q subinterface data (404).
+        Raises httpx.HTTPStatusError on other errors.
+        """
+        url = f"{self._base}/restconf/data/network-state-export:subinterface/device={device_name}"
+        async with self._client() as c:
+            resp = await c.get(url)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            entries = data.get("network-state-export:device") or data.get("device", [])
+            return entries[0] if entries else None
+
     async def get_lag_config(self, device_name: str) -> dict | None:
         """Return the lag-config entry for *device_name* from the NSO package oper-data.
 

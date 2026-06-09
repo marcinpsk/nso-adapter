@@ -162,6 +162,12 @@ class Device(Base):
     svi_intents: Mapped[list[SviIntent]] = relationship(
         "SviIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
+    subinterfaces: Mapped[list[DeviceSubinterface]] = relationship(
+        "DeviceSubinterface", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
+    subinterface_intents: Mapped[list[SubinterfaceIntent]] = relationship(
+        "SubinterfaceIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
     isis_interface_intents: Mapped[list[IsisInterfaceIntent]] = relationship(
         "IsisInterfaceIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
@@ -821,6 +827,53 @@ class SviIntent(Base):
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     device: Mapped[Device] = relationship("Device", back_populates="svi_intents")
+
+
+class DeviceSubinterface(Base):
+    """Read mirror of one dot1q L3 subinterface — M36, read-only.
+
+    No IPs (those ride interface-ip). One row per (device, interface-name). The
+    dot1q tag is interface-local encapsulation, deliberately NOT a foreign key.
+    """
+
+    __tablename__ = "device_subinterface"
+    __table_args__ = (UniqueConstraint("device_id", "interface_name", name="uq_devicesubif_identity"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    interface_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    parent_interface: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    dot1q_vlan: Mapped[int | None] = mapped_column(Integer, nullable=True)  # interface-local 802.1q tag
+    sub_type: Mapped[str] = mapped_column(String(16), nullable=False, default="subinterface")
+    vrf: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
+
+    device: Mapped[Device] = relationship("Device", back_populates="subinterfaces")
+
+
+class SubinterfaceIntent(Base):
+    """Write-path intent for a dot1q L3 subinterface accepted by the operator (M36)."""
+
+    __tablename__ = "subinterface_intent"
+    __table_args__ = (UniqueConstraint("device_id", "interface_name", name="uq_subifintent_identity"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    interface_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    parent_interface: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    dot1q_vlan: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sub_type: Mapped[str] = mapped_column(String(16), nullable=False, default="subinterface")
+    vrf: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    device: Mapped[Device] = relationship("Device", back_populates="subinterface_intents")
 
 
 class LoggingHostIntent(Base):

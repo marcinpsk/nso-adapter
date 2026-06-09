@@ -227,6 +227,9 @@ _LOGGING_SERVICE_PATH = "/restconf/data/logging-reconciler:logging-config"
 # RESTCONF path to the svi-reconciler service list (SVI/IRB write path, M35)
 _SVI_SERVICE_PATH = "/restconf/data/svi-reconciler:svi-config"
 
+# RESTCONF path to the subinterface-reconciler service list (dot1q write path, M36)
+_SUBIF_SERVICE_PATH = "/restconf/data/subinterface-reconciler:subif-config"
+
 # RESTCONF path to the l2-sap-reconciler service list (M37 P2b)
 _L2_SAP_SERVICE_PATH = "/restconf/data/l2-sap-reconciler:l2-sap-config"
 
@@ -497,6 +500,57 @@ async def apply_svi_config(
             )
 
     logger.info("nso.apply.svi_ok", device=device_name, count=len(interfaces))
+
+
+async def apply_subinterface_config(
+    client: NsoClient,
+    device_name: str,
+    subif_intent_rows: list,
+) -> None:
+    """Write the dot1q subinterface intent snapshot for a device to NSO (M36).
+
+    Materialises <parent>.<unit> (encapsulation dot1Q + vrf forwarding) / Junos
+    unit vlan-id via the subinterface-reconciler; IPs ride the interface-reconciler.
+    Reconcile mode (brownfield adoption). Raises NsoApplyError on failure.
+    """
+    interfaces = []
+    for row in subif_intent_rows:
+        entry: dict = {
+            "interface-name": row.interface_name,
+            "parent-interface": row.parent_interface,
+            "dot1q-vlan": row.dot1q_vlan,
+            "type": row.sub_type,
+        }
+        if row.vrf:
+            entry["vrf"] = row.vrf
+        interfaces.append(entry)
+
+    payload = json.dumps(
+        {"subinterface-reconciler:subif-config": [{"device": device_name, "interface": interfaces}]}
+    )
+    url = f"{client._base}{_SUBIF_SERVICE_PATH}"
+
+    async with client._client(timeout=client._action_timeout) as c:
+        resp = await c.patch(
+            url,
+            content=payload,
+            headers={"Content-Type": "application/yang-data+json"},
+        )
+        if resp.status_code not in (200, 201, 204):
+            try:
+                err = resp.json()
+            except Exception:
+                err = {"raw": resp.text}
+            logger.error(
+                "nso.apply.subif_patch_failed", device=device_name, status=resp.status_code, body=err
+            )
+            raise NsoApplyError(
+                "nso_patch_failed",
+                f"NSO PATCH for subinterface intent failed with status {resp.status_code}",
+                detail={"nso_error": err},
+            )
+
+    logger.info("nso.apply.subif_ok", device=device_name, count=len(interfaces))
 
 
 async def apply_l2_saps(
