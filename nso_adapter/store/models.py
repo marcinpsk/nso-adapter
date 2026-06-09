@@ -159,6 +159,9 @@ class Device(Base):
     svis: Mapped[list[DeviceSvi]] = relationship(
         "DeviceSvi", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
+    svi_intents: Mapped[list[SviIntent]] = relationship(
+        "SviIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
     isis_interface_intents: Mapped[list[IsisInterfaceIntent]] = relationship(
         "IsisInterfaceIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
@@ -797,6 +800,27 @@ class DeviceSvi(Base):
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
 
     device: Mapped[Device] = relationship("Device", back_populates="svis")
+
+
+class SviIntent(Base):
+    """Write-path intent for an L3 VLAN interface (SVI / IRB) accepted by the operator."""
+
+    __tablename__ = "svi_intent"
+    __table_args__ = (UniqueConstraint("device_id", "interface_name", name="uq_sviintent_identity"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    interface_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    vlan_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    svi_type: Mapped[str] = mapped_column(String(8), nullable=False, default="svi")  # svi | irb
+    vrf: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    device: Mapped[Device] = relationship("Device", back_populates="svi_intents")
 
 
 class LoggingHostIntent(Base):

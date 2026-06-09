@@ -224,6 +224,9 @@ _STATIC_ROUTE_SERVICE_PATH = "/restconf/data/static-route-reconciler:static-rout
 # RESTCONF path to the logging-reconciler service list (remote syslog write path)
 _LOGGING_SERVICE_PATH = "/restconf/data/logging-reconciler:logging-config"
 
+# RESTCONF path to the svi-reconciler service list (SVI/IRB write path, M35)
+_SVI_SERVICE_PATH = "/restconf/data/svi-reconciler:svi-config"
+
 # RESTCONF path to the l2-sap-reconciler service list (M37 P2b)
 _L2_SAP_SERVICE_PATH = "/restconf/data/l2-sap-reconciler:l2-sap-config"
 
@@ -449,6 +452,51 @@ async def apply_logging_config(
             )
 
     logger.info("nso.apply.logging_ok", device=device_name, host_count=len(hosts))
+
+
+async def apply_svi_config(
+    client: NsoClient,
+    device_name: str,
+    svi_intent_rows: list,
+) -> None:
+    """Write the SVI/IRB intent snapshot for a device to NSO (M35).
+
+    Materialises interface VlanN / interfaces irb unit N via the svi-reconciler;
+    IPs ride the interface-reconciler. Reconcile mode (brownfield adoption).
+
+    Raises NsoApplyError on failure.
+    """
+    interfaces = []
+    for row in svi_intent_rows:
+        entry: dict = {"interface-name": row.interface_name, "vlan-id": row.vlan_id, "type": row.svi_type}
+        if row.vrf:
+            entry["vrf"] = row.vrf
+        interfaces.append(entry)
+
+    payload = json.dumps({"svi-reconciler:svi-config": [{"device": device_name, "interface": interfaces}]})
+    url = f"{client._base}{_SVI_SERVICE_PATH}"
+
+    async with client._client(timeout=client._action_timeout) as c:
+        resp = await c.patch(
+            url,
+            content=payload,
+            headers={"Content-Type": "application/yang-data+json"},
+        )
+        if resp.status_code not in (200, 201, 204):
+            try:
+                err = resp.json()
+            except Exception:
+                err = {"raw": resp.text}
+            logger.error(
+                "nso.apply.svi_patch_failed", device=device_name, status=resp.status_code, body=err
+            )
+            raise NsoApplyError(
+                "nso_patch_failed",
+                f"NSO PATCH for SVI intent failed with status {resp.status_code}",
+                detail={"nso_error": err},
+            )
+
+    logger.info("nso.apply.svi_ok", device=device_name, count=len(interfaces))
 
 
 async def apply_l2_saps(

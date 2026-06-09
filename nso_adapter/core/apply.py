@@ -47,6 +47,7 @@ from nso_adapter.store.models import (
     SnmpSystemInfoIntent,
     SnmpV3UserIntent,
     StaticRouteIntent,
+    SviIntent,
     SyncState,
 )
 
@@ -114,6 +115,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
         apply_route_policy_config,
         apply_snmp_config,
         apply_static_routes,
+        apply_svi_config,
     )
     from nso_adapter.store.db import get_session
 
@@ -260,6 +262,16 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 if not force and row.last_apply_at is not None and row.last_apply_error is None:
                     continue
                 logging_eligible.append(row)
+
+            # Collect SVI/IRB intent rows (M35 write path)
+            svi_eligible: list[SviIntent] = []
+            svi_result = await db.execute(select(SviIntent).where(SviIntent.device_id == device_id))
+            for row in svi_result.scalars().all():
+                if row.accepted_at is None:
+                    continue
+                if not force and row.last_apply_at is not None and row.last_apply_error is None:
+                    continue
+                svi_eligible.append(row)
 
             # Collect L2 SAP intent rows (M37 P2b — Nokia SAP write path)
             l2_eligible: list[L2SapIntent] = []
@@ -680,6 +692,33 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     logging_outcome_failed = len(logging_eligible)
                     logging_failed.append({"error": repr(exc)})
 
+            # ── Step 6c1b: SVI/IRB intent pass (M35) ─────────────────────────
+            svi_outcome_ok = 0
+            svi_outcome_failed = 0
+            svi_failed: list[dict] = []
+
+            if svi_eligible:
+                try:
+                    await apply_svi_config(client=client, device_name=device_name, svi_intent_rows=svi_eligible)
+                    for row in svi_eligible:
+                        row.last_apply_at = now
+                        row.last_apply_error = None
+                    svi_outcome_ok = len(svi_eligible)
+                except NsoApplyError as exc:
+                    logger.error("apply.svi_failed", job_id=job_id, device=device_name, error=exc.message)
+                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
+                    for row in svi_eligible:
+                        row.last_apply_error = err_payload
+                    svi_outcome_failed = len(svi_eligible)
+                    svi_failed.append({"error": exc.message})
+                except Exception as exc:
+                    logger.exception("apply.svi_unexpected_error", job_id=job_id)
+                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
+                    for row in svi_eligible:
+                        row.last_apply_error = err_payload
+                    svi_outcome_failed = len(svi_eligible)
+                    svi_failed.append({"error": repr(exc)})
+
             # ── Step 6c2: L2 SAP intent pass (M37 P2b) ───────────────────────
             l2_outcome_ok = 0
             l2_outcome_failed = 0
@@ -936,6 +975,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 + snmp_outcome_failed
                 + sr_outcome_failed
                 + logging_outcome_failed
+                + svi_outcome_failed
                 + l2_outcome_failed
                 + isis_outcome_failed
                 + bgp_outcome_failed
@@ -962,6 +1002,10 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 "logging_count_by_outcome": {
                     "in_sync": logging_outcome_ok,
                     "apply_failed": logging_outcome_failed,
+                },
+                "svi_count_by_outcome": {
+                    "in_sync": svi_outcome_ok,
+                    "apply_failed": svi_outcome_failed,
                 },
                 "l2_sap_count_by_outcome": {
                     "in_sync": l2_outcome_ok,
@@ -994,6 +1038,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     + [{"type": "snmp", **a} for a in snmp_failed]
                     + [{"type": "static_route", **a} for a in sr_failed]
                     + [{"type": "logging", **a} for a in logging_failed]
+                    + [{"type": "svi", **a} for a in svi_failed]
                     + [{"type": "l2_sap", **a} for a in l2_failed]
                     + [{"type": "isis", **a} for a in isis_failed]
                     + [{"type": "bgp", **a} for a in bgp_failed]
