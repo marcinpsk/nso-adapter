@@ -233,6 +233,9 @@ _SUBIF_SERVICE_PATH = "/restconf/data/subinterface-reconciler:subif-config"
 # RESTCONF path to the vlan-reconciler service list (VLAN-database write path, M34)
 _VLAN_SERVICE_PATH = "/restconf/data/vlan-reconciler:vlan-config"
 
+# RESTCONF path to the bfd-reconciler service list (per-interface BFD write path)
+_BFD_SERVICE_PATH = "/restconf/data/bfd-reconciler:bfd-config"
+
 # RESTCONF path to the l2-sap-reconciler service list (M37 P2b)
 _L2_SAP_SERVICE_PATH = "/restconf/data/l2-sap-reconciler:l2-sap-config"
 
@@ -598,6 +601,54 @@ async def apply_vlan_config(
             )
 
     logger.info("nso.apply.vlan_ok", device=device_name, count=len(vlans))
+
+
+async def apply_bfd_config(
+    client: NsoClient,
+    device_name: str,
+    bfd_intent_rows: list,
+) -> None:
+    """Write the per-interface BFD intent snapshot for a device to NSO.
+
+    Materialises BFD timers via the bfd-reconciler (IOS interface bfd interval;
+    IOS-XR bfd address-family; Junos ae bfd-liveness-detection; Nokia router
+    interface ipv4 bfd). Reconcile mode. Raises NsoApplyError on failure.
+    """
+    interfaces = []
+    for row in bfd_intent_rows:
+        entry: dict = {"interface-name": row.interface_name, "micro-bfd": bool(row.micro_bfd)}
+        if row.min_tx is not None:
+            entry["min-tx"] = row.min_tx
+        if row.min_rx is not None:
+            entry["min-rx"] = row.min_rx
+        if row.multiplier is not None:
+            entry["multiplier"] = row.multiplier
+        interfaces.append(entry)
+
+    payload = json.dumps({"bfd-reconciler:bfd-config": [{"device": device_name, "interface": interfaces}]})
+    url = f"{client._base}{_BFD_SERVICE_PATH}"
+
+    async with client._client(timeout=client._action_timeout) as c:
+        resp = await c.patch(
+            url,
+            content=payload,
+            headers={"Content-Type": "application/yang-data+json"},
+        )
+        if resp.status_code not in (200, 201, 204):
+            try:
+                err = resp.json()
+            except Exception:
+                err = {"raw": resp.text}
+            logger.error(
+                "nso.apply.bfd_patch_failed", device=device_name, status=resp.status_code, body=err
+            )
+            raise NsoApplyError(
+                "nso_patch_failed",
+                f"NSO PATCH for BFD intent failed with status {resp.status_code}",
+                detail={"nso_error": err},
+            )
+
+    logger.info("nso.apply.bfd_ok", device=device_name, count=len(interfaces))
 
 
 async def apply_l2_saps(

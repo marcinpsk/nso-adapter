@@ -159,6 +159,9 @@ class Device(Base):
     bfd_interfaces: Mapped[list[DeviceBfdInterface]] = relationship(
         "DeviceBfdInterface", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
+    bfd_intents: Mapped[list[BfdIntent]] = relationship(
+        "BfdIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
     svis: Mapped[list[DeviceSvi]] = relationship(
         "DeviceSvi", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
@@ -1094,6 +1097,28 @@ class DeviceBfdInterface(Base):
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
 
     device: Mapped[Device] = relationship("Device", back_populates="bfd_interfaces")
+
+
+class BfdIntent(Base):
+    """Write-path intent for per-interface BFD timers accepted by the operator."""
+
+    __tablename__ = "bfd_intent"
+    __table_args__ = (UniqueConstraint("device_id", "interface_name", name="uq_bfdintent_identity"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    interface_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    min_tx: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    min_rx: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    multiplier: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    micro_bfd: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    device: Mapped[Device] = relationship("Device", back_populates="bfd_intents")
 
 
 class IsisInterfaceIntent(Base):

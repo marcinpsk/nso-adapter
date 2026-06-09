@@ -45,6 +45,7 @@ from nso_adapter.store.models import (
     SnmpCommunityIntent,
     SnmpHostIntent,
     SnmpSystemInfoIntent,
+    BfdIntent,
     SnmpV3UserIntent,
     StaticRouteIntent,
     SubinterfaceIntent,
@@ -116,6 +117,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
         apply_ospf_config,
         apply_route_policy_config,
         apply_snmp_config,
+        apply_bfd_config,
         apply_static_routes,
         apply_subinterface_config,
         apply_svi_config,
@@ -298,6 +300,16 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 if not force and row.last_apply_at is not None and row.last_apply_error is None:
                     continue
                 vlan_eligible.append(row)
+
+            # Collect per-interface BFD intent rows (BFD write path)
+            bfd_eligible: list[BfdIntent] = []
+            bfd_result = await db.execute(select(BfdIntent).where(BfdIntent.device_id == device_id))
+            for row in bfd_result.scalars().all():
+                if row.accepted_at is None:
+                    continue
+                if not force and row.last_apply_at is not None and row.last_apply_error is None:
+                    continue
+                bfd_eligible.append(row)
 
             # Collect L2 SAP intent rows (M37 P2b — Nokia SAP write path)
             l2_eligible: list[L2SapIntent] = []
@@ -801,6 +813,33 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     vlan_outcome_failed = len(vlan_eligible)
                     vlan_failed.append({"error": repr(exc)})
 
+            # ── Step 6c1e: per-interface BFD intent pass ─────────────────────
+            bfd_outcome_ok = 0
+            bfd_outcome_failed = 0
+            bfd_failed: list[dict] = []
+
+            if bfd_eligible:
+                try:
+                    await apply_bfd_config(client=client, device_name=device_name, bfd_intent_rows=bfd_eligible)
+                    for row in bfd_eligible:
+                        row.last_apply_at = now
+                        row.last_apply_error = None
+                    bfd_outcome_ok = len(bfd_eligible)
+                except NsoApplyError as exc:
+                    logger.error("apply.bfd_failed", job_id=job_id, device=device_name, error=exc.message)
+                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
+                    for row in bfd_eligible:
+                        row.last_apply_error = err_payload
+                    bfd_outcome_failed = len(bfd_eligible)
+                    bfd_failed.append({"error": exc.message})
+                except Exception as exc:
+                    logger.exception("apply.bfd_unexpected_error", job_id=job_id)
+                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
+                    for row in bfd_eligible:
+                        row.last_apply_error = err_payload
+                    bfd_outcome_failed = len(bfd_eligible)
+                    bfd_failed.append({"error": repr(exc)})
+
             # ── Step 6c2: L2 SAP intent pass (M37 P2b) ───────────────────────
             l2_outcome_ok = 0
             l2_outcome_failed = 0
@@ -1031,6 +1070,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 and not svi_eligible
                 and not subif_eligible
                 and not vlan_eligible
+                and not bfd_eligible
                 and not l2_eligible
                 and not isis_eligible
                 and not bgp_eligible
@@ -1048,6 +1088,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     "static_route_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "subinterface_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "vlan_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+                    "bfd_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "l2_sap_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "isis_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "bgp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
@@ -1066,6 +1107,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 + svi_outcome_failed
                 + subif_outcome_failed
                 + vlan_outcome_failed
+                + bfd_outcome_failed
                 + l2_outcome_failed
                 + isis_outcome_failed
                 + bgp_outcome_failed
@@ -1105,6 +1147,10 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     "in_sync": vlan_outcome_ok,
                     "apply_failed": vlan_outcome_failed,
                 },
+                "bfd_count_by_outcome": {
+                    "in_sync": bfd_outcome_ok,
+                    "apply_failed": bfd_outcome_failed,
+                },
                 "l2_sap_count_by_outcome": {
                     "in_sync": l2_outcome_ok,
                     "apply_failed": l2_outcome_failed,
@@ -1139,6 +1185,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     + [{"type": "svi", **a} for a in svi_failed]
                     + [{"type": "subinterface", **a} for a in subif_failed]
                     + [{"type": "vlan", **a} for a in vlan_failed]
+                    + [{"type": "bfd", **a} for a in bfd_failed]
                     + [{"type": "l2_sap", **a} for a in l2_failed]
                     + [{"type": "isis", **a} for a in isis_failed]
                     + [{"type": "bgp", **a} for a in bgp_failed]

@@ -152,6 +152,7 @@ async def test_run_apply_nothing_eligible(adapter_client):
             "static_route_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
             "subinterface_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
             "vlan_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+            "bfd_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
             "l2_sap_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
             "isis_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
             "bgp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
