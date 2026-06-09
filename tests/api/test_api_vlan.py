@@ -82,3 +82,38 @@ async def test_apply_switchport_builds_payload(adapter_client):
 async def test_apply_switchport_device_not_found(adapter_client):
     resp = await adapter_client.post("/api/v1/devices/999999/switchport/apply", json={"interfaces": []}, headers=AUTH)
     assert resp.status_code == 404
+
+
+async def _count_vlan_intent(device_id: int) -> int:
+    from sqlalchemy import select
+
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import VlanIntent
+
+    async for db in get_session():
+        rows = (await db.execute(select(VlanIntent).where(VlanIntent.device_id == device_id))).scalars().all()
+        return len(rows)
+    return 0
+
+
+@pytest.mark.anyio
+async def test_put_vlan_intent_stores_and_full_replaces(adapter_client):
+    device_id = await seed_device(nso_device_name="vlan-wp", netbox_device_id=1250)
+    body = {"vlans": [{"vlan_id": 10, "name": "MGMT"}, {"vlan_id": 2213, "name": "RENAMED"}]}
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/vlan-intent", json=body, headers=AUTH)
+    assert resp.status_code == 200 and resp.json()["count"] == 2
+    assert await _count_vlan_intent(device_id) == 2
+    # full-replace: one VLAN → the other is deleted
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/vlan-intent",
+        json={"vlans": [{"vlan_id": 2213, "name": "RENAMED"}]},
+        headers=AUTH,
+    )
+    assert resp.json()["count"] == 1
+    assert await _count_vlan_intent(device_id) == 1
+
+
+@pytest.mark.anyio
+async def test_put_vlan_intent_unknown_device_404(adapter_client):
+    resp = await adapter_client.put("/api/v1/devices/999999/vlan-intent", json={"vlans": []}, headers=AUTH)
+    assert resp.status_code == 404

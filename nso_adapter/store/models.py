@@ -138,6 +138,9 @@ class Device(Base):
     vlan_database: Mapped[list[DeviceVlan]] = relationship(
         "DeviceVlan", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
+    vlan_intents: Mapped[list[VlanIntent]] = relationship(
+        "VlanIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
     switchports: Mapped[list[DeviceSwitchport]] = relationship(
         "DeviceSwitchport", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
@@ -416,6 +419,25 @@ class DeviceVlan(Base):
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
     device: Mapped[Device] = relationship("Device", back_populates="vlan_database")
+
+
+class VlanIntent(Base):
+    """Write-path intent for a VLAN-database entry (vid + name) accepted by the operator (M34)."""
+
+    __tablename__ = "vlan_intent"
+    __table_args__ = (UniqueConstraint("device_id", "vlan_id", name="uq_vlanintent_identity"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    vlan_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    device: Mapped[Device] = relationship("Device", back_populates="vlan_intents")
 
 
 class DeviceSwitchport(Base):

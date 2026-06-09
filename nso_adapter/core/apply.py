@@ -50,6 +50,7 @@ from nso_adapter.store.models import (
     SubinterfaceIntent,
     SviIntent,
     SyncState,
+    VlanIntent,
 )
 
 logger = structlog.get_logger(__name__)
@@ -118,6 +119,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
         apply_static_routes,
         apply_subinterface_config,
         apply_svi_config,
+        apply_vlan_config,
     )
     from nso_adapter.store.db import get_session
 
@@ -286,6 +288,16 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 if not force and row.last_apply_at is not None and row.last_apply_error is None:
                     continue
                 subif_eligible.append(row)
+
+            # Collect VLAN-database intent rows (M34 write path)
+            vlan_eligible: list[VlanIntent] = []
+            vlan_result = await db.execute(select(VlanIntent).where(VlanIntent.device_id == device_id))
+            for row in vlan_result.scalars().all():
+                if row.accepted_at is None:
+                    continue
+                if not force and row.last_apply_at is not None and row.last_apply_error is None:
+                    continue
+                vlan_eligible.append(row)
 
             # Collect L2 SAP intent rows (M37 P2b — Nokia SAP write path)
             l2_eligible: list[L2SapIntent] = []
@@ -762,6 +774,33 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     subif_outcome_failed = len(subif_eligible)
                     subif_failed.append({"error": repr(exc)})
 
+            # ── Step 6c1d: VLAN-database intent pass (M34) ───────────────────
+            vlan_outcome_ok = 0
+            vlan_outcome_failed = 0
+            vlan_failed: list[dict] = []
+
+            if vlan_eligible:
+                try:
+                    await apply_vlan_config(client=client, device_name=device_name, vlan_intent_rows=vlan_eligible)
+                    for row in vlan_eligible:
+                        row.last_apply_at = now
+                        row.last_apply_error = None
+                    vlan_outcome_ok = len(vlan_eligible)
+                except NsoApplyError as exc:
+                    logger.error("apply.vlan_failed", job_id=job_id, device=device_name, error=exc.message)
+                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
+                    for row in vlan_eligible:
+                        row.last_apply_error = err_payload
+                    vlan_outcome_failed = len(vlan_eligible)
+                    vlan_failed.append({"error": exc.message})
+                except Exception as exc:
+                    logger.exception("apply.vlan_unexpected_error", job_id=job_id)
+                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
+                    for row in vlan_eligible:
+                        row.last_apply_error = err_payload
+                    vlan_outcome_failed = len(vlan_eligible)
+                    vlan_failed.append({"error": repr(exc)})
+
             # ── Step 6c2: L2 SAP intent pass (M37 P2b) ───────────────────────
             l2_outcome_ok = 0
             l2_outcome_failed = 0
@@ -991,6 +1030,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 and not logging_eligible
                 and not svi_eligible
                 and not subif_eligible
+                and not vlan_eligible
                 and not l2_eligible
                 and not isis_eligible
                 and not bgp_eligible
@@ -1007,6 +1047,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     "snmp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "static_route_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "subinterface_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+                    "vlan_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "l2_sap_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "isis_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "bgp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
@@ -1024,6 +1065,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 + logging_outcome_failed
                 + svi_outcome_failed
                 + subif_outcome_failed
+                + vlan_outcome_failed
                 + l2_outcome_failed
                 + isis_outcome_failed
                 + bgp_outcome_failed
@@ -1059,6 +1101,10 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     "in_sync": subif_outcome_ok,
                     "apply_failed": subif_outcome_failed,
                 },
+                "vlan_count_by_outcome": {
+                    "in_sync": vlan_outcome_ok,
+                    "apply_failed": vlan_outcome_failed,
+                },
                 "l2_sap_count_by_outcome": {
                     "in_sync": l2_outcome_ok,
                     "apply_failed": l2_outcome_failed,
@@ -1092,6 +1138,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     + [{"type": "logging", **a} for a in logging_failed]
                     + [{"type": "svi", **a} for a in svi_failed]
                     + [{"type": "subinterface", **a} for a in subif_failed]
+                    + [{"type": "vlan", **a} for a in vlan_failed]
                     + [{"type": "l2_sap", **a} for a in l2_failed]
                     + [{"type": "isis", **a} for a in isis_failed]
                     + [{"type": "bgp", **a} for a in bgp_failed]

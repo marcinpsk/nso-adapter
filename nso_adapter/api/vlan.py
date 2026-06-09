@@ -10,11 +10,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from datetime import UTC, datetime
+
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import api_error
 from nso_adapter.core.importer import get_nso_client
 from nso_adapter.core.switchport_intent import apply_switchport_config as apply_switchport_core
-from nso_adapter.store.models import Device, DeviceSwitchport, DeviceVlan
+from nso_adapter.store.models import Device, DeviceSettings, DeviceSwitchport, DeviceVlan, VlanIntent
 
 router = APIRouter(prefix="/api/v1/devices", tags=["vlan"])
 
@@ -88,3 +90,63 @@ async def apply_switchport(
         raise api_error(404, "not_found", "Device not found")
     nso_client = get_nso_client(device.nso_instance)
     return await apply_switchport_core(device, payload, nso_client)
+
+
+# ---------------------------------------------------------------------------
+# PUT /{device_id}/vlan-intent  (M34 VLAN-database write path — deferred apply)
+# ---------------------------------------------------------------------------
+
+
+class VlanEntry(BaseModel):
+    vlan_id: int
+    name: str = ""
+    accepted_at: datetime | None = None
+
+
+class VlanIntentUpdate(BaseModel):
+    vlans: list[VlanEntry]
+
+
+@router.put("/{device_id}/vlan-intent", dependencies=[Depends(verify_token)])
+async def put_vlan_intent(device_id: int, body: VlanIntentUpdate, db: AsyncSession = Depends(get_db)):
+    """Replace the adapter's VLAN-database intent mirror for this device atomically.
+
+    Full-replace: rows not in the body are deleted. ``accepted_at`` defaults to now.
+    If ``auto_apply`` is enabled on the device, an apply job is enqueued. The single
+    device Apply commits these via the vlan-reconciler.
+    """
+    if await db.get(Device, device_id) is None:
+        raise api_error(404, "not_found", "Device not found")
+
+    existing = await db.execute(select(VlanIntent).where(VlanIntent.device_id == device_id))
+    existing_rows: dict[int, VlanIntent] = {r.vlan_id: r for r in existing.scalars().all()}
+    new_keys = {v.vlan_id for v in body.vlans}
+
+    for vid, row in existing_rows.items():
+        if vid not in new_keys:
+            await db.delete(row)
+    await db.flush()
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    count = 0
+    for item in body.vlans:
+        accepted = item.accepted_at.replace(tzinfo=None) if item.accepted_at else now
+        row = existing_rows.get(item.vlan_id)
+        if row is None:
+            row = VlanIntent(device_id=device_id, vlan_id=item.vlan_id)
+            db.add(row)
+        row.name = item.name or None
+        row.accepted_at = accepted
+        count += 1
+
+    await db.flush()
+    settings = (
+        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    ).scalar_one_or_none()
+    if settings and settings.auto_apply and count > 0:
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True)
+
+    await db.commit()
+    return {"device_id": device_id, "count": count}

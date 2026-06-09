@@ -230,6 +230,9 @@ _SVI_SERVICE_PATH = "/restconf/data/svi-reconciler:svi-config"
 # RESTCONF path to the subinterface-reconciler service list (dot1q write path, M36)
 _SUBIF_SERVICE_PATH = "/restconf/data/subinterface-reconciler:subif-config"
 
+# RESTCONF path to the vlan-reconciler service list (VLAN-database write path, M34)
+_VLAN_SERVICE_PATH = "/restconf/data/vlan-reconciler:vlan-config"
+
 # RESTCONF path to the l2-sap-reconciler service list (M37 P2b)
 _L2_SAP_SERVICE_PATH = "/restconf/data/l2-sap-reconciler:l2-sap-config"
 
@@ -551,6 +554,50 @@ async def apply_subinterface_config(
             )
 
     logger.info("nso.apply.subif_ok", device=device_name, count=len(interfaces))
+
+
+async def apply_vlan_config(
+    client: NsoClient,
+    device_name: str,
+    vlan_intent_rows: list,
+) -> None:
+    """Write the VLAN-database intent snapshot for a device to NSO (M34 write path).
+
+    Materialises 'vlan <id> / name <name>' (IOS) / 'vlans <name> vlan-id <id>'
+    (Junos) via the vlan-reconciler. Reconcile mode (brownfield adoption).
+    Raises NsoApplyError on failure.
+    """
+    vlans = []
+    for row in vlan_intent_rows:
+        entry: dict = {"vlan-id": row.vlan_id}
+        if row.name:
+            entry["name"] = row.name
+        vlans.append(entry)
+
+    payload = json.dumps({"vlan-reconciler:vlan-config": [{"device": device_name, "vlan": vlans}]})
+    url = f"{client._base}{_VLAN_SERVICE_PATH}"
+
+    async with client._client(timeout=client._action_timeout) as c:
+        resp = await c.patch(
+            url,
+            content=payload,
+            headers={"Content-Type": "application/yang-data+json"},
+        )
+        if resp.status_code not in (200, 201, 204):
+            try:
+                err = resp.json()
+            except Exception:
+                err = {"raw": resp.text}
+            logger.error(
+                "nso.apply.vlan_patch_failed", device=device_name, status=resp.status_code, body=err
+            )
+            raise NsoApplyError(
+                "nso_patch_failed",
+                f"NSO PATCH for VLAN intent failed with status {resp.status_code}",
+                detail={"nso_error": err},
+            )
+
+    logger.info("nso.apply.vlan_ok", device=device_name, count=len(vlans))
 
 
 async def apply_l2_saps(
