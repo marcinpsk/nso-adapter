@@ -76,6 +76,14 @@ def test_start_scheduler_registers_lag_refresh_job(monkeypatch: pytest.MonkeyPat
                 logging_poll_interval=300,
                 enable_l2_service_sync=True,
                 l2_service_poll_interval=300,
+                enable_vlan_sync=True,
+                vlan_poll_interval=300,
+                enable_switchport_sync=True,
+                switchport_poll_interval=300,
+                enable_svi_sync=True,
+                svi_poll_interval=300,
+                enable_subinterface_sync=True,
+                subinterface_poll_interval=300,
                 enable_topology_interface_sync=False,
                 topology_interface_poll_interval=120,
             )
@@ -93,6 +101,10 @@ def test_start_scheduler_registers_lag_refresh_job(monkeypatch: pytest.MonkeyPat
         "lag_config_refresh",
         "interface_ip_refresh",
         "l2_service_refresh",
+        "vlan_refresh",
+        "switchport_refresh",
+        "svi_refresh",
+        "subinterface_refresh",
     }
     scheduler_module.stop_scheduler()
     assert fake_scheduler.stopped is True
@@ -130,6 +142,14 @@ def test_start_scheduler_skips_lag_refresh_when_disabled(monkeypatch: pytest.Mon
                 logging_poll_interval=300,
                 enable_l2_service_sync=False,
                 l2_service_poll_interval=300,
+                enable_vlan_sync=False,
+                vlan_poll_interval=300,
+                enable_switchport_sync=False,
+                switchport_poll_interval=300,
+                enable_svi_sync=False,
+                svi_poll_interval=300,
+                enable_subinterface_sync=False,
+                subinterface_poll_interval=300,
                 enable_topology_interface_sync=False,
                 topology_interface_poll_interval=120,
             )
@@ -188,6 +208,41 @@ async def test_scheduled_l2_service_refresh_refreshes_all_devices(adapter_client
     monkeypatch.setattr("nso_adapter.core.l2_service.refresh_l2_services_for_device", refresh)
 
     await scheduler_module._scheduled_l2_service_refresh()
+
+    assert refresh.await_count == 2
+    assert all(call.kwargs["refresh_source"] == "poll" for call in refresh.await_args_list)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("scheduled_fn", "refresh_target"),
+    [
+        ("_scheduled_vlan_refresh", "nso_adapter.core.vlan.refresh_vlan_database_for_device"),
+        ("_scheduled_switchport_refresh", "nso_adapter.core.vlan.refresh_switchport_for_device"),
+        ("_scheduled_svi_refresh", "nso_adapter.core.svi.refresh_svi_for_device"),
+        ("_scheduled_subinterface_refresh", "nso_adapter.core.subinterface.refresh_subinterface_for_device"),
+    ],
+)
+async def test_l2l3_family_refresh_refreshes_all_devices(
+    adapter_client, monkeypatch, scheduled_fn, refresh_target
+):
+    """M34/M35/M36: the L2/L3 interface-family poll jobs refresh every managed device."""
+    async for db in get_session():
+        db.add_all(
+            [
+                Device(nso_instance="nso-dev", nso_device_name="d1", netbox_device_id=3001),
+                Device(nso_instance="nso-dev", nso_device_name="d2", netbox_device_id=3002),
+            ]
+        )
+        await db.commit()
+        break
+
+    refresh = AsyncMock()
+    nso_client = MagicMock()
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: nso_client)
+    monkeypatch.setattr(refresh_target, refresh)
+
+    await getattr(scheduler_module, scheduled_fn)()
 
     assert refresh.await_count == 2
     assert all(call.kwargs["refresh_source"] == "poll" for call in refresh.await_args_list)

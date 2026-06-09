@@ -84,6 +84,18 @@ class SchedulerConfig(BaseModel):
     route_policy_poll_interval: int = 300
     enable_l2_service_sync: bool = True
     l2_service_poll_interval: int = 300
+    # L2/L3 interface family (M34 VLAN-db + switchport, M35 SVI/IRB, M36 dot1q
+    # subinterface). These otherwise refresh ONLY on an SSE config-change event, so
+    # without a periodic poll their mirror never populates / self-heals on a device
+    # that hasn't changed since the adapter started.
+    enable_vlan_sync: bool = True
+    vlan_poll_interval: int = 300
+    enable_switchport_sync: bool = True
+    switchport_poll_interval: int = 300
+    enable_svi_sync: bool = True
+    svi_poll_interval: int = 300
+    enable_subinterface_sync: bool = True
+    subinterface_poll_interval: int = 300
     # Topology interface reconcile: ensured NetBox held the LAG parents, logical
     # channels/SAPs and loopback/system interfaces that the OLD bound_port-named
     # correlation needed. M27R supersedes this: interface-attributes now exports

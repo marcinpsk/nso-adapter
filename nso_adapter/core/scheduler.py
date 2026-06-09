@@ -483,6 +483,62 @@ async def _scheduled_route_policy_refresh() -> None:
             await refresh_route_policy_for_device(db, device, nso_client, refresh_source="poll")
 
 
+async def _refresh_all_devices(refresh_fn, label: str) -> None:
+    """Run *refresh_fn(db, device, nso_client, refresh_source='poll')* for every
+    NSO-managed device. Shared body for the L2/L3 interface-family poll jobs
+    (M34 VLAN-db + switchport, M35 SVI/IRB, M36 dot1q subinterface), which would
+    otherwise be byte-for-byte copies of each other.
+    """
+    from sqlalchemy import select
+
+    from nso_adapter.core.importer import get_nso_client
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device
+
+    async for db in get_session():
+        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
+        for device in result.scalars().all():
+            try:
+                nso_client = get_nso_client(device.nso_instance)
+            except RuntimeError:
+                logger.debug(
+                    f"scheduler.{label}.skipped",
+                    device_id=device.id,
+                    reason="no_nso_client",
+                    instance=device.nso_instance,
+                )
+                continue
+            await refresh_fn(db, device, nso_client, refresh_source="poll")
+
+
+async def _scheduled_vlan_refresh() -> None:
+    """Periodic fallback: refresh the VLAN database for all managed devices (M34)."""
+    from nso_adapter.core.vlan import refresh_vlan_database_for_device
+
+    await _refresh_all_devices(refresh_vlan_database_for_device, "vlan")
+
+
+async def _scheduled_switchport_refresh() -> None:
+    """Periodic fallback: refresh L2 switchport config for all managed devices (M34)."""
+    from nso_adapter.core.vlan import refresh_switchport_for_device
+
+    await _refresh_all_devices(refresh_switchport_for_device, "switchport")
+
+
+async def _scheduled_svi_refresh() -> None:
+    """Periodic fallback: refresh SVIs/IRBs for all managed devices (M35)."""
+    from nso_adapter.core.svi import refresh_svi_for_device
+
+    await _refresh_all_devices(refresh_svi_for_device, "svi")
+
+
+async def _scheduled_subinterface_refresh() -> None:
+    """Periodic fallback: refresh dot1q subinterfaces for all managed devices (M36)."""
+    from nso_adapter.core.subinterface import refresh_subinterface_for_device
+
+    await _refresh_all_devices(refresh_subinterface_for_device, "subinterface")
+
+
 async def _scheduled_topology_interfaces_refresh() -> None:
     """Periodic reconcile: ensure NetBox holds the LAG/channel/loopback interfaces
     that bound_port correlation needs (the cfg.port feed never creates them).
@@ -611,6 +667,34 @@ def start_scheduler() -> None:
             "interval",
             minutes=cfg.scheduler.l2_service_poll_interval,
             id="l2_service_refresh",
+        )
+    if cfg.scheduler.enable_vlan_sync and cfg.scheduler.vlan_poll_interval > 0:
+        _scheduler.add_job(
+            _scheduled_vlan_refresh,
+            "interval",
+            minutes=cfg.scheduler.vlan_poll_interval,
+            id="vlan_refresh",
+        )
+    if cfg.scheduler.enable_switchport_sync and cfg.scheduler.switchport_poll_interval > 0:
+        _scheduler.add_job(
+            _scheduled_switchport_refresh,
+            "interval",
+            minutes=cfg.scheduler.switchport_poll_interval,
+            id="switchport_refresh",
+        )
+    if cfg.scheduler.enable_svi_sync and cfg.scheduler.svi_poll_interval > 0:
+        _scheduler.add_job(
+            _scheduled_svi_refresh,
+            "interval",
+            minutes=cfg.scheduler.svi_poll_interval,
+            id="svi_refresh",
+        )
+    if cfg.scheduler.enable_subinterface_sync and cfg.scheduler.subinterface_poll_interval > 0:
+        _scheduler.add_job(
+            _scheduled_subinterface_refresh,
+            "interval",
+            minutes=cfg.scheduler.subinterface_poll_interval,
+            id="subinterface_refresh",
         )
     if cfg.scheduler.enable_route_policy_sync and cfg.scheduler.route_policy_poll_interval > 0:
         _scheduler.add_job(
