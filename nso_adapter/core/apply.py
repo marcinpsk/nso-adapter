@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from nso_adapter.store.models import (
     BgpAfIntent,
@@ -400,13 +401,19 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     for paf in paf_result.scalars().all():
                         pafs_by_peer.setdefault(paf.peer_id, []).append(paf)
 
+                # Populate the manually-loaded relationships as *committed* state.
+                # Writing raw lists into __dict__ bypasses SQLAlchemy instrumentation, so a
+                # later flush of these (now-dirty) rows computes history on the relationship,
+                # finds a plain list, and crashes ("'list' object has no attribute
+                # '_sa_adapter'"), aborting the whole apply. set_committed_value instruments
+                # the collection and marks it as loaded-from-DB → empty history on flush.
                 for s in all_scopes:
-                    s.__dict__["address_families"] = afs_by_scope.get(s.id, [])
-                    s.__dict__["peers"] = peers_by_scope.get(s.id, [])
+                    set_committed_value(s, "address_families", afs_by_scope.get(s.id, []))
+                    set_committed_value(s, "peers", peers_by_scope.get(s.id, []))
                 for p in all_peers:
-                    p.__dict__["peer_address_families"] = pafs_by_peer.get(p.id, [])
+                    set_committed_value(p, "peer_address_families", pafs_by_peer.get(p.id, []))
                 for r in bgp_eligible:
-                    r.__dict__["scopes"] = scopes_by_router.get(r.id, [])
+                    set_committed_value(r, "scopes", scopes_by_router.get(r.id, []))
 
             # Collect route-policy object intent rows
             rp_eligible: list[RoutePolicyObjectIntent] = []

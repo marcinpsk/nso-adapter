@@ -473,3 +473,37 @@ async def test_run_apply_ip_already_applied_skipped_without_force(adapter_client
         await run_apply(job_id=job_id, device_id=device_id, force=False)
 
     mock_ip_apply.assert_not_awaited()
+
+
+async def test_run_apply_bgp_intent_does_not_crash_on_commit(adapter_client):
+    """Regression: a dirty BgpRouterIntent must not crash the apply commit.
+
+    The apply manually eager-loads BGP relationships (scopes/peers/afs). It used to write
+    raw Python lists into __dict__, which bypasses SQLAlchemy instrumentation — so once the
+    row was marked applied (dirty) the commit flush hit
+    'list object has no attribute _sa_adapter' and aborted the ENTIRE job. set_committed_value
+    instruments the collection, so flush sees committed (empty-history) state.
+    """
+    from datetime import timezone
+
+    from nso_adapter.store.models import BgpRouterIntent
+
+    device_id = await _seed_device("rtr-bgp-crash", 555)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(BgpRouterIntent(device_id=device_id, asn="65100", accepted_at=datetime.now(timezone.utc)))
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_bgp_config", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)  # must not raise
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        assert job.result["bgp_count_by_outcome"]["in_sync"] == 1
+        break
