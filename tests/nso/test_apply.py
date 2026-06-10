@@ -7,7 +7,17 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nso_adapter.nso.apply import NsoApplyError, apply_interface_attribute, apply_interface_ips
+from types import SimpleNamespace
+
+from nso_adapter.nso import apply as apply_mod
+from nso_adapter.nso.apply import (
+    NsoApplyError,
+    _device_delta_from_dry_run,
+    _verify_native_or_raise,
+    apply_interface_attribute,
+    apply_interface_ips,
+    apply_static_routes,
+)
 
 
 def _make_nso_client(base="http://nso"):
@@ -43,12 +53,15 @@ async def test_apply_description_success():
     await apply_interface_attribute(client, "core-rtr-01", "GigabitEthernet0/0", "description", "uplink")
 
     mock_http = client._client.return_value.__aenter__.return_value
-    mock_http.patch.assert_called_once()
-    (url,) = mock_http.patch.call_args[0]
+    # Real PATCH + post-apply native dry-run verify = two calls.
+    assert mock_http.patch.call_count == 2
+    real_call = mock_http.patch.call_args_list[0]
+    (url,) = real_call[0]
     assert "interface-reconciler" in url
+    assert "dry-run" not in url
     import json
 
-    payload = json.loads(mock_http.patch.call_args[1]["content"])
+    payload = json.loads(real_call[1]["content"])
     entries = payload["interface-reconciler:interface-config"]
     assert entries[0]["description"] == "uplink"
     assert entries[0]["device"] == "core-rtr-01"
@@ -434,3 +447,88 @@ async def test_apply_switchport_config_nso_error_raises():
     with pytest.raises(NsoApplyError) as exc_info:
         await apply_switchport_config(client=client, device_name="sw03", interfaces=[{"interface-name": "Gi0/1"}])
     assert exc_info.value.code == "nso_patch_failed"
+
+
+# ── Post-apply native dry-run verification (false-success guard) ────────────────
+
+
+class TestDeviceDeltaFromDryRun:
+    def test_empty_native_means_no_delta(self):
+        assert _device_delta_from_dry_run({"dry-run-result": {"native": {}}}, "sw03") == ""
+
+    def test_absent_native_means_no_delta(self):
+        assert _device_delta_from_dry_run({"dry-run-result": {"native": None}}, "sw03") == ""
+
+    def test_matching_device_returns_delta(self):
+        body = {"dry-run-result": {"native": {"device": [{"name": "sw03", "data": "ip route 1.0.0.0 ...\n"}]}}}
+        assert _device_delta_from_dry_run(body, "sw03") == "ip route 1.0.0.0 ...\n"
+
+    def test_other_device_only_means_no_delta(self):
+        body = {"dry-run-result": {"native": {"device": [{"name": "other", "data": "x"}]}}}
+        assert _device_delta_from_dry_run(body, "sw03") == ""
+
+    def test_unexpected_shape_returns_none(self):
+        assert _device_delta_from_dry_run({"something-else": 1}, "sw03") is None
+        assert _device_delta_from_dry_run("not-a-dict", "sw03") is None
+
+
+@pytest.mark.asyncio
+async def test_verify_raises_on_nonempty_delta():
+    """A non-empty native device delta after apply is a false success → raise."""
+    client = _make_nso_client()
+    body = {"dry-run-result": {"native": {"device": [{"name": "sw03", "data": "ip route 1.0.0.0 255.0.0.0 2.2.2.2 1\n"}]}}}
+    client._client.return_value = _mock_http_ctx(_mock_httpx_response(200, json_data=body))
+
+    with pytest.raises(NsoApplyError) as exc_info:
+        await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="static_route")
+    assert exc_info.value.code == "verify_mismatch"
+    assert "ip route" in exc_info.value.detail["device_delta"]
+
+
+@pytest.mark.asyncio
+async def test_verify_passes_on_empty_delta():
+    client = _make_nso_client()
+    client._client.return_value = _mock_http_ctx(_mock_httpx_response(200, json_data={"dry-run-result": {"native": {}}}))
+    await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="vlan")  # no raise
+
+
+@pytest.mark.asyncio
+async def test_verify_inconclusive_does_not_raise():
+    """Unexpected/garbage dry-run body is fail-safe (no raise, apply stands)."""
+    client = _make_nso_client()
+    client._client.return_value = _mock_http_ctx(_mock_httpx_response(200, json_data={"weird": 1}))
+    await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="vlan")  # no raise
+
+
+@pytest.mark.asyncio
+async def test_verify_disabled_by_toggle(monkeypatch):
+    """When VERIFY_AFTER_APPLY is off, no dry-run call is made."""
+    monkeypatch.setattr(apply_mod, "VERIFY_AFTER_APPLY", False)
+    client = _make_nso_client()
+    client._client.return_value = _mock_http_ctx(_mock_httpx_response(200))
+    await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="vlan")
+    client._client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_apply_static_routes_verify_mismatch_raises():
+    """End-to-end: real PATCH succeeds (204) but the verify dry-run shows a delta → raise."""
+    client = _make_nso_client()
+    real_resp = _mock_httpx_response(204)
+    dry_resp = _mock_httpx_response(
+        200, json_data={"dry-run-result": {"native": {"device": [{"name": "sw03", "data": "ip route ...\n"}]}}}
+    )
+    mock_http = AsyncMock()
+    mock_http.patch.side_effect = [real_resp, dry_resp]
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=mock_http)
+    ctx.__aexit__ = AsyncMock(return_value=None)
+    client._client.return_value = ctx
+
+    row = SimpleNamespace(vrf="", prefix="100.64.0.0/10", next_hop="172.16.0.1", metric=1, permanent=False, tag=None)
+    with pytest.raises(NsoApplyError) as exc_info:
+        await apply_static_routes(client=client, device_name="sw03", route_intent_rows=[row])
+    assert exc_info.value.code == "verify_mismatch"
+    # First call is the real PATCH (no dry-run), second is the verify dry-run.
+    assert "dry-run" not in mock_http.patch.call_args_list[0][0][0]
+    assert "dry-run=native" in mock_http.patch.call_args_list[1][0][0]

@@ -18,12 +18,19 @@ interface-reconciler service path with the native commit API.
 from __future__ import annotations
 
 import json
+import os
 
 import structlog
 
 from nso_adapter.nso.client import NsoClient
 
 logger = structlog.get_logger(__name__)
+
+# After a successful apply, re-issue the same intent as a native dry-run and
+# assert NSO would push nothing further to the device. A non-empty device delta
+# means the intent did not actually land (silently dropped/normalised by the
+# NED, or rejected) — i.e. a false success. Toggle off with NSO_ADAPTER_VERIFY_APPLY=0.
+VERIFY_AFTER_APPLY = os.environ.get("NSO_ADAPTER_VERIFY_APPLY", "1").strip().lower() not in ("0", "false", "no")
 
 # RESTCONF path to the interface-reconciler service list
 _SERVICE_PATH = "/restconf/data/interface-reconciler:interface-config"
@@ -40,6 +47,85 @@ class NsoApplyError(Exception):
         self.code = code
         self.message = message
         self.detail = detail or {}
+
+
+def _device_delta_from_dry_run(body: object, device_name: str) -> str | None:
+    """Return the native device delta for *device_name* from a dry-run-result body.
+
+    Returns the (possibly empty) southbound delta NSO would still push, or None
+    when the response is not the expected ``dry-run-result`` shape — in which
+    case verification is treated as inconclusive by the caller.
+
+    Empty/absent ``native`` or no matching device entry both mean "no delta" ("").
+    """
+    if not isinstance(body, dict):
+        return None
+    result = body.get("dry-run-result")
+    if not isinstance(result, dict):
+        return None
+    native = result.get("native")
+    if native in (None, {}):
+        return ""
+    if not isinstance(native, dict):
+        return None
+    devices = native.get("device")
+    if not devices:
+        return ""
+    if not isinstance(devices, list):
+        return None
+    for entry in devices:
+        if isinstance(entry, dict) and entry.get("name") == device_name:
+            return str(entry.get("data") or "")
+    return ""
+
+
+async def _verify_native_or_raise(
+    client: NsoClient, url: str, payload: str, device_name: str, *, scope: str
+) -> None:
+    """Re-issue *payload* as a native dry-run; raise if NSO would still change the device.
+
+    Catches false successes: a 2xx PATCH whose intent NSO silently did not fully
+    apply leaves a non-empty native device delta on the immediate re-dry-run.
+
+    Fail-safe: transport errors, non-2xx, unparseable bodies or unexpected shapes
+    are logged and treated as inconclusive (no raise) so verification never blocks
+    an otherwise-successful apply. Compares against NSO's CDB, so out-of-band
+    device drift (CDB vs physical) is out of scope here — that needs sync-from.
+    """
+    if not VERIFY_AFTER_APPLY:
+        return
+
+    dry_url = f"{url}?dry-run=native"
+    try:
+        async with client._client(timeout=client._action_timeout) as c:
+            resp = await c.patch(
+                dry_url,
+                content=payload,
+                headers={"Content-Type": "application/yang-data+json"},
+            )
+        if resp.status_code not in (200, 201, 204):
+            logger.warning(
+                "nso.apply.verify_inconclusive", scope=scope, device=device_name, status=resp.status_code
+            )
+            return
+        body = resp.json()
+    except Exception as exc:  # network/transport/parse — never block the apply on verify
+        logger.warning("nso.apply.verify_skipped", scope=scope, device=device_name, error=repr(exc))
+        return
+
+    delta = _device_delta_from_dry_run(body, device_name)
+    if delta is None:
+        logger.warning("nso.apply.verify_unexpected_shape", scope=scope, device=device_name)
+        return
+    if delta.strip():
+        logger.error("nso.apply.verify_mismatch", scope=scope, device=device_name, delta=delta)
+        raise NsoApplyError(
+            "verify_mismatch",
+            f"{scope}: applied intent did not land on {device_name!r} — "
+            f"NSO would still push changes to the device",
+            detail={"device_delta": delta},
+        )
+    logger.info("nso.apply.verify_ok", scope=scope, device=device_name)
 
 
 async def apply_interface_attribute(
@@ -118,6 +204,8 @@ async def apply_interface_attribute(
         interface=interface_name,
         attribute=attribute,
     )
+
+    await _verify_native_or_raise(client, url, payload, device_name, scope="interface_attribute")
 
 
 async def apply_interface_ips(
@@ -214,6 +302,8 @@ async def apply_interface_ips(
         ipv4_count=len(ipv4_entries),
         ipv6_count=len(ipv6_entries),
     )
+
+    await _verify_native_or_raise(client, url, payload, device_name, scope="interface_ip")
 
 
 _SNMP_SERVICE_PATH = "/restconf/data/snmp-reconciler:snmp-config"
@@ -343,6 +433,8 @@ async def apply_snmp_config(
         host_count=len(host_intents),
     )
 
+    await _verify_native_or_raise(client, url, payload, device_name, scope="snmp")
+
 
 async def apply_static_routes(
     client: NsoClient,
@@ -404,6 +496,8 @@ async def apply_static_routes(
         route_count=len(routes),
     )
 
+    await _verify_native_or_raise(client, url, payload, device_name, scope="static_route")
+
 
 async def apply_logging_config(
     client: NsoClient,
@@ -462,6 +556,8 @@ async def apply_logging_config(
 
     logger.info("nso.apply.logging_ok", device=device_name, host_count=len(hosts))
 
+    await _verify_native_or_raise(client, url, payload, device_name, scope="logging")
+
 
 async def apply_svi_config(
     client: NsoClient,
@@ -506,6 +602,8 @@ async def apply_svi_config(
             )
 
     logger.info("nso.apply.svi_ok", device=device_name, count=len(interfaces))
+
+    await _verify_native_or_raise(client, url, payload, device_name, scope="svi")
 
 
 async def apply_subinterface_config(
@@ -558,6 +656,8 @@ async def apply_subinterface_config(
 
     logger.info("nso.apply.subif_ok", device=device_name, count=len(interfaces))
 
+    await _verify_native_or_raise(client, url, payload, device_name, scope="subinterface")
+
 
 async def apply_vlan_config(
     client: NsoClient,
@@ -601,6 +701,8 @@ async def apply_vlan_config(
             )
 
     logger.info("nso.apply.vlan_ok", device=device_name, count=len(vlans))
+
+    await _verify_native_or_raise(client, url, payload, device_name, scope="vlan")
 
 
 async def apply_bfd_config(
@@ -649,6 +751,8 @@ async def apply_bfd_config(
             )
 
     logger.info("nso.apply.bfd_ok", device=device_name, count=len(interfaces))
+
+    await _verify_native_or_raise(client, url, payload, device_name, scope="bfd")
 
 
 async def apply_l2_saps(
@@ -712,6 +816,8 @@ async def apply_l2_saps(
         sap_count=len(saps),
     )
 
+    await _verify_native_or_raise(client, url, payload, device_name, scope="l2_sap")
+
 
 async def apply_lag_config(
     client: NsoClient,
@@ -766,6 +872,8 @@ async def apply_lag_config(
         bundle_count=len(bundles),
     )
 
+    await _verify_native_or_raise(client, url, payload, device_name, scope="lag")
+
 
 async def apply_switchport_config(
     client: NsoClient,
@@ -815,6 +923,8 @@ async def apply_switchport_config(
         device=device_name,
         interface_count=len(interfaces),
     )
+
+    await _verify_native_or_raise(client, url, payload, device_name, scope="switchport")
 
 
 async def apply_isis_interfaces(
@@ -931,6 +1041,8 @@ async def apply_isis_interfaces(
         process_count=len(processes),
     )
 
+    await _verify_native_or_raise(client, url, payload, device_name, scope="isis")
+
 
 async def apply_bgp_config(
     client: NsoClient,
@@ -1045,6 +1157,8 @@ async def apply_bgp_config(
         peer_count=peer_count,
     )
 
+    await _verify_native_or_raise(client, url, payload, device_name, scope="bgp")
+
 
 async def apply_route_policy_config(
     client: NsoClient,
@@ -1116,6 +1230,8 @@ async def apply_route_policy_config(
         object_count=obj_count,
         families=list(by_family.keys()),
     )
+
+    await _verify_native_or_raise(client, url, payload, device_name, scope="route_policy")
 
 
 # RESTCONF path to the ospf-reconciler service list
@@ -1229,3 +1345,5 @@ async def apply_ospf_config(
         process_count=len(processes),
         interface_count=len(interfaces),
     )
+
+    await _verify_native_or_raise(client, url, payload, device_name, scope="ospf")
