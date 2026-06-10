@@ -1028,28 +1028,32 @@ configuration as last observed from NSO.
   "last_refreshed_at": "2025-01-01T00:00:00",
   "refresh_source": "sse",
   "instances": [
-    {
-      "process_id": 1,
-      "router_id": "10.0.0.1",
-      "vrf": "",
-      "areas": [{"area_id": "0.0.0.0"}]
-    }
+    {"process_id": "1", "vrf": "", "areas": ["0.0.0.0"], "router_id": "10.0.0.1"}
   ],
   "interfaces": [
     {
       "interface_name": "GigabitEthernet0/0",
-      "process_id": 1,
-      "area_id": "0.0.0.0",
-      "passive": false,
-      "priority": null,
-      "cost": null,
-      "network_type": null,
-      "auth_type": null,
-      "auth_present": false
+      "passive": false, "auth_present": false,
+      "process_id": "1", "area_id": "0.0.0.0",
+      "priority": 10, "cost": 100,
+      "network_type": "point-to-point", "auth_type": "md5"
     }
   ]
 }
 ```
+
+**Key contract (pinned by `tests/api/test_contract_ospf.py` ↔ plugin
+`tests/test_contract_ospf.py`).** Optional keys are **omitted when unset**, not `null`:
+
+| Level | Always present | Optional (omitted when unset) |
+|---|---|---|
+| top | `device_id`, `last_refreshed_at`, `refresh_source`, `instances`, `interfaces` | — |
+| instance | `process_id`, `vrf`, `areas` | `router_id` |
+| interface | `interface_name`, `passive`, `auth_present` | `process_id`, `area_id`, `priority`, `cost`, `network_type`, `auth_type` |
+
+`process_id` is a **string** (named processes on IOS-XR/Junos). `areas` is an opaque
+list passthrough (the plugin stores it verbatim). `last_refreshed_at` on the OSPF
+endpoint is the raw datetime (no `Z` suffix, unlike BGP/ISIS).
 
 ### `PUT /api/v1/devices/{id}/ospf-intent` → `200 | 404`
 
@@ -1090,3 +1094,42 @@ referencing it are silently skipped (process-presence gate in the NSO package).
 
 If `auto_apply` is `true` on device settings and at least one eligible intent
 row is present, an apply job is enqueued automatically.
+
+---
+
+## Redistribution (M20)
+
+### `GET /api/v1/devices/{id}/redistribution` → `200`
+
+Return all redistribution statements cached from NSO for this device (the flat
+read-mirror; the same data also appears nested under the BGP/OSPF/ISIS intent PUTs).
+The plugin consumes this in `redistribution_reconciler.reconcile_redistribution`.
+
+```json
+{
+  "device_id": 1,
+  "last_refreshed_at": "2026-06-01T10:00:00",
+  "refresh_source": "poll",
+  "entries": [
+    {
+      "dest_protocol": "ospf", "dest_ref": "1",
+      "source_protocol": "bgp", "source_ref": "65100",
+      "route_map": "RM-REDIST", "metric": 100, "metric_type": "type-1"
+    },
+    {"dest_protocol": "isis", "dest_ref": "", "source_protocol": "connected", "source_ref": ""}
+  ]
+}
+```
+
+When no data exists: `{ "device_id": 1, "last_refreshed_at": null, "refresh_source": "never", "entries": [] }`.
+
+**Key contract (pinned by `tests/api/test_contract_redistribution.py` ↔ plugin
+`tests/test_contract_redistribution.py`).** Optional keys are **omitted when unset**,
+not `null`:
+
+| Level | Always present | Optional (omitted when unset) |
+|---|---|---|
+| top | `device_id`, `last_refreshed_at`, `refresh_source`, `entries` | — |
+| entry | `dest_protocol`, `dest_ref`, `source_protocol`, `source_ref` | `route_map`, `metric`, `metric_type` |
+
+`source_ref` is blank for `connected`/`static`; populated for `ospf`/`isis`/`bgp`.
