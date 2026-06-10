@@ -1188,3 +1188,58 @@ plugin in `route_policy_reconciler.reconcile_route_policy`. Full YANG-level deta
 
 `match_*` are `list[str]` (object names); `match`/`set` are **JSON strings** the plugin
 `json.loads`es. `action` is normalised to permit/deny by the plugin.
+
+---
+
+## IS-IS (M18 / M33)
+
+### `GET /api/v1/devices/{id}/isis-interfaces` → `200 | 404`
+
+The deepest read-mirror: IS-IS `processes` and per-`interfaces` config. Processes carry a
+large optional scalar set plus four nested JSON-bag containers; interfaces carry their own
+scalars + `settings`/`levels`. Optional scalars and the containers are **omitted when
+unset**. The nested dicts are hyphen→snake normalised (`_snake`) and the plugin reads fixed
+key sets out of them. Consumed by the plugin in `template_content._reconcile_isis_process`
+/ `_reconcile_isis_interfaces`.
+
+```json
+{
+  "device_id": 1, "last_refreshed_at": "2026-06-01T10:00:00Z", "refresh_source": "poll",
+  "processes": [
+    {"process_tag": "1", "net": "49.0001...00", "is_type": "level-2", "sr_enabled": true,
+     "levels": [{"level": "2", "default_metric": 10, "wide_metrics_only": true, "preference": 7,
+                 "labeled_preference": 7, "disabled": false, "auth_type": "md5"}],
+     "segment_routing": {"enabled": true, "prefix_sid_range": "global", "srgb_start": 100000,
+                         "srgb_range": 200000, "node_sid_index": 100, "node_sid_label": 100100,
+                         "node_sid_v6_index": 200, "node_sid_v6_label": 100200,
+                         "maximum_sid_depth": 10, "tunnel_table_pref": 8},
+     "flex_algos": [{"algo_id": 128, "metric_type": "igp", "priority": 100,
+                     "admin_group_exclude": ["RED"], "admin_group_include_any": ["BLUE"],
+                     "admin_group_include_all": []}]}
+  ],
+  "interfaces": [
+    {"interface_name": "GE0/0", "af": "ipv4", "process_tag": "1", "passive": false,
+     "metric": 10, "network_type": "point-to-point",
+     "levels": [{"level": "2", "metric": 10, "hello_interval": 3, "hello_multiplier": 3,
+                 "priority": 64, "passive": false}]}
+  ]
+}
+```
+
+**Key contract (pinned by `tests/api/test_contract_isis.py` ↔ plugin
+`tests/test_contract_isis.py`).** Optional keys omitted when unset:
+
+| Level | Always present | Optional (omitted when unset) |
+|---|---|---|
+| top | `device_id`, `last_refreshed_at`, `refresh_source`, `processes`, `interfaces` | — |
+| process | `process_tag` | `net`, `is_type`, `metric_style`, `overload_bit`, `area_auth_type/present/key`, `domain_auth_type/present/key`, `spf_initial_wait`, `spf_max_wait`, `lsp_initial_wait`, `lsp_max_wait`, `lsp_lifetime`, `lsp_refresh_interval`, `lsp_mtu`, `overload_on_startup`, `overload_timeout`, `te_enabled`, `sr_enabled`, `sr_node_msd`, `distance`, `maximum_paths`, `reference_bandwidth`, `settings`, `levels`, `segment_routing`, `flex_algos` |
+| interface | `interface_name`, `af`, `process_tag`, `passive` | `circuit_type`, `network_type`, `metric`, `bound_port`, `hello_auth_type`, `hello_auth_present`, `bfd_enabled`, `csnp_interval`, `retransmit_interval`, `lsp_interval`, `mesh_group`, `settings`, `levels` |
+
+Nested-bag key sets (snake_case): **instance level** = `level`, `default_metric`,
+`wide_metrics_only`, `preference`, `labeled_preference`, `disabled`, `auth_type`;
+**interface level** = `level`, `metric`, `hello_interval`, `hello_multiplier`, `priority`,
+`passive`; **segment_routing** = `enabled`, `prefix_sid_range`, `srgb_start`, `srgb_range`,
+`node_sid_index`, `node_sid_label`, `node_sid_v6_index`, `node_sid_v6_label`,
+`maximum_sid_depth`, `tunnel_table_pref`; **flex_algos** = `algo_id`, `metric_type`,
+`priority`, `admin_group_exclude`, `admin_group_include_any`, `admin_group_include_all`.
+`process_tag` / `af` are strings; `settings` is an opaque EAV `{key: value}` bag.
