@@ -1133,3 +1133,58 @@ not `null`:
 | entry | `dest_protocol`, `dest_ref`, `source_protocol`, `source_ref` | `route_map`, `metric`, `metric_type` |
 
 `source_ref` is blank for `connected`/`static`; populated for `ospf`/`isis`/`bgp`.
+
+---
+
+## Route Policy (M17)
+
+### `GET /api/v1/devices/{id}/route-policy` → `200 | 404`
+
+Return the route-policy read-mirror: the four policy-object families (prefix-list /
+community-list / as-path / route-map) each with their ordered entries. Consumed by the
+plugin in `route_policy_reconciler.reconcile_route_policy`. Full YANG-level detail in
+`m17-route-policy-contract.md`. **No top-level `refresh_source`** on this endpoint.
+
+```json
+{
+  "device_id": 1,
+  "last_refreshed_at": "2026-06-01T10:00:00Z",
+  "prefix_lists": [
+    {"name": "PL-1", "family": 4, "entries": [
+      {"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8", "ge": 16, "le": 24},
+      {"sequence": 20, "action": "deny", "prefix": "0.0.0.0/0"}
+    ]}
+  ],
+  "community_lists": [
+    {"name": "CL-1", "entries": [{"sequence": 10, "action": "permit", "community": "65000:100"}]}
+  ],
+  "as_paths": [
+    {"name": "AP-1", "entries": [{"sequence": 10, "action": "permit", "pattern": "^65000_"}]}
+  ],
+  "route_maps": [
+    {"name": "RM-1", "entries": [
+      {"sequence": 10, "action": "permit",
+       "match_prefix_lists": ["PL-1"], "match_community_lists": ["CL-1"], "match_as_paths": ["AP-1"],
+       "match": "{\"prefix\": \"PL-1\"}", "set": "{\"local_preference\": 200}"}
+    ]}
+  ]
+}
+```
+
+**Key contract (pinned by `tests/api/test_contract_route_policy.py` ↔ plugin
+`tests/test_contract_route_policy.py`).** Only the prefix-list entry has optional keys
+(`ge`/`le`, omitted when unset); every other level emits a fixed key set:
+
+| Level | Keys |
+|---|---|
+| top | `device_id`, `last_refreshed_at`, `prefix_lists`, `community_lists`, `as_paths`, `route_maps` |
+| prefix_list | `name`, `family` (int 4/6), `entries` |
+| prefix_list entry | `sequence`, `action`, `prefix` (+ optional `ge`, `le`) |
+| community_list / as_path | `name`, `entries` |
+| community_list entry | `sequence`, `action`, `community` |
+| as_path entry | `sequence`, `action`, `pattern` |
+| route_map | `name`, `entries` |
+| route_map entry | `sequence`, `action`, `match_prefix_lists`, `match_community_lists`, `match_as_paths`, `match`, `set` |
+
+`match_*` are `list[str]` (object names); `match`/`set` are **JSON strings** the plugin
+`json.loads`es. `action` is normalised to permit/deny by the plugin.
