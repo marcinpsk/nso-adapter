@@ -309,6 +309,8 @@ async def seed_bgp_config(
                     local_as=peer_def.get("local_as"),
                     ttl=peer_def.get("ttl"),
                     password=peer_def.get("password"),
+                    source=peer_def.get("source"),
+                    bfd_enabled=peer_def.get("bfd_enabled"),
                 )
                 db.add(peer)
                 await db.flush()

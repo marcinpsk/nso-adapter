@@ -779,14 +779,30 @@ Return the BGP config read-mirror for this device (populated from NSO via the
           "peers": [
             {
               "peer_address": "192.0.2.1",
-              "enabled": true,
+              "enabled": false,
               "peer_group": "UPSTREAM",
               "remote_as": "65001",
-              "local_as": null,
-              "ttl": null,
-              "password": null,
+              "local_as": "65100",
+              "ttl": 2,
+              "password": "s3cret",
+              "source": "Loopback0",
+              "bfd_enabled": true,
               "address_families": [
-                {"af": "ipv4-unicast", "enabled": true}
+                {"af": "ipv4-unicast", "enabled": true,
+                 "routemap_in": "RM-IN", "routemap_out": "RM-OUT",
+                 "prefixlist_in": "PL-IN", "prefixlist_out": "PL-OUT"}
+              ]
+            }
+          ],
+          "peer_groups": [
+            {
+              "name": "UPSTREAM",
+              "remote_as": "65001",
+              "source": "Loopback0",
+              "address_families": [
+                {"af": "ipv4-unicast",
+                 "routemap_in": "RM-IN", "routemap_out": "RM-OUT",
+                 "prefixlist_in": "PL-IN", "prefixlist_out": "PL-OUT"}
               ]
             }
           ]
@@ -799,7 +815,22 @@ Return the BGP config read-mirror for this device (populated from NSO via the
 
 When no BGP data exists: `{ "device_id": 1, "last_refreshed_at": null, "refresh_source": "never", "routers": [] }`.
 
-`password` is included when set (plaintext by design — BGP session passwords authenticate adjacencies, not config access).
+**Key contract (pinned by `tests/api/test_contract_bgp.py` ↔ plugin
+`tests/test_contract_bgp.py`).** Optional keys are **omitted when unset**, not emitted
+as `null`:
+
+| Level | Always present | Optional (omitted when unset) |
+|---|---|---|
+| top | `device_id`, `last_refreshed_at`, `refresh_source`, `routers` | — |
+| router | `asn`, `scopes` | — |
+| scope | `vrf`, `address_families` (list[str]), `peers`, `peer_groups` | — |
+| peer | `peer_address`, `enabled`, `address_families` | `peer_group`, `remote_as`, `local_as`, `ttl`, `password`, `source`, `bfd_enabled` |
+| peer AF | `af`, `enabled` | `routemap_in`, `routemap_out`, `prefixlist_in`, `prefixlist_out` |
+| peer_group | `name`, `address_families` | `remote_as`, `source` |
+| peer_group AF | `af` | `routemap_in`, `routemap_out`, `prefixlist_in`, `prefixlist_out` |
+
+`remote_as`/`local_as` are **strings** (ASN). `password` is included when set
+(plaintext by design — BGP session passwords authenticate adjacencies, not config access).
 
 ---
 
