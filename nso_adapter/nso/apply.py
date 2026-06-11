@@ -128,6 +128,58 @@ async def _verify_native_or_raise(
     logger.info("nso.apply.verify_ok", scope=scope, device=device_name)
 
 
+async def _send_service_config(
+    client: NsoClient,
+    service_path: str,
+    root_key: str,
+    device_name: str,
+    body: dict,
+    *,
+    scope: str,
+    replace: bool = False,
+) -> None:
+    """Send a reconciler service instance body to NSO — the shared apply/removal tail.
+
+    ``replace=False`` (apply/add/update): merge-PATCH the service list path, then run
+    the native dry-run verify guard. ``replace=True`` (removal): PUT-replace the keyed
+    instance (``<service_path>=<device>``) so omitted list entries are dropped and
+    FASTMAP reverts them — merge-PATCH never drops, and a node-level DELETE 404s on
+    empty-string list keys. On replace, *body* must be the FULL desired state.
+    """
+    payload = json.dumps({root_key: [body]})
+    if replace:
+        url = f"{client._base}{service_path}={device_name}"
+        method = "put"
+    else:
+        url = f"{client._base}{service_path}"
+        method = "patch"
+    async with client._client(timeout=client._action_timeout) as c:
+        resp = await getattr(c, method)(
+            url, content=payload, headers={"Content-Type": "application/yang-data+json"}
+        )
+        if resp.status_code not in (200, 201, 204):
+            try:
+                err = resp.json()
+            except Exception:
+                err = {"raw": resp.text}
+            logger.error(
+                "nso.apply.service_send_failed",
+                scope=scope,
+                device=device_name,
+                method=method,
+                status=resp.status_code,
+                body=err,
+            )
+            raise NsoApplyError(
+                "nso_put_failed" if replace else "nso_patch_failed",
+                f"NSO {method.upper()} for {scope} failed with status {resp.status_code}",
+                detail={"nso_error": err},
+            )
+    logger.info("nso.apply.service_sent", scope=scope, device=device_name, method=method, replace=replace)
+    if not replace:
+        await _verify_native_or_raise(client, url, payload, device_name, scope=scope)
+
+
 async def apply_interface_attribute(
     client: NsoClient,
     device_name: str,
@@ -350,14 +402,15 @@ async def apply_snmp_config(
     v3_user_intents: list,
     host_intents: list,
     system_info_intent,
+    *,
+    replace: bool = False,
 ) -> None:
     """Write the full SNMP intent snapshot for a device to the snmp-reconciler service.
 
-    Builds a single PATCH body covering all communities (by label + vault_ref),
-    v3 users, hosts, and system info.  The snmp-reconciler NSO service resolves
-    Vault refs at commit time — vault_refs are passed verbatim.
-
-    Raises NsoApplyError on failure.
+    Builds a single body covering all communities (by label + vault_ref), v3 users,
+    hosts, and system info.  The snmp-reconciler NSO service resolves Vault refs at
+    commit time — vault_refs are passed verbatim.  ``replace=True`` PUT-replaces the
+    keyed instance so removed elements are reverted.  Raises NsoApplyError on failure.
     """
     entry: dict = {"device": device_name}
 
@@ -399,54 +452,30 @@ async def apply_snmp_config(
         if system_info_intent.contact is not None:
             entry["contact"] = system_info_intent.contact
 
-    url = f"{client._base}{_SNMP_SERVICE_PATH}"
-    payload = json.dumps({"snmp-reconciler:snmp-config": [entry]})
-
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.patch(
-            url,
-            content=payload,
-            headers={"Content-Type": "application/yang-data+json"},
-        )
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.snmp_patch_failed",
-                device=device_name,
-                status=resp.status_code,
-                body=err,
-            )
-            raise NsoApplyError(
-                "nso_patch_failed",
-                f"NSO SNMP PATCH failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-
-    logger.info(
-        "nso.apply.snmp_ok",
-        device=device_name,
-        community_count=len(community_intents),
-        v3_user_count=len(v3_user_intents),
-        host_count=len(host_intents),
+    await _send_service_config(
+        client,
+        _SNMP_SERVICE_PATH,
+        "snmp-reconciler:snmp-config",
+        device_name,
+        entry,
+        scope="snmp",
+        replace=replace,
     )
-
-    await _verify_native_or_raise(client, url, payload, device_name, scope="snmp")
 
 
 async def apply_static_routes(
     client: NsoClient,
     device_name: str,
     route_intent_rows: list,
+    *,
+    replace: bool = False,
 ) -> None:
     """Write static route intent for a single device to NSO.
 
-    Builds a full static-route-reconciler PATCH body from the supplied rows
-    and commits with reconcile option so pre-existing routes are adopted.
-
-    Raises NsoApplyError on failure.
+    Builds a full static-route-reconciler body from the supplied rows and commits in
+    reconcile mode so pre-existing routes are adopted. ``replace=True`` PUT-replaces
+    the keyed instance (full desired state) so removed routes are reverted on the
+    device. Raises NsoApplyError on failure.
     """
     routes = []
     for row in route_intent_rows:
@@ -463,53 +492,29 @@ async def apply_static_routes(
             entry["tag"] = row.tag
         routes.append(entry)
 
-    payload = json.dumps({"static-route-reconciler:static-route-config": [{"device": device_name, "route": routes}]})
-
-    url = f"{client._base}{_STATIC_ROUTE_SERVICE_PATH}"
-
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.patch(
-            url,
-            content=payload,
-            headers={"Content-Type": "application/yang-data+json"},
-        )
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.static_route_patch_failed",
-                device=device_name,
-                status=resp.status_code,
-                body=err,
-            )
-            raise NsoApplyError(
-                "nso_patch_failed",
-                f"NSO PATCH for static-route intent failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-
-    logger.info(
-        "nso.apply.static_route_ok",
-        device=device_name,
-        route_count=len(routes),
+    await _send_service_config(
+        client,
+        _STATIC_ROUTE_SERVICE_PATH,
+        "static-route-reconciler:static-route-config",
+        device_name,
+        {"device": device_name, "route": routes},
+        scope="static_route",
+        replace=replace,
     )
-
-    await _verify_native_or_raise(client, url, payload, device_name, scope="static_route")
 
 
 async def apply_logging_config(
     client: NsoClient,
     device_name: str,
     host_intent_rows: list,
+    *,
+    replace: bool = False,
 ) -> None:
     """Write the full remote-syslog intent snapshot for a device to NSO.
 
-    Builds a logging-reconciler PATCH body from the supplied rows; the service
-    adopts pre-existing brownfield logging config (reconcile). No secrets.
-
-    Raises NsoApplyError on failure.
+    Builds a logging-reconciler body from the supplied rows; the service adopts
+    pre-existing brownfield logging config (reconcile). ``replace=True`` PUT-replaces
+    the keyed instance so removed hosts are reverted. No secrets.
     """
     hosts = []
     for row in host_intent_rows:
@@ -528,48 +533,29 @@ async def apply_logging_config(
             entry["source"] = row.source
         hosts.append(entry)
 
-    payload = json.dumps({"logging-reconciler:logging-config": [{"device": device_name, "host": hosts}]})
-    url = f"{client._base}{_LOGGING_SERVICE_PATH}"
-
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.patch(
-            url,
-            content=payload,
-            headers={"Content-Type": "application/yang-data+json"},
-        )
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.logging_patch_failed",
-                device=device_name,
-                status=resp.status_code,
-                body=err,
-            )
-            raise NsoApplyError(
-                "nso_patch_failed",
-                f"NSO PATCH for logging intent failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-
-    logger.info("nso.apply.logging_ok", device=device_name, host_count=len(hosts))
-
-    await _verify_native_or_raise(client, url, payload, device_name, scope="logging")
+    await _send_service_config(
+        client,
+        _LOGGING_SERVICE_PATH,
+        "logging-reconciler:logging-config",
+        device_name,
+        {"device": device_name, "host": hosts},
+        scope="logging",
+        replace=replace,
+    )
 
 
 async def apply_svi_config(
     client: NsoClient,
     device_name: str,
     svi_intent_rows: list,
+    *,
+    replace: bool = False,
 ) -> None:
     """Write the SVI/IRB intent snapshot for a device to NSO (M35).
 
     Materialises interface VlanN / interfaces irb unit N via the svi-reconciler;
     IPs ride the interface-reconciler. Reconcile mode (brownfield adoption).
-
-    Raises NsoApplyError on failure.
+    ``replace=True`` PUT-replaces the keyed instance so removed SVIs are reverted.
     """
     interfaces = []
     for row in svi_intent_rows:
@@ -578,44 +564,30 @@ async def apply_svi_config(
             entry["vrf"] = row.vrf
         interfaces.append(entry)
 
-    payload = json.dumps({"svi-reconciler:svi-config": [{"device": device_name, "interface": interfaces}]})
-    url = f"{client._base}{_SVI_SERVICE_PATH}"
-
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.patch(
-            url,
-            content=payload,
-            headers={"Content-Type": "application/yang-data+json"},
-        )
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.svi_patch_failed", device=device_name, status=resp.status_code, body=err
-            )
-            raise NsoApplyError(
-                "nso_patch_failed",
-                f"NSO PATCH for SVI intent failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-
-    logger.info("nso.apply.svi_ok", device=device_name, count=len(interfaces))
-
-    await _verify_native_or_raise(client, url, payload, device_name, scope="svi")
+    await _send_service_config(
+        client,
+        _SVI_SERVICE_PATH,
+        "svi-reconciler:svi-config",
+        device_name,
+        {"device": device_name, "interface": interfaces},
+        scope="svi",
+        replace=replace,
+    )
 
 
 async def apply_subinterface_config(
     client: NsoClient,
     device_name: str,
     subif_intent_rows: list,
+    *,
+    replace: bool = False,
 ) -> None:
     """Write the dot1q subinterface intent snapshot for a device to NSO (M36).
 
     Materialises <parent>.<unit> (encapsulation dot1Q + vrf forwarding) / Junos
     unit vlan-id via the subinterface-reconciler; IPs ride the interface-reconciler.
-    Reconcile mode (brownfield adoption). Raises NsoApplyError on failure.
+    Reconcile mode (brownfield adoption). ``replace=True`` PUT-replaces the keyed
+    instance so removed subinterfaces are reverted.
     """
     interfaces = []
     for row in subif_intent_rows:
@@ -629,46 +601,30 @@ async def apply_subinterface_config(
             entry["vrf"] = row.vrf
         interfaces.append(entry)
 
-    payload = json.dumps(
-        {"subinterface-reconciler:subif-config": [{"device": device_name, "interface": interfaces}]}
+    await _send_service_config(
+        client,
+        _SUBIF_SERVICE_PATH,
+        "subinterface-reconciler:subif-config",
+        device_name,
+        {"device": device_name, "interface": interfaces},
+        scope="subinterface",
+        replace=replace,
     )
-    url = f"{client._base}{_SUBIF_SERVICE_PATH}"
-
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.patch(
-            url,
-            content=payload,
-            headers={"Content-Type": "application/yang-data+json"},
-        )
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.subif_patch_failed", device=device_name, status=resp.status_code, body=err
-            )
-            raise NsoApplyError(
-                "nso_patch_failed",
-                f"NSO PATCH for subinterface intent failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-
-    logger.info("nso.apply.subif_ok", device=device_name, count=len(interfaces))
-
-    await _verify_native_or_raise(client, url, payload, device_name, scope="subinterface")
 
 
 async def apply_vlan_config(
     client: NsoClient,
     device_name: str,
     vlan_intent_rows: list,
+    *,
+    replace: bool = False,
 ) -> None:
     """Write the VLAN-database intent snapshot for a device to NSO (M34 write path).
 
     Materialises 'vlan <id> / name <name>' (IOS) / 'vlans <name> vlan-id <id>'
     (Junos) via the vlan-reconciler. Reconcile mode (brownfield adoption).
-    Raises NsoApplyError on failure.
+    ``replace=True`` PUT-replaces the keyed instance (full desired list) so removed
+    VLANs are reverted on the device. Raises NsoApplyError on failure.
     """
     vlans = []
     for row in vlan_intent_rows:
@@ -677,44 +633,30 @@ async def apply_vlan_config(
             entry["name"] = row.name
         vlans.append(entry)
 
-    payload = json.dumps({"vlan-reconciler:vlan-config": [{"device": device_name, "vlan": vlans}]})
-    url = f"{client._base}{_VLAN_SERVICE_PATH}"
-
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.patch(
-            url,
-            content=payload,
-            headers={"Content-Type": "application/yang-data+json"},
-        )
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.vlan_patch_failed", device=device_name, status=resp.status_code, body=err
-            )
-            raise NsoApplyError(
-                "nso_patch_failed",
-                f"NSO PATCH for VLAN intent failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-
-    logger.info("nso.apply.vlan_ok", device=device_name, count=len(vlans))
-
-    await _verify_native_or_raise(client, url, payload, device_name, scope="vlan")
+    await _send_service_config(
+        client,
+        _VLAN_SERVICE_PATH,
+        "vlan-reconciler:vlan-config",
+        device_name,
+        {"device": device_name, "vlan": vlans},
+        scope="vlan",
+        replace=replace,
+    )
 
 
 async def apply_bfd_config(
     client: NsoClient,
     device_name: str,
     bfd_intent_rows: list,
+    *,
+    replace: bool = False,
 ) -> None:
     """Write the per-interface BFD intent snapshot for a device to NSO.
 
     Materialises BFD timers via the bfd-reconciler (IOS interface bfd interval;
     IOS-XR bfd address-family; Junos ae bfd-liveness-detection; Nokia router
-    interface ipv4 bfd). Reconcile mode. Raises NsoApplyError on failure.
+    interface ipv4 bfd). Reconcile mode. ``replace=True`` PUT-replaces the keyed
+    instance so removed BFD interfaces are reverted.
     """
     interfaces = []
     for row in bfd_intent_rows:
@@ -727,46 +669,30 @@ async def apply_bfd_config(
             entry["multiplier"] = row.multiplier
         interfaces.append(entry)
 
-    payload = json.dumps({"bfd-reconciler:bfd-config": [{"device": device_name, "interface": interfaces}]})
-    url = f"{client._base}{_BFD_SERVICE_PATH}"
-
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.patch(
-            url,
-            content=payload,
-            headers={"Content-Type": "application/yang-data+json"},
-        )
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.bfd_patch_failed", device=device_name, status=resp.status_code, body=err
-            )
-            raise NsoApplyError(
-                "nso_patch_failed",
-                f"NSO PATCH for BFD intent failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-
-    logger.info("nso.apply.bfd_ok", device=device_name, count=len(interfaces))
-
-    await _verify_native_or_raise(client, url, payload, device_name, scope="bfd")
+    await _send_service_config(
+        client,
+        _BFD_SERVICE_PATH,
+        "bfd-reconciler:bfd-config",
+        device_name,
+        {"device": device_name, "interface": interfaces},
+        scope="bfd",
+        replace=replace,
+    )
 
 
 async def apply_l2_saps(
     client: NsoClient,
     device_name: str,
     sap_intent_rows: list,
+    *,
+    replace: bool = False,
 ) -> None:
     """Write Nokia L2 SAP intent for a single device to NSO (M37 P2b).
 
-    Builds a full l2-sap-reconciler PATCH body from the supplied rows and
-    commits with reconcile option so pre-existing SAPs are adopted. The NSO
-    service adds each SAP under an EXISTING epipe/vpls service (SAP-only).
-
-    Raises NsoApplyError on failure.
+    Builds a full l2-sap-reconciler body from the supplied rows and commits in
+    reconcile mode so pre-existing SAPs are adopted. The NSO service adds each SAP
+    under an EXISTING epipe/vpls service (SAP-only). ``replace=True`` PUT-replaces
+    the keyed instance so removed SAPs are reverted.
     """
     saps = []
     for row in sap_intent_rows:
@@ -783,148 +709,71 @@ async def apply_l2_saps(
             entry["inner-tag"] = row.inner_tag
         saps.append(entry)
 
-    payload = json.dumps({"l2-sap-reconciler:l2-sap-config": [{"device": device_name, "sap": saps}]})
-
-    url = f"{client._base}{_L2_SAP_SERVICE_PATH}"
-
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.patch(
-            url,
-            content=payload,
-            headers={"Content-Type": "application/yang-data+json"},
-        )
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.l2_sap_patch_failed",
-                device=device_name,
-                status=resp.status_code,
-                body=err,
-            )
-            raise NsoApplyError(
-                "nso_patch_failed",
-                f"NSO PATCH for L2 SAP intent failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-
-    logger.info(
-        "nso.apply.l2_sap_ok",
-        device=device_name,
-        sap_count=len(saps),
+    await _send_service_config(
+        client,
+        _L2_SAP_SERVICE_PATH,
+        "l2-sap-reconciler:l2-sap-config",
+        device_name,
+        {"device": device_name, "sap": saps},
+        scope="l2_sap",
+        replace=replace,
     )
-
-    await _verify_native_or_raise(client, url, payload, device_name, scope="l2_sap")
 
 
 async def apply_lag_config(
     client: NsoClient,
     device_name: str,
     bundles: list[dict],
+    *,
+    replace: bool = False,
 ) -> None:
     """Write LACP/LAG bundle intent for a single device to NSO (M33).
 
-    Builds a full lag-reconciler PATCH body from the supplied bundle dicts and
-    commits with reconcile option so pre-existing LAGs are adopted. The bundle
-    list is full-replace: FASTMAP removes bundles absent from the payload.
+    Builds a full lag-reconciler body from the supplied bundle dicts and commits in
+    reconcile mode so pre-existing LAGs are adopted. ``replace=True`` PUT-replaces the
+    keyed instance so removed bundles are reverted (the plugin force-pushes the full
+    owned snapshot, so the input is already the full desired state).
 
     Each bundle dict uses YANG-style keys: ``name`` (key), ``lag-id``,
     optional ``min-links``/``system-priority``/``system-id``/``timer``/
     ``admin-key``, and ``member`` (list of ``interface-name`` + optional
     ``mode``/``port-priority``).
-
-    Raises NsoApplyError on failure.
     """
-    payload = json.dumps(
-        {"lag-reconciler:lag-config": [{"device": device_name, "bundle": bundles}]}
+    await _send_service_config(
+        client,
+        _LAG_SERVICE_PATH,
+        "lag-reconciler:lag-config",
+        device_name,
+        {"device": device_name, "bundle": bundles},
+        scope="lag",
+        replace=replace,
     )
-
-    url = f"{client._base}{_LAG_SERVICE_PATH}"
-
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.patch(
-            url,
-            content=payload,
-            headers={"Content-Type": "application/yang-data+json"},
-        )
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.lag_patch_failed",
-                device=device_name,
-                status=resp.status_code,
-                body=err,
-            )
-            raise NsoApplyError(
-                "nso_patch_failed",
-                f"NSO PATCH for LAG intent failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-
-    logger.info(
-        "nso.apply.lag_ok",
-        device=device_name,
-        bundle_count=len(bundles),
-    )
-
-    await _verify_native_or_raise(client, url, payload, device_name, scope="lag")
 
 
 async def apply_switchport_config(
     client: NsoClient,
     device_name: str,
     interfaces: list[dict],
+    *,
+    replace: bool = False,
 ) -> None:
     """Write L2 switchport intent for a single device to NSO (M34).
 
-    Builds a full switchport-reconciler PATCH body and commits in reconcile mode.
-    Each interface dict uses YANG-style keys: ``interface-name`` (key), optional
-    ``mode`` (access|trunk|trunk-all), ``untagged-vlan``, and ``tagged-vlan``
-    (list of ids). The interface list is full-replace (FASTMAP removes absent).
-
-    Raises NsoApplyError on failure.
+    Builds a full switchport-reconciler body and commits in reconcile mode. Each
+    interface dict uses YANG-style keys: ``interface-name`` (key), optional ``mode``
+    (access|trunk|trunk-all), ``untagged-vlan``, and ``tagged-vlan`` (list of ids).
+    ``replace=True`` PUT-replaces the keyed instance so removed switchports are
+    reverted (the plugin force-pushes the full owned snapshot).
     """
-    payload = json.dumps(
-        {"switchport-reconciler:switchport-config": [{"device": device_name, "interface": interfaces}]}
+    await _send_service_config(
+        client,
+        _SWITCHPORT_SERVICE_PATH,
+        "switchport-reconciler:switchport-config",
+        device_name,
+        {"device": device_name, "interface": interfaces},
+        scope="switchport",
+        replace=replace,
     )
-
-    url = f"{client._base}{_SWITCHPORT_SERVICE_PATH}"
-
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.patch(
-            url,
-            content=payload,
-            headers={"Content-Type": "application/yang-data+json"},
-        )
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.switchport_patch_failed",
-                device=device_name,
-                status=resp.status_code,
-                body=err,
-            )
-            raise NsoApplyError(
-                "nso_patch_failed",
-                f"NSO PATCH for switchport intent failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-
-    logger.info(
-        "nso.apply.switchport_ok",
-        device=device_name,
-        interface_count=len(interfaces),
-    )
-
-    await _verify_native_or_raise(client, url, payload, device_name, scope="switchport")
 
 
 def build_isis_process_payload(
@@ -1159,28 +1008,6 @@ async def replace_isis_service(
         body["process-config"] = processes
     await replace_service_instance(
         client, _ISIS_SERVICE_PATH, "isis-reconciler:isis-config", device_name, body
-    )
-
-
-async def replace_vlan_config(
-    client: NsoClient,
-    device_name: str,
-    vlan_intent_rows: list,
-) -> None:
-    """PUT-replace the vlan-reconciler service instance (full desired VLAN list).
-
-    Propagates VLAN removals: a vid dropped from *vlan_intent_rows* is removed from
-    the device. An empty list clears all managed VLANs for the device.
-    """
-    vlans = []
-    for row in vlan_intent_rows:
-        entry: dict = {"vlan-id": row.vlan_id}
-        if row.name:
-            entry["name"] = row.name
-        vlans.append(entry)
-    body = {"device": device_name, "vlan": vlans}
-    await replace_service_instance(
-        client, _VLAN_SERVICE_PATH, "vlan-reconciler:vlan-config", device_name, body
     )
 
 

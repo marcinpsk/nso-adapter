@@ -154,9 +154,9 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
     )
     existing_comms: dict[str, SnmpCommunityIntent] = {r.label: r for r in existing_comms_result.scalars().all()}
     new_comm_labels = {e.label for e in body.communities}
-    for label, row in existing_comms.items():
-        if label not in new_comm_labels:
-            await db.delete(row)
+    removed_any = [label for label in existing_comms if label not in new_comm_labels]
+    for label in list(removed_any):
+        await db.delete(existing_comms[label])
     await db.flush()
 
     comm_count = 0
@@ -184,9 +184,9 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
     existing_users_result = await db.execute(select(SnmpV3UserIntent).where(SnmpV3UserIntent.device_id == device_id))
     existing_users: dict[str, SnmpV3UserIntent] = {r.username: r for r in existing_users_result.scalars().all()}
     new_usernames = {e.username for e in body.v3_users}
-    for username, row in existing_users.items():
-        if username not in new_usernames:
-            await db.delete(row)
+    removed_any += [u for u in existing_users if u not in new_usernames]
+    for username in [u for u in existing_users if u not in new_usernames]:
+        await db.delete(existing_users[username])
     await db.flush()
 
     user_count = 0
@@ -212,9 +212,9 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
     existing_hosts_result = await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))
     existing_hosts: dict[str, SnmpHostIntent] = {r.address: r for r in existing_hosts_result.scalars().all()}
     new_addresses = {e.address for e in body.hosts}
-    for address, row in existing_hosts.items():
-        if address not in new_addresses:
-            await db.delete(row)
+    removed_any += [a for a in existing_hosts if a not in new_addresses]
+    for address in [a for a in existing_hosts if a not in new_addresses]:
+        await db.delete(existing_hosts[address])
     await db.flush()
 
     host_count = 0
@@ -247,6 +247,7 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
     if body.system_info is None:
         if existing_sysinfo:
             await db.delete(existing_sysinfo)
+            removed_any.append("system-info")
     else:
         accepted = body.system_info.accepted_at.replace(tzinfo=None) if body.system_info.accepted_at else now
         if existing_sysinfo:
@@ -274,6 +275,33 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
         await enqueue_apply(db, device_id, force=True)
 
     await db.commit()
+
+    # Removal propagation: PUT-replace the snmp-reconciler instance with the full
+    # remaining intent so a removed community/user/host/system-info is reverted.
+    if removed_any:
+        from nso_adapter.core.importer import get_nso_client
+        from nso_adapter.nso.apply import apply_snmp_config
+
+        comms = (
+            await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id))
+        ).scalars().all()
+        users = (
+            await db.execute(select(SnmpV3UserIntent).where(SnmpV3UserIntent.device_id == device_id))
+        ).scalars().all()
+        hosts = (
+            await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))
+        ).scalars().all()
+        sysinfo = (
+            await db.execute(select(SnmpSystemInfoIntent).where(SnmpSystemInfoIntent.device_id == device_id))
+        ).scalar_one_or_none()
+        try:
+            nso_client = get_nso_client(device.nso_instance)
+            await apply_snmp_config(
+                nso_client, device.nso_device_name, comms, users, hosts, sysinfo, replace=True
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("snmp_intent.replace_failed", device_id=device_id, error=repr(exc))
+
     logger.info(
         "snmp_intent.put.ok",
         device_id=device_id,

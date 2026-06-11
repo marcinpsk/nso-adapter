@@ -87,9 +87,9 @@ async def put_logging_intent(device_id: int, body: LoggingIntentUpdate, db: Asyn
     existing_rows: dict[str, LoggingHostIntent] = {r.address: r for r in existing_result.scalars().all()}
     new_keys = {item.address for item in body.hosts}
 
-    for addr, row in existing_rows.items():
-        if addr not in new_keys:
-            await db.delete(row)
+    removed = [addr for addr in existing_rows if addr not in new_keys]
+    for addr in removed:
+        await db.delete(existing_rows[addr])
     await db.flush()
 
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -119,4 +119,12 @@ async def put_logging_intent(device_id: int, body: LoggingIntentUpdate, db: Asyn
         await enqueue_apply(db, device_id, force=True)
 
     await db.commit()
-    return {"device_id": device_id, "count": count}
+
+    replaced = False
+    if removed:
+        from nso_adapter.core.removal import replace_on_removal
+        from nso_adapter.nso.apply import apply_logging_config
+
+        replaced = await replace_on_removal(db, device, removed, LoggingHostIntent, apply_logging_config)
+
+    return {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}

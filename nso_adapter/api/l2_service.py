@@ -79,7 +79,8 @@ async def put_l2_sap_intent(device_id: int, body: L2SapIntentUpdate, db: AsyncSe
     ``accepted_at`` defaults to now if not supplied. If ``auto_apply`` is enabled
     on the device, an apply job is enqueued after the upsert.
     """
-    if await db.get(Device, device_id) is None:
+    device = await db.get(Device, device_id)
+    if device is None:
         raise api_error(404, "not_found", "Device not found")
 
     existing_result = await db.execute(select(L2SapIntent).where(L2SapIntent.device_id == device_id))
@@ -89,9 +90,9 @@ async def put_l2_sap_intent(device_id: int, body: L2SapIntentUpdate, db: AsyncSe
 
     new_keys: set[tuple] = {(item.service_name, item.sap_id) for item in body.saps}
 
-    for key, row in existing_rows.items():
-        if key not in new_keys:
-            await db.delete(row)
+    removed = [key for key in existing_rows if key not in new_keys]
+    for key in removed:
+        await db.delete(existing_rows[key])
     await db.flush()
 
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -130,4 +131,12 @@ async def put_l2_sap_intent(device_id: int, body: L2SapIntentUpdate, db: AsyncSe
         await enqueue_apply(db, device_id, force=True)
 
     await db.commit()
-    return {"device_id": device_id, "count": count}
+
+    replaced = False
+    if removed:
+        from nso_adapter.core.removal import replace_on_removal
+        from nso_adapter.nso.apply import apply_l2_saps
+
+        replaced = await replace_on_removal(db, device, removed, L2SapIntent, apply_l2_saps)
+
+    return {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}

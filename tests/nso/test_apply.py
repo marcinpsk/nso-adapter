@@ -675,11 +675,12 @@ async def test_replace_service_instance_puts_keyed_instance():
 
 
 @pytest.mark.asyncio
-async def test_replace_vlan_config_drops_removed_vid():
-    """replace_vlan_config PUT-replaces with the full remaining vlan list (removed vid absent)."""
+async def test_apply_vlan_config_replace_puts_remaining_list():
+    """apply_vlan_config(replace=True) PUT-replaces the keyed instance with the full
+    remaining vlan list (a dropped vid is simply absent from the body)."""
     import json
 
-    from nso_adapter.nso.apply import replace_vlan_config
+    from nso_adapter.nso.apply import apply_vlan_config
 
     client = _make_nso_client()
     mock_http = AsyncMock()
@@ -690,7 +691,32 @@ async def test_replace_vlan_config_drops_removed_vid():
     client._client.return_value = ctx
 
     rows = [SimpleNamespace(vlan_id=10, name="keep")]  # 3366 dropped → absent from body
-    await replace_vlan_config(client=client, device_name="sw3", vlan_intent_rows=rows)
+    await apply_vlan_config(client=client, device_name="sw3", vlan_intent_rows=rows, replace=True)
+    (url,) = mock_http.put.call_args[0]
+    assert url.endswith("vlan-reconciler:vlan-config=sw3")
     body = json.loads(mock_http.put.call_args[1]["content"])
     vids = [v["vlan-id"] for v in body["vlan-reconciler:vlan-config"][0]["vlan"]]
     assert vids == [10]
+    mock_http.patch.assert_not_called()  # replace must not also PATCH/verify
+
+
+@pytest.mark.asyncio
+async def test_apply_static_routes_replace_puts_keyed_instance():
+    """apply_static_routes(replace=True) PUT-replaces instead of merge-PATCH."""
+    import json
+
+    client = _make_nso_client()
+    mock_http = AsyncMock()
+    mock_http.put.return_value = _mock_httpx_response(204)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=mock_http)
+    ctx.__aexit__ = AsyncMock(return_value=None)
+    client._client.return_value = ctx
+
+    rows = [SimpleNamespace(vrf="", prefix="10.0.0.0/8", next_hop="1.1.1.1", metric=1, permanent=False, tag=None)]
+    await apply_static_routes(client=client, device_name="sw3", route_intent_rows=rows, replace=True)
+    (url,) = mock_http.put.call_args[0]
+    assert url.endswith("static-route-reconciler:static-route-config=sw3")
+    body = json.loads(mock_http.put.call_args[1]["content"])
+    assert body["static-route-reconciler:static-route-config"][0]["route"][0]["prefix"] == "10.0.0.0/8"
+    mock_http.patch.assert_not_called()

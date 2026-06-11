@@ -67,16 +67,17 @@ async def put_svi_intent(device_id: int, body: SviIntentUpdate, db: AsyncSession
     Full-replace: rows not in the body are deleted. ``accepted_at`` defaults to now.
     If ``auto_apply`` is enabled on the device, an apply job is enqueued.
     """
-    if await db.get(Device, device_id) is None:
+    device = await db.get(Device, device_id)
+    if device is None:
         raise api_error(404, "not_found", "Device not found")
 
     existing = await db.execute(select(SviIntent).where(SviIntent.device_id == device_id))
     existing_rows: dict[str, SviIntent] = {r.interface_name: r for r in existing.scalars().all()}
     new_keys = {i.interface_name for i in body.interfaces}
 
-    for name, row in existing_rows.items():
-        if name not in new_keys:
-            await db.delete(row)
+    removed = [name for name in existing_rows if name not in new_keys]
+    for name in removed:
+        await db.delete(existing_rows[name])
     await db.flush()
 
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -103,4 +104,12 @@ async def put_svi_intent(device_id: int, body: SviIntentUpdate, db: AsyncSession
         await enqueue_apply(db, device_id, force=True)
 
     await db.commit()
-    return {"device_id": device_id, "count": count}
+
+    replaced = False
+    if removed:
+        from nso_adapter.core.removal import replace_on_removal
+        from nso_adapter.nso.apply import apply_svi_config
+
+        replaced = await replace_on_removal(db, device, removed, SviIntent, apply_svi_config)
+
+    return {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}

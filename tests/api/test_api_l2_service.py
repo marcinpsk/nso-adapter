@@ -79,7 +79,10 @@ async def test_put_l2_sap_intent_upserts(adapter_client):
         f"/api/v1/devices/{device_id}/l2-sap-intent", json=body, headers=AUTH
     )
     assert resp.status_code == 200
-    assert resp.json() == {"device_id": device_id, "count": 2}
+    payload = resp.json()
+    assert payload["device_id"] == device_id
+    assert payload["count"] == 2
+    assert payload["removed"] == 0  # nothing dropped on a fresh upsert
     rows = await _get_intents(device_id)
     assert set(rows) == {("TL", "lag-60:3999"), ("701", "1/1/c31/3:701")}
     assert rows[("TL", "lag-60:3999")].accepted_at is not None

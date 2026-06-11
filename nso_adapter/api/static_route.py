@@ -113,9 +113,9 @@ async def put_static_route_intent(device_id: int, body: StaticRouteIntentUpdate,
     new_keys: set[tuple] = {(item.vrf, item.prefix, item.next_hop) for item in body.routes}
 
     # Delete rows absent from the new payload.
-    for key, row in existing_rows.items():
-        if key not in new_keys:
-            await db.delete(row)
+    removed = [key for key in existing_rows if key not in new_keys]
+    for key in removed:
+        await db.delete(existing_rows[key])
     await db.flush()
 
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -155,4 +155,12 @@ async def put_static_route_intent(device_id: int, body: StaticRouteIntentUpdate,
         await enqueue_apply(db, device_id, force=True)
 
     await db.commit()
-    return {"device_id": device_id, "count": count}
+
+    replaced = False
+    if removed:
+        from nso_adapter.core.removal import replace_on_removal
+        from nso_adapter.nso.apply import apply_static_routes
+
+        replaced = await replace_on_removal(db, device, removed, StaticRouteIntent, apply_static_routes)
+
+    return {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}

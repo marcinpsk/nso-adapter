@@ -152,28 +152,12 @@ async def put_vlan_intent(device_id: int, body: VlanIntentUpdate, db: AsyncSessi
     await db.commit()
 
     # Removal propagation: a dropped vid won't be removed by the next merge-PATCH
-    # apply, so PUT-replace the vlan-reconciler instance with the full desired list
-    # (remaining rows) → FASTMAP reverts the removed VLAN on the device.
+    # apply, so PUT-replace the vlan-reconciler instance with the remaining list.
     replaced = False
     if removed_vids:
-        from nso_adapter.nso.apply import replace_vlan_config
+        from nso_adapter.core.removal import replace_on_removal
+        from nso_adapter.nso.apply import apply_vlan_config
 
-        remaining = (
-            await db.execute(
-                select(VlanIntent).where(
-                    VlanIntent.device_id == device_id, VlanIntent.accepted_at.is_not(None)
-                )
-            )
-        ).scalars().all()
-        try:
-            nso_client = get_nso_client(device.nso_instance)
-            await replace_vlan_config(nso_client, device.nso_device_name, remaining)
-            replaced = True
-        except Exception as exc:  # noqa: BLE001
-            import structlog
-
-            structlog.get_logger(__name__).error(
-                "vlan_intent.replace_failed", device_id=device_id, error=repr(exc)
-            )
+        replaced = await replace_on_removal(db, device, removed_vids, VlanIntent, apply_vlan_config)
 
     return {"device_id": device_id, "count": count, "removed": len(removed_vids), "replaced": replaced}
