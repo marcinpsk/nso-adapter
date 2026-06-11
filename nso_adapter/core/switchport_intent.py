@@ -44,7 +44,9 @@ async def apply_switchport_config(device: "Device", payload, nso_client: "NsoCli
     interfaces = _build_interface_payload(payload.interfaces)
 
     try:
-        await _nso_apply_switchport_config(nso_client, device.nso_device_name, interfaces)
+        # Full-replace: the plugin always pushes the full owned switchport snapshot, so
+        # PUT-replace drops interfaces removed in NetBox (merge-PATCH would not).
+        await _nso_apply_switchport_config(nso_client, device.nso_device_name, interfaces, replace=True)
     except NsoApplyError as exc:
         logger.warning(
             "switchport_intent.apply.failed",

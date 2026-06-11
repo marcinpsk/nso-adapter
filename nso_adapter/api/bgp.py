@@ -300,6 +300,24 @@ async def put_bgp_intent(device_id: int, body: BgpIntentUpdate, db: AsyncSession
     if not device:
         raise api_error(404, "not_found", "Device not found")
 
+    # Capture existing router ASNs + peer identities before the wipe so we can detect
+    # removal (router- or peer-level) and re-assert the full desired state afterwards.
+    existing_asns = set(
+        (
+            await db.execute(select(BgpRouterIntent.asn).where(BgpRouterIntent.device_id == device_id))
+        ).scalars().all()
+    )
+    existing_peers = set(
+        (
+            await db.execute(
+                select(BgpPeerIntent.peer_address)
+                .join(BgpScopeIntent, BgpPeerIntent.scope_id == BgpScopeIntent.id)
+                .join(BgpRouterIntent, BgpScopeIntent.router_id == BgpRouterIntent.id)
+                .where(BgpRouterIntent.device_id == device_id)
+            )
+        ).scalars().all()
+    )
+
     # Full-replace: delete all existing BGP router intent rows for this device.
     await db.execute(delete(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))
     await db.flush()
@@ -370,6 +388,7 @@ async def put_bgp_intent(device_id: int, body: BgpIntentUpdate, db: AsyncSession
                 for re in af_data.redistribution:
                     incoming_redist_keys.add((dest_ref, re.source_protocol, re.source_ref))
 
+    removed_redist = [k for k in existing_redist_map if k not in incoming_redist_keys]
     for key in list(existing_redist_map):
         if key not in incoming_redist_keys:
             await db.delete(existing_redist_map[key])
@@ -404,4 +423,38 @@ async def put_bgp_intent(device_id: int, body: BgpIntentUpdate, db: AsyncSession
             await enqueue_apply(db, device_id, force=True)
 
     await db.commit()
+
+    # Removal propagation: if a router/peer/redistribution was dropped, PUT-replace the
+    # bgp-reconciler instance with the full remaining desired state so it's reverted on
+    # the device (merge-PATCH on the next apply would not drop it).
+    incoming_asns = {r.asn for r in body.routers}
+    incoming_peers = {p.peer_address for r in body.routers for s in r.scopes for p in s.peers}
+    removed = bool((existing_asns - incoming_asns) or (existing_peers - incoming_peers) or removed_redist)
+    if removed:
+        from nso_adapter.core.bgp_load import attach_bgp_relationships
+        from nso_adapter.core.importer import get_nso_client
+        from nso_adapter.nso.apply import apply_bgp_config
+
+        routers = (
+            await db.execute(
+                select(BgpRouterIntent).where(
+                    BgpRouterIntent.device_id == device_id, BgpRouterIntent.accepted_at.is_not(None)
+                )
+            )
+        ).scalars().all()
+        await attach_bgp_relationships(db, routers)
+        redist_rows = (
+            await db.execute(
+                select(RedistributionIntent).where(
+                    RedistributionIntent.device_id == device_id,
+                    RedistributionIntent.dest_protocol == "bgp",
+                )
+            )
+        ).scalars().all()
+        try:
+            nso_client = get_nso_client(device.nso_instance)
+            await apply_bgp_config(nso_client, device.nso_device_name, routers, redist_rows, replace=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("bgp_intent.replace_failed", device_id=device_id, error=repr(exc))
+
     return {"device_id": device_id, "router_count": router_count}

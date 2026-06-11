@@ -19,14 +19,9 @@ from datetime import UTC, datetime
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import set_committed_value
 
 from nso_adapter.store.models import (
-    BgpAfIntent,
-    BgpPeerAfIntent,
-    BgpPeerIntent,
     BgpRouterIntent,
-    BgpScopeIntent,
     DbInterface,
     Device,
     InterfaceAttrState,
@@ -371,62 +366,9 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
 
             # Eagerly load BGP relationships for apply (avoids lazy-raise)
             if bgp_eligible:
-                bgp_router_ids = [r.id for r in bgp_eligible]
-                scope_result = await db.execute(
-                    select(BgpScopeIntent).where(BgpScopeIntent.router_id.in_(bgp_router_ids))
-                )
-                scopes_by_router: dict[int, list[BgpScopeIntent]] = {}
-                all_scopes = scope_result.scalars().all()
-                for s in all_scopes:
-                    scopes_by_router.setdefault(s.router_id, []).append(s)
+                from nso_adapter.core.bgp_load import attach_bgp_relationships
 
-                scope_ids = [s.id for s in all_scopes]
-                af_result = (
-                    await db.execute(select(BgpAfIntent).where(BgpAfIntent.scope_id.in_(scope_ids)))
-                    if scope_ids
-                    else None
-                )
-                afs_by_scope: dict[int, list[BgpAfIntent]] = {}
-                if af_result:
-                    for af in af_result.scalars().all():
-                        afs_by_scope.setdefault(af.scope_id, []).append(af)
-
-                peer_result = (
-                    await db.execute(select(BgpPeerIntent).where(BgpPeerIntent.scope_id.in_(scope_ids)))
-                    if scope_ids
-                    else None
-                )
-                peers_by_scope: dict[int, list[BgpPeerIntent]] = {}
-                all_peers: list[BgpPeerIntent] = []
-                if peer_result:
-                    all_peers = peer_result.scalars().all()
-                    for p in all_peers:
-                        peers_by_scope.setdefault(p.scope_id, []).append(p)
-
-                peer_ids = [p.id for p in all_peers]
-                paf_result = (
-                    await db.execute(select(BgpPeerAfIntent).where(BgpPeerAfIntent.peer_id.in_(peer_ids)))
-                    if peer_ids
-                    else None
-                )
-                pafs_by_peer: dict[int, list[BgpPeerAfIntent]] = {}
-                if paf_result:
-                    for paf in paf_result.scalars().all():
-                        pafs_by_peer.setdefault(paf.peer_id, []).append(paf)
-
-                # Populate the manually-loaded relationships as *committed* state.
-                # Writing raw lists into __dict__ bypasses SQLAlchemy instrumentation, so a
-                # later flush of these (now-dirty) rows computes history on the relationship,
-                # finds a plain list, and crashes ("'list' object has no attribute
-                # '_sa_adapter'"), aborting the whole apply. set_committed_value instruments
-                # the collection and marks it as loaded-from-DB → empty history on flush.
-                for s in all_scopes:
-                    set_committed_value(s, "address_families", afs_by_scope.get(s.id, []))
-                    set_committed_value(s, "peers", peers_by_scope.get(s.id, []))
-                for p in all_peers:
-                    set_committed_value(p, "peer_address_families", pafs_by_peer.get(p.id, []))
-                for r in bgp_eligible:
-                    set_committed_value(r, "scopes", scopes_by_router.get(r.id, []))
+                await attach_bgp_relationships(db, bgp_eligible)
 
             # Collect route-policy object intent rows
             rp_eligible: list[RoutePolicyObjectIntent] = []

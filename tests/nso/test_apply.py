@@ -692,12 +692,14 @@ async def test_apply_vlan_config_replace_puts_remaining_list():
 
     rows = [SimpleNamespace(vlan_id=10, name="keep")]  # 3366 dropped → absent from body
     await apply_vlan_config(client=client, device_name="sw3", vlan_intent_rows=rows, replace=True)
-    (url,) = mock_http.put.call_args[0]
+    # First PUT is the real replace; the second is the native dry-run verify.
+    (url,) = mock_http.put.call_args_list[0][0]
     assert url.endswith("vlan-reconciler:vlan-config=sw3")
-    body = json.loads(mock_http.put.call_args[1]["content"])
+    body = json.loads(mock_http.put.call_args_list[0][1]["content"])
     vids = [v["vlan-id"] for v in body["vlan-reconciler:vlan-config"][0]["vlan"]]
     assert vids == [10]
-    mock_http.patch.assert_not_called()  # replace must not also PATCH/verify
+    assert "dry-run=native" in mock_http.put.call_args_list[1][0][0]  # verify uses PUT too
+    mock_http.patch.assert_not_called()  # replace must not merge-PATCH
 
 
 @pytest.mark.asyncio
@@ -715,8 +717,8 @@ async def test_apply_static_routes_replace_puts_keyed_instance():
 
     rows = [SimpleNamespace(vrf="", prefix="10.0.0.0/8", next_hop="1.1.1.1", metric=1, permanent=False, tag=None)]
     await apply_static_routes(client=client, device_name="sw3", route_intent_rows=rows, replace=True)
-    (url,) = mock_http.put.call_args[0]
+    (url,) = mock_http.put.call_args_list[0][0]
     assert url.endswith("static-route-reconciler:static-route-config=sw3")
-    body = json.loads(mock_http.put.call_args[1]["content"])
+    body = json.loads(mock_http.put.call_args_list[0][1]["content"])
     assert body["static-route-reconciler:static-route-config"][0]["route"][0]["prefix"] == "10.0.0.0/8"
     mock_http.patch.assert_not_called()

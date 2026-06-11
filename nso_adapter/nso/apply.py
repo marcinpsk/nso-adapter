@@ -80,12 +80,14 @@ def _device_delta_from_dry_run(body: object, device_name: str) -> str | None:
 
 
 async def _verify_native_or_raise(
-    client: NsoClient, url: str, payload: str, device_name: str, *, scope: str
+    client: NsoClient, url: str, payload: str, device_name: str, *, scope: str, method: str = "patch"
 ) -> None:
     """Re-issue *payload* as a native dry-run; raise if NSO would still change the device.
 
-    Catches false successes: a 2xx PATCH whose intent NSO silently did not fully
-    apply leaves a non-empty native device delta on the immediate re-dry-run.
+    Catches false successes: a 2xx apply whose intent NSO silently did not fully
+    apply leaves a non-empty native device delta on the immediate re-dry-run. The
+    dry-run uses the same *method* as the apply (PUT for a replace, so a still-present
+    removed entry is also caught).
 
     Fail-safe: transport errors, non-2xx, unparseable bodies or unexpected shapes
     are logged and treated as inconclusive (no raise) so verification never blocks
@@ -98,7 +100,7 @@ async def _verify_native_or_raise(
     dry_url = f"{url}?dry-run=native"
     try:
         async with client._client(timeout=client._action_timeout) as c:
-            resp = await c.patch(
+            resp = await getattr(c, method)(
                 dry_url,
                 content=payload,
                 headers={"Content-Type": "application/yang-data+json"},
@@ -176,8 +178,7 @@ async def _send_service_config(
                 detail={"nso_error": err},
             )
     logger.info("nso.apply.service_sent", scope=scope, device=device_name, method=method, replace=replace)
-    if not replace:
-        await _verify_native_or_raise(client, url, payload, device_name, scope=scope)
+    await _verify_native_or_raise(client, url, payload, device_name, scope=scope, method=method)
 
 
 async def apply_interface_attribute(
@@ -1016,12 +1017,16 @@ async def apply_bgp_config(
     device_name: str,
     router_intent_rows: list,
     redistribution_rows: list | None = None,
+    *,
+    replace: bool = False,
 ) -> None:
-    """Write BGP intent for a single device to NSO via bgp-reconciler PATCH.
+    """Write BGP intent for a single device to NSO via the bgp-reconciler.
 
     Builds the full router/scope/AF/peer/peer-AF tree from the supplied
     BgpRouterIntent rows (with relationships eagerly loaded by the caller)
-    and commits with reconcile option so pre-existing BGP config is adopted.
+    and commits in reconcile mode so pre-existing BGP config is adopted.
+    ``replace=True`` PUT-replaces the keyed instance so removed routers/peers are
+    reverted.
 
     *redistribution_rows* rows must have: dest_ref (f"{asn}:{vrf}:{af}"),
     source_protocol, source_ref, route_map (optional), metric (optional).
@@ -1090,55 +1095,30 @@ async def apply_bgp_config(
             )
         routers.append({"asn": int(r.asn), "scope": scopes_out})
 
-    payload = json.dumps({"bgp-reconciler:bgp-config": [{"device": device_name, "router": routers}]})
-    url = f"{client._base}{_BGP_SERVICE_PATH}"
-
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.patch(
-            url,
-            content=payload,
-            headers={"Content-Type": "application/yang-data+json"},
-        )
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.bgp_patch_failed",
-                device=device_name,
-                status=resp.status_code,
-                body=err,
-            )
-            raise NsoApplyError(
-                "nso_patch_failed",
-                f"NSO PATCH for BGP intent failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-
-    peer_count = sum(len(scope["peer"]) for r in routers for scope in r["scope"])
-    logger.info(
-        "nso.apply.bgp_ok",
-        device=device_name,
-        router_count=len(routers),
-        peer_count=peer_count,
+    await _send_service_config(
+        client,
+        _BGP_SERVICE_PATH,
+        "bgp-reconciler:bgp-config",
+        device_name,
+        {"device": device_name, "router": routers},
+        scope="bgp",
+        replace=replace,
     )
-
-    await _verify_native_or_raise(client, url, payload, device_name, scope="bgp")
 
 
 async def apply_route_policy_config(
     client: NsoClient,
     device_name: str,
     intent_rows: list,
+    *,
+    replace: bool = False,
 ) -> None:
-    """Write route-policy intent for a single device to NSO via route-policy-reconciler PATCH.
+    """Write route-policy intent for a single device to NSO via the route-policy-reconciler.
 
     Groups RoutePolicyObjectIntent rows by family and builds the canonical NSO service
-    payload per docs/m17-route-policy-contract.md §2.  Commits with PATCH (reconcile
-    semantics on the service list).
-
-    Raises NsoApplyError on failure.
+    payload per docs/m17-route-policy-contract.md §2 (reconcile semantics).
+    ``replace=True`` PUT-replaces the keyed instance so removed policy objects are
+    reverted. Raises NsoApplyError on failure.
     """
     from collections import defaultdict
 
@@ -1146,59 +1126,28 @@ async def apply_route_policy_config(
     for row in intent_rows:
         by_family[row.family].append({"name": row.name, "entries": row.entries})
 
-    payload = json.dumps(
-        {
-            "route-policy-reconciler:route-policy-config": [
-                {
-                    "device": device_name,
-                    "prefix-list": [
-                        {"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("prefix_list", [])
-                    ],
-                    "community-list": [
-                        {"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("community_list", [])
-                    ],
-                    "as-path": [{"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("as_path", [])],
-                    "route-map": [
-                        {"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("route_map", [])
-                    ],
-                }
-            ]
-        }
+    body = {
+        "device": device_name,
+        "prefix-list": [
+            {"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("prefix_list", [])
+        ],
+        "community-list": [
+            {"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("community_list", [])
+        ],
+        "as-path": [{"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("as_path", [])],
+        "route-map": [
+            {"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("route_map", [])
+        ],
+    }
+    await _send_service_config(
+        client,
+        _ROUTE_POLICY_SERVICE_PATH,
+        "route-policy-reconciler:route-policy-config",
+        device_name,
+        body,
+        scope="route_policy",
+        replace=replace,
     )
-    url = f"{client._base}{_ROUTE_POLICY_SERVICE_PATH}"
-
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.patch(
-            url,
-            content=payload,
-            headers={"Content-Type": "application/yang-data+json"},
-        )
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.route_policy_patch_failed",
-                device=device_name,
-                status=resp.status_code,
-                body=err,
-            )
-            raise NsoApplyError(
-                "nso_patch_failed",
-                f"NSO PATCH for route-policy intent failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-
-    obj_count = sum(len(v) for v in by_family.values())
-    logger.info(
-        "nso.apply.route_policy_ok",
-        device=device_name,
-        object_count=obj_count,
-        families=list(by_family.keys()),
-    )
-
-    await _verify_native_or_raise(client, url, payload, device_name, scope="route_policy")
 
 
 # RESTCONF path to the ospf-reconciler service list
@@ -1211,11 +1160,14 @@ async def apply_ospf_config(
     process_intent_rows: list,
     interface_intent_rows: list,
     redistribution_rows: list | None = None,
+    *,
+    replace: bool = False,
 ) -> None:
     """Write OSPF process and interface intent for a single device to NSO.
 
-    Builds a full ospf-reconciler PATCH body from the supplied rows and
-    commits with reconcile option so pre-existing OSPF config is adopted.
+    Builds a full ospf-reconciler body from the supplied rows and commits in
+    reconcile mode so pre-existing OSPF config is adopted. ``replace=True``
+    PUT-replaces the keyed instance so removed processes/interfaces are reverted.
 
     *process_intent_rows* rows must have: process_id, router_id (optional), vrf (optional).
     *interface_intent_rows* rows must have: interface_name, process_id, area_id,
@@ -1280,37 +1232,12 @@ async def apply_ospf_config(
     if processes:
         service_body["process-config"] = processes
 
-    payload = json.dumps({"ospf-reconciler:ospf-config": [service_body]})
-    url = f"{client._base}{_OSPF_SERVICE_PATH}"
-
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.patch(
-            url,
-            content=payload,
-            headers={"Content-Type": "application/yang-data+json"},
-        )
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.ospf_patch_failed",
-                device=device_name,
-                status=resp.status_code,
-                body=err,
-            )
-            raise NsoApplyError(
-                "nso_patch_failed",
-                f"NSO PATCH for OSPF intent failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-
-    logger.info(
-        "nso.apply.ospf_ok",
-        device=device_name,
-        process_count=len(processes),
-        interface_count=len(interfaces),
+    await _send_service_config(
+        client,
+        _OSPF_SERVICE_PATH,
+        "ospf-reconciler:ospf-config",
+        device_name,
+        service_body,
+        scope="ospf",
+        replace=replace,
     )
-
-    await _verify_native_or_raise(client, url, payload, device_name, scope="ospf")

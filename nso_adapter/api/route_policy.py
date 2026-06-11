@@ -256,6 +256,18 @@ async def put_route_policy_intent(
     now = datetime.now(UTC).replace(tzinfo=None)
     upserted = 0
 
+    # Full-replace: drop objects for this device that are absent from the payload
+    # (the plugin always pushes the full owned set).
+    incoming_keys = {(o.get("family"), o.get("name")) for o in objects}
+    existing_all = (
+        await db.execute(select(RoutePolicyObjectIntent).where(RoutePolicyObjectIntent.device_id == device_id))
+    ).scalars().all()
+    removed = [(r.family, r.name) for r in existing_all if (r.family, r.name) not in incoming_keys]
+    for r in existing_all:
+        if (r.family, r.name) not in incoming_keys:
+            await db.delete(r)
+    await db.flush()
+
     for obj in objects:
         family = obj.get("family")
         name = obj.get("name")
@@ -299,7 +311,14 @@ async def put_route_policy_intent(
         "route_policy_intent.put",
         device_id=device_id,
         upserted=upserted,
+        removed=len(removed),
     )
+
+    if removed:
+        from nso_adapter.core.removal import replace_on_removal
+        from nso_adapter.nso.apply import apply_route_policy_config
+
+        await replace_on_removal(db, device, removed, RoutePolicyObjectIntent, apply_route_policy_config)
 
     # Return updated intent state for all objects on this device.
     result = await db.execute(

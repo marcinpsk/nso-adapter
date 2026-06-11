@@ -63,7 +63,9 @@ async def apply_lag_config(device: Device, payload, nso_client: NsoClient) -> di
     bundles = _build_bundle_payload(payload.bundles)
 
     try:
-        await _nso_apply_lag_config(nso_client, device.nso_device_name, bundles)
+        # Full-replace: the plugin always pushes the full owned bundle snapshot, so
+        # PUT-replace drops bundles removed in NetBox (merge-PATCH would not).
+        await _nso_apply_lag_config(nso_client, device.nso_device_name, bundles, replace=True)
     except NsoApplyError as exc:
         logger.warning(
             "lag_intent.apply.failed",

@@ -146,6 +146,7 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
     existing_inst_map = {row.process_id: row for row in existing_inst.scalars().all()}
     incoming_inst_pids = {e.process_id for e in payload.instances}
 
+    removed_any = [("inst", pid) for pid in existing_inst_map if pid not in incoming_inst_pids]
     for pid in list(existing_inst_map):
         if pid not in incoming_inst_pids:
             await db.delete(existing_inst_map[pid])
@@ -164,6 +165,7 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
     existing_iface_map = {row.interface_name: row for row in existing_iface.scalars().all()}
     incoming_iface_names = {e.interface_name for e in payload.interfaces}
 
+    removed_any += [("iface", n) for n in existing_iface_map if n not in incoming_iface_names]
     for name in list(existing_iface_map):
         if name not in incoming_iface_names:
             await db.delete(existing_iface_map[name])
@@ -196,6 +198,7 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
         for re in inst_entry.redistribution:
             incoming_redist_keys.add((dest_ref, re.source_protocol, re.source_ref))
 
+    removed_any += [("redist", k) for k in existing_redist_map if k not in incoming_redist_keys]
     for key in list(existing_redist_map):
         if key not in incoming_redist_keys:
             await db.delete(existing_redist_map[key])
@@ -220,6 +223,32 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
             row.metric_type = re.metric_type
 
     await db.commit()
+
+    # Removal propagation: PUT-replace the ospf-reconciler instance with the full
+    # remaining desired state so removed processes/interfaces/redist are reverted.
+    if removed_any:
+        from nso_adapter.core.importer import get_nso_client
+        from nso_adapter.nso.apply import apply_ospf_config
+
+        insts = (
+            await db.execute(select(OspfInstanceIntent).where(OspfInstanceIntent.device_id == device_id))
+        ).scalars().all()
+        ifaces = (
+            await db.execute(select(OspfInterfaceIntent).where(OspfInterfaceIntent.device_id == device_id))
+        ).scalars().all()
+        redist = (
+            await db.execute(
+                select(RedistributionIntent).where(
+                    RedistributionIntent.device_id == device_id,
+                    RedistributionIntent.dest_protocol == "ospf",
+                )
+            )
+        ).scalars().all()
+        try:
+            nso_client = get_nso_client(device.nso_instance)
+            await apply_ospf_config(nso_client, device.nso_device_name, insts, ifaces, redist, replace=True)
+        except Exception as exc:  # noqa: BLE001
+            structlog.get_logger(__name__).error("ospf_intent.replace_failed", device_id=device_id, error=repr(exc))
 
     return {
         "device_id": device_id,
