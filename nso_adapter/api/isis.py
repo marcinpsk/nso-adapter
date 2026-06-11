@@ -18,6 +18,7 @@ from nso_adapter.store.models import (
     Device,
     DeviceIsisInterface,
     DeviceIsisProcess,
+    IsisFlexAlgoIntent,
     IsisInterfaceIntent,
     IsisProcessIntent,
     RedistributionIntent,
@@ -343,3 +344,144 @@ async def put_isis_interface_intent(
 
     await db.commit()
     return {"device_id": device_id, "interface_count": iface_count, "process_count": proc_count}
+
+
+class IsisFlexAlgoEntry(BaseModel):
+    process_tag: str = ""
+    algo_id: int
+    metric_type: str | None = None
+    priority: int | None = None
+    admin_group_exclude: str | None = None
+    admin_group_include_any: str | None = None
+    admin_group_include_all: str | None = None
+    accepted_at: datetime | None = None
+
+
+class IsisFlexAlgoIntentUpdate(BaseModel):
+    flex_algos: list[IsisFlexAlgoEntry]
+
+
+@router.put("/{device_id}/isis-flex-algo-intent", dependencies=[Depends(verify_token)])
+async def put_isis_flex_algo_intent(
+    device_id: int, body: IsisFlexAlgoIntentUpdate, db: AsyncSession = Depends(get_db)
+):
+    """Replace the adapter's IS-IS Flex-Algorithm intent mirror for this device atomically.
+
+    Full-replace semantics: rows not present in the request body are deleted.
+    ``accepted_at`` defaults to now if not supplied.  If ``auto_apply`` is enabled
+    on the device, an apply job is enqueued after the upsert.
+    """
+    device = await db.get(Device, device_id)
+    if not device:
+        raise api_error(404, "not_found", "Device not found")
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+
+    existing_result = await db.execute(
+        select(IsisFlexAlgoIntent).where(IsisFlexAlgoIntent.device_id == device_id)
+    )
+    existing_rows: dict[tuple, IsisFlexAlgoIntent] = {
+        (r.process_tag, r.algo_id): r for r in existing_result.scalars().all()
+    }
+    new_keys: set[tuple] = {(item.process_tag, item.algo_id) for item in body.flex_algos}
+
+    removed_keys: list[tuple] = []
+    for key, row in existing_rows.items():
+        if key not in new_keys:
+            removed_keys.append(key)
+            await db.delete(row)
+    await db.flush()
+
+    count = 0
+    for item in body.flex_algos:
+        key = (item.process_tag, item.algo_id)
+        accepted = item.accepted_at.replace(tzinfo=None) if item.accepted_at else now
+        row = existing_rows.get(key)
+        if row is None:
+            row = IsisFlexAlgoIntent(
+                device_id=device_id,
+                process_tag=item.process_tag,
+                algo_id=item.algo_id,
+                accepted_at=accepted,
+            )
+            db.add(row)
+        row.metric_type = item.metric_type
+        row.priority = item.priority
+        row.admin_group_exclude = item.admin_group_exclude
+        row.admin_group_include_any = item.admin_group_include_any
+        row.admin_group_include_all = item.admin_group_include_all
+        row.accepted_at = accepted
+        count += 1
+
+    await db.flush()
+
+    from nso_adapter.store.models import DeviceSettings
+
+    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    settings = settings_result.scalar_one_or_none()
+    if settings and settings.auto_apply and count > 0:
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True)
+
+    await db.commit()
+
+    # Removal must be pushed to NSO explicitly: a merge-PATCH on the next apply
+    # would not drop the omitted entry, and a node-level DELETE can't address an
+    # empty-string process-tag key.  PUT-replace the whole process-config list
+    # (built from the full desired state) so FASTMAP reverts removed flex-algos.
+    replaced = False
+    if removed_keys:
+        from nso_adapter.core.importer import get_nso_client
+        from nso_adapter.nso.apply import (
+            build_isis_interface_payload,
+            build_isis_process_payload,
+            replace_isis_service,
+        )
+
+        proc_rows = (
+            await db.execute(
+                select(IsisProcessIntent).where(
+                    IsisProcessIntent.device_id == device_id,
+                    IsisProcessIntent.accepted_at.is_not(None),
+                )
+            )
+        ).scalars().all()
+        flex_rows = (
+            await db.execute(
+                select(IsisFlexAlgoIntent).where(
+                    IsisFlexAlgoIntent.device_id == device_id,
+                    IsisFlexAlgoIntent.accepted_at.is_not(None),
+                )
+            )
+        ).scalars().all()
+        redist_rows = (
+            await db.execute(
+                select(RedistributionIntent).where(
+                    RedistributionIntent.device_id == device_id,
+                    RedistributionIntent.dest_protocol == "isis",
+                )
+            )
+        ).scalars().all()
+        iface_rows = (
+            await db.execute(
+                select(IsisInterfaceIntent).where(
+                    IsisInterfaceIntent.device_id == device_id,
+                    IsisInterfaceIntent.accepted_at.is_not(None),
+                )
+            )
+        ).scalars().all()
+        processes = build_isis_process_payload(proc_rows, redist_rows, flex_rows)
+        interfaces = build_isis_interface_payload(iface_rows)
+        try:
+            nso_client = get_nso_client(device.nso_instance)
+            await replace_isis_service(nso_client, device.nso_device_name, interfaces, processes)
+            replaced = True
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "isis_flex_algo.service_replace_failed",
+                device_id=device_id,
+                error=repr(exc),
+            )
+
+    return {"device_id": device_id, "flex_algo_count": count, "service_replaced": replaced}

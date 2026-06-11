@@ -180,6 +180,9 @@ class Device(Base):
     isis_process_intents: Mapped[list[IsisProcessIntent]] = relationship(
         "IsisProcessIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
+    isis_flex_algo_intents: Mapped[list[IsisFlexAlgoIntent]] = relationship(
+        "IsisFlexAlgoIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
     bgp_routers: Mapped[list[DeviceBgpRouter]] = relationship(
         "DeviceBgpRouter", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
@@ -1169,6 +1172,37 @@ class IsisProcessIntent(Base):
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     device: Mapped[Device] = relationship("Device", back_populates="isis_process_intents")
+
+
+class IsisFlexAlgoIntent(Base):
+    """Write-path intent for an IS-IS Flex-Algorithm definition accepted by the operator.
+
+    Keyed by (device, process_tag, algo_id) independently of IsisProcessIntent so a
+    flex-algo can be accepted/applied even when no other process-level config exists
+    (e.g. IOS-XR, where process_tag is the 'router isis <tag>' instance name).
+    """
+
+    __tablename__ = "isis_flex_algo_intent"
+    __table_args__ = (
+        UniqueConstraint("device_id", "process_tag", "algo_id", name="uq_isisflexalgointent_identity"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    process_tag: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    algo_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    metric_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    priority: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    admin_group_exclude: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    admin_group_include_any: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    admin_group_include_all: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    device: Mapped[Device] = relationship("Device", back_populates="isis_flex_algo_intents")
 
 
 class DeviceBgpRouter(Base):

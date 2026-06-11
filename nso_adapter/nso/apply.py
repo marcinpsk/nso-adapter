@@ -927,12 +927,90 @@ async def apply_switchport_config(
     await _verify_native_or_raise(client, url, payload, device_name, scope="switchport")
 
 
+def build_isis_process_payload(
+    isis_process_rows: list | None,
+    redistribution_rows: list | None = None,
+    flex_algo_rows: list | None = None,
+) -> list[dict]:
+    """Build the isis-reconciler ``process-config`` payload (with nested redistribute
+    and flex-algo) from store rows.  Shared by the apply path and the flex-algo
+    removal path (PUT-replace), so both produce identical process-config bodies."""
+    redist_by_proc: dict[str, list[dict]] = {}
+    for row in redistribution_rows or []:
+        entry: dict = {
+            "source-protocol": row.source_protocol,
+            "source-ref": row.source_ref,
+        }
+        if row.route_map:
+            entry["route-map"] = row.route_map
+        if row.metric is not None:
+            entry["metric"] = row.metric
+        if row.metric_type:
+            entry["metric-type"] = row.metric_type
+        redist_by_proc.setdefault(row.dest_ref, []).append(entry)
+
+    processes: list[dict] = []
+    for row in isis_process_rows or []:
+        entry = {"process-tag": row.process_tag or ""}
+        if row.net is not None:
+            entry["net"] = row.net
+        # Enum leaves reject the empty string — omit when blank (not just None).
+        if row.is_type:
+            entry["is-type"] = row.is_type
+        if row.metric_style:
+            entry["metric-style"] = row.metric_style
+        if row.overload_bit is not None:
+            entry["overload-bit"] = bool(row.overload_bit)
+        if row.area_auth_type:
+            entry["area-auth-type"] = row.area_auth_type
+            if row.area_auth_key is not None:
+                entry["area-auth-key"] = row.area_auth_key
+        if row.domain_auth_type:
+            entry["domain-auth-type"] = row.domain_auth_type
+            if row.domain_auth_key is not None:
+                entry["domain-auth-key"] = row.domain_auth_key
+        proc_redist = redist_by_proc.get(row.process_tag or "", [])
+        if proc_redist:
+            entry["redistribute"] = proc_redist
+        processes.append(entry)
+
+    # Attach Flex-Algo definitions to their process-config entry, creating a
+    # minimal entry for any process-tag that has flex-algo but no process row.
+    flex_by_proc: dict[str, list[dict]] = {}
+    for row in flex_algo_rows or []:
+        fa_entry: dict = {"algo-id": int(row.algo_id)}
+        if row.metric_type:
+            fa_entry["metric-type"] = row.metric_type
+        if row.priority is not None:
+            fa_entry["priority"] = int(row.priority)
+        if row.admin_group_exclude:
+            fa_entry["admin-group-exclude"] = row.admin_group_exclude
+        if row.admin_group_include_any:
+            fa_entry["admin-group-include-any"] = row.admin_group_include_any
+        if row.admin_group_include_all:
+            fa_entry["admin-group-include-all"] = row.admin_group_include_all
+        flex_by_proc.setdefault(row.process_tag or "", []).append(fa_entry)
+
+    if flex_by_proc:
+        proc_by_tag = {p["process-tag"]: p for p in processes}
+        for tag, fa_list in flex_by_proc.items():
+            proc = proc_by_tag.get(tag)
+            if proc is None:
+                proc = {"process-tag": tag}
+                processes.append(proc)
+                proc_by_tag[tag] = proc
+            proc["flex-algo"] = fa_list
+
+    return processes
+
+
 async def apply_isis_interfaces(
     client: NsoClient,
     device_name: str,
     isis_intent_rows: list,
     isis_process_rows: list | None = None,
     redistribution_rows: list | None = None,
+    flex_algo_rows: list | None = None,
 ) -> None:
     """Write IS-IS interface-enablement and process intent for a single device to NSO.
 
@@ -948,62 +1026,13 @@ async def apply_isis_interfaces(
 
     Raises NsoApplyError on failure.
     """
-    # Index redistribution by dest_ref (= process_tag)
-    redist_by_proc: dict[str, list[dict]] = {}
-    for row in redistribution_rows or []:
-        entry: dict = {
-            "source-protocol": row.source_protocol,
-            "source-ref": row.source_ref,
-        }
-        if row.route_map:
-            entry["route-map"] = row.route_map
-        if row.metric is not None:
-            entry["metric"] = row.metric
-        if row.metric_type:
-            entry["metric-type"] = row.metric_type
-        redist_by_proc.setdefault(row.dest_ref, []).append(entry)
+    processes = build_isis_process_payload(isis_process_rows, redistribution_rows, flex_algo_rows)
 
-    processes = []
-    for row in isis_process_rows or []:
-        entry = {"process-tag": row.process_tag or ""}
-        if row.net is not None:
-            entry["net"] = row.net
-        if row.is_type is not None:
-            entry["is-type"] = row.is_type
-        if row.metric_style is not None:
-            entry["metric-style"] = row.metric_style
-        if row.overload_bit is not None:
-            entry["overload-bit"] = bool(row.overload_bit)
-        if row.area_auth_type is not None:
-            entry["area-auth-type"] = row.area_auth_type
-            if row.area_auth_key is not None:
-                entry["area-auth-key"] = row.area_auth_key
-        if row.domain_auth_type is not None:
-            entry["domain-auth-type"] = row.domain_auth_type
-            if row.domain_auth_key is not None:
-                entry["domain-auth-key"] = row.domain_auth_key
-        proc_redist = redist_by_proc.get(row.process_tag or "", [])
-        if proc_redist:
-            entry["redistribute"] = proc_redist
-        processes.append(entry)
+    interfaces = build_isis_interface_payload(isis_intent_rows)
 
-    interfaces = []
-    for row in isis_intent_rows:
-        entry = {
-            "interface-name": row.interface_name,
-            "af": row.af,
-            "process-tag": row.process_tag or "",
-            "passive": bool(row.passive) if row.passive is not None else False,
-        }
-        if row.circuit_type is not None:
-            entry["circuit-type"] = row.circuit_type
-        if row.network_type is not None:
-            entry["network-type"] = row.network_type
-        if row.metric is not None:
-            entry["metric"] = row.metric
-        interfaces.append(entry)
-
-    service_body: dict = {"device": device_name, "interface-config": interfaces}
+    service_body: dict = {"device": device_name}
+    if interfaces:
+        service_body["interface-config"] = interfaces
     if processes:
         service_body["process-config"] = processes
 
@@ -1044,6 +1073,80 @@ async def apply_isis_interfaces(
     await _verify_native_or_raise(client, url, payload, device_name, scope="isis")
 
 
+def build_isis_interface_payload(isis_intent_rows: list | None) -> list[dict]:
+    """Build the isis-reconciler ``interface-config`` payload from store rows."""
+    interfaces: list[dict] = []
+    for row in isis_intent_rows or []:
+        entry = {
+            "interface-name": row.interface_name,
+            "af": row.af,
+            "process-tag": row.process_tag or "",
+            "passive": bool(row.passive) if row.passive is not None else False,
+        }
+        if row.circuit_type:
+            # YANG enum is level-1 | level-2-only | level-1-2; "level-2" is a
+            # common alias that the reconciler rejects → normalise it.
+            entry["circuit-type"] = "level-2-only" if row.circuit_type == "level-2" else row.circuit_type
+        if row.network_type:
+            entry["network-type"] = row.network_type
+        if row.metric is not None:
+            entry["metric"] = row.metric
+        interfaces.append(entry)
+    return interfaces
+
+
+async def replace_isis_service(
+    client: NsoClient,
+    device_name: str,
+    interfaces: list[dict],
+    processes: list[dict],
+) -> None:
+    """RESTCONF PUT-replace the whole isis-reconciler service instance for a device.
+
+    Removal must be explicit: a merge-PATCH that omits an entry leaves it in the
+    FASTMAP service intent (and on the device), and a node-level DELETE can't address
+    an empty-string process-tag key (NSO 404s).  PUT on the keyed service instance
+    (``isis-config=<device>``) replaces its entire content with the supplied full
+    desired state, so omitted entries (e.g. a removed flex-algo) are dropped and
+    FASTMAP reverts the device config.
+
+    *interfaces* and *processes* must be the FULL desired state for the device.
+    """
+    body: dict = {"device": device_name}
+    if interfaces:
+        body["interface-config"] = interfaces
+    if processes:
+        body["process-config"] = processes
+    url = f"{client._base}/restconf/data/isis-reconciler:isis-config={device_name}"
+    payload = json.dumps({"isis-reconciler:isis-config": [body]})
+    async with client._client(timeout=client._action_timeout) as c:
+        resp = await c.put(
+            url, content=payload, headers={"Content-Type": "application/yang-data+json"}
+        )
+        if resp.status_code not in (200, 201, 204):
+            try:
+                err = resp.json()
+            except Exception:
+                err = {"raw": resp.text}
+            logger.error(
+                "nso.apply.isis_service_replace_failed",
+                device=device_name,
+                status=resp.status_code,
+                body=err,
+            )
+            raise NsoApplyError(
+                "nso_put_failed",
+                f"NSO PUT for IS-IS service failed with status {resp.status_code}",
+                detail={"nso_error": err},
+            )
+    logger.info(
+        "nso.apply.isis_service_replaced",
+        device=device_name,
+        interface_count=len(interfaces),
+        process_count=len(processes),
+    )
+
+
 async def apply_bgp_config(
     client: NsoClient,
     device_name: str,
@@ -1081,7 +1184,7 @@ async def apply_bgp_config(
             afs_out = []
             for af in scope.address_families:
                 af_dest_ref = f"{r.asn}:{scope.vrf}:{af.af}"
-                af_entry: dict = {"af": af.af}
+                af_entry: dict = {"afi": af.af}
                 af_redist = redist_by_af.get(af_dest_ref, [])
                 if af_redist:
                     af_entry["redistribute"] = af_redist
@@ -1102,9 +1205,9 @@ async def apply_bgp_config(
                     peer_entry["ttl"] = peer.ttl
                 if peer.password is not None:
                     peer_entry["password"] = peer.password
-                peer_entry["address-family"] = [
+                peer_entry["peer-address-family"] = [
                     {
-                        "af": paf.af,
+                        "afi": paf.af,
                         "enabled": paf.enabled,
                         **({"routemap-in": paf.routemap_in} if paf.routemap_in else {}),
                         **({"routemap-out": paf.routemap_out} if paf.routemap_out else {}),

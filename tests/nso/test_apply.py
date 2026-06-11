@@ -532,3 +532,118 @@ async def test_apply_static_routes_verify_mismatch_raises():
     # First call is the real PATCH (no dry-run), second is the verify dry-run.
     assert "dry-run" not in mock_http.patch.call_args_list[0][0][0]
     assert "dry-run=native" in mock_http.patch.call_args_list[1][0][0]
+
+
+@pytest.mark.asyncio
+async def test_apply_bgp_config_uses_correct_yang_keys():
+    """Regression (finding #31): the bgp-reconciler service YANG uses `afi` (not `af`)
+    and `peer-address-family` (not `address-family`) under each peer. Sending the wrong
+    keys caused a live 400 `unknown element: address-family` on rg03's IOS BGP."""
+    import json
+
+    from nso_adapter.nso.apply import apply_bgp_config
+
+    client = _make_nso_client()
+    real_resp = _mock_httpx_response(204)
+    # Verify dry-run with no device delta → guard passes.
+    dry_resp = _mock_httpx_response(200, json_data={"dry-run-result": {"native": {"device": []}}})
+    mock_http = AsyncMock()
+    mock_http.patch.side_effect = [real_resp, dry_resp]
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=mock_http)
+    ctx.__aexit__ = AsyncMock(return_value=None)
+    client._client.return_value = ctx
+
+    paf = SimpleNamespace(
+        af="ipv4-unicast", enabled=True,
+        routemap_in=None, routemap_out=None, prefixlist_in=None, prefixlist_out=None,
+    )
+    peer = SimpleNamespace(
+        peer_address="192.168.204.2", enabled=True, peer_group=None,
+        remote_as=65100, local_as=None, ttl=None, password=None,
+        peer_address_families=[paf],
+    )
+    scope = SimpleNamespace(
+        vrf="", address_families=[SimpleNamespace(af="ipv4-unicast")], peers=[peer],
+    )
+    router = SimpleNamespace(asn=65100, scopes=[scope])
+
+    await apply_bgp_config(client=client, device_name="rg03", router_intent_rows=[router])
+
+    payload = json.loads(mock_http.patch.call_args_list[0][1]["content"])
+    router_out = payload["bgp-reconciler:bgp-config"][0]["router"][0]
+    scope_out = router_out["scope"][0]
+    # scope-level AF list key is `afi`
+    assert scope_out["address-family"][0]["afi"] == "ipv4-unicast"
+    assert "af" not in scope_out["address-family"][0]
+    # per-peer AF list is `peer-address-family` keyed by `afi`
+    peer_out = scope_out["peer"][0]
+    assert "address-family" not in peer_out
+    assert peer_out["peer-address-family"][0]["afi"] == "ipv4-unicast"
+
+
+def test_build_isis_process_payload_attaches_flex_algo():
+    """Flex-algo rows attach under their process-tag, creating a minimal process
+    entry when the tag has no process row (e.g. IOS-XR flex-only)."""
+    from nso_adapter.nso.apply import build_isis_process_payload
+
+    fa = SimpleNamespace(
+        process_tag="NA4-CORE", algo_id=130, metric_type="delay-metric", priority=200,
+        admin_group_exclude="RED", admin_group_include_any=None, admin_group_include_all=None,
+    )
+    procs = build_isis_process_payload(isis_process_rows=[], redistribution_rows=[], flex_algo_rows=[fa])
+    assert len(procs) == 1
+    p = procs[0]
+    assert p["process-tag"] == "NA4-CORE"
+    assert p["flex-algo"][0]["algo-id"] == 130
+    assert p["flex-algo"][0]["metric-type"] == "delay-metric"
+    assert p["flex-algo"][0]["admin-group-exclude"] == "RED"
+
+
+def test_build_isis_process_payload_omits_empty_enums():
+    """Empty-string enum leaves (metric-style/is-type) are omitted, not sent as ''."""
+    from nso_adapter.nso.apply import build_isis_process_payload
+
+    row = SimpleNamespace(
+        process_tag="0", net="49.0001.00", is_type="", metric_style="", overload_bit=None,
+        area_auth_type="", area_auth_key=None, domain_auth_type="", domain_auth_key=None,
+    )
+    procs = build_isis_process_payload(isis_process_rows=[row], redistribution_rows=[], flex_algo_rows=[])
+    assert "metric-style" not in procs[0]
+    assert "is-type" not in procs[0]
+    assert procs[0]["net"] == "49.0001.00"
+
+
+def test_build_isis_interface_payload_normalises_circuit_type():
+    """circuit-type 'level-2' (invalid enum) is normalised to 'level-2-only'."""
+    from nso_adapter.nso.apply import build_isis_interface_payload
+
+    row = SimpleNamespace(
+        interface_name="ae2.0", af="ipv4", process_tag="", passive=False,
+        circuit_type="level-2", network_type=None, metric=10,
+    )
+    ifaces = build_isis_interface_payload([row])
+    assert ifaces[0]["circuit-type"] == "level-2-only"
+
+
+@pytest.mark.asyncio
+async def test_replace_isis_service_puts_keyed_instance():
+    """replace_isis_service PUTs the keyed service instance (so empty process-tags
+    removal works — PUT key is the device name, not the empty list key)."""
+    import json
+
+    from nso_adapter.nso.apply import replace_isis_service
+
+    client = _make_nso_client()
+    mock_http = AsyncMock()
+    mock_http.put.return_value = _mock_httpx_response(204)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=mock_http)
+    ctx.__aexit__ = AsyncMock(return_value=None)
+    client._client.return_value = ctx
+    await replace_isis_service(client=client, device_name="rc1", interfaces=[{"interface-name": "ae2.0"}], processes=[])
+
+    (url,) = mock_http.put.call_args[0]
+    assert url.endswith("isis-reconciler:isis-config=rc1")
+    body = json.loads(mock_http.put.call_args[1]["content"])
+    assert body["isis-reconciler:isis-config"][0]["device"] == "rc1"

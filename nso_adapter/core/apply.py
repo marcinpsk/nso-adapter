@@ -32,6 +32,7 @@ from nso_adapter.store.models import (
     InterfaceAttrState,
     InterfaceIntent,
     InterfaceIpIntent,
+    IsisFlexAlgoIntent,
     IsisInterfaceIntent,
     IsisProcessIntent,
     Job,
@@ -345,6 +346,18 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 if not force and row.last_apply_at is not None and row.last_apply_error is None:
                     continue
                 isis_process_eligible.append(row)
+
+            # Collect IS-IS Flex-Algo intent rows (applied alongside process rows)
+            isis_flex_eligible: list[IsisFlexAlgoIntent] = []
+            isis_flex_result = await db.execute(
+                select(IsisFlexAlgoIntent).where(IsisFlexAlgoIntent.device_id == device_id)
+            )
+            for row in isis_flex_result.scalars().all():
+                if row.accepted_at is None:
+                    continue
+                if not force and row.last_apply_at is not None and row.last_apply_error is None:
+                    continue
+                isis_flex_eligible.append(row)
 
             # Collect BGP router intent rows (eligibility at the router level)
             bgp_eligible: list[BgpRouterIntent] = []
@@ -888,7 +901,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
             isis_outcome_failed = 0
             isis_failed: list[dict] = []
 
-            if isis_eligible or isis_process_eligible or redist_isis:
+            if isis_eligible or isis_process_eligible or redist_isis or isis_flex_eligible:
                 try:
                     await apply_isis_interfaces(
                         client=client,
@@ -896,6 +909,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                         isis_intent_rows=isis_eligible,
                         isis_process_rows=isis_process_eligible,
                         redistribution_rows=redist_isis,
+                        flex_algo_rows=isis_flex_eligible,
                     )
                     for row in isis_eligible:
                         row.last_apply_at = now
@@ -906,7 +920,15 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     for row in redist_isis:
                         row.last_apply_at = now
                         row.last_apply_error = None
-                    isis_outcome_ok = len(isis_eligible) + len(isis_process_eligible) + len(redist_isis)
+                    for row in isis_flex_eligible:
+                        row.last_apply_at = now
+                        row.last_apply_error = None
+                    isis_outcome_ok = (
+                        len(isis_eligible)
+                        + len(isis_process_eligible)
+                        + len(redist_isis)
+                        + len(isis_flex_eligible)
+                    )
                 except NsoApplyError as exc:
                     logger.error(
                         "apply.isis_failed",
@@ -921,7 +943,14 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                         row.last_apply_error = err_payload
                     for row in redist_isis:
                         row.last_apply_error = err_payload
-                    isis_outcome_failed = len(isis_eligible) + len(isis_process_eligible) + len(redist_isis)
+                    for row in isis_flex_eligible:
+                        row.last_apply_error = err_payload
+                    isis_outcome_failed = (
+                        len(isis_eligible)
+                        + len(isis_process_eligible)
+                        + len(redist_isis)
+                        + len(isis_flex_eligible)
+                    )
                     isis_failed.append({"error": exc.message})
                 except Exception as exc:
                     logger.exception("apply.isis_unexpected_error", job_id=job_id)
@@ -932,7 +961,14 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                         row.last_apply_error = err_payload
                     for row in redist_isis:
                         row.last_apply_error = err_payload
-                    isis_outcome_failed = len(isis_eligible) + len(isis_process_eligible) + len(redist_isis)
+                    for row in isis_flex_eligible:
+                        row.last_apply_error = err_payload
+                    isis_outcome_failed = (
+                        len(isis_eligible)
+                        + len(isis_process_eligible)
+                        + len(redist_isis)
+                        + len(isis_flex_eligible)
+                    )
                     isis_failed.append({"error": repr(exc)})
 
             # ── Step 6e: BGP intent pass ──────────────────────────────────────
