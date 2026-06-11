@@ -109,7 +109,11 @@ class RedistributionEntry(BaseModel):
 
 
 class OspfInstanceEntry(BaseModel):
-    process_id: int
+    # process_id is a STRING (matches the OspfInstanceIntent.process_id String column and
+    # the plugin's CharField; IOS-XR/Junos allow named processes). Declaring it int made
+    # asyncpg reject the coerced value on insert — only surfaced once OSPF intent was first
+    # pushed (greenfield Nokia OSPF).
+    process_id: str
     router_id: str | None = None
     vrf: str = ""
     areas: list[dict] = []
@@ -118,7 +122,7 @@ class OspfInstanceEntry(BaseModel):
 
 class OspfInterfaceEntry(BaseModel):
     interface_name: str
-    process_id: int | None = None
+    process_id: str | None = None
     area_id: str | None = None
     passive: bool = False
     priority: int | None = None
