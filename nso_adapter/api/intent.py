@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 import structlog
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
@@ -164,3 +164,58 @@ async def get_intent(device_id: int, db: AsyncSession = Depends(get_db)):
         "attributes": rows,
         "updated_at": updated_at.isoformat() + "Z",
     }
+
+
+async def _device_intent_counts(db: AsyncSession, device_id: int) -> dict[str, dict]:
+    """Count rows of every ``*_intent`` table for a device, with apply-state breakdown.
+
+    Generic (driven by the SQLAlchemy metadata, so DB-agnostic and auto-covering every
+    current and future intent scope). Tables keyed by ``device_id`` are counted directly;
+    those keyed by ``interface_id`` are joined through ``interfaces``. Child intent tables
+    (no device/interface key, e.g. ``bgp_af_intent``) are skipped — they are covered
+    transitively by their parent scope. Only scopes with a non-zero count are returned. Table
+    names come from the model catalogue, not user input, so the f-strings carry no injection risk.
+    """
+    from nso_adapter.store.models import Base
+
+    out: dict[str, dict] = {}
+    for tname, table in sorted(Base.metadata.tables.items()):
+        if not tname.endswith("_intent"):
+            continue
+        cols = set(table.c.keys())
+        if "device_id" in cols:
+            frm, where = f"{tname} x", "x.device_id = :d"
+        elif "interface_id" in cols:
+            frm, where = f"{tname} x join interfaces i on x.interface_id = i.id", "i.device_id = :d"
+        else:
+            continue
+        sel = "count(*) as total"
+        if "last_apply_at" in cols:
+            sel += ", count(x.last_apply_at) as applied"
+        if "last_apply_error" in cols:
+            sel += ", count(x.last_apply_error) as failed"
+        row = (
+            await db.execute(text(f"select {sel} from {frm} where {where}"), {"d": device_id})
+        ).mappings().first()
+        if row and row["total"]:
+            out[tname] = {
+                "count": row["total"],
+                "applied": row.get("applied", 0) or 0,
+                "failed": row.get("failed", 0) or 0,
+            }
+    return out
+
+
+@router.get("/{device_id}/intent-summary", dependencies=[Depends(verify_token)])
+async def get_intent_summary(device_id: int, db: AsyncSession = Depends(get_db)):
+    """Per-scope summary of the adapter's intent mirror for a device.
+
+    Surfaces what the adapter currently holds as owned intent (per ``*_intent`` table), so the
+    plugin can detect adapter↔NetBox drift (intent the adapter holds that NetBox no longer
+    owns — the split-brain) and offer a re-sync. Returns only non-empty scopes.
+    """
+    device = await db.get(Device, device_id)
+    if not device:
+        raise api_error(404, "not_found", "Device not found")
+    scopes = await _device_intent_counts(db, device_id)
+    return {"device_id": device_id, "scopes": scopes}
