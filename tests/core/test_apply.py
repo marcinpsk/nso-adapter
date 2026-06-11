@@ -169,7 +169,9 @@ async def test_collect_apply_diff_returns_scope_deltas(adapter_client):
 
     device_id = await _seed_device("rtr-diff", 199)
     async for db in get_session():
-        db.add(OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1"))
+        db.add(OspfInstanceIntent(
+            device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow()
+        ))
         await db.commit()
         break
 
@@ -191,7 +193,9 @@ async def test_collect_apply_diff_empty_scope_omitted(adapter_client):
 
     device_id = await _seed_device("rtr-diff2", 198)
     async for db in get_session():
-        db.add(OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1"))
+        db.add(OspfInstanceIntent(
+            device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow()
+        ))
         await db.commit()
         break
 
@@ -204,6 +208,35 @@ async def test_collect_apply_diff_empty_scope_omitted(adapter_client):
             diffs = await collect_apply_diff(db, device_id)
             break
     assert diffs == {}
+
+
+async def test_collect_apply_diff_covers_multiple_scopes(adapter_client):
+    """collect_apply_diff dry-runs every scope with accepted intent, keyed by scope name."""
+    from nso_adapter.core.apply import collect_apply_diff
+    from nso_adapter.store.models import OspfInstanceIntent, StaticRouteIntent
+
+    device_id = await _seed_device("rtr-diff3", 197)
+    async for db in get_session():
+        db.add(OspfInstanceIntent(
+            device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow()
+        ))
+        db.add(StaticRouteIntent(
+            device_id=device_id, vrf="", prefix="10.0.0.0/24", next_hop="10.0.0.1",
+            accepted_at=datetime.utcnow(),
+        ))
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_ospf_config", new_callable=AsyncMock, return_value="OSPF DELTA"),
+        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock, return_value="STATIC DELTA"),
+    ):
+        async for db in get_session():
+            diffs = await collect_apply_diff(db, device_id)
+            break
+    assert diffs == {"ospf": "OSPF DELTA", "static_route": "STATIC DELTA"}
 
 
 async def test_run_apply_all_succeed(adapter_client):

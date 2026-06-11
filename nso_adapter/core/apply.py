@@ -103,18 +103,19 @@ async def enqueue_apply(db: AsyncSession, device_id: int, force: bool = True) ->
 async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]:
     """Read-only preview: the per-scope native device diff the next Apply would push.
 
-    For each scope, the owned intent is dry-run against NSO (``?dry-run=native``) — NSO
-    computes the device-native config it *would* push without committing anything. Returns
-    ``{scope: native_delta}`` for scopes with a non-empty change (a scope already in sync
-    yields an empty delta and is omitted). Never writes to NSO or the DB.
+    For each scope, the accepted owned intent is dry-run against NSO (``?dry-run=native``)
+    — NSO computes the device-native config it *would* push without committing anything.
+    Returns ``{scope: native_delta}`` for scopes with a non-empty change (a scope already
+    in sync yields an empty delta and is omitted). Never writes to NSO or the DB.
 
-    Currently covers OSPF + interface-IP (the reconciler scopes plumbed for dry-run);
-    extend by adding a block per scope — each is: load the owned intent, call the matching
-    ``apply_*(..., dry_run=True)``, collect the returned delta.
+    Covers every scope ``run_apply`` pushes through the intent store: interface
+    attributes/IPs, OSPF, IS-IS, BGP, route-policy, SNMP, static routes, logging, SVI,
+    subinterfaces, VLANs, BFD, and L2 SAPs (LAG/switchport are pushed out-of-band by the
+    plugin, not from this intent store, so they have no preview here). Each scope is a
+    best-effort, isolated dry-run — one failing/slow scope never blocks the others.
     """
     from nso_adapter.core.importer import get_nso_client
-    from nso_adapter.nso.apply import apply_interface_ips, apply_ospf_config
-    from nso_adapter.store.models import OspfInstanceIntent, OspfInterfaceIntent
+    from nso_adapter.nso import apply as nso_apply
 
     device = await db.get(Device, device_id)
     if not device:
@@ -123,33 +124,55 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
     device_name = device.nso_device_name
     diffs: dict[str, str] = {}
 
-    # ── OSPF ──────────────────────────────────────────────────────────────────
-    inst = (
-        await db.execute(select(OspfInstanceIntent).where(OspfInstanceIntent.device_id == device_id))
-    ).scalars().all()
-    oif = (
-        await db.execute(select(OspfInterfaceIntent).where(OspfInterfaceIntent.device_id == device_id))
-    ).scalars().all()
-    if inst or oif:
-        try:
-            delta = await apply_ospf_config(
-                client=client,
-                device_name=device_name,
-                process_intent_rows=list(inst),
-                interface_intent_rows=list(oif),
-                redistribution_rows=[],
-                dry_run=True,
-            )
-            if delta and delta.strip():
-                diffs["ospf"] = delta
-        except Exception as exc:  # noqa: BLE001 — preview must never fail hard
-            logger.warning("apply_diff.scope_failed", scope="ospf", device=device_name, error=repr(exc))
+    async def _accepted(model) -> list:
+        """All rows of *model* for this device that have been accepted (Apply-eligible)."""
+        rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
+        return [r for r in rows if getattr(r, "accepted_at", None) is not None]
 
-    # ── Interface IPs ─────────────────────────────────────────────────────────
+    async def _record(scope: str, coro) -> None:
+        """Run one scope's dry-run; store a non-empty delta. Never raise."""
+        try:
+            delta = await coro
+        except Exception as exc:  # noqa: BLE001 — preview must never fail hard
+            logger.warning("apply_diff.scope_failed", scope=scope, device=device_name, error=repr(exc))
+            return
+        if delta and delta.strip():
+            diffs[scope] = delta
+
     ifaces = {
         i.id: i
         for i in (await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))).scalars().all()
     }
+
+    # ── Interface attributes (description / enabled) — one dry-run per accepted slice ──
+    attr_delta = ""
+    for iface in ifaces.values():
+        rows = (
+            await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface.id))
+        ).scalars().all()
+        for r in rows:
+            if r.accepted_at is None or r.attribute not in ("description", "enabled"):
+                continue
+            try:
+                delta = await nso_apply.apply_interface_attribute(
+                    client=client,
+                    device_name=device_name,
+                    interface_name=iface.name,
+                    attribute=r.attribute,
+                    value=r.intent_value,
+                    dry_run=True,
+                )
+                if delta and delta.strip():
+                    attr_delta += delta
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "apply_diff.scope_failed", scope="interface_attribute", device=device_name,
+                    interface=iface.name, error=repr(exc),
+                )
+    if attr_delta.strip():
+        diffs["interface_attribute"] = attr_delta
+
+    # ── Interface IPs — one dry-run per interface that carries IP intent ──────────
     ip_rows = (
         await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id.in_(list(ifaces) or [-1])))
     ).scalars().all()
@@ -161,7 +184,7 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
         iface = ifaces[iface_id]
         rk = _nokia_routed_kind(iface)
         try:
-            delta = await apply_interface_ips(
+            delta = await nso_apply.apply_interface_ips(
                 client=client,
                 device_name=device_name,
                 interface_name=iface.name,
@@ -181,6 +204,114 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
             )
     if ip_delta.strip():
         diffs["interface_ip"] = ip_delta
+
+    # ── Redistribution rows split by destination protocol (shared by ospf/isis/bgp) ──
+    redist = await _accepted(RedistributionIntent)
+    redist_ospf = [r for r in redist if r.dest_protocol == "ospf"]
+    redist_isis = [r for r in redist if r.dest_protocol == "isis"]
+    redist_bgp = [r for r in redist if r.dest_protocol == "bgp"]
+
+    # ── OSPF ──────────────────────────────────────────────────────────────────
+    ospf_inst = await _accepted(OspfInstanceIntent)
+    ospf_iface = await _accepted(OspfInterfaceIntent)
+    if ospf_inst or ospf_iface or redist_ospf:
+        await _record("ospf", nso_apply.apply_ospf_config(
+            client=client, device_name=device_name,
+            process_intent_rows=ospf_inst, interface_intent_rows=ospf_iface,
+            redistribution_rows=redist_ospf, dry_run=True,
+        ))
+
+    # ── IS-IS (interface + process + redistribute + flex-algo) ───────────────────
+    isis_iface = await _accepted(IsisInterfaceIntent)
+    isis_proc = await _accepted(IsisProcessIntent)
+    isis_flex = await _accepted(IsisFlexAlgoIntent)
+    if isis_iface or isis_proc or redist_isis or isis_flex:
+        await _record("isis", nso_apply.apply_isis_interfaces(
+            client=client, device_name=device_name,
+            isis_intent_rows=isis_iface, isis_process_rows=isis_proc,
+            redistribution_rows=redist_isis, flex_algo_rows=isis_flex, dry_run=True,
+        ))
+
+    # ── BGP (relationships eagerly loaded, like run_apply) ───────────────────────
+    bgp = await _accepted(BgpRouterIntent)
+    if bgp or redist_bgp:
+        if bgp:
+            from nso_adapter.core.bgp_load import attach_bgp_relationships
+
+            await attach_bgp_relationships(db, bgp)
+        await _record("bgp", nso_apply.apply_bgp_config(
+            client=client, device_name=device_name,
+            router_intent_rows=bgp, redistribution_rows=redist_bgp, dry_run=True,
+        ))
+
+    # ── Route-policy objects ─────────────────────────────────────────────────────
+    rp = await _accepted(RoutePolicyObjectIntent)
+    if rp:
+        await _record("route_policy", nso_apply.apply_route_policy_config(
+            client=client, device_name=device_name, intent_rows=rp, dry_run=True,
+        ))
+
+    # ── SNMP (communities / v3 users / hosts / system info) ──────────────────────
+    snmp_comm = await _accepted(SnmpCommunityIntent)
+    snmp_user = await _accepted(SnmpV3UserIntent)
+    snmp_host = await _accepted(SnmpHostIntent)
+    snmp_sysinfo_rows = await _accepted(SnmpSystemInfoIntent)
+    snmp_sysinfo = snmp_sysinfo_rows[0] if snmp_sysinfo_rows else None
+    if snmp_comm or snmp_user or snmp_host or snmp_sysinfo:
+        await _record("snmp", nso_apply.apply_snmp_config(
+            client=client, device_name=device_name,
+            community_intents=snmp_comm, v3_user_intents=snmp_user,
+            host_intents=snmp_host, system_info_intent=snmp_sysinfo, dry_run=True,
+        ))
+
+    # ── Static routes ────────────────────────────────────────────────────────────
+    sr = await _accepted(StaticRouteIntent)
+    if sr:
+        await _record("static_route", nso_apply.apply_static_routes(
+            client=client, device_name=device_name, route_intent_rows=sr, dry_run=True,
+        ))
+
+    # ── Logging (remote syslog) ──────────────────────────────────────────────────
+    lg = await _accepted(LoggingHostIntent)
+    if lg:
+        await _record("logging", nso_apply.apply_logging_config(
+            client=client, device_name=device_name, host_intent_rows=lg, dry_run=True,
+        ))
+
+    # ── SVI / IRB ────────────────────────────────────────────────────────────────
+    svi = await _accepted(SviIntent)
+    if svi:
+        await _record("svi", nso_apply.apply_svi_config(
+            client=client, device_name=device_name, svi_intent_rows=svi, dry_run=True,
+        ))
+
+    # ── dot1q subinterfaces ──────────────────────────────────────────────────────
+    subif = await _accepted(SubinterfaceIntent)
+    if subif:
+        await _record("subinterface", nso_apply.apply_subinterface_config(
+            client=client, device_name=device_name, subif_intent_rows=subif, dry_run=True,
+        ))
+
+    # ── VLAN database ────────────────────────────────────────────────────────────
+    vlan = await _accepted(VlanIntent)
+    if vlan:
+        await _record("vlan", nso_apply.apply_vlan_config(
+            client=client, device_name=device_name, vlan_intent_rows=vlan, dry_run=True,
+        ))
+
+    # ── BFD ──────────────────────────────────────────────────────────────────────
+    bfd = await _accepted(BfdIntent)
+    if bfd:
+        await _record("bfd", nso_apply.apply_bfd_config(
+            client=client, device_name=device_name, bfd_intent_rows=bfd, dry_run=True,
+        ))
+
+    # ── L2 SAPs (Nokia epipe/vpls) ───────────────────────────────────────────────
+    l2 = await _accepted(L2SapIntent)
+    if l2:
+        await _record("l2_sap", nso_apply.apply_l2_saps(
+            client=client, device_name=device_name, sap_intent_rows=l2, dry_run=True,
+        ))
 
     return diffs
 

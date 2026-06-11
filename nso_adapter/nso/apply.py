@@ -199,7 +199,9 @@ async def apply_interface_attribute(
     interface_name: str,
     attribute: str,
     value: str | None,
-) -> None:
+    *,
+    dry_run: bool = False,
+) -> str | None:
     """Write a single (device, interface, attribute) intent slice to NSO.
 
     Creates or updates the service instance keyed by (device_name, interface_name)
@@ -236,6 +238,9 @@ async def apply_interface_attribute(
     payload = json.dumps(
         {"interface-reconciler:interface-config": service_body["interface-reconciler:interface-config"]}
     )
+
+    if dry_run:
+        return await native_dry_run(client, url, payload, device_name, method="patch")
 
     async with client._client(timeout=client._action_timeout) as c:
         # Use PATCH to create-or-update the service instance
@@ -421,7 +426,8 @@ async def apply_snmp_config(
     system_info_intent,
     *,
     replace: bool = False,
-) -> None:
+    dry_run: bool = False,
+) -> str | None:
     """Write the full SNMP intent snapshot for a device to the snmp-reconciler service.
 
     Builds a single body covering all communities (by label + vault_ref), v3 users,
@@ -477,6 +483,7 @@ async def apply_snmp_config(
         entry,
         scope="snmp",
         replace=replace,
+        dry_run=dry_run,
     )
 
 
@@ -486,7 +493,8 @@ async def apply_static_routes(
     route_intent_rows: list,
     *,
     replace: bool = False,
-) -> None:
+    dry_run: bool = False,
+) -> str | None:
     """Write static route intent for a single device to NSO.
 
     Builds a full static-route-reconciler body from the supplied rows and commits in
@@ -517,6 +525,7 @@ async def apply_static_routes(
         {"device": device_name, "route": routes},
         scope="static_route",
         replace=replace,
+        dry_run=dry_run,
     )
 
 
@@ -526,7 +535,8 @@ async def apply_logging_config(
     host_intent_rows: list,
     *,
     replace: bool = False,
-) -> None:
+    dry_run: bool = False,
+) -> str | None:
     """Write the full remote-syslog intent snapshot for a device to NSO.
 
     Builds a logging-reconciler body from the supplied rows; the service adopts
@@ -558,6 +568,7 @@ async def apply_logging_config(
         {"device": device_name, "host": hosts},
         scope="logging",
         replace=replace,
+        dry_run=dry_run,
     )
 
 
@@ -567,7 +578,8 @@ async def apply_svi_config(
     svi_intent_rows: list,
     *,
     replace: bool = False,
-) -> None:
+    dry_run: bool = False,
+) -> str | None:
     """Write the SVI/IRB intent snapshot for a device to NSO (M35).
 
     Materialises interface VlanN / interfaces irb unit N via the svi-reconciler;
@@ -589,6 +601,7 @@ async def apply_svi_config(
         {"device": device_name, "interface": interfaces},
         scope="svi",
         replace=replace,
+        dry_run=dry_run,
     )
 
 
@@ -598,7 +611,8 @@ async def apply_subinterface_config(
     subif_intent_rows: list,
     *,
     replace: bool = False,
-) -> None:
+    dry_run: bool = False,
+) -> str | None:
     """Write the dot1q subinterface intent snapshot for a device to NSO (M36).
 
     Materialises <parent>.<unit> (encapsulation dot1Q + vrf forwarding) / Junos
@@ -626,6 +640,7 @@ async def apply_subinterface_config(
         {"device": device_name, "interface": interfaces},
         scope="subinterface",
         replace=replace,
+        dry_run=dry_run,
     )
 
 
@@ -635,7 +650,8 @@ async def apply_vlan_config(
     vlan_intent_rows: list,
     *,
     replace: bool = False,
-) -> None:
+    dry_run: bool = False,
+) -> str | None:
     """Write the VLAN-database intent snapshot for a device to NSO (M34 write path).
 
     Materialises 'vlan <id> / name <name>' (IOS) / 'vlans <name> vlan-id <id>'
@@ -658,6 +674,7 @@ async def apply_vlan_config(
         {"device": device_name, "vlan": vlans},
         scope="vlan",
         replace=replace,
+        dry_run=dry_run,
     )
 
 
@@ -667,7 +684,8 @@ async def apply_bfd_config(
     bfd_intent_rows: list,
     *,
     replace: bool = False,
-) -> None:
+    dry_run: bool = False,
+) -> str | None:
     """Write the per-interface BFD intent snapshot for a device to NSO.
 
     Materialises BFD timers via the bfd-reconciler (IOS interface bfd interval;
@@ -694,6 +712,7 @@ async def apply_bfd_config(
         {"device": device_name, "interface": interfaces},
         scope="bfd",
         replace=replace,
+        dry_run=dry_run,
     )
 
 
@@ -703,7 +722,8 @@ async def apply_l2_saps(
     sap_intent_rows: list,
     *,
     replace: bool = False,
-) -> None:
+    dry_run: bool = False,
+) -> str | None:
     """Write Nokia L2 SAP intent for a single device to NSO (M37 P2b).
 
     Builds a full l2-sap-reconciler body from the supplied rows and commits in
@@ -734,6 +754,7 @@ async def apply_l2_saps(
         {"device": device_name, "sap": saps},
         scope="l2_sap",
         replace=replace,
+        dry_run=dry_run,
     )
 
 
@@ -743,7 +764,8 @@ async def apply_lag_config(
     bundles: list[dict],
     *,
     replace: bool = False,
-) -> None:
+    dry_run: bool = False,
+) -> str | None:
     """Write LACP/LAG bundle intent for a single device to NSO (M33).
 
     Builds a full lag-reconciler body from the supplied bundle dicts and commits in
@@ -764,6 +786,7 @@ async def apply_lag_config(
         {"device": device_name, "bundle": bundles},
         scope="lag",
         replace=replace,
+        dry_run=dry_run,
     )
 
 
@@ -773,7 +796,8 @@ async def apply_switchport_config(
     interfaces: list[dict],
     *,
     replace: bool = False,
-) -> None:
+    dry_run: bool = False,
+) -> str | None:
     """Write L2 switchport intent for a single device to NSO (M34).
 
     Builds a full switchport-reconciler body and commits in reconcile mode. Each
@@ -790,6 +814,7 @@ async def apply_switchport_config(
         {"device": device_name, "interface": interfaces},
         scope="switchport",
         replace=replace,
+        dry_run=dry_run,
     )
 
 
@@ -877,7 +902,9 @@ async def apply_isis_interfaces(
     isis_process_rows: list | None = None,
     redistribution_rows: list | None = None,
     flex_algo_rows: list | None = None,
-) -> None:
+    *,
+    dry_run: bool = False,
+) -> str | None:
     """Write IS-IS interface-enablement and process intent for a single device to NSO.
 
     Builds a full isis-reconciler PATCH body from the supplied rows and
@@ -905,6 +932,9 @@ async def apply_isis_interfaces(
     payload = json.dumps({"isis-reconciler:isis-config": [service_body]})
 
     url = f"{client._base}{_ISIS_SERVICE_PATH}"
+
+    if dry_run:
+        return await native_dry_run(client, url, payload, device_name, method="patch")
 
     async with client._client(timeout=client._action_timeout) as c:
         resp = await c.patch(
@@ -1035,7 +1065,8 @@ async def apply_bgp_config(
     redistribution_rows: list | None = None,
     *,
     replace: bool = False,
-) -> None:
+    dry_run: bool = False,
+) -> str | None:
     """Write BGP intent for a single device to NSO via the bgp-reconciler.
 
     Builds the full router/scope/AF/peer/peer-AF tree from the supplied
@@ -1119,6 +1150,7 @@ async def apply_bgp_config(
         {"device": device_name, "router": routers},
         scope="bgp",
         replace=replace,
+        dry_run=dry_run,
     )
 
 
@@ -1128,7 +1160,8 @@ async def apply_route_policy_config(
     intent_rows: list,
     *,
     replace: bool = False,
-) -> None:
+    dry_run: bool = False,
+) -> str | None:
     """Write route-policy intent for a single device to NSO via the route-policy-reconciler.
 
     Groups RoutePolicyObjectIntent rows by family and builds the canonical NSO service
@@ -1163,6 +1196,7 @@ async def apply_route_policy_config(
         body,
         scope="route_policy",
         replace=replace,
+        dry_run=dry_run,
     )
 
 
