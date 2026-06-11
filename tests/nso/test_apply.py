@@ -647,3 +647,50 @@ async def test_replace_isis_service_puts_keyed_instance():
     assert url.endswith("isis-reconciler:isis-config=rc1")
     body = json.loads(mock_http.put.call_args[1]["content"])
     assert body["isis-reconciler:isis-config"][0]["device"] == "rc1"
+
+
+@pytest.mark.asyncio
+async def test_replace_service_instance_puts_keyed_instance():
+    """Generic removal primitive: PUT on the keyed service instance with the full body."""
+    import json
+
+    from nso_adapter.nso.apply import replace_service_instance
+
+    client = _make_nso_client()
+    mock_http = AsyncMock()
+    mock_http.put.return_value = _mock_httpx_response(204)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=mock_http)
+    ctx.__aexit__ = AsyncMock(return_value=None)
+    client._client.return_value = ctx
+
+    await replace_service_instance(
+        client, "/restconf/data/vlan-reconciler:vlan-config", "vlan-reconciler:vlan-config",
+        "sw3", {"device": "sw3", "vlan": [{"vlan-id": 10}]},
+    )
+    (url,) = mock_http.put.call_args[0]
+    assert url.endswith("vlan-reconciler:vlan-config=sw3")
+    body = json.loads(mock_http.put.call_args[1]["content"])
+    assert body["vlan-reconciler:vlan-config"][0]["vlan"][0]["vlan-id"] == 10
+
+
+@pytest.mark.asyncio
+async def test_replace_vlan_config_drops_removed_vid():
+    """replace_vlan_config PUT-replaces with the full remaining vlan list (removed vid absent)."""
+    import json
+
+    from nso_adapter.nso.apply import replace_vlan_config
+
+    client = _make_nso_client()
+    mock_http = AsyncMock()
+    mock_http.put.return_value = _mock_httpx_response(204)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=mock_http)
+    ctx.__aexit__ = AsyncMock(return_value=None)
+    client._client.return_value = ctx
+
+    rows = [SimpleNamespace(vlan_id=10, name="keep")]  # 3366 dropped → absent from body
+    await replace_vlan_config(client=client, device_name="sw3", vlan_intent_rows=rows)
+    body = json.loads(mock_http.put.call_args[1]["content"])
+    vids = [v["vlan-id"] for v in body["vlan-reconciler:vlan-config"][0]["vlan"]]
+    assert vids == [10]

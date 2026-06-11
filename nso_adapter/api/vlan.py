@@ -115,16 +115,17 @@ async def put_vlan_intent(device_id: int, body: VlanIntentUpdate, db: AsyncSessi
     If ``auto_apply`` is enabled on the device, an apply job is enqueued. The single
     device Apply commits these via the vlan-reconciler.
     """
-    if await db.get(Device, device_id) is None:
+    device = await db.get(Device, device_id)
+    if device is None:
         raise api_error(404, "not_found", "Device not found")
 
     existing = await db.execute(select(VlanIntent).where(VlanIntent.device_id == device_id))
     existing_rows: dict[int, VlanIntent] = {r.vlan_id: r for r in existing.scalars().all()}
     new_keys = {v.vlan_id for v in body.vlans}
 
-    for vid, row in existing_rows.items():
-        if vid not in new_keys:
-            await db.delete(row)
+    removed_vids = [vid for vid in existing_rows if vid not in new_keys]
+    for vid in removed_vids:
+        await db.delete(existing_rows[vid])
     await db.flush()
 
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -149,4 +150,30 @@ async def put_vlan_intent(device_id: int, body: VlanIntentUpdate, db: AsyncSessi
         await enqueue_apply(db, device_id, force=True)
 
     await db.commit()
-    return {"device_id": device_id, "count": count}
+
+    # Removal propagation: a dropped vid won't be removed by the next merge-PATCH
+    # apply, so PUT-replace the vlan-reconciler instance with the full desired list
+    # (remaining rows) → FASTMAP reverts the removed VLAN on the device.
+    replaced = False
+    if removed_vids:
+        from nso_adapter.nso.apply import replace_vlan_config
+
+        remaining = (
+            await db.execute(
+                select(VlanIntent).where(
+                    VlanIntent.device_id == device_id, VlanIntent.accepted_at.is_not(None)
+                )
+            )
+        ).scalars().all()
+        try:
+            nso_client = get_nso_client(device.nso_instance)
+            await replace_vlan_config(nso_client, device.nso_device_name, remaining)
+            replaced = True
+        except Exception as exc:  # noqa: BLE001
+            import structlog
+
+            structlog.get_logger(__name__).error(
+                "vlan_intent.replace_failed", device_id=device_id, error=repr(exc)
+            )
+
+    return {"device_id": device_id, "count": count, "removed": len(removed_vids), "replaced": replaced}

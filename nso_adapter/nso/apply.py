@@ -1095,30 +1095,27 @@ def build_isis_interface_payload(isis_intent_rows: list | None) -> list[dict]:
     return interfaces
 
 
-async def replace_isis_service(
+async def replace_service_instance(
     client: NsoClient,
+    service_path: str,
+    root_key: str,
     device_name: str,
-    interfaces: list[dict],
-    processes: list[dict],
+    body: dict,
 ) -> None:
-    """RESTCONF PUT-replace the whole isis-reconciler service instance for a device.
+    """RESTCONF PUT-replace a keyed reconciler service instance with the full desired body.
 
-    Removal must be explicit: a merge-PATCH that omits an entry leaves it in the
-    FASTMAP service intent (and on the device), and a node-level DELETE can't address
-    an empty-string process-tag key (NSO 404s).  PUT on the keyed service instance
-    (``isis-config=<device>``) replaces its entire content with the supplied full
-    desired state, so omitted entries (e.g. a removed flex-algo) are dropped and
-    FASTMAP reverts the device config.
+    Generalised removal primitive. Removal must be explicit: a merge-PATCH that omits
+    an entry leaves it in the FASTMAP service intent (and on the device), and a
+    node-level DELETE 404s on empty-string list keys. PUT on the keyed instance
+    (``<service_path>=<device>``) replaces its entire content with *body*, so omitted
+    list entries are dropped and FASTMAP reverts the device config.
 
-    *interfaces* and *processes* must be the FULL desired state for the device.
+    *body* is the full desired instance dict (must include the ``device`` key). A body
+    with only the device key clears all of this service's managed config for the device.
+    Reconcile commit is implied by the service's own commit behaviour.
     """
-    body: dict = {"device": device_name}
-    if interfaces:
-        body["interface-config"] = interfaces
-    if processes:
-        body["process-config"] = processes
-    url = f"{client._base}/restconf/data/isis-reconciler:isis-config={device_name}"
-    payload = json.dumps({"isis-reconciler:isis-config": [body]})
+    url = f"{client._base}{service_path}={device_name}"
+    payload = json.dumps({root_key: [body]})
     async with client._client(timeout=client._action_timeout) as c:
         resp = await c.put(
             url, content=payload, headers={"Content-Type": "application/yang-data+json"}
@@ -1129,21 +1126,61 @@ async def replace_isis_service(
             except Exception:
                 err = {"raw": resp.text}
             logger.error(
-                "nso.apply.isis_service_replace_failed",
+                "nso.apply.service_replace_failed",
+                service=root_key,
                 device=device_name,
                 status=resp.status_code,
                 body=err,
             )
             raise NsoApplyError(
                 "nso_put_failed",
-                f"NSO PUT for IS-IS service failed with status {resp.status_code}",
+                f"NSO PUT-replace for {root_key} failed with status {resp.status_code}",
                 detail={"nso_error": err},
             )
-    logger.info(
-        "nso.apply.isis_service_replaced",
-        device=device_name,
-        interface_count=len(interfaces),
-        process_count=len(processes),
+    logger.info("nso.apply.service_replaced", service=root_key, device=device_name)
+
+
+async def replace_isis_service(
+    client: NsoClient,
+    device_name: str,
+    interfaces: list[dict],
+    processes: list[dict],
+) -> None:
+    """PUT-replace the isis-reconciler service instance (full desired state).
+
+    Thin wrapper over :func:`replace_service_instance` used to propagate IS-IS
+    removals (e.g. a deleted flex-algo). *interfaces* and *processes* are the FULL
+    desired state for the device.
+    """
+    body: dict = {"device": device_name}
+    if interfaces:
+        body["interface-config"] = interfaces
+    if processes:
+        body["process-config"] = processes
+    await replace_service_instance(
+        client, _ISIS_SERVICE_PATH, "isis-reconciler:isis-config", device_name, body
+    )
+
+
+async def replace_vlan_config(
+    client: NsoClient,
+    device_name: str,
+    vlan_intent_rows: list,
+) -> None:
+    """PUT-replace the vlan-reconciler service instance (full desired VLAN list).
+
+    Propagates VLAN removals: a vid dropped from *vlan_intent_rows* is removed from
+    the device. An empty list clears all managed VLANs for the device.
+    """
+    vlans = []
+    for row in vlan_intent_rows:
+        entry: dict = {"vlan-id": row.vlan_id}
+        if row.name:
+            entry["name"] = row.name
+        vlans.append(entry)
+    body = {"device": device_name, "vlan": vlans}
+    await replace_service_instance(
+        client, _VLAN_SERVICE_PATH, "vlan-reconciler:vlan-config", device_name, body
     )
 
 
