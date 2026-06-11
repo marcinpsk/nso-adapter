@@ -79,6 +79,32 @@ def _device_delta_from_dry_run(body: object, device_name: str) -> str | None:
     return ""
 
 
+async def native_dry_run(
+    client: NsoClient, url: str, payload: str, device_name: str, *, method: str = "patch"
+) -> str | None:
+    """Issue *payload* to *url* as a native dry-run (``?dry-run=native``) and return the delta.
+
+    No commit happens — NSO computes the native device config the intent *would* push and
+    returns it. The returned string is the device-native delta (``""`` = no change), or
+    ``None`` when the dry-run was inconclusive (non-2xx / transport / unparseable / wrong
+    shape). Same machinery as the post-apply verify guard, surfaced for the pre-apply preview.
+    """
+    dry_url = f"{url}?dry-run=native"
+    try:
+        async with client._client(timeout=client._action_timeout) as c:
+            resp = await getattr(c, method)(
+                dry_url,
+                content=payload,
+                headers={"Content-Type": "application/yang-data+json"},
+            )
+        if resp.status_code not in (200, 201, 204):
+            return None
+        body = resp.json()
+    except Exception:  # network/transport/parse — inconclusive, never block
+        return None
+    return _device_delta_from_dry_run(body, device_name)
+
+
 async def _verify_native_or_raise(
     client: NsoClient, url: str, payload: str, device_name: str, *, scope: str, method: str = "patch"
 ) -> None:
@@ -97,27 +123,9 @@ async def _verify_native_or_raise(
     if not VERIFY_AFTER_APPLY:
         return
 
-    dry_url = f"{url}?dry-run=native"
-    try:
-        async with client._client(timeout=client._action_timeout) as c:
-            resp = await getattr(c, method)(
-                dry_url,
-                content=payload,
-                headers={"Content-Type": "application/yang-data+json"},
-            )
-        if resp.status_code not in (200, 201, 204):
-            logger.warning(
-                "nso.apply.verify_inconclusive", scope=scope, device=device_name, status=resp.status_code
-            )
-            return
-        body = resp.json()
-    except Exception as exc:  # network/transport/parse — never block the apply on verify
-        logger.warning("nso.apply.verify_skipped", scope=scope, device=device_name, error=repr(exc))
-        return
-
-    delta = _device_delta_from_dry_run(body, device_name)
+    delta = await native_dry_run(client, url, payload, device_name, method=method)
     if delta is None:
-        logger.warning("nso.apply.verify_unexpected_shape", scope=scope, device=device_name)
+        logger.warning("nso.apply.verify_inconclusive_or_unexpected", scope=scope, device=device_name)
         return
     if delta.strip():
         logger.error("nso.apply.verify_mismatch", scope=scope, device=device_name, delta=delta)
@@ -139,7 +147,8 @@ async def _send_service_config(
     *,
     scope: str,
     replace: bool = False,
-) -> None:
+    dry_run: bool = False,
+) -> str | None:
     """Send a reconciler service instance body to NSO — the shared apply/removal tail.
 
     ``replace=False`` (apply/add/update): merge-PATCH the service list path, then run
@@ -155,6 +164,9 @@ async def _send_service_config(
     else:
         url = f"{client._base}{service_path}"
         method = "patch"
+    if dry_run:
+        # Preview: compute the native device delta without committing anything.
+        return await native_dry_run(client, url, payload, device_name, method=method)
     async with client._client(timeout=client._action_timeout) as c:
         resp = await getattr(c, method)(
             url, content=payload, headers={"Content-Type": "application/yang-data+json"}
@@ -271,7 +283,8 @@ async def apply_interface_ips(
     service: str | None = None,
     parent_binding: str | None = None,
     encap_tag: str | None = None,
-) -> None:
+    dry_run: bool = False,
+) -> str | None:
     """Write IP addresses and VRF for a single interface to NSO.
 
     Builds a full interface-reconciler PATCH body from the supplied rows,
@@ -323,6 +336,9 @@ async def apply_interface_ips(
 
     url = f"{client._base}{_SERVICE_PATH}"
     payload = json.dumps({"interface-reconciler:interface-config": [entry]})
+
+    if dry_run:
+        return await native_dry_run(client, url, payload, device_name, method="patch")
 
     async with client._client(timeout=client._action_timeout) as c:
         resp = await c.patch(
@@ -453,7 +469,7 @@ async def apply_snmp_config(
         if system_info_intent.contact is not None:
             entry["contact"] = system_info_intent.contact
 
-    await _send_service_config(
+    return await _send_service_config(
         client,
         _SNMP_SERVICE_PATH,
         "snmp-reconciler:snmp-config",
@@ -493,7 +509,7 @@ async def apply_static_routes(
             entry["tag"] = row.tag
         routes.append(entry)
 
-    await _send_service_config(
+    return await _send_service_config(
         client,
         _STATIC_ROUTE_SERVICE_PATH,
         "static-route-reconciler:static-route-config",
@@ -534,7 +550,7 @@ async def apply_logging_config(
             entry["source"] = row.source
         hosts.append(entry)
 
-    await _send_service_config(
+    return await _send_service_config(
         client,
         _LOGGING_SERVICE_PATH,
         "logging-reconciler:logging-config",
@@ -565,7 +581,7 @@ async def apply_svi_config(
             entry["vrf"] = row.vrf
         interfaces.append(entry)
 
-    await _send_service_config(
+    return await _send_service_config(
         client,
         _SVI_SERVICE_PATH,
         "svi-reconciler:svi-config",
@@ -602,7 +618,7 @@ async def apply_subinterface_config(
             entry["vrf"] = row.vrf
         interfaces.append(entry)
 
-    await _send_service_config(
+    return await _send_service_config(
         client,
         _SUBIF_SERVICE_PATH,
         "subinterface-reconciler:subif-config",
@@ -634,7 +650,7 @@ async def apply_vlan_config(
             entry["name"] = row.name
         vlans.append(entry)
 
-    await _send_service_config(
+    return await _send_service_config(
         client,
         _VLAN_SERVICE_PATH,
         "vlan-reconciler:vlan-config",
@@ -670,7 +686,7 @@ async def apply_bfd_config(
             entry["multiplier"] = row.multiplier
         interfaces.append(entry)
 
-    await _send_service_config(
+    return await _send_service_config(
         client,
         _BFD_SERVICE_PATH,
         "bfd-reconciler:bfd-config",
@@ -710,7 +726,7 @@ async def apply_l2_saps(
             entry["inner-tag"] = row.inner_tag
         saps.append(entry)
 
-    await _send_service_config(
+    return await _send_service_config(
         client,
         _L2_SAP_SERVICE_PATH,
         "l2-sap-reconciler:l2-sap-config",
@@ -740,7 +756,7 @@ async def apply_lag_config(
     ``admin-key``, and ``member`` (list of ``interface-name`` + optional
     ``mode``/``port-priority``).
     """
-    await _send_service_config(
+    return await _send_service_config(
         client,
         _LAG_SERVICE_PATH,
         "lag-reconciler:lag-config",
@@ -766,7 +782,7 @@ async def apply_switchport_config(
     ``replace=True`` PUT-replaces the keyed instance so removed switchports are
     reverted (the plugin force-pushes the full owned snapshot).
     """
-    await _send_service_config(
+    return await _send_service_config(
         client,
         _SWITCHPORT_SERVICE_PATH,
         "switchport-reconciler:switchport-config",
@@ -1095,7 +1111,7 @@ async def apply_bgp_config(
             )
         routers.append({"asn": int(r.asn), "scope": scopes_out})
 
-    await _send_service_config(
+    return await _send_service_config(
         client,
         _BGP_SERVICE_PATH,
         "bgp-reconciler:bgp-config",
@@ -1139,7 +1155,7 @@ async def apply_route_policy_config(
             {"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("route_map", [])
         ],
     }
-    await _send_service_config(
+    return await _send_service_config(
         client,
         _ROUTE_POLICY_SERVICE_PATH,
         "route-policy-reconciler:route-policy-config",
@@ -1162,7 +1178,8 @@ async def apply_ospf_config(
     redistribution_rows: list | None = None,
     *,
     replace: bool = False,
-) -> None:
+    dry_run: bool = False,
+) -> str | None:
     """Write OSPF process and interface intent for a single device to NSO.
 
     Builds a full ospf-reconciler body from the supplied rows and commits in
@@ -1232,7 +1249,7 @@ async def apply_ospf_config(
     if processes:
         service_body["process-config"] = processes
 
-    await _send_service_config(
+    return await _send_service_config(
         client,
         _OSPF_SERVICE_PATH,
         "ospf-reconciler:ospf-config",
@@ -1240,4 +1257,5 @@ async def apply_ospf_config(
         service_body,
         scope="ospf",
         replace=replace,
+        dry_run=dry_run,
     )

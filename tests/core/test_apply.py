@@ -162,6 +162,50 @@ async def test_run_apply_nothing_eligible(adapter_client):
         break
 
 
+async def test_collect_apply_diff_returns_scope_deltas(adapter_client):
+    """collect_apply_diff dry-runs each scope's intent and returns the native device delta."""
+    from nso_adapter.core.apply import collect_apply_diff
+    from nso_adapter.store.models import OspfInstanceIntent
+
+    device_id = await _seed_device("rtr-diff", 199)
+    async for db in get_session():
+        db.add(OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1"))
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_ospf_config", new_callable=AsyncMock, return_value="OSPF NATIVE DELTA"),
+    ):
+        async for db in get_session():
+            diffs = await collect_apply_diff(db, device_id)
+            break
+    assert diffs == {"ospf": "OSPF NATIVE DELTA"}
+
+
+async def test_collect_apply_diff_empty_scope_omitted(adapter_client):
+    """A scope whose dry-run shows no change (empty delta) is omitted from the result."""
+    from nso_adapter.core.apply import collect_apply_diff
+    from nso_adapter.store.models import OspfInstanceIntent
+
+    device_id = await _seed_device("rtr-diff2", 198)
+    async for db in get_session():
+        db.add(OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1"))
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_ospf_config", new_callable=AsyncMock, return_value="   "),
+    ):
+        async for db in get_session():
+            diffs = await collect_apply_diff(db, device_id)
+            break
+    assert diffs == {}
+
+
 async def test_run_apply_all_succeed(adapter_client):
     """run_apply marks job succeeded when all attributes apply successfully."""
     device_id = await _seed_device("rtr-a13", 113)

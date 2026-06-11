@@ -77,3 +77,18 @@ async def action_apply(
 ):
     """Phase 2 — push accepted NetBox intent to NSO via reconcile-commit service."""
     return await _trigger(device_id, JobType.apply, db)
+
+
+@router.get("/{device_id}/actions/apply-diff", dependencies=[Depends(verify_token)])
+async def action_apply_diff(
+    device_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Preview the per-scope native device diff the next Apply would push (NSO dry-run, no commit)."""
+    from nso_adapter.core.apply import collect_apply_diff
+
+    device = await db.get(Device, device_id)
+    if not device:
+        raise api_error(404, "not_found", "Device not found")
+    diffs = await collect_apply_diff(db, device_id)
+    return {"device_id": device_id, "diffs": diffs}

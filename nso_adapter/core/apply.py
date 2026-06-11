@@ -100,6 +100,91 @@ async def enqueue_apply(db: AsyncSession, device_id: int, force: bool = True) ->
     return job
 
 
+async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]:
+    """Read-only preview: the per-scope native device diff the next Apply would push.
+
+    For each scope, the owned intent is dry-run against NSO (``?dry-run=native``) — NSO
+    computes the device-native config it *would* push without committing anything. Returns
+    ``{scope: native_delta}`` for scopes with a non-empty change (a scope already in sync
+    yields an empty delta and is omitted). Never writes to NSO or the DB.
+
+    Currently covers OSPF + interface-IP (the reconciler scopes plumbed for dry-run);
+    extend by adding a block per scope — each is: load the owned intent, call the matching
+    ``apply_*(..., dry_run=True)``, collect the returned delta.
+    """
+    from nso_adapter.core.importer import get_nso_client
+    from nso_adapter.nso.apply import apply_interface_ips, apply_ospf_config
+    from nso_adapter.store.models import OspfInstanceIntent, OspfInterfaceIntent
+
+    device = await db.get(Device, device_id)
+    if not device:
+        return {}
+    client = get_nso_client(device.nso_instance)
+    device_name = device.nso_device_name
+    diffs: dict[str, str] = {}
+
+    # ── OSPF ──────────────────────────────────────────────────────────────────
+    inst = (
+        await db.execute(select(OspfInstanceIntent).where(OspfInstanceIntent.device_id == device_id))
+    ).scalars().all()
+    oif = (
+        await db.execute(select(OspfInterfaceIntent).where(OspfInterfaceIntent.device_id == device_id))
+    ).scalars().all()
+    if inst or oif:
+        try:
+            delta = await apply_ospf_config(
+                client=client,
+                device_name=device_name,
+                process_intent_rows=list(inst),
+                interface_intent_rows=list(oif),
+                redistribution_rows=[],
+                dry_run=True,
+            )
+            if delta and delta.strip():
+                diffs["ospf"] = delta
+        except Exception as exc:  # noqa: BLE001 — preview must never fail hard
+            logger.warning("apply_diff.scope_failed", scope="ospf", device=device_name, error=repr(exc))
+
+    # ── Interface IPs ─────────────────────────────────────────────────────────
+    ifaces = {
+        i.id: i
+        for i in (await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))).scalars().all()
+    }
+    ip_rows = (
+        await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id.in_(list(ifaces) or [-1])))
+    ).scalars().all()
+    by_iface: dict[int, list] = {}
+    for r in ip_rows:
+        by_iface.setdefault(r.interface_id, []).append(r)
+    ip_delta = ""
+    for iface_id, rows in by_iface.items():
+        iface = ifaces[iface_id]
+        rk = _nokia_routed_kind(iface)
+        try:
+            delta = await apply_interface_ips(
+                client=client,
+                device_name=device_name,
+                interface_name=iface.name,
+                ip_intent_rows=rows,
+                kind=rk,
+                service=iface.service if rk in ("ies", "vprn") else None,
+                parent_binding=iface.parent_binding,
+                encap_tag=iface.encap_tag,
+                dry_run=True,
+            )
+            if delta and delta.strip():
+                ip_delta += delta
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "apply_diff.scope_failed", scope="interface_ip", device=device_name,
+                interface=iface.name, error=repr(exc),
+            )
+    if ip_delta.strip():
+        diffs["interface_ip"] = ip_delta
+
+    return diffs
+
+
 async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
     """Background task: execute the apply for *device_id*."""
     from nso_adapter.core.importer import get_nso_client
