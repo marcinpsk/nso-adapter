@@ -259,6 +259,79 @@ async def test_put_ip_intent_unknown_interface_skipped(adapter_client):
     assert resp.json()["address_count"] == 0
 
 
+async def test_put_ip_intent_greenfield_routed_creates_interface(adapter_client):
+    """An unknown interface carrying Nokia routed binding → DbInterface is materialised (M27)."""
+    from sqlalchemy import select
+
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import DbInterface, InterfaceIpIntent
+
+    device_id = await seed_device(nso_device_name="ip-intent-gf", netbox_device_id=910)
+    payload = {
+        "addresses": [
+            {
+                "interface": "LAG99:99",
+                "address": "84.116.249.160/31",
+                "family": "ipv4",
+                "routed": True,
+                "parent_binding": "lag-99",
+                "encap_tag": "99",
+            }
+        ]
+    }
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["address_count"] == 1
+
+    async for db in get_session():
+        iface = (
+            await db.execute(
+                select(DbInterface).where(DbInterface.device_id == device_id, DbInterface.name == "LAG99:99")
+            )
+        ).scalar_one()
+        assert iface.kind == "logical"
+        assert iface.parent_binding == "lag-99"
+        assert iface.encap_tag == "99"
+        rows = (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface.id))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].address == "84.116.249.160/31"
+        break
+
+
+async def test_put_ip_intent_routed_backfills_binding_only_when_missing(adapter_client):
+    """Existing imported interface: routed entry backfills null binding, never clobbers."""
+    from sqlalchemy import select
+
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import DbInterface
+
+    device_id = await seed_device(nso_device_name="ip-intent-bf", netbox_device_id=911)
+    await _seed_interface(device_id, "LAG99:10")  # imported, no binding columns set
+    payload = {
+        "addresses": [
+            {
+                "interface": "LAG99:10",
+                "address": "10.0.0.0/31",
+                "family": "ipv4",
+                "routed": True,
+                "parent_binding": "lag-99",
+                "encap_tag": "10",
+            }
+        ]
+    }
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=payload)
+    assert resp.status_code == 200
+    async for db in get_session():
+        iface = (
+            await db.execute(
+                select(DbInterface).where(DbInterface.device_id == device_id, DbInterface.name == "LAG99:10")
+            )
+        ).scalar_one()
+        assert iface.parent_binding == "lag-99"
+        assert iface.encap_tag == "10"
+        break
+
+
 async def test_put_ip_intent_404_unknown_device(adapter_client):
     """Device not found → 404 not_found."""
     payload = {"addresses": []}

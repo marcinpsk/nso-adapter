@@ -94,6 +94,12 @@ class IpAddressEntry(BaseModel):
     secondary: bool = False
     vrf: str = ""  # "" = global/default routing table
     accepted_at: datetime | None = None
+    # Greenfield Nokia routed-interface binding (M27): for an operator-created routed
+    # sub-interface the adapter never imported, the plugin supplies the SR OS binding so
+    # the apply can create `router Base interface <name> port <parent-binding>:<encap-tag>`.
+    routed: bool = False  # this is a Nokia routed logical interface (create DbInterface if absent)
+    parent_binding: str | None = None  # the bound port/LAG, e.g. "lag-99"
+    encap_tag: str | None = None  # dot1q tag, e.g. "99"
 
 
 class IpIntentUpdate(BaseModel):
@@ -114,6 +120,40 @@ async def put_ip_intent(device_id: int, body: IpIntentUpdate, db: AsyncSession =
 
     ifaces_result = await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))
     ifaces = {iface.name: iface for iface in ifaces_result.scalars().all()}
+
+    # Greenfield Nokia routed sub-interface (M27): the operator created it in NetBox, so the
+    # adapter never imported a DbInterface for it. Materialise a minimal routed row from the
+    # binding the plugin supplied, so the intent FK resolves and the apply emits the SR OS
+    # `router Base interface <name> port <parent-binding>:<encap-tag>`. Existing rows missing
+    # the binding (legacy import) are backfilled, never clobbered.
+    for item in body.addresses:
+        if not (item.routed and item.parent_binding):
+            continue
+        iface = ifaces.get(item.interface)
+        if iface is None:
+            iface = DbInterface(
+                device_id=device_id,
+                name=item.interface,
+                kind="logical",
+                parent_binding=item.parent_binding,
+                encap_tag=item.encap_tag,
+            )
+            db.add(iface)
+            ifaces[item.interface] = iface
+            logger.info(
+                "ip_intent.put.greenfield_interface",
+                device_id=device_id,
+                interface=item.interface,
+                parent_binding=item.parent_binding,
+                encap_tag=item.encap_tag,
+            )
+        else:
+            # Backfill binding on an existing (imported) row when missing; never clobber.
+            if not iface.parent_binding:
+                iface.parent_binding = item.parent_binding
+            if not iface.encap_tag and item.encap_tag:
+                iface.encap_tag = item.encap_tag
+    await db.flush()  # assign ids to freshly-created interfaces before intent rows reference them
 
     existing_result = await db.execute(
         select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id.in_([i.id for i in ifaces.values()]))
