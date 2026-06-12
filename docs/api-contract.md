@@ -386,9 +386,11 @@ rows (empty push → all removed). Re-sync **never writes to the device** —
 it only aligns the adapter mirror with NetBox ownership.
 
 Known limits (accepted): equal-count/different-rows drift is invisible;
-BGP is detected at scope level only (one `bgp_router_intent` row covers N
-owned peers — counts aren't 1:1, but any BGP re-push rewrites the whole
-router tree and heals stale children). Design + per-scope parity audit:
+multi-table scopes (IS-IS, OSPF, SNMP) compare summed counts, so a surplus
+in one table can be masked by a deficit in another; BGP is detected at
+scope level only (one `bgp_router_intent` row covers N owned peers —
+counts aren't 1:1, but any BGP re-push rewrites the whole router tree and
+heals stale children). Design + per-scope parity audit:
 `docs/intent-split-brain-design.md`.
 
 ## Interfaces & sync state
