@@ -539,6 +539,13 @@ async def _scheduled_subinterface_refresh() -> None:
     await _refresh_all_devices(refresh_subinterface_for_device, "subinterface")
 
 
+async def _scheduled_interface_mtu_refresh() -> None:
+    """Periodic fallback: refresh per-interface MTU for all managed devices (Phase 2b)."""
+    from nso_adapter.core.interface_mtu import refresh_interface_mtu_for_device
+
+    await _refresh_all_devices(refresh_interface_mtu_for_device, "interface_mtu")
+
+
 async def _scheduled_topology_interfaces_refresh() -> None:
     """Periodic reconcile: ensure NetBox holds the LAG/channel/loopback interfaces
     that bound_port correlation needs (the cfg.port feed never creates them).
@@ -695,6 +702,13 @@ def start_scheduler() -> None:
             "interval",
             minutes=cfg.scheduler.subinterface_poll_interval,
             id="subinterface_refresh",
+        )
+    if cfg.scheduler.enable_interface_mtu_sync and cfg.scheduler.interface_mtu_poll_interval > 0:
+        _scheduler.add_job(
+            _scheduled_interface_mtu_refresh,
+            "interval",
+            minutes=cfg.scheduler.interface_mtu_poll_interval,
+            id="interface_mtu_refresh",
         )
     if cfg.scheduler.enable_route_policy_sync and cfg.scheduler.route_policy_poll_interval > 0:
         _scheduler.add_job(

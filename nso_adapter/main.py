@@ -26,6 +26,7 @@ from nso_adapter.api.lag_config import router as lag_config_router
 from nso_adapter.api.vlan import router as vlan_router
 from nso_adapter.api.lag_topology import router as lag_topology_router
 from nso_adapter.api.logging_config import router as logging_config_router
+from nso_adapter.api.interface_mtu import router as interface_mtu_router
 from nso_adapter.api.subinterface import router as subinterface_router
 from nso_adapter.api.svi import router as svi_router
 from nso_adapter.api.nso_instances import router as nso_instances_router
@@ -42,6 +43,7 @@ from nso_adapter.core.l2_service import handle_l2_service_change
 from nso_adapter.core.lag_topology import handle_netconf_config_change
 from nso_adapter.core.scheduler import start_scheduler, stop_scheduler
 from nso_adapter.core.snmp import handle_snmp_config_change
+from nso_adapter.core.interface_mtu import handle_interface_mtu_change
 from nso_adapter.core.subinterface import handle_subinterface_change
 from nso_adapter.core.svi import handle_svi_change
 from nso_adapter.core.vlan import handle_switchport_change, handle_vlan_database_change
@@ -123,6 +125,8 @@ async def lifespan(app: FastAPI):
                     await handle_switchport_change(parsed, db, clients)
                     await handle_svi_change(parsed, db, clients)
                     await handle_subinterface_change(parsed, db, clients)
+                    if cfg.scheduler.enable_interface_mtu_sync:
+                        await handle_interface_mtu_change(parsed, db, clients)
 
             asyncio.create_task(_handle())
 
@@ -199,6 +203,7 @@ def create_app() -> FastAPI:
     app.include_router(logging_config_router)
     app.include_router(svi_router)
     app.include_router(subinterface_router)
+    app.include_router(interface_mtu_router)
     app.include_router(static_route_router)
     app.include_router(l2_service_router)
     app.include_router(isis_router)

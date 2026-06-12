@@ -96,6 +96,8 @@ class SchedulerConfig(BaseModel):
     svi_poll_interval: int = 300
     enable_subinterface_sync: bool = True
     subinterface_poll_interval: int = 300
+    enable_interface_mtu_sync: bool = True
+    interface_mtu_poll_interval: int = 300
     # Topology interface reconcile: ensured NetBox held the LAG parents, logical
     # channels/SAPs and loopback/system interfaces that the OLD bound_port-named
     # correlation needed. M27R supersedes this: interface-attributes now exports
