@@ -1251,6 +1251,8 @@ async def apply_ospf_config(
             entry["router-id"] = row.router_id
         if row.vrf:
             entry["vrf"] = row.vrf
+        if getattr(row, "enabled", None) is not None:
+            entry["enabled"] = bool(row.enabled)
         proc_redist = redist_by_proc.get(str(row.process_id), [])
         if proc_redist:
             entry["redistribute"] = proc_redist

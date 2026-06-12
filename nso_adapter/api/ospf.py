@@ -65,6 +65,8 @@ async def get_ospf(device_id: int, db: AsyncSession = Depends(get_db)):
         entry: dict = {"process_id": row.process_id, "vrf": row.vrf or "", "areas": row.areas or []}
         if row.router_id is not None:
             entry["router_id"] = row.router_id
+        if row.enabled is not None:
+            entry["enabled"] = row.enabled
         instances.append(entry)
 
     interfaces = []
@@ -116,6 +118,7 @@ class OspfInstanceEntry(BaseModel):
     process_id: str
     router_id: str | None = None
     vrf: str = ""
+    enabled: bool | None = None
     areas: list[dict] = []
     redistribution: list[RedistributionEntry] = []
 
@@ -163,6 +166,7 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
         row.router_id = entry.router_id
         row.vrf = entry.vrf
         row.areas = entry.areas
+        row.enabled = entry.enabled
 
     # Full-replace interface intents
     existing_iface = await db.execute(select(OspfInterfaceIntent).where(OspfInterfaceIntent.device_id == device_id))

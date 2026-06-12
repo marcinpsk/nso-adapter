@@ -1683,6 +1683,9 @@ class DeviceOspfInstance(Base):
     vrf: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     # areas stored as JSON: [{area_id, area_type}]
     areas: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # OSPF process admin-state (Nokia SR OS 'admin-state enable'); None when the NED
+    # has no explicit admin-state (process enabled by config presence).
+    enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
 
@@ -1728,6 +1731,8 @@ class OspfInstanceIntent(Base):
     router_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     vrf: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     areas: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # OSPF process admin-state intent (Nokia SR OS 'admin-state enable').
+    enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)

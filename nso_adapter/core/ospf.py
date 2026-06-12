@@ -42,6 +42,7 @@ async def _upsert_ospf_data(
                 router_id=inst.get("router-id"),
                 vrf=inst.get("vrf", ""),
                 areas=inst.get("area", []),
+                enabled=inst.get("enabled"),
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
             )
