@@ -1197,6 +1197,12 @@ Valid `family` values: `prefix_list` · `community_list` · `as_path` ·
 `route_map` (unknown family → `422 invalid_family`). The
 `route-policy-reconciler` NSO service applies the objects on the next Apply.
 
+`route_map` entries use the reconciler's YANG leaf names (passed verbatim
+into the service payload): `sequence`, `action`, `match-prefix-lists`,
+`match-community-lists`, `match-as-paths`, `match-json`, `set-json` (the
+JSON blobs are serialised strings, keys per m17-route-policy-contract.md §2).
+Legacy snake_case / `match`+`set` entries are normalised at apply time.
+
 ---
 
 ## IS-IS (M18 / M33)

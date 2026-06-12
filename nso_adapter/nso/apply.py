@@ -131,8 +131,7 @@ async def _verify_native_or_raise(
         logger.error("nso.apply.verify_mismatch", scope=scope, device=device_name, delta=delta)
         raise NsoApplyError(
             "verify_mismatch",
-            f"{scope}: applied intent did not land on {device_name!r} — "
-            f"NSO would still push changes to the device",
+            f"{scope}: applied intent did not land on {device_name!r} — NSO would still push changes to the device",
             detail={"device_delta": delta},
         )
     logger.info("nso.apply.verify_ok", scope=scope, device=device_name)
@@ -168,9 +167,7 @@ async def _send_service_config(
         # Preview: compute the native device delta without committing anything.
         return await native_dry_run(client, url, payload, device_name, method=method)
     async with client._client(timeout=client._action_timeout) as c:
-        resp = await getattr(c, method)(
-            url, content=payload, headers={"Content-Type": "application/yang-data+json"}
-        )
+        resp = await getattr(c, method)(url, content=payload, headers={"Content-Type": "application/yang-data+json"})
         if resp.status_code not in (200, 201, 204):
             try:
                 err = resp.json()
@@ -1055,9 +1052,7 @@ async def replace_service_instance(
     url = f"{client._base}{service_path}={device_name}"
     payload = json.dumps({root_key: [body]})
     async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.put(
-            url, content=payload, headers={"Content-Type": "application/yang-data+json"}
-        )
+        resp = await c.put(url, content=payload, headers={"Content-Type": "application/yang-data+json"})
         if resp.status_code not in (200, 201, 204):
             try:
                 err = resp.json()
@@ -1095,9 +1090,7 @@ async def replace_isis_service(
         body["interface-config"] = interfaces
     if processes:
         body["process-config"] = processes
-    await replace_service_instance(
-        client, _ISIS_SERVICE_PATH, "isis-reconciler:isis-config", device_name, body
-    )
+    await replace_service_instance(client, _ISIS_SERVICE_PATH, "isis-reconciler:isis-config", device_name, body)
 
 
 async def apply_bgp_config(
@@ -1196,6 +1189,40 @@ async def apply_bgp_config(
     )
 
 
+# Route-map intent entry keys → route-policy-reconciler YANG leaf names. The plugin
+# pushes YANG-shaped keys; legacy intents carried snake_case / "match"+"set" dict
+# blobs — normalise both so a stale row can't 400 the RESTCONF call.
+_RM_ENTRY_KEY_MAP = {
+    "sequence": "sequence",
+    "action": "action",
+    "match-prefix-lists": "match-prefix-lists",
+    "match_prefix_lists": "match-prefix-lists",
+    "match-community-lists": "match-community-lists",
+    "match_community_lists": "match-community-lists",
+    "match-as-paths": "match-as-paths",
+    "match_as_paths": "match-as-paths",
+    "match-json": "match-json",
+    "match_json": "match-json",
+    "match": "match-json",
+    "set-json": "set-json",
+    "set_json": "set-json",
+    "set": "set-json",
+}
+
+
+def _normalize_route_map_entry(entry: dict) -> dict:
+    """Map a stored route-map intent entry onto the reconciler's YANG leaf names."""
+    out: dict = {}
+    for key, value in entry.items():
+        yang_key = _RM_ENTRY_KEY_MAP.get(key)
+        if yang_key is None:
+            continue
+        if yang_key in ("match-json", "set-json") and not isinstance(value, str):
+            value = json.dumps(value or {}, sort_keys=True)
+        out[yang_key] = value
+    return out
+
+
 async def apply_route_policy_config(
     client: NsoClient,
     device_name: str,
@@ -1215,20 +1242,19 @@ async def apply_route_policy_config(
 
     by_family: dict[str, list] = defaultdict(list)
     for row in intent_rows:
-        by_family[row.family].append({"name": row.name, "entries": row.entries})
+        entries = row.entries
+        if row.family == "route_map":
+            entries = [_normalize_route_map_entry(e) for e in entries if isinstance(e, dict)]
+        by_family[row.family].append({"name": row.name, "entries": entries})
 
     body = {
         "device": device_name,
-        "prefix-list": [
-            {"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("prefix_list", [])
-        ],
+        "prefix-list": [{"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("prefix_list", [])],
         "community-list": [
             {"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("community_list", [])
         ],
         "as-path": [{"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("as_path", [])],
-        "route-map": [
-            {"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("route_map", [])
-        ],
+        "route-map": [{"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("route_map", [])],
     }
     return await _send_service_config(
         client,

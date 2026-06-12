@@ -3,11 +3,10 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-from types import SimpleNamespace
 
 from nso_adapter.nso import apply as apply_mod
 from nso_adapter.nso.apply import (
@@ -220,9 +219,7 @@ async def test_apply_l2_saps_nso_error_raises():
     client._client.return_value = _mock_http_ctx(_mock_httpx_response(409, json_data={"error": {}}))
 
     with pytest.raises(NsoApplyError) as exc_info:
-        await apply_l2_saps(
-            client=client, device_name="ra1", sap_intent_rows=[_SapRow("TL", "epipe", "lag-60:1")]
-        )
+        await apply_l2_saps(client=client, device_name="ra1", sap_intent_rows=[_SapRow("TL", "epipe", "lag-60:1")])
     assert exc_info.value.code == "nso_patch_failed"
 
 
@@ -267,9 +264,7 @@ async def test_apply_lag_config_nso_error_raises():
     client._client.return_value = _mock_http_ctx(_mock_httpx_response(409, json_data={"error": {}}))
 
     with pytest.raises(NsoApplyError) as exc_info:
-        await apply_lag_config(
-            client=client, device_name="sw03", bundles=[{"name": "Port-channel1", "lag-id": 1}]
-        )
+        await apply_lag_config(client=client, device_name="sw03", bundles=[{"name": "Port-channel1", "lag-id": 1}])
     assert exc_info.value.code == "nso_patch_failed"
 
 
@@ -366,8 +361,14 @@ async def test_apply_interface_ips_nokia_routed_context():
 
     row = _make_ip_row("7.7.7.7/32", family="ipv4", vrf="CRPD-VPN")
     await apply_interface_ips(
-        client, "ra1", "CRPD-VPN:LO7", [row],
-        kind="vprn", service="CRPD-VPN", parent_binding="lag-99", encap_tag="10",
+        client,
+        "ra1",
+        "CRPD-VPN:LO7",
+        [row],
+        kind="vprn",
+        service="CRPD-VPN",
+        parent_binding="lag-99",
+        encap_tag="10",
     )
 
     import json
@@ -392,9 +393,9 @@ async def test_apply_interface_ips_no_kind_omits_routed_fields():
 
     import json
 
-    entry = json.loads(
-        client._client.return_value.__aenter__.return_value.patch.call_args.kwargs["content"]
-    )["interface-reconciler:interface-config"][0]
+    entry = json.loads(client._client.return_value.__aenter__.return_value.patch.call_args.kwargs["content"])[
+        "interface-reconciler:interface-config"
+    ][0]
     assert "kind" not in entry and "parent-binding" not in entry
 
 
@@ -476,7 +477,9 @@ class TestDeviceDeltaFromDryRun:
 async def test_verify_raises_on_nonempty_delta():
     """A non-empty native device delta after apply is a false success → raise."""
     client = _make_nso_client()
-    body = {"dry-run-result": {"native": {"device": [{"name": "sw03", "data": "ip route 1.0.0.0 255.0.0.0 2.2.2.2 1\n"}]}}}
+    body = {
+        "dry-run-result": {"native": {"device": [{"name": "sw03", "data": "ip route 1.0.0.0 255.0.0.0 2.2.2.2 1\n"}]}}
+    }
     client._client.return_value = _mock_http_ctx(_mock_httpx_response(200, json_data=body))
 
     with pytest.raises(NsoApplyError) as exc_info:
@@ -488,7 +491,9 @@ async def test_verify_raises_on_nonempty_delta():
 @pytest.mark.asyncio
 async def test_verify_passes_on_empty_delta():
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(200, json_data={"dry-run-result": {"native": {}}}))
+    client._client.return_value = _mock_http_ctx(
+        _mock_httpx_response(200, json_data={"dry-run-result": {"native": {}}})
+    )
     await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="vlan")  # no raise
 
 
@@ -555,16 +560,27 @@ async def test_apply_bgp_config_uses_correct_yang_keys():
     client._client.return_value = ctx
 
     paf = SimpleNamespace(
-        af="ipv4-unicast", enabled=True,
-        routemap_in=None, routemap_out=None, prefixlist_in=None, prefixlist_out=None,
+        af="ipv4-unicast",
+        enabled=True,
+        routemap_in=None,
+        routemap_out=None,
+        prefixlist_in=None,
+        prefixlist_out=None,
     )
     peer = SimpleNamespace(
-        peer_address="192.168.204.2", enabled=True, peer_group=None,
-        remote_as=65100, local_as=None, ttl=None, password=None,
+        peer_address="192.168.204.2",
+        enabled=True,
+        peer_group=None,
+        remote_as=65100,
+        local_as=None,
+        ttl=None,
+        password=None,
         peer_address_families=[paf],
     )
     scope = SimpleNamespace(
-        vrf="", address_families=[SimpleNamespace(af="ipv4-unicast")], peers=[peer],
+        vrf="",
+        address_families=[SimpleNamespace(af="ipv4-unicast")],
+        peers=[peer],
     )
     router = SimpleNamespace(asn=65100, scopes=[scope])
 
@@ -588,8 +604,13 @@ def test_build_isis_process_payload_attaches_flex_algo():
     from nso_adapter.nso.apply import build_isis_process_payload
 
     fa = SimpleNamespace(
-        process_tag="NA4-CORE", algo_id=130, metric_type="delay-metric", priority=200,
-        admin_group_exclude="RED", admin_group_include_any=None, admin_group_include_all=None,
+        process_tag="NA4-CORE",
+        algo_id=130,
+        metric_type="delay-metric",
+        priority=200,
+        admin_group_exclude="RED",
+        admin_group_include_any=None,
+        admin_group_include_all=None,
     )
     procs = build_isis_process_payload(isis_process_rows=[], redistribution_rows=[], flex_algo_rows=[fa])
     assert len(procs) == 1
@@ -605,8 +626,15 @@ def test_build_isis_process_payload_omits_empty_enums():
     from nso_adapter.nso.apply import build_isis_process_payload
 
     row = SimpleNamespace(
-        process_tag="0", net="49.0001.00", is_type="", metric_style="", overload_bit=None,
-        area_auth_type="", area_auth_key=None, domain_auth_type="", domain_auth_key=None,
+        process_tag="0",
+        net="49.0001.00",
+        is_type="",
+        metric_style="",
+        overload_bit=None,
+        area_auth_type="",
+        area_auth_key=None,
+        domain_auth_type="",
+        domain_auth_key=None,
     )
     procs = build_isis_process_payload(isis_process_rows=[row], redistribution_rows=[], flex_algo_rows=[])
     assert "metric-style" not in procs[0]
@@ -619,8 +647,13 @@ def test_build_isis_interface_payload_normalises_circuit_type():
     from nso_adapter.nso.apply import build_isis_interface_payload
 
     row = SimpleNamespace(
-        interface_name="ae2.0", af="ipv4", process_tag="", passive=False,
-        circuit_type="level-2", network_type=None, metric=10,
+        interface_name="ae2.0",
+        af="ipv4",
+        process_tag="",
+        passive=False,
+        circuit_type="level-2",
+        network_type=None,
+        metric=10,
     )
     ifaces = build_isis_interface_payload([row])
     assert ifaces[0]["circuit-type"] == "level-2-only"
@@ -665,8 +698,11 @@ async def test_replace_service_instance_puts_keyed_instance():
     client._client.return_value = ctx
 
     await replace_service_instance(
-        client, "/restconf/data/vlan-reconciler:vlan-config", "vlan-reconciler:vlan-config",
-        "sw3", {"device": "sw3", "vlan": [{"vlan-id": 10}]},
+        client,
+        "/restconf/data/vlan-reconciler:vlan-config",
+        "vlan-reconciler:vlan-config",
+        "sw3",
+        {"device": "sw3", "vlan": [{"vlan-id": 10}]},
     )
     (url,) = mock_http.put.call_args[0]
     assert url.endswith("vlan-reconciler:vlan-config=sw3")
@@ -722,3 +758,38 @@ async def test_apply_static_routes_replace_puts_keyed_instance():
     body = json.loads(mock_http.put.call_args_list[0][1]["content"])
     assert body["static-route-reconciler:static-route-config"][0]["route"][0]["prefix"] == "10.0.0.0/8"
     mock_http.patch.assert_not_called()
+
+
+def test_normalize_route_map_entry_yang_shape_passthrough():
+    """New plugin payloads already use the YANG leaf names — preserved verbatim."""
+    entry = {
+        "sequence": 10,
+        "action": "permit",
+        "match-prefix-lists": ["PL-1"],
+        "match-community-lists": [],
+        "match-as-paths": [],
+        "match-json": '{"protocol": ["direct"], "to_protocol": ["bgp"]}',
+        "set-json": '{"next_hop_self": true}',
+    }
+    assert apply_mod._normalize_route_map_entry(entry) == entry
+
+
+def test_normalize_route_map_entry_legacy_shape():
+    """Legacy intents carried match/set blobs (dict or str) and no match refs —
+    mapped onto match-json/set-json; unknown keys dropped (RESTCONF would 400)."""
+    entry = {
+        "sequence": 10,
+        "action": "deny",
+        "match": {"x": 1},
+        "set": '{"local_preference": 200}',
+        "match_prefix_lists": ["PL-1"],
+        "bogus": "dropped",
+    }
+    out = apply_mod._normalize_route_map_entry(entry)
+    assert out == {
+        "sequence": 10,
+        "action": "deny",
+        "match-json": '{"x": 1}',
+        "set-json": '{"local_preference": 200}',
+        "match-prefix-lists": ["PL-1"],
+    }
