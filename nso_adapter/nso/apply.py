@@ -400,6 +400,9 @@ _VLAN_SERVICE_PATH = "/restconf/data/vlan-reconciler:vlan-config"
 # RESTCONF path to the bfd-reconciler service list (per-interface BFD write path)
 _BFD_SERVICE_PATH = "/restconf/data/bfd-reconciler:bfd-config"
 
+# RESTCONF path to the mtu-reconciler service list (per-interface MTU write path, Phase 2b)
+_MTU_SERVICE_PATH = "/restconf/data/mtu-reconciler:mtu-config"
+
 # RESTCONF path to the l2-sap-reconciler service list (M37 P2b)
 _L2_SAP_SERVICE_PATH = "/restconf/data/l2-sap-reconciler:l2-sap-config"
 
@@ -711,6 +714,45 @@ async def apply_bfd_config(
         device_name,
         {"device": device_name, "interface": interfaces},
         scope="bfd",
+        replace=replace,
+        dry_run=dry_run,
+    )
+
+
+async def apply_mtu_config(
+    client: NsoClient,
+    device_name: str,
+    mtu_intent_rows: list,
+    *,
+    replace: bool = False,
+    dry_run: bool = False,
+) -> str | None:
+    """Write the per-interface MTU intent snapshot for a device to NSO (Phase 2b).
+
+    Materialises native L2 mtu / ip-mtu / mpls-mtu via the mtu-reconciler (IOS
+    interface mtu + subif ip mtu; IOS-XR interface mtu + ipv4 mtu; Junos physical
+    mtu + unit family mtu; Nokia port ethernet mtu + router interface ip-mtu).
+    Reconcile mode. ``replace=True`` PUT-replaces the keyed instance so removed
+    MTU interfaces are reverted.
+    """
+    interfaces = []
+    for row in mtu_intent_rows:
+        entry: dict = {"interface-name": row.interface_name}
+        if row.mtu is not None:
+            entry["mtu"] = row.mtu
+        if row.ip_mtu is not None:
+            entry["ip-mtu"] = row.ip_mtu
+        if row.mpls_mtu is not None:
+            entry["mpls-mtu"] = row.mpls_mtu
+        interfaces.append(entry)
+
+    return await _send_service_config(
+        client,
+        _MTU_SERVICE_PATH,
+        "mtu-reconciler:mtu-config",
+        device_name,
+        {"device": device_name, "interface": interfaces},
+        scope="interface_mtu",
         replace=replace,
         dry_run=dry_run,
     )

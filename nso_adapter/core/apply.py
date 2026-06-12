@@ -43,6 +43,7 @@ from nso_adapter.store.models import (
     SnmpHostIntent,
     SnmpSystemInfoIntent,
     BfdIntent,
+    InterfaceMtuIntent,
     SnmpV3UserIntent,
     StaticRouteIntent,
     SubinterfaceIntent,
@@ -306,6 +307,13 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
             client=client, device_name=device_name, bfd_intent_rows=bfd, dry_run=True,
         ))
 
+    # ── Interface MTU (Phase 2b) ─────────────────────────────────────────────────
+    mtu = await _accepted(InterfaceMtuIntent)
+    if mtu:
+        await _record("interface_mtu", nso_apply.apply_mtu_config(
+            client=client, device_name=device_name, mtu_intent_rows=mtu, dry_run=True,
+        ))
+
     # ── L2 SAPs (Nokia epipe/vpls) ───────────────────────────────────────────────
     l2 = await _accepted(L2SapIntent)
     if l2:
@@ -331,6 +339,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
         apply_route_policy_config,
         apply_snmp_config,
         apply_bfd_config,
+        apply_mtu_config,
         apply_static_routes,
         apply_subinterface_config,
         apply_svi_config,
@@ -523,6 +532,16 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 if not force and row.last_apply_at is not None and row.last_apply_error is None:
                     continue
                 bfd_eligible.append(row)
+
+            # Collect per-interface MTU intent rows (Phase 2b write path)
+            mtu_eligible: list[InterfaceMtuIntent] = []
+            mtu_result = await db.execute(select(InterfaceMtuIntent).where(InterfaceMtuIntent.device_id == device_id))
+            for row in mtu_result.scalars().all():
+                if row.accepted_at is None:
+                    continue
+                if not force and row.last_apply_at is not None and row.last_apply_error is None:
+                    continue
+                mtu_eligible.append(row)
 
             # Collect L2 SAP intent rows (M37 P2b — Nokia SAP write path)
             l2_eligible: list[L2SapIntent] = []
@@ -1018,6 +1037,33 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     bfd_outcome_failed = len(bfd_eligible)
                     bfd_failed.append({"error": repr(exc)})
 
+            # ── Step 6c1f: per-interface MTU intent pass (Phase 2b) ──────────
+            mtu_outcome_ok = 0
+            mtu_outcome_failed = 0
+            mtu_failed: list[dict] = []
+
+            if mtu_eligible:
+                try:
+                    await apply_mtu_config(client=client, device_name=device_name, mtu_intent_rows=mtu_eligible)
+                    for row in mtu_eligible:
+                        row.last_apply_at = now
+                        row.last_apply_error = None
+                    mtu_outcome_ok = len(mtu_eligible)
+                except NsoApplyError as exc:
+                    logger.error("apply.interface_mtu_failed", job_id=job_id, device=device_name, error=exc.message)
+                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
+                    for row in mtu_eligible:
+                        row.last_apply_error = err_payload
+                    mtu_outcome_failed = len(mtu_eligible)
+                    mtu_failed.append({"error": exc.message})
+                except Exception as exc:
+                    logger.exception("apply.interface_mtu_unexpected_error", job_id=job_id)
+                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
+                    for row in mtu_eligible:
+                        row.last_apply_error = err_payload
+                    mtu_outcome_failed = len(mtu_eligible)
+                    mtu_failed.append({"error": repr(exc)})
+
             # ── Step 6c2: L2 SAP intent pass (M37 P2b) ───────────────────────
             l2_outcome_ok = 0
             l2_outcome_failed = 0
@@ -1272,6 +1318,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 and not subif_eligible
                 and not vlan_eligible
                 and not bfd_eligible
+                and not mtu_eligible
                 and not l2_eligible
                 and not isis_eligible
                 and not bgp_eligible
@@ -1290,6 +1337,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     "subinterface_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "vlan_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "bfd_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+                    "interface_mtu_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "l2_sap_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "isis_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
                     "bgp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
@@ -1309,6 +1357,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 + subif_outcome_failed
                 + vlan_outcome_failed
                 + bfd_outcome_failed
+                + mtu_outcome_failed
                 + l2_outcome_failed
                 + isis_outcome_failed
                 + bgp_outcome_failed
@@ -1352,6 +1401,10 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     "in_sync": bfd_outcome_ok,
                     "apply_failed": bfd_outcome_failed,
                 },
+                "interface_mtu_count_by_outcome": {
+                    "in_sync": mtu_outcome_ok,
+                    "apply_failed": mtu_outcome_failed,
+                },
                 "l2_sap_count_by_outcome": {
                     "in_sync": l2_outcome_ok,
                     "apply_failed": l2_outcome_failed,
@@ -1387,6 +1440,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     + [{"type": "subinterface", **a} for a in subif_failed]
                     + [{"type": "vlan", **a} for a in vlan_failed]
                     + [{"type": "bfd", **a} for a in bfd_failed]
+                    + [{"type": "interface_mtu", **a} for a in mtu_failed]
                     + [{"type": "l2_sap", **a} for a in l2_failed]
                     + [{"type": "isis", **a} for a in isis_failed]
                     + [{"type": "bgp", **a} for a in bgp_failed]

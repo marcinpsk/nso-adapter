@@ -7,6 +7,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy import select
 
 from tests.conftest import VALID_TOKEN, seed_device
 
@@ -55,3 +56,42 @@ async def test_interface_mtu_unknown_device_is_404(adapter_client):
 async def test_interface_mtu_requires_auth(adapter_client):
     resp = await adapter_client.get("/api/v1/devices/1/interface-mtu")
     assert resp.status_code in (401, 403)
+
+
+async def _count_mtu_intent(device_id: int) -> int:
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import InterfaceMtuIntent
+
+    async for db in get_session():
+        rows = (
+            await db.execute(select(InterfaceMtuIntent).where(InterfaceMtuIntent.device_id == device_id))
+        ).scalars().all()
+        return len(rows)
+    return 0
+
+
+@pytest.mark.anyio
+async def test_put_interface_mtu_intent_stores_and_full_replaces(adapter_client):
+    device_id = await seed_device()
+    body = {"interfaces": [
+        {"interface_name": "Port-channel1", "mtu": 9216},
+        {"interface_name": "LAG99:99", "ip_mtu": 9170},
+    ]}
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/interface-mtu-intent", json=body, headers=AUTH)
+    assert resp.status_code == 200 and resp.json()["count"] == 2
+    assert await _count_mtu_intent(device_id) == 2
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/interface-mtu-intent",
+        json={"interfaces": [{"interface_name": "LAG99:99", "ip_mtu": 9170}]},
+        headers=AUTH,
+    )
+    assert resp.json()["count"] == 1
+    assert await _count_mtu_intent(device_id) == 1
+
+
+@pytest.mark.anyio
+async def test_put_interface_mtu_intent_unknown_device_404(adapter_client):
+    resp = await adapter_client.put(
+        "/api/v1/devices/999999/interface-mtu-intent", json={"interfaces": []}, headers=AUTH
+    )
+    assert resp.status_code == 404

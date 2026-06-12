@@ -177,6 +177,9 @@ class Device(Base):
     interface_mtus: Mapped[list[DeviceInterfaceMtu]] = relationship(
         "DeviceInterfaceMtu", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
+    interface_mtu_intents: Mapped[list[InterfaceMtuIntent]] = relationship(
+        "InterfaceMtuIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
     isis_interface_intents: Mapped[list[IsisInterfaceIntent]] = relationship(
         "IsisInterfaceIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
@@ -1152,6 +1155,27 @@ class BfdIntent(Base):
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     device: Mapped[Device] = relationship("Device", back_populates="bfd_intents")
+
+
+class InterfaceMtuIntent(Base):
+    """Write-path intent for per-interface MTU accepted by the operator (Phase 2b)."""
+
+    __tablename__ = "interface_mtu_intent"
+    __table_args__ = (UniqueConstraint("device_id", "interface_name", name="uq_ifmtuintent_identity"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    interface_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    mtu: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ip_mtu: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mpls_mtu: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    device: Mapped[Device] = relationship("Device", back_populates="interface_mtu_intents")
 
 
 class IsisInterfaceIntent(Base):
