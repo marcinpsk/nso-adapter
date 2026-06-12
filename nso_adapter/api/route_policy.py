@@ -242,8 +242,8 @@ async def put_route_policy_intent(
         }
 
     Each object with ``"accepted": true`` gets ``accepted_at`` stamped.
-    Objects not present in this PUT are left untouched (partial-update semantics —
-    callers send only the objects they want to accept).
+    Full-replace semantics: the plugin always pushes the full owned set, so objects
+    absent from the payload are removed from the mirror.
     """
     device = await db.get(Device, device_id)
     if not device:
@@ -260,8 +260,10 @@ async def put_route_policy_intent(
     # (the plugin always pushes the full owned set).
     incoming_keys = {(o.get("family"), o.get("name")) for o in objects}
     existing_all = (
-        await db.execute(select(RoutePolicyObjectIntent).where(RoutePolicyObjectIntent.device_id == device_id))
-    ).scalars().all()
+        (await db.execute(select(RoutePolicyObjectIntent).where(RoutePolicyObjectIntent.device_id == device_id)))
+        .scalars()
+        .all()
+    )
     removed = [(r.family, r.name) for r in existing_all if (r.family, r.name) not in incoming_keys]
     for r in existing_all:
         if (r.family, r.name) not in incoming_keys:
