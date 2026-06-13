@@ -56,6 +56,7 @@ source = ["nso_adapter"]
 # these as part of any change that touches the listed files. Extract pure
 # logic into testable helpers; let the thin lifecycle wrapper carry low
 # coverage as a signal, not hide it.
+branch = true
 omit = [
     "*/alembic/*",
     # GRANDFATHERED — scheduler lifecycle requires APScheduler integration.
