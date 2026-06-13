@@ -17,6 +17,7 @@ import structlog
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import (
     Device,
@@ -45,6 +46,9 @@ async def _upsert_route_policy_data(
     refresh_source: str,
 ) -> None:
     """Full-replace: delete existing route-policy rows for *device*, then insert."""
+    # Per-NED community members are normalised to the canonical (Cisco/Junos) form
+    # on the way in, so the plugin and drift-detection compare like-for-like.
+    dialect = community_dialect_for(device.ned_id)
     await db.execute(delete(DeviceRoutePolicyPrefixList).where(DeviceRoutePolicyPrefixList.device_id == device.id))
     await db.execute(
         delete(DeviceRoutePolicyCommunityList).where(DeviceRoutePolicyCommunityList.device_id == device.id)
@@ -91,7 +95,7 @@ async def _upsert_route_policy_data(
                 community_list_id=cl.id,
                 sequence=e["sequence"],
                 action=e["action"],
-                community=e["community"],
+                community=dialect.to_canonical(e["community"]),
             )
             db.add(entry)
 

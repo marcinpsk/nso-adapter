@@ -1269,6 +1269,7 @@ async def apply_route_policy_config(
     device_name: str,
     intent_rows: list,
     *,
+    ned_id: str | None = None,
     replace: bool = False,
     dry_run: bool = False,
 ) -> str | None:
@@ -1278,8 +1279,19 @@ async def apply_route_policy_config(
     payload per docs/m17-route-policy-contract.md §2 (reconcile semantics).
     ``replace=True`` PUT-replaces the keyed instance so removed policy objects are
     reverted. Raises NsoApplyError on failure.
+
+    Community members are stored canonically (Cisco/Junos form) in NetBox but each NED
+    spells them differently; ``ned_id`` selects the dialect that translates them to the
+    device's wire form. Members the NED cannot represent (e.g. ``color:`` on Nokia) are
+    dropped from this device's push — so one bad member can't abort the whole community —
+    and logged per-device on a real apply (``dry_run=False``) for the operator/auto-apply
+    journal.
     """
     from collections import defaultdict
+
+    from nso_adapter.core.community_dialect import UNREPRESENTABLE, community_dialect_for
+
+    dialect = community_dialect_for(ned_id)
 
     by_family: dict[str, list] = defaultdict(list)
     for row in intent_rows:
@@ -1288,12 +1300,29 @@ async def apply_route_policy_config(
             entries = [_normalize_route_map_entry(e) for e in entries if isinstance(e, dict)]
         by_family[row.family].append({"name": row.name, "entries": entries})
 
+    def _community_list_entry(obj: dict) -> dict:
+        """Translate this community's members to the device dialect, skipping any the NED can't hold."""
+        kept: list = []
+        for entry in obj["entries"]:
+            wire = dialect.from_canonical(entry["community"])
+            if wire is UNREPRESENTABLE:
+                if not dry_run:
+                    logger.warning(
+                        "apply.route_policy.member_skipped",
+                        device=device_name,
+                        ned_id=ned_id,
+                        community=obj["name"],
+                        member=entry["community"],
+                        reason="unrepresentable_on_ned",
+                    )
+                continue
+            kept.append({**entry, "community": wire} if wire != entry["community"] else entry)
+        return {"name": obj["name"], "entry": kept}
+
     body = {
         "device": device_name,
         "prefix-list": [{"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("prefix_list", [])],
-        "community-list": [
-            {"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("community_list", [])
-        ],
+        "community-list": [_community_list_entry(obj) for obj in by_family.get("community_list", [])],
         "as-path": [{"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("as_path", [])],
         "route-map": [{"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("route_map", [])],
     }

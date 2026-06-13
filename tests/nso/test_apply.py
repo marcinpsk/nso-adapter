@@ -764,6 +764,73 @@ async def test_apply_static_routes_replace_puts_keyed_instance():
     mock_http.patch.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_apply_route_policy_translates_and_skips_members_per_ned():
+    """On a Nokia (timos) device the canonical community members are translated to
+    the SR OS dialect and the ones it can't represent (``color:``) are dropped from
+    the pushed body — so one bad member can't abort the whole community."""
+    import json
+
+    from nso_adapter.nso.apply import apply_route_policy_config
+
+    client = _make_nso_client()
+    mock_http = AsyncMock()
+    mock_http.patch.return_value = _mock_httpx_response(204)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=mock_http)
+    ctx.__aexit__ = AsyncMock(return_value=None)
+    client._client.return_value = ctx
+
+    entries = [
+        {"sequence": 10, "action": "permit", "community": "6830:1234"},
+        {"sequence": 20, "action": "permit", "community": "6830:.*"},  # digit-domain regex kept
+        {"sequence": 30, "action": "permit", "community": "target:6830:1234"},
+        {"sequence": 40, "action": "permit", "community": "large:6830:6370:1234"},  # exact → strip large:
+        {"sequence": 50, "action": "permit", "community": "color:0:128"},  # no SR OS keyword
+        {"sequence": 60, "action": "permit", "community": "color:0:12."},  # no SR OS keyword
+        {"sequence": 70, "action": "permit", "community": "no-export"},
+    ]
+    rows = [SimpleNamespace(family="community_list", name="cnad-test", entries=entries)]
+
+    await apply_route_policy_config(client=client, device_name="ra1", intent_rows=rows, ned_id="timos-nc-23.10")
+
+    body = json.loads(mock_http.patch.call_args_list[0][1]["content"])
+    cl = body["route-policy-reconciler:route-policy-config"][0]["community-list"][0]
+    members = [e["community"] for e in cl["entry"]]
+    assert members == ["6830:1234", "6830:.*", "target:6830:1234", "6830:6370:1234", "no-export"]
+
+
+@pytest.mark.asyncio
+async def test_apply_route_policy_keeps_all_members_on_identity_ned():
+    """A NED with no dialect override (IOS-XR here) keeps every member verbatim —
+    ``color:`` is a valid Cisco extcommunity, so nothing is dropped."""
+    import json
+
+    from nso_adapter.nso.apply import apply_route_policy_config
+
+    client = _make_nso_client()
+    mock_http = AsyncMock()
+    mock_http.patch.return_value = _mock_httpx_response(204)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=mock_http)
+    ctx.__aexit__ = AsyncMock(return_value=None)
+    client._client.return_value = ctx
+
+    entries = [
+        {"sequence": 10, "action": "permit", "community": "color:0:128"},
+        {"sequence": 20, "action": "permit", "community": "large:6830:6370:.*"},
+    ]
+    rows = [SimpleNamespace(family="community_list", name="cnad-test", entries=entries)]
+
+    await apply_route_policy_config(client=client, device_name="rx", intent_rows=rows, ned_id="cisco-iosxr-cli-7.76")
+
+    body = json.loads(mock_http.patch.call_args_list[0][1]["content"])
+    members = [
+        e["community"] for e in body["route-policy-reconciler:route-policy-config"][0]["community-list"][0]["entry"]
+    ]
+    assert members == ["color:0:128", "large:6830:6370:.*"]  # untouched
+
+
 def test_normalize_route_map_entry_yang_shape_passthrough():
     """New plugin payloads already use the YANG leaf names — preserved verbatim."""
     entry = {

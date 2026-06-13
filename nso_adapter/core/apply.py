@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.store.models import (
+    BfdIntent,
     BgpRouterIntent,
     DbInterface,
     Device,
@@ -28,6 +29,7 @@ from nso_adapter.store.models import (
     InterfaceAttrState,
     InterfaceIntent,
     InterfaceIpIntent,
+    InterfaceMtuIntent,
     IsisFlexAlgoIntent,
     IsisInterfaceIntent,
     IsisProcessIntent,
@@ -43,8 +45,6 @@ from nso_adapter.store.models import (
     SnmpCommunityIntent,
     SnmpHostIntent,
     SnmpSystemInfoIntent,
-    BfdIntent,
-    InterfaceMtuIntent,
     SnmpV3UserIntent,
     StaticRouteIntent,
     SubinterfaceIntent,
@@ -282,6 +282,7 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
                 client=client,
                 device_name=device_name,
                 intent_rows=rp,
+                ned_id=device.ned_id,
                 dry_run=True,
             ),
         )
@@ -418,17 +419,17 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
     from nso_adapter.core.importer import get_nso_client
     from nso_adapter.nso.apply import (
         NsoApplyError,
+        apply_bfd_config,
         apply_bgp_config,
         apply_interface_attribute,
         apply_interface_ips,
         apply_isis_interfaces,
         apply_l2_saps,
         apply_logging_config,
+        apply_mtu_config,
         apply_ospf_config,
         apply_route_policy_config,
         apply_snmp_config,
-        apply_bfd_config,
-        apply_mtu_config,
         apply_static_routes,
         apply_subinterface_config,
         apply_svi_config,
@@ -1320,6 +1321,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                         client=client,
                         device_name=device_name,
                         intent_rows=rp_eligible,
+                        ned_id=device.ned_id,
                     )
                     for row in rp_eligible:
                         row.last_apply_at = now
