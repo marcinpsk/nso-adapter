@@ -677,7 +677,8 @@ async def test_replace_isis_service_puts_keyed_instance():
     await replace_isis_service(client=client, device_name="rc1", interfaces=[{"interface-name": "ae2.0"}], processes=[])
 
     (url,) = mock_http.put.call_args[0]
-    assert url.endswith("isis-reconciler:isis-config=rc1")
+    assert url.split("?")[0].endswith("isis-reconciler:isis-config=rc1")
+    assert "reconcile=keep-non-service-config" in url
     body = json.loads(mock_http.put.call_args[1]["content"])
     assert body["isis-reconciler:isis-config"][0]["device"] == "rc1"
 
@@ -705,7 +706,8 @@ async def test_replace_service_instance_puts_keyed_instance():
         {"device": "sw3", "vlan": [{"vlan-id": 10}]},
     )
     (url,) = mock_http.put.call_args[0]
-    assert url.endswith("vlan-reconciler:vlan-config=sw3")
+    assert url.split("?")[0].endswith("vlan-reconciler:vlan-config=sw3")
+    assert "reconcile=keep-non-service-config" in url
     body = json.loads(mock_http.put.call_args[1]["content"])
     assert body["vlan-reconciler:vlan-config"][0]["vlan"][0]["vlan-id"] == 10
 
@@ -730,7 +732,8 @@ async def test_apply_vlan_config_replace_puts_remaining_list():
     await apply_vlan_config(client=client, device_name="sw3", vlan_intent_rows=rows, replace=True)
     # First PUT is the real replace; the second is the native dry-run verify.
     (url,) = mock_http.put.call_args_list[0][0]
-    assert url.endswith("vlan-reconciler:vlan-config=sw3")
+    assert url.split("?")[0].endswith("vlan-reconciler:vlan-config=sw3")
+    assert "reconcile=keep-non-service-config" in url
     body = json.loads(mock_http.put.call_args_list[0][1]["content"])
     vids = [v["vlan-id"] for v in body["vlan-reconciler:vlan-config"][0]["vlan"]]
     assert vids == [10]
@@ -754,7 +757,8 @@ async def test_apply_static_routes_replace_puts_keyed_instance():
     rows = [SimpleNamespace(vrf="", prefix="10.0.0.0/8", next_hop="1.1.1.1", metric=1, permanent=False, tag=None)]
     await apply_static_routes(client=client, device_name="sw3", route_intent_rows=rows, replace=True)
     (url,) = mock_http.put.call_args_list[0][0]
-    assert url.endswith("static-route-reconciler:static-route-config=sw3")
+    assert url.split("?")[0].endswith("static-route-reconciler:static-route-config=sw3")
+    assert "reconcile=keep-non-service-config" in url
     body = json.loads(mock_http.put.call_args_list[0][1]["content"])
     assert body["static-route-reconciler:static-route-config"][0]["route"][0]["prefix"] == "10.0.0.0/8"
     mock_http.patch.assert_not_called()
@@ -846,3 +850,62 @@ async def test_apply_ospf_replace_body_keeps_enabled():
     payload = json.loads(mock_http.put.call_args_list[0][1]["content"])
     proc = payload["ospf-reconciler:ospf-config"][0]["process-config"][0]
     assert proc["enabled"] is True
+
+
+# ── reconcile commit option (brownfield adoption) ────────────────────────────
+
+
+def test_commit_url_appends_reconcile_by_default(monkeypatch):
+    """A plain service write gets ``?reconcile=keep-non-service-config``."""
+    from nso_adapter.nso.apply import _commit_url
+
+    monkeypatch.setattr(apply_mod, "RECONCILE_COMMIT", "keep-non-service-config")
+    assert _commit_url("http://nso/restconf/data/x") == ("http://nso/restconf/data/x?reconcile=keep-non-service-config")
+
+
+def test_commit_url_combines_dry_run_and_reconcile(monkeypatch):
+    """dry_run=True adds ``dry-run=native`` alongside reconcile (NSO accepts both)."""
+    from nso_adapter.nso.apply import _commit_url
+
+    monkeypatch.setattr(apply_mod, "RECONCILE_COMMIT", "keep-non-service-config")
+    assert _commit_url("http://nso/x", dry_run=True) == (
+        "http://nso/x?dry-run=native&reconcile=keep-non-service-config"
+    )
+
+
+def test_commit_url_uses_ampersand_when_url_has_query(monkeypatch):
+    """An existing ``?`` in the URL means the param is joined with ``&``."""
+    from nso_adapter.nso.apply import _commit_url
+
+    monkeypatch.setattr(apply_mod, "RECONCILE_COMMIT", "discard-non-service-config")
+    assert _commit_url("http://nso/x?already=1") == ("http://nso/x?already=1&reconcile=discard-non-service-config")
+
+
+def test_commit_url_no_param_when_disabled(monkeypatch):
+    """Empty RECONCILE_COMMIT reverts to a plain commit (no reconcile param)."""
+    from nso_adapter.nso.apply import _commit_url
+
+    monkeypatch.setattr(apply_mod, "RECONCILE_COMMIT", "")
+    assert _commit_url("http://nso/x") == "http://nso/x"
+    assert _commit_url("http://nso/x", dry_run=True) == "http://nso/x?dry-run=native"
+
+
+@pytest.mark.asyncio
+async def test_apply_real_commit_carries_reconcile_and_dry_run_does_too(monkeypatch):
+    """The real PATCH commits with reconcile; the post-apply verify dry-run carries
+    both dry-run=native and reconcile so the preview matches the commit."""
+    monkeypatch.setattr(apply_mod, "RECONCILE_COMMIT", "keep-non-service-config")
+    client = _make_nso_client()
+    client._client.return_value = _mock_http_ctx(_mock_httpx_response(204))
+
+    await apply_interface_attribute(client, "core-rtr-01", "Gi0/0", "description", "uplink")
+
+    mock_http = client._client.return_value.__aenter__.return_value
+    real_url = mock_http.patch.call_args_list[0][0][0]
+    verify_url = mock_http.patch.call_args_list[1][0][0]
+    # Real commit: reconcile present, NOT a dry-run.
+    assert "reconcile=keep-non-service-config" in real_url
+    assert "dry-run" not in real_url
+    # Verify dry-run: both params.
+    assert "dry-run=native" in verify_url
+    assert "reconcile=keep-non-service-config" in verify_url

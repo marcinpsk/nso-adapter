@@ -32,11 +32,49 @@ logger = structlog.get_logger(__name__)
 # NED, or rejected) — i.e. a false success. Toggle off with NSO_ADAPTER_VERIFY_APPLY=0.
 VERIFY_AFTER_APPLY = os.environ.get("NSO_ADAPTER_VERIFY_APPLY", "1").strip().lower() not in ("0", "false", "no")
 
+# NSO reconcile commit option — a brownfield GUARDRAIL. When a reconciler service's
+# footprint overlaps config the device already carries as *non-service* config (pulled
+# in by sync-from), `keep-non-service-config` tells NSO to KEEP (adopt without deleting)
+# that config. Live testing on a Nokia route-target community showed `keep` is
+# equivalent to NSO's implicit default here — a plain commit already adopts brownfield
+# config rather than conflicting — so this does NOT change current behaviour; it makes
+# the safe choice EXPLICIT and immune to a deployment whose NSO global-settings (or a
+# future default) is discard. The real danger it locks out is `discard-non-service-config`,
+# which actively DELETES unmodeled config under the footprint: a partial/empty intent
+# (e.g. a community-list whose members didn't make it into the push) would, under discard,
+# wipe the device's real members. Verified live: an empty community intent under discard
+# emitted a `member delete`, under keep emitted nothing. NSO validates the value (an
+# unknown one → HTTP 400 invalid-value), so it is sent verbatim. Override with
+# NSO_ADAPTER_RECONCILE_COMMIT=discard-non-service-config, or ""/off/none for a plain
+# commit (no reconcile param — same observed result as keep on this NSO).
+_RAW_RECONCILE = os.environ.get("NSO_ADAPTER_RECONCILE_COMMIT", "keep-non-service-config").strip()
+RECONCILE_COMMIT = "" if _RAW_RECONCILE.lower() in ("", "0", "off", "false", "no", "none") else _RAW_RECONCILE
+
 # RESTCONF path to the interface-reconciler service list
 _SERVICE_PATH = "/restconf/data/interface-reconciler:interface-config"
 
 # RESTCONF path to open a write transaction and commit with reconcile
 _COMMIT_PATH = "/restconf/operations/tailf-netconf-transactions:commit"
+
+
+def _commit_url(url: str, *, dry_run: bool = False) -> str:
+    """Append NSO RESTCONF commit query params to a reconciler-service write *url*.
+
+    Always adds ``reconcile=<RECONCILE_COMMIT>`` (when configured) so every service
+    write adopts pre-existing brownfield device config instead of conflicting with it.
+    ``dry_run=True`` also adds ``dry-run=native`` (compute the southbound delta, commit
+    nothing). The two combine — NSO accepts ``?dry-run=native&reconcile=...`` and a
+    dry-run then previews exactly what the reconcile commit would do.
+    """
+    params: list[str] = []
+    if dry_run:
+        params.append("dry-run=native")
+    if RECONCILE_COMMIT:
+        params.append(f"reconcile={RECONCILE_COMMIT}")
+    if not params:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}{'&'.join(params)}"
 
 
 class NsoApplyError(Exception):
@@ -89,7 +127,7 @@ async def native_dry_run(
     ``None`` when the dry-run was inconclusive (non-2xx / transport / unparseable / wrong
     shape). Same machinery as the post-apply verify guard, surfaced for the pre-apply preview.
     """
-    dry_url = f"{url}?dry-run=native"
+    dry_url = _commit_url(url, dry_run=True)
     try:
         async with client._client(timeout=client._action_timeout) as c:
             resp = await getattr(c, method)(
@@ -167,7 +205,9 @@ async def _send_service_config(
         # Preview: compute the native device delta without committing anything.
         return await native_dry_run(client, url, payload, device_name, method=method)
     async with client._client(timeout=client._action_timeout) as c:
-        resp = await getattr(c, method)(url, content=payload, headers={"Content-Type": "application/yang-data+json"})
+        resp = await getattr(c, method)(
+            _commit_url(url), content=payload, headers={"Content-Type": "application/yang-data+json"}
+        )
         if resp.status_code not in (200, 201, 204):
             try:
                 err = resp.json()
@@ -240,9 +280,9 @@ async def apply_interface_attribute(
         return await native_dry_run(client, url, payload, device_name, method="patch")
 
     async with client._client(timeout=client._action_timeout) as c:
-        # Use PATCH to create-or-update the service instance
+        # Use PATCH to create-or-update the service instance (reconcile commit).
         resp = await c.patch(
-            url,
+            _commit_url(url),
             content=payload,
             headers={"Content-Type": "application/yang-data+json"},
         )
@@ -344,7 +384,7 @@ async def apply_interface_ips(
 
     async with client._client(timeout=client._action_timeout) as c:
         resp = await c.patch(
-            url,
+            _commit_url(url),
             content=payload,
             headers={"Content-Type": "application/yang-data+json"},
         )
@@ -977,7 +1017,7 @@ async def apply_isis_interfaces(
 
     async with client._client(timeout=client._action_timeout) as c:
         resp = await c.patch(
-            url,
+            _commit_url(url),
             content=payload,
             headers={"Content-Type": "application/yang-data+json"},
         )
@@ -1047,12 +1087,13 @@ async def replace_service_instance(
 
     *body* is the full desired instance dict (must include the ``device`` key). A body
     with only the device key clears all of this service's managed config for the device.
-    Reconcile commit is implied by the service's own commit behaviour.
+    The PUT carries the ``reconcile`` commit option (see ``_commit_url``) so the replace
+    still adopts brownfield config rather than conflicting with it.
     """
     url = f"{client._base}{service_path}={device_name}"
     payload = json.dumps({root_key: [body]})
     async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.put(url, content=payload, headers={"Content-Type": "application/yang-data+json"})
+        resp = await c.put(_commit_url(url), content=payload, headers={"Content-Type": "application/yang-data+json"})
         if resp.status_code not in (200, 201, 204):
             try:
                 err = resp.json()

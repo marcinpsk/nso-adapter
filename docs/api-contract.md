@@ -57,7 +57,9 @@ in the spec.
 ## Enums
 
 - **`mapping_status`**: `mapped` · `unmatched_device` · `unmatched_interfaces`
-- **`job.type`**: `sync` · `detect-drift` · `connect` · `apply` (Phase 2)
+- **`job.type`**: `sync` · `detect-drift` · `connect` · `apply` (Phase 2) ·
+  `removal` (async PUT-replace that reverts dropped intent — see
+  [Removal propagation](#removal-propagation))
 - **`job.status`**: `queued` · `running` · `succeeded` · `failed`
 - **`compliance_status`** (per attribute) — full lifecycle:
   - `unknown` — known to the plugin but never synced.
@@ -488,10 +490,32 @@ Once M4 lands, normal contract:
   - `nso_commit_failed` (502) — the apply ran but at least one attribute's
     commit failed; `error.detail.attributes` lists the failed ones.
 
+**Reconcile commit (brownfield guardrail).** Every reconciler-service write (apply,
+update, and removal PUT-replace) is committed with the NSO RESTCONF
+`?reconcile=keep-non-service-config` query parameter. When a service's footprint
+overlaps config the device already carries as *non-service* config (pulled into CDB
+by `sync-from`), `keep-non-service-config` tells NSO to **keep** (adopt without
+deleting) that config. Live testing (a Nokia route-target community on ra1) showed
+this is **equivalent to NSO's implicit default here** — a plain commit already adopts
+brownfield config rather than conflicting — so the param does **not** change current
+behaviour; it makes the safe choice explicit and immune to a deployment whose NSO
+global-settings (or a future default) is `discard`. What it locks out is
+`discard-non-service-config`, which actively **deletes** unmodeled config under the
+footprint: a partial/empty intent would, under discard, wipe the device's real
+config (verified live — an empty community intent emitted a `member delete` under
+discard, nothing under keep). NSO validates the value (unknown → `400 invalid-value`),
+so it is sent verbatim. The pre-apply dry-run preview (`apply-diff`) and the
+post-apply native verify carry the same param so the preview matches the commit.
+Controlled by `NSO_ADAPTER_RECONCILE_COMMIT` (default `keep-non-service-config`;
+`discard-non-service-config` to prune; `""`/`off` for a plain commit — same observed
+result as keep on this NSO).
+
 ### `GET /api/v1/devices/{id}/actions/apply-diff` → `200 | 404`
 
 Preview the per-scope **native device diff** the next Apply would push (NSO
-`?dry-run=native`; nothing is committed). Synchronous — no job. `diffs` maps
+`?dry-run=native&reconcile=keep-non-service-config`; nothing is committed — the
+reconcile param makes the preview match the real reconcile commit). Synchronous —
+no job. `diffs` maps
 scope → native delta; scopes already in sync yield an empty delta and are
 omitted. LAG/switchport have no preview (pushed out-of-band by the plugin,
 not from the intent store).
@@ -1081,8 +1105,19 @@ The `ospf-reconciler` NSO service applies the intent to device configuration.
 If the target OSPF process is absent on the device, interface entries
 referencing it are silently skipped (process-presence gate in the NSO package).
 
+**Admin-state delete-guard.** An OSPF instance is ALWAYS applied with an explicit
+`enabled` (Nokia SR OS `admin-state`): when the intent row leaves `enabled` unset
+(`None`) the apply body and the reconciler both default it to **enabled**. This is
+load-bearing on the removal path — a PUT-replace (see below) rebuilds the service
+footprint from the remaining rows, and an omitted `enabled` would drop `admin-state`
+from that footprint, which FASTMAP then deletes on the device, disabling OSPF
+entirely. An operator who genuinely wants an instance down must send `enabled: false`
+explicitly; `None` is treated as "unknown → keep enabled", never as "remove".
+
 If `auto_apply` is `true` on device settings and at least one eligible intent
-row is present, an apply job is enqueued automatically.
+row is present, an apply job is enqueued automatically. Removed instances/interfaces/
+redistribution are reverted on the device via an async removal job (see
+[Removal propagation](#removal-propagation)), not inline in this request.
 
 ---
 
@@ -1287,11 +1322,29 @@ Every `PUT /api/v1/devices/{id}/*-intent` endpoint below (and `vlan-intent`,
   the device settings, an apply job is enqueued; otherwise the next explicit
   `actions/apply` commits it via the scope's `*-reconciler` NSO service.
 - Where dropping a row from a keyed NSO service list requires it, the adapter
-  PUT-replaces the service instance so removals propagate (merge-PATCH never
-  drops; see `removal.replace_on_removal`).
-- → `200` `{ "device_id": 1, "count": <rows stored>, "removed": <rows dropped>,
-  "replaced": <bool — removal propagated via PUT-replace> }`
+  queues an async removal job (see [Removal propagation](#removal-propagation)).
+- → `200` `{ "device_id": 1, "count": <rows stored>, "removed": <rows dropped> }`.
+  The PUT returns as soon as the rows are stored; if rows were dropped a `removal`
+  job is queued and runs in the background (the response does not wait for it).
 - `404` unknown device; `422` invalid payload.
+
+### Removal propagation
+
+A merge-PATCH apply never drops a list entry the payload omits, so deleting a row
+from the intent store would otherwise leave the config orphaned on the device. To
+revert it, the owning `*-reconciler` service instance is **PUT-replaced** with the
+full remaining accepted state, which lets NSO FASTMAP delete the dropped entries.
+
+That PUT-replace is a synchronous device commit that can exceed the plugin's HTTP
+client timeout (~30s). So it does **not** run inline in the intent PUT: when an
+intent PUT drops one or more rows it enqueues a **`removal`** job (a new
+`jobtype` enum value), atomically with the row deletes, and returns immediately.
+A worker runs the job in the background, re-reading the **current** accepted rows
+and PUT-replacing the service — so the job is idempotent and is requeued (not
+failed) after a worker restart. Scope is carried in `Job.context.scope` (one of
+`route_policy · bfd · svi · subinterface · static_route · interface_mtu · vlan ·
+logging · l2_sap · ospf · bgp`). Job status is observable via `GET …/jobs` like
+any other job; a failed removal records `error.code = "removal_failed"`.
 
 ---
 
