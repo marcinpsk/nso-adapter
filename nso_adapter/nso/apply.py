@@ -1319,8 +1319,12 @@ async def apply_ospf_config(
             entry["router-id"] = row.router_id
         if row.vrf:
             entry["vrf"] = row.vrf
-        if getattr(row, "enabled", None) is not None:
-            entry["enabled"] = bool(row.enabled)
+        # Delete-guard: ALWAYS assert the admin-state. Omitting `enabled` lets a
+        # PUT-replace (removal propagation, replace=True) rebuild the service footprint
+        # without admin-state — which FASTMAP then deletes on the device, disabling OSPF
+        # entirely (Nokia SR OS needs an explicit `admin-state enable`). A managed OSPF
+        # instance defaults to enabled; an operator who wants it down sets enabled=False.
+        entry["enabled"] = bool(row.enabled) if getattr(row, "enabled", None) is not None else True
         proc_redist = redist_by_proc.get(str(row.process_id), [])
         if proc_redist:
             entry["redistribute"] = proc_redist

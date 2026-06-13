@@ -793,3 +793,56 @@ def test_normalize_route_map_entry_legacy_shape():
         "set-json": '{"local_preference": 200}',
         "match-prefix-lists": ["PL-1"],
     }
+
+
+@pytest.mark.asyncio
+async def test_apply_ospf_always_asserts_enabled_delete_guard():
+    """Delete-guard: the OSPF process body ALWAYS carries `enabled`, even when the
+    intent row leaves it None — so a PUT-replace can never drop admin-state and
+    disable OSPF. Default is True; explicit False is preserved."""
+    import json
+
+    from nso_adapter.nso.apply import apply_ospf_config
+
+    client = _make_nso_client()
+    client._client.return_value = _mock_http_ctx(_mock_httpx_response(204))
+
+    rows = [
+        SimpleNamespace(process_id="1", router_id="10.0.0.1", vrf="", enabled=None),
+        SimpleNamespace(process_id="2", router_id="10.0.0.2", vrf="", enabled=False),
+    ]
+    await apply_ospf_config(client=client, device_name="ra1", process_intent_rows=rows, interface_intent_rows=[])
+
+    mock_http = client._client.return_value.__aenter__.return_value
+    payload = json.loads(mock_http.patch.call_args[1]["content"])
+    procs = payload["ospf-reconciler:ospf-config"][0]["process-config"]
+    by_pid = {p["process-id"]: p for p in procs}
+    assert by_pid[1]["enabled"] is True  # None → default enable (guard)
+    assert by_pid[2]["enabled"] is False  # explicit disable preserved
+
+
+@pytest.mark.asyncio
+async def test_apply_ospf_replace_body_keeps_enabled():
+    """The same guard holds on the removal path (replace=True PUT-replace) — the
+    body that reverts removed rows still asserts admin-state, so a removal never
+    collaterally disables OSPF."""
+    import json
+
+    from nso_adapter.nso.apply import apply_ospf_config
+
+    client = _make_nso_client()
+    mock_http = AsyncMock()
+    mock_http.put.return_value = _mock_httpx_response(204)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=mock_http)
+    ctx.__aexit__ = AsyncMock(return_value=None)
+    client._client.return_value = ctx
+
+    rows = [SimpleNamespace(process_id="1", router_id="10.0.0.1", vrf="", enabled=None)]
+    await apply_ospf_config(
+        client=client, device_name="ra1", process_intent_rows=rows, interface_intent_rows=[], replace=True
+    )
+
+    payload = json.loads(mock_http.put.call_args_list[0][1]["content"])
+    proc = payload["ospf-reconciler:ospf-config"][0]["process-config"][0]
+    assert proc["enabled"] is True
