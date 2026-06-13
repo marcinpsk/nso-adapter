@@ -24,6 +24,7 @@ from nso_adapter.store.models import (
     BgpRouterIntent,
     DbInterface,
     Device,
+    DeviceSettings,
     InterfaceAttrState,
     InterfaceIntent,
     InterfaceIpIntent,
@@ -149,8 +150,8 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
     attr_delta = ""
     for iface in ifaces.values():
         rows = (
-            await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface.id))
-        ).scalars().all()
+            (await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface.id))).scalars().all()
+        )
         for r in rows:
             if r.accepted_at is None or r.attribute not in ("description", "enabled"):
                 continue
@@ -167,16 +168,21 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
                     attr_delta += delta
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "apply_diff.scope_failed", scope="interface_attribute", device=device_name,
-                    interface=iface.name, error=repr(exc),
+                    "apply_diff.scope_failed",
+                    scope="interface_attribute",
+                    device=device_name,
+                    interface=iface.name,
+                    error=repr(exc),
                 )
     if attr_delta.strip():
         diffs["interface_attribute"] = attr_delta
 
     # ── Interface IPs — one dry-run per interface that carries IP intent ──────────
     ip_rows = (
-        await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id.in_(list(ifaces) or [-1])))
-    ).scalars().all()
+        (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id.in_(list(ifaces) or [-1]))))
+        .scalars()
+        .all()
+    )
     by_iface: dict[int, list] = {}
     for r in ip_rows:
         by_iface.setdefault(r.interface_id, []).append(r)
@@ -200,8 +206,11 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
                 ip_delta += delta
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "apply_diff.scope_failed", scope="interface_ip", device=device_name,
-                interface=iface.name, error=repr(exc),
+                "apply_diff.scope_failed",
+                scope="interface_ip",
+                device=device_name,
+                interface=iface.name,
+                error=repr(exc),
             )
     if ip_delta.strip():
         diffs["interface_ip"] = ip_delta
@@ -216,22 +225,35 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
     ospf_inst = await _accepted(OspfInstanceIntent)
     ospf_iface = await _accepted(OspfInterfaceIntent)
     if ospf_inst or ospf_iface or redist_ospf:
-        await _record("ospf", nso_apply.apply_ospf_config(
-            client=client, device_name=device_name,
-            process_intent_rows=ospf_inst, interface_intent_rows=ospf_iface,
-            redistribution_rows=redist_ospf, dry_run=True,
-        ))
+        await _record(
+            "ospf",
+            nso_apply.apply_ospf_config(
+                client=client,
+                device_name=device_name,
+                process_intent_rows=ospf_inst,
+                interface_intent_rows=ospf_iface,
+                redistribution_rows=redist_ospf,
+                dry_run=True,
+            ),
+        )
 
     # ── IS-IS (interface + process + redistribute + flex-algo) ───────────────────
     isis_iface = await _accepted(IsisInterfaceIntent)
     isis_proc = await _accepted(IsisProcessIntent)
     isis_flex = await _accepted(IsisFlexAlgoIntent)
     if isis_iface or isis_proc or redist_isis or isis_flex:
-        await _record("isis", nso_apply.apply_isis_interfaces(
-            client=client, device_name=device_name,
-            isis_intent_rows=isis_iface, isis_process_rows=isis_proc,
-            redistribution_rows=redist_isis, flex_algo_rows=isis_flex, dry_run=True,
-        ))
+        await _record(
+            "isis",
+            nso_apply.apply_isis_interfaces(
+                client=client,
+                device_name=device_name,
+                isis_intent_rows=isis_iface,
+                isis_process_rows=isis_proc,
+                redistribution_rows=redist_isis,
+                flex_algo_rows=isis_flex,
+                dry_run=True,
+            ),
+        )
 
     # ── BGP (relationships eagerly loaded, like run_apply) ───────────────────────
     bgp = await _accepted(BgpRouterIntent)
@@ -240,17 +262,29 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
             from nso_adapter.core.bgp_load import attach_bgp_relationships
 
             await attach_bgp_relationships(db, bgp)
-        await _record("bgp", nso_apply.apply_bgp_config(
-            client=client, device_name=device_name,
-            router_intent_rows=bgp, redistribution_rows=redist_bgp, dry_run=True,
-        ))
+        await _record(
+            "bgp",
+            nso_apply.apply_bgp_config(
+                client=client,
+                device_name=device_name,
+                router_intent_rows=bgp,
+                redistribution_rows=redist_bgp,
+                dry_run=True,
+            ),
+        )
 
     # ── Route-policy objects ─────────────────────────────────────────────────────
     rp = await _accepted(RoutePolicyObjectIntent)
     if rp:
-        await _record("route_policy", nso_apply.apply_route_policy_config(
-            client=client, device_name=device_name, intent_rows=rp, dry_run=True,
-        ))
+        await _record(
+            "route_policy",
+            nso_apply.apply_route_policy_config(
+                client=client,
+                device_name=device_name,
+                intent_rows=rp,
+                dry_run=True,
+            ),
+        )
 
     # ── SNMP (communities / v3 users / hosts / system info) ──────────────────────
     snmp_comm = await _accepted(SnmpCommunityIntent)
@@ -259,67 +293,122 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
     snmp_sysinfo_rows = await _accepted(SnmpSystemInfoIntent)
     snmp_sysinfo = snmp_sysinfo_rows[0] if snmp_sysinfo_rows else None
     if snmp_comm or snmp_user or snmp_host or snmp_sysinfo:
-        await _record("snmp", nso_apply.apply_snmp_config(
-            client=client, device_name=device_name,
-            community_intents=snmp_comm, v3_user_intents=snmp_user,
-            host_intents=snmp_host, system_info_intent=snmp_sysinfo, dry_run=True,
-        ))
+        await _record(
+            "snmp",
+            nso_apply.apply_snmp_config(
+                client=client,
+                device_name=device_name,
+                community_intents=snmp_comm,
+                v3_user_intents=snmp_user,
+                host_intents=snmp_host,
+                system_info_intent=snmp_sysinfo,
+                dry_run=True,
+            ),
+        )
 
     # ── Static routes ────────────────────────────────────────────────────────────
     sr = await _accepted(StaticRouteIntent)
     if sr:
-        await _record("static_route", nso_apply.apply_static_routes(
-            client=client, device_name=device_name, route_intent_rows=sr, dry_run=True,
-        ))
+        await _record(
+            "static_route",
+            nso_apply.apply_static_routes(
+                client=client,
+                device_name=device_name,
+                route_intent_rows=sr,
+                dry_run=True,
+            ),
+        )
 
     # ── Logging (remote syslog) ──────────────────────────────────────────────────
     lg = await _accepted(LoggingHostIntent)
     if lg:
-        await _record("logging", nso_apply.apply_logging_config(
-            client=client, device_name=device_name, host_intent_rows=lg, dry_run=True,
-        ))
+        await _record(
+            "logging",
+            nso_apply.apply_logging_config(
+                client=client,
+                device_name=device_name,
+                host_intent_rows=lg,
+                dry_run=True,
+            ),
+        )
 
     # ── SVI / IRB ────────────────────────────────────────────────────────────────
     svi = await _accepted(SviIntent)
     if svi:
-        await _record("svi", nso_apply.apply_svi_config(
-            client=client, device_name=device_name, svi_intent_rows=svi, dry_run=True,
-        ))
+        await _record(
+            "svi",
+            nso_apply.apply_svi_config(
+                client=client,
+                device_name=device_name,
+                svi_intent_rows=svi,
+                dry_run=True,
+            ),
+        )
 
     # ── dot1q subinterfaces ──────────────────────────────────────────────────────
     subif = await _accepted(SubinterfaceIntent)
     if subif:
-        await _record("subinterface", nso_apply.apply_subinterface_config(
-            client=client, device_name=device_name, subif_intent_rows=subif, dry_run=True,
-        ))
+        await _record(
+            "subinterface",
+            nso_apply.apply_subinterface_config(
+                client=client,
+                device_name=device_name,
+                subif_intent_rows=subif,
+                dry_run=True,
+            ),
+        )
 
     # ── VLAN database ────────────────────────────────────────────────────────────
     vlan = await _accepted(VlanIntent)
     if vlan:
-        await _record("vlan", nso_apply.apply_vlan_config(
-            client=client, device_name=device_name, vlan_intent_rows=vlan, dry_run=True,
-        ))
+        await _record(
+            "vlan",
+            nso_apply.apply_vlan_config(
+                client=client,
+                device_name=device_name,
+                vlan_intent_rows=vlan,
+                dry_run=True,
+            ),
+        )
 
     # ── BFD ──────────────────────────────────────────────────────────────────────
     bfd = await _accepted(BfdIntent)
     if bfd:
-        await _record("bfd", nso_apply.apply_bfd_config(
-            client=client, device_name=device_name, bfd_intent_rows=bfd, dry_run=True,
-        ))
+        await _record(
+            "bfd",
+            nso_apply.apply_bfd_config(
+                client=client,
+                device_name=device_name,
+                bfd_intent_rows=bfd,
+                dry_run=True,
+            ),
+        )
 
     # ── Interface MTU (Phase 2b) ─────────────────────────────────────────────────
     mtu = await _accepted(InterfaceMtuIntent)
     if mtu:
-        await _record("interface_mtu", nso_apply.apply_mtu_config(
-            client=client, device_name=device_name, mtu_intent_rows=mtu, dry_run=True,
-        ))
+        await _record(
+            "interface_mtu",
+            nso_apply.apply_mtu_config(
+                client=client,
+                device_name=device_name,
+                mtu_intent_rows=mtu,
+                dry_run=True,
+            ),
+        )
 
     # ── L2 SAPs (Nokia epipe/vpls) ───────────────────────────────────────────────
     l2 = await _accepted(L2SapIntent)
     if l2:
-        await _record("l2_sap", nso_apply.apply_l2_saps(
-            client=client, device_name=device_name, sap_intent_rows=l2, dry_run=True,
-        ))
+        await _record(
+            "l2_sap",
+            nso_apply.apply_l2_saps(
+                client=client,
+                device_name=device_name,
+                sap_intent_rows=l2,
+                dry_run=True,
+            ),
+        )
 
     return diffs
 
@@ -362,6 +451,22 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
 
             client = get_nso_client(device.nso_instance)
             device_name = device.nso_device_name
+
+            # ── Step 0: sync-from before apply (clears NSO/device out-of-sync) ──
+            # A timed-out or partial prior commit leaves NSO's CDB inconsistent with the
+            # device; the next apply is then refused ("device out of sync"). Re-reading the
+            # device first clears it. Best-effort: a failure here must not abort the apply —
+            # the per-scope dry-run verify still catches real problems. Disable per device
+            # (DeviceSettings.sync_before_apply) for NEDs that already sync on connect.
+            settings_row = (
+                await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+            ).scalar_one_or_none()
+            if settings_row is None or settings_row.sync_before_apply:
+                try:
+                    await client.sync_from(device_name)
+                    logger.info("apply.sync_from.done", device=device_name)
+                except Exception as exc:
+                    logger.warning("apply.sync_from.failed", device=device_name, error=str(exc))
 
             # ── Step 1: snapshot intent ──────────────────────────────────────
             ifaces_result = await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))
@@ -481,9 +586,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
 
             # Collect logging (remote-syslog) intent rows
             logging_eligible: list[LoggingHostIntent] = []
-            logging_result = await db.execute(
-                select(LoggingHostIntent).where(LoggingHostIntent.device_id == device_id)
-            )
+            logging_result = await db.execute(select(LoggingHostIntent).where(LoggingHostIntent.device_id == device_id))
             for row in logging_result.scalars().all():
                 if row.accepted_at is None:
                     continue
@@ -503,9 +606,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
 
             # Collect dot1q subinterface intent rows (M36 write path)
             subif_eligible: list[SubinterfaceIntent] = []
-            subif_result = await db.execute(
-                select(SubinterfaceIntent).where(SubinterfaceIntent.device_id == device_id)
-            )
+            subif_result = await db.execute(select(SubinterfaceIntent).where(SubinterfaceIntent.device_id == device_id))
             for row in subif_result.scalars().all():
                 if row.accepted_at is None:
                     continue
@@ -911,9 +1012,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                         row.last_apply_error = None
                     logging_outcome_ok = len(logging_eligible)
                 except NsoApplyError as exc:
-                    logger.error(
-                        "apply.logging_failed", job_id=job_id, device=device_name, error=exc.message
-                    )
+                    logger.error("apply.logging_failed", job_id=job_id, device=device_name, error=exc.message)
                     err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
                     for row in logging_eligible:
                         row.last_apply_error = err_payload
@@ -1128,10 +1227,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                         row.last_apply_at = now
                         row.last_apply_error = None
                     isis_outcome_ok = (
-                        len(isis_eligible)
-                        + len(isis_process_eligible)
-                        + len(redist_isis)
-                        + len(isis_flex_eligible)
+                        len(isis_eligible) + len(isis_process_eligible) + len(redist_isis) + len(isis_flex_eligible)
                     )
                 except NsoApplyError as exc:
                     logger.error(
@@ -1150,10 +1246,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     for row in isis_flex_eligible:
                         row.last_apply_error = err_payload
                     isis_outcome_failed = (
-                        len(isis_eligible)
-                        + len(isis_process_eligible)
-                        + len(redist_isis)
-                        + len(isis_flex_eligible)
+                        len(isis_eligible) + len(isis_process_eligible) + len(redist_isis) + len(isis_flex_eligible)
                     )
                     isis_failed.append({"error": exc.message})
                 except Exception as exc:
@@ -1168,10 +1261,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                     for row in isis_flex_eligible:
                         row.last_apply_error = err_payload
                     isis_outcome_failed = (
-                        len(isis_eligible)
-                        + len(isis_process_eligible)
-                        + len(redist_isis)
-                        + len(isis_flex_eligible)
+                        len(isis_eligible) + len(isis_process_eligible) + len(redist_isis) + len(isis_flex_eligible)
                     )
                     isis_failed.append({"error": repr(exc)})
 

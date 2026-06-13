@@ -26,6 +26,8 @@ async def test_get_scope_returns_attributes(adapter_client):
     assert body["device_id"] == device_id
     assert set(body["attributes"]) == {"description", "enabled"}
     assert body["auto_apply"] is False
+    # Default sync-before-apply is on (no DeviceSettings row yet).
+    assert body["sync_before_apply"] is True
     assert "updated_at" in body
 
 
@@ -134,6 +136,35 @@ async def test_put_scope_updates_existing_device_settings(adapter_client):
     )
     assert resp.status_code == 200
     assert resp.json()["auto_apply"] is True
+
+
+async def test_put_scope_round_trips_sync_before_apply(adapter_client):
+    """PUT scope persists sync_before_apply (the per-device sync-from-before-apply toggle);
+    it defaults to True when omitted and round-trips through GET."""
+    device_id = await seed_device(
+        nso_instance="nso-dev",
+        nso_device_name="scope-sync-toggle",
+        netbox_device_id=614,
+    )
+    # Omitting the field defaults to True.
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/scope",
+        json={"attributes": ["description"], "auto_apply": False},
+        headers=AUTH,
+    )
+    assert resp.json()["sync_before_apply"] is True
+
+    # Explicitly disable it.
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/scope",
+        json={"attributes": ["description"], "auto_apply": False, "sync_before_apply": False},
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["sync_before_apply"] is False
+
+    get_resp = await adapter_client.get(f"/api/v1/devices/{device_id}/scope", headers=AUTH)
+    assert get_resp.json()["sync_before_apply"] is False
 
 
 async def test_put_scope_unknown_device_returns_404(adapter_client):

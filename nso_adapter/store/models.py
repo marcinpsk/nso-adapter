@@ -22,6 +22,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -316,6 +317,10 @@ class DeviceSettings(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     device_id: Mapped[int] = mapped_column(Integer, ForeignKey("devices.id"), unique=True, index=True)
     auto_apply: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Sync-from the device before each apply to clear NSO/device out-of-sync (a timed-out
+    # or partial commit leaves the CDB inconsistent and the next apply is refused). Default
+    # on; can be disabled per device for NEDs that already sync-on-connect.
+    sync_before_apply: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
 
     device: Mapped[Device] = relationship("Device", back_populates="settings")

@@ -23,6 +23,7 @@ def _scope_out(device_id: int, attrs: list[ManagedScope], settings: DeviceSettin
         "device_id": device_id,
         "attributes": [s.attribute for s in attrs],
         "auto_apply": settings.auto_apply if settings else False,
+        "sync_before_apply": settings.sync_before_apply if settings else True,
         "updated_at": updated_at.isoformat() + "Z",
     }
 
@@ -42,6 +43,7 @@ async def get_scope(device_id: int, db: AsyncSession = Depends(get_db)):
 class ScopeUpdate(BaseModel):
     attributes: list[str]
     auto_apply: bool = False
+    sync_before_apply: bool = True
 
 
 @router.put("/{device_id}/scope", dependencies=[Depends(verify_token)])
@@ -57,10 +59,15 @@ async def update_scope(device_id: int, body: ScopeUpdate, db: AsyncSession = Dep
     settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
     settings = settings_result.scalar_one_or_none()
     if settings is None:
-        settings = DeviceSettings(device_id=device_id, auto_apply=body.auto_apply)
+        settings = DeviceSettings(
+            device_id=device_id,
+            auto_apply=body.auto_apply,
+            sync_before_apply=body.sync_before_apply,
+        )
         db.add(settings)
     else:
         settings.auto_apply = body.auto_apply
+        settings.sync_before_apply = body.sync_before_apply
     await db.commit()
 
     return _scope_out(device_id, attrs, settings)

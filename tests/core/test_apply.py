@@ -14,6 +14,7 @@ from nso_adapter.store.db import get_session
 from nso_adapter.store.models import (
     DbInterface,
     Device,
+    DeviceSettings,
     InterfaceAttrState,
     InterfaceIntent,
     Job,
@@ -163,6 +164,57 @@ async def test_run_apply_nothing_eligible(adapter_client):
         break
 
 
+async def _set_sync_before_apply(device_id: int, value: bool) -> None:
+    async for db in get_session():
+        db.add(DeviceSettings(device_id=device_id, auto_apply=False, sync_before_apply=value))
+        await db.commit()
+        return
+    raise RuntimeError("no session")
+
+
+async def test_run_apply_syncs_from_device_by_default(adapter_client):
+    """With no DeviceSettings (or sync_before_apply on), run_apply sync-froms the device
+    before pushing intent — clears the out-of-sync a prior timed-out commit can leave."""
+    device_id = await _seed_device("rtr-sync-on", 130)
+    job_id = await _seed_apply_job(device_id)
+
+    mock_client = AsyncMock()
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    mock_client.sync_from.assert_awaited_once_with("rtr-sync-on")
+
+
+async def test_run_apply_skips_sync_from_when_disabled(adapter_client):
+    """sync_before_apply=False (per-device toggle) skips the pre-apply sync-from — for
+    NEDs that already sync on connect."""
+    device_id = await _seed_device("rtr-sync-off", 131)
+    await _set_sync_before_apply(device_id, False)
+    job_id = await _seed_apply_job(device_id)
+
+    mock_client = AsyncMock()
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    mock_client.sync_from.assert_not_called()
+
+
+async def test_run_apply_survives_sync_from_failure(adapter_client):
+    """A failing pre-apply sync-from is best-effort — it must not fail the apply."""
+    device_id = await _seed_device("rtr-sync-err", 132)
+    job_id = await _seed_apply_job(device_id)
+
+    mock_client = AsyncMock()
+    mock_client.sync_from.side_effect = RuntimeError("transport timeout")
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded  # nothing eligible, sync error swallowed
+        break
+
+
 async def test_collect_apply_diff_returns_scope_deltas(adapter_client):
     """collect_apply_diff dry-runs each scope's intent and returns the native device delta."""
     from nso_adapter.core.apply import collect_apply_diff
@@ -170,9 +222,9 @@ async def test_collect_apply_diff_returns_scope_deltas(adapter_client):
 
     device_id = await _seed_device("rtr-diff", 199)
     async for db in get_session():
-        db.add(OspfInstanceIntent(
-            device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow()
-        ))
+        db.add(
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+        )
         await db.commit()
         break
 
@@ -194,9 +246,9 @@ async def test_collect_apply_diff_empty_scope_omitted(adapter_client):
 
     device_id = await _seed_device("rtr-diff2", 198)
     async for db in get_session():
-        db.add(OspfInstanceIntent(
-            device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow()
-        ))
+        db.add(
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+        )
         await db.commit()
         break
 
@@ -218,13 +270,18 @@ async def test_collect_apply_diff_covers_multiple_scopes(adapter_client):
 
     device_id = await _seed_device("rtr-diff3", 197)
     async for db in get_session():
-        db.add(OspfInstanceIntent(
-            device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow()
-        ))
-        db.add(StaticRouteIntent(
-            device_id=device_id, vrf="", prefix="10.0.0.0/24", next_hop="10.0.0.1",
-            accepted_at=datetime.utcnow(),
-        ))
+        db.add(
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+        )
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id,
+                vrf="",
+                prefix="10.0.0.0/24",
+                next_hop="10.0.0.1",
+                accepted_at=datetime.utcnow(),
+            )
+        )
         await db.commit()
         break
 
