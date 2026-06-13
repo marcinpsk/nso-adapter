@@ -43,8 +43,11 @@ _HEARTBEAT_INTERVAL = 15.0
 _EMPTY_POLL_INTERVAL = 2.0
 # Job types safe to auto-requeue after an orphaning restart: read-only or
 # idempotent.  An interrupted ``apply`` is *not* requeued — never silently
-# re-push device config.
-_REQUEUE_ON_RESTART = {JobType.sync, JobType.detect_drift, JobType.connect}
+# re-push operator intent that may have changed.  A ``removal`` IS requeued: it
+# re-reads the CURRENT accepted rows and PUT-replaces, so re-running only
+# re-asserts the already-decided desired state (idempotent), and dropping it
+# would leave orphaned device config behind.
+_REQUEUE_ON_RESTART = {JobType.sync, JobType.detect_drift, JobType.connect, JobType.removal}
 
 _workers: list[asyncio.Task] = []
 _stop: asyncio.Event | None = None

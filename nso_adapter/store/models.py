@@ -53,6 +53,7 @@ class JobType(str, enum.Enum):
     detect_drift = "detect-drift"
     connect = "connect"
     apply = "apply"  # Phase 2: push accepted intent to NSO
+    removal = "removal"  # async PUT-replace to revert removed intent (see core/removal.py)
 
 
 class SyncState(str, enum.Enum):
@@ -401,9 +402,7 @@ class LagMemberConfig(Base):
     """Read-mirror of LACP member port parameters from NSO (M33)."""
 
     __tablename__ = "lag_member_config"
-    __table_args__ = (
-        UniqueConstraint("lag_bundle_id", "interface_name", name="uq_lag_member_config_bundle_iface"),
-    )
+    __table_args__ = (UniqueConstraint("lag_bundle_id", "interface_name", name="uq_lag_member_config_bundle_iface"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     lag_bundle_id: Mapped[int] = mapped_column(
@@ -487,9 +486,7 @@ class DeviceSwitchportTaggedVlan(Base):
     switchport_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("device_switchport.id", ondelete="CASCADE"), nullable=False
     )
-    vlan_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("device_vlan.id", ondelete="CASCADE"), nullable=False
-    )
+    vlan_id: Mapped[int] = mapped_column(Integer, ForeignKey("device_vlan.id", ondelete="CASCADE"), nullable=False)
 
 
 class InterfaceIpAddress(Base):
@@ -969,9 +966,7 @@ class DeviceL2Sap(Base):
     """
 
     __tablename__ = "device_l2_sap"
-    __table_args__ = (
-        UniqueConstraint("device_id", "service_name", "sap_id", name="uq_devicel2sap_identity"),
-    )
+    __table_args__ = (UniqueConstraint("device_id", "service_name", "sap_id", name="uq_devicel2sap_identity"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     device_id: Mapped[int] = mapped_column(
@@ -998,9 +993,7 @@ class L2SapIntent(Base):
     """
 
     __tablename__ = "l2_sap_intent"
-    __table_args__ = (
-        UniqueConstraint("device_id", "service_name", "sap_id", name="uq_l2sapintent_identity"),
-    )
+    __table_args__ = (UniqueConstraint("device_id", "service_name", "sap_id", name="uq_l2sapintent_identity"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     device_id: Mapped[int] = mapped_column(
@@ -1237,9 +1230,7 @@ class IsisFlexAlgoIntent(Base):
     """
 
     __tablename__ = "isis_flex_algo_intent"
-    __table_args__ = (
-        UniqueConstraint("device_id", "process_tag", "algo_id", name="uq_isisflexalgointent_identity"),
-    )
+    __table_args__ = (UniqueConstraint("device_id", "process_tag", "algo_id", name="uq_isisflexalgointent_identity"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     device_id: Mapped[int] = mapped_column(
@@ -1409,9 +1400,7 @@ class DeviceBgpPeerGroupAddressFamily(Base):
     prefixlist_in: Mapped[str | None] = mapped_column(String(255), nullable=True)
     prefixlist_out: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    peer_group: Mapped[DeviceBgpPeerGroup] = relationship(
-        "DeviceBgpPeerGroup", back_populates="address_families"
-    )
+    peer_group: Mapped[DeviceBgpPeerGroup] = relationship("DeviceBgpPeerGroup", back_populates="address_families")
 
 
 # ---------------------------------------------------------------------------

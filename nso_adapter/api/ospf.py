@@ -230,33 +230,17 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
             row.metric = re.metric
             row.metric_type = re.metric_type
 
-    await db.commit()
-
-    # Removal propagation: PUT-replace the ospf-reconciler instance with the full
-    # remaining desired state so removed processes/interfaces/redist are reverted.
+    # Removal propagation: if a process/interface/redist was dropped, queue an async
+    # removal job that PUT-replaces the ospf-reconciler instance with the full
+    # remaining desired state so FASTMAP reverts the removed entries. Enqueued in the
+    # same transaction as the deletes (atomic), and run in the background so this PUT
+    # never blocks on the device commit (which can exceed the client's 30s timeout).
     if removed_any:
-        from nso_adapter.core.importer import get_nso_client
-        from nso_adapter.nso.apply import apply_ospf_config
+        from nso_adapter.core.removal import enqueue_removal
 
-        insts = (
-            await db.execute(select(OspfInstanceIntent).where(OspfInstanceIntent.device_id == device_id))
-        ).scalars().all()
-        ifaces = (
-            await db.execute(select(OspfInterfaceIntent).where(OspfInterfaceIntent.device_id == device_id))
-        ).scalars().all()
-        redist = (
-            await db.execute(
-                select(RedistributionIntent).where(
-                    RedistributionIntent.device_id == device_id,
-                    RedistributionIntent.dest_protocol == "ospf",
-                )
-            )
-        ).scalars().all()
-        try:
-            nso_client = get_nso_client(device.nso_instance)
-            await apply_ospf_config(nso_client, device.nso_device_name, insts, ifaces, redist, replace=True)
-        except Exception as exc:  # noqa: BLE001
-            structlog.get_logger(__name__).error("ospf_intent.replace_failed", device_id=device_id, error=repr(exc))
+        await enqueue_removal(db, device_id, "ospf")
+
+    await db.commit()
 
     return {
         "device_id": device_id,

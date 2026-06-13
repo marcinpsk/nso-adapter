@@ -160,9 +160,17 @@ async def _run_apply(job_id: int, device_id: int) -> None:
     await run_apply(job_id, device_id, force=True)
 
 
+async def _run_removal(job_id: int, device_id: int) -> None:
+    from nso_adapter.core.removal import run_removal
+
+    logger.info("job.removal.start", job_id=job_id, device_id=device_id)
+    await run_removal(job_id, device_id)
+
+
 _JOB_RUNNERS = {
     JobType.sync: _run_sync,
     JobType.detect_drift: _run_detect_drift,
     JobType.connect: _run_connect,
     JobType.apply: _run_apply,
+    JobType.removal: _run_removal,
 }

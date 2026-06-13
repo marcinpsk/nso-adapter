@@ -68,9 +68,7 @@ async def test_put_ospf_intent_admin_state(adapter_client):
         ).scalar_one()
         assert inst.enabled is True
         # The dry-run apply body must carry the admin-state for the reconciler to write it.
-        with patch(
-            "nso_adapter.nso.apply.native_dry_run", new_callable=AsyncMock, return_value="OK"
-        ) as mock_dry:
+        with patch("nso_adapter.nso.apply.native_dry_run", new_callable=AsyncMock, return_value="OK") as mock_dry:
             await apply_ospf_config(
                 client=SimpleNamespace(_base="http://nso/restconf/data"),
                 device_name="ospf-admin-dev",
@@ -83,3 +81,46 @@ async def test_put_ospf_intent_admin_state(adapter_client):
         assert proc["enabled"] is True
         break
 
+
+async def test_put_ospf_intent_removal_enqueues_job_not_inline(adapter_client):
+    """Dropping an OSPF instance queues an async `removal` job (no inline device commit).
+
+    The PUT must return promptly; the PUT-replace that reverts the dropped process on
+    the device runs in the background via the removal job.
+    """
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Job, JobStatus, JobType
+
+    device_id = await seed_device(nso_device_name="ospf-removal-dev", netbox_device_id=922)
+    # Seed two processes, then PUT a payload that drops one.
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ospf-intent",
+        headers=AUTH,
+        json={
+            "instances": [
+                {"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []},
+                {"process_id": "2", "router_id": "2.2.2.2", "vrf": "", "areas": []},
+            ],
+            "interfaces": [],
+        },
+    )
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ospf-intent",
+        headers=AUTH,
+        json={
+            "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
+            "interfaces": [],
+        },
+    )
+    assert resp.status_code == 200
+
+    async for db in get_session():
+        jobs = (
+            (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal)))
+            .scalars()
+            .all()
+        )
+        assert len(jobs) == 1
+        assert jobs[0].status == JobStatus.queued
+        assert jobs[0].context == {"scope": "ospf"}
+        break
