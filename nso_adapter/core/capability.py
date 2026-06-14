@@ -117,6 +117,8 @@ async def refresh_device_capability(
     out = await actions.capability_probe(nso_client, device_name)
     ned_id = str(out.get("ned-id", "") or "")
     sw_version = str(out.get("sw-version", "") or "")
+    if sw_version == "None":  # defensive: an absent platform/version must not become a key
+        sw_version = ""
     if not ned_id:
         logger.debug("capability.refresh.no_ned", device=device_name)
         return {}
@@ -220,12 +222,25 @@ def _check_constructs(keys, mapping, scope, construct):
     return out
 
 
+def coverage_unknown(rows) -> bool:
+    """True when the probe has not assessed this NED's route-policy at all.
+
+    The probe emits a ``('coverage', <ned>, 'unknown')`` marker for NEDs it doesn't yet
+    classify (Junos / Nokia / unknown). It means "not assessed", NOT "all supported" — so
+    the consumer shows "not assessed" instead of green, and never blocks an attach on it.
+    """
+    return any(r.scope == "coverage" and r.status == "unknown" for r in rows)
+
+
 def preflight(rows, community_members=(), set_keys=(), match_keys=()) -> dict:
     """Check requested elements against cached capability *rows* for one ``(ned, sw)``.
 
-    Returns ``{fully_supported, unsupported:[{scope,element,status,detail}]}``. A community
-    member is matched by KIND (so ``color:0:200`` inherits the verdict probed for any color);
-    a set/match key maps to its construct name(s). ``status`` in (skipped, unsupported) flags.
+    Returns ``{fully_supported, unsupported:[{scope,element,status,detail}], coverage_unknown}``.
+    A community member is matched by KIND (so ``color:0:200`` inherits the verdict probed for
+    any color); a set/match key maps to its construct name(s). ``status`` in (skipped,
+    unsupported) flags. ``coverage_unknown`` is a SEPARATE signal: when the NED is unassessed
+    it stays ``fully_supported`` (block only on a known-negative) but the consumer shows "not
+    assessed" rather than claiming full support.
     """
     kind, construct = _index_rows(rows)
     unsupported = []
@@ -235,7 +250,11 @@ def preflight(rows, community_members=(), set_keys=(), match_keys=()) -> dict:
             unsupported.append({"scope": "community", "element": str(member), "status": status, "detail": detail})
     unsupported += _check_constructs(set_keys, _SET_KEY_CONSTRUCTS, "rm-set", construct)
     unsupported += _check_constructs(match_keys, _MATCH_KEY_CONSTRUCTS, "rm-match", construct)
-    return {"fully_supported": not unsupported, "unsupported": unsupported}
+    return {
+        "fully_supported": not unsupported,
+        "unsupported": unsupported,
+        "coverage_unknown": coverage_unknown(rows),
+    }
 
 
 # Rejected-command → (scope, construct-name) for the accepted half. Names match the

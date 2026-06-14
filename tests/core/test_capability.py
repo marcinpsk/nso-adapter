@@ -168,7 +168,25 @@ def test_preflight_all_native_is_fully_supported():
 
     rows = [_row("community", "65000:1", "native"), _row("rm-set", "set extcommunity", "native")]
     res = preflight(rows, community_members=["65000:5"], set_keys=["extcommunity_rt"])
-    assert res == {"fully_supported": True, "unsupported": []}
+    assert res == {"fully_supported": True, "unsupported": [], "coverage_unknown": False}
+
+
+def test_preflight_coverage_unknown_does_not_block():
+    """An unassessed NED (coverage marker) reports coverage_unknown but stays fully_supported.
+
+    Block only on a KNOWN-negative — a Junos/Nokia attach must not be blocked just because
+    the probe hasn't classified that platform yet.
+    """
+    from nso_adapter.core.capability import coverage_unknown, preflight
+
+    rows = [_row("coverage", "juniper-junos-nc-4.19", "unknown", detail="not yet implemented")]
+    assert coverage_unknown(rows) is True
+    res = preflight(rows, community_members=["color:0:200"], set_keys=["extcommunity_color"])
+    assert res["fully_supported"] is True  # never block on unknown
+    assert res["unsupported"] == []
+    assert res["coverage_unknown"] is True
+    # an assessed device has no coverage marker
+    assert coverage_unknown([_row("community", "65000:1", "native")]) is False
 
 
 def test_parse_rejected_construct():

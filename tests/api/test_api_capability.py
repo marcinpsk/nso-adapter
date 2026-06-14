@@ -107,6 +107,46 @@ async def test_preflight_flags_unsupported_parts(adapter_client_with_nso, monkey
 
 
 @pytest.mark.asyncio
+async def test_uncovered_ned_reports_coverage_unknown(adapter_client_with_nso, monkeypatch):  # noqa: F811
+    """A Junos/Nokia probe emits a 'coverage unknown' marker → API surfaces it, never blocks."""
+    from nso_adapter.core import capability
+
+    async def fake_probe(_client, _name):
+        return {
+            "ned-id": "juniper-junos-nc-4.19",
+            "sw-version": "24.4R2",
+            "element": [
+                {
+                    "scope": "coverage",
+                    "name": "juniper-junos-nc-4.19",
+                    "status": "unknown",
+                    "detail": "route-policy capability probing not yet implemented for this NED",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(capability.actions, "capability_probe", fake_probe)
+    device_id = await seed_device(nso_device_name="rd1")
+
+    resp = await adapter_client_with_nso.get(f"/api/v1/devices/{device_id}/capability?refresh=true", headers=AUTH)
+    body = resp.json()
+    assert body["known"] is True
+    assert body["coverage_unknown"] is True
+
+    # preflight on an attach: not blocked (fully_supported), but flagged as unassessed
+    resp = await adapter_client_with_nso.post(
+        f"/api/v1/devices/{device_id}/route-policy/preflight?refresh=false",
+        headers=AUTH,
+        json={"community_members": ["color:0:200"], "set_keys": ["extcommunity_color"]},
+    )
+    body = resp.json()
+    assert body["known"] is True
+    assert body["fully_supported"] is True
+    assert body["unsupported"] == []
+    assert body["coverage_unknown"] is True
+
+
+@pytest.mark.asyncio
 async def test_preflight_unknown_device_is_fail_open(adapter_client_with_nso, monkeypatch):  # noqa: F811
     """A device that's never been probed (refresh=false) is reported unknown, not blocked."""
     calls: list[str] = []

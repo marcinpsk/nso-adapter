@@ -67,6 +67,7 @@ async def get_capability(device_id: int, refresh: bool = False, db: AsyncSession
         "known": True,
         "ned_id": info["ned_id"],
         "sw_version": info["sw_version"],
+        "coverage_unknown": capability.coverage_unknown(rows),
         "elements": [
             {"scope": r.scope, "name": r.name, "status": r.status, "detail": r.detail, "source": r.source} for r in rows
         ],
@@ -86,7 +87,7 @@ async def preflight_route_policy(
     device, client = await _device_and_client(device_id, db)
     info = await capability.resolve_capability_key(db, client, device, refresh=refresh)
     if not info:
-        return {"known": False, "fully_supported": True, "unsupported": []}
+        return {"known": False, "fully_supported": True, "unsupported": [], "coverage_unknown": False}
     rows = await capability.get_device_capability(db, info["ned_id"], info["sw_version"])
     result = capability.preflight(rows, body.community_members, body.set_keys, body.match_keys)
     return {"known": True, "ned_id": info["ned_id"], "sw_version": info["sw_version"], **result}
