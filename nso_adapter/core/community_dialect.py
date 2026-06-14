@@ -30,9 +30,13 @@ live device (apply commit results) + SR OS 23.10 route-policy docs:
   ``ext:030b:000000000080``); it sits on the device verbatim → round-trips
   unchanged on Nokia. The ``030b`` sub-type is the Color Ext-Community, so an
   ``ext:030b:…`` member re-canonicalises to ``color:F:V`` on READ (see below);
-- ``color:F:V`` IS representable on Nokia: it is the Color Extended Community
-  (RFC 9012, Type 0x03 / Sub-Type 0x0b), written ``ext:030b:FFFFVVVVVVVV``.
-  ``color:0:128`` ⇄ ``ext:030b:000000000080`` (verified live: FLEX128). Only an
+- ``color:CO:V`` IS representable on Nokia: it is the Color Extended Community
+  (RFC 9012, Type 0x03 / Sub-Type 0x0b). The middle field is the Color-Only (CO)
+  bits — the top 2 bits of the flags field (``flags = CO << 14``) — which carry
+  real SR-policy semantics, so they are encoded exactly. Older SR OS takes the hex
+  form ``ext:030b:FFFFVVVVVVVV`` (``color:0:128`` ⇄ ``ext:030b:000000000080`` —
+  verified live: FLEX128); newer SR OS also accepts the native ``color:CO:V``
+  keyword, which READ normalises (``color:00:600`` → ``color:0:600``). Only an
   EXACT color maps; a regex color (``color:0:12.``) stays UNREPRESENTABLE.
   ``bandwidth:`` is still not an SR OS keyword → UNREPRESENTABLE;
 - ``large:`` (RFC 8092) — ``&`` is SR OS's large-community part separator. An EXACT
@@ -88,48 +92,71 @@ def _has_regex(value: str) -> bool:
 
 # Color Extended Community (RFC 9012 §4.3): a transitive-opaque ext-community —
 # Type ``0x03`` + Sub-Type ``0x0b`` (the ``030b`` head), then a 2-byte Flags field
-# and a 4-byte Color Value. Cisco/Junos spell it ``color:F:V``; Nokia (and Junos
-# 23.3+ when given hex) spell the SAME community ``ext:030b:FFFFVVVVVVVV``. We
-# translate so the two dialects unify on the canonical ``color:`` form.
+# and a 4-byte Color Value. Everyone spells it ``color:CO:V``: Cisco/Junos canonical,
+# AND Nokia SR OS natively (e.g. ``color:00:600``). The middle field is the two
+# Color-Only (CO) bits, which occupy the TOP 2 bits of the flags field's first
+# octet — so CO 0/1/2/3 ⇒ flags ``0x0000``/``0x4000``/``0x8000``/``0xC000`` ⇒
+# ``flags = CO << 14``. CO bits are semantically significant (they govern SR-policy
+# next-hop resolution), so the encoding must be exact, not a raw passthrough.
 #
-# ``F`` is carried as the RAW 2-byte flags integer, so the value round-trips
-# byte-for-byte without having to resolve the CO-bit semantics of the flags field
-# (all observed data has F=0 anyway). Only an EXACT color maps — a regex color
-# (e.g. ``color:0:12.``) has no single hex value, so it stays UNREPRESENTABLE.
+# Older SR OS takes the hex form ``ext:030b:FFFFVVVVVVVV`` (FLEX128/129 live on the
+# 23.10 lab device are stored this way); newer SR OS also accepts the native
+# ``color:CO:V`` keyword (see :meth:`_NokiaCommunityDialect.to_canonical`). We
+# translate so all dialects unify on the canonical ``color:CO:V``. Only an EXACT
+# color maps — a regex color (``color:0:12.``) has no single hex value → skipped.
 _COLOR_EXT_PREFIX = "ext:030b:"
 _HEX_DIGITS: frozenset[str] = frozenset("0123456789abcdefABCDEF")
+_CO_MAX = 0x3  # CO is a 2-bit field (values 0..3)
 
 
 def _color_to_nokia_ext(member: str):
-    """``color:F:V`` (exact integer F and V) → ``ext:030b:FFFFVVVVVVVV``, else None.
+    """``color:CO:V`` (CO bits 0..3, exact integer V) → ``ext:030b:FFFFVVVVVVVV``, else None.
 
-    None signals "not an exact color" (regex/wildcard or out-of-range) so the
-    caller falls through to UNREPRESENTABLE.
+    CO occupies the top 2 bits of the 2-byte flags field (``flags = CO << 14``); V is
+    the 4-byte color value. None signals "not an exact color" (regex/wildcard or
+    out-of-range) so the caller falls through to UNREPRESENTABLE.
     """
     parts = member.split(":", 1)[1].split(":")
     if len(parts) != 2:
         return None
-    flags_s, value_s = parts
-    if not (flags_s.isdigit() and value_s.isdigit()):
+    co_s, value_s = parts
+    if not (co_s.isdigit() and value_s.isdigit()):
         return None
-    flags, value = int(flags_s), int(value_s)
-    if flags > 0xFFFF or value > 0xFFFFFFFF:
+    co, value = int(co_s), int(value_s)
+    if co > _CO_MAX or value > 0xFFFFFFFF:
         return None
-    return f"{_COLOR_EXT_PREFIX}{flags:04x}{value:08x}"
+    return f"{_COLOR_EXT_PREFIX}{co << 14:04x}{value:08x}"
 
 
 def _nokia_ext_to_color(member: str):
-    """``ext:030b:FFFFVVVVVVVV`` (12 hex) → ``color:F:V``, else None.
+    """``ext:030b:FFFFVVVVVVVV`` (12 hex) → ``color:CO:V``, else None.
 
-    Only the color sub-type (``030b``) with exactly 12 hex digits maps; any other
-    ``ext:`` extended community returns None and round-trips raw.
+    CO is recovered from the top 2 bits of the flags field (``flags >> 14``); only the
+    color sub-type (``030b``) with exactly 12 hex digits maps. Any other ``ext:``
+    extended community returns None and round-trips raw.
     """
     if not member.startswith(_COLOR_EXT_PREFIX):
         return None
     hexbody = member[len(_COLOR_EXT_PREFIX) :]
     if len(hexbody) != 12 or any(c not in _HEX_DIGITS for c in hexbody):
         return None
-    return f"color:{int(hexbody[:4], 16)}:{int(hexbody[4:], 16)}"
+    co = int(hexbody[:4], 16) >> 14
+    return f"color:{co}:{int(hexbody[4:], 16)}"
+
+
+def _normalize_native_color(member: str):
+    """Native SR OS ``color:CO:V`` → canonical ``color:CO:V`` with int-normalised fields.
+
+    Newer SR OS writes the color community by keyword (``color:00:600``); normalise
+    CO/V to plain ints (``color:0:600``) so it unifies with the Cisco/Junos form.
+    Returns None when *member* is not an exact native color (e.g. a regex color).
+    """
+    if not member.startswith("color:"):
+        return None
+    parts = member.split(":")
+    if len(parts) != 3 or not (parts[1].isdigit() and parts[2].isdigit()):
+        return None
+    return f"color:{int(parts[1])}:{int(parts[2])}"
 
 
 class CommunityDialect:
@@ -166,11 +193,17 @@ class _NokiaCommunityDialect(CommunityDialect):
     def to_canonical(self, member: str) -> str:
         m = member.strip()
         # ``ext:030b:…`` is the Color Extended Community in hex — re-canonicalise it
-        # to the human-readable ``color:F:V`` form so it unifies with Cisco/Junos.
-        # Other ``ext:`` sub-types fall through and round-trip raw.
+        # to the ``color:CO:V`` form so it unifies with Cisco/Junos. Other ``ext:``
+        # sub-types fall through and round-trip raw.
         color = _nokia_ext_to_color(m)
         if color is not None:
             return color
+        # Newer SR OS reports color natively as ``color:CO:V`` — normalise CO/V to
+        # plain ints so it unifies with the canonical form (``color:00:600`` →
+        # ``color:0:600``). Prep for a NED that emits the keyword rather than hex.
+        native_color = _normalize_native_color(m)
+        if native_color is not None:
+            return native_color
         # A bare 3-part member with a numeric head is an RFC 8092 large community on
         # SR OS (no keyword) — restore the canonical ``large:`` prefix. Exact large
         # communities use ``:`` separators; regex large communities use ``&``.

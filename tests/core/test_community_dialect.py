@@ -119,12 +119,31 @@ def test_nokia_color_round_trips_through_canonical():
     assert d.to_canonical(d.from_canonical("color:0:128")) == "color:0:128"
 
 
-def test_nokia_color_nonzero_flags_round_trips_as_raw_int():
-    # F is carried as the raw 2-byte flags integer (no CO-bit interpretation), so
-    # the round-trip is byte-faithful for any flags value.
+@pytest.mark.parametrize(
+    ("co", "hexflags"),
+    [(0, "0000"), (1, "4000"), (2, "8000"), (3, "c000")],
+)
+def test_nokia_color_co_bits_map_to_top_two_flag_bits(co, hexflags):
+    # CO occupies the top 2 bits of the flags field (flags = CO << 14): CO is
+    # semantically significant (SR-policy next-hop resolution), so it must be exact.
     d = _nokia()
-    assert d.from_canonical("color:16384:128") == "ext:030b:400000000080"
-    assert d.to_canonical("ext:030b:400000000080") == "color:16384:128"
+    member = f"color:{co}:128"
+    ext = f"ext:030b:{hexflags}00000080"
+    assert d.from_canonical(member) == ext
+    assert d.to_canonical(ext) == member
+
+
+def test_nokia_color_out_of_range_co_is_unrepresentable():
+    # CO is a 2-bit field; a value > 3 is not a valid color community.
+    assert _nokia().from_canonical("color:4:128") is UNREPRESENTABLE
+
+
+def test_nokia_reads_native_color_keyword_normalised():
+    # Newer SR OS reports color by keyword (color:00:600); READ normalises CO/V to
+    # ints so it unifies with the Cisco/Junos color:0:600 form.
+    d = _nokia()
+    assert d.to_canonical("color:00:600") == "color:0:600"
+    assert d.to_canonical("color:01:128") == "color:1:128"
 
 
 def test_nokia_regex_color_stays_unrepresentable():
