@@ -1238,6 +1238,85 @@ into the service payload): `sequence`, `action`, `match-prefix-lists`,
 JSON blobs are serialised strings, keys per m17-route-policy-contract.md §2).
 Legacy snake_case / `match`+`set` entries are normalised at apply time.
 
+### Capability matrix (route-policy pre-flight)
+
+A per-device compatibility cache that lets the plugin flag, **at attach time**, which parts
+of a route-map / community-list won't apply on a device — instead of the operator finding
+out only when it silently didn't land. Backed by the persisted `device_capability` table,
+keyed by **`(ned_id, sw_version)`** so identical boxes share one verdict (probe one, reuse
+for many). Design + rationale: `compatibility-matrix-plan.md`.
+
+Each verdict row has a `status` — `native` (applies as-is) · `translated` (dialect-rewritten,
+e.g. Nokia color→hex) · `skipped` (the NED can't model it) · `unsupported` (the device parser
+**refused** it at commit) — and a `source`: `probe` (representable half, from the NSO
+capability-probe action) or `apply` (accepted half, from a real `apply_failed` device
+rejection). **Apply wins** — a real rejection is never downgraded by a later probe.
+
+**Key resolution — `refresh`.** Resolving a device's `(ned_id, sw_version)` key normally needs
+a live NSO probe. The `refresh` query param controls this: `refresh=true` probes NSO now and
+persists the learned key on the device row (authoritative — "check now" / attach-time);
+`refresh=false` serves the **last-learned** key from the device row with no probe (the cheap
+panel read), reporting `"known": false` when the device has never been probed.
+
+All three endpoints return `409 no_nso_client` when the device's NSO instance has no client.
+
+#### `POST /api/v1/devices/{id}/capability/refresh` → `200 | 404 | 409`
+
+Force a probe now and persist the representable-half verdict. Returns the learned key + count:
+
+```json
+{ "ned_id": "cisco-ios-cli-6.114", "sw_version": "17.15.4c", "count": 23 }
+```
+
+A probe that reports no NED returns `{"ned_id": "", "sw_version": "", "count": 0}`.
+
+#### `GET /api/v1/devices/{id}/capability?refresh={bool}` → `200 | 404 | 409`
+
+Return the cached verdict rows for this device's key. **`refresh` defaults to `false`** (cache-only).
+
+```json
+{
+  "known": true,
+  "ned_id": "cisco-ios-cli-6.114", "sw_version": "15.2(4)E10",
+  "elements": [
+    {"scope": "community", "name": "color:0:128", "status": "skipped", "detail": "no IOS home", "source": "probe"},
+    {"scope": "rm-set", "name": "set extcommunity color", "status": "unsupported", "detail": "% Invalid input", "source": "apply"}
+  ]
+}
+```
+
+A never-probed device (cache-only) returns `{"known": false, "ned_id": "", "sw_version": "", "elements": []}`.
+`scope` is `community` · `rm-set` · `rm-match`.
+
+#### `POST /api/v1/devices/{id}/route-policy/preflight?refresh={bool}` → `200 | 404 | 409`
+
+Check a would-be attach against the matrix. **`refresh` defaults to `true`** (an attach is an
+explicit, authoritative check). Body — what the object would push (the plugin derives it from
+the netbox-routing object, mirroring the route-policy intent it would send):
+
+```json
+{ "community_members": ["color:0:200", "65000:9"],
+  "set_keys": ["extcommunity_color", "metric_type"],
+  "match_keys": ["local_preference"] }
+```
+
+`community_members` are matched by **KIND** (`color:0:200` inherits the verdict probed for any
+`color` member); `set_keys` / `match_keys` are the set-/match-json keys, mapped to construct
+names (`extcommunity_color` → `set extcommunity color`, `metric_type` → `set metric-type`, …).
+
+```json
+{ "known": true, "ned_id": "cisco-ios-cli-6.114", "sw_version": "15.2(4)E10",
+  "fully_supported": false,
+  "unsupported": [
+    {"scope": "community", "element": "color:0:200", "status": "skipped", "detail": "no IOS home"}
+  ] }
+```
+
+An element flags when its matched row is `skipped` or `unsupported`. **Block-only-on-known-negative:**
+an unknown device (cache-only, never probed) or unreachable adapter returns
+`{"known": false, "fully_supported": true, "unsupported": []}` — the plugin must **not** block on
+it, only on a `known` + `fully_supported: false` verdict.
+
 ---
 
 ## IS-IS (M18 / M33)
