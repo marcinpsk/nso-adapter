@@ -767,8 +767,9 @@ async def test_apply_static_routes_replace_puts_keyed_instance():
 @pytest.mark.asyncio
 async def test_apply_route_policy_translates_and_skips_members_per_ned():
     """On a Nokia (timos) device the canonical community members are translated to
-    the SR OS dialect and the ones it can't represent (``color:``) are dropped from
-    the pushed body — so one bad member can't abort the whole community."""
+    the SR OS dialect (incl. an exact ``color:`` → its ``ext:030b:`` hex) and the
+    ones it genuinely can't represent (a regex ``color:``) are dropped from the
+    pushed body — so one bad member can't abort the whole community."""
     import json
 
     from nso_adapter.nso.apply import apply_route_policy_config
@@ -786,8 +787,8 @@ async def test_apply_route_policy_translates_and_skips_members_per_ned():
         {"sequence": 20, "action": "permit", "community": "6830:.*"},  # digit-domain regex kept
         {"sequence": 30, "action": "permit", "community": "target:6830:1234"},
         {"sequence": 40, "action": "permit", "community": "large:6830:6370:1234"},  # exact → strip large:
-        {"sequence": 50, "action": "permit", "community": "color:0:128"},  # no SR OS keyword
-        {"sequence": 60, "action": "permit", "community": "color:0:12."},  # no SR OS keyword
+        {"sequence": 50, "action": "permit", "community": "color:0:128"},  # exact color → ext:030b hex
+        {"sequence": 60, "action": "permit", "community": "color:0:12."},  # regex color → dropped
         {"sequence": 70, "action": "permit", "community": "no-export"},
     ]
     rows = [SimpleNamespace(family="community_list", name="cnad-test", entries=entries)]
@@ -797,14 +798,22 @@ async def test_apply_route_policy_translates_and_skips_members_per_ned():
     body = json.loads(mock_http.patch.call_args_list[0][1]["content"])
     cl = body["route-policy-reconciler:route-policy-config"][0]["community-list"][0]
     members = [e["community"] for e in cl["entry"]]
-    assert members == ["6830:1234", "6830:.*", "target:6830:1234", "6830:6370:1234", "no-export"]
+    assert members == [
+        "6830:1234",
+        "6830:.*",
+        "target:6830:1234",
+        "6830:6370:1234",
+        "ext:030b:000000000080",
+        "no-export",
+    ]
     assert cl["invert-match"] is False
 
 
 @pytest.mark.asyncio
 async def test_apply_route_policy_carries_invert_match_and_amp_large_on_nokia():
-    """An inverted community-list keeps its invert-match flag in the pushed body, and
-    a regex large community is rendered in SR OS `&`-separated form (color: dropped)."""
+    """An inverted community-list keeps its invert-match flag in the pushed body, a
+    regex large community is rendered in SR OS `&`-separated form, and an exact
+    color: is translated to its ext:030b: hex."""
     import json
 
     from nso_adapter.nso.apply import apply_route_policy_config
@@ -821,7 +830,7 @@ async def test_apply_route_policy_carries_invert_match_and_amp_large_on_nokia():
         {"sequence": 10, "action": "permit", "community": "no-export"},
         {"sequence": 20, "action": "permit", "community": "6830:21000"},
         {"sequence": 30, "action": "permit", "community": "large:6830:.*:[0-4]"},  # regex large → &
-        {"sequence": 40, "action": "permit", "community": "color:0:128"},  # dropped on Nokia
+        {"sequence": 40, "action": "permit", "community": "color:0:128"},  # exact color → ext:030b hex
     ]
     rows = [SimpleNamespace(family="community_list", name="SCRUBBER", entries=entries, invert_match=True)]
 
@@ -830,7 +839,12 @@ async def test_apply_route_policy_carries_invert_match_and_amp_large_on_nokia():
     body = json.loads(mock_http.patch.call_args_list[0][1]["content"])
     cl = body["route-policy-reconciler:route-policy-config"][0]["community-list"][0]
     assert cl["invert-match"] is True
-    assert [e["community"] for e in cl["entry"]] == ["no-export", "6830:21000", "6830&.*&[0-4]"]
+    assert [e["community"] for e in cl["entry"]] == [
+        "no-export",
+        "6830:21000",
+        "6830&.*&[0-4]",
+        "ext:030b:000000000080",
+    ]
 
 
 @pytest.mark.asyncio

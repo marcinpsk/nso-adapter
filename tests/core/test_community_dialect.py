@@ -2,8 +2,9 @@
 """Per-NED community-member dialect codec (nso_adapter/core/community_dialect.py).
 
 Grounded in live-device + SR OS doc facts (see the module docstring): Nokia keeps
-exact std/ext/large members and digit-domain regex verbatim, uses `&&` only for
-regex large communities, and has no `color:`/`bandwidth:` policy keyword.
+exact std/ext/large members and digit-domain regex verbatim, uses `&` only for
+regex large communities, and represents an exact `color:F:V` as the Color
+Ext-Community hex `ext:030b:FFFFVVVVVVVV` (regex color + `bandwidth:` stay gaps).
 """
 
 from __future__ import annotations
@@ -56,8 +57,7 @@ def test_other_neds_get_identity_default(ned_id):
         "6830:1.3.",
         "target:6830:1234",  # exact route-target
         "origin:6830:1234",  # exact route-origin
-        "ext:030b:000000000080",  # raw RFC 4360 ext-community hex (live: FLEX128)
-        "ext:030b:000000000081",  # live: FLEX129
+        "ext:4300:0000075bcd15",  # non-color ext-community hex → round-trips raw
         "no-export",
         "no-advertise",
         "NO-EXPORT",  # case-insensitive well-known
@@ -89,13 +89,47 @@ def test_nokia_two_part_standard_is_not_misread_as_large():
     assert _nokia().to_canonical("6830:1234") == "6830:1234"
 
 
-def test_nokia_ext_hex_round_trips_verbatim():
-    # Regression: ext: members are a native SR OS form (read live from FLEX128/129);
-    # the codec must not mark a member the device itself holds as UNREPRESENTABLE.
+def test_nokia_non_color_ext_round_trips_verbatim():
+    # A non-color ext: sub-type is a native SR OS form the device holds verbatim;
+    # the codec must not translate or drop it.
     d = _nokia()
-    member = "ext:030b:000000000080"
+    member = "ext:4300:0000075bcd15"
     assert d.to_canonical(member) == member
     assert d.from_canonical(member) == member
+
+
+# ── Nokia: color:F:V ⇄ Color Ext-Community hex ext:030b:FFFFVVVVVVVV ──────────
+# RFC 9012 §4.3: Type 0x03 / Sub-Type 0x0b. Verified live — FLEX128 member
+# `ext:030b:000000000080` is color value 128 (= cnad-test's `color:0:128`).
+
+
+def test_nokia_exact_color_writes_ext_hex():
+    d = _nokia()
+    assert d.from_canonical("color:0:128") == "ext:030b:000000000080"  # FLEX128
+    assert d.from_canonical("color:0:129") == "ext:030b:000000000081"  # FLEX129
+
+
+def test_nokia_color_ext_reads_back_as_color():
+    assert _nokia().to_canonical("ext:030b:000000000080") == "color:0:128"
+    assert _nokia().to_canonical("ext:030b:000000000081") == "color:0:129"
+
+
+def test_nokia_color_round_trips_through_canonical():
+    d = _nokia()
+    assert d.to_canonical(d.from_canonical("color:0:128")) == "color:0:128"
+
+
+def test_nokia_color_nonzero_flags_round_trips_as_raw_int():
+    # F is carried as the raw 2-byte flags integer (no CO-bit interpretation), so
+    # the round-trip is byte-faithful for any flags value.
+    d = _nokia()
+    assert d.from_canonical("color:16384:128") == "ext:030b:400000000080"
+    assert d.to_canonical("ext:030b:400000000080") == "color:16384:128"
+
+
+def test_nokia_regex_color_stays_unrepresentable():
+    # A regex color (no single hex value) cannot be a Color Ext-Community.
+    assert _nokia().from_canonical("color:0:12.") is UNREPRESENTABLE
 
 
 # ── Nokia: regex large community = 3 ``&``-separated parts (from live config) ──
@@ -122,15 +156,15 @@ def test_nokia_exact_large_still_uses_colons():
 
 
 # ── Nokia: members not representable in `community member` are reported ───────
-# color:/bandwidth:/soo: are genuine SR OS gaps (not policy-community keywords).
-# These are surfaced (skip + per-device journal), never silently kept in the push.
+# regex color / bandwidth: / soo: are genuine SR OS gaps (not policy-community
+# keywords, or no single hex value). Surfaced (skip + per-device journal), never
+# silently kept in the push. (An EXACT color: IS representable — see above.)
 
 
 @pytest.mark.parametrize(
     "member",
     [
-        "color:0:128",
-        "color:0:12.",
+        "color:0:12.",  # regex color — no single hex value
         "bandwidth:6830:100",
         "soo:6830:1",
     ],
