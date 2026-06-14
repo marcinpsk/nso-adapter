@@ -798,6 +798,39 @@ async def test_apply_route_policy_translates_and_skips_members_per_ned():
     cl = body["route-policy-reconciler:route-policy-config"][0]["community-list"][0]
     members = [e["community"] for e in cl["entry"]]
     assert members == ["6830:1234", "6830:.*", "target:6830:1234", "6830:6370:1234", "no-export"]
+    assert cl["invert-match"] is False
+
+
+@pytest.mark.asyncio
+async def test_apply_route_policy_carries_invert_match_and_amp_large_on_nokia():
+    """An inverted community-list keeps its invert-match flag in the pushed body, and
+    a regex large community is rendered in SR OS `&`-separated form (color: dropped)."""
+    import json
+
+    from nso_adapter.nso.apply import apply_route_policy_config
+
+    client = _make_nso_client()
+    mock_http = AsyncMock()
+    mock_http.patch.return_value = _mock_httpx_response(204)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=mock_http)
+    ctx.__aexit__ = AsyncMock(return_value=None)
+    client._client.return_value = ctx
+
+    entries = [
+        {"sequence": 10, "action": "permit", "community": "no-export"},
+        {"sequence": 20, "action": "permit", "community": "6830:21000"},
+        {"sequence": 30, "action": "permit", "community": "large:6830:.*:[0-4]"},  # regex large → &
+        {"sequence": 40, "action": "permit", "community": "color:0:128"},  # dropped on Nokia
+    ]
+    rows = [SimpleNamespace(family="community_list", name="SCRUBBER", entries=entries, invert_match=True)]
+
+    await apply_route_policy_config(client=client, device_name="ra1", intent_rows=rows, ned_id="timos-nc-23.10")
+
+    body = json.loads(mock_http.patch.call_args_list[0][1]["content"])
+    cl = body["route-policy-reconciler:route-policy-config"][0]["community-list"][0]
+    assert cl["invert-match"] is True
+    assert [e["community"] for e in cl["entry"]] == ["no-export", "6830:21000", "6830&.*&[0-4]"]
 
 
 @pytest.mark.asyncio

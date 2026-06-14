@@ -187,7 +187,7 @@ async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_db)):
         cl_entries_out = [
             {"sequence": e.sequence, "action": e.action, "community": e.community} for e in cl_entries_by_id[cl.id]
         ]
-        community_lists_out.append({"name": cl.name, "entries": cl_entries_out})
+        community_lists_out.append({"name": cl.name, "invert_match": cl.invert_match, "entries": cl_entries_out})
 
     as_paths_out = []
     for ap in as_paths:
@@ -275,6 +275,7 @@ async def put_route_policy_intent(
         name = obj.get("name")
         entries = obj.get("entries")
         accepted = obj.get("accepted", False)
+        invert_match = bool(obj.get("invert_match", False))
 
         if family not in _VALID_FAMILIES:
             raise api_error(422, "invalid_family", f"Unknown family: {family!r}")
@@ -298,11 +299,13 @@ async def put_route_policy_intent(
                 family=family,
                 name=name,
                 entries=entries,
+                invert_match=invert_match,
                 accepted_at=now if accepted else None,
             )
             db.add(row)
         else:
             row.entries = entries
+            row.invert_match = invert_match
             if accepted:
                 row.accepted_at = now
 

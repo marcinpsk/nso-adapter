@@ -84,6 +84,7 @@ async def _upsert_route_policy_data(
         cl = DeviceRoutePolicyCommunityList(
             device_id=device.id,
             name=cl_data["name"],
+            invert_match=bool(cl_data.get("invert-match", False)),
             content_hash=_content_hash(cl_data),
             last_refreshed_at=now,
             refresh_source=refresh_source,

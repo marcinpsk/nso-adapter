@@ -56,6 +56,8 @@ def test_other_neds_get_identity_default(ned_id):
         "6830:1.3.",
         "target:6830:1234",  # exact route-target
         "origin:6830:1234",  # exact route-origin
+        "ext:030b:000000000080",  # raw RFC 4360 ext-community hex (live: FLEX128)
+        "ext:030b:000000000081",  # live: FLEX129
         "no-export",
         "no-advertise",
         "NO-EXPORT",  # case-insensitive well-known
@@ -87,10 +89,41 @@ def test_nokia_two_part_standard_is_not_misread_as_large():
     assert _nokia().to_canonical("6830:1234") == "6830:1234"
 
 
+def test_nokia_ext_hex_round_trips_verbatim():
+    # Regression: ext: members are a native SR OS form (read live from FLEX128/129);
+    # the codec must not mark a member the device itself holds as UNREPRESENTABLE.
+    d = _nokia()
+    member = "ext:030b:000000000080"
+    assert d.to_canonical(member) == member
+    assert d.from_canonical(member) == member
+
+
+# ── Nokia: regex large community = 3 ``&``-separated parts (from live config) ──
+# `&` is SR OS's large-community part separator; exact large uses `:`, regex uses `&`.
+# Source: live `expression expr "NOT (… OR 6830&.*&[0-4])"` ⇄ Junos `large:6830:.*:[0-4]`.
+
+
+def test_nokia_reads_amp_large_as_canonical_large():
+    assert _nokia().to_canonical("6830&.*&[0-4]") == "large:6830:.*:[0-4]"
+
+
+def test_nokia_writes_regex_large_with_amp_separators():
+    assert _nokia().from_canonical("large:6830:.*:[0-4]") == "6830&.*&[0-4]"
+
+
+def test_nokia_regex_large_round_trips_through_canonical():
+    d = _nokia()
+    assert d.to_canonical(d.from_canonical("large:6830:.*:[0-4]")) == "large:6830:.*:[0-4]"
+
+
+def test_nokia_exact_large_still_uses_colons():
+    # Exact (no regex) large communities keep the colon form, not `&`.
+    assert _nokia().from_canonical("large:6830:6370:1234") == "6830:6370:1234"
+
+
 # ── Nokia: members not representable in `community member` are reported ───────
-# color:/bandwidth: are genuine SR OS gaps; a REGEX large member is rejected by
-# SR OS (only exact large communities are allowed). Both are surfaced (skip +
-# per-device journal), never silently kept in the push.
+# color:/bandwidth:/soo: are genuine SR OS gaps (not policy-community keywords).
+# These are surfaced (skip + per-device journal), never silently kept in the push.
 
 
 @pytest.mark.parametrize(
@@ -100,8 +133,6 @@ def test_nokia_two_part_standard_is_not_misread_as_large():
         "color:0:12.",
         "bandwidth:6830:100",
         "soo:6830:1",
-        "large:6830:6370:.*",  # regex large — SR OS rejects regex in large members
-        "large:6830:6370:1.",
     ],
 )
 def test_nokia_reports_unrepresentable_keywords(member):

@@ -1576,6 +1576,9 @@ class DeviceRoutePolicyCommunityList(Base):
         Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(256), nullable=False)
+    # Junos invert-match / Nokia "expression NOT (…)": the list matches routes
+    # carrying NONE of its members. No native form on Cisco community-lists.
+    invert_match: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="poll")
@@ -1704,6 +1707,8 @@ class RoutePolicyObjectIntent(Base):
     family: Mapped[str] = mapped_column(String(32))  # prefix_list / community_list / as_path / route_map
     name: Mapped[str] = mapped_column(String(255))
     entries: Mapped[dict | list] = mapped_column(JSON, nullable=False)
+    # community_list only: Junos invert-match / Nokia "expression NOT (…)".
+    invert_match: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_apply_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)

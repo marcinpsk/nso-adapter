@@ -1298,7 +1298,9 @@ async def apply_route_policy_config(
         entries = row.entries
         if row.family == "route_map":
             entries = [_normalize_route_map_entry(e) for e in entries if isinstance(e, dict)]
-        by_family[row.family].append({"name": row.name, "entries": entries})
+        by_family[row.family].append(
+            {"name": row.name, "entries": entries, "invert_match": getattr(row, "invert_match", False)}
+        )
 
     def _community_list_entry(obj: dict) -> dict:
         """Translate this community's members to the device dialect, skipping any the NED can't hold."""
@@ -1317,7 +1319,7 @@ async def apply_route_policy_config(
                     )
                 continue
             kept.append({**entry, "community": wire} if wire != entry["community"] else entry)
-        return {"name": obj["name"], "entry": kept}
+        return {"name": obj["name"], "invert-match": bool(obj.get("invert_match", False)), "entry": kept}
 
     body = {
         "device": device_name,

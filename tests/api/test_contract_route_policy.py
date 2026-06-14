@@ -29,13 +29,19 @@ REQUIRED_TOP_KEYS = {"device_id", "last_refreshed_at", "prefix_lists", "communit
 REQUIRED_PL_KEYS = {"name", "family", "entries"}
 REQUIRED_PL_ENTRY_KEYS = {"sequence", "action", "prefix"}
 OPTIONAL_PL_ENTRY_KEYS = {"ge", "le"}
-REQUIRED_CL_KEYS = {"name", "entries"}
+REQUIRED_CL_KEYS = {"name", "invert_match", "entries"}
 REQUIRED_CL_ENTRY_KEYS = {"sequence", "action", "community"}
 REQUIRED_AP_KEYS = {"name", "entries"}
 REQUIRED_AP_ENTRY_KEYS = {"sequence", "action", "pattern"}
 REQUIRED_RM_KEYS = {"name", "entries"}
 REQUIRED_RM_ENTRY_KEYS = {
-    "sequence", "action", "match_prefix_lists", "match_community_lists", "match_as_paths", "match", "set",
+    "sequence",
+    "action",
+    "match_prefix_lists",
+    "match_community_lists",
+    "match_as_paths",
+    "match",
+    "set",
 }
 
 
@@ -58,16 +64,21 @@ async def _seed_route_policy(device_id: int) -> None:
         db.add(pl)
         await db.flush()
         # Maximal entry (ge+le) + minimal entry (omitted).
-        db.add(DeviceRoutePolicyPrefixListEntry(prefix_list_id=pl.id, sequence=10, action="permit",
-                                                prefix="10.0.0.0/8", ge=16, le=24))
-        db.add(DeviceRoutePolicyPrefixListEntry(prefix_list_id=pl.id, sequence=20, action="deny",
-                                                prefix="0.0.0.0/0"))
+        db.add(
+            DeviceRoutePolicyPrefixListEntry(
+                prefix_list_id=pl.id, sequence=10, action="permit", prefix="10.0.0.0/8", ge=16, le=24
+            )
+        )
+        db.add(DeviceRoutePolicyPrefixListEntry(prefix_list_id=pl.id, sequence=20, action="deny", prefix="0.0.0.0/0"))
 
         cl = DeviceRoutePolicyCommunityList(device_id=device_id, name="CL-1", last_refreshed_at=ts)
         db.add(cl)
         await db.flush()
-        db.add(DeviceRoutePolicyCommunityListEntry(community_list_id=cl.id, sequence=10, action="permit",
-                                                   community="65000:100"))
+        db.add(
+            DeviceRoutePolicyCommunityListEntry(
+                community_list_id=cl.id, sequence=10, action="permit", community="65000:100"
+            )
+        )
 
         ap = DeviceRoutePolicyASPath(device_id=device_id, name="AP-1", last_refreshed_at=ts)
         db.add(ap)
@@ -77,10 +88,18 @@ async def _seed_route_policy(device_id: int) -> None:
         rm = DeviceRoutePolicyRouteMap(device_id=device_id, name="RM-1", last_refreshed_at=ts)
         db.add(rm)
         await db.flush()
-        db.add(DeviceRoutePolicyRouteMapEntry(route_map_id=rm.id, sequence=10, action="permit",
-                                              match_prefix_lists=["PL-1"], match_community_lists=["CL-1"],
-                                              match_as_paths=["AP-1"], match_json='{"prefix": "PL-1"}',
-                                              set_json='{"local_preference": 200}'))
+        db.add(
+            DeviceRoutePolicyRouteMapEntry(
+                route_map_id=rm.id,
+                sequence=10,
+                action="permit",
+                match_prefix_lists=["PL-1"],
+                match_community_lists=["CL-1"],
+                match_as_paths=["AP-1"],
+                match_json='{"prefix": "PL-1"}',
+                set_json='{"local_preference": 200}',
+            )
+        )
         await db.commit()
         break
 

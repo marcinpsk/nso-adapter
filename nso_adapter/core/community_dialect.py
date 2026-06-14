@@ -26,14 +26,20 @@ live device (apply commit results) + SR OS 23.10 route-policy docs:
   the device verbatim → pass through unchanged;
 - ``.`` / ``*`` / ``[]`` / ``()`` / ``-`` regex over the digit:colon domain are
   accepted verbatim (e.g. ``6830:1113.``, ``6830:.*`` and ``6830:*`` commit live);
+- ``ext:`` is a raw RFC 4360 extended community in hex (type+value, e.g.
+  ``ext:030b:000000000080``); it sits on the device verbatim → round-trips
+  unchanged on Nokia;
 - ``color:`` / ``bandwidth:`` are not SR OS policy-community keywords → those
   members are UNREPRESENTABLE on Nokia (genuine device limitation);
-- ``large:`` (RFC 8092) — SR OS holds an EXACT large community as three colon parts
-  with NO keyword: canonical ``large:a:b:c`` ⇄ Nokia ``a:b:c`` (verified live: ``a:b:c``
-  commits, ``large:a:b:c`` and ``large:a&&b&&c`` are rejected MGMT_CORE #2301). On READ
-  a bare 3-part colon member is re-prefixed back to canonical ``large:``. SR OS does
-  NOT accept a regex inside a large member (``6830:6370:.*`` rejected) → regex large
-  stays UNREPRESENTABLE (skip + per-device journal).
+- ``large:`` (RFC 8092) — ``&`` is SR OS's large-community part separator. An EXACT
+  large community is three **colon** parts with NO keyword (``large:a:b:c`` ⇄ Nokia
+  ``a:b:c`` — verified live: ``a:b:c`` commits, ``large:a:b:c`` rejected); a large
+  community carrying a **regex** is three **``&``**-separated parts
+  (``large:6830:.*:[0-4]`` ⇄ Nokia ``6830&.*&[0-4]`` — straight from the live
+  ``expression`` config, and the exact Junos ``large:6830:.*:[0-4]`` member). My
+  earlier probe wrongly doubled the separator (``a&&b&&c`` → MGMT_CORE #2301); the
+  separator is a single ``&``. On READ a bare 3-part member (colon or ``&``) is
+  re-prefixed to canonical ``large:``.
 """
 
 from __future__ import annotations
@@ -99,16 +105,23 @@ class _NokiaCommunityDialect(CommunityDialect):
     """Nokia SR OS (timos) community-member dialect."""
 
     # SR OS ``policy-options community member`` keywords that pass through verbatim.
-    # ``large`` is handled specially (keyword stripped); ``color``/``bandwidth`` and
-    # any other Cisco/Junos keyword aren't SR OS keywords → UNREPRESENTABLE.
-    _SUPPORTED_KEYWORDS: frozenset[str] = frozenset({"target", "origin"})
+    # ``target``/``origin`` are route-target/route-origin extended communities;
+    # ``ext`` is a raw RFC 4360 extended community in hex (``ext:030b:00000000…``,
+    # confirmed live on the device). ``large`` is handled specially (keyword
+    # stripped); ``color``/``bandwidth`` and any other Cisco/Junos keyword aren't
+    # SR OS keywords → UNREPRESENTABLE.
+    _SUPPORTED_KEYWORDS: frozenset[str] = frozenset({"target", "origin", "ext"})
 
     def to_canonical(self, member: str) -> str:
         m = member.strip()
-        # A bare 3-part colon member with a numeric head is an RFC 8092 large
-        # community on SR OS (no keyword) — restore the canonical ``large:`` prefix.
-        if _typed_keyword(m) is None and m.count(":") == 2 and m[:1].isdigit():
-            return "large:" + m
+        # A bare 3-part member with a numeric head is an RFC 8092 large community on
+        # SR OS (no keyword) — restore the canonical ``large:`` prefix. Exact large
+        # communities use ``:`` separators; regex large communities use ``&``.
+        if _typed_keyword(m) is None and m[:1].isdigit():
+            if m.count(":") == 2:
+                return "large:" + m
+            if m.count("&") == 2:
+                return "large:" + m.replace("&", ":")
         return m
 
     def from_canonical(self, member: str):
@@ -131,11 +144,13 @@ class _NokiaCommunityDialect(CommunityDialect):
     def _large_from_canonical(member: str):
         body = member.split(":", 1)[1]  # drop the canonical `large:` prefix
         parts = body.split(":")
-        # SR OS holds an exact large community as three colon parts, keyword-less.
-        # It rejects a regex inside a large member (verified live) → skip those.
-        if len(parts) == 3 and not any(_has_regex(p) for p in parts):
-            return body
-        return UNREPRESENTABLE
+        if len(parts) != 3:
+            return UNREPRESENTABLE
+        # SR OS keeps an exact large community as three colon parts (keyword-less),
+        # and a regex large community as three ``&``-separated parts.
+        if any(_has_regex(p) for p in parts):
+            return "&".join(parts)
+        return body
 
 
 # Default identity dialect, shared by every NED without a registered override.
