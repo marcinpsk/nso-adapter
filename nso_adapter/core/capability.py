@@ -232,15 +232,34 @@ def coverage_unknown(rows) -> bool:
     return any(r.scope == "coverage" and r.status == "unknown" for r in rows)
 
 
-def preflight(rows, community_members=(), set_keys=(), match_keys=()) -> dict:
+def _check_aspath_names(aspath_names, construct):
+    """Flag as-path lists whose name has no home on this NED.
+
+    Driven by the probe's ``('as-path', 'named-list', 'unsupported')`` row: where it is
+    present (IOS — as-path access-lists are numbered 1-500, the name IS the number), an
+    as-path whose name is not a 1-500 number can't apply. NEDs that support named as-path
+    lists (IOS-XR / Junos / Nokia) carry no such row, so nothing is flagged.
+    """
+    rule = construct.get(("as-path", "named-list"))
+    if not (rule and rule[0] == "unsupported"):
+        return []
+    out = []
+    for raw in aspath_names:
+        name = str(raw).strip()
+        if not (name.isdigit() and 1 <= int(name) <= 500):
+            out.append({"scope": "as-path", "element": name, "status": "unsupported", "detail": rule[1]})
+    return out
+
+
+def preflight(rows, community_members=(), set_keys=(), match_keys=(), aspath_names=()) -> dict:
     """Check requested elements against cached capability *rows* for one ``(ned, sw)``.
 
     Returns ``{fully_supported, unsupported:[{scope,element,status,detail}], coverage_unknown}``.
     A community member is matched by KIND (so ``color:0:200`` inherits the verdict probed for
-    any color); a set/match key maps to its construct name(s). ``status`` in (skipped,
-    unsupported) flags. ``coverage_unknown`` is a SEPARATE signal: when the NED is unassessed
-    it stays ``fully_supported`` (block only on a known-negative) but the consumer shows "not
-    assessed" rather than claiming full support.
+    any color); a set/match key maps to its construct name(s); an as-path name is checked for a
+    NED-numeric requirement. ``status`` in (skipped, unsupported) flags. ``coverage_unknown`` is
+    a SEPARATE signal: when the NED is unassessed it stays ``fully_supported`` (block only on a
+    known-negative) but the consumer shows "not assessed" rather than claiming full support.
     """
     kind, construct = _index_rows(rows)
     unsupported = []
@@ -250,6 +269,7 @@ def preflight(rows, community_members=(), set_keys=(), match_keys=()) -> dict:
             unsupported.append({"scope": "community", "element": str(member), "status": status, "detail": detail})
     unsupported += _check_constructs(set_keys, _SET_KEY_CONSTRUCTS, "rm-set", construct)
     unsupported += _check_constructs(match_keys, _MATCH_KEY_CONSTRUCTS, "rm-match", construct)
+    unsupported += _check_aspath_names(aspath_names, construct)
     return {
         "fully_supported": not unsupported,
         "unsupported": unsupported,

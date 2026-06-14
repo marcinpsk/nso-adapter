@@ -171,6 +171,27 @@ def test_preflight_all_native_is_fully_supported():
     assert res == {"fully_supported": True, "unsupported": [], "coverage_unknown": False}
 
 
+def test_preflight_flags_non_numeric_aspath_on_ios():
+    """With the IOS 'as-path named-list unsupported' row, a named as-path is flagged; numeric is fine."""
+    from nso_adapter.core.capability import preflight
+
+    rows = [_row("as-path", "named-list", "unsupported", detail="IOS as-path is numbered 1-500")]
+    res = preflight(rows, aspath_names=["AP-NAMED", "50", "501"])
+    flagged = {u["element"] for u in res["unsupported"]}
+    assert flagged == {"AP-NAMED", "501"}  # named + out-of-range; "50" is a valid number
+    assert res["fully_supported"] is False
+
+
+def test_preflight_aspath_not_flagged_without_named_list_row():
+    """A NED that supports named as-path lists (no probe row) never flags an as-path name."""
+    from nso_adapter.core.capability import preflight
+
+    rows = [_row("community", "65000:1", "native")]  # e.g. IOS-XR/Junos — no as-path named-list row
+    res = preflight(rows, aspath_names=["AP-NAMED"])
+    assert res["fully_supported"] is True
+    assert res["unsupported"] == []
+
+
 def test_preflight_coverage_unknown_does_not_block():
     """An unassessed NED (coverage marker) reports coverage_unknown but stays fully_supported.
 

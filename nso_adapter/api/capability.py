@@ -29,6 +29,7 @@ class PreflightRequest(BaseModel):
     community_members: list[str] = []
     set_keys: list[str] = []
     match_keys: list[str] = []
+    aspath_names: list[str] = []
 
 
 async def _device_and_client(device_id: int, db: AsyncSession):
@@ -89,5 +90,5 @@ async def preflight_route_policy(
     if not info:
         return {"known": False, "fully_supported": True, "unsupported": [], "coverage_unknown": False}
     rows = await capability.get_device_capability(db, info["ned_id"], info["sw_version"])
-    result = capability.preflight(rows, body.community_members, body.set_keys, body.match_keys)
+    result = capability.preflight(rows, body.community_members, body.set_keys, body.match_keys, body.aspath_names)
     return {"known": True, "ned_id": info["ned_id"], "sw_version": info["sw_version"], **result}
