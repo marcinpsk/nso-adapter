@@ -1339,6 +1339,24 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                         row.last_apply_error = err_payload
                     rp_outcome_failed = len(rp_eligible)
                     rp_failed.append({"error": exc.message})
+                    # Accepted-half: record the device-parser rejection in the capability
+                    # matrix so every box on this (ned, sw) is flagged from now on. The
+                    # difference is only learnable from a real commit (dry-run renders it).
+                    try:
+                        from nso_adapter.core.capability import (
+                            parse_rejected_construct,
+                            record_capability_rejection,
+                            refresh_device_capability,
+                        )
+
+                        info = await refresh_device_capability(db, client, device_name)
+                        scope, name = parse_rejected_construct(exc.message)
+                        if info and name:
+                            await record_capability_rejection(
+                                db, info["ned_id"], info["sw_version"], scope, name, exc.message[:256]
+                            )
+                    except Exception:  # noqa: BLE001 — capability recording is best-effort
+                        logger.debug("apply.capability_record_skipped", job_id=job_id)
                 except Exception as exc:
                     logger.exception("apply.route_policy_unexpected_error", job_id=job_id)
                     err_payload = {"code": "internal", "message": repr(exc), "detail": {}}

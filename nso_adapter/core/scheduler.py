@@ -483,6 +483,32 @@ async def _scheduled_route_policy_refresh() -> None:
             await refresh_route_policy_for_device(db, device, nso_client, refresh_source="poll")
 
 
+async def _scheduled_capability_refresh() -> None:
+    """Daily: refresh the route-policy capability matrix (representable half) for the fleet.
+
+    Probes each managed device; identical (ned_id, sw_version) boxes upsert the same rows
+    (idempotent). The apply-failed hook keeps the accepted half current between probes.
+    """
+    from sqlalchemy import select
+
+    from nso_adapter.core.capability import refresh_device_capability
+    from nso_adapter.core.importer import get_nso_client
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device
+
+    async for db in get_session():
+        devices = (await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))).scalars().all()
+        for device in devices:
+            try:
+                nso_client = get_nso_client(device.nso_instance)
+            except RuntimeError:
+                continue
+            try:
+                await refresh_device_capability(db, nso_client, device.nso_device_name)
+            except Exception as exc:  # noqa: BLE001 — one device must not abort the fleet refresh
+                logger.warning("scheduler.capability.failed", device_id=device.id, error=str(exc))
+
+
 async def _refresh_all_devices(refresh_fn, label: str) -> None:
     """Run *refresh_fn(db, device, nso_client, refresh_source='poll')* for every
     NSO-managed device. Shared body for the L2/L3 interface-family poll jobs
@@ -716,6 +742,13 @@ def start_scheduler() -> None:
             "interval",
             minutes=cfg.scheduler.route_policy_poll_interval,
             id="route_policy_refresh",
+        )
+    if cfg.scheduler.enable_capability_refresh and cfg.scheduler.capability_refresh_interval > 0:
+        _scheduler.add_job(
+            _scheduled_capability_refresh,
+            "interval",
+            minutes=cfg.scheduler.capability_refresh_interval,
+            id="capability_refresh",
         )
     if cfg.scheduler.enable_topology_interface_sync and cfg.scheduler.topology_interface_poll_interval > 0:
         _scheduler.add_job(

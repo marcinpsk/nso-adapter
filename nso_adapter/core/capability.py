@@ -13,6 +13,8 @@ operator finding out only when it silently didn't land. Two halves feed each ver
 
 from __future__ import annotations
 
+import re
+
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -117,3 +119,139 @@ async def refresh_device_capability(db: AsyncSession, nso_client: NsoClient, dev
     count = await record_probe_capability(db, ned_id, sw_version, elements)
     logger.info("capability.refresh.done", device=device_name, ned_id=ned_id, sw_version=sw_version, elements=count)
     return {"ned_id": ned_id, "sw_version": sw_version, "count": count}
+
+
+# ── Preflight: check an attach against the cached matrix ──────────────────────
+
+_RANK = {"native": 0, "translated": 1, "skipped": 2, "unsupported": 3}
+_RT_KW = {"target", "rt", "route-target"}
+_SOO_KW = {"origin", "soo", "route-origin"}
+_REGEX_META = frozenset(".[]()?+^$|\\*")
+
+# set-/match-json key → candidate matrix construct names (probe uses the container name;
+# the apply hook may record a finer 'set extcommunity color', so list both).
+_SET_KEY_CONSTRUCTS = {
+    "community": ["set community"],
+    "community_additive": ["set community"],
+    "extcommunity_rt": ["set extcommunity"],
+    "extcommunity_soo": ["set extcommunity"],
+    "extcommunity_color": ["set extcommunity color", "set extcommunity"],
+    "comm_list_delete": ["set comm-list delete"],
+    "extcomm_list_delete": ["set extcomm-list delete"],
+    "metric_type": ["set metric-type"],
+    "tag": ["set tag"],
+    "level": ["set level"],
+    "large_community": ["set large-community"],
+}
+_MATCH_KEY_CONSTRUCTS = {
+    "route_type": ["match route-type"],
+    "local_preference": ["match local-preference"],
+    "length": ["match length"],
+    "large_community": ["match large-community"],
+}
+
+
+def _community_kind(member: str) -> str:
+    """Coarse kind of a community member — the granularity the matrix groups by."""
+    m = str(member).strip()
+    head, sep, _rest = m.partition(":")
+    keyword = head.lower() if sep and head and not head[0].isdigit() else None
+    if keyword in _RT_KW:
+        return "rt"
+    if keyword in _SOO_KW:
+        return "soo"
+    if keyword in ("large", "color", "bandwidth", "encapsulation"):
+        return keyword
+    return "regex" if any(c in _REGEX_META for c in m) else "standard"
+
+
+def _index_rows(rows):
+    """Build (community kind→(status,detail), construct (scope,name)→(status,detail)) maps.
+
+    Community rows collapse to their KIND, keeping the worst (highest-ranked) status.
+    """
+    kind: dict[str, tuple[str, str]] = {}
+    construct: dict[tuple[str, str], tuple[str, str]] = {}
+    for r in rows:
+        if r.scope == "community":
+            k = _community_kind(r.name)
+            cur = kind.get(k)
+            if cur is None or _RANK.get(r.status, 0) > _RANK.get(cur[0], 0):
+                kind[k] = (r.status, r.detail)
+        else:
+            construct[(r.scope, r.name)] = (r.status, r.detail)
+    return kind, construct
+
+
+def _check_constructs(keys, mapping, scope, construct):
+    """Flag set/match keys whose best matching construct row is skipped/unsupported."""
+    out = []
+    for key in keys:
+        best = None
+        for name in mapping.get(key, []):
+            got = construct.get((scope, name))
+            if got and _RANK.get(got[0], 0) >= _RANK.get((best or (name, "native", ""))[1], 0):
+                best = (name, got[0], got[1])
+        if best and best[1] in ("skipped", "unsupported"):
+            out.append({"scope": scope, "element": best[0], "status": best[1], "detail": best[2]})
+    return out
+
+
+def preflight(rows, community_members=(), set_keys=(), match_keys=()) -> dict:
+    """Check requested elements against cached capability *rows* for one ``(ned, sw)``.
+
+    Returns ``{fully_supported, unsupported:[{scope,element,status,detail}]}``. A community
+    member is matched by KIND (so ``color:0:200`` inherits the verdict probed for any color);
+    a set/match key maps to its construct name(s). ``status`` in (skipped, unsupported) flags.
+    """
+    kind, construct = _index_rows(rows)
+    unsupported = []
+    for member in community_members:
+        status, detail = kind.get(_community_kind(member), ("native", ""))
+        if status in ("skipped", "unsupported"):
+            unsupported.append({"scope": "community", "element": str(member), "status": status, "detail": detail})
+    unsupported += _check_constructs(set_keys, _SET_KEY_CONSTRUCTS, "rm-set", construct)
+    unsupported += _check_constructs(match_keys, _MATCH_KEY_CONSTRUCTS, "rm-match", construct)
+    return {"fully_supported": not unsupported, "unsupported": unsupported}
+
+
+# Rejected-command → (scope, construct-name) for the accepted half. Names match the
+# preflight candidate names so a later preflight surfaces the device's real rejection.
+_REJECTION_CONSTRUCTS = (
+    ("rm-set", "set extcommunity color", "set extcommunity color"),
+    ("rm-set", "set extcommunity", "set extcommunity"),
+    ("rm-set", "set comm-list delete", "set comm-list"),
+    ("rm-set", "set extcomm-list delete", "set extcomm-list"),
+    ("rm-set", "set metric-type", "set metric-type"),
+    ("rm-set", "set large-community", "set large-community"),
+    ("rm-set", "set tag", "set tag"),
+    ("rm-set", "set level", "set level"),
+    ("rm-match", "match route-type", "match route-type"),
+    ("rm-match", "match local-preference", "match local-preference"),
+    ("rm-match", "match length", "match length"),
+    ("rm-match", "match as-path", "match as-path"),
+    ("community", "ip large-community-list", "ip large-community-list"),
+)
+
+
+def parse_rejected_construct(message: str):
+    """Map a device-parser rejection error → ``(scope, construct-name)`` (or ``(None, None)``).
+
+    Pulls the offending ``command: <cmd>`` from the NED error and normalises it to a known
+    construct so the accepted-half rejection matches what the preflight checks.
+    """
+    match = re.search(r"command:\s*(.+?)[\r\n]", message or "")
+    cmd = (match.group(1) if match else "").strip()
+    if not cmd:
+        return None, None
+    low = cmd.lower()
+    for scope, name, prefix in _REJECTION_CONSTRUCTS:
+        if low.startswith(prefix):
+            return scope, name
+    if low.startswith("set "):
+        return "rm-set", " ".join(cmd.split()[:3])
+    if low.startswith("match "):
+        return "rm-match", " ".join(cmd.split()[:3])
+    if "community-list" in low:
+        return "community", " ".join(cmd.split()[:3])
+    return None, None

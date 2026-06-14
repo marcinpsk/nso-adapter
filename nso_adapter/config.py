@@ -82,6 +82,11 @@ class SchedulerConfig(BaseModel):
     redistribution_poll_interval: int = 300
     enable_route_policy_sync: bool = True
     route_policy_poll_interval: int = 300
+    # Route-policy capability matrix probe — refreshes the representable half per device
+    # on a slow cadence (daily by default; the apply-failed hook keeps the accepted half
+    # current between probes). Operators can also force a refresh via the capability API.
+    enable_capability_refresh: bool = True
+    capability_refresh_interval: int = 1440  # minutes (daily)
     enable_l2_service_sync: bool = True
     l2_service_poll_interval: int = 300
     # L2/L3 interface family (M34 VLAN-db + switchport, M35 SVI/IRB, M36 dot1q

@@ -74,6 +74,8 @@ def test_start_scheduler_registers_lag_refresh_job(monkeypatch: pytest.MonkeyPat
                 redistribution_poll_interval=300,
                 enable_route_policy_sync=False,
                 route_policy_poll_interval=300,
+                enable_capability_refresh=False,
+                capability_refresh_interval=1440,
                 enable_logging_sync=False,
                 logging_poll_interval=300,
                 enable_l2_service_sync=True,
@@ -142,6 +144,8 @@ def test_start_scheduler_skips_lag_refresh_when_disabled(monkeypatch: pytest.Mon
                 redistribution_poll_interval=300,
                 enable_route_policy_sync=False,
                 route_policy_poll_interval=300,
+                enable_capability_refresh=False,
+                capability_refresh_interval=1440,
                 enable_logging_sync=False,
                 logging_poll_interval=300,
                 enable_l2_service_sync=False,
@@ -227,9 +231,7 @@ async def test_scheduled_l2_service_refresh_refreshes_all_devices(adapter_client
         ("_scheduled_subinterface_refresh", "nso_adapter.core.subinterface.refresh_subinterface_for_device"),
     ],
 )
-async def test_l2l3_family_refresh_refreshes_all_devices(
-    adapter_client, monkeypatch, scheduled_fn, refresh_target
-):
+async def test_l2l3_family_refresh_refreshes_all_devices(adapter_client, monkeypatch, scheduled_fn, refresh_target):
     """M34/M35/M36: the L2/L3 interface-family poll jobs refresh every managed device."""
     async for db in get_session():
         db.add_all(

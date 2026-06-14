@@ -88,3 +88,52 @@ async def test_refresh_parses_and_stores_probe_output(adapter_client, monkeypatc
         rows = await capability.get_device_capability(db, _NED, "17.15.4c")
         assert {(r.scope, r.name) for r in rows} == {("community", "color:0:128"), ("rm-set", "set extcommunity")}
         break
+
+
+def _row(scope, name, status, source="probe", detail=""):
+    from nso_adapter.store.models import DeviceCapability
+
+    return DeviceCapability(
+        ned_id=_NED, sw_version="x", scope=scope, name=name, status=status, detail=detail, source=source
+    )
+
+
+def test_preflight_flags_community_kind_and_constructs():
+    from nso_adapter.core.capability import preflight
+
+    rows = [
+        _row("community", "color:0:128", "skipped", detail="no IOS home"),
+        _row("community", "65000:1", "native"),
+        _row("rm-set", "set extcommunity", "native"),
+        _row("rm-set", "set extcommunity color", "unsupported", source="apply", detail="% Invalid input"),
+        _row("rm-set", "set metric-type", "native"),
+    ]
+    res = preflight(
+        rows,
+        community_members=["color:0:200", "65000:9"],  # color flagged (by kind), exact native
+        set_keys=["extcommunity_color", "metric_type"],  # color flagged via apply row, metric-type ok
+    )
+    assert res["fully_supported"] is False
+    flagged = {(u["scope"], u["element"]) for u in res["unsupported"]}
+    assert ("community", "color:0:200") in flagged
+    assert ("rm-set", "set extcommunity color") in flagged
+    assert not any(u["element"] == "65000:9" for u in res["unsupported"])
+    assert not any(u["element"] == "set metric-type" for u in res["unsupported"])
+
+
+def test_preflight_all_native_is_fully_supported():
+    from nso_adapter.core.capability import preflight
+
+    rows = [_row("community", "65000:1", "native"), _row("rm-set", "set extcommunity", "native")]
+    res = preflight(rows, community_members=["65000:5"], set_keys=["extcommunity_rt"])
+    assert res == {"fully_supported": True, "unsupported": []}
+
+
+def test_parse_rejected_construct():
+    from nso_adapter.core.capability import parse_rejected_construct
+
+    msg = "External error ...: command: set extcommunity color 12\r\n: ... % Invalid input"
+    assert parse_rejected_construct(msg) == ("rm-set", "set extcommunity color")
+    assert parse_rejected_construct("command: match as-path AP-X\n") == ("rm-match", "match as-path")
+    assert parse_rejected_construct("command: set comm-list FOO delete\n") == ("rm-set", "set comm-list delete")
+    assert parse_rejected_construct("no command here") == (None, None)

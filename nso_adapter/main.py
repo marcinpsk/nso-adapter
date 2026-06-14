@@ -13,22 +13,20 @@ from fastapi import FastAPI
 from nso_adapter.api.actions import router as actions_router
 from nso_adapter.api.bfd import router as bfd_router
 from nso_adapter.api.bgp import router as bgp_router
+from nso_adapter.api.capability import router as capability_router
 from nso_adapter.api.devices import router as devices_router
 from nso_adapter.api.errors import ApiError, api_error_handler
 from nso_adapter.api.health import router as health_router
 from nso_adapter.api.intent import router as intent_router
 from nso_adapter.api.interface_ip import router as interface_ip_router
+from nso_adapter.api.interface_mtu import router as interface_mtu_router
 from nso_adapter.api.interfaces import router as interfaces_router
 from nso_adapter.api.isis import router as isis_router
 from nso_adapter.api.jobs import router as jobs_router
 from nso_adapter.api.l2_service import router as l2_service_router
 from nso_adapter.api.lag_config import router as lag_config_router
-from nso_adapter.api.vlan import router as vlan_router
 from nso_adapter.api.lag_topology import router as lag_topology_router
 from nso_adapter.api.logging_config import router as logging_config_router
-from nso_adapter.api.interface_mtu import router as interface_mtu_router
-from nso_adapter.api.subinterface import router as subinterface_router
-from nso_adapter.api.svi import router as svi_router
 from nso_adapter.api.nso_instances import router as nso_instances_router
 from nso_adapter.api.ospf import router as ospf_router
 from nso_adapter.api.redistribution import router as redistribution_router
@@ -36,14 +34,17 @@ from nso_adapter.api.route_policy import router as route_policy_router
 from nso_adapter.api.scope import router as scope_router
 from nso_adapter.api.snmp import router as snmp_router
 from nso_adapter.api.static_route import router as static_route_router
+from nso_adapter.api.subinterface import router as subinterface_router
+from nso_adapter.api.svi import router as svi_router
+from nso_adapter.api.vlan import router as vlan_router
 from nso_adapter.config import get_config, get_env_settings
 from nso_adapter.core.importer import register_nso_client, set_netbox_client
 from nso_adapter.core.interface_ip import handle_interface_ip_change
+from nso_adapter.core.interface_mtu import handle_interface_mtu_change
 from nso_adapter.core.l2_service import handle_l2_service_change
 from nso_adapter.core.lag_topology import handle_netconf_config_change
 from nso_adapter.core.scheduler import start_scheduler, stop_scheduler
 from nso_adapter.core.snmp import handle_snmp_config_change
-from nso_adapter.core.interface_mtu import handle_interface_mtu_change
 from nso_adapter.core.subinterface import handle_subinterface_change
 from nso_adapter.core.svi import handle_svi_change
 from nso_adapter.core.vlan import handle_switchport_change, handle_vlan_database_change
@@ -210,6 +211,7 @@ def create_app() -> FastAPI:
     app.include_router(bfd_router)
     app.include_router(bgp_router)
     app.include_router(route_policy_router)
+    app.include_router(capability_router)
     app.include_router(ospf_router)
     app.include_router(redistribution_router)
     app.include_router(jobs_router)
