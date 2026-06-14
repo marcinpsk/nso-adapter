@@ -56,3 +56,19 @@ async def connect(client: NsoClient, device_name: str) -> dict:
         resp = await c.post(url)
         resp.raise_for_status()
         return resp.json().get("tailf-ncs:output", {})
+
+
+async def capability_probe(client: NsoClient, device_name: str) -> dict:
+    """POST the route-policy capability-probe action.
+
+    Returns the reconciler's representable-half verdict for the device's NED:
+    ``{ned-id, sw-version, element:[{scope,name,status,detail}, ...]}``.
+    """
+    url = f"{client._base}/restconf/data/route-policy-reconciler:route-policy-capability/probe"
+    body = {"route-policy-reconciler:input": {"device": device_name}}
+    async with client._client(timeout=client._action_timeout) as c:
+        resp = await c.post(url, json=body)
+        resp.raise_for_status()
+        if resp.status_code == 204 or not resp.content:
+            return {}
+        return resp.json().get("route-policy-reconciler:output", {})

@@ -1892,3 +1892,34 @@ class RedistributionIntent(Base):
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     device: Mapped[Device] = relationship("Device", back_populates="redistribution_intents")
+
+
+class DeviceCapability(Base):
+    """Route-policy capability matrix, keyed by ``(ned_id, sw_version)``.
+
+    The compatibility cache that lets the plugin flag — at attach time — which parts of
+    a route-map / community-list won't apply on a device, instead of the operator finding
+    out only when it silently didn't land. Persisted so it survives an adapter restart.
+
+    Two sources feed each per-element verdict:
+      - ``source='probe'`` — the REPRESENTABLE half, from the NSO ``capability-probe``
+        action (what the reconciler can model/send for this NED).
+      - ``source='apply'`` — the ACCEPTED half, from a real ``apply_failed`` device-parser
+        rejection (what the box actually takes at commit). Apply wins over probe.
+
+    Keyed by ``(ned_id, sw_version)`` so 20 identical boxes share one verdict; a box on a
+    different software version (or NED) falls into a different key and is re-checked.
+    """
+
+    __tablename__ = "device_capability"
+    __table_args__ = (UniqueConstraint("ned_id", "sw_version", "scope", "name", name="uq_device_capability"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ned_id: Mapped[str] = mapped_column(String(256), index=True)
+    sw_version: Mapped[str] = mapped_column(String(128), index=True)
+    scope: Mapped[str] = mapped_column(String(32))  # community | rm-set | rm-match
+    name: Mapped[str] = mapped_column(String(128))  # member-kind / construct
+    status: Mapped[str] = mapped_column(String(16))  # native | translated | skipped | unsupported
+    detail: Mapped[str] = mapped_column(String(256), default="")
+    source: Mapped[str] = mapped_column(String(16))  # probe | apply
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
