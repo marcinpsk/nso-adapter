@@ -104,8 +104,13 @@ async def get_device_capability(db: AsyncSession, ned_id: str, sw_version: str) 
     )
 
 
-async def refresh_device_capability(db: AsyncSession, nso_client: NsoClient, device_name: str) -> dict:
+async def refresh_device_capability(
+    db: AsyncSession, nso_client: NsoClient, device_name: str, device: m.Device | None = None
+) -> dict:
     """Invoke the NSO capability-probe action for a device and store the representable half.
+
+    Also persists the learned ``(ned_id, sw_version)`` onto the device row (when *device*
+    is given) so a later read can resolve the key without re-probing.
 
     Returns ``{ned_id, sw_version, count}`` (or ``{}`` when the probe reports no NED).
     """
@@ -117,8 +122,26 @@ async def refresh_device_capability(db: AsyncSession, nso_client: NsoClient, dev
         return {}
     elements = out.get("element", []) or []
     count = await record_probe_capability(db, ned_id, sw_version, elements)
+    if device is not None and (device.ned_id != ned_id or device.sw_version != sw_version):
+        device.ned_id, device.sw_version = ned_id, sw_version
+        await db.commit()
     logger.info("capability.refresh.done", device=device_name, ned_id=ned_id, sw_version=sw_version, elements=count)
     return {"ned_id": ned_id, "sw_version": sw_version, "count": count}
+
+
+async def resolve_capability_key(db: AsyncSession, nso_client: NsoClient, device: m.Device, *, refresh: bool) -> dict:
+    """Resolve a device's ``(ned_id, sw_version)`` capability key.
+
+    With ``refresh=True`` (the authoritative path — "check now" / attach) this probes NSO
+    and persists the learned key. With ``refresh=False`` (the cheap panel-read path) it uses
+    the key already stored on the device row, returning ``{}`` when none has been learned yet
+    (so the caller reports an honest "unknown — check now" instead of blocking).
+    """
+    if refresh:
+        return await refresh_device_capability(db, nso_client, device.nso_device_name, device)
+    if device.ned_id and device.sw_version:
+        return {"ned_id": device.ned_id, "sw_version": device.sw_version, "count": 0}
+    return {}
 
 
 # ── Preflight: check an attach against the cached matrix ──────────────────────

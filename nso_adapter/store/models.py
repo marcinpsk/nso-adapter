@@ -79,6 +79,9 @@ class Device(Base):
     nso_device_name: Mapped[str] = mapped_column(String(256), index=True)
     netbox_device_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     ned_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Last platform version learned from a capability probe — lets the capability
+    # cache resolve this device's (ned_id, sw_version) key WITHOUT a live probe.
+    sw_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     mapping_status: Mapped[MappingStatus] = mapped_column(Enum(MappingStatus), default=MappingStatus.mapped)
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_sync_status: Mapped[LastSyncStatus | None] = mapped_column(Enum(LastSyncStatus), nullable=True)

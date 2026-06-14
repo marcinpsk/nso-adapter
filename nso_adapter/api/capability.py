@@ -46,22 +46,25 @@ async def _device_and_client(device_id: int, db: AsyncSession):
 async def refresh_capability(device_id: int, db: AsyncSession = Depends(get_db)):
     """Force a capability probe for this device now ('check now') and persist the result."""
     device, client = await _device_and_client(device_id, db)
-    info = await capability.refresh_device_capability(db, client, device.nso_device_name)
+    info = await capability.refresh_device_capability(db, client, device.nso_device_name, device)
     return info or {"ned_id": "", "sw_version": "", "count": 0}
 
 
 @router.get("/{device_id}/capability", dependencies=[Depends(verify_token)])
-async def get_capability(device_id: int, db: AsyncSession = Depends(get_db)):
+async def get_capability(device_id: int, refresh: bool = False, db: AsyncSession = Depends(get_db)):
     """Return the cached capability verdict for this device's (ned_id, sw_version).
 
-    Probes once if the device's key has never been seen (so the first read is populated).
+    ``refresh=true`` probes NSO now (the explicit "check now"); ``refresh=false`` (default —
+    the cheap panel read) serves the device's last-learned key, returning an empty key when
+    the device has never been probed.
     """
     device, client = await _device_and_client(device_id, db)
-    info = await capability.refresh_device_capability(db, client, device.nso_device_name)
+    info = await capability.resolve_capability_key(db, client, device, refresh=refresh)
     if not info:
-        return {"ned_id": "", "sw_version": "", "elements": []}
+        return {"known": False, "ned_id": "", "sw_version": "", "elements": []}
     rows = await capability.get_device_capability(db, info["ned_id"], info["sw_version"])
     return {
+        "known": True,
         "ned_id": info["ned_id"],
         "sw_version": info["sw_version"],
         "elements": [
@@ -71,14 +74,17 @@ async def get_capability(device_id: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/{device_id}/route-policy/preflight", dependencies=[Depends(verify_token)])
-async def preflight_route_policy(device_id: int, body: PreflightRequest, db: AsyncSession = Depends(get_db)):
+async def preflight_route_policy(
+    device_id: int, body: PreflightRequest, refresh: bool = True, db: AsyncSession = Depends(get_db)
+):
     """Check a would-be attach against this device's capability matrix.
 
-    Refreshes the device's (ned, sw) verdict (one probe), then reports which requested
-    community members / route-map constructs won't fully apply on this box.
+    ``refresh=true`` (default — the authoritative attach-time check) probes the device's
+    (ned, sw) verdict once; ``refresh=false`` (the cheap panel read) uses the last-learned
+    key. Reports which requested community members / route-map constructs won't fully apply.
     """
     device, client = await _device_and_client(device_id, db)
-    info = await capability.refresh_device_capability(db, client, device.nso_device_name)
+    info = await capability.resolve_capability_key(db, client, device, refresh=refresh)
     if not info:
         return {"known": False, "fully_supported": True, "unsupported": []}
     rows = await capability.get_device_capability(db, info["ned_id"], info["sw_version"])

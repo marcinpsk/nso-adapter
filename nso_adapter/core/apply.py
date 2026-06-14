@@ -1349,7 +1349,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                             refresh_device_capability,
                         )
 
-                        info = await refresh_device_capability(db, client, device_name)
+                        info = await refresh_device_capability(db, client, device_name, device)
                         scope, name = parse_rejected_construct(exc.message)
                         if info and name:
                             await record_capability_rejection(

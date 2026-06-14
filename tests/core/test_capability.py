@@ -90,6 +90,48 @@ async def test_refresh_parses_and_stores_probe_output(adapter_client, monkeypatc
         break
 
 
+@pytest.mark.asyncio
+async def test_refresh_persists_key_then_cache_only_resolve(adapter_client, monkeypatch):  # noqa: F811
+    """A probe persists (ned_id, sw_version) on the device so a later read needs no probe."""
+    from nso_adapter.core import capability
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device
+    from tests.conftest import seed_device
+
+    device_id = await seed_device(nso_device_name="rg03")
+
+    probe_calls = {"n": 0}
+
+    async def fake_probe(_client, _name):
+        probe_calls["n"] += 1
+        return {
+            "ned-id": _NED,
+            "sw-version": "17.15.4c",
+            "element": [{"scope": "rm-set", "name": "set extcommunity", "status": "native", "detail": ""}],
+        }
+
+    monkeypatch.setattr(capability.actions, "capability_probe", fake_probe)
+
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        # refresh=False before any probe → key unknown, no probe fired
+        assert await capability.resolve_capability_key(db, object(), device, refresh=False) == {}
+        assert probe_calls["n"] == 0
+
+        # refresh=True probes once and persists the learned key onto the device row
+        info = await capability.resolve_capability_key(db, object(), device, refresh=True)
+        assert info["ned_id"] == _NED and info["sw_version"] == "17.15.4c"
+        assert probe_calls["n"] == 1
+        refreshed = await db.get(Device, device_id)
+        assert (refreshed.ned_id, refreshed.sw_version) == (_NED, "17.15.4c")
+
+        # refresh=False now resolves from the stored key WITHOUT another probe
+        cached = await capability.resolve_capability_key(db, object(), refreshed, refresh=False)
+        assert cached == {"ned_id": _NED, "sw_version": "17.15.4c", "count": 0}
+        assert probe_calls["n"] == 1
+        break
+
+
 def _row(scope, name, status, source="probe", detail=""):
     from nso_adapter.store.models import DeviceCapability
 

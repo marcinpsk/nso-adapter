@@ -504,7 +504,7 @@ async def _scheduled_capability_refresh() -> None:
             except RuntimeError:
                 continue
             try:
-                await refresh_device_capability(db, nso_client, device.nso_device_name)
+                await refresh_device_capability(db, nso_client, device.nso_device_name, device)
             except Exception as exc:  # noqa: BLE001 — one device must not abort the fleet refresh
                 logger.warning("scheduler.capability.failed", device_id=device.id, error=str(exc))
 
