@@ -51,6 +51,72 @@ def test_ned_family_bare_prefix_still_matches():
     assert ned_family("juniper-junos-evo-nc") == "junos"
 
 
+# ── NED transport derivation (device-type for onboarding) ──────────────────────
+
+
+def test_ned_transport_cli():
+    from nso_adapter.nso.neds import ned_transport
+
+    assert ned_transport("cisco-ios-cli-6.114") == "cli"
+    assert ned_transport("cisco-iosxr-cli-7.76") == "cli"
+
+
+def test_ned_transport_netconf():
+    from nso_adapter.nso.neds import ned_transport
+
+    assert ned_transport("juniper-junos-nc-4.19") == "netconf"
+    assert ned_transport("juniper-junos-evo-nc-24.4") == "netconf"
+    assert ned_transport("timos-nc-23.10") == "netconf"
+    assert ned_transport("nokia-sros-nc-22.10") == "netconf"
+
+
+def test_ned_transport_doubled_identityref_form():
+    """Real NSO RESTCONF ned-ids are the doubled prefix:identity form."""
+    from nso_adapter.nso.neds import ned_transport
+
+    assert ned_transport("juniper-junos-nc-4.19:juniper-junos-nc-4.19") == "netconf"
+    assert ned_transport("cisco-ios-cli-6.114:cisco-ios-cli-6.114") == "cli"
+
+
+def test_ned_transport_generic_and_unknown():
+    from nso_adapter.nso.neds import ned_transport
+
+    assert ned_transport("acme-thing-gen-1.0") == "generic"
+    assert ned_transport("no-protocol-token") is None
+    assert ned_transport("") is None
+
+
+def test_resolve_device_type_derives_from_ned_id():
+    from nso_adapter.nso.neds import resolve_device_type
+
+    # The bug: a netconf NED defaulting to device-type cli. Derivation fixes it.
+    assert resolve_device_type("juniper-junos-nc-4.19") == "netconf"
+    assert resolve_device_type("cisco-ios-cli-6.114") == "cli"
+
+
+def test_resolve_device_type_rejects_contradicting_request():
+    """ned_type='cli' for a '-nc-' NED is exactly how rd2 was mis-onboarded → refuse."""
+    import pytest
+
+    from nso_adapter.nso.neds import resolve_device_type
+
+    with pytest.raises(ValueError, match="contradicts"):
+        resolve_device_type("juniper-junos-nc-4.19", requested="cli")
+
+
+def test_resolve_device_type_agreeing_request_ok():
+    from nso_adapter.nso.neds import resolve_device_type
+
+    assert resolve_device_type("juniper-junos-nc-4.19", requested="netconf") == "netconf"
+
+
+def test_resolve_device_type_unknown_falls_back_to_request():
+    from nso_adapter.nso.neds import resolve_device_type
+
+    assert resolve_device_type("mystery-ned", requested="generic") == "generic"
+    assert resolve_device_type("mystery-ned") == "cli"  # default when nothing known
+
+
 # ── NED package component parsing (NED inventory) ──────────────────────────────
 
 

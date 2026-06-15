@@ -94,7 +94,7 @@ async def provision_nso_device(
     ned_id: str,
     authgroup: str,
     netbox_device_id: int | None = None,
-    ned_type: str = "cli",
+    ned_type: str | None = None,
     port: int | None = None,
     admin_state: str = "unlocked",
     do_sync: bool = True,
@@ -108,14 +108,21 @@ async def provision_nso_device(
       4. sync-from (pull running config into CDB) — non-fatal; normal sync retries
       5. create the adapter Device mapping row (if ``netbox_device_id`` given)
 
+    ``ned_type`` (the NSO ``device-type`` transport) is derived from ``ned_id`` when
+    not given; an explicit value that contradicts the ned_id raises ValueError
+    (guards against onboarding a NETCONF NED as ``device-type cli``).
+
     On a blocking failure the device is left in NSO as-is for retry (no rollback).
     Returns ``{"ok": bool, "steps": [...], "device_id": int|None}``.
     """
     from nso_adapter.core.importer import get_nso_client
+    from nso_adapter.nso.neds import resolve_device_type
 
     known = {inst.name for inst in get_config().nso_instances}
     if nso_instance not in known:
         raise ValueError(f"NSO instance {nso_instance!r} not found in config")
+
+    device_type = resolve_device_type(ned_id, ned_type)
 
     client = get_nso_client(nso_instance)
     steps: list[dict] = []
@@ -134,8 +141,8 @@ async def provision_nso_device(
         if await client.device_exists(device_name):
             _step("create", "exists")
         else:
-            await client.create_device(device_name, address, ned_id, authgroup, ned_type=ned_type, port=port)
-            _step("create", "ok")
+            await client.create_device(device_name, address, ned_id, authgroup, ned_type=device_type, port=port)
+            _step("create", "ok", f"device-type={device_type}")
     except Exception as exc:
         _step("create", "failed", repr(exc))
         return _result(False)

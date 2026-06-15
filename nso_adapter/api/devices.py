@@ -94,7 +94,7 @@ class DeviceProvision(BaseModel):
     ned_id: str
     authgroup: str
     netbox_device_id: int | None = None
-    ned_type: str = "cli"
+    ned_type: str | None = None  # None → derive transport (cli/netconf/…) from ned_id
     port: int | None = None
     admin_state: str = "unlocked"
     sync: bool = True

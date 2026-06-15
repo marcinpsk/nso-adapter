@@ -59,6 +59,57 @@ async def test_provision_happy_path(adapter_client_with_nso):
     client.sync_from.assert_awaited_once()
 
 
+async def test_provision_derives_netconf_transport_from_ned_id(adapter_client_with_nso):
+    """Regression (rd2): a netconf NED must onboard as device-type netconf, not cli.
+
+    No ned_type is passed — it is derived from the ned_id. The old default of
+    ``cli`` produced ``device-type cli ned-id juniper-junos-nc-4.19``, an invalid
+    transport that left the device unable to sync its netconf config.
+    """
+    from nso_adapter.core.onboarding import provision_nso_device
+    from nso_adapter.store.db import get_session
+
+    client = _mock_client()
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
+        async for db in get_session():
+            res = await provision_nso_device(
+                db,
+                nso_instance="nso-dev",
+                device_name="junos-rtr",
+                address="10.0.0.9",
+                ned_id="juniper-junos-nc-4.19:juniper-junos-nc-4.19",
+                authgroup="network",
+            )
+            break
+    assert res["ok"] is True
+    _, kwargs = client.create_device.call_args
+    assert kwargs["ned_type"] == "netconf"
+
+
+async def test_provision_rejects_transport_contradicting_ned_id(adapter_client_with_nso):
+    """An explicit ned_type that disagrees with the ned_id raises (no mis-onboard)."""
+    import pytest
+
+    from nso_adapter.core.onboarding import provision_nso_device
+    from nso_adapter.store.db import get_session
+
+    client = _mock_client()
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
+        async for db in get_session():
+            with pytest.raises(ValueError, match="contradicts"):
+                await provision_nso_device(
+                    db,
+                    nso_instance="nso-dev",
+                    device_name="bad-junos",
+                    address="10.0.0.9",
+                    ned_id="juniper-junos-nc-4.19",
+                    authgroup="network",
+                    ned_type="cli",
+                )
+            break
+    client.create_device.assert_not_awaited()
+
+
 async def test_provision_idempotent_existing_device(adapter_client_with_nso):
     from nso_adapter.core.onboarding import provision_nso_device
     from nso_adapter.store.db import get_session

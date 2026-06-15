@@ -29,6 +29,52 @@ def ned_family(ned_id: str) -> str | None:
 
 _NED_DEVICE_TYPE_KEYS: tuple[str, ...] = ("cli", "netconf", "generic")
 
+# NSO encodes the southbound transport in the NED id's protocol token (the segment
+# before the version): cisco-ios-cli-6.114 → cli; juniper-junos-nc-4.19 → netconf;
+# foo-gen-1.0 → generic. Map each known token to the NSO ``device-type`` transport.
+_NED_PROTO_TO_TRANSPORT: dict[str, str] = {
+    "cli": "cli",
+    "nc": "netconf",
+    "netconf": "netconf",
+    "gen": "generic",
+    "generic": "generic",
+    "snmp": "snmp",
+}
+
+
+def ned_transport(ned_id: str) -> str | None:
+    """Return the NSO ``device-type`` transport encoded in *ned_id*, or None.
+
+    The transport (cli / netconf / generic / snmp) is part of the NED id naming
+    convention — e.g. ``juniper-junos-nc-4.19`` is a NETCONF NED (``-nc-``), not a
+    CLI one. Handles the doubled identityref form NSO RESTCONF returns
+    (``juniper-junos-nc-4.19:juniper-junos-nc-4.19``).
+    """
+    core = ned_id.split(":")[-1]
+    for tok in reversed(core.split("-")):
+        transport = _NED_PROTO_TO_TRANSPORT.get(tok.lower())
+        if transport is not None:
+            return transport
+    return None
+
+
+def resolve_device_type(ned_id: str, requested: str | None = None) -> str:
+    """Resolve the NSO ``device-type`` transport for onboarding *ned_id*.
+
+    The transport is authoritatively encoded in the NED id, so it is derived from
+    there. A *requested* value that contradicts a derivable transport raises
+    ``ValueError`` — the guard that stops a NETCONF NED (``-nc-``) being onboarded
+    as ``device-type cli`` (the bug that left prod-lab03c-rd2.lab unable to sync).
+    When the NED id carries no recognisable protocol token, fall back to *requested*
+    (or ``"cli"``).
+    """
+    derived = ned_transport(ned_id)
+    if derived is None:
+        return requested or "cli"
+    if requested is not None and requested != derived:
+        raise ValueError(f"ned_type {requested!r} contradicts NED id {ned_id!r} (transport={derived!r})")
+    return derived
+
 
 def _ned_oper_status(raw) -> str:
     """Normalise a packages/package oper-status into a short string.
