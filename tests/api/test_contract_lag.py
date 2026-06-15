@@ -35,15 +35,25 @@ async def test_lag_config_contract(adapter_client):
     ts = datetime(2026, 6, 1, 10, 0, 0)
     async for db in get_session():
         # Maximal bundle (every optional) + minimal bundle (only required).
-        b1 = LagBundleConfig(device_id=device_id, name="Bundle-Ether1", lag_id=1, min_links=2,
-                             system_priority=100, system_id="00:11:22:33:44:55", timer="fast", admin_key=10,
-                             last_refreshed_at=ts, refresh_source="poll")
+        b1 = LagBundleConfig(
+            device_id=device_id,
+            name="Bundle-Ether1",
+            lag_id=1,
+            min_links=2,
+            system_priority=100,
+            system_id="00:11:22:33:44:55",
+            timer="fast",
+            admin_key=10,
+            last_refreshed_at=ts,
+            refresh_source="poll",
+        )
         db.add(b1)
         await db.flush()
         db.add(LagMemberConfig(lag_bundle_id=b1.id, interface_name="GE0/1", mode="active", port_priority=32))
         db.add(LagMemberConfig(lag_bundle_id=b1.id, interface_name="GE0/2"))  # minimal member
-        b2 = LagBundleConfig(device_id=device_id, name="Bundle-Ether2", lag_id=2,
-                             last_refreshed_at=ts, refresh_source="poll")
+        b2 = LagBundleConfig(
+            device_id=device_id, name="Bundle-Ether2", lag_id=2, last_refreshed_at=ts, refresh_source="poll"
+        )
         db.add(b2)
         await db.commit()
         break

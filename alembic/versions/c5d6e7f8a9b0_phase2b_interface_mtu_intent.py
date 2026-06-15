@@ -7,8 +7,10 @@ Create Date: 2026-06-12
 Write-path intent for per-interface MTU (mtu / ip-mtu / mpls-mtu) accepted by the
 operator. Applied to the device via the mtu-reconciler NSO service.
 """
-from alembic import op
+
 import sqlalchemy as sa
+
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "c5d6e7f8a9b0"
@@ -33,9 +35,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("device_id", "interface_name", name="uq_ifmtuintent_identity"),
     )
-    op.create_index(
-        op.f("ix_interface_mtu_intent_device_id"), "interface_mtu_intent", ["device_id"], unique=False
-    )
+    op.create_index(op.f("ix_interface_mtu_intent_device_id"), "interface_mtu_intent", ["device_id"], unique=False)
 
 
 def downgrade() -> None:

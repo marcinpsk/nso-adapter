@@ -72,9 +72,7 @@ class SubinterfaceIntentUpdate(BaseModel):
 
 
 @router.put("/{device_id}/subinterface-intent", dependencies=[Depends(verify_token)])
-async def put_subinterface_intent(
-    device_id: int, body: SubinterfaceIntentUpdate, db: AsyncSession = Depends(get_db)
-):
+async def put_subinterface_intent(device_id: int, body: SubinterfaceIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's subinterface intent mirror for this device atomically.
 
     Full-replace: rows not in the body are deleted. ``accepted_at`` defaults to now.

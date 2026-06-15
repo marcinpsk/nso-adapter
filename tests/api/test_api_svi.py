@@ -19,19 +19,20 @@ async def test_svi_returns_seeded_rows(adapter_client):
     assert resp.status_code == 200
     assert resp.json() == {
         "device_id": device_id,
-        "interfaces": [
-            {"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "MGMT", "source": "svi"}
-        ],
+        "interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "MGMT", "source": "svi"}],
     }
 
 
 @pytest.mark.anyio
 async def test_svi_ordered_by_vlan_id(adapter_client):
     device_id = await seed_device()
-    await seed_svi(device_id, [
-        {"interface_name": "Vlan200", "vlan_id": 200, "type": "svi"},
-        {"interface_name": "Vlan100", "vlan_id": 100, "type": "svi"},
-    ])
+    await seed_svi(
+        device_id,
+        [
+            {"interface_name": "Vlan200", "vlan_id": 200, "type": "svi"},
+            {"interface_name": "Vlan100", "vlan_id": 100, "type": "svi"},
+        ],
+    )
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/svi", headers=AUTH)
     vids = [i["vlan_id"] for i in resp.json()["interfaces"]]
     assert vids == [100, 200]
@@ -65,10 +66,12 @@ async def _count_svi_intent(device_id: int) -> int:
 @pytest.mark.anyio
 async def test_put_svi_intent_stores_and_full_replaces(adapter_client):
     device_id = await seed_device()
-    body = {"interfaces": [
-        {"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "MGMT"},
-        {"interface_name": "Vlan200", "vlan_id": 200, "type": "svi"},
-    ]}
+    body = {
+        "interfaces": [
+            {"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "MGMT"},
+            {"interface_name": "Vlan200", "vlan_id": 200, "type": "svi"},
+        ]
+    }
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/svi-intent", json=body, headers=AUTH)
     assert resp.status_code == 200 and resp.json()["count"] == 2
     assert await _count_svi_intent(device_id) == 2

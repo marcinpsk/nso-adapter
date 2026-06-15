@@ -60,7 +60,7 @@ logger = structlog.get_logger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI):  # noqa: C901
     cfg = get_config()
     env = get_env_settings()
 

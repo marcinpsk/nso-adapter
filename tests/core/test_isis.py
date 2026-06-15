@@ -43,9 +43,7 @@ async def test_refresh_persists_bound_port_for_nokia(adapter_client):
 
         await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
 
-        result = await db.execute(
-            select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id)
-        )
+        result = await db.execute(select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id))
         by_name = {r.interface_name: r for r in result.scalars().all()}
         assert by_name["LAG99:10"].bound_port == "lag-99:10"
         assert by_name["system"].bound_port is None
@@ -64,9 +62,7 @@ async def test_refresh_empty_bound_port_string_stored_as_none(adapter_client):
 
         await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
 
-        result = await db.execute(
-            select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id)
-        )
+        result = await db.execute(select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id))
         row = result.scalars().one()
         assert row.bound_port is None
 
@@ -84,9 +80,7 @@ async def test_refresh_cisco_interface_has_no_bound_port(adapter_client):
 
         await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
 
-        result = await db.execute(
-            select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id)
-        )
+        result = await db.execute(select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id))
         row = result.scalars().one()
         assert row.bound_port is None
 
@@ -107,9 +101,7 @@ async def test_refresh_persists_hello_auth(adapter_client):
 
         await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
 
-        result = await db.execute(
-            select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id)
-        )
+        result = await db.execute(select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id))
         by_name = {r.interface_name: r for r in result.scalars().all()}
         assert by_name["ae10.0"].hello_auth_type == "md5"
         assert by_name["ae10.0"].hello_auth_present is True

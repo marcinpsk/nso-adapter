@@ -51,6 +51,7 @@ async def onboard_device(
 
     Raises:
         ValueError: if the NSO instance is unknown or the device is already registered.
+
     """
     cfg = get_config()
     known_instances = {inst.name for inst in cfg.nso_instances}

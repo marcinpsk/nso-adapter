@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""
-validate_pipe.py — Phase 0 connectivity smoke test.
+"""validate_pipe.py — Phase 0 connectivity smoke test.
 
 Tests:
   1. NSO RESTCONF reachable and returns device list

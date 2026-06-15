@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """M35: DeviceSvi ORM model + unique constraint."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -30,8 +31,17 @@ def _make_device(session):
 
 def test_svi_row_can_be_created(db):
     d = _make_device(db)
-    db.add(DeviceSvi(device_id=d.id, interface_name="Vlan100", vlan_id=100, svi_type="svi",
-                     vrf="MGMT", last_refreshed_at=datetime.now(UTC), refresh_source="notification"))
+    db.add(
+        DeviceSvi(
+            device_id=d.id,
+            interface_name="Vlan100",
+            vlan_id=100,
+            svi_type="svi",
+            vrf="MGMT",
+            last_refreshed_at=datetime.now(UTC),
+            refresh_source="notification",
+        )
+    )
     db.commit()
     row = db.execute(select(DeviceSvi).where(DeviceSvi.device_id == d.id)).scalars().one()
     assert row.interface_name == "Vlan100" and row.vlan_id == 100 and row.svi_type == "svi"
@@ -40,10 +50,26 @@ def test_svi_row_can_be_created(db):
 def test_svi_unique_constraint(db):
     d = _make_device(db)
     ts = datetime.now(UTC)
-    db.add(DeviceSvi(device_id=d.id, interface_name="Vlan100", vlan_id=100, svi_type="svi",
-                     last_refreshed_at=ts, refresh_source="poll"))
+    db.add(
+        DeviceSvi(
+            device_id=d.id,
+            interface_name="Vlan100",
+            vlan_id=100,
+            svi_type="svi",
+            last_refreshed_at=ts,
+            refresh_source="poll",
+        )
+    )
     db.flush()
-    db.add(DeviceSvi(device_id=d.id, interface_name="Vlan100", vlan_id=100, svi_type="svi",
-                     last_refreshed_at=ts, refresh_source="poll"))
+    db.add(
+        DeviceSvi(
+            device_id=d.id,
+            interface_name="Vlan100",
+            vlan_id=100,
+            svi_type="svi",
+            last_refreshed_at=ts,
+            refresh_source="poll",
+        )
+    )
     with pytest.raises(IntegrityError):
         db.flush()

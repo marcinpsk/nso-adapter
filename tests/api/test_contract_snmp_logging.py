@@ -40,14 +40,42 @@ async def test_snmp_config_contract(adapter_client):
     device_id = await seed_device(nso_device_name="snmp-ct", netbox_device_id=7960)
     ts = datetime(2026, 6, 1, 10, 0, 0)
     async for db in get_session():
-        db.add(SnmpCommunity(device_id=device_id, community_hash="abc", access="RO", acl="ACL-1",
-                             last_refreshed_at=ts, refresh_source="poll"))
-        db.add(SnmpV3User(device_id=device_id, username="netops", has_auth_secret=True, has_priv_secret=False,
-                          last_refreshed_at=ts, refresh_source="poll"))
-        db.add(SnmpHost(device_id=device_id, address="10.0.0.9", version="2c", notify_type="trap", port=162,
-                        last_refreshed_at=ts, refresh_source="poll"))
-        db.add(SnmpSystemInfo(device_id=device_id, location="DC1", contact="noc@x",
-                              last_refreshed_at=ts, refresh_source="poll"))
+        db.add(
+            SnmpCommunity(
+                device_id=device_id,
+                community_hash="abc",
+                access="RO",
+                acl="ACL-1",
+                last_refreshed_at=ts,
+                refresh_source="poll",
+            )
+        )
+        db.add(
+            SnmpV3User(
+                device_id=device_id,
+                username="netops",
+                has_auth_secret=True,
+                has_priv_secret=False,
+                last_refreshed_at=ts,
+                refresh_source="poll",
+            )
+        )
+        db.add(
+            SnmpHost(
+                device_id=device_id,
+                address="10.0.0.9",
+                version="2c",
+                notify_type="trap",
+                port=162,
+                last_refreshed_at=ts,
+                refresh_source="poll",
+            )
+        )
+        db.add(
+            SnmpSystemInfo(
+                device_id=device_id, location="DC1", contact="noc@x", last_refreshed_at=ts, refresh_source="poll"
+            )
+        )
         await db.commit()
         break
 
@@ -70,11 +98,21 @@ async def test_logging_config_contract(adapter_client):
     ts = datetime(2026, 6, 1, 10, 0, 0)
     async for db in get_session():
         # Maximal host (every optional) + minimal host (only address).
-        db.add(DeviceLoggingHost(device_id=device_id, address="10.0.0.5", port=514, severity="informational",
-                                 facility="local7", transport="udp", vrf="MGMT", source="Loopback0",
-                                 last_refreshed_at=ts, refresh_source="poll"))
-        db.add(DeviceLoggingHost(device_id=device_id, address="10.0.0.6",
-                                 last_refreshed_at=ts, refresh_source="poll"))
+        db.add(
+            DeviceLoggingHost(
+                device_id=device_id,
+                address="10.0.0.5",
+                port=514,
+                severity="informational",
+                facility="local7",
+                transport="udp",
+                vrf="MGMT",
+                source="Loopback0",
+                last_refreshed_at=ts,
+                refresh_source="poll",
+            )
+        )
+        db.add(DeviceLoggingHost(device_id=device_id, address="10.0.0.6", last_refreshed_at=ts, refresh_source="poll"))
         await db.commit()
         break
 

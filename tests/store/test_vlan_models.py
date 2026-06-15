@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """M34: DeviceVlan / DeviceSwitchport / DeviceSwitchportTaggedVlan model tests."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -36,28 +37,38 @@ def _make_device(session):
 
 def test_vlan_models_can_be_created(db):
     device = _make_device(db)
-    vlan = DeviceVlan(device_id=device.id, vlan_id=100, name="DATA",
-                      last_refreshed_at=datetime.now(UTC), refresh_source="notification")
+    vlan = DeviceVlan(
+        device_id=device.id,
+        vlan_id=100,
+        name="DATA",
+        last_refreshed_at=datetime.now(UTC),
+        refresh_source="notification",
+    )
     db.add(vlan)
     db.flush()
-    sp = DeviceSwitchport(device_id=device.id, interface_name="GigabitEthernet0/1", mode="access",
-                          untagged_vlan_id=vlan.id, last_refreshed_at=datetime.now(UTC),
-                          refresh_source="notification")
+    sp = DeviceSwitchport(
+        device_id=device.id,
+        interface_name="GigabitEthernet0/1",
+        mode="access",
+        untagged_vlan_id=vlan.id,
+        last_refreshed_at=datetime.now(UTC),
+        refresh_source="notification",
+    )
     db.add(sp)
     db.flush()
     db.add(DeviceSwitchportTaggedVlan(switchport_id=sp.id, vlan_id=vlan.id))
     db.commit()
 
-    loaded = db.execute(
-        select(DeviceSwitchport).where(DeviceSwitchport.device_id == device.id)
-    ).scalars().one()
+    loaded = db.execute(select(DeviceSwitchport).where(DeviceSwitchport.device_id == device.id)).scalars().one()
     assert loaded.untagged_vlan_id == vlan.id
 
 
 def test_vlan_unique_constraint(db):
     device = _make_device(db)
     ts = datetime.now(UTC)
-    db.add(DeviceVlan(device_id=device.id, vlan_id=100, name="DATA", last_refreshed_at=ts, refresh_source="notification"))
+    db.add(
+        DeviceVlan(device_id=device.id, vlan_id=100, name="DATA", last_refreshed_at=ts, refresh_source="notification")
+    )
     db.flush()
     db.add(DeviceVlan(device_id=device.id, vlan_id=100, name="VOICE", last_refreshed_at=ts, refresh_source="poll"))
     with pytest.raises(IntegrityError):

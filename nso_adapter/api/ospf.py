@@ -141,7 +141,7 @@ class OspfIntentUpdate(BaseModel):
 
 
 @router.put("/{device_id}/ospf-intent", dependencies=[Depends(verify_token)])
-async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSession = Depends(get_db)):
+async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSession = Depends(get_db)):  # noqa: C901
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")

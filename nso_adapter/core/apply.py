@@ -102,7 +102,7 @@ async def enqueue_apply(db: AsyncSession, device_id: int, force: bool = True) ->
     return job
 
 
-async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]:
+async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]:  # noqa: C901
     """Read-only preview: the per-scope native device diff the next Apply would push.
 
     For each scope, the accepted owned intent is dry-run against NSO (``?dry-run=native``)
@@ -414,7 +414,7 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
     return diffs
 
 
-async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
+async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:  # noqa: C901
     """Background task: execute the apply for *device_id*."""
     from nso_adapter.core.importer import get_nso_client
     from nso_adapter.nso.apply import (

@@ -194,9 +194,7 @@ async def _device_intent_counts(db: AsyncSession, device_id: int) -> dict[str, d
             sel += ", count(x.last_apply_at) as applied"
         if "last_apply_error" in cols:
             sel += ", count(x.last_apply_error) as failed"
-        row = (
-            await db.execute(text(f"select {sel} from {frm} where {where}"), {"d": device_id})
-        ).mappings().first()
+        row = (await db.execute(text(f"select {sel} from {frm} where {where}"), {"d": device_id})).mappings().first()
         if row and row["total"]:
             out[tname] = {
                 "count": row["total"],

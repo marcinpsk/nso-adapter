@@ -29,17 +29,24 @@ async def _seed_mtu(device_id: int, rows: list[dict]) -> None:
 @pytest.mark.anyio
 async def test_interface_mtu_returns_seeded_rows(adapter_client):
     device_id = await seed_device()
-    await _seed_mtu(device_id, [
-        {"interface_name": "Port-channel1", "mtu": 9216},
-        {"interface_name": "LAG99:99", "ip_mtu": 9170, "bound_port": "lag-99"},
-    ])
+    await _seed_mtu(
+        device_id,
+        [
+            {"interface_name": "Port-channel1", "mtu": 9216},
+            {"interface_name": "LAG99:99", "ip_mtu": 9170, "bound_port": "lag-99"},
+        ],
+    )
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/interface-mtu", headers=AUTH)
     assert resp.status_code == 200
     body = resp.json()
     assert body["device_id"] == device_id
     by_name = {i["interface_name"]: i for i in body["interfaces"]}
     assert by_name["Port-channel1"] == {
-        "interface_name": "Port-channel1", "mtu": 9216, "ip_mtu": None, "mpls_mtu": None, "bound_port": ""
+        "interface_name": "Port-channel1",
+        "mtu": 9216,
+        "ip_mtu": None,
+        "mpls_mtu": None,
+        "bound_port": "",
     }
     assert by_name["LAG99:99"]["ip_mtu"] == 9170
     assert by_name["LAG99:99"]["bound_port"] == "lag-99"
@@ -64,8 +71,10 @@ async def _count_mtu_intent(device_id: int) -> int:
 
     async for db in get_session():
         rows = (
-            await db.execute(select(InterfaceMtuIntent).where(InterfaceMtuIntent.device_id == device_id))
-        ).scalars().all()
+            (await db.execute(select(InterfaceMtuIntent).where(InterfaceMtuIntent.device_id == device_id)))
+            .scalars()
+            .all()
+        )
         return len(rows)
     return 0
 
@@ -73,10 +82,12 @@ async def _count_mtu_intent(device_id: int) -> int:
 @pytest.mark.anyio
 async def test_put_interface_mtu_intent_stores_and_full_replaces(adapter_client):
     device_id = await seed_device()
-    body = {"interfaces": [
-        {"interface_name": "Port-channel1", "mtu": 9216},
-        {"interface_name": "LAG99:99", "ip_mtu": 9170},
-    ]}
+    body = {
+        "interfaces": [
+            {"interface_name": "Port-channel1", "mtu": 9216},
+            {"interface_name": "LAG99:99", "ip_mtu": 9170},
+        ]
+    }
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/interface-mtu-intent", json=body, headers=AUTH)
     assert resp.status_code == 200 and resp.json()["count"] == 2
     assert await _count_mtu_intent(device_id) == 2

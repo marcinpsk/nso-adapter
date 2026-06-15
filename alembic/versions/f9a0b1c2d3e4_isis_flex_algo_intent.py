@@ -8,8 +8,10 @@ Write-path intent mirror for IS-IS Flex-Algorithm definitions the operator
 accepted. The single device Apply commits these via the isis-reconciler service
 (flex-algo list under process-config).
 """
-from alembic import op
+
 import sqlalchemy as sa
+
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "f9a0b1c2d3e4"
@@ -35,9 +37,7 @@ def upgrade() -> None:
         sa.Column("last_apply_error", sa.JSON(), nullable=True),
         sa.ForeignKeyConstraint(["device_id"], ["devices.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "device_id", "process_tag", "algo_id", name="uq_isisflexalgointent_identity"
-        ),
+        sa.UniqueConstraint("device_id", "process_tag", "algo_id", name="uq_isisflexalgointent_identity"),
     )
     op.create_index(
         op.f("ix_isis_flex_algo_intent_device_id"),
@@ -48,7 +48,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(
-        op.f("ix_isis_flex_algo_intent_device_id"), table_name="isis_flex_algo_intent"
-    )
+    op.drop_index(op.f("ix_isis_flex_algo_intent_device_id"), table_name="isis_flex_algo_intent")
     op.drop_table("isis_flex_algo_intent")

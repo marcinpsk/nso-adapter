@@ -28,8 +28,8 @@ async def _device_session(device_id: int):
 
 async def _rows(db, device_id):
     rows = (
-        await db.execute(select(DeviceInterfaceMtu).where(DeviceInterfaceMtu.device_id == device_id))
-    ).scalars().all()
+        (await db.execute(select(DeviceInterfaceMtu).where(DeviceInterfaceMtu.device_id == device_id))).scalars().all()
+    )
     return {r.interface_name: r for r in rows}
 
 

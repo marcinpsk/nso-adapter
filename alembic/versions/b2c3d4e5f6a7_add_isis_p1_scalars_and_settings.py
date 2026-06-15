@@ -29,9 +29,17 @@ depends_on: str | Sequence[str] | None = None
 
 
 _PROC_INT_COLS = (
-    "spf_initial_wait", "spf_max_wait", "lsp_initial_wait", "lsp_max_wait",
-    "lsp_lifetime", "lsp_refresh_interval", "lsp_mtu", "overload_timeout",
-    "sr_node_msd", "distance", "maximum_paths",
+    "spf_initial_wait",
+    "spf_max_wait",
+    "lsp_initial_wait",
+    "lsp_max_wait",
+    "lsp_lifetime",
+    "lsp_refresh_interval",
+    "lsp_mtu",
+    "overload_timeout",
+    "sr_node_msd",
+    "distance",
+    "maximum_paths",
 )
 _PROC_BOOL_COLS = ("overload_on_startup", "te_enabled", "sr_enabled")
 _IFACE_INT_COLS = ("csnp_interval", "retransmit_interval", "lsp_interval")

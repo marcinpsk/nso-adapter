@@ -32,9 +32,19 @@ async def test_interface_ips_contract(adapter_client):
     device_id = await seed_device(nso_device_name="ip-ct", netbox_device_id=7980)
     ts = datetime(2026, 6, 1, 10, 0, 0)
     async for db in get_session():
-        db.add(InterfaceIpAddress(device_id=device_id, interface_name="GE0/0", address="10.0.0.1/24",
-                                  vrf="", family="ipv4", secondary=False, bound_port="GE0/0",
-                                  last_refreshed_at=ts, refresh_source="poll"))
+        db.add(
+            InterfaceIpAddress(
+                device_id=device_id,
+                interface_name="GE0/0",
+                address="10.0.0.1/24",
+                vrf="",
+                family="ipv4",
+                secondary=False,
+                bound_port="GE0/0",
+                last_refreshed_at=ts,
+                refresh_source="poll",
+            )
+        )
         await db.commit()
         break
 

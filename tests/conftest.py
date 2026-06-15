@@ -391,12 +391,14 @@ async def seed_lag_config(
             db.add(bundle)
             await db.flush()
             for m in b.get("members", []):
-                db.add(LagMemberConfig(
-                    lag_bundle_id=bundle.id,
-                    interface_name=m["interface_name"],
-                    mode=m.get("mode"),
-                    port_priority=m.get("port_priority"),
-                ))
+                db.add(
+                    LagMemberConfig(
+                        lag_bundle_id=bundle.id,
+                        interface_name=m["interface_name"],
+                        mode=m.get("mode"),
+                        port_priority=m.get("port_priority"),
+                    )
+                )
         await db.commit()
 
 
@@ -410,10 +412,15 @@ async def seed_vlan_database(device_id: int, vlans: list[dict]):
     now = datetime.now(UTC).replace(tzinfo=None)
     async for db in get_session():
         for v in vlans:
-            db.add(DeviceVlan(
-                device_id=device_id, vlan_id=v["vlan_id"], name=v.get("name", ""),
-                last_refreshed_at=now, refresh_source="test",
-            ))
+            db.add(
+                DeviceVlan(
+                    device_id=device_id,
+                    vlan_id=v["vlan_id"],
+                    name=v.get("name", ""),
+                    last_refreshed_at=now,
+                    refresh_source="test",
+                )
+            )
         await db.commit()
         return
 
@@ -428,11 +435,17 @@ async def seed_svi(device_id: int, interfaces: list[dict]):
     now = datetime.now(UTC).replace(tzinfo=None)
     async for db in get_session():
         for i in interfaces:
-            db.add(DeviceSvi(
-                device_id=device_id, interface_name=i["interface_name"], vlan_id=i["vlan_id"],
-                svi_type=i.get("type", "svi"), vrf=i.get("vrf") or None,
-                last_refreshed_at=now, refresh_source="test",
-            ))
+            db.add(
+                DeviceSvi(
+                    device_id=device_id,
+                    interface_name=i["interface_name"],
+                    vlan_id=i["vlan_id"],
+                    svi_type=i.get("type", "svi"),
+                    vrf=i.get("vrf") or None,
+                    last_refreshed_at=now,
+                    refresh_source="test",
+                )
+            )
         await db.commit()
         return
 
@@ -450,12 +463,18 @@ async def seed_subinterface(device_id: int, interfaces: list[dict]):
     now = datetime.now(UTC).replace(tzinfo=None)
     async for db in get_session():
         for i in interfaces:
-            db.add(DeviceSubinterface(
-                device_id=device_id, interface_name=i["interface_name"],
-                parent_interface=i.get("parent_interface") or None,
-                dot1q_vlan=i.get("dot1q_vlan"), sub_type=i.get("type", "subinterface"),
-                vrf=i.get("vrf") or None, last_refreshed_at=now, refresh_source="test",
-            ))
+            db.add(
+                DeviceSubinterface(
+                    device_id=device_id,
+                    interface_name=i["interface_name"],
+                    parent_interface=i.get("parent_interface") or None,
+                    dot1q_vlan=i.get("dot1q_vlan"),
+                    sub_type=i.get("type", "subinterface"),
+                    vrf=i.get("vrf") or None,
+                    last_refreshed_at=now,
+                    refresh_source="test",
+                )
+            )
         await db.commit()
         return
 
@@ -480,9 +499,7 @@ async def seed_switchport(device_id: int, interfaces: list[dict]):
     async for db in get_session():
         existing = {
             r.vlan_id: r
-            for r in (
-                await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device_id))
-            ).scalars().all()
+            for r in (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device_id))).scalars().all()
         }
         vids: set[int] = set()
         for itf in interfaces:
@@ -491,17 +508,21 @@ async def seed_switchport(device_id: int, interfaces: list[dict]):
             vids.update(itf.get("tagged_vlans", []))
         for vid in vids:
             if vid not in existing:
-                row = DeviceVlan(device_id=device_id, vlan_id=vid, name="",
-                                 last_refreshed_at=now, refresh_source="test")
+                row = DeviceVlan(
+                    device_id=device_id, vlan_id=vid, name="", last_refreshed_at=now, refresh_source="test"
+                )
                 db.add(row)
                 await db.flush()
                 existing[vid] = row
         for itf in interfaces:
             uv = existing.get(itf["untagged_vlan"]) if itf.get("untagged_vlan") is not None else None
             sp = DeviceSwitchport(
-                device_id=device_id, interface_name=itf["interface_name"], mode=itf.get("mode"),
+                device_id=device_id,
+                interface_name=itf["interface_name"],
+                mode=itf.get("mode"),
                 untagged_vlan_id=uv.id if uv is not None else None,
-                last_refreshed_at=now, refresh_source="test",
+                last_refreshed_at=now,
+                refresh_source="test",
             )
             db.add(sp)
             await db.flush()

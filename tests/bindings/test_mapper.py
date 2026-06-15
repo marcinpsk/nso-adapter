@@ -444,7 +444,9 @@ async def test_bulk_ensure_m27r_logical_name_explicit_parent():
     base_call = {p["name"]: p["type"] for p in client.bulk_create_interfaces.await_args_list[0][0][0]}
     assert base_call == {"lag-99": "lag", "system": "virtual"}
     # children keep their faithful names + parent to the explicit binding (not renamed)
-    child_call = {p["name"]: (p["type"], p.get("parent")) for p in client.bulk_create_interfaces.await_args_list[1][0][0]}
+    child_call = {
+        p["name"]: (p["type"], p.get("parent")) for p in client.bulk_create_interfaces.await_args_list[1][0][0]
+    }
     assert child_call == {"LAG99:10": ("virtual", 20), "IXIA_CRPD": ("virtual", 5)}
 
 

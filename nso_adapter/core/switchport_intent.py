@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Switchport apply — writes accepted L2 switchport intent to the switchport-reconciler (M34)."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -32,7 +33,7 @@ def _build_interface_payload(interfaces) -> list[dict]:
     return out
 
 
-async def apply_switchport_config(device: "Device", payload, nso_client: "NsoClient") -> dict:
+async def apply_switchport_config(device: Device, payload, nso_client: NsoClient) -> dict:
     """Full-replace the switchport-reconciler service for *device* with the request interfaces."""
     if not device.nso_device_name:
         return {

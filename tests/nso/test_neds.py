@@ -61,9 +61,16 @@ def _ned_pkg(ned_id, vendor="Cisco", os_list=None):
         "package-version": "1.0",
         "oper-status": {"up": [None]},
         "component": [
-            {"name": "x", "ned": {"cli": {"ned-id": ned_id}, "device": {
-                "vendor": vendor, "operating-system": os_list or [],
-            }}},
+            {
+                "name": "x",
+                "ned": {
+                    "cli": {"ned-id": ned_id},
+                    "device": {
+                        "vendor": vendor,
+                        "operating-system": os_list or [],
+                    },
+                },
+            },
         ],
     }
 

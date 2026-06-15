@@ -7,8 +7,10 @@ Create Date: 2026-06-09
 Read mirror of L3 VLAN interfaces (SVIs / IRBs) exported from NSO. No IPs — those
 ride the interface-ip path. One row per (device, interface-name).
 """
-from alembic import op
+
 import sqlalchemy as sa
+
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "a4b5c6d7e8f9"

@@ -7,8 +7,10 @@ Create Date: 2026-06-12
 Read mirror for per-interface MTU (mtu / ip-mtu / mpls-mtu + Nokia bound-port)
 exported from NSO under FLAG_NO_DEFAULTS. Read-only first — no intent table yet.
 """
-from alembic import op
+
 import sqlalchemy as sa
+
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "b3c4d5e6f7a8"
@@ -33,9 +35,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("device_id", "interface_name", name="uq_deviceifmtu_identity"),
     )
-    op.create_index(
-        op.f("ix_device_interface_mtu_device_id"), "device_interface_mtu", ["device_id"], unique=False
-    )
+    op.create_index(op.f("ix_device_interface_mtu_device_id"), "device_interface_mtu", ["device_id"], unique=False)
 
 
 def downgrade() -> None:

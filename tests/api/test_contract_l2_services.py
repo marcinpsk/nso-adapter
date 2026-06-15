@@ -30,8 +30,19 @@ async def test_l2_services_contract(adapter_client):
 
     device_id = await seed_device(nso_device_name="l2svc-ct", netbox_device_id=7995)
     async for db in get_session():
-        db.add(DeviceL2Sap(device_id=device_id, service_name="EPIPE-1", service_type="epipe", service_id=100,
-                           sap_id="1/1/1:200", port="1/1/1", outer_tag=200, inner_tag=None, refresh_source="poll"))
+        db.add(
+            DeviceL2Sap(
+                device_id=device_id,
+                service_name="EPIPE-1",
+                service_type="epipe",
+                service_id=100,
+                sap_id="1/1/1:200",
+                port="1/1/1",
+                outer_tag=200,
+                inner_tag=None,
+                refresh_source="poll",
+            )
+        )
         await db.commit()
         break
 

@@ -44,9 +44,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("device_id", "interface_name", name="uq_devicebfdinterface_identity"),
     )
-    op.create_index(
-        op.f("ix_device_bfd_interface_device_id"), "device_bfd_interface", ["device_id"], unique=False
-    )
+    op.create_index(op.f("ix_device_bfd_interface_device_id"), "device_bfd_interface", ["device_id"], unique=False)
 
 
 def downgrade() -> None:

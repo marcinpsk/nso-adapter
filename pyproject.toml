@@ -30,6 +30,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "httpx>=0.28.1",
+    "pre-commit>=4.0",
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "pytest-cov>=7.1.0",
@@ -83,8 +84,34 @@ exclude_also = [
 line-length = 120
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP"]
-ignore = ["E501", "D100", "D101", "D102", "D103", "D104", "D105", "D107", "UP042"]
+select = ["E", "F", "W", "D", "C901", "I", "RET", "UP"]
+ignore = [
+    "E501",
+    "F403",
+    "F405",
+    # Docstring PRESENCE is not required — we enforce one FORMAT convention, not coverage.
+    "D100",
+    "D101",
+    "D102",
+    "D103",
+    "D104",
+    "D105",
+    "D106",
+    "D107",
+    # One convention: summary on the first line (D212), no blank line before a class
+    # docstring (D211) — i.e. disable the conflicting D213/D203.
+    "D203",
+    "D213",
+    "UP042",
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"tests/**" = ["D"]
+"alembic/**" = ["D"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["nso_adapter"]

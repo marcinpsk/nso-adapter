@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """LAG config refresh — reads NSO lag-config oper-data and upserts the DB."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -22,14 +23,10 @@ async def _upsert_lag_configs(
     refresh_source: str,
 ) -> None:
     """Full-replace: delete existing rows, then insert fresh ones."""
-    existing = await db.execute(
-        select(LagBundleConfig.id).where(LagBundleConfig.device_id == device.id)
-    )
+    existing = await db.execute(select(LagBundleConfig.id).where(LagBundleConfig.device_id == device.id))
     bundle_ids = existing.scalars().all()
     if bundle_ids:
-        await db.execute(
-            delete(LagMemberConfig).where(LagMemberConfig.lag_bundle_id.in_(bundle_ids))
-        )
+        await db.execute(delete(LagMemberConfig).where(LagMemberConfig.lag_bundle_id.in_(bundle_ids)))
     await db.execute(delete(LagBundleConfig).where(LagBundleConfig.device_id == device.id))
 
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -49,12 +46,14 @@ async def _upsert_lag_configs(
         db.add(b)
         await db.flush()
         for member in bundle.get("member", []):
-            db.add(LagMemberConfig(
-                lag_bundle_id=b.id,
-                interface_name=member["interface-name"],
-                mode=member.get("mode"),
-                port_priority=member.get("port-priority"),
-            ))
+            db.add(
+                LagMemberConfig(
+                    lag_bundle_id=b.id,
+                    interface_name=member["interface-name"],
+                    mode=member.get("mode"),
+                    port_priority=member.get("port-priority"),
+                )
+            )
     await db.commit()
 
 

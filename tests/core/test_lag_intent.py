@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for core/lag_intent.apply_lag_config (envelope behaviour)."""
+
 from __future__ import annotations
 
 from types import SimpleNamespace

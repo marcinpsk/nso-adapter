@@ -38,7 +38,7 @@ router = APIRouter(prefix="/api/v1/devices", tags=["bgp"])
 
 
 @router.get("/{device_id}/bgp-config", dependencies=[Depends(verify_token)])
-async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_db)):
+async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_db)):  # noqa: C901
     """Return the BGP config read-mirror for this device."""
     device = await db.get(Device, device_id)
     if not device:
@@ -289,7 +289,7 @@ class BgpIntentUpdate(BaseModel):
 
 
 @router.put("/{device_id}/bgp-intent", dependencies=[Depends(verify_token)])
-async def put_bgp_intent(device_id: int, body: BgpIntentUpdate, db: AsyncSession = Depends(get_db)):
+async def put_bgp_intent(device_id: int, body: BgpIntentUpdate, db: AsyncSession = Depends(get_db)):  # noqa: C901
     """Replace the adapter's BGP intent mirror for this device atomically.
 
     Full-replace semantics per device: all existing intent rows for the device

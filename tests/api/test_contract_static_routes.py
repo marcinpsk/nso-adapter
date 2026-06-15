@@ -33,11 +33,31 @@ async def test_static_routes_contract(adapter_client):
     ts = datetime(2026, 6, 1, 10, 0, 0)
     async for db in get_session():
         # Maximal route (every optional) + minimal route (only required).
-        db.add(DeviceStaticRoute(device_id=device_id, vrf="", prefix="10.0.0.0/8", next_hop="192.0.2.1",
-                                 interface_next_hop="GE0/0", metric=10, permanent=True, tag=99, name="RT-1",
-                                 last_refreshed_at=ts, refresh_source="poll"))
-        db.add(DeviceStaticRoute(device_id=device_id, vrf="", prefix="0.0.0.0/0", next_hop="192.0.2.254",
-                                 last_refreshed_at=ts, refresh_source="poll"))
+        db.add(
+            DeviceStaticRoute(
+                device_id=device_id,
+                vrf="",
+                prefix="10.0.0.0/8",
+                next_hop="192.0.2.1",
+                interface_next_hop="GE0/0",
+                metric=10,
+                permanent=True,
+                tag=99,
+                name="RT-1",
+                last_refreshed_at=ts,
+                refresh_source="poll",
+            )
+        )
+        db.add(
+            DeviceStaticRoute(
+                device_id=device_id,
+                vrf="",
+                prefix="0.0.0.0/0",
+                next_hop="192.0.2.254",
+                last_refreshed_at=ts,
+                refresh_source="poll",
+            )
+        )
         await db.commit()
         break
 

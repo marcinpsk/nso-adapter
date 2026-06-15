@@ -223,7 +223,7 @@ def _check_constructs(keys, mapping, scope, construct):
 
 
 def coverage_unknown(rows) -> bool:
-    """True when the probe has not assessed this NED's route-policy at all.
+    """Return True when the probe has not assessed this NED's route-policy at all.
 
     The probe emits a ``('coverage', <ned>, 'unknown')`` marker for NEDs it doesn't yet
     classify (Junos / Nokia / unknown). It means "not assessed", NOT "all supported" — so

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """M36: DeviceSubinterface + SubinterfaceIntent ORM models + unique constraints."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -36,11 +37,18 @@ def _make_device(session):
 
 def test_subif_row_can_be_created(db):
     d = _make_device(db)
-    db.add(DeviceSubinterface(
-        device_id=d.id, interface_name="GigabitEthernet0/1.100", parent_interface="GigabitEthernet0/1",
-        dot1q_vlan=100, sub_type="subinterface", vrf="TENANT_A",
-        last_refreshed_at=datetime.now(UTC), refresh_source="notification",
-    ))
+    db.add(
+        DeviceSubinterface(
+            device_id=d.id,
+            interface_name="GigabitEthernet0/1.100",
+            parent_interface="GigabitEthernet0/1",
+            dot1q_vlan=100,
+            sub_type="subinterface",
+            vrf="TENANT_A",
+            last_refreshed_at=datetime.now(UTC),
+            refresh_source="notification",
+        )
+    )
     db.commit()
     row = db.execute(select(DeviceSubinterface).where(DeviceSubinterface.device_id == d.id)).scalars().one()
     assert row.interface_name == "GigabitEthernet0/1.100"
@@ -51,11 +59,17 @@ def test_subif_row_can_be_created(db):
 def test_subif_unique_constraint(db):
     d = _make_device(db)
     ts = datetime.now(UTC)
-    db.add(DeviceSubinterface(device_id=d.id, interface_name="ge-0/0/0.10", dot1q_vlan=10,
-                              last_refreshed_at=ts, refresh_source="poll"))
+    db.add(
+        DeviceSubinterface(
+            device_id=d.id, interface_name="ge-0/0/0.10", dot1q_vlan=10, last_refreshed_at=ts, refresh_source="poll"
+        )
+    )
     db.flush()
-    db.add(DeviceSubinterface(device_id=d.id, interface_name="ge-0/0/0.10", dot1q_vlan=10,
-                              last_refreshed_at=ts, refresh_source="poll"))
+    db.add(
+        DeviceSubinterface(
+            device_id=d.id, interface_name="ge-0/0/0.10", dot1q_vlan=10, last_refreshed_at=ts, refresh_source="poll"
+        )
+    )
     with pytest.raises(IntegrityError):
         db.flush()
 

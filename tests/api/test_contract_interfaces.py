@@ -79,9 +79,7 @@ async def _seed_iface_with_intent(device_id: int):
 
 async def test_interfaces_payload_matches_contract_exactly(adapter_client):
     """The interface dict and each attr dict expose EXACTLY the documented keys."""
-    device_id = await seed_device(
-        nso_instance="nso-dev", nso_device_name="contract-dev", netbox_device_id=7900
-    )
+    device_id = await seed_device(nso_instance="nso-dev", nso_device_name="contract-dev", netbox_device_id=7900)
     await _seed_iface_with_intent(device_id)
 
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/interfaces", headers=AUTH)

@@ -80,9 +80,7 @@ async def refresh_vlan_database_for_device(
     vlans = (entry or {}).get("vlan", []) or (entry or {}).get("vlans", [])
     existing = {
         r.vlan_id: r
-        for r in (
-            await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))
-        ).scalars().all()
+        for r in (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))).scalars().all()
     }
     seen: set[int] = set()
     now = _now()
@@ -127,9 +125,7 @@ async def refresh_switchport_for_device(
     interfaces = (entry or {}).get("interface", []) or (entry or {}).get("interfaces", [])
     vlan_by_vid = {
         r.vlan_id: r
-        for r in (
-            await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))
-        ).scalars().all()
+        for r in (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))).scalars().all()
     }
     existing = {
         r.interface_name: r
@@ -139,7 +135,9 @@ async def refresh_switchport_for_device(
                 .where(DeviceSwitchport.device_id == device.id)
                 .options(selectinload(DeviceSwitchport.tagged_vlans))
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     }
     seen: set[str] = set()
     now = _now()
@@ -158,11 +156,7 @@ async def refresh_switchport_for_device(
         db.add(row)
         await db.flush()
         # rebuild tagged-vlan join rows
-        await db.execute(
-            delete(DeviceSwitchportTaggedVlan).where(
-                DeviceSwitchportTaggedVlan.switchport_id == row.id
-            )
-        )
+        await db.execute(delete(DeviceSwitchportTaggedVlan).where(DeviceSwitchportTaggedVlan.switchport_id == row.id))
         for tv in _parse_vlan_string(item.get("tagged-vlans") or item.get("tagged_vlans")):
             vlan = vlan_by_vid.get(tv)
             if vlan is not None:
@@ -171,18 +165,14 @@ async def refresh_switchport_for_device(
         if name not in seen:
             await db.delete(row)
     await db.commit()
-    logger.info(
-        "switchport.refresh.done", device_id=device.id, interfaces=len(seen), source=refresh_source
-    )
+    logger.info("switchport.refresh.done", device_id=device.id, interfaces=len(seen), source=refresh_source)
 
 
 async def _handle_change(event_data, db, nso_clients, refresh_fn) -> None:
     changed = parse_changed_nso_devices(event_data)
     if not changed:
         return
-    devices = (
-        await db.execute(select(Device).where(Device.nso_device_name.in_(changed)))
-    ).scalars().all()
+    devices = (await db.execute(select(Device).where(Device.nso_device_name.in_(changed)))).scalars().all()
     for device in devices:
         nso_client = nso_clients.get(device.nso_instance)
         if nso_client is None:

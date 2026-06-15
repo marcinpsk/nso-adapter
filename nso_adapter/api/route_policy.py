@@ -32,7 +32,7 @@ router = APIRouter(prefix="/api/v1/devices", tags=["route-policy"])
 
 
 @router.get("/{device_id}/route-policy", dependencies=[Depends(verify_token)])
-async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_db)):
+async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_db)):  # noqa: C901
     """Return the route-policy config read-mirror for this device.
 
     Response shape matches the YANG contract in m17-route-policy-contract.md §3.

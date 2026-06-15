@@ -70,9 +70,7 @@ class InterfaceMtuIntentUpdate(BaseModel):
 
 
 @router.put("/{device_id}/interface-mtu-intent", dependencies=[Depends(verify_token)])
-async def put_interface_mtu_intent(
-    device_id: int, body: InterfaceMtuIntentUpdate, db: AsyncSession = Depends(get_db)
-):
+async def put_interface_mtu_intent(device_id: int, body: InterfaceMtuIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's per-interface MTU intent mirror for this device atomically.
 
     Full-replace: rows not in the body are deleted (and the device MTU reverted via

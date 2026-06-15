@@ -54,11 +54,20 @@ def test_create_l2_sap(db):
 
 def test_qinq_sap_keeps_inner_tag(db):
     dev = _make_device(db)
-    db.add(DeviceL2Sap(
-        device_id=dev.id, service_name="TL", service_type="epipe", service_id=4022,
-        sap_id="1/1/c28/1:100.10", port="1/1/c28/1", outer_tag=100, inner_tag=10,
-        last_refreshed_at=datetime.now(UTC), refresh_source="poll",
-    ))
+    db.add(
+        DeviceL2Sap(
+            device_id=dev.id,
+            service_name="TL",
+            service_type="epipe",
+            service_id=4022,
+            sap_id="1/1/c28/1:100.10",
+            port="1/1/c28/1",
+            outer_tag=100,
+            inner_tag=10,
+            last_refreshed_at=datetime.now(UTC),
+            refresh_source="poll",
+        )
+    )
     db.commit()
     loaded = db.execute(select(DeviceL2Sap)).scalars().one()
     assert (loaded.outer_tag, loaded.inner_tag, loaded.service_id) == (100, 10, 4022)
@@ -67,12 +76,30 @@ def test_qinq_sap_keeps_inner_tag(db):
 def test_l2_sap_unique_constraint(db):
     dev = _make_device(db)
     ts = datetime.now(UTC)
-    db.add(DeviceL2Sap(device_id=dev.id, service_name="TL", service_type="epipe",
-                       sap_id="lag-60:3999", port="lag-60", outer_tag=3999,
-                       last_refreshed_at=ts, refresh_source="poll"))
+    db.add(
+        DeviceL2Sap(
+            device_id=dev.id,
+            service_name="TL",
+            service_type="epipe",
+            sap_id="lag-60:3999",
+            port="lag-60",
+            outer_tag=3999,
+            last_refreshed_at=ts,
+            refresh_source="poll",
+        )
+    )
     db.flush()
-    db.add(DeviceL2Sap(device_id=dev.id, service_name="TL", service_type="epipe",
-                       sap_id="lag-60:3999", port="lag-60", outer_tag=3999,
-                       last_refreshed_at=ts, refresh_source="poll"))
+    db.add(
+        DeviceL2Sap(
+            device_id=dev.id,
+            service_name="TL",
+            service_type="epipe",
+            sap_id="lag-60:3999",
+            port="lag-60",
+            outer_tag=3999,
+            last_refreshed_at=ts,
+            refresh_source="poll",
+        )
+    )
     with pytest.raises(IntegrityError):
         db.flush()

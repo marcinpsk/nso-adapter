@@ -45,7 +45,13 @@ async def test_provision_happy_path(adapter_client_with_nso):
 
     assert res["ok"] is True
     s = _steps(res)
-    assert s == {"create": "ok", "fetch_host_keys": "ok", "admin_state": "ok", "sync_from": "ok", "adapter_mapping": "ok"}
+    assert s == {
+        "create": "ok",
+        "fetch_host_keys": "ok",
+        "admin_state": "ok",
+        "sync_from": "ok",
+        "adapter_mapping": "ok",
+    }
     assert res["device_id"] is not None
     client.create_device.assert_awaited_once()
     client.fetch_host_keys.assert_awaited_once()
@@ -61,8 +67,12 @@ async def test_provision_idempotent_existing_device(adapter_client_with_nso):
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
         async for db in get_session():
             res = await provision_nso_device(
-                db, nso_instance="nso-dev", device_name="dev-exists", address="1.1.1.1",
-                ned_id="x", authgroup="network",
+                db,
+                nso_instance="nso-dev",
+                device_name="dev-exists",
+                address="1.1.1.1",
+                ned_id="x",
+                authgroup="network",
             )
             break
     assert res["ok"] is True
@@ -78,8 +88,12 @@ async def test_provision_aborts_on_create_failure(adapter_client_with_nso):
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
         async for db in get_session():
             res = await provision_nso_device(
-                db, nso_instance="nso-dev", device_name="bad", address="1.1.1.1",
-                ned_id="x", authgroup="network",
+                db,
+                nso_instance="nso-dev",
+                device_name="bad",
+                address="1.1.1.1",
+                ned_id="x",
+                authgroup="network",
             )
             break
     assert res["ok"] is False
@@ -95,8 +109,12 @@ async def test_provision_aborts_on_fetch_host_keys_failure(adapter_client_with_n
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
         async for db in get_session():
             res = await provision_nso_device(
-                db, nso_instance="nso-dev", device_name="unreach", address="1.1.1.1",
-                ned_id="x", authgroup="network",
+                db,
+                nso_instance="nso-dev",
+                device_name="unreach",
+                address="1.1.1.1",
+                ned_id="x",
+                authgroup="network",
             )
             break
     assert res["ok"] is False
@@ -123,8 +141,12 @@ async def test_provision_unlocks_before_fetch_host_keys(adapter_client_with_nso)
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
         async for db in get_session():
             await provision_nso_device(
-                db, nso_instance="nso-dev", device_name="ordered", address="1.1.1.1",
-                ned_id="x", authgroup="network",
+                db,
+                nso_instance="nso-dev",
+                device_name="ordered",
+                address="1.1.1.1",
+                ned_id="x",
+                authgroup="network",
             )
             break
     order = [c[0] for c in parent.mock_calls]
@@ -139,8 +161,13 @@ async def test_provision_sync_failure_is_nonfatal(adapter_client_with_nso):
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
         async for db in get_session():
             res = await provision_nso_device(
-                db, nso_instance="nso-dev", device_name="nosync", address="1.1.1.1",
-                ned_id="x", authgroup="network", netbox_device_id=77,
+                db,
+                nso_instance="nso-dev",
+                device_name="nosync",
+                address="1.1.1.1",
+                ned_id="x",
+                authgroup="network",
+                netbox_device_id=77,
             )
             break
     assert res["ok"] is True  # sync-from failure does not block onboarding
@@ -155,8 +182,12 @@ async def test_provision_unknown_instance_raises(adapter_client):
     async for db in get_session():
         with pytest.raises(ValueError):
             await provision_nso_device(
-                db, nso_instance="ghost", device_name="x", address="1.1.1.1",
-                ned_id="x", authgroup="network",
+                db,
+                nso_instance="ghost",
+                device_name="x",
+                address="1.1.1.1",
+                ned_id="x",
+                authgroup="network",
             )
         break
 
@@ -170,13 +201,18 @@ async def test_provision_retries_fetch_host_keys_once(adapter_client_with_nso):
 
     client = _mock_client()
     client.fetch_host_keys.side_effect = [RuntimeError("connection reset"), {"result": "updated"}]
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=client), patch(
-        "nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=client),
+        patch("nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()),
     ):
         async for db in get_session():
             res = await provision_nso_device(
-                db, nso_instance="nso-dev", device_name="retry-ok", address="1.1.1.1",
-                ned_id="x", authgroup="network",
+                db,
+                nso_instance="nso-dev",
+                device_name="retry-ok",
+                address="1.1.1.1",
+                ned_id="x",
+                authgroup="network",
             )
             break
     assert res["ok"] is True
@@ -192,13 +228,18 @@ async def test_provision_fetch_host_keys_fails_after_one_retry(adapter_client_wi
     from nso_adapter.store.db import get_session
 
     client = _mock_client(fetch=RuntimeError("still down"))
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=client), patch(
-        "nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=client),
+        patch("nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()),
     ):
         async for db in get_session():
             res = await provision_nso_device(
-                db, nso_instance="nso-dev", device_name="retry-bad", address="1.1.1.1",
-                ned_id="x", authgroup="network",
+                db,
+                nso_instance="nso-dev",
+                device_name="retry-bad",
+                address="1.1.1.1",
+                ned_id="x",
+                authgroup="network",
             )
             break
     assert res["ok"] is False
@@ -215,13 +256,18 @@ async def test_provision_retries_sync_from_once(adapter_client_with_nso):
 
     client = _mock_client()
     client.sync_from.side_effect = [False, True]
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=client), patch(
-        "nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=client),
+        patch("nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()),
     ):
         async for db in get_session():
             res = await provision_nso_device(
-                db, nso_instance="nso-dev", device_name="sync-retry", address="1.1.1.1",
-                ned_id="x", authgroup="network",
+                db,
+                nso_instance="nso-dev",
+                device_name="sync-retry",
+                address="1.1.1.1",
+                ned_id="x",
+                authgroup="network",
             )
             break
     assert _steps(res)["sync_from"] == "ok"

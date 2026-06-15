@@ -24,13 +24,27 @@ logger = structlog.get_logger(__name__)
 # isis-interface process/interface nodes onto the typed DB columns. Hyphenated
 # export key → snake_case column.
 _PROC_SCALAR_KEYS = (
-    "spf-initial-wait", "spf-max-wait", "lsp-initial-wait", "lsp-max-wait",
-    "lsp-lifetime", "lsp-refresh-interval", "lsp-mtu", "overload-on-startup",
-    "overload-timeout", "te-enabled", "sr-enabled", "sr-node-msd",
-    "distance", "maximum-paths", "reference-bandwidth",
+    "spf-initial-wait",
+    "spf-max-wait",
+    "lsp-initial-wait",
+    "lsp-max-wait",
+    "lsp-lifetime",
+    "lsp-refresh-interval",
+    "lsp-mtu",
+    "overload-on-startup",
+    "overload-timeout",
+    "te-enabled",
+    "sr-enabled",
+    "sr-node-msd",
+    "distance",
+    "maximum-paths",
+    "reference-bandwidth",
 )
 _IFACE_SCALAR_KEYS = (
-    "csnp-interval", "retransmit-interval", "lsp-interval", "mesh-group",
+    "csnp-interval",
+    "retransmit-interval",
+    "lsp-interval",
+    "mesh-group",
 )
 
 

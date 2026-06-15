@@ -28,8 +28,8 @@ async def _device_session(device_id: int):
 
 async def _rows(db, device_id):
     rows = (
-        await db.execute(select(DeviceSubinterface).where(DeviceSubinterface.device_id == device_id))
-    ).scalars().all()
+        (await db.execute(select(DeviceSubinterface).where(DeviceSubinterface.device_id == device_id))).scalars().all()
+    )
     return {r.interface_name: r for r in rows}
 
 
@@ -41,10 +41,19 @@ async def test_refresh_inserts_subinterfaces(adapter_client):
         nso_client.get_subinterface.return_value = {
             "device-name": "subif-rtr01",
             "interface": [
-                {"interface-name": "GigabitEthernet0/1.100", "parent-interface": "GigabitEthernet0/1",
-                 "dot1q-vlan": 100, "type": "subinterface", "vrf": "TENANT_A"},
-                {"interface-name": "ge-0/0/0.200", "parent-interface": "ge-0/0/0",
-                 "dot1q-vlan": 200, "type": "subinterface"},
+                {
+                    "interface-name": "GigabitEthernet0/1.100",
+                    "parent-interface": "GigabitEthernet0/1",
+                    "dot1q-vlan": 100,
+                    "type": "subinterface",
+                    "vrf": "TENANT_A",
+                },
+                {
+                    "interface-name": "ge-0/0/0.200",
+                    "parent-interface": "ge-0/0/0",
+                    "dot1q-vlan": 200,
+                    "type": "subinterface",
+                },
             ],
         }
         await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")

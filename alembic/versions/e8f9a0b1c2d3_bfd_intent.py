@@ -7,8 +7,10 @@ Create Date: 2026-06-09
 Write-path intent mirror for per-interface BFD timers the operator accepted. The
 single device Apply commits these via the bfd-reconciler service.
 """
-from alembic import op
+
 import sqlalchemy as sa
+
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "e8f9a0b1c2d3"

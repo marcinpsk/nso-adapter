@@ -73,8 +73,16 @@ async def test_svi_contract(adapter_client):
 
     device_id = await seed_device(nso_device_name="l2-svi", netbox_device_id=7952)
     async for db in get_session():
-        db.add(DeviceSvi(device_id=device_id, interface_name="Vlan100", vlan_id=100, svi_type="svi",
-                         vrf="MGMT", refresh_source="poll"))
+        db.add(
+            DeviceSvi(
+                device_id=device_id,
+                interface_name="Vlan100",
+                vlan_id=100,
+                svi_type="svi",
+                vrf="MGMT",
+                refresh_source="poll",
+            )
+        )
         await db.commit()
         break
 
@@ -92,8 +100,17 @@ async def test_subinterface_contract(adapter_client):
 
     device_id = await seed_device(nso_device_name="l2-subif", netbox_device_id=7953)
     async for db in get_session():
-        db.add(DeviceSubinterface(device_id=device_id, interface_name="GE0/0.100", parent_interface="GE0/0",
-                                  dot1q_vlan=100, sub_type="subinterface", vrf="", refresh_source="poll"))
+        db.add(
+            DeviceSubinterface(
+                device_id=device_id,
+                interface_name="GE0/0.100",
+                parent_interface="GE0/0",
+                dot1q_vlan=100,
+                sub_type="subinterface",
+                vrf="",
+                refresh_source="poll",
+            )
+        )
         await db.commit()
         break
 

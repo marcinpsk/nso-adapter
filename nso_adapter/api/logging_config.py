@@ -26,7 +26,13 @@ async def get_logging_config(device_id: int, db: AsyncSession = Depends(get_db))
         raise api_error(404, "not_found", "Device not found")
 
     rows = (
-        (await db.execute(select(DeviceLoggingHost).where(DeviceLoggingHost.device_id == device_id).order_by(DeviceLoggingHost.address)))
+        (
+            await db.execute(
+                select(DeviceLoggingHost)
+                .where(DeviceLoggingHost.device_id == device_id)
+                .order_by(DeviceLoggingHost.address)
+            )
+        )
         .scalars()
         .all()
     )

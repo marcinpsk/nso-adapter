@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Topology interface reconcile — the dedicated creation owner for the LAG
-parents, logical channels/SAPs and loopback/system interfaces that the
-attribute sync's cfg.port feed never sees.
+"""Reconcile the topology interfaces the attribute sync's cfg.port feed never sees.
+
+The dedicated creation owner for the LAG parents, logical channels/SAPs and
+loopback/system interfaces.
 
 Without these in NetBox, Nokia SR OS bound_port correlation (IS-IS and
 interface-IP) resolves nothing: IS-IS interfaces are logical router-interfaces

@@ -29,7 +29,14 @@ async def test_bfd_interfaces_mirrored(adapter_client):
     device_id = await seed_device(nso_device_name="bfd-dev", netbox_device_id=970)
     async with _device_session(device_id) as (db, device):
         interfaces = [
-            {"interface-name": "ae10", "min-tx": 300, "min-rx": 300, "multiplier": 3, "micro-bfd": True, "enabled": True},
+            {
+                "interface-name": "ae10",
+                "min-tx": 300,
+                "min-rx": 300,
+                "multiplier": 3,
+                "micro-bfd": True,
+                "enabled": True,
+            },
             {
                 "interface-name": "lag-99",
                 "bound-port": "lag-99",

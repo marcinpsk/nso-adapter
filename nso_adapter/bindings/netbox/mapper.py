@@ -90,7 +90,7 @@ def _base_type_for(kind: str | None, name: str) -> str:
     return _guess_netbox_type(name)
 
 
-async def bulk_ensure_interfaces(
+async def bulk_ensure_interfaces(  # noqa: C901
     client: NetboxClient,
     netbox_device_id: int,
     interfaces: list[str | dict],
@@ -156,7 +156,10 @@ async def bulk_ensure_interfaces(
     missing_bases = [b for b in base_names if b not in name_to_id]
     if missing_bases:
         created = await client.bulk_create_interfaces(
-            [{"device": netbox_device_id, "name": b, "type": _base_type_for(kind_by_name.get(b), b)} for b in missing_bases]
+            [
+                {"device": netbox_device_id, "name": b, "type": _base_type_for(kind_by_name.get(b), b)}
+                for b in missing_bases
+            ]
         )
         for obj in created:
             name_to_id[obj["name"]] = obj["id"]

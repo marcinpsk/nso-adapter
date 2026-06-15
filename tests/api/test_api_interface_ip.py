@@ -292,7 +292,11 @@ async def test_put_ip_intent_greenfield_routed_creates_interface(adapter_client)
         assert iface.kind == "logical"
         assert iface.parent_binding == "lag-99"
         assert iface.encap_tag == "99"
-        rows = (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface.id))).scalars().all()
+        rows = (
+            (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface.id)))
+            .scalars()
+            .all()
+        )
         assert len(rows) == 1
         assert rows[0].address == "84.116.249.160/31"
         break

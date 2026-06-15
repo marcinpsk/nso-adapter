@@ -26,10 +26,12 @@ async def _count_bfd_intent(device_id: int) -> int:
 @pytest.mark.anyio
 async def test_put_bfd_intent_stores_and_full_replaces(adapter_client):
     device_id = await seed_device(nso_device_name="bfd-wp", netbox_device_id=1400)
-    body = {"interfaces": [
-        {"interface_name": "Port-channel1", "min_tx": 300, "min_rx": 300, "multiplier": 3, "micro_bfd": True},
-        {"interface_name": "GigabitEthernet0/1", "min_tx": 100, "min_rx": 100, "multiplier": 5},
-    ]}
+    body = {
+        "interfaces": [
+            {"interface_name": "Port-channel1", "min_tx": 300, "min_rx": 300, "multiplier": 3, "micro_bfd": True},
+            {"interface_name": "GigabitEthernet0/1", "min_tx": 100, "min_rx": 100, "multiplier": 5},
+        ]
+    }
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/bfd-intent", json=body, headers=AUTH)
     assert resp.status_code == 200 and resp.json()["count"] == 2
     assert await _count_bfd_intent(device_id) == 2

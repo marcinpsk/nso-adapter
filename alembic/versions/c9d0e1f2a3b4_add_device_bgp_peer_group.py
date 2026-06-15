@@ -37,9 +37,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("scope_id", "name", name="uq_devicebgppeergroup_identity"),
     )
-    op.create_index(
-        op.f("ix_device_bgp_peer_group_scope_id"), "device_bgp_peer_group", ["scope_id"], unique=False
-    )
+    op.create_index(op.f("ix_device_bgp_peer_group_scope_id"), "device_bgp_peer_group", ["scope_id"], unique=False)
 
     op.create_table(
         "device_bgp_peer_group_af",

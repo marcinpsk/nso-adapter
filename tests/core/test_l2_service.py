@@ -18,11 +18,20 @@ from tests.conftest import seed_device
 _NSO_ENTRY = {
     "device-name": "l2-ra1",
     "service": [
-        {"service-name": "TL", "service-type": "epipe", "service-id": 4022,
-         "sap": [{"sap-id": "lag-60:3999", "port": "lag-60", "outer-tag": 3999},
-                 {"sap-id": "lag-60:4022", "port": "lag-60", "outer-tag": 4022}]},
-        {"service-name": "701", "service-type": "vpls",
-         "sap": [{"sap-id": "1/1/c28/1:100.10", "port": "1/1/c28/1", "outer-tag": 100, "inner-tag": 10}]},
+        {
+            "service-name": "TL",
+            "service-type": "epipe",
+            "service-id": 4022,
+            "sap": [
+                {"sap-id": "lag-60:3999", "port": "lag-60", "outer-tag": 3999},
+                {"sap-id": "lag-60:4022", "port": "lag-60", "outer-tag": 4022},
+            ],
+        },
+        {
+            "service-name": "701",
+            "service-type": "vpls",
+            "sap": [{"sap-id": "1/1/c28/1:100.10", "port": "1/1/c28/1", "outer-tag": 100, "inner-tag": 10}],
+        },
     ],
 }
 
@@ -66,8 +75,13 @@ async def test_refresh_replaces_existing_rows(adapter_client):
         # Second refresh with fewer services → full-replace prunes the rest.
         nso_client.get_l2_services.return_value = {
             "device-name": "l2-replace",
-            "service": [{"service-name": "701", "service-type": "vpls",
-                         "sap": [{"sap-id": "1/1/c31/3:701", "port": "1/1/c31/3", "outer-tag": 701}]}],
+            "service": [
+                {
+                    "service-name": "701",
+                    "service-type": "vpls",
+                    "sap": [{"sap-id": "1/1/c31/3:701", "port": "1/1/c31/3", "outer-tag": 701}],
+                }
+            ],
         }
         await refresh_l2_services_for_device(db, device, nso_client)
 

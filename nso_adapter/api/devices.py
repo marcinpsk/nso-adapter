@@ -38,8 +38,7 @@ async def _state_summary(device_id: int, db: AsyncSession) -> dict:
 
 async def _last_job_id(device_id: int, db: AsyncSession) -> int | None:
     result = await db.execute(select(Job.id).where(Job.device_id == device_id).order_by(Job.created_at.desc()).limit(1))
-    row = result.scalar_one_or_none()
-    return row
+    return result.scalar_one_or_none()
 
 
 def _device_out(d: Device) -> dict:
@@ -103,9 +102,12 @@ class DeviceProvision(BaseModel):
 
 @router.post("/provision", dependencies=[Depends(verify_token)])
 async def provision_device(body: DeviceProvision, db: AsyncSession = Depends(get_db)):
-    """Provision a device INTO NSO: create node → fetch-host-keys → unlock → sync-from,
-    then create the adapter mapping. Returns the step-by-step result (200 even on a
-    blocking step failure — inspect ``ok``/``steps``; the device is left for retry)."""
+    """Provision a device INTO NSO, then create the adapter mapping.
+
+    Steps: create node → fetch-host-keys → unlock → sync-from. Returns the step-by-step
+    result (200 even on a blocking step failure — inspect ``ok``/``steps``; the device is
+    left for retry).
+    """
     from nso_adapter.core.onboarding import provision_nso_device
 
     try:

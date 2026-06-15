@@ -30,7 +30,7 @@ from nso_adapter.store.models import (
 logger = structlog.get_logger(__name__)
 
 
-async def _upsert_bgp_data(
+async def _upsert_bgp_data(  # noqa: C901
     db: AsyncSession,
     device: Device,
     routers: list[dict],
@@ -99,9 +99,7 @@ async def _upsert_bgp_data(
                     # the peer is enabled if ANY occurrence is active.
                     if bool(peer_data.get("enabled", True)):
                         peer.enabled = True
-                    logger.debug(
-                        "bgp.peer_merged_across_groups", device_id=device.id, vrf=vrf, peer_address=peer_addr
-                    )
+                    logger.debug("bgp.peer_merged_across_groups", device_id=device.id, vrf=vrf, peer_address=peer_addr)
 
                 seen_afis = afis_by_addr[peer_addr]
                 for paf_data in peer_data.get("peer-address-family", []):

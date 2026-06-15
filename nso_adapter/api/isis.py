@@ -30,13 +30,15 @@ router = APIRouter(prefix="/api/v1/devices", tags=["isis"])
 
 
 def _snake(d: dict) -> dict:
-    """Normalize a dict's hyphenated keys (as stored from NSO) to snake_case so
-    the plugin can map them straight onto netbox_routing model fields."""
+    """Normalize a dict's hyphenated keys (as stored from NSO) to snake_case.
+
+    So the plugin can map them straight onto netbox_routing model fields.
+    """
     return {k.replace("-", "_"): v for k, v in d.items()}
 
 
 @router.get("/{device_id}/isis-interfaces", dependencies=[Depends(verify_token)])
-async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_db)):
+async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_db)):  # noqa: C901
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
@@ -91,10 +93,21 @@ async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_db)
         if row.domain_auth_key is not None:
             entry["domain_auth_key"] = row.domain_auth_key
         for col in (
-            "spf_initial_wait", "spf_max_wait", "lsp_initial_wait", "lsp_max_wait",
-            "lsp_lifetime", "lsp_refresh_interval", "lsp_mtu", "overload_on_startup",
-            "overload_timeout", "te_enabled", "sr_enabled", "sr_node_msd",
-            "distance", "maximum_paths", "reference_bandwidth",
+            "spf_initial_wait",
+            "spf_max_wait",
+            "lsp_initial_wait",
+            "lsp_max_wait",
+            "lsp_lifetime",
+            "lsp_refresh_interval",
+            "lsp_mtu",
+            "overload_on_startup",
+            "overload_timeout",
+            "te_enabled",
+            "sr_enabled",
+            "sr_node_msd",
+            "distance",
+            "maximum_paths",
+            "reference_bandwidth",
         ):
             val = getattr(row, col)
             if val is not None:
@@ -195,7 +208,7 @@ class IsisInterfaceIntentUpdate(BaseModel):
 
 
 @router.put("/{device_id}/isis-interface-intent", dependencies=[Depends(verify_token)])
-async def put_isis_interface_intent(
+async def put_isis_interface_intent(  # noqa: C901
     device_id: int, body: IsisInterfaceIntentUpdate, db: AsyncSession = Depends(get_db)
 ):
     """Replace the adapter's IS-IS interface and process intent mirror for this device atomically.
@@ -362,9 +375,7 @@ class IsisFlexAlgoIntentUpdate(BaseModel):
 
 
 @router.put("/{device_id}/isis-flex-algo-intent", dependencies=[Depends(verify_token)])
-async def put_isis_flex_algo_intent(
-    device_id: int, body: IsisFlexAlgoIntentUpdate, db: AsyncSession = Depends(get_db)
-):
+async def put_isis_flex_algo_intent(device_id: int, body: IsisFlexAlgoIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's IS-IS Flex-Algorithm intent mirror for this device atomically.
 
     Full-replace semantics: rows not present in the request body are deleted.
@@ -377,9 +388,7 @@ async def put_isis_flex_algo_intent(
 
     now = datetime.now(UTC).replace(tzinfo=None)
 
-    existing_result = await db.execute(
-        select(IsisFlexAlgoIntent).where(IsisFlexAlgoIntent.device_id == device_id)
-    )
+    existing_result = await db.execute(select(IsisFlexAlgoIntent).where(IsisFlexAlgoIntent.device_id == device_id))
     existing_rows: dict[tuple, IsisFlexAlgoIntent] = {
         (r.process_tag, r.algo_id): r for r in existing_result.scalars().all()
     }
@@ -440,37 +449,53 @@ async def put_isis_flex_algo_intent(
         )
 
         proc_rows = (
-            await db.execute(
-                select(IsisProcessIntent).where(
-                    IsisProcessIntent.device_id == device_id,
-                    IsisProcessIntent.accepted_at.is_not(None),
+            (
+                await db.execute(
+                    select(IsisProcessIntent).where(
+                        IsisProcessIntent.device_id == device_id,
+                        IsisProcessIntent.accepted_at.is_not(None),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         flex_rows = (
-            await db.execute(
-                select(IsisFlexAlgoIntent).where(
-                    IsisFlexAlgoIntent.device_id == device_id,
-                    IsisFlexAlgoIntent.accepted_at.is_not(None),
+            (
+                await db.execute(
+                    select(IsisFlexAlgoIntent).where(
+                        IsisFlexAlgoIntent.device_id == device_id,
+                        IsisFlexAlgoIntent.accepted_at.is_not(None),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         redist_rows = (
-            await db.execute(
-                select(RedistributionIntent).where(
-                    RedistributionIntent.device_id == device_id,
-                    RedistributionIntent.dest_protocol == "isis",
+            (
+                await db.execute(
+                    select(RedistributionIntent).where(
+                        RedistributionIntent.device_id == device_id,
+                        RedistributionIntent.dest_protocol == "isis",
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         iface_rows = (
-            await db.execute(
-                select(IsisInterfaceIntent).where(
-                    IsisInterfaceIntent.device_id == device_id,
-                    IsisInterfaceIntent.accepted_at.is_not(None),
+            (
+                await db.execute(
+                    select(IsisInterfaceIntent).where(
+                        IsisInterfaceIntent.device_id == device_id,
+                        IsisInterfaceIntent.accepted_at.is_not(None),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         processes = build_isis_process_payload(proc_rows, redist_rows, flex_rows)
         interfaces = build_isis_interface_payload(iface_rows)
         try:

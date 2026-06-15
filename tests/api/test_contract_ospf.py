@@ -34,17 +34,49 @@ async def _seed_ospf(device_id: int) -> None:
     ts = datetime(2026, 6, 1, 10, 0, 0)
     async for db in get_session():
         # Maximal instance (router_id set) + minimal instance (omitted).
-        db.add(DeviceOspfInstance(device_id=device_id, process_id="1", vrf="", areas=["0.0.0.0"],
-                                  router_id="10.0.0.1", last_refreshed_at=ts, refresh_source="poll"))
-        db.add(DeviceOspfInstance(device_id=device_id, process_id="2", vrf="", areas=[],
-                                  last_refreshed_at=ts, refresh_source="poll"))
+        db.add(
+            DeviceOspfInstance(
+                device_id=device_id,
+                process_id="1",
+                vrf="",
+                areas=["0.0.0.0"],
+                router_id="10.0.0.1",
+                last_refreshed_at=ts,
+                refresh_source="poll",
+            )
+        )
+        db.add(
+            DeviceOspfInstance(
+                device_id=device_id, process_id="2", vrf="", areas=[], last_refreshed_at=ts, refresh_source="poll"
+            )
+        )
         # Maximal interface (every optional) + minimal interface (only required).
-        db.add(DeviceOspfInterface(device_id=device_id, interface_name="GE0/0", process_id="1",
-                                   area_id="0.0.0.0", passive=True, priority=10, cost=100,
-                                   network_type="point-to-point", auth_type="md5", auth_present=True,
-                                   last_refreshed_at=ts, refresh_source="poll"))
-        db.add(DeviceOspfInterface(device_id=device_id, interface_name="GE0/1", passive=False,
-                                   auth_present=False, last_refreshed_at=ts, refresh_source="poll"))
+        db.add(
+            DeviceOspfInterface(
+                device_id=device_id,
+                interface_name="GE0/0",
+                process_id="1",
+                area_id="0.0.0.0",
+                passive=True,
+                priority=10,
+                cost=100,
+                network_type="point-to-point",
+                auth_type="md5",
+                auth_present=True,
+                last_refreshed_at=ts,
+                refresh_source="poll",
+            )
+        )
+        db.add(
+            DeviceOspfInterface(
+                device_id=device_id,
+                interface_name="GE0/1",
+                passive=False,
+                auth_present=False,
+                last_refreshed_at=ts,
+                refresh_source="poll",
+            )
+        )
         await db.commit()
         break
 

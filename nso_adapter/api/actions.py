@@ -62,7 +62,7 @@ async def sync_notify(
     device_id: int,
     db: AsyncSession = Depends(get_db),
 ):
-    """Called by the NetBox plugin when scope or intent changes for this device.
+    """Handle the NetBox plugin's notification that scope or intent changed for this device.
 
     Triggers an immediate sync job. If a job is already running, returns 409 with
     the existing job_id so the plugin can poll for the result.

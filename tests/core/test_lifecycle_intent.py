@@ -94,9 +94,7 @@ async def test_put_intent_stamps_accepted_and_writes_intent_table(adapter_client
 
     async for db in get_session():
         rows = (
-            (await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface_id)))
-            .scalars()
-            .all()
+            (await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface_id))).scalars().all()
         )
         break
     assert len(rows) == 1
@@ -107,9 +105,7 @@ async def test_detect_drift_in_sync_when_device_matches_deployed_intent(adapter_
     """Phase 2: once intent is deployed and the device matches it, detect_drift reports
     in_sync — comparing against the deployed intent, not the cached netbox_value."""
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="li-dev2", netbox_device_id=7951)
-    iface_id, attr_id = await _seed(
-        device_id, netbox_value="dev-desc", nso_value="dev-desc", status=SyncState.accepted
-    )
+    iface_id, attr_id = await _seed(device_id, netbox_value="dev-desc", nso_value="dev-desc", status=SyncState.accepted)
     await _add_deployed_intent(iface_id, "op-desc")
 
     await _run_detect_drift(device_id, "li-dev2", device_reports="op-desc")
@@ -120,9 +116,7 @@ async def test_detect_drift_in_sync_when_device_matches_deployed_intent(adapter_
 async def test_detect_drift_drifted_when_device_differs_from_deployed_intent(adapter_client):
     """Phase 2: a device value that diverges from the deployed intent is drifted."""
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="li-dev3", netbox_device_id=7952)
-    iface_id, attr_id = await _seed(
-        device_id, netbox_value="dev-desc", nso_value="dev-desc", status=SyncState.in_sync
-    )
+    iface_id, attr_id = await _seed(device_id, netbox_value="dev-desc", nso_value="dev-desc", status=SyncState.in_sync)
     await _add_deployed_intent(iface_id, "op-desc")
 
     await _run_detect_drift(device_id, "li-dev3", device_reports="hand-edited-on-device")

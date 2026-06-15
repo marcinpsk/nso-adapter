@@ -58,8 +58,16 @@ async def test_duplicate_peer_merges_address_families(adapter_client):
                     "vrf": "",
                     "address-family": [{"af": "ipv4-unicast"}],
                     "peer": [
-                        {"peer-address": "10.0.0.1", "peer-group": "v4", "peer-address-family": [{"afi": "ipv4-unicast"}]},
-                        {"peer-address": "10.0.0.1", "peer-group": "v6", "peer-address-family": [{"afi": "ipv6-unicast"}]},
+                        {
+                            "peer-address": "10.0.0.1",
+                            "peer-group": "v4",
+                            "peer-address-family": [{"afi": "ipv4-unicast"}],
+                        },
+                        {
+                            "peer-address": "10.0.0.1",
+                            "peer-group": "v6",
+                            "peer-address-family": [{"afi": "ipv6-unicast"}],
+                        },
                     ],
                 }
             ],
@@ -138,6 +146,7 @@ async def test_peer_enabled_in_any_group_wins_on_merge(adapter_client):
         assert peers[0].enabled is True
         break
 
+
 async def test_peer_af_policy_in_maps_to_routemap(adapter_client):
     """Junos/Timos per-AF policy-in/out map to routemap_in/out; IOS routemap-in too."""
     from nso_adapter.core.bgp import _upsert_bgp_data
@@ -155,9 +164,7 @@ async def test_peer_af_policy_in_maps_to_routemap(adapter_client):
                     "peer": [
                         {
                             "peer-address": "10.0.0.1",
-                            "peer-address-family": [
-                                {"afi": "ipv4-unicast", "policy-in": "PIN", "policy-out": "POUT"}
-                            ],
+                            "peer-address-family": [{"afi": "ipv4-unicast", "policy-in": "PIN", "policy-out": "POUT"}],
                         },
                         {
                             "peer-address": "10.0.0.2",
@@ -173,10 +180,14 @@ async def test_peer_af_policy_in_maps_to_routemap(adapter_client):
     async for db in get_session():
         device = await db.get(Device, device_id)
         await _upsert_bgp_data(db, device, routers, "test")
-        afs = {(a.routemap_in, a.routemap_out, a.prefixlist_out) for a in (await db.execute(select(DeviceBgpPeerAddressFamily))).scalars().all()}
+        afs = {
+            (a.routemap_in, a.routemap_out, a.prefixlist_out)
+            for a in (await db.execute(select(DeviceBgpPeerAddressFamily))).scalars().all()
+        }
         assert ("PIN", "POUT", None) in afs  # policy-in/out -> routemap_in/out
-        assert ("RIN", None, "PLO") in afs   # IOS routemap-in + prefixlist-out
+        assert ("RIN", None, "PLO") in afs  # IOS routemap-in + prefixlist-out
         break
+
 
 async def test_peer_source_imported(adapter_client):
     """Peer 'source' (update-source iface / local-address) is stored on the peer."""

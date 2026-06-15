@@ -198,7 +198,7 @@ async def refresh_route_policy_for_device(
 
 
 async def handle_route_policy_change(device_name: str, db: AsyncSession, nso_client: NsoClient) -> None:
-    """Placeholder SSE hook — refresh route-policy for a single device by name."""
+    """Refresh route-policy for a single device by name (placeholder SSE hook)."""
     result = await db.execute(select(Device).where(Device.nso_device_name == device_name))
     device = result.scalar_one_or_none()
     if device is None:

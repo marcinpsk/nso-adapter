@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Redistribution refresh — reads redistribute statements from OSPF/ISIS/BGP
-oper-data already cached by the NSO package and upserts device_redistribution rows.
+"""Refresh device_redistribution rows from OSPF/ISIS/BGP redistribute oper-data.
+
+Reads redistribute statements already cached by the NSO package and upserts
+device_redistribution rows.
 
 Entry points:
 - refresh_redistribution_for_device() — called on-demand after each OSPF/ISIS/BGP

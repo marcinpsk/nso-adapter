@@ -7,8 +7,10 @@ Create Date: 2026-06-09
 Write-path intent mirror for remote syslog servers the NetBox operator accepted.
 The single device Apply commits these via the logging-reconciler NSO service.
 """
-from alembic import op
+
 import sqlalchemy as sa
+
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "f3a4b5c6d7e8"
@@ -36,9 +38,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("device_id", "address", name="uq_logginghostintent_identity"),
     )
-    op.create_index(
-        op.f("ix_logging_host_intent_device_id"), "logging_host_intent", ["device_id"], unique=False
-    )
+    op.create_index(op.f("ix_logging_host_intent_device_id"), "logging_host_intent", ["device_id"], unique=False)
 
 
 def downgrade() -> None:

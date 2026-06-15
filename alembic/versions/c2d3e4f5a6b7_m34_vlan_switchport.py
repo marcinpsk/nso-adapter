@@ -6,17 +6,19 @@ Revision ID: c2d3e4f5a6b7
 Revises: b0c1d2e3f4a5
 Create Date: 2026-06-07 08:00:00.000000
 """
+
 from __future__ import annotations
 
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision: str = "c2d3e4f5a6b7"
-down_revision: Union[str, Sequence[str], None] = "b0c1d2e3f4a5"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | Sequence[str] | None = "b0c1d2e3f4a5"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
@@ -48,9 +50,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("device_id", "interface_name", name="uq_deviceswitchport_identity"),
     )
-    op.create_index(
-        op.f("ix_device_switchport_device_id"), "device_switchport", ["device_id"], unique=False
-    )
+    op.create_index(op.f("ix_device_switchport_device_id"), "device_switchport", ["device_id"], unique=False)
 
     op.create_table(
         "device_switchport_tagged_vlan",

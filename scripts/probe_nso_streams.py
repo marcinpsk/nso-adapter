@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Probe NSO RESTCONF notification streams via SSE.
+r"""Probe NSO RESTCONF notification streams via SSE.
 
 Usage (env-based):
     NSO_URL=http://nso-host:8080 NSO_USER=admin NSO_PASSWORD=secret \\

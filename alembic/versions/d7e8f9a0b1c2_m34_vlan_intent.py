@@ -7,8 +7,10 @@ Create Date: 2026-06-09
 Write-path intent mirror for VLAN-database entries (vid + name) the operator
 accepted. The single device Apply commits these via the vlan-reconciler service.
 """
-from alembic import op
+
 import sqlalchemy as sa
+
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "d7e8f9a0b1c2"

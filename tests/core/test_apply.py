@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -619,14 +619,13 @@ async def test_run_apply_bgp_intent_does_not_crash_on_commit(adapter_client):
     'list object has no attribute _sa_adapter' and aborted the ENTIRE job. set_committed_value
     instruments the collection, so flush sees committed (empty-history) state.
     """
-    from datetime import timezone
 
     from nso_adapter.store.models import BgpRouterIntent
 
     device_id = await _seed_device("rtr-bgp-crash", 555)
     job_id = await _seed_apply_job(device_id)
     async for db in get_session():
-        db.add(BgpRouterIntent(device_id=device_id, asn="65100", accepted_at=datetime.now(timezone.utc)))
+        db.add(BgpRouterIntent(device_id=device_id, asn="65100", accepted_at=datetime.now(UTC)))
         await db.commit()
         break
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """M34: GET /devices/{id}/vlan-database and /switchport."""
+
 from __future__ import annotations
 
 import pytest
@@ -25,18 +26,24 @@ async def test_vlan_database_returns_seeded_rows(adapter_client):
 @pytest.mark.anyio
 async def test_switchport_returns_seeded_rows(adapter_client):
     device_id = await seed_device(nso_device_name="vlan-sw2", netbox_device_id=1201)
-    await seed_switchport(device_id, [
-        {"interface_name": "GigabitEthernet0/1", "mode": "access", "untagged_vlan": 10, "tagged_vlans": []},
-        {"interface_name": "GigabitEthernet0/2", "mode": "trunk", "untagged_vlan": 99, "tagged_vlans": [20, 30]},
-    ])
+    await seed_switchport(
+        device_id,
+        [
+            {"interface_name": "GigabitEthernet0/1", "mode": "access", "untagged_vlan": 10, "tagged_vlans": []},
+            {"interface_name": "GigabitEthernet0/2", "mode": "trunk", "untagged_vlan": 99, "tagged_vlans": [20, 30]},
+        ],
+    )
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/switchport", headers=AUTH)
     assert resp.status_code == 200
     body = resp.json()
     assert body["device_id"] == device_id
     by_name = {i["interface_name"]: i for i in body["interfaces"]}
     assert by_name["GigabitEthernet0/1"] == {
-        "interface_name": "GigabitEthernet0/1", "mode": "access", "untagged_vlan": 10,
-        "tagged_vlans": [], "source": "switchport",
+        "interface_name": "GigabitEthernet0/1",
+        "mode": "access",
+        "untagged_vlan": 10,
+        "tagged_vlans": [],
+        "source": "switchport",
     }
     assert by_name["GigabitEthernet0/2"]["untagged_vlan"] == 99
     assert by_name["GigabitEthernet0/2"]["tagged_vlans"] == [20, 30]
@@ -59,17 +66,20 @@ async def test_vlan_database_requires_auth(adapter_client):
 @pytest.mark.anyio
 async def test_apply_switchport_builds_payload(adapter_client):
     from unittest.mock import AsyncMock, patch
+
     device_id = await seed_device(nso_device_name="sw-apply", netbox_device_id=1210)
     nso_write = AsyncMock()
-    body = {"interfaces": [
-        {"interface_name": "Gi0/1", "mode": "access", "untagged_vlan": 10, "tagged_vlans": []},
-        {"interface_name": "Gi0/2", "mode": "trunk", "untagged_vlan": 99, "tagged_vlans": [20, 30]}]}
+    body = {
+        "interfaces": [
+            {"interface_name": "Gi0/1", "mode": "access", "untagged_vlan": 10, "tagged_vlans": []},
+            {"interface_name": "Gi0/2", "mode": "trunk", "untagged_vlan": 99, "tagged_vlans": [20, 30]},
+        ]
+    }
     with (
         patch("nso_adapter.api.vlan.get_nso_client", return_value=AsyncMock()),
         patch("nso_adapter.core.switchport_intent._nso_apply_switchport_config", nso_write),
     ):
-        resp = await adapter_client.post(
-            f"/api/v1/devices/{device_id}/switchport/apply", json=body, headers=AUTH)
+        resp = await adapter_client.post(f"/api/v1/devices/{device_id}/switchport/apply", json=body, headers=AUTH)
     assert resp.status_code == 200
     assert resp.json()["status"] == "deployed"
     _c, dev_name, ifaces = nso_write.await_args.args

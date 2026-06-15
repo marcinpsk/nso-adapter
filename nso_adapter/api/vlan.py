@@ -4,13 +4,13 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-
-from datetime import UTC, datetime
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import api_error
@@ -37,15 +37,13 @@ async def get_vlan_database(device_id: int, db: AsyncSession = Depends(get_db)):
     if await db.get(Device, device_id) is None:
         raise api_error(404, "not_found", "Device not found")
     rows = (
-        await db.execute(
-            select(DeviceVlan).where(DeviceVlan.device_id == device_id).order_by(DeviceVlan.vlan_id)
-        )
-    ).scalars().all()
+        (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device_id).order_by(DeviceVlan.vlan_id)))
+        .scalars()
+        .all()
+    )
     return {
         "device_id": device_id,
-        "vlans": [
-            {"vlan_id": r.vlan_id, "name": r.name or "", "source": "vlan-database"} for r in rows
-        ],
+        "vlans": [{"vlan_id": r.vlan_id, "name": r.name or "", "source": "vlan-database"} for r in rows],
     }
 
 
@@ -54,16 +52,20 @@ async def get_switchport(device_id: int, db: AsyncSession = Depends(get_db)):
     if await db.get(Device, device_id) is None:
         raise api_error(404, "not_found", "Device not found")
     rows = (
-        await db.execute(
-            select(DeviceSwitchport)
-            .where(DeviceSwitchport.device_id == device_id)
-            .order_by(DeviceSwitchport.interface_name)
-            .options(
-                selectinload(DeviceSwitchport.untagged_vlan),
-                selectinload(DeviceSwitchport.tagged_vlans),
+        (
+            await db.execute(
+                select(DeviceSwitchport)
+                .where(DeviceSwitchport.device_id == device_id)
+                .order_by(DeviceSwitchport.interface_name)
+                .options(
+                    selectinload(DeviceSwitchport.untagged_vlan),
+                    selectinload(DeviceSwitchport.tagged_vlans),
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     return {
         "device_id": device_id,
         "interfaces": [

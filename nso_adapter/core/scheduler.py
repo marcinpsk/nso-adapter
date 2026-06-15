@@ -510,10 +510,11 @@ async def _scheduled_capability_refresh() -> None:
 
 
 async def _refresh_all_devices(refresh_fn, label: str) -> None:
-    """Run *refresh_fn(db, device, nso_client, refresh_source='poll')* for every
-    NSO-managed device. Shared body for the L2/L3 interface-family poll jobs
-    (M34 VLAN-db + switchport, M35 SVI/IRB, M36 dot1q subinterface), which would
-    otherwise be byte-for-byte copies of each other.
+    """Run *refresh_fn(db, device, nso_client, refresh_source='poll')* for every NSO device.
+
+    Shared body for the L2/L3 interface-family poll jobs (M34 VLAN-db + switchport,
+    M35 SVI/IRB, M36 dot1q subinterface), which would otherwise be byte-for-byte
+    copies of each other.
     """
     from sqlalchemy import select
 
@@ -573,8 +574,9 @@ async def _scheduled_interface_mtu_refresh() -> None:
 
 
 async def _scheduled_topology_interfaces_refresh() -> None:
-    """Periodic reconcile: ensure NetBox holds the LAG/channel/loopback interfaces
-    that bound_port correlation needs (the cfg.port feed never creates them).
+    """Ensure NetBox holds the LAG/channel/loopback interfaces bound_port correlation needs.
+
+    A periodic reconcile for the interfaces the cfg.port feed never creates.
 
     Reads the adapter mirror (IS-IS / interface-IP / lag-topology, already
     refreshed by their own jobs) plus the attribute-sync DbInterface rows. Runs
@@ -602,7 +604,7 @@ async def _scheduled_topology_interfaces_refresh() -> None:
                 logger.error("scheduler.topology_interfaces.error", device_id=device.id, error=repr(exc))
 
 
-def start_scheduler() -> None:
+def start_scheduler() -> None:  # noqa: C901
     global _scheduler
     cfg = get_config()
     _scheduler = AsyncIOScheduler()

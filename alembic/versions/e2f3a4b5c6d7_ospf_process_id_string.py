@@ -7,8 +7,10 @@ Create Date: 2026-06-08
 IOS-XR (and Junos) allow named OSPF processes (e.g. "test", "DEVICES"), which do
 not fit an integer process-id. Widen process_id to a string on every OSPF table.
 """
-from alembic import op
+
 import sqlalchemy as sa
+
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "e2f3a4b5c6d7"

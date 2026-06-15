@@ -25,8 +25,8 @@ async def attach_bgp_relationships(db: AsyncSession, routers: list) -> list:
 
     router_ids = [r.id for r in routers]
     all_scopes = (
-        await db.execute(select(BgpScopeIntent).where(BgpScopeIntent.router_id.in_(router_ids)))
-    ).scalars().all()
+        (await db.execute(select(BgpScopeIntent).where(BgpScopeIntent.router_id.in_(router_ids)))).scalars().all()
+    )
     scopes_by_router: dict[int, list] = {}
     for s in all_scopes:
         scopes_by_router.setdefault(s.router_id, []).append(s)
@@ -36,13 +36,11 @@ async def attach_bgp_relationships(db: AsyncSession, routers: list) -> list:
     peers_by_scope: dict[int, list] = {}
     all_peers: list = []
     if scope_ids:
-        for af in (
-            await db.execute(select(BgpAfIntent).where(BgpAfIntent.scope_id.in_(scope_ids)))
-        ).scalars().all():
+        for af in (await db.execute(select(BgpAfIntent).where(BgpAfIntent.scope_id.in_(scope_ids)))).scalars().all():
             afs_by_scope.setdefault(af.scope_id, []).append(af)
         all_peers = (
-            await db.execute(select(BgpPeerIntent).where(BgpPeerIntent.scope_id.in_(scope_ids)))
-        ).scalars().all()
+            (await db.execute(select(BgpPeerIntent).where(BgpPeerIntent.scope_id.in_(scope_ids)))).scalars().all()
+        )
         for p in all_peers:
             peers_by_scope.setdefault(p.scope_id, []).append(p)
 
@@ -50,8 +48,8 @@ async def attach_bgp_relationships(db: AsyncSession, routers: list) -> list:
     pafs_by_peer: dict[int, list] = {}
     if peer_ids:
         for paf in (
-            await db.execute(select(BgpPeerAfIntent).where(BgpPeerAfIntent.peer_id.in_(peer_ids)))
-        ).scalars().all():
+            (await db.execute(select(BgpPeerAfIntent).where(BgpPeerAfIntent.peer_id.in_(peer_ids)))).scalars().all()
+        ):
             pafs_by_peer.setdefault(paf.peer_id, []).append(paf)
 
     for s in all_scopes:

@@ -18,7 +18,11 @@ async def _count_intent(device_id: int) -> int:
     from nso_adapter.store.models import LoggingHostIntent
 
     async for db in get_session():
-        rows = (await db.execute(select(LoggingHostIntent).where(LoggingHostIntent.device_id == device_id))).scalars().all()
+        rows = (
+            (await db.execute(select(LoggingHostIntent).where(LoggingHostIntent.device_id == device_id)))
+            .scalars()
+            .all()
+        )
         return len(rows)
     return 0
 
@@ -26,10 +30,12 @@ async def _count_intent(device_id: int) -> int:
 @pytest.mark.anyio
 async def test_put_logging_intent_stores_rows(adapter_client):
     device_id = await seed_device()
-    body = {"hosts": [
-        {"address": "10.0.0.1", "severity": "informational", "source": "Loopback0"},
-        {"address": "10.0.0.2", "port": 6514, "vrf": "MGMT"},
-    ]}
+    body = {
+        "hosts": [
+            {"address": "10.0.0.1", "severity": "informational", "source": "Loopback0"},
+            {"address": "10.0.0.2", "port": 6514, "vrf": "MGMT"},
+        ]
+    }
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/logging-intent", json=body, headers=AUTH)
     assert resp.status_code == 200
     assert resp.json()["count"] == 2

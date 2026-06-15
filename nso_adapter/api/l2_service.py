@@ -27,12 +27,16 @@ async def get_l2_services(device_id: int, db: AsyncSession = Depends(get_db)):
         raise api_error(404, "not_found", "Device not found")
 
     rows = (
-        await db.execute(
-            select(DeviceL2Sap)
-            .where(DeviceL2Sap.device_id == device_id)
-            .order_by(DeviceL2Sap.service_name, DeviceL2Sap.sap_id)
+        (
+            await db.execute(
+                select(DeviceL2Sap)
+                .where(DeviceL2Sap.device_id == device_id)
+                .order_by(DeviceL2Sap.service_name, DeviceL2Sap.sap_id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     services: dict[str, dict] = {}
     for r in rows:
@@ -45,9 +49,7 @@ async def get_l2_services(device_id: int, db: AsyncSession = Depends(get_db)):
                 "saps": [],
             },
         )
-        svc["saps"].append(
-            {"sap_id": r.sap_id, "port": r.port, "outer_tag": r.outer_tag, "inner_tag": r.inner_tag}
-        )
+        svc["saps"].append({"sap_id": r.sap_id, "port": r.port, "outer_tag": r.outer_tag, "inner_tag": r.inner_tag})
 
     return {"device_id": device_id, "services": list(services.values())}
 
@@ -84,9 +86,7 @@ async def put_l2_sap_intent(device_id: int, body: L2SapIntentUpdate, db: AsyncSe
         raise api_error(404, "not_found", "Device not found")
 
     existing_result = await db.execute(select(L2SapIntent).where(L2SapIntent.device_id == device_id))
-    existing_rows: dict[tuple, L2SapIntent] = {
-        (r.service_name, r.sap_id): r for r in existing_result.scalars().all()
-    }
+    existing_rows: dict[tuple, L2SapIntent] = {(r.service_name, r.sap_id): r for r in existing_result.scalars().all()}
 
     new_keys: set[tuple] = {(item.service_name, item.sap_id) for item in body.saps}
 

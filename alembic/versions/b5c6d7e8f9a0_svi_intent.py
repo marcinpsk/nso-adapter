@@ -7,8 +7,10 @@ Create Date: 2026-06-09
 Write-path intent mirror for L3 VLAN interfaces the operator accepted. The single
 device Apply commits these via the svi-reconciler NSO service.
 """
-from alembic import op
+
 import sqlalchemy as sa
+
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "b5c6d7e8f9a0"

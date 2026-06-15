@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for the /api/v1/devices/{id}/lag-config endpoints."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, patch
@@ -40,19 +41,22 @@ async def test_lag_config_device_not_found(adapter_client):
 @pytest.mark.anyio
 async def test_lag_config_bundle_with_members(adapter_client):
     device_id = await seed_device(nso_device_name="lag-config-full", netbox_device_id=1102)
-    await seed_lag_config(device_id, bundles=[
-        {
-            "name": "Port-channel1",
-            "lag_id": 1,
-            "min_links": 2,
-            "system_priority": 100,
-            "timer": "fast",
-            "members": [
-                {"interface_name": "GigabitEthernet0/1", "mode": "active", "port_priority": 200},
-                {"interface_name": "GigabitEthernet0/2", "mode": "active"},
-            ],
-        }
-    ])
+    await seed_lag_config(
+        device_id,
+        bundles=[
+            {
+                "name": "Port-channel1",
+                "lag_id": 1,
+                "min_links": 2,
+                "system_priority": 100,
+                "timer": "fast",
+                "members": [
+                    {"interface_name": "GigabitEthernet0/1", "mode": "active", "port_priority": 200},
+                    {"interface_name": "GigabitEthernet0/2", "mode": "active"},
+                ],
+            }
+        ],
+    )
 
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/lag-config", headers=AUTH)
     assert resp.status_code == 200
@@ -129,16 +133,12 @@ async def test_apply_lag_config_builds_service_payload(adapter_client):
 
 @pytest.mark.anyio
 async def test_apply_lag_config_device_not_found(adapter_client):
-    resp = await adapter_client.post(
-        "/api/v1/devices/99999/lag-config/apply", json=_APPLY_BODY, headers=AUTH
-    )
+    resp = await adapter_client.post("/api/v1/devices/99999/lag-config/apply", json=_APPLY_BODY, headers=AUTH)
     assert resp.status_code == 404
 
 
 @pytest.mark.anyio
 async def test_apply_lag_config_requires_auth(adapter_client):
     device_id = await seed_device(nso_device_name="lag-apply-noauth", netbox_device_id=1111)
-    resp = await adapter_client.post(
-        f"/api/v1/devices/{device_id}/lag-config/apply", json=_APPLY_BODY
-    )
+    resp = await adapter_client.post(f"/api/v1/devices/{device_id}/lag-config/apply", json=_APPLY_BODY)
     assert resp.status_code == 401

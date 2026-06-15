@@ -31,33 +31,81 @@ TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "processes", "in
 
 PROC_REQUIRED_KEYS = {"process_tag"}
 PROC_OPTIONAL_SCALARS = {
-    "net", "is_type", "metric_style", "overload_bit",
-    "area_auth_type", "area_auth_present", "area_auth_key",
-    "domain_auth_type", "domain_auth_present", "domain_auth_key",
-    "spf_initial_wait", "spf_max_wait", "lsp_initial_wait", "lsp_max_wait",
-    "lsp_lifetime", "lsp_refresh_interval", "lsp_mtu",
-    "overload_on_startup", "overload_timeout",
-    "te_enabled", "sr_enabled", "sr_node_msd",
-    "distance", "maximum_paths", "reference_bandwidth",
+    "net",
+    "is_type",
+    "metric_style",
+    "overload_bit",
+    "area_auth_type",
+    "area_auth_present",
+    "area_auth_key",
+    "domain_auth_type",
+    "domain_auth_present",
+    "domain_auth_key",
+    "spf_initial_wait",
+    "spf_max_wait",
+    "lsp_initial_wait",
+    "lsp_max_wait",
+    "lsp_lifetime",
+    "lsp_refresh_interval",
+    "lsp_mtu",
+    "overload_on_startup",
+    "overload_timeout",
+    "te_enabled",
+    "sr_enabled",
+    "sr_node_msd",
+    "distance",
+    "maximum_paths",
+    "reference_bandwidth",
 }
 PROC_CONTAINER_KEYS = {"settings", "levels", "segment_routing", "flex_algos"}
 
 IFACE_REQUIRED_KEYS = {"interface_name", "af", "process_tag", "passive"}
 IFACE_OPTIONAL_SCALARS = {
-    "circuit_type", "network_type", "metric", "bound_port",
-    "hello_auth_type", "hello_auth_present", "bfd_enabled",
-    "csnp_interval", "retransmit_interval", "lsp_interval", "mesh_group",
+    "circuit_type",
+    "network_type",
+    "metric",
+    "bound_port",
+    "hello_auth_type",
+    "hello_auth_present",
+    "bfd_enabled",
+    "csnp_interval",
+    "retransmit_interval",
+    "lsp_interval",
+    "mesh_group",
 }
 IFACE_CONTAINER_KEYS = {"settings", "levels"}
 
 # Nested JSON-bag sub-dict key sets (snake-cased output the plugin reads).
-INSTANCE_LEVEL_KEYS = {"level", "default_metric", "wide_metrics_only", "preference",
-                       "labeled_preference", "disabled", "auth_type"}
+INSTANCE_LEVEL_KEYS = {
+    "level",
+    "default_metric",
+    "wide_metrics_only",
+    "preference",
+    "labeled_preference",
+    "disabled",
+    "auth_type",
+}
 IFACE_LEVEL_KEYS = {"level", "metric", "hello_interval", "hello_multiplier", "priority", "passive"}
-SR_KEYS = {"enabled", "prefix_sid_range", "srgb_start", "srgb_range", "node_sid_index", "node_sid_label",
-           "node_sid_v6_index", "node_sid_v6_label", "maximum_sid_depth", "tunnel_table_pref"}
-FLEX_KEYS = {"algo_id", "metric_type", "priority",
-             "admin_group_exclude", "admin_group_include_any", "admin_group_include_all"}
+SR_KEYS = {
+    "enabled",
+    "prefix_sid_range",
+    "srgb_start",
+    "srgb_range",
+    "node_sid_index",
+    "node_sid_label",
+    "node_sid_v6_index",
+    "node_sid_v6_label",
+    "maximum_sid_depth",
+    "tunnel_table_pref",
+}
+FLEX_KEYS = {
+    "algo_id",
+    "metric_type",
+    "priority",
+    "admin_group_exclude",
+    "admin_group_include_any",
+    "admin_group_include_all",
+}
 
 
 async def _seed_isis(device_id: int) -> None:
@@ -67,39 +115,115 @@ async def _seed_isis(device_id: int) -> None:
     ts = datetime(2026, 6, 1, 10, 0, 0)
     # Nested bags are stored hyphenated (as the extractor writes them); the adapter
     # _snake()s them on output → the snake_case keys the plugin consumes.
-    instance_level = {"level": "2", "default-metric": 10, "wide-metrics-only": True, "preference": 7,
-                      "labeled-preference": 7, "disabled": False, "auth-type": "md5"}
-    sr = {"enabled": True, "prefix-sid-range": "global", "srgb-start": 100000, "srgb-range": 200000,
-          "node-sid-index": 100, "node-sid-label": 100100, "node-sid-v6-index": 200, "node-sid-v6-label": 100200,
-          "maximum-sid-depth": 10, "tunnel-table-pref": 8}
-    flex = {"algo-id": 128, "metric-type": "igp", "priority": 100, "admin-group-exclude": ["RED"],
-            "admin-group-include-any": ["BLUE"], "admin-group-include-all": []}
-    iface_level = {"level": "2", "metric": 10, "hello-interval": 3, "hello-multiplier": 3,
-                   "priority": 64, "passive": False}
+    instance_level = {
+        "level": "2",
+        "default-metric": 10,
+        "wide-metrics-only": True,
+        "preference": 7,
+        "labeled-preference": 7,
+        "disabled": False,
+        "auth-type": "md5",
+    }
+    sr = {
+        "enabled": True,
+        "prefix-sid-range": "global",
+        "srgb-start": 100000,
+        "srgb-range": 200000,
+        "node-sid-index": 100,
+        "node-sid-label": 100100,
+        "node-sid-v6-index": 200,
+        "node-sid-v6-label": 100200,
+        "maximum-sid-depth": 10,
+        "tunnel-table-pref": 8,
+    }
+    flex = {
+        "algo-id": 128,
+        "metric-type": "igp",
+        "priority": 100,
+        "admin-group-exclude": ["RED"],
+        "admin-group-include-any": ["BLUE"],
+        "admin-group-include-all": [],
+    }
+    iface_level = {
+        "level": "2",
+        "metric": 10,
+        "hello-interval": 3,
+        "hello-multiplier": 3,
+        "priority": 64,
+        "passive": False,
+    }
 
     async for db in get_session():
         # MAXIMAL process: every scalar set + all four containers populated.
-        db.add(DeviceIsisProcess(
-            device_id=device_id, process_tag="1", net="49.0001.0000.0000.0001.00", is_type="level-2",
-            metric_style="wide", overload_bit=False, area_auth_type="md5", area_auth_present=True,
-            area_auth_key="x", domain_auth_type="md5", domain_auth_present=True, domain_auth_key="y",
-            spf_initial_wait=50, spf_max_wait=5000, lsp_initial_wait=50, lsp_max_wait=5000,
-            lsp_lifetime=65535, lsp_refresh_interval=65000, lsp_mtu=1492, overload_on_startup=True,
-            overload_timeout=180, te_enabled=True, sr_enabled=True, sr_node_msd=10, distance=115,
-            maximum_paths=8, reference_bandwidth=100000, settings={"some-knob": "v"},
-            levels=[instance_level], segment_routing=sr, flex_algos=[flex],
-            last_refreshed_at=ts, refresh_source="poll"))
+        db.add(
+            DeviceIsisProcess(
+                device_id=device_id,
+                process_tag="1",
+                net="49.0001.0000.0000.0001.00",
+                is_type="level-2",
+                metric_style="wide",
+                overload_bit=False,
+                area_auth_type="md5",
+                area_auth_present=True,
+                area_auth_key="x",
+                domain_auth_type="md5",
+                domain_auth_present=True,
+                domain_auth_key="y",
+                spf_initial_wait=50,
+                spf_max_wait=5000,
+                lsp_initial_wait=50,
+                lsp_max_wait=5000,
+                lsp_lifetime=65535,
+                lsp_refresh_interval=65000,
+                lsp_mtu=1492,
+                overload_on_startup=True,
+                overload_timeout=180,
+                te_enabled=True,
+                sr_enabled=True,
+                sr_node_msd=10,
+                distance=115,
+                maximum_paths=8,
+                reference_bandwidth=100000,
+                settings={"some-knob": "v"},
+                levels=[instance_level],
+                segment_routing=sr,
+                flex_algos=[flex],
+                last_refreshed_at=ts,
+                refresh_source="poll",
+            )
+        )
         # MINIMAL process: only process_tag (every optional/container omitted).
         db.add(DeviceIsisProcess(device_id=device_id, process_tag="2", last_refreshed_at=ts, refresh_source="poll"))
         # MAXIMAL interface + MINIMAL interface.
-        db.add(DeviceIsisInterface(
-            device_id=device_id, interface_name="GE0/0", af="ipv4", process_tag="1", circuit_type="level-2-only",
-            network_type="point-to-point", metric=10, passive=False, bound_port="GE0/0", hello_auth_type="md5",
-            hello_auth_present=True, bfd_enabled=True, csnp_interval=10, retransmit_interval=5, lsp_interval=33,
-            mesh_group="1", settings={"some-knob": "v"}, levels=[iface_level],
-            last_refreshed_at=ts, refresh_source="poll"))
-        db.add(DeviceIsisInterface(device_id=device_id, interface_name="GE0/1", af="ipv4",
-                                   last_refreshed_at=ts, refresh_source="poll"))
+        db.add(
+            DeviceIsisInterface(
+                device_id=device_id,
+                interface_name="GE0/0",
+                af="ipv4",
+                process_tag="1",
+                circuit_type="level-2-only",
+                network_type="point-to-point",
+                metric=10,
+                passive=False,
+                bound_port="GE0/0",
+                hello_auth_type="md5",
+                hello_auth_present=True,
+                bfd_enabled=True,
+                csnp_interval=10,
+                retransmit_interval=5,
+                lsp_interval=33,
+                mesh_group="1",
+                settings={"some-knob": "v"},
+                levels=[iface_level],
+                last_refreshed_at=ts,
+                refresh_source="poll",
+            )
+        )
+        db.add(
+            DeviceIsisInterface(
+                device_id=device_id, interface_name="GE0/1", af="ipv4", last_refreshed_at=ts, refresh_source="poll"
+            )
+        )
         await db.commit()
         break
 

@@ -228,6 +228,7 @@ async def _send_service_config(
             )
     logger.info("nso.apply.service_sent", scope=scope, device=device_name, method=method, replace=replace)
     await _verify_native_or_raise(client, url, payload, device_name, scope=scope, method=method)
+    return None
 
 
 async def apply_interface_attribute(
@@ -313,6 +314,7 @@ async def apply_interface_attribute(
     )
 
     await _verify_native_or_raise(client, url, payload, device_name, scope="interface_attribute")
+    return None
 
 
 async def apply_interface_ips(
@@ -415,6 +417,7 @@ async def apply_interface_ips(
     )
 
     await _verify_native_or_raise(client, url, payload, device_name, scope="interface_ip")
+    return None
 
 
 _SNMP_SERVICE_PATH = "/restconf/data/snmp-reconciler:snmp-config"
@@ -897,14 +900,16 @@ async def apply_switchport_config(
     )
 
 
-def build_isis_process_payload(
+def build_isis_process_payload(  # noqa: C901
     isis_process_rows: list | None,
     redistribution_rows: list | None = None,
     flex_algo_rows: list | None = None,
 ) -> list[dict]:
-    """Build the isis-reconciler ``process-config`` payload (with nested redistribute
-    and flex-algo) from store rows.  Shared by the apply path and the flex-algo
-    removal path (PUT-replace), so both produce identical process-config bodies."""
+    """Build the isis-reconciler ``process-config`` payload from store rows.
+
+    Includes nested redistribute and flex-algo. Shared by the apply path and the
+    flex-algo removal path (PUT-replace), so both produce identical process-config bodies.
+    """
     redist_by_proc: dict[str, list[dict]] = {}
     for row in redistribution_rows or []:
         entry: dict = {
@@ -1046,6 +1051,7 @@ async def apply_isis_interfaces(
     )
 
     await _verify_native_or_raise(client, url, payload, device_name, scope="isis")
+    return None
 
 
 def build_isis_interface_payload(isis_intent_rows: list | None) -> list[dict]:
@@ -1344,7 +1350,7 @@ async def apply_route_policy_config(
 _OSPF_SERVICE_PATH = "/restconf/data/ospf-reconciler:ospf-config"
 
 
-async def apply_ospf_config(
+async def apply_ospf_config(  # noqa: C901
     client: NsoClient,
     device_name: str,
     process_intent_rows: list,

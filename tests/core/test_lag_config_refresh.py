@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for refresh_lag_config_for_device (core/lag_config.py)."""
+
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
@@ -54,8 +55,8 @@ async def test_refresh_lag_config_happy(adapter_client):
 
         nso_client.get_lag_config.assert_awaited_once_with("sw03")
         bundles = (
-            await db.execute(select(LagBundleConfig).where(LagBundleConfig.device_id == device.id))
-        ).scalars().all()
+            (await db.execute(select(LagBundleConfig).where(LagBundleConfig.device_id == device.id))).scalars().all()
+        )
         members = (await db.execute(select(LagMemberConfig))).scalars().all()
         assert {b.name for b in bundles} == {"Port-channel1", "Port-channel2"}
         pc1 = next(b for b in bundles if b.name == "Port-channel1")

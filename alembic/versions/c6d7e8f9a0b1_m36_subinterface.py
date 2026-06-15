@@ -8,8 +8,10 @@ Read mirror + write-path intent for dot1q L3 subinterfaces (IOS Gi0/1.100,
 Junos ge-0/0/0.100) exported from NSO. No IPs — those ride interface-ip. The
 dot1q tag is interface-local encapsulation, deliberately not a foreign key.
 """
-from alembic import op
+
 import sqlalchemy as sa
+
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "c6d7e8f9a0b1"
@@ -34,9 +36,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("device_id", "interface_name", name="uq_devicesubif_identity"),
     )
-    op.create_index(
-        op.f("ix_device_subinterface_device_id"), "device_subinterface", ["device_id"], unique=False
-    )
+    op.create_index(op.f("ix_device_subinterface_device_id"), "device_subinterface", ["device_id"], unique=False)
 
     op.create_table(
         "subinterface_intent",
@@ -54,9 +54,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("device_id", "interface_name", name="uq_subifintent_identity"),
     )
-    op.create_index(
-        op.f("ix_subinterface_intent_device_id"), "subinterface_intent", ["device_id"], unique=False
-    )
+    op.create_index(op.f("ix_subinterface_intent_device_id"), "subinterface_intent", ["device_id"], unique=False)
 
 
 def downgrade() -> None:

@@ -86,7 +86,7 @@ def _typed_keyword(member: str) -> str | None:
 
 
 def _has_regex(value: str) -> bool:
-    """True if *value* contains any regex metacharacter."""
+    """Return True if *value* contains any regex metacharacter."""
     return any(ch in _REGEX_METACHARS for ch in value)
 
 

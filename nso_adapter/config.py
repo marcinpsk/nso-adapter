@@ -131,8 +131,10 @@ class AppConfig(BaseModel):
 
 
 class EnvSettings(BaseSettings):
-    """Minimal env-only settings — only the AppRole secrets needed to bootstrap Vault,
-    plus the path to the config file."""
+    """Minimal env-only settings.
+
+    Only the AppRole secrets needed to bootstrap Vault, plus the path to the config file.
+    """
 
     config_file: str = "config.yaml"
     vault_role_id: str = ""

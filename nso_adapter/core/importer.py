@@ -182,9 +182,8 @@ async def refresh_routing_surfaces_for_device(
             )
 
 
-async def sync_device(device_id: int, db: AsyncSession) -> dict:
+async def sync_device(device_id: int, db: AsyncSession) -> dict:  # noqa: C901
     """Full sync: NSO → DB → NetBox. Returns job result summary dict."""
-
     device = await db.get(Device, device_id)
     if not device:
         raise ValueError(f"Device {device_id} not found")
@@ -231,10 +230,7 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
                 device.netbox_device_id,
                 # M27R: pass parent_binding/kind so Nokia logical interfaces are created
                 # by their faithful name, parented to the bound port/LAG.
-                [
-                    {"name": i.name, "parent_binding": i.parent_binding, "kind": i.kind}
-                    for i in interfaces
-                ],
+                [{"name": i.name, "parent_binding": i.parent_binding, "kind": i.kind} for i in interfaces],
             )
         except Exception as exc:
             logger.warning("netbox.bulk_ensure_failed", device_id=device_id, error=str(exc))
@@ -404,9 +400,7 @@ async def detect_drift(device_id: int, db: AsyncSession) -> dict:
             for nb_iface in await nb_client.list_interfaces(device.netbox_device_id):
                 netbox_attrs[nb_iface["name"]] = nb_iface
         except Exception as exc:
-            logger.warning(
-                "netbox.drift_read_failed", device_id=device_id, error=str(exc) or type(exc).__name__
-            )
+            logger.warning("netbox.drift_read_failed", device_id=device_id, error=str(exc) or type(exc).__name__)
 
     for iface in interfaces:
         result_rows = await db.execute(

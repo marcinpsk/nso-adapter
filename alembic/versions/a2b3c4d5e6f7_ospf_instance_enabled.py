@@ -14,8 +14,10 @@ the read mirror (device_ospf_instance) and the write-path intent
 Nullable: None when the NED has no explicit admin-state (process enabled by
 config presence).
 """
-from alembic import op
+
 import sqlalchemy as sa
+
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "a2b3c4d5e6f7"

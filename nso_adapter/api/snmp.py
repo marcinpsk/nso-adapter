@@ -135,7 +135,7 @@ class SnmpIntentUpdate(BaseModel):
 
 
 @router.put("/{device_id}/snmp-intent", dependencies=[Depends(verify_token)])
-async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSession = Depends(get_db)):
+async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSession = Depends(get_db)):  # noqa: C901
     """Replace the adapter's SNMP intent mirror for this device atomically.
 
     Full-replace semantics: rows not present in the request body are deleted.
@@ -283,22 +283,20 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
         from nso_adapter.nso.apply import apply_snmp_config
 
         comms = (
-            await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id))
-        ).scalars().all()
+            (await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)))
+            .scalars()
+            .all()
+        )
         users = (
-            await db.execute(select(SnmpV3UserIntent).where(SnmpV3UserIntent.device_id == device_id))
-        ).scalars().all()
-        hosts = (
-            await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))
-        ).scalars().all()
+            (await db.execute(select(SnmpV3UserIntent).where(SnmpV3UserIntent.device_id == device_id))).scalars().all()
+        )
+        hosts = (await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))).scalars().all()
         sysinfo = (
             await db.execute(select(SnmpSystemInfoIntent).where(SnmpSystemInfoIntent.device_id == device_id))
         ).scalar_one_or_none()
         try:
             nso_client = get_nso_client(device.nso_instance)
-            await apply_snmp_config(
-                nso_client, device.nso_device_name, comms, users, hosts, sysinfo, replace=True
-            )
+            await apply_snmp_config(nso_client, device.nso_device_name, comms, users, hosts, sysinfo, replace=True)
         except Exception as exc:  # noqa: BLE001
             logger.error("snmp_intent.replace_failed", device_id=device_id, error=repr(exc))
 
