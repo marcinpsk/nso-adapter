@@ -472,6 +472,13 @@ class TestDeviceDeltaFromDryRun:
         assert _device_delta_from_dry_run({"something-else": 1}, "sw03") is None
         assert _device_delta_from_dry_run("not-a-dict", "sw03") is None
 
+    def test_native_not_a_dict_is_inconclusive(self):
+        # a non-empty, non-dict `native` is a shape we can't parse → inconclusive (None)
+        assert _device_delta_from_dry_run({"dry-run-result": {"native": "weird"}}, "sw03") is None
+
+    def test_native_device_not_a_list_is_inconclusive(self):
+        assert _device_delta_from_dry_run({"dry-run-result": {"native": {"device": "nope"}}}, "sw03") is None
+
 
 @pytest.mark.asyncio
 async def test_verify_raises_on_nonempty_delta():
@@ -640,6 +647,41 @@ def test_build_isis_process_payload_omits_empty_enums():
     assert "metric-style" not in procs[0]
     assert "is-type" not in procs[0]
     assert procs[0]["net"] == "49.0001.00"
+
+
+def test_build_isis_process_payload_nests_redistribute():
+    """Redistribution rows nest under their dest process-tag; optional route-map / metric /
+    metric-type are emitted only when set (the per-row optional branches)."""
+    from nso_adapter.nso.apply import build_isis_process_payload
+
+    proc = SimpleNamespace(
+        process_tag="0",
+        net=None,
+        is_type="",
+        metric_style="",
+        overload_bit=None,
+        area_auth_type="",
+        area_auth_key=None,
+        domain_auth_type="",
+        domain_auth_key=None,
+    )
+    full = SimpleNamespace(
+        dest_ref="0", source_protocol="bgp", source_ref="65000", route_map="RM", metric=100, metric_type="external"
+    )
+    minimal = SimpleNamespace(
+        dest_ref="0", source_protocol="connected", source_ref="", route_map=None, metric=None, metric_type=""
+    )
+    procs = build_isis_process_payload(isis_process_rows=[proc], redistribution_rows=[full, minimal], flex_algo_rows=[])
+
+    redist = procs[0]["redistribute"]
+    assert redist[0] == {
+        "source-protocol": "bgp",
+        "source-ref": "65000",
+        "route-map": "RM",
+        "metric": 100,
+        "metric-type": "external",
+    }
+    assert redist[1] == {"source-protocol": "connected", "source-ref": ""}  # optionals omitted
 
 
 def test_build_isis_interface_payload_normalises_circuit_type():

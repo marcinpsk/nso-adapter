@@ -5,11 +5,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from nso_adapter.core.apply import enqueue_apply, run_apply
+from nso_adapter.core.apply import _nokia_routed_kind, enqueue_apply, run_apply
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import (
     DbInterface,
@@ -22,6 +23,32 @@ from nso_adapter.store.models import (
     JobType,
     SyncState,
 )
+
+# ── _nokia_routed_kind (pure: derives SR OS router context from kind/service/vrf) ──
+
+
+def _iface(kind, service="", vrf=""):
+    return SimpleNamespace(kind=kind, service=service, vrf=vrf)
+
+
+def test_nokia_routed_kind_none_for_non_routed_interfaces():
+    assert _nokia_routed_kind(_iface("physical")) is None
+    assert _nokia_routed_kind(_iface("lag")) is None
+
+
+def test_nokia_routed_kind_base_when_no_service():
+    assert _nokia_routed_kind(_iface("loopback")) == "base"
+    assert _nokia_routed_kind(_iface("logical")) == "base"
+
+
+def test_nokia_routed_kind_vprn_when_vrf_equals_service():
+    assert _nokia_routed_kind(_iface("logical", service="VPRN-A", vrf="VPRN-A")) == "vprn"
+
+
+def test_nokia_routed_kind_ies_when_service_global_table_or_mismatched_vrf():
+    assert _nokia_routed_kind(_iface("logical", service="IES-1", vrf="")) == "ies"
+    assert _nokia_routed_kind(_iface("logical", service="SVC", vrf="other")) == "ies"
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
