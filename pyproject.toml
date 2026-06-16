@@ -63,9 +63,6 @@ omit = [
     # GRANDFATHERED — scheduler lifecycle requires APScheduler integration.
     # Test inner functions directly per testing-strategy.md §3.6.
     "nso_adapter/core/scheduler.py",
-    # GRANDFATHERED — full pipeline importer, currently integration-only.
-    # Pure helpers should be extracted and unit-tested.
-    "nso_adapter/core/importer.py",
 ]
 
 [tool.coverage.report]

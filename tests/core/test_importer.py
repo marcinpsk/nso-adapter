@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 from unittest.mock import AsyncMock, patch
 
+import pytest
 import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -487,3 +488,94 @@ async def test_refresh_routing_surfaces_isolates_failures(db_session: AsyncSessi
     # every surface was attempted, including the one that raised
     for m in targets.values():
         m.assert_awaited_once()
+
+
+# ── discover_devices + helpers (paydown of the grandfathered coverage omit) ────
+
+import types  # noqa: E402
+
+from nso_adapter.core.importer import (  # noqa: E402
+    _attr_str,
+    _load_intent_by_attr,
+    discover_devices,
+    get_nso_client,
+)
+from nso_adapter.store.models import InterfaceIntent  # noqa: E402
+
+
+def _cfg(*instance_names: str):
+    return types.SimpleNamespace(nso_instances=[types.SimpleNamespace(name=n) for n in instance_names])
+
+
+def _discover_client(names_or_exc):
+    client = AsyncMock()
+    if isinstance(names_or_exc, Exception):
+        client.list_devices = AsyncMock(side_effect=names_or_exc)
+    else:
+        client.list_devices = AsyncMock(return_value=names_or_exc)
+    return client
+
+
+async def test_discover_devices_creates_new_devices(db_session: AsyncSession):
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = _discover_client([{"name": "sw01"}, {"name": "sw02"}])
+    with patch("nso_adapter.core.importer.get_config", return_value=_cfg("nso-dev")):
+        await discover_devices(db_session)
+
+    rows = (await db_session.execute(select(Device).where(Device.nso_instance == "nso-dev"))).scalars().all()
+    assert sorted(d.nso_device_name for d in rows) == ["sw01", "sw02"]
+
+
+async def test_discover_devices_skips_nameless_and_does_not_duplicate(db_session: AsyncSession):
+    db_session.add(Device(nso_instance="nso-dev", nso_device_name="sw01"))
+    await db_session.commit()
+
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = _discover_client([{"name": "sw01"}, {"name": ""}, {}, {"name": "sw02"}])
+    with patch("nso_adapter.core.importer.get_config", return_value=_cfg("nso-dev")):
+        await discover_devices(db_session)
+
+    rows = (await db_session.execute(select(Device).where(Device.nso_instance == "nso-dev"))).scalars().all()
+    assert sorted(d.nso_device_name for d in rows) == ["sw01", "sw02"]  # no dup, no nameless
+
+
+async def test_discover_devices_continues_on_list_error(db_session: AsyncSession):
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = _discover_client(RuntimeError("NSO down"))
+    with patch("nso_adapter.core.importer.get_config", return_value=_cfg("nso-dev")):
+        await discover_devices(db_session)  # must not raise
+
+    rows = (await db_session.execute(select(Device))).scalars().all()
+    assert rows == []
+
+
+def test_attr_str_normalises_description_and_enabled():
+    assert _attr_str("description", "") is None  # blank description collapses to None
+    assert _attr_str("description", None) is None
+    assert _attr_str("description", "uplink") == "uplink"
+    assert _attr_str("enabled", False) == "False"  # enabled keeps its bool string
+    assert _attr_str("mtu", None) is None
+    assert _attr_str("mtu", 1500) == "1500"
+
+
+def test_get_nso_client_unregistered_raises():
+    with pytest.raises(RuntimeError, match="not registered"):
+        get_nso_client("does-not-exist")
+
+
+async def test_load_intent_by_attr_returns_attribute_value_map(db_session: AsyncSession):
+    device = Device(nso_instance="nso-dev", nso_device_name="sw09")
+    db_session.add(device)
+    await db_session.commit()
+    iface = DbInterface(device_id=device.id, name="GigabitEthernet0/1")
+    db_session.add(iface)
+    await db_session.commit()
+    db_session.add(InterfaceIntent(interface_id=iface.id, attribute="description", intent_value="uplink"))
+    db_session.add(InterfaceIntent(interface_id=iface.id, attribute="enabled", intent_value="True"))
+    await db_session.commit()
+
+    intent = await _load_intent_by_attr(db_session, iface.id)
+    assert intent == {"description": "uplink", "enabled": "True"}
