@@ -1,0 +1,56 @@
+services:
+  nso-adapter:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "7997:8000"
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    environment:
+      - CONFIG_FILE=/app/config.yaml
+      # Dev database: dedicated Postgres (below), reached on the adapter-db network.
+      # Overrides config.yaml's database_url via the DATABASE_URL env hook.
+      - DATABASE_URL=postgresql+asyncpg://nso:nso@adapter-db:5432/nso_adapter
+      # NO_PROXY / no_proxy (NSO + Vault + NetBox hosts) are injected from .env
+      # (gitignored) via env_file above. Kept out of this tracked file and out of
+      # the environment: block so the shell environment can't shadow them.
+    depends_on:
+      adapter-db:
+        condition: service_healthy
+    networks:
+      - docker_frontend
+      - adapter-db
+
+  # Dedicated dev Postgres — the scheduler and API run concurrently and need real
+  # MVCC, which removes the "database is locked" class of bugs. Postgres is the only
+  # supported runtime engine. container_name is host-unique on purpose (several
+  # Postgres run on this host).
+  adapter-db:
+    image: postgres:16-alpine
+    container_name: nso-adapter-postgres-dev
+    environment:
+      - POSTGRES_USER=nso
+      - POSTGRES_PASSWORD=nso
+      - POSTGRES_DB=nso_adapter
+    volumes:
+      - nso_adapter_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nso -d nso_adapter"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - adapter-db
+
+networks:
+  docker_frontend:
+    external: true
+  # Private bridge shared only between the adapter and its dev Postgres.
+  adapter-db:
+    driver: bridge
+
+volumes:
+  nso_adapter_pgdata:

@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: Apache-2.0
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync dependencies
+        run: uv sync --all-groups
+
+      - name: Ruff lint
+        run: uv run --native-tls -- ruff check .
+
+      - name: Ruff format check
+        run: uv run --native-tls -- ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nso
+          POSTGRES_PASSWORD: nso
+          POSTGRES_DB: nso_adapter
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nso"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync dependencies
+        run: uv sync --all-groups
+
+      # Full unit suite on sqlite (fast, hermetic) PLUS the PostgreSQL-gated
+      # parity test — ALEMBIC_PARITY_DB_URL makes test_schema_parity.py run
+      # instead of skip, so create_all↔alembic parity is asserted in one pass
+      # and coverage is measured over the whole suite.
+      - name: Test suite (+ Postgres parity lane)
+        env:
+          ALEMBIC_PARITY_DB_URL: postgresql+psycopg2://nso:nso@localhost:5432/postgres
+        run: uv run --native-tls -- pytest -q
+
+      # Prove a fresh database bootstraps end-to-end from the squashed baseline.
+      - name: Verify alembic upgrade head on a fresh PostgreSQL DB
+        env:
+          DATABASE_URL: postgresql+psycopg2://nso:nso@localhost:5432/nso_adapter
+        run: uv run --native-tls -- python -m nso_adapter.db_migrate

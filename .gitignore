@@ -52,3 +52,8 @@ LOCAL-DEV.md
 
 # Per-developer agent / superpowers staging dir — not part of the project
 docs/superpowers/
+
+# Internal working docs (milestone plans/scopes/designs, spike findings) — kept
+# local, never tracked. Only the cross-component API contract stays in git.
+docs/*
+!docs/api-contract.md
