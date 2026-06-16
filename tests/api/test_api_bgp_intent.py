@@ -269,3 +269,134 @@ async def test_put_bgp_intent_no_auto_apply_when_disabled(adapter_client):
         ).scalar_one_or_none()
         assert job is None
         break
+
+
+# ── redistribution intent (AF-scoped) ─────────────────────────────────────────
+
+
+def _router_with_redist(redistribution: list[dict], *, asn: str = "65100", vrf: str = "") -> dict:
+    return {
+        "asn": asn,
+        "scopes": [
+            {
+                "vrf": vrf,
+                "address_families": [{"af": "ipv4-unicast", "redistribution": redistribution}],
+                "peers": [],
+            }
+        ],
+    }
+
+
+@pytest.mark.anyio
+async def test_put_bgp_intent_creates_redistribution_rows(adapter_client):
+    """AF-scoped redistribution entries become RedistributionIntent rows (dest_protocol=bgp)."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import RedistributionIntent
+
+    device_id = await seed_device(nso_device_name="bgp-redist-create", netbox_device_id=2010)
+    body = {
+        "routers": [
+            _router_with_redist(
+                [
+                    {"source_protocol": "ospf", "source_ref": "1", "route_map": "RM-OSPF", "metric": 100},
+                    {"source_protocol": "connected", "source_ref": "", "route_map": None, "metric": None},
+                ]
+            )
+        ]
+    }
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/bgp-intent", json=body, headers=AUTH)
+    assert resp.status_code == 200
+
+    async for db in get_session():
+        rows = (
+            (await db.execute(select(RedistributionIntent).where(RedistributionIntent.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        break
+    by_src = {r.source_protocol: r for r in rows}
+    assert set(by_src) == {"ospf", "connected"}
+    assert all(r.dest_protocol == "bgp" and r.dest_ref == "65100::ipv4-unicast" for r in rows)
+    assert (by_src["ospf"].source_ref, by_src["ospf"].route_map, by_src["ospf"].metric) == ("1", "RM-OSPF", 100)
+    assert (by_src["connected"].route_map, by_src["connected"].metric) == (None, None)
+
+
+@pytest.mark.anyio
+async def test_put_bgp_intent_redistribution_full_replace_and_update(adapter_client):
+    """Re-PUT drops absent redistribution rows and updates the kept one in place."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import RedistributionIntent
+
+    device_id = await seed_device(nso_device_name="bgp-redist-replace", netbox_device_id=2011)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent",
+        json={
+            "routers": [
+                _router_with_redist(
+                    [
+                        {"source_protocol": "ospf", "source_ref": "1", "route_map": "RM-A", "metric": 100},
+                        {"source_protocol": "static", "source_ref": "", "route_map": None, "metric": None},
+                    ]
+                )
+            ]
+        },
+        headers=AUTH,
+    )
+
+    # Re-PUT keeping ospf (changed route_map/metric), dropping static.
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent",
+        json={
+            "routers": [
+                _router_with_redist(
+                    [{"source_protocol": "ospf", "source_ref": "1", "route_map": "RM-B", "metric": 250}]
+                )
+            ]
+        },
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+
+    async for db in get_session():
+        rows = (
+            (await db.execute(select(RedistributionIntent).where(RedistributionIntent.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        break
+    assert len(rows) == 1  # static dropped
+    assert rows[0].source_protocol == "ospf"
+    assert (rows[0].route_map, rows[0].metric) == ("RM-B", 250)  # updated in place
+
+
+@pytest.mark.anyio
+async def test_put_bgp_intent_redistribution_removal_enqueues_removal_job(adapter_client):
+    """Dropping a redistribution row (with no router/peer change) still queues a removal job."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Job, JobType
+
+    device_id = await seed_device(nso_device_name="bgp-redist-removal", netbox_device_id=2012)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent",
+        json={
+            "routers": [
+                _router_with_redist([{"source_protocol": "ospf", "source_ref": "1", "route_map": None, "metric": None}])
+            ]
+        },
+        headers=AUTH,
+    )
+
+    # Same router/scope/AF, but the redistribution entry is gone → removal propagation.
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent",
+        json={"routers": [_router_with_redist([])]},
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+
+    async for db in get_session():
+        job = (
+            await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal))
+        ).scalar_one_or_none()
+        break
+    assert job is not None  # redistribution removal alone triggers the bgp removal job

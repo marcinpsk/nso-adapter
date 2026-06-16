@@ -270,3 +270,46 @@ async def test_bgp_config_peer_af_policy_refs_omitted_when_null(adapter_client):
     # Null policy fields must not appear in the serialized output
     for field in ("routemap_in", "routemap_out", "prefixlist_in", "prefixlist_out"):
         assert field not in af or af[field] is None
+
+
+# ── serializer edge cases ─────────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_bgp_config_router_with_no_scopes(adapter_client):
+    """A router with zero scopes serializes to an empty scopes list (no AF/peer queries)."""
+    device_id = await seed_device(nso_device_name="bgp-no-scopes-dev", netbox_device_id=908)
+    await seed_bgp_config(device_id, asn="65100", scopes=[])  # router, but no scopes at all
+
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
+    assert resp.status_code == 200
+    routers = resp.json()["routers"]
+    assert len(routers) == 1
+    assert routers[0]["asn"] == "65100"
+    assert routers[0]["scopes"] == []
+
+
+@pytest.mark.anyio
+async def test_bgp_config_peer_group_omits_null_remote_as_and_source(adapter_client):
+    """A peer group with no remote_as/source omits those keys in the response."""
+    device_id = await seed_device(nso_device_name="bgp-pg-bare-dev", netbox_device_id=909)
+    await seed_bgp_config(
+        device_id,
+        asn="65100",
+        scopes=[
+            {
+                "vrf": "",
+                "afs": ["ipv4-unicast"],
+                "peers": [],
+                "peer_groups": [{"name": "Bare-PG", "af_defs": []}],  # no remote_as, no source
+            }
+        ],
+    )
+
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
+    assert resp.status_code == 200
+    pg = resp.json()["routers"][0]["scopes"][0]["peer_groups"][0]
+    assert pg["name"] == "Bare-PG"
+    assert "remote_as" not in pg
+    assert "source" not in pg
+    assert pg["address_families"] == []

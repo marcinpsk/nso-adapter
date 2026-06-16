@@ -288,24 +288,12 @@ class BgpIntentUpdate(BaseModel):
     routers: list[BgpRouterModel]
 
 
-@router.put("/{device_id}/bgp-intent", dependencies=[Depends(verify_token)])
-async def put_bgp_intent(device_id: int, body: BgpIntentUpdate, db: AsyncSession = Depends(get_db)):  # noqa: C901
-    """Replace the adapter's BGP intent mirror for this device atomically.
-
-    Full-replace semantics per device: all existing intent rows for the device
-    are deleted and replaced with the new payload.  If ``auto_apply`` is
-    enabled and the new payload is non-empty, an apply job is enqueued.
-    """
-    device = await db.get(Device, device_id)
-    if not device:
-        raise api_error(404, "not_found", "Device not found")
-
-    # Capture existing router ASNs + peer identities before the wipe so we can detect
-    # removal (router- or peer-level) and re-assert the full desired state afterwards.
-    existing_asns = set(
+async def _capture_bgp_identities(db: AsyncSession, device_id: int) -> tuple[set[str], set[str]]:
+    """Snapshot existing router ASNs + peer addresses before the wipe, for removal detection."""
+    asns = set(
         (await db.execute(select(BgpRouterIntent.asn).where(BgpRouterIntent.device_id == device_id))).scalars().all()
     )
-    existing_peers = set(
+    peers = set(
         (
             await db.execute(
                 select(BgpPeerIntent.peer_address)
@@ -317,120 +305,162 @@ async def put_bgp_intent(device_id: int, body: BgpIntentUpdate, db: AsyncSession
         .scalars()
         .all()
     )
+    return asns, peers
 
-    # Full-replace: delete all existing BGP router intent rows for this device.
+
+async def _insert_peer(db: AsyncSession, scope_id: int, peer_data: BgpPeerModel) -> None:
+    """Insert one peer intent row + its per-AF policy rows under a scope."""
+    peer_row = BgpPeerIntent(
+        scope_id=scope_id,
+        peer_address=peer_data.peer_address,
+        enabled=peer_data.enabled,
+        peer_group=peer_data.peer_group,
+        remote_as=peer_data.remote_as,
+        local_as=peer_data.local_as,
+        ttl=peer_data.ttl,
+        password=peer_data.password,
+    )
+    db.add(peer_row)
+    await db.flush()
+    for paf_data in peer_data.address_families:
+        db.add(
+            BgpPeerAfIntent(
+                peer_id=peer_row.id,
+                af=paf_data.af,
+                enabled=paf_data.enabled,
+                routemap_in=paf_data.routemap_in,
+                routemap_out=paf_data.routemap_out,
+                prefixlist_in=paf_data.prefixlist_in,
+                prefixlist_out=paf_data.prefixlist_out,
+            )
+        )
+
+
+async def _insert_scope(db: AsyncSession, router_id: int, scope_data: BgpScopeModel) -> None:
+    """Insert one scope intent row + its address-family and peer children."""
+    scope_row = BgpScopeIntent(router_id=router_id, vrf=scope_data.vrf)
+    db.add(scope_row)
+    await db.flush()
+    for af_data in scope_data.address_families:
+        db.add(BgpAfIntent(scope_id=scope_row.id, af=af_data.af))
+    for peer_data in scope_data.peers:
+        await _insert_peer(db, scope_row.id, peer_data)
+
+
+async def _rebuild_router_intent(db: AsyncSession, device_id: int, routers: list[BgpRouterModel], now: datetime) -> int:
+    """Full-replace the BGP router→scope→af/peer/peer-af intent tree. Returns the router count."""
     await db.execute(delete(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))
     await db.flush()
-
-    now = datetime.now(UTC).replace(tzinfo=None)
-    router_count = 0
-
-    for router_data in body.routers:
+    count = 0
+    for router_data in routers:
         accepted = router_data.accepted_at.replace(tzinfo=None) if router_data.accepted_at else now
-        router_row = BgpRouterIntent(
-            device_id=device_id,
-            asn=router_data.asn,
-            accepted_at=accepted,
-        )
+        router_row = BgpRouterIntent(device_id=device_id, asn=router_data.asn, accepted_at=accepted)
         db.add(router_row)
         await db.flush()
-        router_count += 1
-
+        count += 1
         for scope_data in router_data.scopes:
-            scope_row = BgpScopeIntent(router_id=router_row.id, vrf=scope_data.vrf)
-            db.add(scope_row)
-            await db.flush()
-
-            for af_data in scope_data.address_families:
-                db.add(BgpAfIntent(scope_id=scope_row.id, af=af_data.af))
-            for peer_data in scope_data.peers:
-                peer_row = BgpPeerIntent(
-                    scope_id=scope_row.id,
-                    peer_address=peer_data.peer_address,
-                    enabled=peer_data.enabled,
-                    peer_group=peer_data.peer_group,
-                    remote_as=peer_data.remote_as,
-                    local_as=peer_data.local_as,
-                    ttl=peer_data.ttl,
-                    password=peer_data.password,
-                )
-                db.add(peer_row)
-                await db.flush()
-
-                for paf_data in peer_data.address_families:
-                    db.add(
-                        BgpPeerAfIntent(
-                            peer_id=peer_row.id,
-                            af=paf_data.af,
-                            enabled=paf_data.enabled,
-                            routemap_in=paf_data.routemap_in,
-                            routemap_out=paf_data.routemap_out,
-                            prefixlist_in=paf_data.prefixlist_in,
-                            prefixlist_out=paf_data.prefixlist_out,
-                        )
-                    )
-
+            await _insert_scope(db, router_row.id, scope_data)
     await db.flush()
+    return count
 
-    # Full-replace redistribution intent rows for this device (dest_protocol=bgp)
-    existing_redist = await db.execute(
-        select(RedistributionIntent).where(
-            RedistributionIntent.device_id == device_id,
-            RedistributionIntent.dest_protocol == "bgp",
+
+def _iter_redistribution(routers: list[BgpRouterModel]):
+    """Yield ``(dest_ref, entry)`` for every AF-scoped redistribution entry in the payload."""
+    for router_data in routers:
+        for scope_data in router_data.scopes:
+            for af_data in scope_data.address_families:
+                dest_ref = f"{router_data.asn}:{scope_data.vrf}:{af_data.af}"
+                for entry in af_data.redistribution:
+                    yield dest_ref, entry
+
+
+async def _sync_redistribution(
+    db: AsyncSession, device_id: int, routers: list[BgpRouterModel], now: datetime
+) -> list[tuple]:
+    """Full-replace BGP (dest_protocol=bgp) redistribution intent rows. Returns the removed keys."""
+    existing = (
+        (
+            await db.execute(
+                select(RedistributionIntent).where(
+                    RedistributionIntent.device_id == device_id,
+                    RedistributionIntent.dest_protocol == "bgp",
+                )
+            )
         )
+        .scalars()
+        .all()
     )
-    existing_redist_map = {(r.dest_ref, r.source_protocol, r.source_ref): r for r in existing_redist.scalars().all()}
-    incoming_redist_keys: set[tuple] = set()
-    for router_data in body.routers:
-        for scope_data in router_data.scopes:
-            for af_data in scope_data.address_families:
-                dest_ref = f"{router_data.asn}:{scope_data.vrf}:{af_data.af}"
-                for re in af_data.redistribution:
-                    incoming_redist_keys.add((dest_ref, re.source_protocol, re.source_ref))
+    existing_map = {(r.dest_ref, r.source_protocol, r.source_ref): r for r in existing}
+    incoming_keys = {(dest_ref, e.source_protocol, e.source_ref) for dest_ref, e in _iter_redistribution(routers)}
 
-    removed_redist = [k for k in existing_redist_map if k not in incoming_redist_keys]
-    for key in list(existing_redist_map):
-        if key not in incoming_redist_keys:
-            await db.delete(existing_redist_map[key])
+    removed = [k for k in existing_map if k not in incoming_keys]
+    for key in removed:
+        await db.delete(existing_map[key])
 
-    now_ts = datetime.now(UTC).replace(tzinfo=None)
-    for router_data in body.routers:
-        for scope_data in router_data.scopes:
-            for af_data in scope_data.address_families:
-                dest_ref = f"{router_data.asn}:{scope_data.vrf}:{af_data.af}"
-                for re in af_data.redistribution:
-                    key = (dest_ref, re.source_protocol, re.source_ref)
-                    row = existing_redist_map.get(key)
-                    if row is None:
-                        row = RedistributionIntent(
-                            device_id=device_id,
-                            dest_protocol="bgp",
-                            dest_ref=dest_ref,
-                            source_protocol=re.source_protocol,
-                            source_ref=re.source_ref,
-                            accepted_at=now_ts,
-                        )
-                        db.add(row)
-                    row.route_map = re.route_map
-                    row.metric = re.metric
+    for dest_ref, entry in _iter_redistribution(routers):
+        key = (dest_ref, entry.source_protocol, entry.source_ref)
+        row = existing_map.get(key)
+        if row is None:
+            row = RedistributionIntent(
+                device_id=device_id,
+                dest_protocol="bgp",
+                dest_ref=dest_ref,
+                source_protocol=entry.source_protocol,
+                source_ref=entry.source_ref,
+                accepted_at=now,
+            )
+            db.add(row)
+        row.route_map = entry.route_map
+        row.metric = entry.metric
+    return removed
 
-    if router_count > 0:
-        settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-        settings = settings_result.scalar_one_or_none()
-        if settings and settings.auto_apply:
-            from nso_adapter.core.apply import enqueue_apply
 
-            await enqueue_apply(db, device_id, force=True)
+async def _maybe_enqueue_apply(db: AsyncSession, device_id: int, router_count: int) -> None:
+    """Enqueue an apply job when the payload is non-empty and the device has auto_apply on."""
+    if router_count <= 0:
+        return
+    settings = (
+        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    ).scalar_one_or_none()
+    if settings and settings.auto_apply:
+        from nso_adapter.core.apply import enqueue_apply
 
-    # Removal propagation: if a router/peer/redistribution was dropped, queue an async
-    # removal job that PUT-replaces the bgp-reconciler instance with the full remaining
-    # desired state so FASTMAP reverts it (merge-PATCH on the next apply would not drop
-    # it). Enqueued atomically with the deletes; run in the background so this PUT never
-    # blocks on the device commit.
-    incoming_asns = {r.asn for r in body.routers}
-    incoming_peers = {p.peer_address for r in body.routers for s in r.scopes for p in s.peers}
-    removed = bool((existing_asns - incoming_asns) or (existing_peers - incoming_peers) or removed_redist)
-    if removed:
+        await enqueue_apply(db, device_id, force=True)
+
+
+def _bgp_removed(
+    existing_asns: set[str], existing_peers: set[str], routers: list[BgpRouterModel], removed_redist: list
+) -> bool:
+    """Report whether any router, peer or redistribution row dropped out of the new payload."""
+    incoming_asns = {r.asn for r in routers}
+    incoming_peers = {p.peer_address for r in routers for s in r.scopes for p in s.peers}
+    return bool((existing_asns - incoming_asns) or (existing_peers - incoming_peers) or removed_redist)
+
+
+@router.put("/{device_id}/bgp-intent", dependencies=[Depends(verify_token)])
+async def put_bgp_intent(device_id: int, body: BgpIntentUpdate, db: AsyncSession = Depends(get_db)):
+    """Replace the adapter's BGP intent mirror for this device atomically.
+
+    Full-replace semantics per device: all existing intent rows for the device
+    are deleted and replaced with the new payload.  If ``auto_apply`` is
+    enabled and the new payload is non-empty, an apply job is enqueued. If a
+    router/peer/redistribution was dropped, a removal job is queued so FASTMAP
+    reverts it on-device (a merge-PATCH apply would not drop it).
+    """
+    device = await db.get(Device, device_id)
+    if not device:
+        raise api_error(404, "not_found", "Device not found")
+
+    # Snapshot identities before the wipe so removal can be detected afterwards.
+    existing_asns, existing_peers = await _capture_bgp_identities(db, device_id)
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    router_count = await _rebuild_router_intent(db, device_id, body.routers, now)
+    removed_redist = await _sync_redistribution(db, device_id, body.routers, now)
+
+    await _maybe_enqueue_apply(db, device_id, router_count)
+
+    if _bgp_removed(existing_asns, existing_peers, body.routers, removed_redist):
         from nso_adapter.core.removal import enqueue_removal
 
         await enqueue_removal(db, device_id, "bgp")
