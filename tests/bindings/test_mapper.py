@@ -281,6 +281,48 @@ async def test_nokia_portid_not_treated_as_unit():
     client.patch_interface.assert_not_called()
 
 
+@pytest.mark.anyio
+async def test_existing_flat_unit_reparent_failure_is_swallowed():
+    """If patching a pre-existing unit's parent fails, the id is still returned."""
+    client = _make_nb_client()
+
+    async def _get(dev_id, name):
+        if name == "ae98":
+            return {"id": 10, "name": "ae98"}
+        if name == "ae98.100":
+            return {"id": 11, "name": "ae98.100", "parent": None}  # flat → reparent attempt
+        return None
+
+    client.get_interface.side_effect = _get
+    client.patch_interface.side_effect = Exception("NetBox 409")
+
+    result = await resolve_or_create_interface(client, 42, _domain_iface("ae98.100"))
+
+    assert result == 11  # reparent_failed is logged, not raised
+    client.create_interface.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_base_creation_failure_creates_unit_parentless():
+    """When the base can't be created, the unit is still created — parentless — not dropped."""
+    client = _make_nb_client()
+    client.get_interface.return_value = None  # nothing exists yet
+
+    async def _create(payload):
+        if payload["name"] == "ae98":
+            raise Exception("NetBox 403")  # base create fails → base_id resolves None
+        return {"id": 11, "name": "ae98.100"}
+
+    client.create_interface.side_effect = _create
+
+    result = await resolve_or_create_interface(client, 42, _domain_iface("ae98.100"))
+
+    assert result == 11
+    unit_payload = next(c.args[0] for c in client.create_interface.await_args_list if c.args[0]["name"] == "ae98.100")
+    assert unit_payload["type"] == "virtual"
+    assert "parent" not in unit_payload  # created without a parent rather than lost
+
+
 # ── bulk_ensure_interfaces (Layer A two-pass inventory) ───────────────────────
 
 
@@ -470,3 +512,266 @@ async def test_bulk_ensure_m27r_namespaced_vprn_loopback_not_split():
     base_call = client.bulk_create_interfaces.await_args_list[0][0][0]
     # one base, virtual, no parent — NOT split into a CRPD-VPN base + child
     assert base_call == [{"device": 42, "name": "CRPD-VPN:LO7", "type": "virtual"}]
+
+
+# ---------------------------------------------------------------------------
+# Extracted decision helpers — pure functions, no client, no mocks
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeInterfaceInputs:
+    def test_mixed_str_and_dict_dedup_and_drop_nameless(self):
+        from nso_adapter.bindings.netbox.mapper import _normalize_interface_inputs
+
+        norm = _normalize_interface_inputs(
+            [
+                "ae0",
+                "ae0",  # duplicate name → dropped
+                {"name": "LAG99:10", "parent_binding": "lag-99", "kind": "logical"},
+                {"name": "", "parent_binding": None, "kind": "loopback"},  # nameless → dropped
+                {"name": "ae0", "parent_binding": "x"},  # duplicate of the str → dropped
+                {"name": "sys", "parent_binding": "", "kind": "loopback"},  # empty pb → None
+            ]
+        )
+
+        assert norm == [
+            {"name": "ae0", "parent_binding": None, "kind": None},
+            {"name": "LAG99:10", "parent_binding": "lag-99", "kind": "logical"},
+            {"name": "sys", "parent_binding": None, "kind": "loopback"},
+        ]
+
+
+class TestResolveParents:
+    def test_explicit_binding_wins_over_name_split(self):
+        from nso_adapter.bindings.netbox.mapper import _resolve_parents
+
+        # kind set + parent_binding → child of the binding; name's ':' is NOT split.
+        children, bases = _resolve_parents([{"name": "LAG99:10", "parent_binding": "lag-99", "kind": "logical"}])
+        assert children == [("LAG99:10", "lag-99")]
+        assert bases == {"lag-99"}
+
+    def test_dotted_unit_name_split_when_no_kind(self):
+        from nso_adapter.bindings.netbox.mapper import _resolve_parents
+
+        children, bases = _resolve_parents([{"name": "ae98.100", "parent_binding": None, "kind": None}])
+        assert children == [("ae98.100", "ae98")]
+        assert bases == {"ae98"}
+
+    def test_kind_set_empty_binding_is_a_base_even_with_colon(self):
+        from nso_adapter.bindings.netbox.mapper import _resolve_parents
+
+        # Namespaced VPRN loopback: kind set, no binding → base, never split on ':'.
+        children, bases = _resolve_parents([{"name": "CRPD-VPN:LO7", "parent_binding": None, "kind": "loopback"}])
+        assert children == []
+        assert bases == {"CRPD-VPN:LO7"}
+
+    def test_plain_name_is_a_base(self):
+        from nso_adapter.bindings.netbox.mapper import _resolve_parents
+
+        children, bases = _resolve_parents([{"name": "system", "parent_binding": None, "kind": None}])
+        assert children == []
+        assert bases == {"system"}
+
+
+class TestBaseCreatePayloads:
+    def test_only_missing_bases_kind_typed(self):
+        from nso_adapter.bindings.netbox.mapper import _base_create_payloads
+
+        payloads = _base_create_payloads(
+            42,
+            base_names={"lag-99", "sys", "GigabitEthernet0/0", "already"},
+            name_to_id={"already": 5},  # already present → excluded
+            kind_by_name={"lag-99": "lag", "sys": "loopback", "GigabitEthernet0/0": None},
+        )
+        by_name = {p["name"]: p["type"] for p in payloads}
+        assert by_name == {"lag-99": "lag", "sys": "virtual", "GigabitEthernet0/0": "1000base-t"}
+        assert all(p["device"] == 42 for p in payloads)
+
+
+class TestChildCreatePayloads:
+    def test_skips_present_and_attaches_resolved_parent(self):
+        from nso_adapter.bindings.netbox.mapper import _child_create_payloads
+
+        payloads = _child_create_payloads(
+            42,
+            children=[("ae98.100", "ae98"), ("ae98.15", "ae98")],
+            name_to_id={"ae98": 10, "ae98.15": 12},  # .15 already present → skipped
+        )
+        assert payloads == [{"device": 42, "name": "ae98.100", "type": "virtual", "parent": 10}]
+
+    def test_unresolved_parent_omits_parent_and_warns(self, caplog):
+        from nso_adapter.bindings.netbox.mapper import _child_create_payloads
+
+        payloads = _child_create_payloads(
+            42,
+            children=[("orphan.7", "ghost")],
+            name_to_id={},  # parent 'ghost' never resolved
+        )
+        # payload created without a 'parent' key rather than dropping the child
+        assert payloads == [{"device": 42, "name": "orphan.7", "type": "virtual"}]
+        assert "parent" not in payloads[0]
+
+
+class TestReparentPatches:
+    def test_wrong_parent_is_repointed(self):
+        from nso_adapter.bindings.netbox.mapper import _reparent_patches
+
+        existing = {"LAG99:10": {"id": 21, "name": "LAG99:10", "parent": 99, "type": "virtual"}}
+        patches = _reparent_patches(
+            children=[("LAG99:10", "lag-99")],
+            base_names={"lag-99"},
+            existing=existing,
+            name_to_id={"lag-99": 20, "LAG99:10": 21},
+            kind_by_name={"LAG99:10": "logical"},
+        )
+        assert patches == [{"id": 21, "parent": 20}]
+
+    def test_nonvirtual_child_is_retyped_virtual(self):
+        from nso_adapter.bindings.netbox.mapper import _reparent_patches
+
+        # Parent already correct; child stored as a guessed physical type → retype only.
+        existing = {"IXIA_CRPD": {"id": 22, "name": "IXIA_CRPD", "parent": {"id": 5}, "type": {"value": "other"}}}
+        patches = _reparent_patches(
+            children=[("IXIA_CRPD", "1/1/c11/1")],
+            base_names=set(),
+            existing=existing,
+            name_to_id={"1/1/c11/1": 5, "IXIA_CRPD": 22},
+            kind_by_name={"IXIA_CRPD": "logical"},
+        )
+        assert patches == [{"id": 22, "type": "virtual"}]
+
+    def test_correct_child_yields_no_patch(self):
+        from nso_adapter.bindings.netbox.mapper import _reparent_patches
+
+        existing = {"ae98.100": {"id": 11, "name": "ae98.100", "parent": {"id": 10}, "type": {"value": "virtual"}}}
+        patches = _reparent_patches(
+            children=[("ae98.100", "ae98")],
+            base_names=set(),
+            existing=existing,
+            name_to_id={"ae98": 10, "ae98.100": 11},
+            kind_by_name={"ae98.100": None},
+        )
+        assert patches == []
+
+    def test_preexisting_logical_base_retyped_to_virtual(self):
+        from nso_adapter.bindings.netbox.mapper import _reparent_patches
+
+        # An unbound loopback a prior name-split sync created as 'other' → retype.
+        existing = {"IXIA": {"id": 40, "name": "IXIA", "type": "other"}}
+        patches = _reparent_patches(
+            children=[],
+            base_names={"IXIA"},
+            existing=existing,
+            name_to_id={"IXIA": 40},
+            kind_by_name={"IXIA": "loopback"},
+        )
+        assert patches == [{"id": 40, "type": "virtual"}]
+
+    def test_preexisting_virtual_base_not_retyped(self):
+        from nso_adapter.bindings.netbox.mapper import _reparent_patches
+
+        existing = {"IXIA": {"id": 40, "name": "IXIA", "type": {"value": "virtual"}}}
+        patches = _reparent_patches(
+            children=[],
+            base_names={"IXIA"},
+            existing=existing,
+            name_to_id={"IXIA": 40},
+            kind_by_name={"IXIA": "loopback"},
+        )
+        assert patches == []
+
+
+class TestTypeValue:
+    def test_reads_slug_dict_and_none(self):
+        from nso_adapter.bindings.netbox.mapper import _type_value
+
+        assert _type_value({"type": "other"}) == "other"
+        assert _type_value({"type": {"value": "virtual"}}) == "virtual"
+        assert _type_value({}) is None
+
+
+# ---------------------------------------------------------------------------
+# bulk_ensure_interfaces — REAL NetboxClient over an httpx MockTransport.
+#
+# Higher fidelity than the AsyncMock client above: the real client serializes
+# the payloads, issues the actual GET/POST/PATCH to /api/dcim/interfaces/, runs
+# its bulk chunking, and parses the created-object ids back. A wrong client call
+# fails here instead of being fabricated by a MagicMock.
+# ---------------------------------------------------------------------------
+
+
+def _fake_netbox(existing: list[dict], *, first_id: int = 1000):
+    """Build an httpx handler emulating NetBox's interface endpoints + a recorder."""
+    import json
+
+    import httpx
+
+    state = {"next_id": first_id, "posts": [], "patches": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/api/dcim/interfaces/":
+            return httpx.Response(200, json={"results": existing, "next": None})
+        body = json.loads(request.content)
+        if request.method == "POST" and path == "/api/dcim/interfaces/":
+            state["posts"].append(body)
+            created = []
+            for p in body:
+                created.append({"id": state["next_id"], "name": p["name"]})
+                state["next_id"] += 1
+            return httpx.Response(201, json=created)
+        if request.method == "PATCH" and path == "/api/dcim/interfaces/":
+            state["patches"].append(body)
+            return httpx.Response(200, json=[{"id": p["id"]} for p in body])
+        return httpx.Response(404, json={})
+
+    return handler, state
+
+
+def _real_client(handler):
+    import httpx
+
+    from nso_adapter.bindings.netbox.client import NetboxClient
+
+    client = NetboxClient(url="http://netbox.local", token="tok")
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return client
+
+
+@pytest.mark.anyio
+async def test_bulk_ensure_real_client_creates_base_then_units():
+    from nso_adapter.bindings.netbox.mapper import bulk_ensure_interfaces
+
+    handler, state = _fake_netbox(existing=[], first_id=1000)
+    client = _real_client(handler)
+
+    result = await bulk_ensure_interfaces(client, 42, ["ae98.100", "ae98.15"])
+
+    # base ae98 posted first (id 1000), then both units parented to it.
+    assert result == {"ae98": 1000, "ae98.100": 1001, "ae98.15": 1002}
+    assert [p["name"] for p in state["posts"][0]] == ["ae98"]
+    units = {p["name"]: p for p in state["posts"][1]}
+    assert units["ae98.100"]["type"] == "virtual" and units["ae98.100"]["parent"] == 1000
+    assert units["ae98.15"]["parent"] == 1000
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_bulk_ensure_real_client_reparents_existing_flat_unit():
+    from nso_adapter.bindings.netbox.mapper import bulk_ensure_interfaces
+
+    handler, state = _fake_netbox(
+        existing=[
+            {"id": 10, "name": "ae98", "parent": None, "type": {"value": "lag"}},
+            {"id": 11, "name": "ae98.100", "parent": None, "type": {"value": "virtual"}},
+        ]
+    )
+    client = _real_client(handler)
+
+    result = await bulk_ensure_interfaces(client, 42, ["ae98.100"])
+
+    assert result == {"ae98": 10, "ae98.100": 11}
+    # nothing created; one PATCH re-pointing the flat unit at its base went over the wire
+    assert state["posts"] == []
+    assert state["patches"] == [[{"id": 11, "parent": 10}]]
+    await client.aclose()
