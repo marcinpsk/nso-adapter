@@ -21,7 +21,11 @@ from nso_adapter.nso.apply import (
     _send_service_config,
     _verify_native_or_raise,
     apply_bfd_config,
+    apply_bgp_config,
+    apply_isis_interfaces,
+    apply_logging_config,
     apply_mtu_config,
+    apply_ospf_config,
     apply_snmp_config,
     apply_static_routes,
     native_dry_run,
@@ -241,3 +245,134 @@ async def test_apply_snmp_config_builds_full_snapshot_body():
     assert entry["host"][0]["address"] == "192.0.2.9"
     assert entry["location"] == "DC-A"
     assert "contact" not in entry  # None contact omitted
+
+
+async def test_apply_logging_config_builds_host_body():
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+    rows = [
+        SimpleNamespace(
+            address="192.0.2.5",
+            port=514,
+            severity="info",
+            facility="local7",
+            transport="udp",
+            vrf="MGMT",
+            source="Loopback0",
+        ),
+        SimpleNamespace(address="192.0.2.6", port=None, severity="", facility="", transport="", vrf="", source=""),
+    ]
+    await apply_logging_config(client, "sw03", rows, dry_run=True)
+
+    hosts = _sent_body(transport)["logging-reconciler:logging-config"][0]["host"]
+    assert hosts[0] == {
+        "address": "192.0.2.5",
+        "port": 514,
+        "severity": "info",
+        "facility": "local7",
+        "transport": "udp",
+        "vrf": "MGMT",
+        "source": "Loopback0",
+    }
+    assert hosts[1] == {"address": "192.0.2.6"}  # all optionals falsy → omitted
+
+
+async def test_apply_isis_interfaces_builds_process_and_interface_config():
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+    iface = SimpleNamespace(
+        interface_name="ae1.0",
+        af="ipv4",
+        process_tag="0",
+        passive=False,
+        circuit_type="level-2",
+        network_type=None,
+        metric=10,
+    )
+    proc = SimpleNamespace(
+        process_tag="0",
+        net="49.0001.00",
+        is_type="level-2-only",
+        metric_style="wide",
+        overload_bit=None,
+        area_auth_type="",
+        area_auth_key=None,
+        domain_auth_type="",
+        domain_auth_key=None,
+    )
+    await apply_isis_interfaces(client, "sw03", [iface], isis_process_rows=[proc], dry_run=True)
+
+    body = _sent_body(transport)["isis-reconciler:isis-config"][0]
+    assert body["interface-config"][0]["circuit-type"] == "level-2-only"  # 'level-2' normalised
+    assert body["process-config"][0] == {
+        "process-tag": "0",
+        "net": "49.0001.00",
+        "is-type": "level-2-only",
+        "metric-style": "wide",
+    }
+
+
+async def test_apply_ospf_config_builds_process_interface_and_redistribute():
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+    proc = SimpleNamespace(process_id=1, router_id="1.1.1.1", vrf="", enabled=None)  # enabled None → default True
+    iface = SimpleNamespace(
+        interface_name="Gi0/1",
+        process_id=1,
+        area_id="0",
+        passive=False,
+        priority=10,
+        cost=100,
+        network_type="point-to-point",
+        auth_type="md5",
+        auth_key="secret",
+    )
+    redist = SimpleNamespace(
+        dest_ref="1", source_protocol="connected", source_ref="", route_map="RM", metric=20, metric_type="type-1"
+    )
+    await apply_ospf_config(client, "sw03", [proc], [iface], redistribution_rows=[redist], dry_run=True)
+
+    body = _sent_body(transport)["ospf-reconciler:ospf-config"][0]
+    p = body["process-config"][0]
+    assert p["process-id"] == 1
+    assert p["enabled"] is True  # delete-guard default-enable
+    assert p["redistribute"] == [
+        {"source-protocol": "connected", "source-ref": "", "route-map": "RM", "metric": 20, "metric-type": "type-1"}
+    ]
+    i = body["interface-config"][0]
+    assert i["network-type"] == "point-to-point"
+    assert i["auth-type"] == "md5" and i["auth-key"] == "secret"
+
+
+async def test_apply_bgp_config_builds_router_scope_peer_tree():
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+    paf = SimpleNamespace(
+        af="ipv4-unicast", enabled=True, routemap_in="RM-IN", routemap_out=None, prefixlist_in=None, prefixlist_out=None
+    )
+    peer = SimpleNamespace(
+        peer_address="192.0.2.1",
+        enabled=True,
+        peer_group="UPSTREAM",
+        remote_as=65001,
+        local_as=None,
+        ttl=None,
+        password="s3c",
+        peer_address_families=[paf],
+    )
+    af = SimpleNamespace(af="ipv4-unicast")
+    scope = SimpleNamespace(vrf="", address_families=[af], peers=[peer])
+    router = SimpleNamespace(asn=65000, scopes=[scope])
+    redist = SimpleNamespace(
+        dest_ref="65000::ipv4-unicast", source_protocol="connected", source_ref="", route_map=None, metric=None
+    )
+    await apply_bgp_config(client, "sw03", [router], redistribution_rows=[redist], dry_run=True)
+
+    r = _sent_body(transport)["bgp-reconciler:bgp-config"][0]["router"][0]
+    assert r["asn"] == 65000
+    sc = r["scope"][0]
+    assert sc["address-family"][0]["redistribute"] == [{"source-protocol": "connected", "source-ref": ""}]
+    p = sc["peer"][0]
+    assert p["peer-address"] == "192.0.2.1"
+    assert p["remote-as"] == 65001 and p["peer-group"] == "UPSTREAM" and p["password"] == "s3c"
+    assert p["peer-address-family"][0] == {"afi": "ipv4-unicast", "enabled": True, "routemap-in": "RM-IN"}
