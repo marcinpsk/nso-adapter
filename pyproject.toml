@@ -52,12 +52,16 @@ addopts = "--cov=nso_adapter --cov-report=term-missing"
 [tool.coverage.run]
 source = ["nso_adapter"]
 # Policy (docs/testing-strategy.md §5.1): file-level omits are restricted to
-# auto-generated/test code. The three module-level entries below are
-# GRANDFATHERED pending a paydown pass — do not add new ones, and remove
-# these as part of any change that touches the listed files. Extract pure
-# logic into testable helpers; let the thin lifecycle wrapper carry low
-# coverage as a signal, not hide it.
+# auto-generated/test code — never source modules. Extract pure logic into
+# testable helpers; let a thin lifecycle wrapper carry low coverage as a
+# signal, not hide it behind an omit.
 branch = true
+# SQLAlchemy's async session bridges async<->sync via greenlet, so every async
+# route handler that awaits the DB runs its body inside a greenlet-switched
+# context. Without this, coverage cannot follow the switch and silently reports
+# those (well-tested) handler bodies as uncovered. greenlet ships as a
+# sqlalchemy[asyncio] dependency.
+concurrency = ["greenlet"]
 omit = ["*/alembic/*"]
 
 [tool.coverage.report]
