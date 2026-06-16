@@ -206,8 +206,118 @@ class IsisInterfaceIntentUpdate(BaseModel):
     processes: list[IsisProcessEntry] = []
 
 
+async def _sync_keyed_intent(db, model, device_id: int, *, key_of, entries, now, apply_fields, make_row) -> int:
+    """Full-replace a keyed IS-IS intent collection. Returns the upserted count.
+
+    Rows whose key (``key_of``, possibly composite) is absent from *entries* are
+    deleted; the rest are upserted — ``make_row`` builds a new identity row,
+    ``apply_fields`` writes the mutable fields (incl. accepted_at) on new + existing.
+    """
+    rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
+    existing = {key_of(r): r for r in rows}
+    incoming = {key_of(e) for e in entries}
+    for key, row in existing.items():
+        if key not in incoming:
+            await db.delete(row)
+    await db.flush()
+
+    count = 0
+    for entry in entries:
+        accepted = entry.accepted_at.replace(tzinfo=None) if entry.accepted_at else now
+        row = existing.get(key_of(entry))
+        if row is None:
+            row = make_row(entry)
+            db.add(row)
+        apply_fields(row, entry, accepted)
+        count += 1
+    return count
+
+
+def _apply_isis_interface_fields(row: IsisInterfaceIntent, e: IsisInterfaceEntry, accepted: datetime) -> None:
+    row.process_tag = e.process_tag
+    row.circuit_type = e.circuit_type
+    row.network_type = e.network_type
+    row.metric = e.metric
+    row.passive = e.passive
+    row.accepted_at = accepted
+
+
+def _apply_isis_process_fields(row: IsisProcessIntent, e: IsisProcessEntry, accepted: datetime) -> None:
+    row.net = e.net
+    row.is_type = e.is_type
+    row.metric_style = e.metric_style
+    row.overload_bit = e.overload_bit
+    row.area_auth_type = e.area_auth_type
+    row.area_auth_key = e.area_auth_key
+    row.domain_auth_type = e.domain_auth_type
+    row.domain_auth_key = e.domain_auth_key
+    row.accepted_at = accepted
+
+
+def _iter_isis_redistribution(processes: list[IsisProcessEntry]):
+    """Yield ``(dest_ref, entry)`` for every per-process redistribution entry (dest_ref = process_tag)."""
+    for proc_entry in processes:
+        dest_ref = proc_entry.process_tag
+        for entry in proc_entry.redistribution:
+            yield dest_ref, entry
+
+
+async def _sync_isis_redistribution(db, device_id: int, processes: list[IsisProcessEntry], now: datetime) -> None:
+    """Full-replace IS-IS (dest_protocol=isis) redistribution intent rows for this device."""
+    existing = (
+        (
+            await db.execute(
+                select(RedistributionIntent).where(
+                    RedistributionIntent.device_id == device_id,
+                    RedistributionIntent.dest_protocol == "isis",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    existing_map = {(r.dest_ref, r.source_protocol, r.source_ref): r for r in existing}
+    incoming_keys = {
+        (dest_ref, e.source_protocol, e.source_ref) for dest_ref, e in _iter_isis_redistribution(processes)
+    }
+
+    for key in list(existing_map):
+        if key not in incoming_keys:
+            await db.delete(existing_map[key])
+
+    for dest_ref, entry in _iter_isis_redistribution(processes):
+        key = (dest_ref, entry.source_protocol, entry.source_ref)
+        row = existing_map.get(key)
+        if row is None:
+            row = RedistributionIntent(
+                device_id=device_id,
+                dest_protocol="isis",
+                dest_ref=dest_ref,
+                source_protocol=entry.source_protocol,
+                source_ref=entry.source_ref,
+                accepted_at=now,
+            )
+            db.add(row)
+        row.route_map = entry.route_map
+        row.metric = entry.metric
+        row.metric_type = entry.metric_type
+
+
+async def _maybe_enqueue_isis_apply(db, device_id: int, iface_count: int, proc_count: int) -> None:
+    """Enqueue an apply job when auto_apply is on and the payload changed something."""
+    from nso_adapter.store.models import DeviceSettings
+
+    settings = (
+        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    ).scalar_one_or_none()
+    if settings and settings.auto_apply and (iface_count > 0 or proc_count > 0):
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True)
+
+
 @router.put("/{device_id}/isis-interface-intent", dependencies=[Depends(verify_token)])
-async def put_isis_interface_intent(  # noqa: C901
+async def put_isis_interface_intent(
     device_id: int, body: IsisInterfaceIntentUpdate, db: AsyncSession = Depends(get_db)
 ):
     """Replace the adapter's IS-IS interface and process intent mirror for this device atomically.
@@ -222,137 +332,28 @@ async def put_isis_interface_intent(  # noqa: C901
 
     now = datetime.now(UTC).replace(tzinfo=None)
 
-    # ── Interface intent (full-replace) ──────────────────────────────────────
-    existing_result = await db.execute(select(IsisInterfaceIntent).where(IsisInterfaceIntent.device_id == device_id))
-    existing_rows: dict[tuple, IsisInterfaceIntent] = {
-        (r.interface_name, r.af): r for r in existing_result.scalars().all()
-    }
-
-    new_iface_keys: set[tuple] = {(item.interface_name, item.af) for item in body.interfaces}
-
-    for key, row in existing_rows.items():
-        if key not in new_iface_keys:
-            await db.delete(row)
-    await db.flush()
-
-    iface_count = 0
-    for item in body.interfaces:
-        key = (item.interface_name, item.af)
-        accepted = item.accepted_at.replace(tzinfo=None) if item.accepted_at else now
-        if key in existing_rows:
-            row = existing_rows[key]
-            row.process_tag = item.process_tag
-            row.circuit_type = item.circuit_type
-            row.network_type = item.network_type
-            row.metric = item.metric
-            row.passive = item.passive
-            row.accepted_at = accepted
-        else:
-            row = IsisInterfaceIntent(
-                device_id=device_id,
-                interface_name=item.interface_name,
-                af=item.af,
-                process_tag=item.process_tag,
-                circuit_type=item.circuit_type,
-                network_type=item.network_type,
-                metric=item.metric,
-                passive=item.passive,
-                accepted_at=accepted,
-            )
-            db.add(row)
-        iface_count += 1
-
-    await db.flush()
-
-    # ── Process intent (full-replace) ────────────────────────────────────────
-    existing_proc_result = await db.execute(select(IsisProcessIntent).where(IsisProcessIntent.device_id == device_id))
-    existing_proc_rows: dict[str, IsisProcessIntent] = {r.process_tag: r for r in existing_proc_result.scalars().all()}
-
-    new_proc_tags: set[str] = {item.process_tag for item in body.processes}
-
-    for tag, row in existing_proc_rows.items():
-        if tag not in new_proc_tags:
-            await db.delete(row)
-    await db.flush()
-
-    proc_count = 0
-    for item in body.processes:
-        accepted = item.accepted_at.replace(tzinfo=None) if item.accepted_at else now
-        if item.process_tag in existing_proc_rows:
-            row = existing_proc_rows[item.process_tag]
-            row.net = item.net
-            row.is_type = item.is_type
-            row.metric_style = item.metric_style
-            row.overload_bit = item.overload_bit
-            row.area_auth_type = item.area_auth_type
-            row.area_auth_key = item.area_auth_key
-            row.domain_auth_type = item.domain_auth_type
-            row.domain_auth_key = item.domain_auth_key
-            row.accepted_at = accepted
-        else:
-            row = IsisProcessIntent(
-                device_id=device_id,
-                process_tag=item.process_tag,
-                net=item.net,
-                is_type=item.is_type,
-                metric_style=item.metric_style,
-                overload_bit=item.overload_bit,
-                area_auth_type=item.area_auth_type,
-                area_auth_key=item.area_auth_key,
-                domain_auth_type=item.domain_auth_type,
-                domain_auth_key=item.domain_auth_key,
-                accepted_at=accepted,
-            )
-            db.add(row)
-        proc_count += 1
-
-    await db.flush()
-
-    # Full-replace redistribution intent rows for this device (dest_protocol=isis)
-    existing_redist = await db.execute(
-        select(RedistributionIntent).where(
-            RedistributionIntent.device_id == device_id,
-            RedistributionIntent.dest_protocol == "isis",
-        )
+    iface_count = await _sync_keyed_intent(
+        db,
+        IsisInterfaceIntent,
+        device_id,
+        key_of=lambda x: (x.interface_name, x.af),
+        entries=body.interfaces,
+        now=now,
+        apply_fields=_apply_isis_interface_fields,
+        make_row=lambda e: IsisInterfaceIntent(device_id=device_id, interface_name=e.interface_name, af=e.af),
     )
-    existing_redist_map = {(r.dest_ref, r.source_protocol, r.source_ref): r for r in existing_redist.scalars().all()}
-    incoming_redist_keys: set[tuple] = set()
-    for proc_entry in body.processes:
-        dest_ref = proc_entry.process_tag
-        for re in proc_entry.redistribution:
-            incoming_redist_keys.add((dest_ref, re.source_protocol, re.source_ref))
-
-    for key in list(existing_redist_map):
-        if key not in incoming_redist_keys:
-            await db.delete(existing_redist_map[key])
-
-    for proc_entry in body.processes:
-        dest_ref = proc_entry.process_tag
-        for re in proc_entry.redistribution:
-            key = (dest_ref, re.source_protocol, re.source_ref)
-            row = existing_redist_map.get(key)
-            if row is None:
-                row = RedistributionIntent(
-                    device_id=device_id,
-                    dest_protocol="isis",
-                    dest_ref=dest_ref,
-                    source_protocol=re.source_protocol,
-                    source_ref=re.source_ref,
-                    accepted_at=now,
-                )
-                db.add(row)
-            row.route_map = re.route_map
-            row.metric = re.metric
-            row.metric_type = re.metric_type
-
-    from nso_adapter.store.models import DeviceSettings
-
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
-    if settings and settings.auto_apply and (iface_count > 0 or proc_count > 0):
-        from nso_adapter.core.apply import enqueue_apply
-
-        await enqueue_apply(db, device_id, force=True)
+    proc_count = await _sync_keyed_intent(
+        db,
+        IsisProcessIntent,
+        device_id,
+        key_of=lambda x: x.process_tag,
+        entries=body.processes,
+        now=now,
+        apply_fields=_apply_isis_process_fields,
+        make_row=lambda e: IsisProcessIntent(device_id=device_id, process_tag=e.process_tag),
+    )
+    await _sync_isis_redistribution(db, device_id, body.processes, now)
+    await _maybe_enqueue_isis_apply(db, device_id, iface_count, proc_count)
 
     await db.commit()
     return {"device_id": device_id, "interface_count": iface_count, "process_count": proc_count}
