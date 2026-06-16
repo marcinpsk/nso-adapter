@@ -304,3 +304,133 @@ async def test_fetch_host_keys_no_fingerprint_raises(patch_client):
     with patch_client(client, 200, payload):  # noqa: SIM117
         with pytest.raises(RuntimeError, match="did not store a key"):
             await client.fetch_host_keys("core-rtr-01")
+
+
+# ── device oper-data getters (the 18 network-state-export:<X>/device readers) ────
+# All share one shape: GET network-state-export:<resource>/device={name} → 404 ⇒ None,
+# else parse the device list and return entry[0] (or None when empty). A capturing
+# transport asserts each method targets the RIGHT resource so a copy-pasted wrong URL
+# is caught, not hidden behind a shared canned payload.
+
+_DEVICE_OPER_METHODS = [
+    ("get_lag_topology", "lag-topology"),
+    ("get_svi", "svi"),
+    ("get_subinterface", "subinterface"),
+    ("get_interface_mtu", "interface-mtu"),
+    ("get_lag_config", "lag-config"),
+    ("get_vlan_database", "vlan-database"),
+    ("get_switchport", "switchport"),
+    ("get_interface_ips", "interface-ip"),
+    ("get_interface_attributes", "interface-attributes"),
+    ("get_snmp_config", "snmp-config"),
+    ("get_logging_config", "logging-config"),
+    ("get_static_routes", "static-route"),
+    ("get_l2_services", "l2-service"),
+    ("get_isis_interfaces", "isis-interface"),
+    ("get_bgp_config", "bgp-config"),
+    ("get_route_policy", "route-policy"),
+    ("get_ospf", "ospf-config"),
+    ("get_bfd_config", "bfd-config"),
+]
+
+
+class _CapturingTransport(httpx.AsyncBaseTransport):
+    def __init__(self, status_code: int, body: dict | None):
+        self._status = status_code
+        self._content = json.dumps(body).encode() if body is not None else b""
+        self.url: str | None = None
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.url = str(request.url)
+        return httpx.Response(
+            self._status,
+            content=self._content,
+            headers={"content-type": "application/yang-data+json"},
+            request=request,
+        )
+
+
+def _capture(client: NsoClient, status: int, body: dict | None):
+    transport = _CapturingTransport(status, body)
+    client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url="http://nso:8080")
+    return transport
+
+
+@pytest.mark.parametrize(("method", "resource"), _DEVICE_OPER_METHODS)
+async def test_device_oper_getter_returns_entry_and_targets_resource(method, resource):
+    client = _make_client()
+    entry = {"device-name": "sw01", "marker": resource}
+    transport = _capture(client, 200, {"network-state-export:device": [entry]})
+
+    result = await getattr(client, method)("sw01")
+
+    assert result == entry
+    assert f"network-state-export:{resource}/device=sw01" in transport.url
+
+
+@pytest.mark.parametrize(("method", "resource"), _DEVICE_OPER_METHODS)
+async def test_device_oper_getter_returns_none_on_404(method, resource):
+    client = _make_client()
+    _capture(client, 404, {"error": "not found"})
+    assert await getattr(client, method)("sw01") is None
+
+
+@pytest.mark.parametrize(("method", "resource"), _DEVICE_OPER_METHODS)
+async def test_device_oper_getter_returns_none_when_device_list_empty(method, resource):
+    client = _make_client()
+    _capture(client, 200, {"network-state-export:device": []})
+    assert await getattr(client, method)("sw01") is None
+
+
+async def test_device_oper_getter_raises_on_500():
+    client = _make_client()
+    _capture(client, 500, {"error": "boom"})
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.get_route_policy("sw01")
+
+
+# ── list_ned_packages (filters to NED-component packages, parses, sorts) ────────
+
+
+def _ned_pkg(ned_id: str, vendor: str = "Cisco", os_list=None):
+    return {
+        "name": ned_id,
+        "package-version": "1.0",
+        "oper-status": {"up": [None]},
+        "component": [
+            {
+                "name": "x",
+                "ned": {"cli": {"ned-id": ned_id}, "device": {"vendor": vendor, "operating-system": os_list or []}},
+            }
+        ],
+    }
+
+
+async def test_list_ned_packages_filters_to_ned_components_and_sorts(patch_client):
+    client = _make_client()
+    payload = {
+        "tailf-ncs:package": [
+            _ned_pkg("cisco-iosxr-cli-7.76", vendor="Cisco", os_list=["IOS XR"]),
+            _ned_pkg("cisco-ios-cli-6.114"),
+            {"name": "route-policy-reconciler", "component": [{"name": "app", "application": {}}]},  # not a NED
+            "not-a-dict",  # skipped
+        ]
+    }
+    with patch_client(client, 200, payload):
+        out = await client.list_ned_packages()
+    assert [p["ned_id"] for p in out] == ["cisco-ios-cli-6.114", "cisco-iosxr-cli-7.76"]  # NED-only, sorted
+    assert out[0]["vendor"] == "Cisco"
+    assert out[1]["operating_systems"] == ["IOS XR"]
+
+
+async def test_list_ned_packages_empty_when_packages_not_a_list(patch_client):
+    client = _make_client()
+    with patch_client(client, 200, {"tailf-ncs:package": "nope"}):
+        assert await client.list_ned_packages() == []
+
+
+async def test_list_ned_packages_raises_on_http_error(patch_client):
+    client = _make_client()
+    with patch_client(client, 503, {"error": "unavailable"}):
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.list_ned_packages()
