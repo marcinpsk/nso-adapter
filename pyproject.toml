@@ -58,12 +58,7 @@ source = ["nso_adapter"]
 # logic into testable helpers; let the thin lifecycle wrapper carry low
 # coverage as a signal, not hide it.
 branch = true
-omit = [
-    "*/alembic/*",
-    # GRANDFATHERED — scheduler lifecycle requires APScheduler integration.
-    # Test inner functions directly per testing-strategy.md §3.6.
-    "nso_adapter/core/scheduler.py",
-]
+omit = ["*/alembic/*"]
 
 [tool.coverage.report]
 fail_under = 60
