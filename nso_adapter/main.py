@@ -53,36 +53,31 @@ from nso_adapter.notifications.persistent_subscriber import persistent_subscribe
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.secrets import make_provider
-from nso_adapter.store.db import get_engine, init_db
+from nso_adapter.store.db import get_engine, get_session, init_db
 from nso_adapter.store.models import Base
 
 logger = structlog.get_logger(__name__)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):  # noqa: C901
-    cfg = get_config()
-    env = get_env_settings()
-
-    structlog.configure(
-        wrapper_class=structlog.make_filtering_bound_logger(__import__("logging").getLevelName(cfg.log_level)),
-    )
-
-    # Init secrets provider — all further secret access goes through this
+def _init_secrets(app: FastAPI, cfg, env):
+    """Build the secrets provider, stashing it and the resolved adapter token on ``app.state``."""
     provider = make_provider(cfg, env)
     app.state.secrets = provider
     app.state.adapter_token = provider.get(cfg.api.adapter_token_ref)
+    return provider
 
-    # Init DB
+
+async def _init_database(cfg) -> None:
+    """Initialise the engine/sessionmaker and ensure the schema exists."""
     init_db(cfg.database_url)
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)  # pragma: no cover
     logger.info("db.ready", url=cfg.database_url)
 
-    # Build NSO clients — resolve username + password per instance
-    from nso_adapter.store.db import get_session
 
+def _build_nso_clients(cfg, provider) -> dict[str, NsoClient]:
+    """Construct and register one NsoClient per configured instance, resolving creds via the provider."""
     nso_clients: dict[str, NsoClient] = {}
     for inst in cfg.nso_instances:
         username = provider.get(inst.username_ref)
@@ -91,69 +86,126 @@ async def lifespan(app: FastAPI):  # noqa: C901
         nso_clients[inst.name] = client
         register_nso_client(inst.name, client)
         logger.info("nso.client.registered", instance=inst.name)
-    app.state.nso_clients = nso_clients
+    return nso_clients
 
-    # Build NetBox client and register with importer
+
+def _build_netbox_client(app: FastAPI, cfg, provider):
+    """Build the pooled NetBox client, stash it on ``app.state`` and register it with the importer."""
     from nso_adapter.bindings.netbox.client import NetboxClient
 
     netbox_token = provider.get(cfg.netbox.api_token_ref)
-    netbox_client = NetboxClient(
-        url=cfg.netbox.base_url,
-        token=netbox_token,
-    )
+    netbox_client = NetboxClient(url=cfg.netbox.base_url, token=netbox_token)
     app.state.netbox_client = netbox_client
     set_netbox_client(netbox_client)
+    return netbox_client
 
+
+async def _dispatch_netconf_change(cfg, parsed: dict, db, clients: dict[str, NsoClient]) -> None:
+    """Fan a parsed NETCONF change out to every config handler, honouring the per-feature sync flags."""
+    await handle_netconf_config_change(parsed, db, clients)
+    await handle_l2_service_change(parsed, db, clients)
+    if cfg.scheduler.enable_interface_ip_sync:
+        await handle_interface_ip_change(parsed, db, clients)
+    if cfg.scheduler.enable_snmp_sync:
+        await handle_snmp_config_change(parsed, db, clients)
+    await handle_vlan_database_change(parsed, db, clients)
+    await handle_switchport_change(parsed, db, clients)
+    await handle_svi_change(parsed, db, clients)
+    await handle_subinterface_change(parsed, db, clients)
+    if cfg.scheduler.enable_interface_mtu_sync:
+        await handle_interface_mtu_change(parsed, db, clients)
+
+
+def _make_sse_event_handler(cfg, clients: dict[str, NsoClient]):
+    """Build the SSE on-event callback: ignore unparseable frames, else dispatch on its own task/session."""
+
+    def on_event(raw: str, parsed: dict | None) -> None:
+        if parsed is None:
+            return
+
+        async def _run() -> None:
+            async for db in get_session():
+                await _dispatch_netconf_change(cfg, parsed, db, clients)
+
+        asyncio.create_task(_run())
+
+    return on_event
+
+
+def _start_sse_streams(cfg, provider, nso_clients: dict[str, NsoClient], sse_stop: asyncio.Event) -> list[asyncio.Task]:
+    """Start one persistent NETCONF SSE subscriber per instance (when enabled); return the spawned tasks."""
     sse_tasks: list[asyncio.Task] = []
+    if not cfg.scheduler.enable_nso_streams:
+        return sse_tasks
+    for inst in cfg.nso_instances:
+        username = provider.get(inst.username_ref)
+        password = provider.get(inst.password_ref)
+        subscriber = SSESubscriber(
+            base_url=inst.base_url,
+            auth=(username, password),
+            host_header=inst.host_header,
+            verify=inst.ca_cert if inst.ca_cert else True,
+        )
+        stream_url = f"{inst.base_url.rstrip('/')}/restconf/streams/NETCONF/json"
+        task = asyncio.create_task(
+            persistent_subscriber(
+                subscriber,
+                stream_url,
+                _make_sse_event_handler(cfg, {inst.name: nso_clients[inst.name]}),
+                stop_event=sse_stop,
+            )
+        )
+        sse_tasks.append(task)
+        logger.info("sse.stream.started", instance=inst.name, url=stream_url)
+    return sse_tasks
+
+
+async def _shutdown_sse(sse_stop: asyncio.Event, sse_tasks: list[asyncio.Task]) -> None:
+    """Signal stop, cancel every SSE task and wait (bounded) for them to drain."""
+    sse_stop.set()
+    for task in sse_tasks:
+        task.cancel()
+    for task in sse_tasks:
+        try:
+            await asyncio.wait_for(task, timeout=5.0)
+        except (asyncio.CancelledError, TimeoutError):
+            pass
+
+
+async def _close_netbox(netbox_client) -> None:
+    """Close the pooled NetBox client, guarding with isawaitable so a mocked client doesn't break teardown."""
+    maybe = netbox_client.aclose()
+    if inspect.isawaitable(maybe):
+        await maybe
+
+
+async def _dispose_engine() -> None:
+    """Dispose the SQLAlchemy engine if one was initialised."""
+    engine = get_engine()
+    if engine:
+        await engine.dispose()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    cfg = get_config()
+    env = get_env_settings()
+
+    structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(__import__("logging").getLevelName(cfg.log_level)),
+    )
+
+    provider = _init_secrets(app, cfg, env)
+    await _init_database(cfg)
+
+    nso_clients = _build_nso_clients(cfg, provider)
+    app.state.nso_clients = nso_clients
+    netbox_client = _build_netbox_client(app, cfg, provider)
+
     sse_stop = asyncio.Event()
+    sse_tasks = _start_sse_streams(cfg, provider, nso_clients, sse_stop)
     app.state.sse_stop = sse_stop
     app.state.sse_tasks = sse_tasks
-
-    def make_handler(clients: dict[str, NsoClient]):
-        def on_event(raw: str, parsed: dict | None) -> None:
-            if parsed is None:
-                return
-
-            async def _handle() -> None:
-                async for db in get_session():
-                    await handle_netconf_config_change(parsed, db, clients)
-                    await handle_l2_service_change(parsed, db, clients)
-                    if cfg.scheduler.enable_interface_ip_sync:
-                        await handle_interface_ip_change(parsed, db, clients)
-                    if cfg.scheduler.enable_snmp_sync:
-                        await handle_snmp_config_change(parsed, db, clients)
-                    await handle_vlan_database_change(parsed, db, clients)
-                    await handle_switchport_change(parsed, db, clients)
-                    await handle_svi_change(parsed, db, clients)
-                    await handle_subinterface_change(parsed, db, clients)
-                    if cfg.scheduler.enable_interface_mtu_sync:
-                        await handle_interface_mtu_change(parsed, db, clients)
-
-            asyncio.create_task(_handle())
-
-        return on_event
-
-    if cfg.scheduler.enable_nso_streams:
-        for inst in cfg.nso_instances:
-            username = provider.get(inst.username_ref)
-            password = provider.get(inst.password_ref)
-            subscriber = SSESubscriber(
-                base_url=inst.base_url,
-                auth=(username, password),
-                host_header=inst.host_header,
-                verify=inst.ca_cert if inst.ca_cert else True,
-            )
-            stream_url = f"{inst.base_url.rstrip('/')}/restconf/streams/NETCONF/json"
-            task = asyncio.create_task(
-                persistent_subscriber(
-                    subscriber,
-                    stream_url,
-                    make_handler({inst.name: nso_clients[inst.name]}),
-                    stop_event=sse_stop,
-                )
-            )
-            sse_tasks.append(task)
-            logger.info("sse.stream.started", instance=inst.name, url=stream_url)
 
     # Start the durable worker pool first: it reconciles orphaned jobs from a
     # previous process (requeue idempotent / fail interrupted apply) before the
@@ -166,24 +218,9 @@ async def lifespan(app: FastAPI):  # noqa: C901
     finally:
         stop_scheduler()
         await stop_workers()
-        sse_stop.set()
-        for task in sse_tasks:
-            task.cancel()
-        for task in sse_tasks:
-            try:
-                await asyncio.wait_for(task, timeout=5.0)
-            except (asyncio.CancelledError, TimeoutError):
-                pass
-
-        # Close the pooled NetBox HTTP client. Guarded with inspect.isawaitable
-        # so a test-mocked client (plain MagicMock) doesn't break teardown.
-        maybe = netbox_client.aclose()
-        if inspect.isawaitable(maybe):
-            await maybe
-
-        engine = get_engine()
-        if engine:
-            await engine.dispose()
+        await _shutdown_sse(sse_stop, sse_tasks)
+        await _close_netbox(netbox_client)
+        await _dispose_engine()
 
 
 def create_app() -> FastAPI:
