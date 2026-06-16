@@ -150,3 +150,11 @@ async def test_route_policy_no_data_shape(adapter_client):
     assert set(body.keys()) == REQUIRED_TOP_KEYS
     assert body["prefix_lists"] == [] and body["route_maps"] == []
     assert body["last_refreshed_at"] is None
+
+
+@pytest.mark.anyio
+async def test_route_policy_get_device_not_found(adapter_client):
+    """GET for a non-existent device → 404."""
+    resp = await adapter_client.get("/api/v1/devices/99999/route-policy", headers=AUTH)
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "not_found"

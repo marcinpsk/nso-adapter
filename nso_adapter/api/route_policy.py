@@ -31,140 +31,22 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/api/v1/devices", tags=["route-policy"])
 
 
-@router.get("/{device_id}/route-policy", dependencies=[Depends(verify_token)])
-async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_db)):  # noqa: C901
-    """Return the route-policy config read-mirror for this device.
+async def _group_in(db: AsyncSession, model, fk_col, ids: list[int], key_attr: str, order_col) -> dict[int, list]:
+    """Load ``model`` rows where ``fk_col`` is in *ids*, grouped by ``key_attr`` (empty ids → {})."""
+    if not ids:
+        return {}
+    rows = (await db.execute(select(model).where(fk_col.in_(ids)).order_by(order_col))).scalars().all()
+    grouped: dict[int, list] = {}
+    for row in rows:
+        grouped.setdefault(getattr(row, key_attr), []).append(row)
+    return grouped
 
-    Response shape matches the YANG contract in m17-route-policy-contract.md §3.
-    """
-    device = await db.get(Device, device_id)
-    if not device:
-        raise api_error(404, "not_found", "Device not found")
 
-    prefix_lists = (
-        (
-            await db.execute(
-                select(DeviceRoutePolicyPrefixList)
-                .where(DeviceRoutePolicyPrefixList.device_id == device_id)
-                .order_by(DeviceRoutePolicyPrefixList.name)
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    community_lists = (
-        (
-            await db.execute(
-                select(DeviceRoutePolicyCommunityList)
-                .where(DeviceRoutePolicyCommunityList.device_id == device_id)
-                .order_by(DeviceRoutePolicyCommunityList.name)
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    as_paths = (
-        (
-            await db.execute(
-                select(DeviceRoutePolicyASPath)
-                .where(DeviceRoutePolicyASPath.device_id == device_id)
-                .order_by(DeviceRoutePolicyASPath.name)
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    route_maps = (
-        (
-            await db.execute(
-                select(DeviceRoutePolicyRouteMap)
-                .where(DeviceRoutePolicyRouteMap.device_id == device_id)
-                .order_by(DeviceRoutePolicyRouteMap.name)
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    # Bulk-load all entries in one query per family to avoid N+1.
-    pl_ids = [p.id for p in prefix_lists]
-    cl_ids = [c.id for c in community_lists]
-    ap_ids = [a.id for a in as_paths]
-    rm_ids = [r.id for r in route_maps]
-
-    pl_entries_by_id: dict[int, list] = {p.id: [] for p in prefix_lists}
-    cl_entries_by_id: dict[int, list] = {c.id: [] for c in community_lists}
-    ap_entries_by_id: dict[int, list] = {a.id: [] for a in as_paths}
-    rm_entries_by_id: dict[int, list] = {r.id: [] for r in route_maps}
-
-    if pl_ids:
-        for e in (
-            (
-                await db.execute(
-                    select(DeviceRoutePolicyPrefixListEntry)
-                    .where(DeviceRoutePolicyPrefixListEntry.prefix_list_id.in_(pl_ids))
-                    .order_by(DeviceRoutePolicyPrefixListEntry.sequence)
-                )
-            )
-            .scalars()
-            .all()
-        ):
-            pl_entries_by_id[e.prefix_list_id].append(e)
-
-    if cl_ids:
-        for e in (
-            (
-                await db.execute(
-                    select(DeviceRoutePolicyCommunityListEntry)
-                    .where(DeviceRoutePolicyCommunityListEntry.community_list_id.in_(cl_ids))
-                    .order_by(DeviceRoutePolicyCommunityListEntry.sequence)
-                )
-            )
-            .scalars()
-            .all()
-        ):
-            cl_entries_by_id[e.community_list_id].append(e)
-
-    if ap_ids:
-        for e in (
-            (
-                await db.execute(
-                    select(DeviceRoutePolicyASPathEntry)
-                    .where(DeviceRoutePolicyASPathEntry.as_path_id.in_(ap_ids))
-                    .order_by(DeviceRoutePolicyASPathEntry.sequence)
-                )
-            )
-            .scalars()
-            .all()
-        ):
-            ap_entries_by_id[e.as_path_id].append(e)
-
-    if rm_ids:
-        for e in (
-            (
-                await db.execute(
-                    select(DeviceRoutePolicyRouteMapEntry)
-                    .where(DeviceRoutePolicyRouteMapEntry.route_map_id.in_(rm_ids))
-                    .order_by(DeviceRoutePolicyRouteMapEntry.sequence)
-                )
-            )
-            .scalars()
-            .all()
-        ):
-            rm_entries_by_id[e.route_map_id].append(e)
-
-    last_refreshed_at = None
-    for obj in (*prefix_lists, *community_lists, *as_paths, *route_maps):
-        ts = obj.last_refreshed_at
-        if ts and (last_refreshed_at is None or ts > last_refreshed_at):
-            last_refreshed_at = ts
-
-    prefix_lists_out = []
-    for pl in prefix_lists:
-        pl_entries_out = [
+def _serialize_prefix_list(pl: DeviceRoutePolicyPrefixList, entries: list) -> dict:
+    return {
+        "name": pl.name,
+        "family": pl.family,
+        "entries": [
             {
                 "sequence": e.sequence,
                 "action": e.action,
@@ -172,35 +54,31 @@ async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_db)): 
                 **({"ge": e.ge} if e.ge is not None else {}),
                 **({"le": e.le} if e.le is not None else {}),
             }
-            for e in pl_entries_by_id[pl.id]
-        ]
-        prefix_lists_out.append(
+            for e in entries
+        ],
+    }
+
+
+def _serialize_community_list(cl: DeviceRoutePolicyCommunityList, entries: list) -> dict:
+    return {
+        "name": cl.name,
+        "invert_match": cl.invert_match,
+        "entries": [{"sequence": e.sequence, "action": e.action, "community": e.community} for e in entries],
+    }
+
+
+def _serialize_as_path(ap: DeviceRoutePolicyASPath, entries: list) -> dict:
+    return {
+        "name": ap.name,
+        "entries": [{"sequence": e.sequence, "action": e.action, "pattern": e.pattern} for e in entries],
+    }
+
+
+def _serialize_route_map(rm: DeviceRoutePolicyRouteMap, entries: list) -> dict:
+    return {
+        "name": rm.name,
+        "entries": [
             {
-                "name": pl.name,
-                "family": pl.family,
-                "entries": pl_entries_out,
-            }
-        )
-
-    community_lists_out = []
-    for cl in community_lists:
-        cl_entries_out = [
-            {"sequence": e.sequence, "action": e.action, "community": e.community} for e in cl_entries_by_id[cl.id]
-        ]
-        community_lists_out.append({"name": cl.name, "invert_match": cl.invert_match, "entries": cl_entries_out})
-
-    as_paths_out = []
-    for ap in as_paths:
-        ap_entries_out = [
-            {"sequence": e.sequence, "action": e.action, "pattern": e.pattern} for e in ap_entries_by_id[ap.id]
-        ]
-        as_paths_out.append({"name": ap.name, "entries": ap_entries_out})
-
-    route_maps_out = []
-    for rm in route_maps:
-        rm_entries_out = []
-        for e in rm_entries_by_id[rm.id]:
-            rm_entry: dict = {
                 "sequence": e.sequence,
                 "action": e.action,
                 "match_prefix_lists": e.match_prefix_lists or [],
@@ -209,16 +87,78 @@ async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_db)): 
                 "match": e.match_json or "{}",
                 "set": e.set_json or "{}",
             }
-            rm_entries_out.append(rm_entry)
-        route_maps_out.append({"name": rm.name, "entries": rm_entries_out})
+            for e in entries
+        ],
+    }
+
+
+async def _load_named(db: AsyncSession, model, device_id: int) -> list:
+    """Load a route-policy family for a device, ordered by name."""
+    return (await db.execute(select(model).where(model.device_id == device_id).order_by(model.name))).scalars().all()
+
+
+@router.get("/{device_id}/route-policy", dependencies=[Depends(verify_token)])
+async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_db)):
+    """Return the route-policy config read-mirror for this device.
+
+    Response shape matches the YANG contract in m17-route-policy-contract.md §3.
+    """
+    device = await db.get(Device, device_id)
+    if not device:
+        raise api_error(404, "not_found", "Device not found")
+
+    prefix_lists = await _load_named(db, DeviceRoutePolicyPrefixList, device_id)
+    community_lists = await _load_named(db, DeviceRoutePolicyCommunityList, device_id)
+    as_paths = await _load_named(db, DeviceRoutePolicyASPath, device_id)
+    route_maps = await _load_named(db, DeviceRoutePolicyRouteMap, device_id)
+
+    # Bulk-load all entries in one query per family to avoid N+1.
+    pl_entries = await _group_in(
+        db,
+        DeviceRoutePolicyPrefixListEntry,
+        DeviceRoutePolicyPrefixListEntry.prefix_list_id,
+        [p.id for p in prefix_lists],
+        "prefix_list_id",
+        DeviceRoutePolicyPrefixListEntry.sequence,
+    )
+    cl_entries = await _group_in(
+        db,
+        DeviceRoutePolicyCommunityListEntry,
+        DeviceRoutePolicyCommunityListEntry.community_list_id,
+        [c.id for c in community_lists],
+        "community_list_id",
+        DeviceRoutePolicyCommunityListEntry.sequence,
+    )
+    ap_entries = await _group_in(
+        db,
+        DeviceRoutePolicyASPathEntry,
+        DeviceRoutePolicyASPathEntry.as_path_id,
+        [a.id for a in as_paths],
+        "as_path_id",
+        DeviceRoutePolicyASPathEntry.sequence,
+    )
+    rm_entries = await _group_in(
+        db,
+        DeviceRoutePolicyRouteMapEntry,
+        DeviceRoutePolicyRouteMapEntry.route_map_id,
+        [r.id for r in route_maps],
+        "route_map_id",
+        DeviceRoutePolicyRouteMapEntry.sequence,
+    )
+
+    last_refreshed_at = None
+    for obj in (*prefix_lists, *community_lists, *as_paths, *route_maps):
+        ts = obj.last_refreshed_at
+        if ts and (last_refreshed_at is None or ts > last_refreshed_at):
+            last_refreshed_at = ts
 
     return {
         "device_id": device_id,
         "last_refreshed_at": last_refreshed_at.isoformat() + "Z" if last_refreshed_at else None,
-        "prefix_lists": prefix_lists_out,
-        "community_lists": community_lists_out,
-        "as_paths": as_paths_out,
-        "route_maps": route_maps_out,
+        "prefix_lists": [_serialize_prefix_list(pl, pl_entries.get(pl.id, [])) for pl in prefix_lists],
+        "community_lists": [_serialize_community_list(cl, cl_entries.get(cl.id, [])) for cl in community_lists],
+        "as_paths": [_serialize_as_path(ap, ap_entries.get(ap.id, [])) for ap in as_paths],
+        "route_maps": [_serialize_route_map(rm, rm_entries.get(rm.id, [])) for rm in route_maps],
     }
 
 
