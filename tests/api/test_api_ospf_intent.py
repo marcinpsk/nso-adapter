@@ -124,3 +124,158 @@ async def test_put_ospf_intent_removal_enqueues_job_not_inline(adapter_client):
         assert jobs[0].status == JobStatus.queued
         assert jobs[0].context == {"scope": "ospf"}
         break
+
+
+async def test_put_ospf_intent_device_not_found(adapter_client):
+    """Non-existent device → 404."""
+    resp = await adapter_client.put(
+        "/api/v1/devices/99999/ospf-intent",
+        headers=AUTH,
+        json={"instances": [], "interfaces": []},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "not_found"
+
+
+async def test_put_ospf_intent_creates_redistribution(adapter_client):
+    """Per-instance redistribution entries become RedistributionIntent rows (dest_protocol=ospf)."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import RedistributionIntent
+
+    device_id = await seed_device(nso_device_name="ospf-redist-create", netbox_device_id=930)
+    payload = {
+        "instances": [
+            {
+                "process_id": "1",
+                "router_id": "1.1.1.1",
+                "vrf": "",
+                "areas": [],
+                "redistribution": [
+                    {
+                        "source_protocol": "bgp",
+                        "source_ref": "65001",
+                        "route_map": "RM",
+                        "metric": 20,
+                        "metric_type": "2",
+                    },
+                    {"source_protocol": "connected", "source_ref": "", "route_map": None, "metric": None},
+                ],
+            }
+        ],
+        "interfaces": [],
+    }
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH, json=payload)
+    assert resp.status_code == 200
+
+    async for db in get_session():
+        rows = (
+            (await db.execute(select(RedistributionIntent).where(RedistributionIntent.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        break
+    by_src = {r.source_protocol: r for r in rows}
+    assert set(by_src) == {"bgp", "connected"}
+    assert all(r.dest_protocol == "ospf" and r.dest_ref == "1" for r in rows)  # dest_ref = process_id
+    assert (by_src["bgp"].source_ref, by_src["bgp"].route_map, by_src["bgp"].metric, by_src["bgp"].metric_type) == (
+        "65001",
+        "RM",
+        20,
+        "2",
+    )
+    assert (by_src["connected"].route_map, by_src["connected"].metric) == (None, None)
+
+
+async def test_put_ospf_intent_redistribution_full_replace_and_update(adapter_client):
+    """Re-PUT drops absent redistribution rows, updates the kept one, and queues a removal job."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Job, JobType, RedistributionIntent
+
+    device_id = await seed_device(nso_device_name="ospf-redist-replace", netbox_device_id=931)
+
+    def _body(redist: list[dict]) -> dict:
+        return {
+            "instances": [
+                {"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": [], "redistribution": redist}
+            ],
+            "interfaces": [],
+        }
+
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ospf-intent",
+        headers=AUTH,
+        json=_body(
+            [
+                {"source_protocol": "bgp", "source_ref": "65001", "route_map": "RM-A", "metric": 10},
+                {"source_protocol": "static", "source_ref": "", "route_map": None, "metric": None},
+            ]
+        ),
+    )
+    # Keep bgp (changed route_map/metric/type), drop static.
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ospf-intent",
+        headers=AUTH,
+        json=_body(
+            [{"source_protocol": "bgp", "source_ref": "65001", "route_map": "RM-B", "metric": 99, "metric_type": "1"}]
+        ),
+    )
+    assert resp.status_code == 200
+
+    async for db in get_session():
+        rows = (
+            (await db.execute(select(RedistributionIntent).where(RedistributionIntent.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        job = (
+            await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal))
+        ).scalar_one_or_none()
+        break
+    assert len(rows) == 1  # static dropped
+    assert rows[0].source_protocol == "bgp"
+    assert (rows[0].route_map, rows[0].metric, rows[0].metric_type) == ("RM-B", 99, "1")  # updated in place
+    assert job is not None  # redistribution removal alone enqueues the ospf removal job
+
+
+async def test_put_ospf_intent_interface_full_replace_and_update(adapter_client):
+    """Re-PUT drops an absent interface, updates the kept one in place, and queues a removal job."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Job, JobType, OspfInterfaceIntent
+
+    device_id = await seed_device(nso_device_name="ospf-iface-replace", netbox_device_id=932)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ospf-intent",
+        headers=AUTH,
+        json={
+            "instances": [],
+            "interfaces": [
+                {"interface_name": "GE0/0", "area_id": "0", "passive": False, "cost": 10},
+                {"interface_name": "GE0/1", "area_id": "0", "passive": False},
+            ],
+        },
+    )
+    # Keep GE0/0 (changed cost/passive), drop GE0/1.
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ospf-intent",
+        headers=AUTH,
+        json={
+            "instances": [],
+            "interfaces": [{"interface_name": "GE0/0", "area_id": "0", "passive": True, "cost": 50}],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["interface_count"] == 1
+
+    async for db in get_session():
+        ifaces = (
+            (await db.execute(select(OspfInterfaceIntent).where(OspfInterfaceIntent.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        job = (
+            await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal))
+        ).scalar_one_or_none()
+        break
+    assert [i.interface_name for i in ifaces] == ["GE0/0"]  # GE0/1 dropped
+    assert (ifaces[0].cost, ifaces[0].passive) == (50, True)  # updated in place
+    assert job is not None

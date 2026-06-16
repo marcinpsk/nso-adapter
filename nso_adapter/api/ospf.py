@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 import structlog
@@ -140,102 +141,148 @@ class OspfIntentUpdate(BaseModel):
     interfaces: list[OspfInterfaceEntry] = []
 
 
+async def _sync_keyed_intent(
+    db: AsyncSession,
+    model,
+    device_id: int,
+    *,
+    key_attr: str,
+    entries: list,
+    now: datetime,
+    apply_fields: Callable,
+    make_row: Callable,
+) -> list[str]:
+    """Full-replace one keyed OSPF intent collection.
+
+    Rows whose key is absent from *entries* are deleted; the rest are upserted
+    (``make_row`` builds a new row from key+accepted_at, ``apply_fields`` writes
+    the mutable fields on both new and existing rows). Returns the removed keys.
+    """
+    rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
+    existing = {getattr(r, key_attr): r for r in rows}
+    incoming = {getattr(e, key_attr) for e in entries}
+    removed = [k for k in existing if k not in incoming]
+    for k in removed:
+        await db.delete(existing[k])
+    for entry in entries:
+        row = existing.get(getattr(entry, key_attr))
+        if row is None:
+            row = make_row(entry, now)
+            db.add(row)
+        apply_fields(row, entry)
+    return removed
+
+
+def _apply_ospf_instance_fields(row: OspfInstanceIntent, e: OspfInstanceEntry) -> None:
+    row.router_id = e.router_id
+    row.vrf = e.vrf
+    row.areas = e.areas
+    row.enabled = e.enabled
+
+
+def _apply_ospf_interface_fields(row: OspfInterfaceIntent, e: OspfInterfaceEntry) -> None:
+    row.process_id = e.process_id
+    row.area_id = e.area_id
+    row.passive = e.passive
+    row.priority = e.priority
+    row.cost = e.cost
+    row.network_type = e.network_type
+    row.auth_type = e.auth_type
+    row.auth_key = e.auth_key
+
+
+def _iter_ospf_redistribution(instances: list[OspfInstanceEntry]):
+    """Yield ``(dest_ref, entry)`` for every per-instance redistribution entry (dest_ref = process_id)."""
+    for inst in instances:
+        dest_ref = str(inst.process_id)
+        for entry in inst.redistribution:
+            yield dest_ref, entry
+
+
+async def _sync_ospf_redistribution(
+    db: AsyncSession, device_id: int, instances: list[OspfInstanceEntry], now: datetime
+) -> list[tuple]:
+    """Full-replace OSPF (dest_protocol=ospf) redistribution intent rows. Returns the removed keys."""
+    existing = (
+        (
+            await db.execute(
+                select(RedistributionIntent).where(
+                    RedistributionIntent.device_id == device_id,
+                    RedistributionIntent.dest_protocol == "ospf",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    existing_map = {(r.dest_ref, r.source_protocol, r.source_ref): r for r in existing}
+    incoming_keys = {
+        (dest_ref, e.source_protocol, e.source_ref) for dest_ref, e in _iter_ospf_redistribution(instances)
+    }
+
+    removed = [k for k in existing_map if k not in incoming_keys]
+    for key in removed:
+        await db.delete(existing_map[key])
+
+    for dest_ref, entry in _iter_ospf_redistribution(instances):
+        key = (dest_ref, entry.source_protocol, entry.source_ref)
+        row = existing_map.get(key)
+        if row is None:
+            row = RedistributionIntent(
+                device_id=device_id,
+                dest_protocol="ospf",
+                dest_ref=dest_ref,
+                source_protocol=entry.source_protocol,
+                source_ref=entry.source_ref,
+                accepted_at=now,
+            )
+            db.add(row)
+        row.route_map = entry.route_map
+        row.metric = entry.metric
+        row.metric_type = entry.metric_type
+    return removed
+
+
 @router.put("/{device_id}/ospf-intent", dependencies=[Depends(verify_token)])
-async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSession = Depends(get_db)):  # noqa: C901
+async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSession = Depends(get_db)):
+    """Replace the adapter's OSPF intent mirror for this device atomically.
+
+    Full-replace semantics per device for instances, interfaces and (instance-scoped)
+    redistribution. If any of the three dropped a row, a `removal` job is queued so the
+    ospf-reconciler PUT-replace reverts it on-device (a merge-PATCH apply would not).
+    The removal runs in the background so this PUT never blocks on the device commit.
+    """
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
 
     now = datetime.now(UTC).replace(tzinfo=None)
 
-    # Full-replace instance intents
-    existing_inst = await db.execute(select(OspfInstanceIntent).where(OspfInstanceIntent.device_id == device_id))
-    existing_inst_map = {row.process_id: row for row in existing_inst.scalars().all()}
-    incoming_inst_pids = {e.process_id for e in payload.instances}
-
-    removed_any = [("inst", pid) for pid in existing_inst_map if pid not in incoming_inst_pids]
-    for pid in list(existing_inst_map):
-        if pid not in incoming_inst_pids:
-            await db.delete(existing_inst_map[pid])
-
-    for entry in payload.instances:
-        row = existing_inst_map.get(entry.process_id)
-        if row is None:
-            row = OspfInstanceIntent(device_id=device_id, process_id=entry.process_id, accepted_at=now)
-            db.add(row)
-        row.router_id = entry.router_id
-        row.vrf = entry.vrf
-        row.areas = entry.areas
-        row.enabled = entry.enabled
-
-    # Full-replace interface intents
-    existing_iface = await db.execute(select(OspfInterfaceIntent).where(OspfInterfaceIntent.device_id == device_id))
-    existing_iface_map = {row.interface_name: row for row in existing_iface.scalars().all()}
-    incoming_iface_names = {e.interface_name for e in payload.interfaces}
-
-    removed_any += [("iface", n) for n in existing_iface_map if n not in incoming_iface_names]
-    for name in list(existing_iface_map):
-        if name not in incoming_iface_names:
-            await db.delete(existing_iface_map[name])
-
-    for entry in payload.interfaces:
-        row = existing_iface_map.get(entry.interface_name)
-        if row is None:
-            row = OspfInterfaceIntent(device_id=device_id, interface_name=entry.interface_name, accepted_at=now)
-            db.add(row)
-        row.process_id = entry.process_id
-        row.area_id = entry.area_id
-        row.passive = entry.passive
-        row.priority = entry.priority
-        row.cost = entry.cost
-        row.network_type = entry.network_type
-        row.auth_type = entry.auth_type
-        row.auth_key = entry.auth_key
-
-    # Full-replace redistribution intent rows for this device (dest_protocol=ospf)
-    existing_redist = await db.execute(
-        select(RedistributionIntent).where(
-            RedistributionIntent.device_id == device_id,
-            RedistributionIntent.dest_protocol == "ospf",
-        )
+    removed_inst = await _sync_keyed_intent(
+        db,
+        OspfInstanceIntent,
+        device_id,
+        key_attr="process_id",
+        entries=payload.instances,
+        now=now,
+        apply_fields=_apply_ospf_instance_fields,
+        make_row=lambda e, ts: OspfInstanceIntent(device_id=device_id, process_id=e.process_id, accepted_at=ts),
     )
-    existing_redist_map = {(r.dest_ref, r.source_protocol, r.source_ref): r for r in existing_redist.scalars().all()}
-    incoming_redist_keys: set[tuple] = set()
-    for inst_entry in payload.instances:
-        dest_ref = str(inst_entry.process_id)
-        for re in inst_entry.redistribution:
-            incoming_redist_keys.add((dest_ref, re.source_protocol, re.source_ref))
+    removed_iface = await _sync_keyed_intent(
+        db,
+        OspfInterfaceIntent,
+        device_id,
+        key_attr="interface_name",
+        entries=payload.interfaces,
+        now=now,
+        apply_fields=_apply_ospf_interface_fields,
+        make_row=lambda e, ts: OspfInterfaceIntent(
+            device_id=device_id, interface_name=e.interface_name, accepted_at=ts
+        ),
+    )
+    removed_redist = await _sync_ospf_redistribution(db, device_id, payload.instances, now)
 
-    removed_any += [("redist", k) for k in existing_redist_map if k not in incoming_redist_keys]
-    for key in list(existing_redist_map):
-        if key not in incoming_redist_keys:
-            await db.delete(existing_redist_map[key])
-
-    for inst_entry in payload.instances:
-        dest_ref = str(inst_entry.process_id)
-        for re in inst_entry.redistribution:
-            key = (dest_ref, re.source_protocol, re.source_ref)
-            row = existing_redist_map.get(key)
-            if row is None:
-                row = RedistributionIntent(
-                    device_id=device_id,
-                    dest_protocol="ospf",
-                    dest_ref=dest_ref,
-                    source_protocol=re.source_protocol,
-                    source_ref=re.source_ref,
-                    accepted_at=now,
-                )
-                db.add(row)
-            row.route_map = re.route_map
-            row.metric = re.metric
-            row.metric_type = re.metric_type
-
-    # Removal propagation: if a process/interface/redist was dropped, queue an async
-    # removal job that PUT-replaces the ospf-reconciler instance with the full
-    # remaining desired state so FASTMAP reverts the removed entries. Enqueued in the
-    # same transaction as the deletes (atomic), and run in the background so this PUT
-    # never blocks on the device commit (which can exceed the client's 30s timeout).
-    if removed_any:
+    if removed_inst or removed_iface or removed_redist:
         from nso_adapter.core.removal import enqueue_removal
 
         await enqueue_removal(db, device_id, "ospf")

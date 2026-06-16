@@ -114,3 +114,42 @@ async def test_ospf_no_data_shape(adapter_client):
     assert set(body.keys()) == REQUIRED_TOP_KEYS
     assert body["instances"] == [] and body["interfaces"] == []
     assert body["refresh_source"] == "never"
+
+
+# ── GET endpoint behavior edges ───────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_ospf_get_device_not_found(adapter_client):
+    """GET for a non-existent device → 404."""
+    resp = await adapter_client.get("/api/v1/devices/99999/ospf", headers=AUTH)
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "not_found"
+
+
+@pytest.mark.anyio
+async def test_ospf_instance_enabled_emitted_when_set(adapter_client):
+    """An instance with an explicit admin-state emits ``enabled`` in the response."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import DeviceOspfInstance
+
+    device_id = await seed_device(nso_device_name="ospf-enabled-dev", netbox_device_id=7932)
+    async for db in get_session():
+        db.add(
+            DeviceOspfInstance(
+                device_id=device_id,
+                process_id="1",
+                vrf="",
+                areas=[],
+                enabled=False,  # explicit admin-state down → must appear (not omitted)
+                last_refreshed_at=datetime(2026, 6, 1, 10, 0, 0),
+                refresh_source="poll",
+            )
+        )
+        await db.commit()
+        break
+
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/ospf", headers=AUTH)
+    assert resp.status_code == 200
+    inst = resp.json()["instances"][0]
+    assert inst["enabled"] is False
