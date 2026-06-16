@@ -37,25 +37,110 @@ def _snake(d: dict) -> dict:
     return {k.replace("-", "_"): v for k, v in d.items()}
 
 
+# Process attributes surfaced only when not None (kept in their on-wire order).
+_PROCESS_OPTIONAL_FIELDS = (
+    "net",
+    "is_type",
+    "metric_style",
+    "overload_bit",
+    "area_auth_type",
+    "area_auth_present",
+    "area_auth_key",
+    "domain_auth_type",
+    "domain_auth_present",
+    "domain_auth_key",
+    "spf_initial_wait",
+    "spf_max_wait",
+    "lsp_initial_wait",
+    "lsp_max_wait",
+    "lsp_lifetime",
+    "lsp_refresh_interval",
+    "lsp_mtu",
+    "overload_on_startup",
+    "overload_timeout",
+    "te_enabled",
+    "sr_enabled",
+    "sr_node_msd",
+    "distance",
+    "maximum_paths",
+    "reference_bandwidth",
+)
+_INTERFACE_OPTIONAL_FIELDS = (
+    "circuit_type",
+    "network_type",
+    "metric",
+    "bound_port",
+    "hello_auth_type",
+    "hello_auth_present",
+    "bfd_enabled",
+    "csnp_interval",
+    "retransmit_interval",
+    "lsp_interval",
+    "mesh_group",
+)
+
+
+def _present_fields(row, names: tuple[str, ...]) -> dict:
+    """Include each named column only when its value is not None."""
+    return {n: getattr(row, n) for n in names if getattr(row, n) is not None}
+
+
+def _serialize_isis_process(row: DeviceIsisProcess) -> dict:
+    entry: dict = {"process_tag": row.process_tag, **_present_fields(row, _PROCESS_OPTIONAL_FIELDS)}
+    if row.settings:
+        entry["settings"] = row.settings
+    if row.levels:
+        entry["levels"] = [_snake(lvl) for lvl in row.levels]
+    if row.segment_routing:
+        entry["segment_routing"] = _snake(row.segment_routing)
+    if row.flex_algos:
+        entry["flex_algos"] = [_snake(fa) for fa in row.flex_algos]
+    return entry
+
+
+def _serialize_isis_interface(row: DeviceIsisInterface) -> dict:
+    entry: dict = {
+        "interface_name": row.interface_name,
+        "af": row.af,
+        "process_tag": row.process_tag,
+        **_present_fields(row, _INTERFACE_OPTIONAL_FIELDS),
+    }
+    if row.settings:
+        entry["settings"] = row.settings
+    if row.levels:
+        entry["levels"] = [_snake(lvl) for lvl in row.levels]
+    entry["passive"] = row.passive
+    return entry
+
+
 @router.get("/{device_id}/isis-interfaces", dependencies=[Depends(verify_token)])
-async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_db)):  # noqa: C901
+async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
 
-    proc_result = await db.execute(
-        select(DeviceIsisProcess)
-        .where(DeviceIsisProcess.device_id == device_id)
-        .order_by(DeviceIsisProcess.process_tag)
+    proc_rows = (
+        (
+            await db.execute(
+                select(DeviceIsisProcess)
+                .where(DeviceIsisProcess.device_id == device_id)
+                .order_by(DeviceIsisProcess.process_tag)
+            )
+        )
+        .scalars()
+        .all()
     )
-    proc_rows = proc_result.scalars().all()
-
-    iface_result = await db.execute(
-        select(DeviceIsisInterface)
-        .where(DeviceIsisInterface.device_id == device_id)
-        .order_by(DeviceIsisInterface.interface_name, DeviceIsisInterface.af)
+    iface_rows = (
+        (
+            await db.execute(
+                select(DeviceIsisInterface)
+                .where(DeviceIsisInterface.device_id == device_id)
+                .order_by(DeviceIsisInterface.interface_name, DeviceIsisInterface.af)
+            )
+        )
+        .scalars()
+        .all()
     )
-    iface_rows = iface_result.scalars().all()
 
     all_rows = list(proc_rows) + list(iface_rows)
     if not all_rows:
@@ -68,99 +153,13 @@ async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_db)
         }
 
     latest = max(all_rows, key=lambda r: r.last_refreshed_at or "")
-
-    processes = []
-    for row in proc_rows:
-        entry: dict = {"process_tag": row.process_tag}
-        if row.net is not None:
-            entry["net"] = row.net
-        if row.is_type is not None:
-            entry["is_type"] = row.is_type
-        if row.metric_style is not None:
-            entry["metric_style"] = row.metric_style
-        if row.overload_bit is not None:
-            entry["overload_bit"] = row.overload_bit
-        if row.area_auth_type is not None:
-            entry["area_auth_type"] = row.area_auth_type
-        if row.area_auth_present is not None:
-            entry["area_auth_present"] = row.area_auth_present
-        if row.area_auth_key is not None:
-            entry["area_auth_key"] = row.area_auth_key
-        if row.domain_auth_type is not None:
-            entry["domain_auth_type"] = row.domain_auth_type
-        if row.domain_auth_present is not None:
-            entry["domain_auth_present"] = row.domain_auth_present
-        if row.domain_auth_key is not None:
-            entry["domain_auth_key"] = row.domain_auth_key
-        for col in (
-            "spf_initial_wait",
-            "spf_max_wait",
-            "lsp_initial_wait",
-            "lsp_max_wait",
-            "lsp_lifetime",
-            "lsp_refresh_interval",
-            "lsp_mtu",
-            "overload_on_startup",
-            "overload_timeout",
-            "te_enabled",
-            "sr_enabled",
-            "sr_node_msd",
-            "distance",
-            "maximum_paths",
-            "reference_bandwidth",
-        ):
-            val = getattr(row, col)
-            if val is not None:
-                entry[col] = val
-        if row.settings:
-            entry["settings"] = row.settings
-        if row.levels:
-            entry["levels"] = [_snake(lvl) for lvl in row.levels]
-        if row.segment_routing:
-            entry["segment_routing"] = _snake(row.segment_routing)
-        if row.flex_algos:
-            entry["flex_algos"] = [_snake(fa) for fa in row.flex_algos]
-        processes.append(entry)
-
-    interfaces = []
-    for row in iface_rows:
-        entry = {
-            "interface_name": row.interface_name,
-            "af": row.af,
-            "process_tag": row.process_tag,
-        }
-        if row.circuit_type is not None:
-            entry["circuit_type"] = row.circuit_type
-        if row.network_type is not None:
-            entry["network_type"] = row.network_type
-        if row.metric is not None:
-            entry["metric"] = row.metric
-        if row.bound_port is not None:
-            entry["bound_port"] = row.bound_port
-        if row.hello_auth_type is not None:
-            entry["hello_auth_type"] = row.hello_auth_type
-        if row.hello_auth_present is not None:
-            entry["hello_auth_present"] = row.hello_auth_present
-        if row.bfd_enabled is not None:
-            entry["bfd_enabled"] = row.bfd_enabled
-        for col in ("csnp_interval", "retransmit_interval", "lsp_interval", "mesh_group"):
-            val = getattr(row, col)
-            if val is not None:
-                entry[col] = val
-        if row.settings:
-            entry["settings"] = row.settings
-        if row.levels:
-            entry["levels"] = [_snake(lvl) for lvl in row.levels]
-        entry["passive"] = row.passive
-        interfaces.append(entry)
-
     last_ts = latest.last_refreshed_at
     return {
         "device_id": device_id,
         "last_refreshed_at": last_ts.isoformat() + "Z" if last_ts else None,
         "refresh_source": latest.refresh_source,
-        "processes": processes,
-        "interfaces": interfaces,
+        "processes": [_serialize_isis_process(r) for r in proc_rows],
+        "interfaces": [_serialize_isis_interface(r) for r in iface_rows],
     }
 
 

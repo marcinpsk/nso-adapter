@@ -61,3 +61,10 @@ async def test_isis_interface_omits_bound_port_when_none(adapter_client):
     ifaces = resp.json()["interfaces"]
     assert len(ifaces) == 1
     assert "bound_port" not in ifaces[0]
+
+
+async def test_isis_interfaces_device_not_found(adapter_client):
+    """GET for a non-existent device → 404."""
+    resp = await adapter_client.get("/api/v1/devices/99999/isis-interfaces", headers=AUTH)
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "not_found"
