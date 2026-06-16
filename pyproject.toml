@@ -66,9 +66,6 @@ omit = [
     # GRANDFATHERED — full pipeline importer, currently integration-only.
     # Pure helpers should be extracted and unit-tested.
     "nso_adapter/core/importer.py",
-    # GRANDFATHERED — Vault secrets backend, requires a live Vault instance.
-    # Parsing/resolution logic should be extracted and unit-tested.
-    "nso_adapter/secrets/vault.py",
 ]
 
 [tool.coverage.report]
