@@ -12,6 +12,7 @@ Sync flow (docs/nso-adapter.md §7):
 from __future__ import annotations
 
 from datetime import datetime
+from typing import NamedTuple
 
 import structlog
 from sqlalchemy import select
@@ -182,23 +183,159 @@ async def refresh_routing_surfaces_for_device(
             )
 
 
-async def sync_device(device_id: int, db: AsyncSession) -> dict:  # noqa: C901
+class _WriteCtx(NamedTuple):
+    """NetBox write context threaded through the per-interface reconcile.
+
+    ``attr_patches`` / ``pending_by_id`` are accumulators mutated in place: the
+    merged PATCH rows, and the (attr_state, value) updates applied only once the
+    bulk PATCH confirms each id was written.
+    """
+
+    nb_client: object
+    device: Device
+    nb_id_by_name: dict[str, int]
+    attr_patches: dict[int, dict]
+    pending_by_id: dict[int, list[tuple]]
+
+
+async def _resolve_ned_id(db: AsyncSession, device: Device, client: NsoClient) -> None:
+    """Resolve the device's NED ID from NSO if unset; mark unmatched + raise on failure."""
+    if device.ned_id:
+        return
+    device.ned_id = await client.get_device_ned_id(device.nso_device_name)
+    if not device.ned_id:
+        device.mapping_status = MappingStatus.unmatched_device
+        device.last_sync_at = datetime.utcnow()
+        device.last_sync_status = LastSyncStatus.failed
+        await db.commit()
+        raise ValueError(f"NSO device {device.nso_device_name!r} not found or has no NED ID")
+
+
+async def _ensure_netbox_interfaces(nb_client, device: Device, device_id: int, interfaces) -> dict[str, int]:
+    """Phase 1: bulk-ensure every NSO interface exists in NetBox; return name→nb_id (best-effort)."""
+    if not (nb_client and device.netbox_device_id):
+        return {}
+    from nso_adapter.bindings.netbox.mapper import bulk_ensure_interfaces
+
+    try:
+        return await bulk_ensure_interfaces(
+            nb_client,
+            device.netbox_device_id,
+            # M27R: pass parent_binding/kind so Nokia logical interfaces are created
+            # by their faithful name, parented to the bound port/LAG.
+            [{"name": i.name, "parent_binding": i.parent_binding, "kind": i.kind} for i in interfaces],
+        )
+    except Exception as exc:
+        logger.warning("netbox.bulk_ensure_failed", device_id=device_id, error=str(exc))
+        return {}
+
+
+async def _upsert_db_interface(db: AsyncSession, device_id: int, iface, existing_ifaces) -> tuple[DbInterface, bool]:
+    """Upsert the DbInterface row + keep the M27R logical-modeling fields fresh. Returns (row, created)."""
+    db_iface = existing_ifaces.get(iface.name)
+    created = False
+    if db_iface is None:
+        db_iface = DbInterface(device_id=device_id, name=iface.name)
+        db.add(db_iface)
+        await db.flush()  # get id before upserting attr states
+        created = True
+    existing_ifaces[iface.name] = db_iface
+    # M27R: NULL/empty for physical ports and for Cisco/Junos.
+    db_iface.parent_binding = iface.parent_binding
+    db_iface.kind = iface.kind
+    db_iface.encap_tag = iface.encap_tag
+    db_iface.vrf = iface.vrf
+    db_iface.service = iface.service
+    return db_iface, created
+
+
+def _reconcile_attr(db, db_iface, attr, iface, intent_by_attr, existing_attrs, ctx: _WriteCtx) -> bool:
+    """Compute one attribute's sync_state, queue a NetBox write if it changed, update the state row.
+
+    Returns True if a Phase-1 ``changed`` was detected (drives changes_detected).
+    """
+    nso_val = iface.nso.description if attr == "description" else iface.nso.enabled
+    nso_str = str(nso_val) if nso_val is not None else None
+
+    attr_state = existing_attrs.get(attr)
+    if attr_state is None:
+        attr_state = InterfaceAttrState(interface_id=db_iface.id, attribute=attr)
+        db.add(attr_state)
+
+    intent_val = intent_by_attr.get(attr)
+    prev_netbox_val = attr_state.netbox_value
+    status = compute_sync_state(nso_str, prev_netbox_val, intent_val)
+    changed = status == SyncState.changed
+
+    # Queue a NetBox write only when the value differs from what we last successfully
+    # wrote (netbox_value, updated after the Phase 2 flush confirms it) — without this
+    # every sync re-patches every interface, overwhelming NetBox.
+    if ctx.nb_client and ctx.device.netbox_device_id:
+        nb_id = ctx.nb_id_by_name.get(iface.name)
+        if nb_id is not None:
+            if db_iface.netbox_interface_id is None:
+                db_iface.netbox_interface_id = nb_id
+            if prev_netbox_val != nso_str:
+                field_payload: dict = {}
+                if attr == "description":
+                    field_payload["description"] = iface.nso.description or ""
+                elif iface.nso.enabled is not None:
+                    field_payload["enabled"] = iface.nso.enabled
+                else:
+                    return changed  # NSO package didn't report enabled; skip write + state update
+                ctx.attr_patches.setdefault(nb_id, {"id": nb_id}).update(field_payload)
+                ctx.pending_by_id.setdefault(nb_id, []).append((attr_state, nso_str))
+
+    attr_state.nso_value = nso_str
+    if intent_val is not None:
+        # Phase 2: intent deployed — use in_sync/drifted; never downgrade to "imported".
+        attr_state.sync_state = status
+    else:
+        # Phase 1: "imported" when values match (netbox_value lags one flush — self-heals).
+        attr_state.sync_state = SyncState.imported if attr_state.netbox_value == nso_str else status
+    attr_state.last_checked_at = datetime.utcnow()
+    return changed
+
+
+async def _reconcile_interface(db, device_id, iface, scope_attrs, existing_ifaces, ctx: _WriteCtx) -> tuple[bool, int]:
+    """Upsert one interface + reconcile each in-scope attr. Returns (created, changes_detected)."""
+    db_iface, created = await _upsert_db_interface(db, device_id, iface, existing_ifaces)
+
+    # InterfaceIntent is the single source of truth for deployed intent (Phase 1 vs 2).
+    attr_result = await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id == db_iface.id))
+    existing_attrs = {row.attribute: row for row in attr_result.scalars().all()}
+    intent_by_attr = await _load_intent_by_attr(db, db_iface.id)
+
+    changes = 0
+    for attr in ("description", "enabled"):
+        if attr not in scope_attrs:
+            continue
+        if _reconcile_attr(db, db_iface, attr, iface, intent_by_attr, existing_attrs, ctx):
+            changes += 1
+    return created, changes
+
+
+async def _flush_netbox_patches(nb_client, attr_patches, pending_by_id) -> int:
+    """Phase 2: push the batched PATCHes; mark netbox_value only for confirmed ids. Returns count."""
+    if not (nb_client and attr_patches):
+        return 0
+    written = await nb_client.bulk_patch_interfaces(list(attr_patches.values()))
+    count = 0
+    for obj in written:
+        for attr_state, nso_str in pending_by_id.get(obj["id"], []):
+            attr_state.netbox_value = nso_str
+            count += 1
+    return count
+
+
+async def sync_device(device_id: int, db: AsyncSession) -> dict:
     """Full sync: NSO → DB → NetBox. Returns job result summary dict."""
     device = await db.get(Device, device_id)
     if not device:
         raise ValueError(f"Device {device_id} not found")
 
     client = get_nso_client(device.nso_instance)
-
-    # Resolve NED ID if not yet set
-    if not device.ned_id:
-        device.ned_id = await client.get_device_ned_id(device.nso_device_name)
-        if not device.ned_id:
-            device.mapping_status = MappingStatus.unmatched_device
-            device.last_sync_at = datetime.utcnow()
-            device.last_sync_status = LastSyncStatus.failed
-            await db.commit()
-            raise ValueError(f"NSO device {device.nso_device_name!r} not found or has no NED ID")
+    await _resolve_ned_id(db, device, client)
 
     # Step 1: sync-from — refresh CDB from live device
     await nso_actions.sync_from(client, device.nso_device_name)
@@ -207,140 +344,29 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:  # noqa: C901
     attrs = await client.get_interface_attributes(device.nso_device_name)
     interfaces = _attrs_to_interface_list(attrs)
 
-    # Determine which attributes are in scope
     scope_result = await db.execute(select(ManagedScope).where(ManagedScope.device_id == device_id))
     scope_attrs = [s.attribute for s in scope_result.scalars().all()]
 
-    # Build lookup: interface name → DbInterface row
     result_rows = await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))
     existing_ifaces: dict[str, DbInterface] = {row.name: row for row in result_rows.scalars().all()}
 
-    # ── Phase 1: bulk interface inventory reconcile (plan Layer A) ──
-    # Ensure every NSO-reported interface (incl. logical units as virtual
-    # subinterfaces parented to their base) exists in NetBox in a few bulk
-    # requests, instead of a GET+POST per interface. Returns name→nb_id.
+    # Phase 1: bulk interface inventory reconcile (plan Layer A).
     nb_client = get_netbox_client()
-    nb_id_by_name: dict[str, int] = {}
-    if nb_client and device.netbox_device_id:
-        from nso_adapter.bindings.netbox.mapper import bulk_ensure_interfaces
-
-        try:
-            nb_id_by_name = await bulk_ensure_interfaces(
-                nb_client,
-                device.netbox_device_id,
-                # M27R: pass parent_binding/kind so Nokia logical interfaces are created
-                # by their faithful name, parented to the bound port/LAG.
-                [{"name": i.name, "parent_binding": i.parent_binding, "kind": i.kind} for i in interfaces],
-            )
-        except Exception as exc:
-            logger.warning("netbox.bulk_ensure_failed", device_id=device_id, error=str(exc))
+    nb_id_by_name = await _ensure_netbox_interfaces(nb_client, device, device_id, interfaces)
 
     interfaces_created = 0
-    interfaces_written = 0
     changes_detected = 0
-    # Batched NetBox attribute updates (Phase 2), merged per interface id so
-    # description+enabled on one interface become a single PATCH row.
-    attr_patches: dict[int, dict] = {}
-    # Pending state updates keyed by NetBox interface id: applied ONLY after the
-    # bulk PATCH confirms that id was written, so a failed/timed-out batch does
-    # not falsely mark state as synced (which would skip it forever).
-    pending_by_id: dict[int, list[tuple]] = {}
-
+    ctx = _WriteCtx(nb_client, device, nb_id_by_name, {}, {})
     for iface in interfaces:
-        # Upsert DbInterface row
-        db_iface = existing_ifaces.get(iface.name)
-        if db_iface is None:
-            db_iface = DbInterface(device_id=device_id, name=iface.name)
-            db.add(db_iface)
-            await db.flush()  # get id before upserting attr states
-            interfaces_created += 1
-        existing_ifaces[iface.name] = db_iface
-        # M27R: keep the logical-interface modeling fields fresh on every sync
-        # (NULL/empty for physical ports and for Cisco/Junos).
-        db_iface.parent_binding = iface.parent_binding
-        db_iface.kind = iface.kind
-        db_iface.encap_tag = iface.encap_tag
-        db_iface.vrf = iface.vrf
-        db_iface.service = iface.service
+        created, changes = await _reconcile_interface(db, device_id, iface, scope_attrs, existing_ifaces, ctx)
+        interfaces_created += int(created)
+        changes_detected += changes
 
-        # Step 3: compute per-attribute sync_state
-        # Load existing attr_states + the deployed intent (single source of truth:
-        # InterfaceIntent, written by PUT /intent / apply / scheduler).
-        attr_result = await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id == db_iface.id))
-        existing_attrs: dict[str, InterfaceAttrState] = {row.attribute: row for row in attr_result.scalars().all()}
-        intent_by_attr = await _load_intent_by_attr(db, db_iface.id)
-
-        for attr in ("description", "enabled"):
-            if attr not in scope_attrs:
-                continue
-            nso_val = iface.nso.description if attr == "description" else iface.nso.enabled
-            nso_str = str(nso_val) if nso_val is not None else None
-
-            attr_state = existing_attrs.get(attr)
-            if attr_state is None:
-                attr_state = InterfaceAttrState(interface_id=db_iface.id, attribute=attr)
-                db.add(attr_state)
-
-            intent_val = intent_by_attr.get(attr)
-            prev_netbox_val = attr_state.netbox_value
-            status = compute_sync_state(nso_str, prev_netbox_val, intent_val)
-            if status == SyncState.changed:
-                changes_detected += 1
-
-            # Step 4 & 5: queue NetBox write (batched) + update state.
-            # Phase 1 already created the interface; resolve its id by name.
-            if nb_client and device.netbox_device_id:
-                nb_id = nb_id_by_name.get(iface.name)
-                if nb_id is not None:
-                    if db_iface.netbox_interface_id is None:
-                        db_iface.netbox_interface_id = nb_id
-                    # Change detection: only enqueue a NetBox write when the value
-                    # actually differs from what we last successfully wrote. Without
-                    # this, every sync re-patches every interface (thousands of
-                    # no-op writes) — which overwhelms NetBox and breeds lock
-                    # contention. netbox_value is updated AFTER the bulk PATCH
-                    # confirms the write (see Phase 2 flush), never optimistically,
-                    # so a failed batch is safely retried next sync.
-                    if prev_netbox_val != nso_str:
-                        field_payload: dict = {}
-                        if attr == "description":
-                            field_payload["description"] = iface.nso.description or ""
-                        elif iface.nso.enabled is not None:
-                            field_payload["enabled"] = iface.nso.enabled
-                        else:
-                            continue  # NSO package didn't report enabled; skip write
-                        attr_patches.setdefault(nb_id, {"id": nb_id}).update(field_payload)
-                        pending_by_id.setdefault(nb_id, []).append((attr_state, nso_str))
-
-            attr_state.nso_value = nso_str
-            if intent_val is not None:
-                # Phase 2: intent has been deployed — use in_sync/drifted from compute_sync_state.
-                # Never downgrade to "imported" even if netbox_value == nso_str.
-                attr_state.sync_state = status
-            else:
-                # Phase 1: no intent yet — mark as "imported" when values match.
-                # Note: netbox_value is only updated after the Phase 2 flush
-                # confirms the write, so a just-written attr stays non-"imported"
-                # until the next reconcile flips it (one-sync lag, self-heals).
-                attr_state.sync_state = SyncState.imported if attr_state.netbox_value == nso_str else status
-            attr_state.last_checked_at = datetime.utcnow()
-
-    # ── Phase 2 flush: push queued attribute updates, batched + isolated ──
-    # Mark netbox_value ONLY for ids the bulk PATCH confirms as written, so a
-    # failed/timed-out batch is safely re-attempted on the next sync rather than
-    # falsely recorded as in-sync.
-    if nb_client and attr_patches:
-        written = await nb_client.bulk_patch_interfaces(list(attr_patches.values()))
-        for obj in written:
-            for attr_state, nso_str in pending_by_id.get(obj["id"], []):
-                attr_state.netbox_value = nso_str
-                interfaces_written += 1
+    # Phase 2 flush: push queued attribute updates, batched + isolated.
+    interfaces_written = await _flush_netbox_patches(nb_client, ctx.attr_patches, ctx.pending_by_id)
 
     # Update device sync state
-    mapping_status = MappingStatus.mapped
-    if not interfaces:
-        mapping_status = MappingStatus.unmatched_interfaces
-    device.mapping_status = mapping_status
+    device.mapping_status = MappingStatus.mapped if interfaces else MappingStatus.unmatched_interfaces
     device.last_sync_at = datetime.utcnow()
     device.last_sync_status = LastSyncStatus.succeeded
     await db.commit()
