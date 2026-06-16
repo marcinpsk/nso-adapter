@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy import select
 
 from nso_adapter.core.apply import _nokia_routed_kind, enqueue_apply, run_apply
 from nso_adapter.store.db import get_session
@@ -322,6 +324,166 @@ async def test_collect_apply_diff_covers_multiple_scopes(adapter_client):
             diffs = await collect_apply_diff(db, device_id)
             break
     assert diffs == {"ospf": "OSPF DELTA", "static_route": "STATIC DELTA"}
+
+
+async def test_collect_apply_diff_device_not_found(adapter_client):
+    """A dry-run preview for an unknown device returns an empty mapping (no NSO call)."""
+    from nso_adapter.core.apply import collect_apply_diff
+
+    async for db in get_session():
+        diffs = await collect_apply_diff(db, 999999)
+        break
+    assert diffs == {}
+
+
+async def test_collect_apply_diff_covers_every_scope(adapter_client):
+    """Every scope with accepted intent gets dry-run and keyed by scope name.
+
+    Locks the per-scope wiring in collect_apply_diff: interface attrs/IPs, OSPF, IS-IS,
+    BGP, route-policy, SNMP, static routes, logging, SVI, subinterface, VLAN, BFD, MTU
+    and L2 SAP each produce their own delta.
+    """
+    from nso_adapter.core.apply import collect_apply_diff
+    from nso_adapter.store import models as m
+
+    device_id = await _seed_device("rtr-diff-all", 196)
+    async for db in get_session():
+        dev = await db.get(Device, device_id)
+        dev.ned_id = "cisco-ios-cli-6.95"
+        iface = DbInterface(device_id=device_id, name="GigabitEthernet0/0", netbox_interface_id=900)
+        db.add(iface)
+        await db.flush()
+        db.add(
+            m.InterfaceIntent(
+                interface_id=iface.id, attribute="description", intent_value="uplink", accepted_at=datetime.utcnow()
+            )
+        )
+        db.add(
+            m.InterfaceIpIntent(
+                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.utcnow()
+            )
+        )
+        db.add(
+            m.OspfInstanceIntent(
+                device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow()
+            )
+        )
+        db.add(
+            m.IsisInterfaceIntent(device_id=device_id, interface_name="Gi0/0", af="ipv4", accepted_at=datetime.utcnow())
+        )
+        db.add(m.BgpRouterIntent(device_id=device_id, asn="65000", accepted_at=datetime.utcnow()))
+        db.add(
+            m.RoutePolicyObjectIntent(
+                device_id=device_id, family="ipv4", name="RM", entries=[], accepted_at=datetime.utcnow()
+            )
+        )
+        db.add(
+            m.SnmpCommunityIntent(
+                device_id=device_id, label="ro", vault_ref="vault://ro", access="ro", accepted_at=datetime.utcnow()
+            )
+        )
+        db.add(
+            m.StaticRouteIntent(
+                device_id=device_id, prefix="10.1.0.0/24", next_hop="10.1.0.1", accepted_at=datetime.utcnow()
+            )
+        )
+        db.add(m.LoggingHostIntent(device_id=device_id, address="10.0.0.99", accepted_at=datetime.utcnow()))
+        db.add(m.SviIntent(device_id=device_id, interface_name="Vlan10", vlan_id=10, accepted_at=datetime.utcnow()))
+        db.add(m.SubinterfaceIntent(device_id=device_id, interface_name="Gi0/0.10", accepted_at=datetime.utcnow()))
+        db.add(m.VlanIntent(device_id=device_id, vlan_id=20, accepted_at=datetime.utcnow()))
+        db.add(m.BfdIntent(device_id=device_id, interface_name="Gi0/1", accepted_at=datetime.utcnow()))
+        db.add(
+            m.InterfaceMtuIntent(device_id=device_id, interface_name="Gi0/2", mtu=9000, accepted_at=datetime.utcnow())
+        )
+        db.add(
+            m.L2SapIntent(
+                device_id=device_id,
+                service_name="EPIPE-1",
+                service_type="epipe",
+                sap_id="1/1/1",
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    # Each dry-run returns a distinct, non-empty native delta keyed off its scope.
+    patches = {
+        "apply_interface_attribute": "ATTR",
+        "apply_interface_ips": "IP",
+        "apply_ospf_config": "OSPF",
+        "apply_isis_interfaces": "ISIS",
+        "apply_bgp_config": "BGP",
+        "apply_route_policy_config": "RP",
+        "apply_snmp_config": "SNMP",
+        "apply_static_routes": "SR",
+        "apply_logging_config": "LOG",
+        "apply_svi_config": "SVI",
+        "apply_subinterface_config": "SUBIF",
+        "apply_vlan_config": "VLAN",
+        "apply_bfd_config": "BFD",
+        "apply_mtu_config": "MTU",
+        "apply_l2_saps": "L2",
+    }
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
+        with ExitStack() as stack:
+            for fn, delta in patches.items():
+                stack.enter_context(patch(f"nso_adapter.nso.apply.{fn}", new_callable=AsyncMock, return_value=delta))
+            async for db in get_session():
+                diffs = await collect_apply_diff(db, device_id)
+                break
+
+    assert diffs == {
+        "interface_attribute": "ATTR",
+        "interface_ip": "IP",
+        "ospf": "OSPF",
+        "isis": "ISIS",
+        "bgp": "BGP",
+        "route_policy": "RP",
+        "snmp": "SNMP",
+        "static_route": "SR",
+        "logging": "LOG",
+        "svi": "SVI",
+        "subinterface": "SUBIF",
+        "vlan": "VLAN",
+        "bfd": "BFD",
+        "interface_mtu": "MTU",
+        "l2_sap": "L2",
+    }
+
+
+async def test_collect_apply_diff_scope_failure_is_isolated(adapter_client):
+    """A scope whose dry-run raises is logged and skipped; other scopes still report."""
+    from nso_adapter.core.apply import collect_apply_diff
+    from nso_adapter.store.models import OspfInstanceIntent, StaticRouteIntent
+
+    device_id = await _seed_device("rtr-diff-iso", 195)
+    async for db in get_session():
+        db.add(
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+        )
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id, prefix="10.2.0.0/24", next_hop="10.2.0.1", accepted_at=datetime.utcnow()
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch(
+            "nso_adapter.nso.apply.apply_ospf_config", new_callable=AsyncMock, side_effect=RuntimeError("dry-run boom")
+        ),
+        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock, return_value="STATIC DELTA"),
+    ):
+        async for db in get_session():
+            diffs = await collect_apply_diff(db, device_id)
+            break
+    # ospf raised → omitted; static_route still present
+    assert diffs == {"static_route": "STATIC DELTA"}
 
 
 async def test_run_apply_all_succeed(adapter_client):
@@ -667,4 +829,459 @@ async def test_run_apply_bgp_intent_does_not_crash_on_commit(adapter_client):
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["bgp_count_by_outcome"]["in_sync"] == 1
+        break
+
+
+# ── Per-scope apply passes (SNMP / static-route / logging / SVI / subif / VLAN /
+#    BFD / MTU / L2-SAP / IS-IS / route-policy / OSPF) ─────────────────────────
+#
+# These passes share one shape: collect accepted rows → call the scope's
+# nso.apply function → on success stamp last_apply_at and report in_sync; on
+# NsoApplyError/other stamp last_apply_error and report apply_failed. The
+# parametrized success test locks the wiring (right apply fn, right result key,
+# rows stamped) for every single-list scope; dedicated tests below cover the
+# multi-list scopes and the failure paths.
+
+
+# (model_name, row kwargs, patched nso.apply fn, result-dict key)
+_SCOPE_CASES = [
+    ("StaticRouteIntent", dict(prefix="10.9.0.0/24", next_hop="10.9.0.1"), "apply_static_routes", "static_route"),
+    ("LoggingHostIntent", dict(address="10.9.0.99"), "apply_logging_config", "logging"),
+    ("SviIntent", dict(interface_name="Vlan10", vlan_id=10), "apply_svi_config", "svi"),
+    ("SubinterfaceIntent", dict(interface_name="GigabitEthernet0/0.10"), "apply_subinterface_config", "subinterface"),
+    ("VlanIntent", dict(vlan_id=20), "apply_vlan_config", "vlan"),
+    ("BfdIntent", dict(interface_name="GigabitEthernet0/1"), "apply_bfd_config", "bfd"),
+    ("InterfaceMtuIntent", dict(interface_name="GigabitEthernet0/2", mtu=9000), "apply_mtu_config", "interface_mtu"),
+    (
+        "L2SapIntent",
+        dict(service_name="EPIPE-1", service_type="epipe", sap_id="1/1/1"),
+        "apply_l2_saps",
+        "l2_sap",
+    ),
+    (
+        "SnmpCommunityIntent",
+        dict(label="ro", vault_ref="vault://snmp/ro", access="ro"),
+        "apply_snmp_config",
+        "snmp",
+    ),
+    ("OspfInstanceIntent", dict(process_id="1", router_id="9.9.9.9"), "apply_ospf_config", "ospf"),
+    ("IsisInterfaceIntent", dict(interface_name="GigabitEthernet0/3", af="ipv4"), "apply_isis_interfaces", "isis"),
+]
+
+
+@pytest.mark.parametrize("model_name, kwargs, apply_fn, result_key", _SCOPE_CASES)
+async def test_run_apply_scope_success(adapter_client, model_name, kwargs, apply_fn, result_key):
+    """Each single-list scope applies its accepted rows and reports them in_sync."""
+    from nso_adapter.store import models as m
+
+    device_id = await _seed_device(f"rtr-{result_key}", 300)
+    job_id = await _seed_apply_job(device_id)
+    model = getattr(m, model_name)
+    async for db in get_session():
+        db.add(model(device_id=device_id, accepted_at=datetime.utcnow(), **kwargs))
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch(f"nso_adapter.nso.apply.{apply_fn}", new_callable=AsyncMock) as mock_apply,
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    mock_apply.assert_awaited_once()
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        assert job.result[f"{result_key}_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
+        # the row was stamped applied
+        rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
+        assert rows[0].last_apply_at is not None
+        assert rows[0].last_apply_error is None
+        break
+
+
+async def test_run_apply_scope_failure_marks_error(adapter_client):
+    """A scope NsoApplyError fails the job, stamps last_apply_error, and tags the item."""
+    from nso_adapter.nso.apply import NsoApplyError
+    from nso_adapter.store.models import StaticRouteIntent
+
+    device_id = await _seed_device("rtr-sr-fail", 310)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id, prefix="10.8.0.0/24", next_hop="10.8.0.1", accepted_at=datetime.utcnow()
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    nso_err = NsoApplyError(code="nso_error", message="route rejected", detail={"x": 1})
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock, side_effect=nso_err),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.result["static_route_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
+        assert job.error["code"] == "nso_commit_failed"
+        items = job.error["detail"]["items"]
+        assert {"type": "static_route", "error": "route rejected"} in items
+        rows = (
+            (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        assert rows[0].last_apply_error == {"code": "nso_error", "message": "route rejected", "detail": {"x": 1}}
+        break
+
+
+async def test_run_apply_scope_unexpected_exception(adapter_client):
+    """A non-NsoApplyError from a scope is caught, recorded as 'internal', job failed."""
+    from nso_adapter.store.models import VlanIntent
+
+    device_id = await _seed_device("rtr-vlan-boom", 311)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(VlanIntent(device_id=device_id, vlan_id=42, accepted_at=datetime.utcnow()))
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch(
+            "nso_adapter.nso.apply.apply_vlan_config",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("kaboom"),
+        ),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.result["vlan_count_by_outcome"]["apply_failed"] == 1
+        rows = (await db.execute(select(VlanIntent).where(VlanIntent.device_id == device_id))).scalars().all()
+        assert rows[0].last_apply_error["code"] == "internal"
+        assert "kaboom" in rows[0].last_apply_error["message"]
+        break
+
+
+async def test_run_apply_isis_applies_process_redist_and_flexalgo(adapter_client):
+    """The IS-IS pass stamps interface + process + redistribute + flex-algo rows together."""
+    from nso_adapter.store.models import (
+        IsisFlexAlgoIntent,
+        IsisInterfaceIntent,
+        IsisProcessIntent,
+        RedistributionIntent,
+    )
+
+    device_id = await _seed_device("rtr-isis-combo", 320)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            IsisInterfaceIntent(device_id=device_id, interface_name="Gi0/3", af="ipv4", accepted_at=datetime.utcnow())
+        )
+        db.add(IsisProcessIntent(device_id=device_id, accepted_at=datetime.utcnow()))
+        db.add(IsisFlexAlgoIntent(device_id=device_id, algo_id=128, accepted_at=datetime.utcnow()))
+        db.add(
+            RedistributionIntent(
+                device_id=device_id,
+                dest_protocol="isis",
+                source_protocol="connected",
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_isis_interfaces", new_callable=AsyncMock) as mock_isis,
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    mock_isis.assert_awaited_once()
+    call = mock_isis.await_args.kwargs
+    assert len(call["isis_intent_rows"]) == 1
+    assert len(call["isis_process_rows"]) == 1
+    assert len(call["redistribution_rows"]) == 1
+    assert len(call["flex_algo_rows"]) == 1
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        # in_sync counts every row across the four lists
+        assert job.result["isis_count_by_outcome"] == {"in_sync": 4, "apply_failed": 0}
+        break
+
+
+async def test_run_apply_ospf_applies_instance_interface_and_redist(adapter_client):
+    """The OSPF pass applies process + interface + ospf-destined redistribution together."""
+    from nso_adapter.store.models import OspfInstanceIntent, OspfInterfaceIntent, RedistributionIntent
+
+    device_id = await _seed_device("rtr-ospf-combo", 321)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+        )
+        db.add(OspfInterfaceIntent(device_id=device_id, interface_name="Gi0/4", accepted_at=datetime.utcnow()))
+        db.add(
+            RedistributionIntent(
+                device_id=device_id,
+                dest_protocol="ospf",
+                source_protocol="static",
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        # a bgp-destined redist row must NOT be swept into the ospf pass
+        db.add(
+            RedistributionIntent(
+                device_id=device_id, dest_protocol="bgp", source_protocol="static", accepted_at=datetime.utcnow()
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_ospf_config", new_callable=AsyncMock) as mock_ospf,
+        patch("nso_adapter.nso.apply.apply_bgp_config", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    mock_ospf.assert_awaited_once()
+    call = mock_ospf.await_args.kwargs
+    assert len(call["process_intent_rows"]) == 1
+    assert len(call["interface_intent_rows"]) == 1
+    assert len(call["redistribution_rows"]) == 1  # only the ospf-destined row
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.result["ospf_count_by_outcome"] == {"in_sync": 3, "apply_failed": 0}
+        break
+
+
+async def test_run_apply_snmp_applies_all_row_types(adapter_client):
+    """The SNMP pass stamps communities, v3 users, hosts and the single system-info row."""
+    from nso_adapter.store.models import (
+        SnmpCommunityIntent,
+        SnmpHostIntent,
+        SnmpSystemInfoIntent,
+        SnmpV3UserIntent,
+    )
+
+    device_id = await _seed_device("rtr-snmp-all", 322)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            SnmpCommunityIntent(
+                device_id=device_id, label="ro", vault_ref="vault://ro", access="ro", accepted_at=datetime.utcnow()
+            )
+        )
+        db.add(SnmpV3UserIntent(device_id=device_id, username="netops", accepted_at=datetime.utcnow()))
+        db.add(
+            SnmpHostIntent(
+                device_id=device_id,
+                address="10.7.0.5",
+                version="v2c",
+                notify_type="traps",
+                community_or_user="ro",
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        db.add(SnmpSystemInfoIntent(device_id=device_id, location="rack-7", accepted_at=datetime.utcnow()))
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock) as mock_snmp,
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    mock_snmp.assert_awaited_once()
+    call = mock_snmp.await_args.kwargs
+    assert len(call["community_intents"]) == 1
+    assert len(call["v3_user_intents"]) == 1
+    assert len(call["host_intents"]) == 1
+    assert call["system_info_intent"] is not None
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        # 3 list rows + 1 system-info row
+        assert job.result["snmp_count_by_outcome"] == {"in_sync": 4, "apply_failed": 0}
+        break
+
+
+async def test_run_apply_route_policy_failure_records_capability(adapter_client):
+    """A route-policy NsoApplyError fails the job AND records a capability rejection.
+
+    The device parser only rejects an unsupported construct on a real commit (dry-run
+    renders it), so the accepted-half learns the (ned, sw) limitation here.
+    """
+    from nso_adapter.nso.apply import NsoApplyError
+    from nso_adapter.store.models import RoutePolicyObjectIntent
+
+    device_id = await _seed_device("rtr-rp-fail", 323)
+    # give the device a ned_id so apply_route_policy_config gets one
+    async for db in get_session():
+        dev = await db.get(Device, device_id)
+        dev.ned_id = "cisco-ios-cli-6.95"
+        await db.commit()
+        break
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            RoutePolicyObjectIntent(
+                device_id=device_id,
+                family="ipv4",
+                name="RM-IN",
+                entries=[],
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    nso_err = NsoApplyError(code="nso_error", message="unsupported set community RM-IN", detail={})
+    rec = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_route_policy_config", new_callable=AsyncMock, side_effect=nso_err),
+        patch(
+            "nso_adapter.core.capability.refresh_device_capability",
+            new_callable=AsyncMock,
+            return_value={"ned_id": "cisco-ios-cli-6.95", "sw_version": "15.5"},
+        ),
+        patch(
+            "nso_adapter.core.capability.parse_rejected_construct",
+            return_value=("route-policy", "RM-IN"),
+        ),
+        patch("nso_adapter.core.capability.record_capability_rejection", new=rec),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    rec.assert_awaited_once()
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.result["route_policy_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
+        break
+
+
+async def test_run_apply_route_policy_capability_recording_is_best_effort(adapter_client):
+    """If capability recording itself raises, the apply still fails cleanly (swallowed)."""
+    from nso_adapter.nso.apply import NsoApplyError
+    from nso_adapter.store.models import RoutePolicyObjectIntent
+
+    device_id = await _seed_device("rtr-rp-cap-err", 324)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            RoutePolicyObjectIntent(
+                device_id=device_id, family="ipv4", name="RM-X", entries=[], accepted_at=datetime.utcnow()
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    nso_err = NsoApplyError(code="nso_error", message="boom", detail={})
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_route_policy_config", new_callable=AsyncMock, side_effect=nso_err),
+        patch(
+            "nso_adapter.core.capability.refresh_device_capability",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("capability backend down"),
+        ),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)  # must not raise
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.result["route_policy_count_by_outcome"]["apply_failed"] == 1
+        break
+
+
+async def test_run_apply_route_policy_capability_skips_record_when_unparseable(adapter_client):
+    """When the rejected construct can't be parsed (no name), no capability row is recorded."""
+    from nso_adapter.nso.apply import NsoApplyError
+    from nso_adapter.store.models import RoutePolicyObjectIntent
+
+    device_id = await _seed_device("rtr-rp-cap-skip", 325)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            RoutePolicyObjectIntent(
+                device_id=device_id, family="ipv4", name="RM-Y", entries=[], accepted_at=datetime.utcnow()
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    nso_err = NsoApplyError(code="nso_error", message="opaque error", detail={})
+    rec = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_route_policy_config", new_callable=AsyncMock, side_effect=nso_err),
+        patch(
+            "nso_adapter.core.capability.refresh_device_capability",
+            new_callable=AsyncMock,
+            return_value={"ned_id": "cisco-ios-cli-6.95", "sw_version": "15.5"},
+        ),
+        patch("nso_adapter.core.capability.parse_rejected_construct", return_value=(None, None)),
+        patch("nso_adapter.core.capability.record_capability_rejection", new=rec),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    rec.assert_not_awaited()
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        break
+
+
+async def test_run_apply_ip_unexpected_exception(adapter_client):
+    """A non-NsoApplyError from the IP pass is recorded as 'internal' and fails the job."""
+    from nso_adapter.store.models import InterfaceIpIntent
+
+    device_id = await _seed_device("rtr-ip-boom", 326)
+    iface_id = await _seed_iface(device_id, "GigabitEthernet0/9")
+    job_id = await _seed_apply_job(device_id)
+    await _seed_ip_intent(iface_id, address="10.6.0.1/24", family="ipv4")
+
+    mock_client = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch(
+            "nso_adapter.nso.apply.apply_interface_ips",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("transport exploded"),
+        ),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.result["ip_count_by_outcome"]["apply_failed"] == 1
+        rows = (
+            (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface_id)))
+            .scalars()
+            .all()
+        )
+        assert rows[0].last_apply_error["code"] == "internal"
+        assert "transport exploded" in rows[0].last_apply_error["message"]
         break

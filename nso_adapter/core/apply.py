@@ -14,12 +14,15 @@ Concurrency: relies on the existing one-job-per-device rule in core/jobs.py.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from typing import NamedTuple
 
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.nso.apply import NsoApplyError
 from nso_adapter.store.models import (
     BfdIntent,
     BgpRouterIntent,
@@ -414,11 +417,366 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
     return diffs
 
 
-async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:  # noqa: C901
-    """Background task: execute the apply for *device_id*."""
+# ── run_apply: shared eligibility + per-scope batch-commit helpers ────────────
+#
+# An "apply pass" pushes one scope's accepted intent to NSO and stamps the
+# outcome back onto the rows. Every scope shares the same eligibility filter and
+# the same success/failure bookkeeping, so that logic lives in the helpers below
+# and ``run_apply`` just wires the scopes together. Each scope commits as one
+# unit: on success every row gets ``last_apply_at`` and a cleared error; on any
+# failure every row records the error payload and the scope reports one item.
+
+
+# Result-dict keys in the order run_apply has always emitted them (also the order
+# failed items are reported in). Interface attributes + IPs come first and are
+# handled out-of-band (per-item, not per-batch); these are the batch scopes.
+_SCOPE_RESULT_ORDER = (
+    "snmp",
+    "static_route",
+    "logging",
+    "svi",
+    "subinterface",
+    "vlan",
+    "bfd",
+    "interface_mtu",
+    "l2_sap",
+    "isis",
+    "bgp",
+    "route_policy",
+    "ospf",
+)
+
+
+class _Scope(NamedTuple):
+    """One per-scope apply pass: which rows to stamp and how to push them."""
+
+    key: str  # result-dict key + failed-item "type"
+    log_label: str  # structlog event infix ("apply.<label>_failed")
+    rows: list  # every row stamped on success/failure; empty ⇒ scope skipped
+    make_coro: Callable[[], Awaitable]  # built lazily, only when rows is non-empty
+    on_nso_error: Callable[[NsoApplyError], Awaitable] | None = None
+
+
+def _is_eligible(row, force: bool) -> bool:
+    """Report whether an accepted intent row is Apply-eligible.
+
+    ``force=False`` additionally skips rows already applied cleanly (a non-null
+    ``last_apply_at`` with no ``last_apply_error``) — only pending/failed rows go.
+    """
+    if row.accepted_at is None:
+        return False
+    if not force and row.last_apply_at is not None and row.last_apply_error is None:
+        return False
+    return True
+
+
+async def _collect_eligible(db: AsyncSession, model, device_id: int, force: bool) -> list:
+    """All Apply-eligible rows of *model* for this device (one device-scoped query)."""
+    rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
+    return [r for r in rows if _is_eligible(r, force)]
+
+
+async def _maybe_sync_from(db: AsyncSession, client, device_name: str, device_id: int) -> None:
+    """Best-effort pre-apply sync-from (per-device gated by DeviceSettings).
+
+    A timed-out or partial prior commit leaves NSO's CDB inconsistent with the device;
+    the next apply is then refused ("device out of sync"). Re-reading the device first
+    clears it. A failure here must not abort the apply — the per-scope verify still
+    catches real problems. ``sync_before_apply=False`` skips it for NEDs that already
+    sync on connect.
+    """
+    settings_row = (
+        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    ).scalar_one_or_none()
+    if settings_row is not None and not settings_row.sync_before_apply:
+        return
+    try:
+        await client.sync_from(device_name)
+        logger.info("apply.sync_from.done", device=device_name)
+    except Exception as exc:
+        logger.warning("apply.sync_from.failed", device=device_name, error=str(exc))
+
+
+async def _collect_attr_eligibility(db: AsyncSession, ifaces: dict, force: bool) -> tuple[list, list]:
+    """Snapshot every interface-attribute intent row; return (snapshot, eligible 3-tuples).
+
+    Eligibility for attributes is keyed off the attr_state's sync_state (not last_apply_at):
+    every accepted row is snapshotted, but only those whose state is in the force/no-force
+    set are returned as ``(attr_state, intent_row, iface)`` for the per-attribute pass.
+    """
+    eligible_statuses = _FORCE_ELIGIBLE if force else _NO_FORCE_ELIGIBLE
+    snapshot: list[dict] = []
+    eligible: list[tuple] = []
+    for iface in ifaces.values():
+        intent_rows = (
+            (await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface.id))).scalars().all()
+        )
+        for intent_row in intent_rows:
+            attr_state = (
+                await db.execute(
+                    select(InterfaceAttrState).where(
+                        InterfaceAttrState.interface_id == iface.id,
+                        InterfaceAttrState.attribute == intent_row.attribute,
+                    )
+                )
+            ).scalar_one_or_none()
+            snapshot.append(
+                {
+                    "interface": iface.name,
+                    "attribute": intent_row.attribute,
+                    "intent_value": intent_row.intent_value,
+                    "accepted_at": intent_row.accepted_at.isoformat() if intent_row.accepted_at else None,
+                    "status_at_snapshot": attr_state.sync_state.value if attr_state else "unknown",
+                }
+            )
+            if attr_state and attr_state.sync_state in eligible_statuses:
+                eligible.append((attr_state, intent_row, iface))
+    return snapshot, eligible
+
+
+async def _collect_ip_eligibility(db: AsyncSession, ifaces: dict, force: bool) -> tuple[list, dict]:
+    """Snapshot every IP intent row; return (snapshot, {iface_id: [eligible rows]})."""
+    snapshot: list[dict] = []
+    by_iface: dict[int, list] = {}
+    for iface in ifaces.values():
+        ip_rows = (
+            (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface.id)))
+            .scalars()
+            .all()
+        )
+        for row in ip_rows:
+            snapshot.append(
+                {
+                    "interface": iface.name,
+                    "address": row.address,
+                    "family": row.family,
+                    "secondary": row.secondary,
+                    "vrf": row.vrf,
+                    "accepted_at": row.accepted_at.isoformat() if row.accepted_at else None,
+                }
+            )
+            if _is_eligible(row, force):
+                by_iface.setdefault(iface.id, []).append(row)
+    return snapshot, by_iface
+
+
+async def _apply_attributes(eligible, apply_fn, *, client, device_name, job_id, now) -> tuple[int, int, list]:
+    """Commit each (interface, attribute) individually and transition its attr_state.
+
+    Unlike the batch scopes, a per-attribute failure isolates to that one attribute.
+    Returns (in_sync, apply_failed, failures).
+    """
+    ok = 0
+    failed = 0
+    failures: list[dict] = []
+    for attr_state, intent_row, iface in eligible:
+        try:
+            await apply_fn(
+                client=client,
+                device_name=device_name,
+                interface_name=iface.name,
+                attribute=intent_row.attribute,
+                value=intent_row.intent_value,
+            )
+        except NsoApplyError as exc:
+            logger.error(
+                "apply.attribute_failed",
+                job_id=job_id,
+                device=device_name,
+                interface=iface.name,
+                attribute=intent_row.attribute,
+                error=exc.message,
+            )
+            attr_state.sync_state = SyncState.apply_failed
+            intent_row.last_apply_error = {"code": exc.code, "message": exc.message, "detail": exc.detail}
+            failed += 1
+            failures.append({"interface": iface.name, "attribute": intent_row.attribute, "error": exc.message})
+        except Exception as exc:
+            logger.exception(
+                "apply.attribute_unexpected_error",
+                job_id=job_id,
+                interface=iface.name,
+                attribute=intent_row.attribute,
+            )
+            attr_state.sync_state = SyncState.apply_failed
+            intent_row.last_apply_error = {"code": "internal", "message": repr(exc), "detail": {}}
+            failed += 1
+            failures.append({"interface": iface.name, "attribute": intent_row.attribute, "error": repr(exc)})
+        else:
+            attr_state.sync_state = SyncState.in_sync
+            intent_row.last_apply_at = now
+            intent_row.last_apply_error = None
+            ok += 1
+    return ok, failed, failures
+
+
+async def _apply_ips(by_iface, ifaces, apply_fn, *, client, device_name, job_id, now) -> tuple[int, int, list]:
+    """Push IP intent one interface at a time (each interface is one commit unit).
+
+    Returns (in_sync, apply_failed, failures); the counts are per-row, the failures
+    per-interface.
+    """
+    ok = 0
+    failed = 0
+    failures: list[dict] = []
+    for iface_id, ip_rows in by_iface.items():
+        iface = ifaces[iface_id]
+        routed_kind = _nokia_routed_kind(iface)
+        try:
+            await apply_fn(
+                client=client,
+                device_name=device_name,
+                interface_name=iface.name,
+                ip_intent_rows=ip_rows,
+                kind=routed_kind,
+                service=iface.service if routed_kind in ("ies", "vprn") else None,
+                parent_binding=iface.parent_binding,
+                encap_tag=iface.encap_tag,
+            )
+        except NsoApplyError as exc:
+            logger.error("apply.ip_failed", job_id=job_id, device=device_name, interface=iface.name, error=exc.message)
+            for row in ip_rows:
+                row.last_apply_error = {"code": exc.code, "message": exc.message, "detail": exc.detail}
+            failed += len(ip_rows)
+            failures.append({"interface": iface.name, "error": exc.message})
+        except Exception as exc:
+            logger.exception("apply.ip_unexpected_error", job_id=job_id, interface=iface.name)
+            for row in ip_rows:
+                row.last_apply_error = {"code": "internal", "message": repr(exc), "detail": {}}
+            failed += len(ip_rows)
+            failures.append({"interface": iface.name, "error": repr(exc)})
+        else:
+            for row in ip_rows:
+                row.last_apply_at = now
+                row.last_apply_error = None
+            ok += len(ip_rows)
+    return ok, failed, failures
+
+
+async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_error=None) -> tuple[int, int, list]:
+    """Push one scope's batch coroutine and stamp the outcome onto every row in *rows*.
+
+    Returns (in_sync, apply_failed, failures). Success stamps last_apply_at and clears
+    the error on every row; an NsoApplyError or any other exception records the error
+    payload on every row and reports a single failure. ``on_nso_error`` is a best-effort
+    side-effect (route-policy uses it to record a device-parser capability rejection).
+    """
+    try:
+        await coro
+    except NsoApplyError as exc:
+        logger.error(f"apply.{log_label}_failed", job_id=job_id, device=device_name, error=exc.message)
+        err = {"code": exc.code, "message": exc.message, "detail": exc.detail}
+        for row in rows:
+            row.last_apply_error = err
+        if on_nso_error is not None:
+            await on_nso_error(exc)
+        return 0, len(rows), [{"error": exc.message}]
+    except Exception as exc:
+        logger.exception(f"apply.{log_label}_unexpected_error", job_id=job_id)
+        err = {"code": "internal", "message": repr(exc), "detail": {}}
+        for row in rows:
+            row.last_apply_error = err
+        return 0, len(rows), [{"error": repr(exc)}]
+    for row in rows:
+        row.last_apply_at = now
+        row.last_apply_error = None
+    return len(rows), 0, []
+
+
+async def _finalize_job(
+    db: AsyncSession,
+    job: Job,
+    job_id: int,
+    device_id: int,
+    any_eligible: bool,
+    attr_outcome: tuple[int, int, list],
+    ip_outcome: tuple[int, int, list],
+    scope_outcomes: dict,
+    scope_failures: dict,
+) -> None:
+    """Assemble job.result/status from the pass outcomes and commit.
+
+    With nothing eligible the job succeeds with an all-zero result and returns early.
+    Otherwise the per-scope counts are emitted; any failure flips the job to failed and
+    collects the per-item errors.
+    """
+    if not any_eligible:
+        logger.info("apply.nothing_eligible", job_id=job_id, device_id=device_id)
+        job.status = JobStatus.succeeded
+        job.result = {
+            "attribute_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+            "ip_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+            "snmp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+            "static_route_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+            "subinterface_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+            "vlan_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+            "bfd_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+            "interface_mtu_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+            "l2_sap_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+            "isis_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+            "bgp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+            "route_policy_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+            "ospf_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
+        }
+        await db.commit()
+        return
+
+    attr_ok, attr_failed, attr_failures = attr_outcome
+    ip_ok, ip_failed, ip_failures = ip_outcome
+
+    result = {
+        "attribute_count_by_outcome": {"in_sync": attr_ok, "apply_failed": attr_failed},
+        "ip_count_by_outcome": {"in_sync": ip_ok, "apply_failed": ip_failed},
+    }
+    for key in _SCOPE_RESULT_ORDER:
+        scope_ok, scope_failed = scope_outcomes[key]
+        result[f"{key}_count_by_outcome"] = {"in_sync": scope_ok, "apply_failed": scope_failed}
+    job.result = result
+
+    total_failed = attr_failed + ip_failed + sum(failed for _ok, failed in scope_outcomes.values())
+    if total_failed == 0:
+        job.status = JobStatus.succeeded
+    else:
+        job.status = JobStatus.failed
+        all_failed = [{"type": "attribute", **a} for a in attr_failures] + [{"type": "ip", **a} for a in ip_failures]
+        for key in _SCOPE_RESULT_ORDER:
+            all_failed.extend({"type": key, **a} for a in scope_failures.get(key, []))
+        job.error = {
+            "code": "nso_commit_failed",
+            "message": f"{total_failed} item(s) failed to apply",
+            "detail": {"items": all_failed},
+        }
+    await db.commit()
+    logger.info(
+        "apply.done",
+        job_id=job_id,
+        in_sync=attr_ok,
+        apply_failed=attr_failed,
+        ip_in_sync=ip_ok,
+        ip_failed=ip_failed,
+        snmp_in_sync=scope_outcomes["snmp"][0],
+        snmp_failed=scope_outcomes["snmp"][1],
+        sr_in_sync=scope_outcomes["static_route"][0],
+        sr_failed=scope_outcomes["static_route"][1],
+        l2_in_sync=scope_outcomes["l2_sap"][0],
+        l2_failed=scope_outcomes["l2_sap"][1],
+        isis_in_sync=scope_outcomes["isis"][0],
+        isis_failed=scope_outcomes["isis"][1],
+        bgp_in_sync=scope_outcomes["bgp"][0],
+        bgp_failed=scope_outcomes["bgp"][1],
+        rp_in_sync=scope_outcomes["route_policy"][0],
+        rp_failed=scope_outcomes["route_policy"][1],
+    )
+
+
+async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int, force: bool) -> None:
+    """Run the apply body: sync-from, snapshot intent, push each scope, finalize the job.
+
+    Raises on a missing device / NSO-client error so ``run_apply``'s outer handler can
+    mark the job failed with an ``internal`` error.
+    """
     from nso_adapter.core.importer import get_nso_client
     from nso_adapter.nso.apply import (
-        NsoApplyError,
         apply_bfd_config,
         apply_bgp_config,
         apply_interface_attribute,
@@ -435,6 +793,258 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:  #
         apply_svi_config,
         apply_vlan_config,
     )
+
+    device = await db.get(Device, device_id)
+    if not device:
+        raise ValueError(f"Device {device_id} not found")
+    client = get_nso_client(device.nso_instance)
+    device_name = device.nso_device_name
+
+    # ── Step 0: sync-from before apply (best-effort) ──
+    await _maybe_sync_from(db, client, device_name, device_id)
+
+    # ── Step 1: snapshot intent + collect every scope's eligible rows ──
+    ifaces = {
+        iface.id: iface
+        for iface in (await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))).scalars().all()
+    }
+    intent_snapshot, attr_eligible = await _collect_attr_eligibility(db, ifaces, force)
+    ip_snapshot, ip_eligible_by_iface = await _collect_ip_eligibility(db, ifaces, force)
+
+    snmp_comm = await _collect_eligible(db, SnmpCommunityIntent, device_id, force)
+    snmp_user = await _collect_eligible(db, SnmpV3UserIntent, device_id, force)
+    snmp_host = await _collect_eligible(db, SnmpHostIntent, device_id, force)
+    snmp_sysinfo_rows = await _collect_eligible(db, SnmpSystemInfoIntent, device_id, force)
+    snmp_sysinfo = snmp_sysinfo_rows[0] if snmp_sysinfo_rows else None
+    snmp_rows = [*snmp_comm, *snmp_user, *snmp_host, *([snmp_sysinfo] if snmp_sysinfo else [])]
+
+    sr_eligible = await _collect_eligible(db, StaticRouteIntent, device_id, force)
+    logging_eligible = await _collect_eligible(db, LoggingHostIntent, device_id, force)
+    svi_eligible = await _collect_eligible(db, SviIntent, device_id, force)
+    subif_eligible = await _collect_eligible(db, SubinterfaceIntent, device_id, force)
+    vlan_eligible = await _collect_eligible(db, VlanIntent, device_id, force)
+    bfd_eligible = await _collect_eligible(db, BfdIntent, device_id, force)
+    mtu_eligible = await _collect_eligible(db, InterfaceMtuIntent, device_id, force)
+    l2_eligible = await _collect_eligible(db, L2SapIntent, device_id, force)
+    isis_eligible = await _collect_eligible(db, IsisInterfaceIntent, device_id, force)
+    isis_process_eligible = await _collect_eligible(db, IsisProcessIntent, device_id, force)
+    isis_flex_eligible = await _collect_eligible(db, IsisFlexAlgoIntent, device_id, force)
+    bgp_eligible = await _collect_eligible(db, BgpRouterIntent, device_id, force)
+    if bgp_eligible:
+        # Eagerly load BGP relationships for apply (avoids lazy-raise on the worker greenlet).
+        from nso_adapter.core.bgp_load import attach_bgp_relationships
+
+        await attach_bgp_relationships(db, bgp_eligible)
+    rp_eligible = await _collect_eligible(db, RoutePolicyObjectIntent, device_id, force)
+    ospf_instance_eligible = await _collect_eligible(db, OspfInstanceIntent, device_id, force)
+    ospf_iface_eligible = await _collect_eligible(db, OspfInterfaceIntent, device_id, force)
+    redist_eligible = await _collect_eligible(db, RedistributionIntent, device_id, force)
+    redist_ospf = [r for r in redist_eligible if r.dest_protocol == "ospf"]
+    redist_isis = [r for r in redist_eligible if r.dest_protocol == "isis"]
+    redist_bgp = [r for r in redist_eligible if r.dest_protocol == "bgp"]
+
+    job.context = {"force": force, "intent_snapshot": intent_snapshot, "ip_snapshot": ip_snapshot}
+    now = datetime.now(UTC).replace(tzinfo=None)
+
+    # ── Step 2: mark attribute states deploying ──
+    for attr_state, _intent_row, _iface in attr_eligible:
+        attr_state.sync_state = SyncState.deploying
+    await db.commit()
+
+    # ── Step 3–6: per-item attribute + IP passes ──
+    attr_outcome = await _apply_attributes(
+        attr_eligible, apply_interface_attribute, client=client, device_name=device_name, job_id=job_id, now=now
+    )
+    ip_outcome = await _apply_ips(
+        ip_eligible_by_iface,
+        ifaces,
+        apply_interface_ips,
+        client=client,
+        device_name=device_name,
+        job_id=job_id,
+        now=now,
+    )
+
+    async def _record_rp_capability(exc: NsoApplyError) -> None:
+        # The device parser only rejects an unsupported construct on a real commit
+        # (dry-run renders it). Record it so every box on this (ned, sw) is flagged.
+        try:
+            from nso_adapter.core.capability import (
+                parse_rejected_construct,
+                record_capability_rejection,
+                refresh_device_capability,
+            )
+
+            info = await refresh_device_capability(db, client, device_name, device)
+            scope, name = parse_rejected_construct(exc.message)
+            if info and name:
+                await record_capability_rejection(
+                    db, info["ned_id"], info["sw_version"], scope, name, exc.message[:256]
+                )
+        except Exception:
+            logger.debug("apply.capability_record_skipped", job_id=job_id)
+
+    # ── Step 6b–6g: one batch commit per remaining scope ──
+    scopes = [
+        _Scope(
+            "snmp",
+            "snmp",
+            snmp_rows,
+            lambda: apply_snmp_config(
+                client=client,
+                device_name=device_name,
+                community_intents=snmp_comm,
+                v3_user_intents=snmp_user,
+                host_intents=snmp_host,
+                system_info_intent=snmp_sysinfo,
+            ),
+        ),
+        _Scope(
+            "static_route",
+            "static_route",
+            sr_eligible,
+            lambda: apply_static_routes(client=client, device_name=device_name, route_intent_rows=sr_eligible),
+        ),
+        _Scope(
+            "logging",
+            "logging",
+            logging_eligible,
+            lambda: apply_logging_config(client=client, device_name=device_name, host_intent_rows=logging_eligible),
+        ),
+        _Scope(
+            "svi",
+            "svi",
+            svi_eligible,
+            lambda: apply_svi_config(client=client, device_name=device_name, svi_intent_rows=svi_eligible),
+        ),
+        _Scope(
+            "subinterface",
+            "subif",
+            subif_eligible,
+            lambda: apply_subinterface_config(client=client, device_name=device_name, subif_intent_rows=subif_eligible),
+        ),
+        _Scope(
+            "vlan",
+            "vlan",
+            vlan_eligible,
+            lambda: apply_vlan_config(client=client, device_name=device_name, vlan_intent_rows=vlan_eligible),
+        ),
+        _Scope(
+            "bfd",
+            "bfd",
+            bfd_eligible,
+            lambda: apply_bfd_config(client=client, device_name=device_name, bfd_intent_rows=bfd_eligible),
+        ),
+        _Scope(
+            "interface_mtu",
+            "interface_mtu",
+            mtu_eligible,
+            lambda: apply_mtu_config(client=client, device_name=device_name, mtu_intent_rows=mtu_eligible),
+        ),
+        _Scope(
+            "l2_sap",
+            "l2_sap",
+            l2_eligible,
+            lambda: apply_l2_saps(client=client, device_name=device_name, sap_intent_rows=l2_eligible),
+        ),
+        _Scope(
+            "isis",
+            "isis",
+            [*isis_eligible, *isis_process_eligible, *redist_isis, *isis_flex_eligible],
+            lambda: apply_isis_interfaces(
+                client=client,
+                device_name=device_name,
+                isis_intent_rows=isis_eligible,
+                isis_process_rows=isis_process_eligible,
+                redistribution_rows=redist_isis,
+                flex_algo_rows=isis_flex_eligible,
+            ),
+        ),
+        _Scope(
+            "bgp",
+            "bgp",
+            [*bgp_eligible, *redist_bgp],
+            lambda: apply_bgp_config(
+                client=client,
+                device_name=device_name,
+                router_intent_rows=bgp_eligible,
+                redistribution_rows=redist_bgp,
+            ),
+        ),
+        _Scope(
+            "route_policy",
+            "route_policy",
+            rp_eligible,
+            lambda: apply_route_policy_config(
+                client=client, device_name=device_name, intent_rows=rp_eligible, ned_id=device.ned_id
+            ),
+            _record_rp_capability,
+        ),
+        _Scope(
+            "ospf",
+            "ospf",
+            [*ospf_instance_eligible, *ospf_iface_eligible, *redist_ospf],
+            lambda: apply_ospf_config(
+                client=client,
+                device_name=device_name,
+                process_intent_rows=ospf_instance_eligible,
+                interface_intent_rows=ospf_iface_eligible,
+                redistribution_rows=redist_ospf,
+            ),
+        ),
+    ]
+
+    scope_outcomes: dict[str, tuple[int, int]] = {}
+    scope_failures: dict[str, list] = {}
+    for sc in scopes:
+        if not sc.rows:
+            scope_outcomes[sc.key] = (0, 0)
+            continue
+        scope_ok, scope_failed, fails = await _run_scope(
+            sc.log_label,
+            sc.make_coro(),
+            sc.rows,
+            job_id=job_id,
+            device_name=device_name,
+            now=now,
+            on_nso_error=sc.on_nso_error,
+        )
+        scope_outcomes[sc.key] = (scope_ok, scope_failed)
+        if fails:
+            scope_failures[sc.key] = fails
+
+    # ── Step 7: finalize ──
+    # "Nothing eligible" mirrors the historical flag set exactly (note: it keys off the
+    # IS-IS *interface* list and the OSPF instance/interface lists, not the process/flex
+    # rows), so the outcome is byte-identical to the pre-refactor worker.
+    any_eligible = any(
+        [
+            attr_eligible,
+            ip_eligible_by_iface,
+            snmp_rows,
+            sr_eligible,
+            logging_eligible,
+            svi_eligible,
+            subif_eligible,
+            vlan_eligible,
+            bfd_eligible,
+            mtu_eligible,
+            l2_eligible,
+            isis_eligible,
+            bgp_eligible,
+            rp_eligible,
+            ospf_instance_eligible,
+            ospf_iface_eligible,
+            redist_eligible,
+        ]
+    )
+    await _finalize_job(
+        db, job, job_id, device_id, any_eligible, attr_outcome, ip_outcome, scope_outcomes, scope_failures
+    )
+
+
+async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
+    """Background task: execute the apply for *device_id* (see module docstring §7a)."""
     from nso_adapter.store.db import get_session
 
     async for db in get_session():
@@ -446,1144 +1056,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:  #
         await db.commit()
 
         try:
-            device = await db.get(Device, device_id)
-            if not device:
-                raise ValueError(f"Device {device_id} not found")
-
-            client = get_nso_client(device.nso_instance)
-            device_name = device.nso_device_name
-
-            # ── Step 0: sync-from before apply (clears NSO/device out-of-sync) ──
-            # A timed-out or partial prior commit leaves NSO's CDB inconsistent with the
-            # device; the next apply is then refused ("device out of sync"). Re-reading the
-            # device first clears it. Best-effort: a failure here must not abort the apply —
-            # the per-scope dry-run verify still catches real problems. Disable per device
-            # (DeviceSettings.sync_before_apply) for NEDs that already sync on connect.
-            settings_row = (
-                await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-            ).scalar_one_or_none()
-            if settings_row is None or settings_row.sync_before_apply:
-                try:
-                    await client.sync_from(device_name)
-                    logger.info("apply.sync_from.done", device=device_name)
-                except Exception as exc:
-                    logger.warning("apply.sync_from.failed", device=device_name, error=str(exc))
-
-            # ── Step 1: snapshot intent ──────────────────────────────────────
-            ifaces_result = await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))
-            ifaces = {iface.id: iface for iface in ifaces_result.scalars().all()}
-
-            intent_snapshot: list[dict] = []
-            eligible: list[tuple[InterfaceAttrState, InterfaceIntent]] = []
-
-            eligible_statuses = _FORCE_ELIGIBLE if force else _NO_FORCE_ELIGIBLE
-
-            for iface in ifaces.values():
-                intent_rows = await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface.id))
-                for intent_row in intent_rows.scalars().all():
-                    # Find the attr_state for sync_state check
-                    attr_state_result = await db.execute(
-                        select(InterfaceAttrState).where(
-                            InterfaceAttrState.interface_id == iface.id,
-                            InterfaceAttrState.attribute == intent_row.attribute,
-                        )
-                    )
-                    attr_state = attr_state_result.scalar_one_or_none()
-
-                    # Include in snapshot regardless; eligibility filters apply
-                    snapshot_entry = {
-                        "interface": iface.name,
-                        "attribute": intent_row.attribute,
-                        "intent_value": intent_row.intent_value,
-                        "accepted_at": intent_row.accepted_at.isoformat() if intent_row.accepted_at else None,
-                        "status_at_snapshot": attr_state.sync_state.value if attr_state else "unknown",
-                    }
-                    intent_snapshot.append(snapshot_entry)
-
-                    if attr_state and attr_state.sync_state in eligible_statuses:
-                        eligible.append((attr_state, intent_row, iface))  # type: ignore[arg-type]
-
-            # Snapshot IP intent rows for context
-            ip_snapshot: list[dict] = []
-            ip_eligible_by_iface: dict[int, list[InterfaceIpIntent]] = {}
-
-            for iface in ifaces.values():
-                ip_rows_result = await db.execute(
-                    select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface.id)
-                )
-                ip_rows = ip_rows_result.scalars().all()
-                for row in ip_rows:
-                    ip_snapshot.append(
-                        {
-                            "interface": iface.name,
-                            "address": row.address,
-                            "family": row.family,
-                            "secondary": row.secondary,
-                            "vrf": row.vrf,
-                            "accepted_at": row.accepted_at.isoformat() if row.accepted_at else None,
-                        }
-                    )
-                    # Eligibility: accepted_at must be set; force=False also requires pending apply
-                    if row.accepted_at is None:
-                        continue
-                    if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                        continue
-                    ip_eligible_by_iface.setdefault(iface.id, []).append(row)
-
-            # Snapshot SNMP intent rows for context
-            snmp_comm_eligible: list[SnmpCommunityIntent] = []
-            snmp_user_eligible: list[SnmpV3UserIntent] = []
-            snmp_host_eligible: list[SnmpHostIntent] = []
-            snmp_sysinfo_eligible: SnmpSystemInfoIntent | None = None
-            snmp_has_eligible = False
-
-            snmp_comm_result = await db.execute(
-                select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)
-            )
-            for row in snmp_comm_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                snmp_comm_eligible.append(row)
-                snmp_has_eligible = True
-
-            snmp_user_result = await db.execute(select(SnmpV3UserIntent).where(SnmpV3UserIntent.device_id == device_id))
-            for row in snmp_user_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                snmp_user_eligible.append(row)
-                snmp_has_eligible = True
-
-            snmp_host_result = await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))
-            for row in snmp_host_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                snmp_host_eligible.append(row)
-                snmp_has_eligible = True
-
-            snmp_sysinfo_result = await db.execute(
-                select(SnmpSystemInfoIntent).where(SnmpSystemInfoIntent.device_id == device_id)
-            )
-            sysinfo_row = snmp_sysinfo_result.scalar_one_or_none()
-            if sysinfo_row and sysinfo_row.accepted_at is not None:
-                if force or sysinfo_row.last_apply_at is None or sysinfo_row.last_apply_error is not None:
-                    snmp_sysinfo_eligible = sysinfo_row
-                    snmp_has_eligible = True
-
-            # Collect static route intent rows
-            sr_eligible: list[StaticRouteIntent] = []
-            sr_result = await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id))
-            for row in sr_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                sr_eligible.append(row)
-
-            # Collect logging (remote-syslog) intent rows
-            logging_eligible: list[LoggingHostIntent] = []
-            logging_result = await db.execute(select(LoggingHostIntent).where(LoggingHostIntent.device_id == device_id))
-            for row in logging_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                logging_eligible.append(row)
-
-            # Collect SVI/IRB intent rows (M35 write path)
-            svi_eligible: list[SviIntent] = []
-            svi_result = await db.execute(select(SviIntent).where(SviIntent.device_id == device_id))
-            for row in svi_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                svi_eligible.append(row)
-
-            # Collect dot1q subinterface intent rows (M36 write path)
-            subif_eligible: list[SubinterfaceIntent] = []
-            subif_result = await db.execute(select(SubinterfaceIntent).where(SubinterfaceIntent.device_id == device_id))
-            for row in subif_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                subif_eligible.append(row)
-
-            # Collect VLAN-database intent rows (M34 write path)
-            vlan_eligible: list[VlanIntent] = []
-            vlan_result = await db.execute(select(VlanIntent).where(VlanIntent.device_id == device_id))
-            for row in vlan_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                vlan_eligible.append(row)
-
-            # Collect per-interface BFD intent rows (BFD write path)
-            bfd_eligible: list[BfdIntent] = []
-            bfd_result = await db.execute(select(BfdIntent).where(BfdIntent.device_id == device_id))
-            for row in bfd_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                bfd_eligible.append(row)
-
-            # Collect per-interface MTU intent rows (Phase 2b write path)
-            mtu_eligible: list[InterfaceMtuIntent] = []
-            mtu_result = await db.execute(select(InterfaceMtuIntent).where(InterfaceMtuIntent.device_id == device_id))
-            for row in mtu_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                mtu_eligible.append(row)
-
-            # Collect L2 SAP intent rows (M37 P2b — Nokia SAP write path)
-            l2_eligible: list[L2SapIntent] = []
-            l2_result = await db.execute(select(L2SapIntent).where(L2SapIntent.device_id == device_id))
-            for row in l2_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                l2_eligible.append(row)
-
-            # Collect IS-IS interface intent rows
-            isis_eligible: list[IsisInterfaceIntent] = []
-            isis_result = await db.execute(
-                select(IsisInterfaceIntent).where(IsisInterfaceIntent.device_id == device_id)
-            )
-            for row in isis_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                isis_eligible.append(row)
-
-            # Collect IS-IS process intent rows (applied alongside interface rows)
-            isis_process_eligible: list[IsisProcessIntent] = []
-            isis_proc_result = await db.execute(
-                select(IsisProcessIntent).where(IsisProcessIntent.device_id == device_id)
-            )
-            for row in isis_proc_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                isis_process_eligible.append(row)
-
-            # Collect IS-IS Flex-Algo intent rows (applied alongside process rows)
-            isis_flex_eligible: list[IsisFlexAlgoIntent] = []
-            isis_flex_result = await db.execute(
-                select(IsisFlexAlgoIntent).where(IsisFlexAlgoIntent.device_id == device_id)
-            )
-            for row in isis_flex_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                isis_flex_eligible.append(row)
-
-            # Collect BGP router intent rows (eligibility at the router level)
-            bgp_eligible: list[BgpRouterIntent] = []
-            bgp_router_result = await db.execute(select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))
-            for row in bgp_router_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                bgp_eligible.append(row)
-
-            # Eagerly load BGP relationships for apply (avoids lazy-raise)
-            if bgp_eligible:
-                from nso_adapter.core.bgp_load import attach_bgp_relationships
-
-                await attach_bgp_relationships(db, bgp_eligible)
-
-            # Collect route-policy object intent rows
-            rp_eligible: list[RoutePolicyObjectIntent] = []
-            rp_result = await db.execute(
-                select(RoutePolicyObjectIntent).where(RoutePolicyObjectIntent.device_id == device_id)
-            )
-            for row in rp_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                rp_eligible.append(row)
-
-            # Collect OSPF instance intent rows
-            ospf_instance_eligible: list[OspfInstanceIntent] = []
-            ospf_inst_result = await db.execute(
-                select(OspfInstanceIntent).where(OspfInstanceIntent.device_id == device_id)
-            )
-            for row in ospf_inst_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                ospf_instance_eligible.append(row)
-
-            # Collect OSPF interface intent rows
-            ospf_iface_eligible: list[OspfInterfaceIntent] = []
-            ospf_iface_result = await db.execute(
-                select(OspfInterfaceIntent).where(OspfInterfaceIntent.device_id == device_id)
-            )
-            for row in ospf_iface_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                ospf_iface_eligible.append(row)
-
-            # Collect redistribution intent rows (keyed by dest_protocol)
-            redist_eligible: list[RedistributionIntent] = []
-            redist_result = await db.execute(
-                select(RedistributionIntent).where(RedistributionIntent.device_id == device_id)
-            )
-            for row in redist_result.scalars().all():
-                if row.accepted_at is None:
-                    continue
-                if not force and row.last_apply_at is not None and row.last_apply_error is None:
-                    continue
-                redist_eligible.append(row)
-
-            redist_ospf = [r for r in redist_eligible if r.dest_protocol == "ospf"]
-            redist_isis = [r for r in redist_eligible if r.dest_protocol == "isis"]
-            redist_bgp = [r for r in redist_eligible if r.dest_protocol == "bgp"]
-
-            job.context = {
-                "force": force,
-                "intent_snapshot": intent_snapshot,
-                "ip_snapshot": ip_snapshot,
-            }
-
-            now = datetime.now(UTC).replace(tzinfo=None)
-
-            # ── Step 2: mark attribute states as deploying ───────────────────
-            for attr_state, _intent_row, _iface in eligible:
-                attr_state.sync_state = SyncState.deploying
-            await db.commit()
-
-            # ── Step 3–5: commit each attribute ─────────────────────────────
-            outcome_in_sync = 0
-            outcome_failed = 0
-            failed_attrs: list[dict] = []
-
-            for attr_state, intent_row, iface in eligible:
-                try:
-                    await apply_interface_attribute(
-                        client=client,
-                        device_name=device_name,
-                        interface_name=iface.name,
-                        attribute=intent_row.attribute,
-                        value=intent_row.intent_value,
-                    )
-                    attr_state.sync_state = SyncState.in_sync
-                    intent_row.last_apply_at = now
-                    intent_row.last_apply_error = None
-                    outcome_in_sync += 1
-                except NsoApplyError as exc:
-                    logger.error(
-                        "apply.attribute_failed",
-                        job_id=job_id,
-                        device=device_name,
-                        interface=iface.name,
-                        attribute=intent_row.attribute,
-                        error=exc.message,
-                    )
-                    attr_state.sync_state = SyncState.apply_failed
-                    intent_row.last_apply_error = {
-                        "code": exc.code,
-                        "message": exc.message,
-                        "detail": exc.detail,
-                    }
-                    outcome_failed += 1
-                    failed_attrs.append(
-                        {
-                            "interface": iface.name,
-                            "attribute": intent_row.attribute,
-                            "error": exc.message,
-                        }
-                    )
-                except Exception as exc:
-                    logger.exception(
-                        "apply.attribute_unexpected_error",
-                        job_id=job_id,
-                        interface=iface.name,
-                        attribute=intent_row.attribute,
-                    )
-                    attr_state.sync_state = SyncState.apply_failed
-                    intent_row.last_apply_error = {
-                        "code": "internal",
-                        "message": repr(exc),
-                        "detail": {},
-                    }
-                    outcome_failed += 1
-                    failed_attrs.append(
-                        {
-                            "interface": iface.name,
-                            "attribute": intent_row.attribute,
-                            "error": repr(exc),
-                        }
-                    )
-
-            # ── Step 6: IP intent pass ───────────────────────────────────────
-            ip_outcome_ok = 0
-            ip_outcome_failed = 0
-            failed_ips: list[dict] = []
-
-            for iface_id, ip_rows in ip_eligible_by_iface.items():
-                iface = ifaces[iface_id]
-                routed_kind = _nokia_routed_kind(iface)
-                try:
-                    await apply_interface_ips(
-                        client=client,
-                        device_name=device_name,
-                        interface_name=iface.name,
-                        ip_intent_rows=ip_rows,
-                        kind=routed_kind,
-                        service=iface.service if routed_kind in ("ies", "vprn") else None,
-                        parent_binding=iface.parent_binding,
-                        encap_tag=iface.encap_tag,
-                    )
-                    for row in ip_rows:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    ip_outcome_ok += len(ip_rows)
-                except NsoApplyError as exc:
-                    logger.error(
-                        "apply.ip_failed",
-                        job_id=job_id,
-                        device=device_name,
-                        interface=iface.name,
-                        error=exc.message,
-                    )
-                    for row in ip_rows:
-                        row.last_apply_error = {
-                            "code": exc.code,
-                            "message": exc.message,
-                            "detail": exc.detail,
-                        }
-                    ip_outcome_failed += len(ip_rows)
-                    failed_ips.append({"interface": iface.name, "error": exc.message})
-                except Exception as exc:
-                    logger.exception(
-                        "apply.ip_unexpected_error",
-                        job_id=job_id,
-                        interface=iface.name,
-                    )
-                    for row in ip_rows:
-                        row.last_apply_error = {"code": "internal", "message": repr(exc), "detail": {}}
-                    ip_outcome_failed += len(ip_rows)
-                    failed_ips.append({"interface": iface.name, "error": repr(exc)})
-
-            # ── Step 6b: SNMP intent pass ────────────────────────────────────
-            snmp_outcome_ok = 0
-            snmp_outcome_failed = 0
-            snmp_failed: list[dict] = []
-
-            if snmp_has_eligible:
-                try:
-                    await apply_snmp_config(
-                        client=client,
-                        device_name=device_name,
-                        community_intents=snmp_comm_eligible,
-                        v3_user_intents=snmp_user_eligible,
-                        host_intents=snmp_host_eligible,
-                        system_info_intent=snmp_sysinfo_eligible,
-                    )
-                    for row in snmp_comm_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    for row in snmp_user_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    for row in snmp_host_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    if snmp_sysinfo_eligible:
-                        snmp_sysinfo_eligible.last_apply_at = now
-                        snmp_sysinfo_eligible.last_apply_error = None
-                    snmp_outcome_ok = (
-                        len(snmp_comm_eligible)
-                        + len(snmp_user_eligible)
-                        + len(snmp_host_eligible)
-                        + (1 if snmp_sysinfo_eligible else 0)
-                    )
-                except NsoApplyError as exc:
-                    logger.error(
-                        "apply.snmp_failed",
-                        job_id=job_id,
-                        device=device_name,
-                        error=exc.message,
-                    )
-                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-                    for row in snmp_comm_eligible:
-                        row.last_apply_error = err_payload
-                    for row in snmp_user_eligible:
-                        row.last_apply_error = err_payload
-                    for row in snmp_host_eligible:
-                        row.last_apply_error = err_payload
-                    if snmp_sysinfo_eligible:
-                        snmp_sysinfo_eligible.last_apply_error = err_payload
-                    snmp_outcome_failed = (
-                        len(snmp_comm_eligible)
-                        + len(snmp_user_eligible)
-                        + len(snmp_host_eligible)
-                        + (1 if snmp_sysinfo_eligible else 0)
-                    )
-                    snmp_failed.append({"error": exc.message})
-                except Exception as exc:
-                    logger.exception("apply.snmp_unexpected_error", job_id=job_id)
-                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
-                    for row in snmp_comm_eligible:
-                        row.last_apply_error = err_payload
-                    for row in snmp_user_eligible:
-                        row.last_apply_error = err_payload
-                    for row in snmp_host_eligible:
-                        row.last_apply_error = err_payload
-                    if snmp_sysinfo_eligible:
-                        snmp_sysinfo_eligible.last_apply_error = err_payload
-                    snmp_outcome_failed = (
-                        len(snmp_comm_eligible)
-                        + len(snmp_user_eligible)
-                        + len(snmp_host_eligible)
-                        + (1 if snmp_sysinfo_eligible else 0)
-                    )
-                    snmp_failed.append({"error": repr(exc)})
-
-            # ── Step 6c: static route intent pass ───────────────────────────
-            sr_outcome_ok = 0
-            sr_outcome_failed = 0
-            sr_failed: list[dict] = []
-
-            if sr_eligible:
-                try:
-                    await apply_static_routes(
-                        client=client,
-                        device_name=device_name,
-                        route_intent_rows=sr_eligible,
-                    )
-                    for row in sr_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    sr_outcome_ok = len(sr_eligible)
-                except NsoApplyError as exc:
-                    logger.error(
-                        "apply.static_route_failed",
-                        job_id=job_id,
-                        device=device_name,
-                        error=exc.message,
-                    )
-                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-                    for row in sr_eligible:
-                        row.last_apply_error = err_payload
-                    sr_outcome_failed = len(sr_eligible)
-                    sr_failed.append({"error": exc.message})
-                except Exception as exc:
-                    logger.exception("apply.static_route_unexpected_error", job_id=job_id)
-                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
-                    for row in sr_eligible:
-                        row.last_apply_error = err_payload
-                    sr_outcome_failed = len(sr_eligible)
-                    sr_failed.append({"error": repr(exc)})
-
-            # ── Step 6c1: logging (remote-syslog) intent pass ────────────────
-            logging_outcome_ok = 0
-            logging_outcome_failed = 0
-            logging_failed: list[dict] = []
-
-            if logging_eligible:
-                try:
-                    await apply_logging_config(
-                        client=client,
-                        device_name=device_name,
-                        host_intent_rows=logging_eligible,
-                    )
-                    for row in logging_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    logging_outcome_ok = len(logging_eligible)
-                except NsoApplyError as exc:
-                    logger.error("apply.logging_failed", job_id=job_id, device=device_name, error=exc.message)
-                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-                    for row in logging_eligible:
-                        row.last_apply_error = err_payload
-                    logging_outcome_failed = len(logging_eligible)
-                    logging_failed.append({"error": exc.message})
-                except Exception as exc:
-                    logger.exception("apply.logging_unexpected_error", job_id=job_id)
-                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
-                    for row in logging_eligible:
-                        row.last_apply_error = err_payload
-                    logging_outcome_failed = len(logging_eligible)
-                    logging_failed.append({"error": repr(exc)})
-
-            # ── Step 6c1b: SVI/IRB intent pass (M35) ─────────────────────────
-            svi_outcome_ok = 0
-            svi_outcome_failed = 0
-            svi_failed: list[dict] = []
-
-            if svi_eligible:
-                try:
-                    await apply_svi_config(client=client, device_name=device_name, svi_intent_rows=svi_eligible)
-                    for row in svi_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    svi_outcome_ok = len(svi_eligible)
-                except NsoApplyError as exc:
-                    logger.error("apply.svi_failed", job_id=job_id, device=device_name, error=exc.message)
-                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-                    for row in svi_eligible:
-                        row.last_apply_error = err_payload
-                    svi_outcome_failed = len(svi_eligible)
-                    svi_failed.append({"error": exc.message})
-                except Exception as exc:
-                    logger.exception("apply.svi_unexpected_error", job_id=job_id)
-                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
-                    for row in svi_eligible:
-                        row.last_apply_error = err_payload
-                    svi_outcome_failed = len(svi_eligible)
-                    svi_failed.append({"error": repr(exc)})
-
-            # ── Step 6c1c: dot1q subinterface intent pass (M36) ──────────────
-            subif_outcome_ok = 0
-            subif_outcome_failed = 0
-            subif_failed: list[dict] = []
-
-            if subif_eligible:
-                try:
-                    await apply_subinterface_config(
-                        client=client, device_name=device_name, subif_intent_rows=subif_eligible
-                    )
-                    for row in subif_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    subif_outcome_ok = len(subif_eligible)
-                except NsoApplyError as exc:
-                    logger.error("apply.subif_failed", job_id=job_id, device=device_name, error=exc.message)
-                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-                    for row in subif_eligible:
-                        row.last_apply_error = err_payload
-                    subif_outcome_failed = len(subif_eligible)
-                    subif_failed.append({"error": exc.message})
-                except Exception as exc:
-                    logger.exception("apply.subif_unexpected_error", job_id=job_id)
-                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
-                    for row in subif_eligible:
-                        row.last_apply_error = err_payload
-                    subif_outcome_failed = len(subif_eligible)
-                    subif_failed.append({"error": repr(exc)})
-
-            # ── Step 6c1d: VLAN-database intent pass (M34) ───────────────────
-            vlan_outcome_ok = 0
-            vlan_outcome_failed = 0
-            vlan_failed: list[dict] = []
-
-            if vlan_eligible:
-                try:
-                    await apply_vlan_config(client=client, device_name=device_name, vlan_intent_rows=vlan_eligible)
-                    for row in vlan_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    vlan_outcome_ok = len(vlan_eligible)
-                except NsoApplyError as exc:
-                    logger.error("apply.vlan_failed", job_id=job_id, device=device_name, error=exc.message)
-                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-                    for row in vlan_eligible:
-                        row.last_apply_error = err_payload
-                    vlan_outcome_failed = len(vlan_eligible)
-                    vlan_failed.append({"error": exc.message})
-                except Exception as exc:
-                    logger.exception("apply.vlan_unexpected_error", job_id=job_id)
-                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
-                    for row in vlan_eligible:
-                        row.last_apply_error = err_payload
-                    vlan_outcome_failed = len(vlan_eligible)
-                    vlan_failed.append({"error": repr(exc)})
-
-            # ── Step 6c1e: per-interface BFD intent pass ─────────────────────
-            bfd_outcome_ok = 0
-            bfd_outcome_failed = 0
-            bfd_failed: list[dict] = []
-
-            if bfd_eligible:
-                try:
-                    await apply_bfd_config(client=client, device_name=device_name, bfd_intent_rows=bfd_eligible)
-                    for row in bfd_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    bfd_outcome_ok = len(bfd_eligible)
-                except NsoApplyError as exc:
-                    logger.error("apply.bfd_failed", job_id=job_id, device=device_name, error=exc.message)
-                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-                    for row in bfd_eligible:
-                        row.last_apply_error = err_payload
-                    bfd_outcome_failed = len(bfd_eligible)
-                    bfd_failed.append({"error": exc.message})
-                except Exception as exc:
-                    logger.exception("apply.bfd_unexpected_error", job_id=job_id)
-                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
-                    for row in bfd_eligible:
-                        row.last_apply_error = err_payload
-                    bfd_outcome_failed = len(bfd_eligible)
-                    bfd_failed.append({"error": repr(exc)})
-
-            # ── Step 6c1f: per-interface MTU intent pass (Phase 2b) ──────────
-            mtu_outcome_ok = 0
-            mtu_outcome_failed = 0
-            mtu_failed: list[dict] = []
-
-            if mtu_eligible:
-                try:
-                    await apply_mtu_config(client=client, device_name=device_name, mtu_intent_rows=mtu_eligible)
-                    for row in mtu_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    mtu_outcome_ok = len(mtu_eligible)
-                except NsoApplyError as exc:
-                    logger.error("apply.interface_mtu_failed", job_id=job_id, device=device_name, error=exc.message)
-                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-                    for row in mtu_eligible:
-                        row.last_apply_error = err_payload
-                    mtu_outcome_failed = len(mtu_eligible)
-                    mtu_failed.append({"error": exc.message})
-                except Exception as exc:
-                    logger.exception("apply.interface_mtu_unexpected_error", job_id=job_id)
-                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
-                    for row in mtu_eligible:
-                        row.last_apply_error = err_payload
-                    mtu_outcome_failed = len(mtu_eligible)
-                    mtu_failed.append({"error": repr(exc)})
-
-            # ── Step 6c2: L2 SAP intent pass (M37 P2b) ───────────────────────
-            l2_outcome_ok = 0
-            l2_outcome_failed = 0
-            l2_failed: list[dict] = []
-
-            if l2_eligible:
-                try:
-                    await apply_l2_saps(
-                        client=client,
-                        device_name=device_name,
-                        sap_intent_rows=l2_eligible,
-                    )
-                    for row in l2_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    l2_outcome_ok = len(l2_eligible)
-                except NsoApplyError as exc:
-                    logger.error(
-                        "apply.l2_sap_failed",
-                        job_id=job_id,
-                        device=device_name,
-                        error=exc.message,
-                    )
-                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-                    for row in l2_eligible:
-                        row.last_apply_error = err_payload
-                    l2_outcome_failed = len(l2_eligible)
-                    l2_failed.append({"error": exc.message})
-                except Exception as exc:
-                    logger.exception("apply.l2_sap_unexpected_error", job_id=job_id)
-                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
-                    for row in l2_eligible:
-                        row.last_apply_error = err_payload
-                    l2_outcome_failed = len(l2_eligible)
-                    l2_failed.append({"error": repr(exc)})
-
-            # ── Step 6d: IS-IS interface + process intent pass ───────────────
-            isis_outcome_ok = 0
-            isis_outcome_failed = 0
-            isis_failed: list[dict] = []
-
-            if isis_eligible or isis_process_eligible or redist_isis or isis_flex_eligible:
-                try:
-                    await apply_isis_interfaces(
-                        client=client,
-                        device_name=device_name,
-                        isis_intent_rows=isis_eligible,
-                        isis_process_rows=isis_process_eligible,
-                        redistribution_rows=redist_isis,
-                        flex_algo_rows=isis_flex_eligible,
-                    )
-                    for row in isis_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    for row in isis_process_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    for row in redist_isis:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    for row in isis_flex_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    isis_outcome_ok = (
-                        len(isis_eligible) + len(isis_process_eligible) + len(redist_isis) + len(isis_flex_eligible)
-                    )
-                except NsoApplyError as exc:
-                    logger.error(
-                        "apply.isis_failed",
-                        job_id=job_id,
-                        device=device_name,
-                        error=exc.message,
-                    )
-                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-                    for row in isis_eligible:
-                        row.last_apply_error = err_payload
-                    for row in isis_process_eligible:
-                        row.last_apply_error = err_payload
-                    for row in redist_isis:
-                        row.last_apply_error = err_payload
-                    for row in isis_flex_eligible:
-                        row.last_apply_error = err_payload
-                    isis_outcome_failed = (
-                        len(isis_eligible) + len(isis_process_eligible) + len(redist_isis) + len(isis_flex_eligible)
-                    )
-                    isis_failed.append({"error": exc.message})
-                except Exception as exc:
-                    logger.exception("apply.isis_unexpected_error", job_id=job_id)
-                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
-                    for row in isis_eligible:
-                        row.last_apply_error = err_payload
-                    for row in isis_process_eligible:
-                        row.last_apply_error = err_payload
-                    for row in redist_isis:
-                        row.last_apply_error = err_payload
-                    for row in isis_flex_eligible:
-                        row.last_apply_error = err_payload
-                    isis_outcome_failed = (
-                        len(isis_eligible) + len(isis_process_eligible) + len(redist_isis) + len(isis_flex_eligible)
-                    )
-                    isis_failed.append({"error": repr(exc)})
-
-            # ── Step 6e: BGP intent pass ──────────────────────────────────────
-            bgp_outcome_ok = 0
-            bgp_outcome_failed = 0
-            bgp_failed: list[dict] = []
-
-            if bgp_eligible or redist_bgp:
-                try:
-                    await apply_bgp_config(
-                        client=client,
-                        device_name=device_name,
-                        router_intent_rows=bgp_eligible,
-                        redistribution_rows=redist_bgp,
-                    )
-                    for row in bgp_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    for row in redist_bgp:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    bgp_outcome_ok = len(bgp_eligible) + len(redist_bgp)
-                except NsoApplyError as exc:
-                    logger.error(
-                        "apply.bgp_failed",
-                        job_id=job_id,
-                        device=device_name,
-                        error=exc.message,
-                    )
-                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-                    for row in bgp_eligible:
-                        row.last_apply_error = err_payload
-                    for row in redist_bgp:
-                        row.last_apply_error = err_payload
-                    bgp_outcome_failed = len(bgp_eligible) + len(redist_bgp)
-                    bgp_failed.append({"error": exc.message})
-                except Exception as exc:
-                    logger.exception("apply.bgp_unexpected_error", job_id=job_id)
-                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
-                    for row in bgp_eligible:
-                        row.last_apply_error = err_payload
-                    for row in redist_bgp:
-                        row.last_apply_error = err_payload
-                    bgp_outcome_failed = len(bgp_eligible) + len(redist_bgp)
-                    bgp_failed.append({"error": repr(exc)})
-
-            # ── Step 6f: route-policy intent pass ────────────────────────────
-            rp_outcome_ok = 0
-            rp_outcome_failed = 0
-            rp_failed: list[dict] = []
-
-            if rp_eligible:
-                try:
-                    await apply_route_policy_config(
-                        client=client,
-                        device_name=device_name,
-                        intent_rows=rp_eligible,
-                        ned_id=device.ned_id,
-                    )
-                    for row in rp_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    rp_outcome_ok = len(rp_eligible)
-                except NsoApplyError as exc:
-                    logger.error(
-                        "apply.route_policy_failed",
-                        job_id=job_id,
-                        device=device_name,
-                        error=exc.message,
-                    )
-                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-                    for row in rp_eligible:
-                        row.last_apply_error = err_payload
-                    rp_outcome_failed = len(rp_eligible)
-                    rp_failed.append({"error": exc.message})
-                    # Accepted-half: record the device-parser rejection in the capability
-                    # matrix so every box on this (ned, sw) is flagged from now on. The
-                    # difference is only learnable from a real commit (dry-run renders it).
-                    try:
-                        from nso_adapter.core.capability import (
-                            parse_rejected_construct,
-                            record_capability_rejection,
-                            refresh_device_capability,
-                        )
-
-                        info = await refresh_device_capability(db, client, device_name, device)
-                        scope, name = parse_rejected_construct(exc.message)
-                        if info and name:
-                            await record_capability_rejection(
-                                db, info["ned_id"], info["sw_version"], scope, name, exc.message[:256]
-                            )
-                    except Exception:  # noqa: BLE001 — capability recording is best-effort
-                        logger.debug("apply.capability_record_skipped", job_id=job_id)
-                except Exception as exc:
-                    logger.exception("apply.route_policy_unexpected_error", job_id=job_id)
-                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
-                    for row in rp_eligible:
-                        row.last_apply_error = err_payload
-                    rp_outcome_failed = len(rp_eligible)
-                    rp_failed.append({"error": repr(exc)})
-
-            # ── Step 6g: OSPF intent pass ─────────────────────────────────────
-            ospf_outcome_ok = 0
-            ospf_outcome_failed = 0
-            ospf_failed: list[dict] = []
-
-            if ospf_instance_eligible or ospf_iface_eligible or redist_ospf:
-                try:
-                    await apply_ospf_config(
-                        client=client,
-                        device_name=device_name,
-                        process_intent_rows=ospf_instance_eligible,
-                        interface_intent_rows=ospf_iface_eligible,
-                        redistribution_rows=redist_ospf,
-                    )
-                    for row in ospf_instance_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    for row in ospf_iface_eligible:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    for row in redist_ospf:
-                        row.last_apply_at = now
-                        row.last_apply_error = None
-                    ospf_outcome_ok = len(ospf_instance_eligible) + len(ospf_iface_eligible) + len(redist_ospf)
-                except NsoApplyError as exc:
-                    logger.error(
-                        "apply.ospf_failed",
-                        job_id=job_id,
-                        device=device_name,
-                        error=exc.message,
-                    )
-                    err_payload = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-                    for row in ospf_instance_eligible:
-                        row.last_apply_error = err_payload
-                    for row in ospf_iface_eligible:
-                        row.last_apply_error = err_payload
-                    for row in redist_ospf:
-                        row.last_apply_error = err_payload
-                    ospf_outcome_failed = len(ospf_instance_eligible) + len(ospf_iface_eligible) + len(redist_ospf)
-                    ospf_failed.append({"error": exc.message})
-                except Exception as exc:
-                    logger.exception("apply.ospf_unexpected_error", job_id=job_id)
-                    err_payload = {"code": "internal", "message": repr(exc), "detail": {}}
-                    for row in ospf_instance_eligible:
-                        row.last_apply_error = err_payload
-                    for row in ospf_iface_eligible:
-                        row.last_apply_error = err_payload
-                    for row in redist_ospf:
-                        row.last_apply_error = err_payload
-                    ospf_outcome_failed = len(ospf_instance_eligible) + len(ospf_iface_eligible) + len(redist_ospf)
-                    ospf_failed.append({"error": repr(exc)})
-
-            # ── Step 7: finalize job ─────────────────────────────────────────
-            if (
-                not eligible
-                and not ip_eligible_by_iface
-                and not snmp_has_eligible
-                and not sr_eligible
-                and not logging_eligible
-                and not svi_eligible
-                and not subif_eligible
-                and not vlan_eligible
-                and not bfd_eligible
-                and not mtu_eligible
-                and not l2_eligible
-                and not isis_eligible
-                and not bgp_eligible
-                and not rp_eligible
-                and not ospf_instance_eligible
-                and not ospf_iface_eligible
-                and not redist_eligible
-            ):
-                logger.info("apply.nothing_eligible", job_id=job_id, device_id=device_id)
-                job.status = JobStatus.succeeded
-                job.result = {
-                    "attribute_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-                    "ip_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-                    "snmp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-                    "static_route_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-                    "subinterface_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-                    "vlan_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-                    "bfd_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-                    "interface_mtu_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-                    "l2_sap_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-                    "isis_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-                    "bgp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-                    "route_policy_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-                    "ospf_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
-                }
-                await db.commit()
-                return
-
-            total_failed = (
-                outcome_failed
-                + ip_outcome_failed
-                + snmp_outcome_failed
-                + sr_outcome_failed
-                + logging_outcome_failed
-                + svi_outcome_failed
-                + subif_outcome_failed
-                + vlan_outcome_failed
-                + bfd_outcome_failed
-                + mtu_outcome_failed
-                + l2_outcome_failed
-                + isis_outcome_failed
-                + bgp_outcome_failed
-                + rp_outcome_failed
-                + ospf_outcome_failed
-            )
-            job.result = {
-                "attribute_count_by_outcome": {
-                    "in_sync": outcome_in_sync,
-                    "apply_failed": outcome_failed,
-                },
-                "ip_count_by_outcome": {
-                    "in_sync": ip_outcome_ok,
-                    "apply_failed": ip_outcome_failed,
-                },
-                "snmp_count_by_outcome": {
-                    "in_sync": snmp_outcome_ok,
-                    "apply_failed": snmp_outcome_failed,
-                },
-                "static_route_count_by_outcome": {
-                    "in_sync": sr_outcome_ok,
-                    "apply_failed": sr_outcome_failed,
-                },
-                "logging_count_by_outcome": {
-                    "in_sync": logging_outcome_ok,
-                    "apply_failed": logging_outcome_failed,
-                },
-                "svi_count_by_outcome": {
-                    "in_sync": svi_outcome_ok,
-                    "apply_failed": svi_outcome_failed,
-                },
-                "subinterface_count_by_outcome": {
-                    "in_sync": subif_outcome_ok,
-                    "apply_failed": subif_outcome_failed,
-                },
-                "vlan_count_by_outcome": {
-                    "in_sync": vlan_outcome_ok,
-                    "apply_failed": vlan_outcome_failed,
-                },
-                "bfd_count_by_outcome": {
-                    "in_sync": bfd_outcome_ok,
-                    "apply_failed": bfd_outcome_failed,
-                },
-                "interface_mtu_count_by_outcome": {
-                    "in_sync": mtu_outcome_ok,
-                    "apply_failed": mtu_outcome_failed,
-                },
-                "l2_sap_count_by_outcome": {
-                    "in_sync": l2_outcome_ok,
-                    "apply_failed": l2_outcome_failed,
-                },
-                "isis_count_by_outcome": {
-                    "in_sync": isis_outcome_ok,
-                    "apply_failed": isis_outcome_failed,
-                },
-                "bgp_count_by_outcome": {
-                    "in_sync": bgp_outcome_ok,
-                    "apply_failed": bgp_outcome_failed,
-                },
-                "route_policy_count_by_outcome": {
-                    "in_sync": rp_outcome_ok,
-                    "apply_failed": rp_outcome_failed,
-                },
-                "ospf_count_by_outcome": {
-                    "in_sync": ospf_outcome_ok,
-                    "apply_failed": ospf_outcome_failed,
-                },
-            }
-            if total_failed == 0:
-                job.status = JobStatus.succeeded
-            else:
-                job.status = JobStatus.failed
-                all_failed = (
-                    [{"type": "attribute", **a} for a in failed_attrs]
-                    + [{"type": "ip", **a} for a in failed_ips]
-                    + [{"type": "snmp", **a} for a in snmp_failed]
-                    + [{"type": "static_route", **a} for a in sr_failed]
-                    + [{"type": "logging", **a} for a in logging_failed]
-                    + [{"type": "svi", **a} for a in svi_failed]
-                    + [{"type": "subinterface", **a} for a in subif_failed]
-                    + [{"type": "vlan", **a} for a in vlan_failed]
-                    + [{"type": "bfd", **a} for a in bfd_failed]
-                    + [{"type": "interface_mtu", **a} for a in mtu_failed]
-                    + [{"type": "l2_sap", **a} for a in l2_failed]
-                    + [{"type": "isis", **a} for a in isis_failed]
-                    + [{"type": "bgp", **a} for a in bgp_failed]
-                    + [{"type": "route_policy", **a} for a in rp_failed]
-                    + [{"type": "ospf", **a} for a in ospf_failed]
-                )
-                job.error = {
-                    "code": "nso_commit_failed",
-                    "message": f"{total_failed} item(s) failed to apply",
-                    "detail": {"items": all_failed},
-                }
-            await db.commit()
-            logger.info(
-                "apply.done",
-                job_id=job_id,
-                in_sync=outcome_in_sync,
-                apply_failed=outcome_failed,
-                ip_in_sync=ip_outcome_ok,
-                ip_failed=ip_outcome_failed,
-                snmp_in_sync=snmp_outcome_ok,
-                snmp_failed=snmp_outcome_failed,
-                sr_in_sync=sr_outcome_ok,
-                sr_failed=sr_outcome_failed,
-                l2_in_sync=l2_outcome_ok,
-                l2_failed=l2_outcome_failed,
-                isis_in_sync=isis_outcome_ok,
-                isis_failed=isis_outcome_failed,
-                bgp_in_sync=bgp_outcome_ok,
-                bgp_failed=bgp_outcome_failed,
-                rp_in_sync=rp_outcome_ok,
-                rp_failed=rp_outcome_failed,
-            )
-
+            await _execute_apply(db, job, job_id, device_id, force)
         except Exception as exc:
             logger.exception("apply.unexpected_error", job_id=job_id, device_id=device_id)
             job.status = JobStatus.failed
