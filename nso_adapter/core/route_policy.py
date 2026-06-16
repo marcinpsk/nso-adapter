@@ -39,6 +39,27 @@ def _content_hash(obj: object) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
+def _dedup_by_name(items: list, family: str, device_name: str) -> list:
+    """Drop objects repeating a name within one refresh (keep the first, log the rest).
+
+    The store keys route-policy objects by ``(device_id, name)``; a reader that reports the
+    same name twice — e.g. SR OS lets an ``as-path`` and an ``as-path-group`` (or two
+    prefix-list reads) share a name — would otherwise abort the WHOLE full-replace refresh on
+    a unique-constraint violation, FREEZING the device's read-mirror. This makes the refresh
+    resilient to any such duplicate regardless of which reader produced it.
+    """
+    seen: set = set()
+    out: list = []
+    for item in items:
+        name = item.get("name")
+        if name in seen:
+            logger.warning("route_policy.refresh.duplicate_name_skipped", device=device_name, family=family, name=name)
+            continue
+        seen.add(name)
+        out.append(item)
+    return out
+
+
 async def _upsert_route_policy_data(
     db: AsyncSession,
     device: Device,
@@ -58,7 +79,7 @@ async def _upsert_route_policy_data(
 
     now = datetime.now(UTC).replace(tzinfo=None)
 
-    for pl_data in data.get("prefix-list", []):
+    for pl_data in _dedup_by_name(data.get("prefix-list", []), "prefix-list", device.nso_device_name):
         pl = DeviceRoutePolicyPrefixList(
             device_id=device.id,
             name=pl_data["name"],
@@ -80,7 +101,7 @@ async def _upsert_route_policy_data(
             )
             db.add(entry)
 
-    for cl_data in data.get("community-list", []):
+    for cl_data in _dedup_by_name(data.get("community-list", []), "community-list", device.nso_device_name):
         cl = DeviceRoutePolicyCommunityList(
             device_id=device.id,
             name=cl_data["name"],
@@ -100,7 +121,7 @@ async def _upsert_route_policy_data(
             )
             db.add(entry)
 
-    for ap_data in data.get("as-path", []):
+    for ap_data in _dedup_by_name(data.get("as-path", []), "as-path", device.nso_device_name):
         ap = DeviceRoutePolicyASPath(
             device_id=device.id,
             name=ap_data["name"],
@@ -119,7 +140,7 @@ async def _upsert_route_policy_data(
             )
             db.add(entry)
 
-    for rm_data in data.get("route-map", []):
+    for rm_data in _dedup_by_name(data.get("route-map", []), "route-map", device.nso_device_name):
         rm = DeviceRoutePolicyRouteMap(
             device_id=device.id,
             name=rm_data["name"],
