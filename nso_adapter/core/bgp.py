@@ -30,7 +30,129 @@ from nso_adapter.store.models import (
 logger = structlog.get_logger(__name__)
 
 
-async def _upsert_bgp_data(  # noqa: C901
+def _add_peer_address_families(
+    db: AsyncSession, peer: DeviceBgpPeer, paf_dicts: list[dict], seen_afis: set[str]
+) -> None:
+    """Add a peer's per-AF policy rows, skipping blank/duplicate afis (merged across groups)."""
+    for paf_data in paf_dicts:
+        paf_name = paf_data.get("afi", "")
+        if not paf_name or paf_name in seen_afis:
+            continue
+        seen_afis.add(paf_name)
+        db.add(
+            DeviceBgpPeerAddressFamily(
+                peer_id=peer.id,
+                af=paf_name,
+                enabled=bool(paf_data.get("enabled", True)),
+                # IOS splits route-map vs prefix-list; Junos/Timos use a single
+                # per-AF policy (policy-in/out) which maps to a route-map.
+                routemap_in=paf_data.get("routemap-in") or paf_data.get("policy-in") or None,
+                routemap_out=paf_data.get("routemap-out") or paf_data.get("policy-out") or None,
+                prefixlist_in=paf_data.get("prefixlist-in") or None,
+                prefixlist_out=paf_data.get("prefixlist-out") or None,
+            )
+        )
+
+
+async def _insert_bgp_peers(db: AsyncSession, scope_id: int, peer_dicts: list[dict], device_id: int, vrf: str) -> None:
+    """Insert peers under a scope, collapsing the same neighbor across groups.
+
+    A BGP neighbor is unique per (router, vrf), but a device may list the same
+    neighbor IP under more than one group — a violation of
+    uq_devicebgppeer_identity that would roll back the ENTIRE device refresh.
+    Collapse to one peer per address and MERGE their address-families (scalar
+    peer fields: first occurrence wins; ``enabled`` is the OR across occurrences).
+    """
+    peers_by_addr: dict[str, DeviceBgpPeer] = {}
+    afis_by_addr: dict[str, set[str]] = {}
+    for peer_data in peer_dicts:
+        peer_addr = peer_data.get("peer-address", "")
+        if not peer_addr:
+            continue
+        peer = peers_by_addr.get(peer_addr)
+        if peer is None:
+            peer = DeviceBgpPeer(
+                scope_id=scope_id,
+                peer_address=peer_addr,
+                enabled=bool(peer_data.get("enabled", True)),
+                peer_group=peer_data.get("peer-group") or None,
+                remote_as=str(peer_data["remote-as"]) if peer_data.get("remote-as") is not None else None,
+                local_as=str(peer_data["local-as"]) if peer_data.get("local-as") is not None else None,
+                ttl=peer_data.get("ttl"),
+                password=peer_data.get("password"),
+                source=peer_data.get("source") or None,
+                bfd_enabled=peer_data.get("bfd-enabled"),
+            )
+            db.add(peer)
+            await db.flush()
+            peers_by_addr[peer_addr] = peer
+            afis_by_addr[peer_addr] = set()
+        else:
+            # Same peer in multiple groups (e.g. one active, one deactivated):
+            # the peer is enabled if ANY occurrence is active.
+            if bool(peer_data.get("enabled", True)):
+                peer.enabled = True
+            logger.debug("bgp.peer_merged_across_groups", device_id=device_id, vrf=vrf, peer_address=peer_addr)
+
+        _add_peer_address_families(db, peer, peer_data.get("peer-address-family", []), afis_by_addr[peer_addr])
+
+
+def _add_peer_group_address_families(db: AsyncSession, pg: DeviceBgpPeerGroup, pgaf_dicts: list[dict]) -> None:
+    """Add a peer-group's per-AF policy rows, skipping blank/duplicate afis."""
+    seen: set[str] = set()
+    for pgaf_data in pgaf_dicts:
+        pgaf_name = pgaf_data.get("afi", "")
+        if not pgaf_name or pgaf_name in seen:
+            continue
+        seen.add(pgaf_name)
+        db.add(
+            DeviceBgpPeerGroupAddressFamily(
+                peer_group_id=pg.id,
+                af=pgaf_name,
+                routemap_in=pgaf_data.get("routemap-in") or pgaf_data.get("policy-in") or None,
+                routemap_out=pgaf_data.get("routemap-out") or pgaf_data.get("policy-out") or None,
+                prefixlist_in=pgaf_data.get("prefixlist-in") or None,
+                prefixlist_out=pgaf_data.get("prefixlist-out") or None,
+            )
+        )
+
+
+async def _insert_bgp_peer_groups(db: AsyncSession, scope_id: int, pg_dicts: list[dict]) -> None:
+    """Insert peer-group / template objects + their per-AF policies, skipping blank/duplicate names."""
+    seen_pg: set[str] = set()
+    for pg_data in pg_dicts:
+        pg_name = pg_data.get("name", "")
+        if not pg_name or pg_name in seen_pg:
+            continue
+        seen_pg.add(pg_name)
+        pg = DeviceBgpPeerGroup(
+            scope_id=scope_id,
+            name=pg_name,
+            remote_as=str(pg_data["remote-as"]) if pg_data.get("remote-as") is not None else None,
+            source=pg_data.get("source") or None,
+        )
+        db.add(pg)
+        await db.flush()
+        _add_peer_group_address_families(db, pg, pg_data.get("peer-group-address-family", []))
+
+
+async def _insert_bgp_scope(db: AsyncSession, router_id: int, scope_data: dict, device_id: int) -> None:
+    """Insert one scope (vrf) + its address-families, peers and peer-groups."""
+    vrf = scope_data.get("vrf", "")
+    scope = DeviceBgpScope(router_id=router_id, vrf=vrf)
+    db.add(scope)
+    await db.flush()
+
+    for af_data in scope_data.get("address-family", []):
+        af_name = af_data.get("af", "")
+        if af_name:
+            db.add(DeviceBgpAddressFamily(scope_id=scope.id, af=af_name))
+
+    await _insert_bgp_peers(db, scope.id, scope_data.get("peer", []), device_id, vrf)
+    await _insert_bgp_peer_groups(db, scope.id, scope_data.get("peer-group", []))
+
+
+async def _upsert_bgp_data(
     db: AsyncSession,
     device: Device,
     routers: list[dict],
@@ -55,104 +177,7 @@ async def _upsert_bgp_data(  # noqa: C901
         await db.flush()
 
         for scope_data in router_data.get("scope", []):
-            vrf = scope_data.get("vrf", "")
-            scope = DeviceBgpScope(router_id=router.id, vrf=vrf)
-            db.add(scope)
-            await db.flush()
-
-            for af_data in scope_data.get("address-family", []):
-                af_name = af_data.get("af", "")
-                if af_name:
-                    db.add(DeviceBgpAddressFamily(scope_id=scope.id, af=af_name))
-
-            # A BGP neighbor is unique per (router, vrf), but a device may list the
-            # same neighbor IP under more than one group — a violation of
-            # uq_devicebgppeer_identity that would roll back the ENTIRE device
-            # refresh. Collapse to one peer per address and MERGE their
-            # address-families (scalar peer fields: first occurrence wins).
-            peers_by_addr: dict[str, DeviceBgpPeer] = {}
-            afis_by_addr: dict[str, set[str]] = {}
-            for peer_data in scope_data.get("peer", []):
-                peer_addr = peer_data.get("peer-address", "")
-                if not peer_addr:
-                    continue
-                peer = peers_by_addr.get(peer_addr)
-                if peer is None:
-                    peer = DeviceBgpPeer(
-                        scope_id=scope.id,
-                        peer_address=peer_addr,
-                        enabled=bool(peer_data.get("enabled", True)),
-                        peer_group=peer_data.get("peer-group") or None,
-                        remote_as=str(peer_data["remote-as"]) if peer_data.get("remote-as") is not None else None,
-                        local_as=str(peer_data["local-as"]) if peer_data.get("local-as") is not None else None,
-                        ttl=peer_data.get("ttl"),
-                        password=peer_data.get("password"),
-                        source=peer_data.get("source") or None,
-                        bfd_enabled=peer_data.get("bfd-enabled"),
-                    )
-                    db.add(peer)
-                    await db.flush()
-                    peers_by_addr[peer_addr] = peer
-                    afis_by_addr[peer_addr] = set()
-                else:
-                    # Same peer in multiple groups (e.g. one active, one deactivated):
-                    # the peer is enabled if ANY occurrence is active.
-                    if bool(peer_data.get("enabled", True)):
-                        peer.enabled = True
-                    logger.debug("bgp.peer_merged_across_groups", device_id=device.id, vrf=vrf, peer_address=peer_addr)
-
-                seen_afis = afis_by_addr[peer_addr]
-                for paf_data in peer_data.get("peer-address-family", []):
-                    paf_name = paf_data.get("afi", "")
-                    if not paf_name or paf_name in seen_afis:
-                        continue
-                    seen_afis.add(paf_name)
-                    db.add(
-                        DeviceBgpPeerAddressFamily(
-                            peer_id=peer.id,
-                            af=paf_name,
-                            enabled=bool(paf_data.get("enabled", True)),
-                            # IOS splits route-map vs prefix-list; Junos/Timos use a single
-                            # per-AF policy (policy-in/out) which maps to a route-map.
-                            routemap_in=paf_data.get("routemap-in") or paf_data.get("policy-in") or None,
-                            routemap_out=paf_data.get("routemap-out") or paf_data.get("policy-out") or None,
-                            prefixlist_in=paf_data.get("prefixlist-in") or None,
-                            prefixlist_out=paf_data.get("prefixlist-out") or None,
-                        )
-                    )
-
-            # Peer-group / template objects with their own per-AF policies.
-            seen_pg: set[str] = set()
-            for pg_data in scope_data.get("peer-group", []):
-                pg_name = pg_data.get("name", "")
-                if not pg_name or pg_name in seen_pg:
-                    continue
-                seen_pg.add(pg_name)
-                pg = DeviceBgpPeerGroup(
-                    scope_id=scope.id,
-                    name=pg_name,
-                    remote_as=str(pg_data["remote-as"]) if pg_data.get("remote-as") is not None else None,
-                    source=pg_data.get("source") or None,
-                )
-                db.add(pg)
-                await db.flush()
-
-                seen_pg_afis: set[str] = set()
-                for pgaf_data in pg_data.get("peer-group-address-family", []):
-                    pgaf_name = pgaf_data.get("afi", "")
-                    if not pgaf_name or pgaf_name in seen_pg_afis:
-                        continue
-                    seen_pg_afis.add(pgaf_name)
-                    db.add(
-                        DeviceBgpPeerGroupAddressFamily(
-                            peer_group_id=pg.id,
-                            af=pgaf_name,
-                            routemap_in=pgaf_data.get("routemap-in") or pgaf_data.get("policy-in") or None,
-                            routemap_out=pgaf_data.get("routemap-out") or pgaf_data.get("policy-out") or None,
-                            prefixlist_in=pgaf_data.get("prefixlist-in") or None,
-                            prefixlist_out=pgaf_data.get("prefixlist-out") or None,
-                        )
-                    )
+            await _insert_bgp_scope(db, router.id, scope_data, device.id)
 
     await db.commit()
 
