@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import NamedTuple
+
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -604,161 +607,109 @@ async def _scheduled_topology_interfaces_refresh() -> None:
                 logger.error("scheduler.topology_interfaces.error", device_id=device.id, error=repr(exc))
 
 
-def start_scheduler() -> None:  # noqa: C901
+class _JobSpec(NamedTuple):
+    """One periodic job's registration rule.
+
+    ``enable_attr`` None → no enable flag (always-on jobs). ``gate_on_interval``
+    True → only register when the resolved interval is > 0 (lets an interval of 0
+    disable a job that has no dedicated enable flag).
+    """
+
+    fn: Callable
+    job_id: str
+    interval_attr: str
+    enable_attr: str | None
+    gate_on_interval: bool
+
+
+# Declarative registry of every periodic job. Order = registration order.
+_JOB_SPECS: tuple[_JobSpec, ...] = (
+    _JobSpec(_scheduled_sync_all, "sync_all_devices", "poll_interval", None, False),
+    _JobSpec(_scheduled_scope_reconcile, "scope_reconcile", "scope_reconcile_interval", None, False),
+    _JobSpec(_scheduled_intent_reconcile, "intent_reconcile", "scope_reconcile_interval", None, False),
+    _JobSpec(_scheduled_lag_topology_refresh, "lag_topology_refresh", "lag_topology_poll_interval", None, True),
+    _JobSpec(_scheduled_lag_config_refresh, "lag_config_refresh", "lag_config_poll_interval", None, True),
+    _JobSpec(
+        _scheduled_interface_ip_refresh,
+        "interface_ip_refresh",
+        "interface_ip_poll_interval",
+        "enable_interface_ip_sync",
+        True,
+    ),
+    _JobSpec(
+        _scheduled_static_route_refresh,
+        "static_route_refresh",
+        "static_route_poll_interval",
+        "enable_static_routing_sync",
+        True,
+    ),
+    _JobSpec(_scheduled_isis_refresh, "isis_refresh", "isis_poll_interval", "enable_isis_sync", True),
+    _JobSpec(_scheduled_bgp_refresh, "bgp_refresh", "bgp_poll_interval", "enable_bgp_sync", True),
+    _JobSpec(_scheduled_ospf_refresh, "ospf_refresh", "ospf_poll_interval", "enable_ospf_sync", True),
+    _JobSpec(
+        _scheduled_redistribution_refresh,
+        "redistribution_refresh",
+        "redistribution_poll_interval",
+        "enable_redistribution_sync",
+        True,
+    ),
+    _JobSpec(_scheduled_snmp_refresh, "snmp_refresh", "snmp_poll_interval", "enable_snmp_sync", True),
+    _JobSpec(_scheduled_logging_refresh, "logging_refresh", "logging_poll_interval", "enable_logging_sync", True),
+    _JobSpec(
+        _scheduled_l2_service_refresh, "l2_service_refresh", "l2_service_poll_interval", "enable_l2_service_sync", True
+    ),
+    _JobSpec(_scheduled_vlan_refresh, "vlan_refresh", "vlan_poll_interval", "enable_vlan_sync", True),
+    _JobSpec(
+        _scheduled_switchport_refresh, "switchport_refresh", "switchport_poll_interval", "enable_switchport_sync", True
+    ),
+    _JobSpec(_scheduled_svi_refresh, "svi_refresh", "svi_poll_interval", "enable_svi_sync", True),
+    _JobSpec(
+        _scheduled_subinterface_refresh,
+        "subinterface_refresh",
+        "subinterface_poll_interval",
+        "enable_subinterface_sync",
+        True,
+    ),
+    _JobSpec(
+        _scheduled_interface_mtu_refresh,
+        "interface_mtu_refresh",
+        "interface_mtu_poll_interval",
+        "enable_interface_mtu_sync",
+        True,
+    ),
+    _JobSpec(
+        _scheduled_route_policy_refresh,
+        "route_policy_refresh",
+        "route_policy_poll_interval",
+        "enable_route_policy_sync",
+        True,
+    ),
+    _JobSpec(
+        _scheduled_capability_refresh,
+        "capability_refresh",
+        "capability_refresh_interval",
+        "enable_capability_refresh",
+        True,
+    ),
+    _JobSpec(
+        _scheduled_topology_interfaces_refresh,
+        "topology_interfaces_refresh",
+        "topology_interface_poll_interval",
+        "enable_topology_interface_sync",
+        True,
+    ),
+)
+
+
+def start_scheduler() -> None:
     global _scheduler
     cfg = get_config()
     _scheduler = AsyncIOScheduler()
-    _scheduler.add_job(
-        _scheduled_sync_all,
-        "interval",
-        minutes=cfg.scheduler.poll_interval,
-        id="sync_all_devices",
-    )
-    _scheduler.add_job(
-        _scheduled_scope_reconcile,
-        "interval",
-        minutes=cfg.scheduler.scope_reconcile_interval,
-        id="scope_reconcile",
-    )
-    _scheduler.add_job(
-        _scheduled_intent_reconcile,
-        "interval",
-        minutes=cfg.scheduler.scope_reconcile_interval,
-        id="intent_reconcile",
-    )
-    if cfg.scheduler.lag_topology_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_lag_topology_refresh,
-            "interval",
-            minutes=cfg.scheduler.lag_topology_poll_interval,
-            id="lag_topology_refresh",
-        )
-    if cfg.scheduler.lag_config_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_lag_config_refresh,
-            "interval",
-            minutes=cfg.scheduler.lag_config_poll_interval,
-            id="lag_config_refresh",
-        )
-    if cfg.scheduler.enable_interface_ip_sync and cfg.scheduler.interface_ip_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_interface_ip_refresh,
-            "interval",
-            minutes=cfg.scheduler.interface_ip_poll_interval,
-            id="interface_ip_refresh",
-        )
-    if cfg.scheduler.enable_static_routing_sync and cfg.scheduler.static_route_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_static_route_refresh,
-            "interval",
-            minutes=cfg.scheduler.static_route_poll_interval,
-            id="static_route_refresh",
-        )
-    if cfg.scheduler.enable_isis_sync and cfg.scheduler.isis_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_isis_refresh,
-            "interval",
-            minutes=cfg.scheduler.isis_poll_interval,
-            id="isis_refresh",
-        )
-    if cfg.scheduler.enable_bgp_sync and cfg.scheduler.bgp_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_bgp_refresh,
-            "interval",
-            minutes=cfg.scheduler.bgp_poll_interval,
-            id="bgp_refresh",
-        )
-    if cfg.scheduler.enable_ospf_sync and cfg.scheduler.ospf_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_ospf_refresh,
-            "interval",
-            minutes=cfg.scheduler.ospf_poll_interval,
-            id="ospf_refresh",
-        )
-    if cfg.scheduler.enable_redistribution_sync and cfg.scheduler.redistribution_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_redistribution_refresh,
-            "interval",
-            minutes=cfg.scheduler.redistribution_poll_interval,
-            id="redistribution_refresh",
-        )
-    if cfg.scheduler.enable_snmp_sync and cfg.scheduler.snmp_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_snmp_refresh,
-            "interval",
-            minutes=cfg.scheduler.snmp_poll_interval,
-            id="snmp_refresh",
-        )
-    if cfg.scheduler.enable_logging_sync and cfg.scheduler.logging_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_logging_refresh,
-            "interval",
-            minutes=cfg.scheduler.logging_poll_interval,
-            id="logging_refresh",
-        )
-    if cfg.scheduler.enable_l2_service_sync and cfg.scheduler.l2_service_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_l2_service_refresh,
-            "interval",
-            minutes=cfg.scheduler.l2_service_poll_interval,
-            id="l2_service_refresh",
-        )
-    if cfg.scheduler.enable_vlan_sync and cfg.scheduler.vlan_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_vlan_refresh,
-            "interval",
-            minutes=cfg.scheduler.vlan_poll_interval,
-            id="vlan_refresh",
-        )
-    if cfg.scheduler.enable_switchport_sync and cfg.scheduler.switchport_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_switchport_refresh,
-            "interval",
-            minutes=cfg.scheduler.switchport_poll_interval,
-            id="switchport_refresh",
-        )
-    if cfg.scheduler.enable_svi_sync and cfg.scheduler.svi_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_svi_refresh,
-            "interval",
-            minutes=cfg.scheduler.svi_poll_interval,
-            id="svi_refresh",
-        )
-    if cfg.scheduler.enable_subinterface_sync and cfg.scheduler.subinterface_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_subinterface_refresh,
-            "interval",
-            minutes=cfg.scheduler.subinterface_poll_interval,
-            id="subinterface_refresh",
-        )
-    if cfg.scheduler.enable_interface_mtu_sync and cfg.scheduler.interface_mtu_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_interface_mtu_refresh,
-            "interval",
-            minutes=cfg.scheduler.interface_mtu_poll_interval,
-            id="interface_mtu_refresh",
-        )
-    if cfg.scheduler.enable_route_policy_sync and cfg.scheduler.route_policy_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_route_policy_refresh,
-            "interval",
-            minutes=cfg.scheduler.route_policy_poll_interval,
-            id="route_policy_refresh",
-        )
-    if cfg.scheduler.enable_capability_refresh and cfg.scheduler.capability_refresh_interval > 0:
-        _scheduler.add_job(
-            _scheduled_capability_refresh,
-            "interval",
-            minutes=cfg.scheduler.capability_refresh_interval,
-            id="capability_refresh",
-        )
-    if cfg.scheduler.enable_topology_interface_sync and cfg.scheduler.topology_interface_poll_interval > 0:
-        _scheduler.add_job(
-            _scheduled_topology_interfaces_refresh,
-            "interval",
-            minutes=cfg.scheduler.topology_interface_poll_interval,
-            id="topology_interfaces_refresh",
-        )
+    for spec in _JOB_SPECS:
+        interval = getattr(cfg.scheduler, spec.interval_attr)
+        enabled = spec.enable_attr is None or getattr(cfg.scheduler, spec.enable_attr)
+        if enabled and (not spec.gate_on_interval or interval > 0):
+            _scheduler.add_job(spec.fn, "interval", minutes=interval, id=spec.job_id)
     _scheduler.start()
     logger.info("scheduler.started")
 

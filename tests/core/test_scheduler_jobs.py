@@ -209,6 +209,29 @@ async def test_intent_reconcile_replaces_intent_and_skips_unknown_interface(adap
 
 
 @pytest.mark.anyio
+async def test_intent_reconcile_deletes_existing_when_no_records(adapter_client, monkeypatch):
+    """A device with a pre-existing intent but no incoming records → row deleted, no re-add."""
+    ids = await _seed_devices(("sw01", 8101))
+    async for db in get_session():
+        iface = DbInterface(device_id=ids["sw01"], name="GigabitEthernet0/1")
+        db.add(iface)
+        await db.flush()
+        db.add(InterfaceIntent(interface_id=iface.id, attribute="description", intent_value="stale"))
+        await db.commit()
+        break
+
+    monkeypatch.setattr("nso_adapter.core.importer.get_netbox_client", lambda: object())
+    monkeypatch.setattr("nso_adapter.bindings.netbox.intent.fetch_all_intent", AsyncMock(return_value=[]))
+
+    await sched._scheduled_intent_reconcile()
+
+    async for db in get_session():
+        rows = (await db.execute(select(InterfaceIntent))).scalars().all()
+        break
+    assert rows == []  # the stale intent was deleted; nothing re-added (count==0)
+
+
+@pytest.mark.anyio
 async def test_capability_refresh_probes_each_device(adapter_client, monkeypatch):
     await _seed_devices(("c1", 9001), ("c2", 9002))
     refresh = AsyncMock()
@@ -245,3 +268,15 @@ async def test_topology_interfaces_refresh_ensures_each_device(adapter_client, m
 
     await sched._scheduled_topology_interfaces_refresh()
     assert ensure.await_count == 2
+
+
+@pytest.mark.anyio
+async def test_topology_interfaces_refresh_isolates_per_device_failure(adapter_client, monkeypatch):
+    """One device's ensure error is logged, not raised, and the fleet refresh continues."""
+    await _seed_devices(("t1", 9301), ("t2", 9302))
+    ensure = AsyncMock(side_effect=RuntimeError("netbox 500"))
+    monkeypatch.setattr("nso_adapter.core.importer.get_netbox_client", lambda: object())
+    monkeypatch.setattr("nso_adapter.core.topology_interfaces.ensure_topology_interfaces", ensure)
+
+    await sched._scheduled_topology_interfaces_refresh()  # must not raise
+    assert ensure.await_count == 2  # both devices attempted despite the error
