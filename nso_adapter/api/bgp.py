@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import NamedTuple
 
 import structlog
 from fastapi import APIRouter, Depends
@@ -37,8 +38,119 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/api/v1/devices", tags=["bgp"])
 
 
+class _BgpGraph(NamedTuple):
+    """Per-device BGP read-mirror rows, pre-grouped by parent id for serialization."""
+
+    scopes_by_router: dict[int, list[DeviceBgpScope]]
+    afs_by_scope: dict[int, list[DeviceBgpAddressFamily]]
+    peers_by_scope: dict[int, list[DeviceBgpPeer]]
+    peer_afs_by_peer: dict[int, list[DeviceBgpPeerAddressFamily]]
+    pgs_by_scope: dict[int, list[DeviceBgpPeerGroup]]
+    pg_afs_by_pg: dict[int, list[DeviceBgpPeerGroupAddressFamily]]
+
+
+async def _group_in(db: AsyncSession, model, fk_col, ids: list[int], key_attr: str, order_col) -> dict[int, list]:
+    """Load ``model`` rows where ``fk_col`` is in *ids*, grouped by ``key_attr`` (empty ids → {})."""
+    if not ids:
+        return {}
+    rows = (await db.execute(select(model).where(fk_col.in_(ids)).order_by(order_col))).scalars().all()
+    grouped: dict[int, list] = {}
+    for row in rows:
+        grouped.setdefault(getattr(row, key_attr), []).append(row)
+    return grouped
+
+
+async def _load_bgp_graph(db: AsyncSession, bgp_routers: list[DeviceBgpRouter]) -> _BgpGraph:
+    """Batch-load the scope/af/peer/peer-af/peer-group graph beneath a device's routers."""
+    router_ids = [r.id for r in bgp_routers]
+    scopes_by_router = await _group_in(
+        db, DeviceBgpScope, DeviceBgpScope.router_id, router_ids, "router_id", DeviceBgpScope.vrf
+    )
+
+    scope_ids = [s.id for scopes in scopes_by_router.values() for s in scopes]
+    afs_by_scope = await _group_in(
+        db, DeviceBgpAddressFamily, DeviceBgpAddressFamily.scope_id, scope_ids, "scope_id", DeviceBgpAddressFamily.af
+    )
+    peers_by_scope = await _group_in(
+        db, DeviceBgpPeer, DeviceBgpPeer.scope_id, scope_ids, "scope_id", DeviceBgpPeer.peer_address
+    )
+    pgs_by_scope = await _group_in(
+        db, DeviceBgpPeerGroup, DeviceBgpPeerGroup.scope_id, scope_ids, "scope_id", DeviceBgpPeerGroup.name
+    )
+
+    peer_ids = [p.id for peers in peers_by_scope.values() for p in peers]
+    peer_afs_by_peer = await _group_in(
+        db,
+        DeviceBgpPeerAddressFamily,
+        DeviceBgpPeerAddressFamily.peer_id,
+        peer_ids,
+        "peer_id",
+        DeviceBgpPeerAddressFamily.af,
+    )
+
+    pg_ids = [g.id for pgs in pgs_by_scope.values() for g in pgs]
+    pg_afs_by_pg = await _group_in(
+        db,
+        DeviceBgpPeerGroupAddressFamily,
+        DeviceBgpPeerGroupAddressFamily.peer_group_id,
+        pg_ids,
+        "peer_group_id",
+        DeviceBgpPeerGroupAddressFamily.af,
+    )
+
+    return _BgpGraph(scopes_by_router, afs_by_scope, peers_by_scope, peer_afs_by_peer, pgs_by_scope, pg_afs_by_pg)
+
+
+# Policy-ref fields included only when truthy (an empty string is omitted).
+_AF_POLICY_FIELDS = ("routemap_in", "routemap_out", "prefixlist_in", "prefixlist_out")
+# Peer attributes included only when not None (False/0/"" are kept).
+_PEER_OPTIONAL_FIELDS = ("peer_group", "remote_as", "local_as", "ttl", "password", "source", "bfd_enabled")
+_PG_OPTIONAL_FIELDS = ("remote_as", "source")
+
+
+def _truthy_fields(obj, names: tuple[str, ...]) -> dict:
+    return {n: getattr(obj, n) for n in names if getattr(obj, n)}
+
+
+def _present_fields(obj, names: tuple[str, ...]) -> dict:
+    return {n: getattr(obj, n) for n in names if getattr(obj, n) is not None}
+
+
+def _serialize_peer(peer: DeviceBgpPeer, peer_afs: list[DeviceBgpPeerAddressFamily]) -> dict:
+    return {
+        "peer_address": peer.peer_address,
+        "enabled": peer.enabled,
+        "address_families": [
+            {"af": paf.af, "enabled": paf.enabled, **_truthy_fields(paf, _AF_POLICY_FIELDS)} for paf in peer_afs
+        ],
+        **_present_fields(peer, _PEER_OPTIONAL_FIELDS),
+    }
+
+
+def _serialize_peer_group(pg: DeviceBgpPeerGroup, pg_afs: list[DeviceBgpPeerGroupAddressFamily]) -> dict:
+    return {
+        "name": pg.name,
+        "address_families": [{"af": pgaf.af, **_truthy_fields(pgaf, _AF_POLICY_FIELDS)} for pgaf in pg_afs],
+        **_present_fields(pg, _PG_OPTIONAL_FIELDS),
+    }
+
+
+def _serialize_scope(scope: DeviceBgpScope, graph: _BgpGraph) -> dict:
+    return {
+        "vrf": scope.vrf,
+        "address_families": [af.af for af in graph.afs_by_scope.get(scope.id, [])],
+        "peers": [
+            _serialize_peer(peer, graph.peer_afs_by_peer.get(peer.id, []))
+            for peer in graph.peers_by_scope.get(scope.id, [])
+        ],
+        "peer_groups": [
+            _serialize_peer_group(pg, graph.pg_afs_by_pg.get(pg.id, [])) for pg in graph.pgs_by_scope.get(scope.id, [])
+        ],
+    }
+
+
 @router.get("/{device_id}/bgp-config", dependencies=[Depends(verify_token)])
-async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_db)):  # noqa: C901
+async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_db)):
     """Return the BGP config read-mirror for this device."""
     device = await db.get(Device, device_id)
     if not device:
@@ -62,175 +174,21 @@ async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_db)):  #
             "routers": [],
         }
 
-    router_ids = [r.id for r in bgp_routers]
-
-    scopes_by_router: dict[int, list[DeviceBgpScope]] = {r.id: [] for r in bgp_routers}
-    for scope in (
-        (
-            await db.execute(
-                select(DeviceBgpScope).where(DeviceBgpScope.router_id.in_(router_ids)).order_by(DeviceBgpScope.vrf)
-            )
-        )
-        .scalars()
-        .all()
-    ):
-        scopes_by_router[scope.router_id].append(scope)
-
-    scope_ids = [s.id for scopes in scopes_by_router.values() for s in scopes]
-
-    afs_by_scope: dict[int, list[DeviceBgpAddressFamily]] = {s_id: [] for s_id in scope_ids}
-    peers_by_scope: dict[int, list[DeviceBgpPeer]] = {s_id: [] for s_id in scope_ids}
-
-    if scope_ids:
-        for af in (
-            (
-                await db.execute(
-                    select(DeviceBgpAddressFamily)
-                    .where(DeviceBgpAddressFamily.scope_id.in_(scope_ids))
-                    .order_by(DeviceBgpAddressFamily.af)
-                )
-            )
-            .scalars()
-            .all()
-        ):
-            afs_by_scope[af.scope_id].append(af)
-
-        for peer in (
-            (
-                await db.execute(
-                    select(DeviceBgpPeer)
-                    .where(DeviceBgpPeer.scope_id.in_(scope_ids))
-                    .order_by(DeviceBgpPeer.peer_address)
-                )
-            )
-            .scalars()
-            .all()
-        ):
-            peers_by_scope[peer.scope_id].append(peer)
-
-    peer_ids = [p.id for peers in peers_by_scope.values() for p in peers]
-    peer_afs_by_peer: dict[int, list[DeviceBgpPeerAddressFamily]] = {p_id: [] for p_id in peer_ids}
-
-    if peer_ids:
-        for paf in (
-            (
-                await db.execute(
-                    select(DeviceBgpPeerAddressFamily)
-                    .where(DeviceBgpPeerAddressFamily.peer_id.in_(peer_ids))
-                    .order_by(DeviceBgpPeerAddressFamily.af)
-                )
-            )
-            .scalars()
-            .all()
-        ):
-            peer_afs_by_peer[paf.peer_id].append(paf)
-
-    pgs_by_scope: dict[int, list[DeviceBgpPeerGroup]] = {s_id: [] for s_id in scope_ids}
-    if scope_ids:
-        for pg in (
-            (
-                await db.execute(
-                    select(DeviceBgpPeerGroup)
-                    .where(DeviceBgpPeerGroup.scope_id.in_(scope_ids))
-                    .order_by(DeviceBgpPeerGroup.name)
-                )
-            )
-            .scalars()
-            .all()
-        ):
-            pgs_by_scope[pg.scope_id].append(pg)
-
-    pg_ids = [g.id for pgs in pgs_by_scope.values() for g in pgs]
-    pg_afs_by_pg: dict[int, list[DeviceBgpPeerGroupAddressFamily]] = {g_id: [] for g_id in pg_ids}
-    if pg_ids:
-        for pgaf in (
-            (
-                await db.execute(
-                    select(DeviceBgpPeerGroupAddressFamily)
-                    .where(DeviceBgpPeerGroupAddressFamily.peer_group_id.in_(pg_ids))
-                    .order_by(DeviceBgpPeerGroupAddressFamily.af)
-                )
-            )
-            .scalars()
-            .all()
-        ):
-            pg_afs_by_pg[pgaf.peer_group_id].append(pgaf)
-
+    graph = await _load_bgp_graph(db, bgp_routers)
     latest_ts = max((r.last_refreshed_at for r in bgp_routers if r.last_refreshed_at), default=None)
-    refresh_source = bgp_routers[0].refresh_source
 
-    routers_out = []
-    for bgp_router in bgp_routers:
-        scopes_out = []
-        for scope in scopes_by_router[bgp_router.id]:
-            peers_out = []
-            for peer in peers_by_scope.get(scope.id, []):
-                peer_afs_out = [
-                    {
-                        "af": paf.af,
-                        "enabled": paf.enabled,
-                        **({"routemap_in": paf.routemap_in} if paf.routemap_in else {}),
-                        **({"routemap_out": paf.routemap_out} if paf.routemap_out else {}),
-                        **({"prefixlist_in": paf.prefixlist_in} if paf.prefixlist_in else {}),
-                        **({"prefixlist_out": paf.prefixlist_out} if paf.prefixlist_out else {}),
-                    }
-                    for paf in peer_afs_by_peer.get(peer.id, [])
-                ]
-                peer_entry: dict = {
-                    "peer_address": peer.peer_address,
-                    "enabled": peer.enabled,
-                    "address_families": peer_afs_out,
-                }
-                if peer.peer_group is not None:
-                    peer_entry["peer_group"] = peer.peer_group
-                if peer.remote_as is not None:
-                    peer_entry["remote_as"] = peer.remote_as
-                if peer.local_as is not None:
-                    peer_entry["local_as"] = peer.local_as
-                if peer.ttl is not None:
-                    peer_entry["ttl"] = peer.ttl
-                if peer.password is not None:
-                    peer_entry["password"] = peer.password
-                if peer.source is not None:
-                    peer_entry["source"] = peer.source
-                if peer.bfd_enabled is not None:
-                    peer_entry["bfd_enabled"] = peer.bfd_enabled
-                peers_out.append(peer_entry)
-
-            peer_groups_out = []
-            for pg in pgs_by_scope.get(scope.id, []):
-                pg_afs_out = [
-                    {
-                        "af": pgaf.af,
-                        **({"routemap_in": pgaf.routemap_in} if pgaf.routemap_in else {}),
-                        **({"routemap_out": pgaf.routemap_out} if pgaf.routemap_out else {}),
-                        **({"prefixlist_in": pgaf.prefixlist_in} if pgaf.prefixlist_in else {}),
-                        **({"prefixlist_out": pgaf.prefixlist_out} if pgaf.prefixlist_out else {}),
-                    }
-                    for pgaf in pg_afs_by_pg.get(pg.id, [])
-                ]
-                pg_entry: dict = {"name": pg.name, "address_families": pg_afs_out}
-                if pg.remote_as is not None:
-                    pg_entry["remote_as"] = pg.remote_as
-                if pg.source is not None:
-                    pg_entry["source"] = pg.source
-                peer_groups_out.append(pg_entry)
-
-            scopes_out.append(
-                {
-                    "vrf": scope.vrf,
-                    "address_families": [af.af for af in afs_by_scope.get(scope.id, [])],
-                    "peers": peers_out,
-                    "peer_groups": peer_groups_out,
-                }
-            )
-
-        routers_out.append({"asn": bgp_router.asn, "scopes": scopes_out})
+    routers_out = [
+        {
+            "asn": bgp_router.asn,
+            "scopes": [_serialize_scope(scope, graph) for scope in graph.scopes_by_router.get(bgp_router.id, [])],
+        }
+        for bgp_router in bgp_routers
+    ]
 
     return {
         "device_id": device_id,
         "last_refreshed_at": latest_ts.isoformat() + "Z" if latest_ts else None,
-        "refresh_source": refresh_source,
+        "refresh_source": bgp_routers[0].refresh_source,
         "routers": routers_out,
     }
 
