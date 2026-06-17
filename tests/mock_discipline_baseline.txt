@@ -12,9 +12,6 @@ core/test_scheduler_jobs.py::test_family_refresh_wrapper_refreshes_all_devices	1
 core/test_topology_interfaces.py::test_empty_topology_does_not_call_bulk_ensure	1
 core/test_topology_interfaces.py::test_no_netbox_binding_returns_empty	1
 core/test_topology_interfaces.py::test_unions_and_filters_sources	1
-nso/test_actions.py::_make_nso_client	1
-nso/test_actions.py::_mock_http_ctx	1
-nso/test_actions.py::_resp	1
 nso/test_client.py::_make_cfg	1
 nso/test_interface_attrs_client.py::_make_cfg	1
 nso/test_lag_topology_client.py::_make_cfg	1
