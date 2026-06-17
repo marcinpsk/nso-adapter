@@ -9,9 +9,6 @@
 conftest.py::_mock_provider	2
 conftest.py::adapter_client	1
 conftest.py::adapter_client_with_nso	1
-core/test_lag_topology_scheduler.py::test_l2l3_family_refresh_refreshes_all_devices	1
-core/test_lag_topology_scheduler.py::test_scheduled_l2_service_refresh_refreshes_all_devices	1
-core/test_lag_topology_scheduler.py::test_scheduled_lag_topology_refresh_refreshes_all_devices	1
 core/test_provision.py::test_provision_unlocks_before_fetch_host_keys	1
 core/test_removal.py::test_dispatch_scope_ospf_uses_multi_row_apply	3
 core/test_removal.py::test_dispatch_scope_simple_calls_apply_replace_true	3

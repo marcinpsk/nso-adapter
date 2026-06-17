@@ -9,6 +9,7 @@ import pytest
 
 from nso_adapter.config import SchedulerConfig
 from nso_adapter.core import scheduler as scheduler_module
+from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device
 
@@ -338,7 +339,7 @@ async def test_scheduled_lag_topology_refresh_refreshes_all_devices(adapter_clie
         break
 
     refresh = AsyncMock()
-    nso_client = MagicMock()
+    nso_client = MagicMock(spec=NsoClient)  # boundary stand-in, bound to the real client interface
     monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: nso_client)
     monkeypatch.setattr("nso_adapter.core.lag_topology.refresh_lag_topology_for_device", refresh)
 
@@ -346,6 +347,10 @@ async def test_scheduled_lag_topology_refresh_refreshes_all_devices(adapter_clie
 
     assert refresh.await_count == 2
     assert all(call.kwargs["refresh_source"] == "poll" for call in refresh.await_args_list)
+    # The resolved NSO client must actually reach refresh (guards against a copy-paste bug
+    # passing the wrong positional arg) — call shape is (db, device, nso_client, ...).
+    assert all(call.args[2] is nso_client for call in refresh.await_args_list)
+    assert {call.args[1].nso_device_name for call in refresh.await_args_list} == {"sw01", "sw02"}
 
 
 @pytest.mark.anyio
@@ -361,7 +366,7 @@ async def test_scheduled_l2_service_refresh_refreshes_all_devices(adapter_client
         break
 
     refresh = AsyncMock()
-    nso_client = MagicMock()
+    nso_client = MagicMock(spec=NsoClient)  # boundary stand-in, bound to the real client interface
     monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: nso_client)
     monkeypatch.setattr("nso_adapter.core.l2_service.refresh_l2_services_for_device", refresh)
 
@@ -369,6 +374,8 @@ async def test_scheduled_l2_service_refresh_refreshes_all_devices(adapter_client
 
     assert refresh.await_count == 2
     assert all(call.kwargs["refresh_source"] == "poll" for call in refresh.await_args_list)
+    assert all(call.args[2] is nso_client for call in refresh.await_args_list)
+    assert {call.args[1].nso_device_name for call in refresh.await_args_list} == {"ra1", "ra2"}
 
 
 @pytest.mark.anyio
@@ -394,7 +401,7 @@ async def test_l2l3_family_refresh_refreshes_all_devices(adapter_client, monkeyp
         break
 
     refresh = AsyncMock()
-    nso_client = MagicMock()
+    nso_client = MagicMock(spec=NsoClient)  # boundary stand-in, bound to the real client interface
     monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: nso_client)
     monkeypatch.setattr(refresh_target, refresh)
 
@@ -402,3 +409,7 @@ async def test_l2l3_family_refresh_refreshes_all_devices(adapter_client, monkeyp
 
     assert refresh.await_count == 2
     assert all(call.kwargs["refresh_source"] == "poll" for call in refresh.await_args_list)
+    # Routes through the shared _refresh_all_devices helper — the resolved client must still
+    # reach refresh as the 3rd positional arg (db, device, nso_client, ...).
+    assert all(call.args[2] is nso_client for call in refresh.await_args_list)
+    assert {call.args[1].nso_device_name for call in refresh.await_args_list} == {"d1", "d2"}
