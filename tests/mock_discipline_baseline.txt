@@ -6,9 +6,6 @@
 # mock, or add an inline `# mock-ok: <reason>`. Regenerate after an intentional
 # change with:  python -m tests.mock_discipline --update-baseline
 
-api/test_health_direct.py::_make_request	1
-api/test_health_direct.py::test_healthz_with_nso_instance_reachable	1
-api/test_health_direct.py::test_healthz_with_nso_instance_unreachable	1
 api/test_nso_instances_direct.py::test_list_instance_devices_marks_onboarded	1
 api/test_nso_instances_direct.py::test_list_instance_devices_nso_connection_error	1
 api/test_nso_instances_direct.py::test_list_instance_devices_returns_sorted_list	1
