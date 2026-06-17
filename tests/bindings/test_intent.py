@@ -5,26 +5,26 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
+from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.bindings.netbox.intent import fetch_all_intent
 
 
 def _make_nb_client(base="http://netbox"):
-    client = MagicMock()
+    # NetboxClient is a real external HTTP boundary; bind the fake to its interface via
+    # spec= so a renamed/removed client method can't be fabricated. fetch_all_intent reads
+    # ._base and calls ._client() — both real members.
+    client = MagicMock(spec=NetboxClient)
     client._base = base
     return client
 
 
-def _mock_httpx_response(json_data, status: int = 200):
-    resp = MagicMock()
-    resp.status_code = status
-    resp.json.return_value = json_data
-    if status >= 400:
-        resp.raise_for_status.side_effect = Exception(f"HTTP {status}")
-    else:
-        resp.raise_for_status.return_value = None
-    return resp
+def _httpx_response(json_data, status: int = 200) -> httpx.Response:
+    """A REAL httpx.Response (real status_code/.json()/.raise_for_status), not a mock —
+    so the parsing fetch_all_intent does runs against genuine response behaviour."""
+    return httpx.Response(status, json=json_data, request=httpx.Request("GET", "http://netbox/intent"))
 
 
 def _mock_http_ctx(responses):
@@ -61,7 +61,7 @@ async def test_fetch_all_intent_basic():
     """Returns records for accepted items."""
     data = {"results": [_intent_item()], "next": None}
     client = _make_nb_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(data))
+    client._client.return_value = _mock_http_ctx(_httpx_response(data))
 
     records = await fetch_all_intent(client)
 
@@ -86,7 +86,7 @@ async def test_fetch_all_intent_skips_non_accepted():
         "next": None,
     }
     client = _make_nb_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(data))
+    client._client.return_value = _mock_http_ctx(_httpx_response(data))
 
     records = await fetch_all_intent(client)
 
@@ -107,8 +107,8 @@ async def test_fetch_all_intent_pagination():
     client = _make_nb_client()
     client._client.return_value = _mock_http_ctx(
         [
-            _mock_httpx_response(page1),
-            _mock_httpx_response(page2),
+            _httpx_response(page1),
+            _httpx_response(page2),
         ]
     )
 
@@ -128,7 +128,7 @@ async def test_fetch_all_intent_skips_non_dict_interface():
     }
     data = {"results": [item], "next": None}
     client = _make_nb_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(data))
+    client._client.return_value = _mock_http_ctx(_httpx_response(data))
 
     records = await fetch_all_intent(client)
     assert len(records) == 0
@@ -145,7 +145,7 @@ async def test_fetch_all_intent_skips_missing_device_id():
     }
     data = {"results": [item], "next": None}
     client = _make_nb_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(data))
+    client._client.return_value = _mock_http_ctx(_httpx_response(data))
 
     records = await fetch_all_intent(client)
     assert len(records) == 0
@@ -161,7 +161,7 @@ async def test_fetch_all_intent_skips_missing_attribute():
     }
     data = {"results": [item], "next": None}
     client = _make_nb_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(data))
+    client._client.return_value = _mock_http_ctx(_httpx_response(data))
 
     records = await fetch_all_intent(client)
     assert len(records) == 0
@@ -173,7 +173,7 @@ async def test_fetch_all_intent_invalid_accepted_at():
     item = _intent_item(accepted_at="not-a-date")
     data = {"results": [item], "next": None}
     client = _make_nb_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(data))
+    client._client.return_value = _mock_http_ctx(_httpx_response(data))
 
     records = await fetch_all_intent(client)
 
@@ -192,7 +192,7 @@ async def test_fetch_all_intent_nso_value_fallback():
     }
     data = {"results": [item], "next": None}
     client = _make_nb_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(data))
+    client._client.return_value = _mock_http_ctx(_httpx_response(data))
 
     records = await fetch_all_intent(client)
     assert records[0].intent_value == "fallback-desc"
@@ -213,7 +213,7 @@ async def test_fetch_all_intent_uses_pooled_client_directly():
     }
     data = {"results": [item], "next": None}
     mock_http = AsyncMock()
-    mock_http.get.return_value = _mock_httpx_response(data)
+    mock_http.get.return_value = _httpx_response(data)
     mock_http.__aenter__.side_effect = RuntimeError("Cannot open a client instance more than once.")
     client = _make_nb_client()
     client._client.return_value = mock_http

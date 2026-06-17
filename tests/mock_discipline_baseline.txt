@@ -6,8 +6,6 @@
 # mock, or add an inline `# mock-ok: <reason>`. Regenerate after an intentional
 # change with:  python -m tests.mock_discipline --update-baseline
 
-bindings/test_intent.py::_make_nb_client	1
-bindings/test_intent.py::_mock_httpx_response	1
 bindings/test_mapper.py::_make_bulk_client	1
 bindings/test_mapper.py::_make_nb_client	1
 bindings/test_scope.py::_make_nb_client	1
