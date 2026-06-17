@@ -12,13 +12,21 @@ from nso_adapter.nso import apply as apply_mod
 from nso_adapter.nso.apply import (
     NsoApplyError,
     _device_delta_from_dry_run,
+    _ospf_interface_entry,
+    _ospf_process_entry,
     _verify_native_or_raise,
     apply_interface_attribute,
     apply_interface_ips,
     apply_static_routes,
     build_isis_process_payload,
 )
-from nso_adapter.store.models import IsisFlexAlgoIntent, IsisProcessIntent, RedistributionIntent
+from nso_adapter.store.models import (
+    IsisFlexAlgoIntent,
+    IsisProcessIntent,
+    OspfInstanceIntent,
+    OspfInterfaceIntent,
+    RedistributionIntent,
+)
 
 
 def _make_nso_client(base="http://nso"):
@@ -737,6 +745,81 @@ def test_build_isis_process_payload_nests_redistribute():
         "metric-type": "external",
     }
     assert redist[1] == {"source-protocol": "connected", "source-ref": ""}  # optionals omitted
+
+
+# ── OSPF process / interface entry builders (pure; real ORM rows, no mocks) ─────
+
+
+def test_ospf_process_entry_full_fields_and_redistribute():
+    """A populated process row emits process-id/router-id/vrf/enabled and nests redistribute."""
+    row = OspfInstanceIntent(process_id="5", router_id="2.2.2.2", vrf="RED", enabled=True)
+    redist = [{"source-protocol": "connected", "source-ref": ""}]
+    assert _ospf_process_entry(row, redist) == {
+        "process-id": 5,
+        "router-id": "2.2.2.2",
+        "vrf": "RED",
+        "enabled": True,
+        "redistribute": redist,
+    }
+
+
+def test_ospf_process_entry_minimal_defaults_enabled_true():
+    """Empty router-id/vrf and unset `enabled` → delete-guard defaults enabled True, no redistribute."""
+    row = OspfInstanceIntent(process_id="1", router_id="", vrf="")
+    assert _ospf_process_entry(row, []) == {"process-id": 1, "enabled": True}
+
+
+def test_ospf_process_entry_explicit_disable_is_preserved():
+    """enabled=False (operator-down) is preserved, not coerced to the default True."""
+    row = OspfInstanceIntent(process_id="1", vrf="", enabled=False)
+    assert _ospf_process_entry(row, [])["enabled"] is False
+
+
+def test_ospf_interface_entry_full_fields():
+    """A populated interface row emits every optional leaf (priority/cost/network-type/auth)."""
+    row = OspfInterfaceIntent(
+        interface_name="Gi0/1",
+        process_id="5",
+        area_id="0",
+        passive=True,
+        priority=10,
+        cost=100,
+        network_type="point-to-point",
+        auth_type="md5",
+        auth_key="secret",
+    )
+    assert _ospf_interface_entry(row) == {
+        "interface-name": "Gi0/1",
+        "process-id": 5,
+        "area-id": "0",
+        "passive": True,
+        "priority": 10,
+        "cost": 100,
+        "network-type": "point-to-point",
+        "auth-type": "md5",
+        "auth-key": "secret",
+    }
+
+
+def test_ospf_interface_entry_minimal_omits_optionals():
+    """Unset optionals are omitted; passive=None falls back to False."""
+    row = OspfInterfaceIntent(interface_name="Gi0/2", process_id="1", area_id="0", passive=None)
+    assert _ospf_interface_entry(row) == {
+        "interface-name": "Gi0/2",
+        "process-id": 1,
+        "area-id": "0",
+        "passive": False,
+    }
+
+
+def test_ospf_interface_entry_auth_type_without_key():
+    """An auth-type set with no key emits the type and omits the key (nested guard)."""
+    row = OspfInterfaceIntent(
+        interface_name="Gi0/3", process_id="1", area_id="0", passive=False, auth_type="clear-text"
+    )
+    entry = _ospf_interface_entry(row)
+    assert entry["auth-type"] == "clear-text"
+    assert "auth-key" not in entry
 
 
 def test_build_isis_interface_payload_normalises_circuit_type():

@@ -900,8 +900,12 @@ async def apply_switchport_config(
     )
 
 
-def _isis_redistribute_entry(row) -> dict:
-    """One ``redistribute`` entry; route-map/metric/metric-type emitted only when set."""
+def _redistribute_entry(row) -> dict:
+    """One ``redistribute`` entry; route-map/metric/metric-type emitted only when set.
+
+    Shared by the IS-IS and OSPF process payloads — both group ``RedistributionIntent``
+    rows by their destination process and nest this identical entry shape.
+    """
     entry: dict = {"source-protocol": row.source_protocol, "source-ref": row.source_ref}
     if row.route_map:
         entry["route-map"] = row.route_map
@@ -965,7 +969,7 @@ def build_isis_process_payload(
     """
     redist_by_proc: dict[str, list[dict]] = {}
     for row in redistribution_rows or []:
-        redist_by_proc.setdefault(row.dest_ref, []).append(_isis_redistribute_entry(row))
+        redist_by_proc.setdefault(row.dest_ref, []).append(_redistribute_entry(row))
 
     processes: list[dict] = [
         _isis_process_entry(row, redist_by_proc.get(row.process_tag or "", [])) for row in isis_process_rows or []
@@ -1361,7 +1365,46 @@ async def apply_route_policy_config(
 _OSPF_SERVICE_PATH = "/restconf/data/ospf-reconciler:ospf-config"
 
 
-async def apply_ospf_config(  # noqa: C901
+def _ospf_process_entry(row, proc_redist: list[dict]) -> dict:
+    """One OSPF ``process-config`` entry from a process row plus its nested redistribute list."""
+    entry: dict = {"process-id": int(row.process_id)}
+    if row.router_id:
+        entry["router-id"] = row.router_id
+    if row.vrf:
+        entry["vrf"] = row.vrf
+    # Delete-guard: ALWAYS assert the admin-state. Omitting `enabled` lets a
+    # PUT-replace (removal propagation, replace=True) rebuild the service footprint
+    # without admin-state — which FASTMAP then deletes on the device, disabling OSPF
+    # entirely (Nokia SR OS needs an explicit `admin-state enable`). A managed OSPF
+    # instance defaults to enabled; an operator who wants it down sets enabled=False.
+    entry["enabled"] = bool(row.enabled) if getattr(row, "enabled", None) is not None else True
+    if proc_redist:
+        entry["redistribute"] = proc_redist
+    return entry
+
+
+def _ospf_interface_entry(row) -> dict:
+    """One OSPF ``interface-config`` entry; optional priority/cost/network-type/auth when set."""
+    entry: dict = {
+        "interface-name": row.interface_name,
+        "process-id": int(row.process_id),
+        "area-id": row.area_id,
+        "passive": bool(row.passive) if row.passive is not None else False,
+    }
+    if row.priority is not None:
+        entry["priority"] = int(row.priority)
+    if row.cost is not None:
+        entry["cost"] = int(row.cost)
+    if row.network_type:
+        entry["network-type"] = row.network_type
+    if row.auth_type:
+        entry["auth-type"] = row.auth_type
+        if row.auth_key:
+            entry["auth-key"] = row.auth_key
+    return entry
+
+
+async def apply_ospf_config(
     client: NsoClient,
     device_name: str,
     process_intent_rows: list,
@@ -1389,55 +1432,10 @@ async def apply_ospf_config(  # noqa: C901
     # Index redistribution by dest_ref (= str(process_id))
     redist_by_proc: dict[str, list[dict]] = {}
     for row in redistribution_rows or []:
-        entry: dict = {
-            "source-protocol": row.source_protocol,
-            "source-ref": row.source_ref,
-        }
-        if row.route_map:
-            entry["route-map"] = row.route_map
-        if row.metric is not None:
-            entry["metric"] = row.metric
-        if row.metric_type:
-            entry["metric-type"] = row.metric_type
-        redist_by_proc.setdefault(row.dest_ref, []).append(entry)
+        redist_by_proc.setdefault(row.dest_ref, []).append(_redistribute_entry(row))
 
-    processes = []
-    for row in process_intent_rows:
-        entry = {"process-id": int(row.process_id)}
-        if row.router_id:
-            entry["router-id"] = row.router_id
-        if row.vrf:
-            entry["vrf"] = row.vrf
-        # Delete-guard: ALWAYS assert the admin-state. Omitting `enabled` lets a
-        # PUT-replace (removal propagation, replace=True) rebuild the service footprint
-        # without admin-state — which FASTMAP then deletes on the device, disabling OSPF
-        # entirely (Nokia SR OS needs an explicit `admin-state enable`). A managed OSPF
-        # instance defaults to enabled; an operator who wants it down sets enabled=False.
-        entry["enabled"] = bool(row.enabled) if getattr(row, "enabled", None) is not None else True
-        proc_redist = redist_by_proc.get(str(row.process_id), [])
-        if proc_redist:
-            entry["redistribute"] = proc_redist
-        processes.append(entry)
-
-    interfaces = []
-    for row in interface_intent_rows:
-        entry = {
-            "interface-name": row.interface_name,
-            "process-id": int(row.process_id),
-            "area-id": row.area_id,
-            "passive": bool(row.passive) if row.passive is not None else False,
-        }
-        if row.priority is not None:
-            entry["priority"] = int(row.priority)
-        if row.cost is not None:
-            entry["cost"] = int(row.cost)
-        if row.network_type:
-            entry["network-type"] = row.network_type
-        if row.auth_type:
-            entry["auth-type"] = row.auth_type
-            if row.auth_key:
-                entry["auth-key"] = row.auth_key
-        interfaces.append(entry)
+    processes = [_ospf_process_entry(row, redist_by_proc.get(str(row.process_id), [])) for row in process_intent_rows]
+    interfaces = [_ospf_interface_entry(row) for row in interface_intent_rows]
 
     service_body: dict = {
         "device": device_name,

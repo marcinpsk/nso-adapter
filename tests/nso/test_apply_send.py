@@ -31,6 +31,7 @@ from nso_adapter.nso.apply import (
     native_dry_run,
 )
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.store.models import OspfInstanceIntent, OspfInterfaceIntent, RedistributionIntent
 
 _EMPTY_DRYRUN = {"dry-run-result": {"native": {}}}
 
@@ -313,12 +314,14 @@ async def test_apply_isis_interfaces_builds_process_and_interface_config():
 
 
 async def test_apply_ospf_config_builds_process_interface_and_redistribute():
+    # Real ORM rows so the assembled body reflects the actual model fields, not a fake's
+    # attribute names; the NsoClient + apply code run for real over a MockTransport.
     transport = _RecordingTransport()
     client = _client_with(transport)
-    proc = SimpleNamespace(process_id=1, router_id="1.1.1.1", vrf="", enabled=None)  # enabled None → default True
-    iface = SimpleNamespace(
+    proc = OspfInstanceIntent(process_id="1", router_id="1.1.1.1", vrf="")  # enabled unset → default True
+    iface = OspfInterfaceIntent(
         interface_name="Gi0/1",
-        process_id=1,
+        process_id="1",
         area_id="0",
         passive=False,
         priority=10,
@@ -327,8 +330,14 @@ async def test_apply_ospf_config_builds_process_interface_and_redistribute():
         auth_type="md5",
         auth_key="secret",
     )
-    redist = SimpleNamespace(
-        dest_ref="1", source_protocol="connected", source_ref="", route_map="RM", metric=20, metric_type="type-1"
+    redist = RedistributionIntent(
+        dest_protocol="ospf",
+        dest_ref="1",
+        source_protocol="connected",
+        source_ref="",
+        route_map="RM",
+        metric=20,
+        metric_type="type-1",
     )
     await apply_ospf_config(client, "sw03", [proc], [iface], redistribution_rows=[redist], dry_run=True)
 
@@ -342,6 +351,38 @@ async def test_apply_ospf_config_builds_process_interface_and_redistribute():
     i = body["interface-config"][0]
     assert i["network-type"] == "point-to-point"
     assert i["auth-type"] == "md5" and i["auth-key"] == "secret"
+
+
+async def test_apply_ospf_config_interface_only_omits_process_config():
+    """With no process rows the body carries interface-config but no process-config key."""
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+    iface = OspfInterfaceIntent(interface_name="Gi0/9", process_id="1", area_id="0", passive=False)
+    await apply_ospf_config(client, "sw03", [], [iface], dry_run=True)
+
+    body = _sent_body(transport)["ospf-reconciler:ospf-config"][0]
+    assert "process-config" not in body
+    assert body["interface-config"][0]["interface-name"] == "Gi0/9"
+
+
+async def test_apply_ospf_config_commits_then_verifies():
+    """A real (non-dry-run) OSPF apply PATCHes the merge path then runs the verify dry-run."""
+    transport = _RecordingTransport(send_status=204)  # PATCH 204, verify dry-run → empty
+    client = _client_with(transport)
+    proc = OspfInstanceIntent(process_id="1", vrf="", enabled=False)  # operator-down preserved
+    iface = OspfInterfaceIntent(interface_name="Gi0/1", process_id="1", area_id="0", passive=False)
+
+    result = await apply_ospf_config(client, "sw03", [proc], [iface])
+
+    assert result is None
+    patch_req = transport.requests[0]
+    assert patch_req.method == "PATCH"
+    assert "dry-run=native" not in str(patch_req.url)
+    assert "reconcile=" in str(patch_req.url)
+    body = json.loads(patch_req.content)["ospf-reconciler:ospf-config"][0]
+    assert body["process-config"][0]["enabled"] is False
+    # a verify dry-run followed the commit
+    assert any("dry-run=native" in str(r.url) for r in transport.requests[1:])
 
 
 async def test_apply_bgp_config_builds_router_scope_peer_tree():
