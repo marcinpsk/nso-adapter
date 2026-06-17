@@ -7,24 +7,30 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.bindings.netbox.writer import WriteResult, write_interfaces
+from nso_adapter.domain.models import Interface, InterfaceAttr
 
 
 def _make_nb_client():
-    client = MagicMock()
-    client._base = "http://netbox"
+    # NetboxClient is a real external HTTP boundary; bind the fake to its interface via
+    # spec= so a renamed/removed client method can't be fabricated. write_interfaces only
+    # calls get_interface() and patch_interface() — both real members.
+    client = MagicMock(spec=NetboxClient)
     client.get_interface = AsyncMock()
     client.patch_interface = AsyncMock()
     return client
 
 
 def _domain_iface(name="GigabitEthernet0/0", description="test", enabled=True):
-    iface = MagicMock()
-    iface.name = name
-    iface.nso = MagicMock()
-    iface.nso.description = description
-    iface.nso.enabled = enabled
-    return iface
+    # Interface/InterfaceAttr are our own domain dataclasses — use the REAL objects so a
+    # renamed/removed field surfaces as AttributeError instead of being silently fabricated
+    # by a MagicMock (write_interfaces reads iface.name, iface.nso.description/.enabled).
+    return Interface(
+        name=name,
+        nso=InterfaceAttr(description=description, enabled=enabled),
+        netbox=InterfaceAttr(description=None, enabled=None),
+    )
 
 
 @pytest.mark.asyncio
@@ -63,7 +69,7 @@ async def test_write_skips_when_resolve_returns_none():
     iface = _domain_iface()
 
     with patch("nso_adapter.bindings.netbox.writer.resolve_or_create_interface", AsyncMock(return_value=None)):
-        result = await write_interfaces(MagicMock(), 42, [iface], ["description"])
+        result = await write_interfaces(_make_nb_client(), 42, [iface], ["description"])
 
     assert result.interfaces_skipped == 1
     assert result.interfaces_written == 0
@@ -103,5 +109,5 @@ async def test_write_counts_skipped_on_patch_error():
 @pytest.mark.asyncio
 async def test_write_empty_interface_list():
     """Returns zero-count result for empty interface list."""
-    result = await write_interfaces(MagicMock(), 42, [], ["description"])
+    result = await write_interfaces(_make_nb_client(), 42, [], ["description"])
     assert result == WriteResult()

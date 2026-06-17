@@ -6,10 +6,6 @@
 # mock, or add an inline `# mock-ok: <reason>`. Regenerate after an intentional
 # change with:  python -m tests.mock_discipline --update-baseline
 
-bindings/test_writer.py::_domain_iface	2
-bindings/test_writer.py::_make_nb_client	1
-bindings/test_writer.py::test_write_empty_interface_list	1
-bindings/test_writer.py::test_write_skips_when_resolve_returns_none	1
 conftest.py::_mock_provider	2
 conftest.py::adapter_client	1
 conftest.py::adapter_client_with_nso	1
