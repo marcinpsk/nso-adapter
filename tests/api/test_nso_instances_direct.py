@@ -10,8 +10,18 @@ import pytest
 from fastapi import HTTPException
 
 from nso_adapter.api.nso_instances import list_instance_devices, list_nso_instances
+from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device
+
+
+def _nso_client(*, devices=None, error: Exception | None = None) -> MagicMock:
+    """Fake the NSO RESTCONF client (a real external HTTP boundary), bound to the real
+    NsoClient interface via spec= so a renamed/removed method can't be fabricated."""
+    client = MagicMock(spec=NsoClient)
+    client.list_devices = AsyncMock(side_effect=error) if error else AsyncMock(return_value=devices or [])
+    return client
+
 
 # ── list_nso_instances ────────────────────────────────────────────────────────
 
@@ -24,10 +34,7 @@ async def test_list_nso_instances_empty_config(adapter_client):
 
 async def test_list_nso_instances_with_instance_reachable(adapter_client_with_nso):
     """list_nso_instances() marks instance reachable when list_devices succeeds."""
-    mock_client = MagicMock()
-    mock_client.list_devices = AsyncMock(return_value=[])
-
-    with patch("nso_adapter.api.nso_instances.get_nso_client", return_value=mock_client):
+    with patch("nso_adapter.api.nso_instances.get_nso_client", return_value=_nso_client(devices=[])):
         result = await list_nso_instances()
 
     assert len(result) == 1
@@ -37,10 +44,10 @@ async def test_list_nso_instances_with_instance_reachable(adapter_client_with_ns
 
 async def test_list_nso_instances_with_instance_unreachable(adapter_client_with_nso):
     """list_nso_instances() marks instance unreachable on exception."""
-    mock_client = MagicMock()
-    mock_client.list_devices = AsyncMock(side_effect=ConnectionError("timeout"))
-
-    with patch("nso_adapter.api.nso_instances.get_nso_client", return_value=mock_client):
+    with patch(
+        "nso_adapter.api.nso_instances.get_nso_client",
+        return_value=_nso_client(error=ConnectionError("timeout")),
+    ):
         result = await list_nso_instances()
 
     assert result[0]["reachable"] is False
@@ -60,11 +67,9 @@ async def test_list_instance_devices_unknown_instance(adapter_client_with_nso):
 
 async def test_list_instance_devices_nso_connection_error(adapter_client_with_nso):
     """list_instance_devices() raises 502 when NSO is unreachable."""
-    mock_client = MagicMock()
-    mock_client.list_devices = AsyncMock(side_effect=ConnectionError("NSO down"))
-
+    nso = _nso_client(error=ConnectionError("NSO down"))
     async for db in get_session():
-        with patch("nso_adapter.api.nso_instances.get_nso_client", return_value=mock_client):
+        with patch("nso_adapter.api.nso_instances.get_nso_client", return_value=nso):
             with pytest.raises(HTTPException) as exc_info:
                 await list_instance_devices(instance_id="nso-dev", db=db)
         assert exc_info.value.status_code == 502
@@ -73,9 +78,8 @@ async def test_list_instance_devices_nso_connection_error(adapter_client_with_ns
 
 async def test_list_instance_devices_returns_sorted_list(adapter_client_with_nso):
     """list_instance_devices() returns enriched, sorted device list."""
-    mock_client = MagicMock()
-    mock_client.list_devices = AsyncMock(
-        return_value=[
+    nso = _nso_client(
+        devices=[
             {
                 "name": "zzz-router",
                 "address": "10.0.0.2",
@@ -93,7 +97,7 @@ async def test_list_instance_devices_returns_sorted_list(adapter_client_with_nso
         ]
     )
     async for db in get_session():
-        with patch("nso_adapter.api.nso_instances.get_nso_client", return_value=mock_client):
+        with patch("nso_adapter.api.nso_instances.get_nso_client", return_value=nso):
             result = await list_instance_devices(instance_id="nso-dev", db=db)
 
         assert result[0]["name"] == "aaa-router"
@@ -111,9 +115,8 @@ async def test_list_instance_devices_marks_onboarded(adapter_client_with_nso):
         await db.refresh(d)
         device_id = d.id
 
-    mock_client = MagicMock()
-    mock_client.list_devices = AsyncMock(
-        return_value=[
+    nso = _nso_client(
+        devices=[
             {
                 "name": "known-router",
                 "address": "10.0.0.3",
@@ -124,7 +127,7 @@ async def test_list_instance_devices_marks_onboarded(adapter_client_with_nso):
         ]
     )
     async for db in get_session():
-        with patch("nso_adapter.api.nso_instances.get_nso_client", return_value=mock_client):
+        with patch("nso_adapter.api.nso_instances.get_nso_client", return_value=nso):
             result = await list_instance_devices(instance_id="nso-dev", db=db)
 
         assert result[0]["onboarded"] is True
@@ -134,16 +137,15 @@ async def test_list_instance_devices_marks_onboarded(adapter_client_with_nso):
 
 async def test_list_instance_devices_skips_invalid_entries(adapter_client_with_nso):
     """list_instance_devices() skips entries without a 'name' key."""
-    mock_client = MagicMock()
-    mock_client.list_devices = AsyncMock(
-        return_value=[
+    nso = _nso_client(
+        devices=[
             {"name": "valid-device", "address": "10.0.0.4"},
             {"no-name-key": "something"},
             {"name": ""},  # falsy name
         ]
     )
     async for db in get_session():
-        with patch("nso_adapter.api.nso_instances.get_nso_client", return_value=mock_client):
+        with patch("nso_adapter.api.nso_instances.get_nso_client", return_value=nso):
             result = await list_instance_devices(instance_id="nso-dev", db=db)
 
     assert len(result) == 1
