@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from nso_adapter.core.jobs import (
@@ -18,6 +19,7 @@ from nso_adapter.core.jobs import (
     enqueue_job,
     get_active_job,
 )
+from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
 
@@ -219,21 +221,39 @@ async def test_run_detect_drift_calls_run_with_db(adapter_client):
 # ── _run_connect ──────────────────────────────────────────────────────────────
 
 
+def _nso_client_for_connect(output: dict) -> MagicMock:
+    """A spec'd NsoClient (real external HTTP boundary) whose pooled client yields a REAL
+    httpx.Response, so nso.actions.connect runs end-to-end: URL build from _base, the
+    `async with client._client(...)` pool, raise_for_status, and the tailf-ncs:output
+    extraction. Only the HTTP socket is faked — bound to NsoClient via spec=."""
+    client = MagicMock(spec=NsoClient)
+    client._base = "http://nso"  # instance attr — set explicitly (spec= permits SET)
+    client._action_timeout = 5.0
+    resp = httpx.Response(
+        200,
+        json={"tailf-ncs:output": output},
+        request=httpx.Request("POST", "http://nso/connect"),
+    )
+    http = AsyncMock()
+    http.post.return_value = resp
+    client._client.return_value.__aenter__.return_value = http
+    return client
+
+
 async def test_run_connect_success(adapter_client):
-    """_run_connect marks job succeeded after NSO connect call."""
+    """_run_connect runs the real connect action and threads its output onto the job."""
     device_id = await _seed_device("rtr-30", 40)
     job_id = await _seed_job(device_id)
 
-    mock_client = MagicMock()
-    with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
-        patch("nso_adapter.nso.actions.connect", new_callable=AsyncMock, return_value={"status": "ok"}),
-    ):
+    client = _nso_client_for_connect({"result": "connected"})
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
         await _run_connect(job_id, device_id)
 
     async for db in get_session():
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
+        # The real connect extracts tailf-ncs:output; _run_connect stores it under "output".
+        assert job.result == {"output": {"result": "connected"}}
         break
 
 
@@ -265,7 +285,10 @@ async def test_run_connect_device_not_in_db(adapter_client):
         assert job.status == JobStatus.failed
         assert "not found" in job.error["message"]
         break
-    """_run_connect returns early when job id doesn't exist in DB."""
+
+
+async def test_run_connect_job_not_found(adapter_client):
+    """_run_connect returns early when the job id doesn't exist in DB."""
     device_id = await _seed_device("rtr-32", 42)
     # Don't seed a job — use a non-existent job_id
     await _run_connect(99999, device_id)  # should not raise
@@ -280,9 +303,11 @@ async def test_run_connect_timeout(adapter_client):
         coro.close()
         raise TimeoutError
 
-    mock_client = MagicMock()
+    # wait_for short-circuits before connect touches the client, so it's only a spec'd
+    # NsoClient placeholder here (bound so a renamed member still couldn't be fabricated).
+    client = MagicMock(spec=NsoClient)
     with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.core.importer.get_nso_client", return_value=client),
         patch("asyncio.wait_for", side_effect=mock_wait_for),
     ):
         await _run_connect(job_id, device_id)

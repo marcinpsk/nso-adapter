@@ -9,8 +9,6 @@
 conftest.py::_mock_provider	2
 conftest.py::adapter_client	1
 conftest.py::adapter_client_with_nso	1
-core/test_jobs.py::test_run_connect_success	1
-core/test_jobs.py::test_run_connect_timeout	1
 core/test_lag_topology_scheduler.py::test_l2l3_family_refresh_refreshes_all_devices	1
 core/test_lag_topology_scheduler.py::test_scheduled_l2_service_refresh_refreshes_all_devices	1
 core/test_lag_topology_scheduler.py::test_scheduled_lag_topology_refresh_refreshes_all_devices	1
