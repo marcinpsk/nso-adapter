@@ -5,8 +5,3 @@
 # Shrink this file over time: replace a mock with a real object or a spec=-bounded
 # mock, or add an inline `# mock-ok: <reason>`. Regenerate after an intentional
 # change with:  python -m tests.mock_discipline --update-baseline
-
-nso/test_client.py::_make_cfg	1
-nso/test_interface_attrs_client.py::_make_cfg	1
-nso/test_lag_topology_client.py::_make_cfg	1
-nso/test_nso_client_methods.py::_make_cfg	1

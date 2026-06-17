@@ -9,20 +9,25 @@ and check_sync without hitting a real NSO instance.
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock
 
 import httpx
 import pytest
 
+from nso_adapter.config import NsoInstanceConfig
 from nso_adapter.nso.client import NsoClient
 
 
 def _make_cfg(base_url: str = "http://nso:8080", ca_cert=None, host_header=None):
-    cfg = MagicMock()
-    cfg.base_url = base_url
-    cfg.ca_cert = ca_cert
-    cfg.host_header = host_header
-    return cfg
+    # A REAL NsoInstanceConfig — NsoClient reads base_url/ca_cert/host_header off it, so a
+    # renamed config field surfaces as a real error instead of a fabricated MagicMock attr.
+    return NsoInstanceConfig(
+        name="nso-dev",
+        base_url=base_url,
+        ca_cert=ca_cert,
+        username_ref="NSO_USERNAME",
+        password_ref="NSO_PASSWORD",
+        host_header=host_header,
+    )
 
 
 def _make_client(base_url: str = "http://nso:8080", host_header=None) -> NsoClient:
