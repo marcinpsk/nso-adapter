@@ -3,24 +3,22 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
-
 from tests.conftest import VALID_TOKEN
 
 
 async def test_healthz_no_auth(adapter_client):
-    """Health endpoint must NOT require auth."""
-    with (
-        patch("nso_adapter.api.health.get_nso_client", side_effect=KeyError("none")),
-        patch("nso_adapter.api.health.get_config") as mc,
-    ):
-        mc.return_value = MagicMock(nso_instances=[])
-        resp = await adapter_client.get("/healthz")
+    """Health endpoint must NOT require auth and reports the (empty) instance list.
+
+    The adapter_client fixture loads a real config with ``nso_instances: []``, so the
+    handler runs end-to-end over the real config — no instances means the reachability
+    loop is skipped and the list comes back empty.
+    """
+    resp = await adapter_client.get("/healthz")
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
     assert "version" in body
-    assert "nso_instances" in body
+    assert body["nso_instances"] == []
 
 
 async def test_devices_requires_auth(adapter_client):

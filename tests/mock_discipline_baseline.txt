@@ -6,7 +6,6 @@
 # mock, or add an inline `# mock-ok: <reason>`. Regenerate after an intentional
 # change with:  python -m tests.mock_discipline --update-baseline
 
-api/test_api.py::test_healthz_no_auth	1
 api/test_api_nso_instances.py::_fake_cfg	2
 api/test_api_nso_instances.py::_fake_nso	1
 api/test_health_direct.py::_make_request	1
