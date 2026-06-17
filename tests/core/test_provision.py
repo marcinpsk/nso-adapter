@@ -9,10 +9,14 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from nso_adapter.nso.client import NsoClient
+
 
 def _mock_client(*, exists=False, create=None, fetch=None, admin=None, sync=True):
-    """An AsyncMock NsoClient with the onboarding methods stubbed."""
-    c = AsyncMock()
+    """An AsyncMock NsoClient (a real external HTTP boundary) with the onboarding methods
+    stubbed. spec=NsoClient binds it to the real interface, so a stubbed/called method that
+    drifts from NsoClient raises AttributeError instead of silently fabricating."""
+    c = AsyncMock(spec=NsoClient)
     c.device_exists.return_value = exists
     c.create_device.side_effect = create
     c.fetch_host_keys.side_effect = fetch
@@ -180,15 +184,10 @@ async def test_provision_aborts_on_fetch_host_keys_failure(adapter_client_with_n
 
 async def test_provision_unlocks_before_fetch_host_keys(adapter_client_with_nso):
     """Regression: unlock MUST happen before fetch-host-keys (locked device blocks SSH)."""
-    from unittest.mock import Mock
-
     from nso_adapter.core.onboarding import provision_nso_device
     from nso_adapter.store.db import get_session
 
     client = _mock_client()
-    parent = Mock()
-    parent.attach_mock(client.set_admin_state, "set_admin_state")
-    parent.attach_mock(client.fetch_host_keys, "fetch_host_keys")
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
         async for db in get_session():
             await provision_nso_device(
@@ -200,7 +199,9 @@ async def test_provision_unlocks_before_fetch_host_keys(adapter_client_with_nso)
                 authgroup="network",
             )
             break
-    order = [c[0] for c in parent.mock_calls]
+    # The client AsyncMock records every onboarding call in order — no separate parent Mock
+    # needed: assert the unlock (set_admin_state) precedes fetch_host_keys.
+    order = [c[0] for c in client.mock_calls]
     assert order.index("set_admin_state") < order.index("fetch_host_keys")
 
 

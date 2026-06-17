@@ -6,7 +6,6 @@
 # mock, or add an inline `# mock-ok: <reason>`. Regenerate after an intentional
 # change with:  python -m tests.mock_discipline --update-baseline
 
-core/test_provision.py::test_provision_unlocks_before_fetch_host_keys	1
 core/test_removal.py::test_dispatch_scope_ospf_uses_multi_row_apply	3
 core/test_removal.py::test_dispatch_scope_simple_calls_apply_replace_true	3
 core/test_removal.py::test_dispatch_scope_unknown_raises	1
