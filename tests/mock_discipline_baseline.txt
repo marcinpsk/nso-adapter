@@ -6,12 +6,6 @@
 # mock, or add an inline `# mock-ok: <reason>`. Regenerate after an intentional
 # change with:  python -m tests.mock_discipline --update-baseline
 
-api/test_actions_direct.py::test_action_connect_returns_job_id	1
-api/test_actions_direct.py::test_action_detect_drift_returns_job_id	1
-api/test_actions_direct.py::test_action_sync_returns_job_id	1
-api/test_actions_direct.py::test_sync_notify_returns_job_id	1
-api/test_actions_direct.py::test_trigger_job_conflict_returns_409	1
-api/test_actions_direct.py::test_trigger_success_returns_job_id	1
 api/test_api.py::test_healthz_no_auth	1
 api/test_api_nso_instances.py::_fake_cfg	2
 api/test_api_nso_instances.py::_fake_nso	1

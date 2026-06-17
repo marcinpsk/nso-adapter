@@ -28,6 +28,17 @@ repos:
         args: [--fix, --exit-non-zero-on-fix]
       - id: ruff-format
 
+  # In-house test-quality guard: flag new spec-less MagicMock/Mock used as object
+  # stand-ins (see tests/mock_discipline.py). Stdlib-only; scans the whole tests/ tree.
+  - repo: local
+    hooks:
+      - id: mock-discipline
+        name: mock-discipline (no new spec-less MagicMock/Mock)
+        entry: python3 -m tests.mock_discipline
+        language: system
+        pass_filenames: false
+        files: ^tests/.*\.py$
+
   # Conventional commit message validation
   - repo: https://github.com/compilerla/conventional-pre-commit
     rev: v4.4.0
