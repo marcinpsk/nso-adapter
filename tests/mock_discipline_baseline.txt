@@ -6,16 +6,6 @@
 # mock, or add an inline `# mock-ok: <reason>`. Regenerate after an intentional
 # change with:  python -m tests.mock_discipline --update-baseline
 
-core/test_removal.py::test_dispatch_scope_ospf_uses_multi_row_apply	3
-core/test_removal.py::test_dispatch_scope_simple_calls_apply_replace_true	3
-core/test_removal.py::test_dispatch_scope_unknown_raises	1
-core/test_removal.py::test_enqueue_removal_creates_job_for_each_valid_scope	2
-core/test_removal.py::test_enqueue_removal_rejects_unknown_scope	1
-core/test_removal.py::test_replace_on_removal_enqueues_job_and_commits	2
-core/test_removal.py::test_replace_on_removal_noop_when_nothing_removed	2
-core/test_removal.py::test_replace_on_removal_unknown_model_returns_false	2
-core/test_removal.py::test_run_removal_dispatches_and_marks_succeeded	1
-core/test_removal.py::test_run_removal_records_failure	1
 core/test_scheduler_jobs.py::test_capability_refresh_isolates_per_device_failures	1
 core/test_scheduler_jobs.py::test_capability_refresh_probes_each_device	1
 core/test_scheduler_jobs.py::test_family_refresh_wrapper_refreshes_all_devices	1
