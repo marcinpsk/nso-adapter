@@ -30,6 +30,8 @@ from nso_adapter.store.models import (
 
 
 def _make_nso_client(base="http://nso"):
+    # mock-ok: external NSO RESTCONF client boundary — only _base/_action_timeout are read;
+    # each test fakes the actual HTTP round-trip via client._client (see _mock_http_ctx).
     client = MagicMock()
     client._base = base
     client._action_timeout = 120.0

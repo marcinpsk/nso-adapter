@@ -69,6 +69,8 @@ class _RecordingTransport(httpx.AsyncBaseTransport):
 
 
 def _client_with(transport: _RecordingTransport) -> NsoClient:
+    # mock-ok: NsoInstanceConfig stub — only base_url/ca_cert/host_header are read; the
+    # real NsoClient + apply code run for real over the httpx MockTransport below.
     cfg = MagicMock()
     cfg.base_url = "http://nso"
     cfg.ca_cert = None
