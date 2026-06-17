@@ -16,7 +16,9 @@ from nso_adapter.nso.apply import (
     apply_interface_attribute,
     apply_interface_ips,
     apply_static_routes,
+    build_isis_process_payload,
 )
+from nso_adapter.store.models import IsisFlexAlgoIntent, IsisProcessIntent, RedistributionIntent
 
 
 def _make_nso_client(base="http://nso"):
@@ -605,71 +607,124 @@ async def test_apply_bgp_config_uses_correct_yang_keys():
     assert peer_out["peer-address-family"][0]["afi"] == "ipv4-unicast"
 
 
+# ── build_isis_process_payload (pure builder; tested against real ORM rows so a
+#    renamed model column breaks the test instead of silently passing) ──────────
+
+
+def test_build_isis_process_payload_empty_inputs():
+    """None / empty row lists yield an empty process-config list."""
+    assert build_isis_process_payload(None, None, None) == []
+    assert build_isis_process_payload([], [], []) == []
+
+
 def test_build_isis_process_payload_attaches_flex_algo():
     """Flex-algo rows attach under their process-tag, creating a minimal process
     entry when the tag has no process row (e.g. IOS-XR flex-only)."""
-    from nso_adapter.nso.apply import build_isis_process_payload
-
-    fa = SimpleNamespace(
+    fa = IsisFlexAlgoIntent(
         process_tag="NA4-CORE",
         algo_id=130,
         metric_type="delay-metric",
         priority=200,
         admin_group_exclude="RED",
-        admin_group_include_any=None,
-        admin_group_include_all=None,
     )
     procs = build_isis_process_payload(isis_process_rows=[], redistribution_rows=[], flex_algo_rows=[fa])
     assert len(procs) == 1
     p = procs[0]
     assert p["process-tag"] == "NA4-CORE"
-    assert p["flex-algo"][0]["algo-id"] == 130
-    assert p["flex-algo"][0]["metric-type"] == "delay-metric"
-    assert p["flex-algo"][0]["admin-group-exclude"] == "RED"
+    assert p["flex-algo"][0] == {
+        "algo-id": 130,
+        "metric-type": "delay-metric",
+        "priority": 200,
+        "admin-group-exclude": "RED",
+    }
+
+
+def test_build_isis_process_payload_flex_algo_attaches_to_existing_process():
+    """A flex-algo whose tag already has a process row attaches to that entry (no duplicate),
+    and the include-any/include-all groups emit while a None priority is omitted."""
+    proc = IsisProcessIntent(process_tag="0", net="49.0001.00")
+    fa = IsisFlexAlgoIntent(
+        process_tag="0",
+        algo_id=128,
+        admin_group_include_any="BLUE",
+        admin_group_include_all="GREEN",
+    )
+    procs = build_isis_process_payload([proc], [], [fa])
+    assert len(procs) == 1  # attached, not duplicated
+    assert procs[0]["net"] == "49.0001.00"
+    fa_out = procs[0]["flex-algo"][0]
+    assert fa_out == {"algo-id": 128, "admin-group-include-any": "BLUE", "admin-group-include-all": "GREEN"}
+    assert "priority" not in fa_out  # None priority omitted
 
 
 def test_build_isis_process_payload_omits_empty_enums():
     """Empty-string enum leaves (metric-style/is-type) are omitted, not sent as ''."""
-    from nso_adapter.nso.apply import build_isis_process_payload
-
-    row = SimpleNamespace(
-        process_tag="0",
-        net="49.0001.00",
-        is_type="",
-        metric_style="",
-        overload_bit=None,
-        area_auth_type="",
-        area_auth_key=None,
-        domain_auth_type="",
-        domain_auth_key=None,
-    )
+    row = IsisProcessIntent(process_tag="0", net="49.0001.00", is_type="", metric_style="")
     procs = build_isis_process_payload(isis_process_rows=[row], redistribution_rows=[], flex_algo_rows=[])
     assert "metric-style" not in procs[0]
     assert "is-type" not in procs[0]
     assert procs[0]["net"] == "49.0001.00"
 
 
+def test_build_isis_process_payload_full_process_fields():
+    """Every populated process leaf (net/is-type/metric-style/overload/area+domain auth) emits."""
+    row = IsisProcessIntent(
+        process_tag="CORE",
+        net="49.0001.0000.0000.0001.00",
+        is_type="level-2-only",
+        metric_style="wide",
+        overload_bit=True,
+        area_auth_type="md5",
+        area_auth_key="area-secret",
+        domain_auth_type="md5",
+        domain_auth_key="domain-secret",
+    )
+    procs = build_isis_process_payload([row])
+    assert procs[0] == {
+        "process-tag": "CORE",
+        "net": "49.0001.0000.0000.0001.00",
+        "is-type": "level-2-only",
+        "metric-style": "wide",
+        "overload-bit": True,
+        "area-auth-type": "md5",
+        "area-auth-key": "area-secret",
+        "domain-auth-type": "md5",
+        "domain-auth-key": "domain-secret",
+    }
+
+
+def test_build_isis_process_payload_overload_bit_false_is_emitted():
+    """overload-bit=False is still sent — the guard is `is not None`, not truthiness."""
+    row = IsisProcessIntent(process_tag="0", overload_bit=False)
+    procs = build_isis_process_payload([row])
+    assert procs[0]["overload-bit"] is False
+
+
+def test_build_isis_process_payload_auth_type_without_key():
+    """An auth type set with no key emits the type and omits the key (nested guard)."""
+    row = IsisProcessIntent(process_tag="0", area_auth_type="clear-text", domain_auth_type="md5")
+    procs = build_isis_process_payload([row])
+    assert procs[0]["area-auth-type"] == "clear-text"
+    assert "area-auth-key" not in procs[0]
+    assert procs[0]["domain-auth-type"] == "md5"
+    assert "domain-auth-key" not in procs[0]
+
+
 def test_build_isis_process_payload_nests_redistribute():
     """Redistribution rows nest under their dest process-tag; optional route-map / metric /
     metric-type are emitted only when set (the per-row optional branches)."""
-    from nso_adapter.nso.apply import build_isis_process_payload
-
-    proc = SimpleNamespace(
-        process_tag="0",
-        net=None,
-        is_type="",
-        metric_style="",
-        overload_bit=None,
-        area_auth_type="",
-        area_auth_key=None,
-        domain_auth_type="",
-        domain_auth_key=None,
+    proc = IsisProcessIntent(process_tag="0")
+    full = RedistributionIntent(
+        dest_protocol="isis",
+        dest_ref="0",
+        source_protocol="bgp",
+        source_ref="65000",
+        route_map="RM",
+        metric=100,
+        metric_type="external",
     )
-    full = SimpleNamespace(
-        dest_ref="0", source_protocol="bgp", source_ref="65000", route_map="RM", metric=100, metric_type="external"
-    )
-    minimal = SimpleNamespace(
-        dest_ref="0", source_protocol="connected", source_ref="", route_map=None, metric=None, metric_type=""
+    minimal = RedistributionIntent(
+        dest_protocol="isis", dest_ref="0", source_protocol="connected", source_ref="", route_map=None, metric=None
     )
     procs = build_isis_process_payload(isis_process_rows=[proc], redistribution_rows=[full, minimal], flex_algo_rows=[])
 

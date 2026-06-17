@@ -900,7 +900,60 @@ async def apply_switchport_config(
     )
 
 
-def build_isis_process_payload(  # noqa: C901
+def _isis_redistribute_entry(row) -> dict:
+    """One ``redistribute`` entry; route-map/metric/metric-type emitted only when set."""
+    entry: dict = {"source-protocol": row.source_protocol, "source-ref": row.source_ref}
+    if row.route_map:
+        entry["route-map"] = row.route_map
+    if row.metric is not None:
+        entry["metric"] = row.metric
+    if row.metric_type:
+        entry["metric-type"] = row.metric_type
+    return entry
+
+
+def _isis_process_entry(row, proc_redist: list[dict]) -> dict:
+    """One ``process-config`` entry from a process row plus its nested redistribute list."""
+    entry: dict = {"process-tag": row.process_tag or ""}
+    if row.net is not None:
+        entry["net"] = row.net
+    # Enum leaves reject the empty string — omit when blank (not just None).
+    if row.is_type:
+        entry["is-type"] = row.is_type
+    if row.metric_style:
+        entry["metric-style"] = row.metric_style
+    if row.overload_bit is not None:
+        entry["overload-bit"] = bool(row.overload_bit)
+    if row.area_auth_type:
+        entry["area-auth-type"] = row.area_auth_type
+        if row.area_auth_key is not None:
+            entry["area-auth-key"] = row.area_auth_key
+    if row.domain_auth_type:
+        entry["domain-auth-type"] = row.domain_auth_type
+        if row.domain_auth_key is not None:
+            entry["domain-auth-key"] = row.domain_auth_key
+    if proc_redist:
+        entry["redistribute"] = proc_redist
+    return entry
+
+
+def _isis_flex_algo_entry(row) -> dict:
+    """One ``flex-algo`` definition entry; optional metric/priority/admin-groups when set."""
+    entry: dict = {"algo-id": int(row.algo_id)}
+    if row.metric_type:
+        entry["metric-type"] = row.metric_type
+    if row.priority is not None:
+        entry["priority"] = int(row.priority)
+    if row.admin_group_exclude:
+        entry["admin-group-exclude"] = row.admin_group_exclude
+    if row.admin_group_include_any:
+        entry["admin-group-include-any"] = row.admin_group_include_any
+    if row.admin_group_include_all:
+        entry["admin-group-include-all"] = row.admin_group_include_all
+    return entry
+
+
+def build_isis_process_payload(
     isis_process_rows: list | None,
     redistribution_rows: list | None = None,
     flex_algo_rows: list | None = None,
@@ -912,59 +965,17 @@ def build_isis_process_payload(  # noqa: C901
     """
     redist_by_proc: dict[str, list[dict]] = {}
     for row in redistribution_rows or []:
-        entry: dict = {
-            "source-protocol": row.source_protocol,
-            "source-ref": row.source_ref,
-        }
-        if row.route_map:
-            entry["route-map"] = row.route_map
-        if row.metric is not None:
-            entry["metric"] = row.metric
-        if row.metric_type:
-            entry["metric-type"] = row.metric_type
-        redist_by_proc.setdefault(row.dest_ref, []).append(entry)
+        redist_by_proc.setdefault(row.dest_ref, []).append(_isis_redistribute_entry(row))
 
-    processes: list[dict] = []
-    for row in isis_process_rows or []:
-        entry = {"process-tag": row.process_tag or ""}
-        if row.net is not None:
-            entry["net"] = row.net
-        # Enum leaves reject the empty string — omit when blank (not just None).
-        if row.is_type:
-            entry["is-type"] = row.is_type
-        if row.metric_style:
-            entry["metric-style"] = row.metric_style
-        if row.overload_bit is not None:
-            entry["overload-bit"] = bool(row.overload_bit)
-        if row.area_auth_type:
-            entry["area-auth-type"] = row.area_auth_type
-            if row.area_auth_key is not None:
-                entry["area-auth-key"] = row.area_auth_key
-        if row.domain_auth_type:
-            entry["domain-auth-type"] = row.domain_auth_type
-            if row.domain_auth_key is not None:
-                entry["domain-auth-key"] = row.domain_auth_key
-        proc_redist = redist_by_proc.get(row.process_tag or "", [])
-        if proc_redist:
-            entry["redistribute"] = proc_redist
-        processes.append(entry)
+    processes: list[dict] = [
+        _isis_process_entry(row, redist_by_proc.get(row.process_tag or "", [])) for row in isis_process_rows or []
+    ]
 
     # Attach Flex-Algo definitions to their process-config entry, creating a
     # minimal entry for any process-tag that has flex-algo but no process row.
     flex_by_proc: dict[str, list[dict]] = {}
     for row in flex_algo_rows or []:
-        fa_entry: dict = {"algo-id": int(row.algo_id)}
-        if row.metric_type:
-            fa_entry["metric-type"] = row.metric_type
-        if row.priority is not None:
-            fa_entry["priority"] = int(row.priority)
-        if row.admin_group_exclude:
-            fa_entry["admin-group-exclude"] = row.admin_group_exclude
-        if row.admin_group_include_any:
-            fa_entry["admin-group-include-any"] = row.admin_group_include_any
-        if row.admin_group_include_all:
-            fa_entry["admin-group-include-all"] = row.admin_group_include_all
-        flex_by_proc.setdefault(row.process_tag or "", []).append(fa_entry)
+        flex_by_proc.setdefault(row.process_tag or "", []).append(_isis_flex_algo_entry(row))
 
     if flex_by_proc:
         proc_by_tag = {p["process-tag"]: p for p in processes}
