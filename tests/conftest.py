@@ -21,12 +21,6 @@ os.environ.pop("DATABASE_URL", None)
 VALID_TOKEN = "test-bearer-token"
 
 
-def _mock_provider():
-    p = MagicMock()
-    p.get = MagicMock(return_value=VALID_TOKEN)
-    return p
-
-
 @pytest.fixture
 async def adapter_client(tmp_path, monkeypatch):
     """FastAPI test client backed by in-memory SQLite.
@@ -58,9 +52,12 @@ database_url: sqlite+aiosqlite:///{tmp_path}/test.db
 
     app = create_app()
 
+    # No make_provider/NetboxClient patches: the real LocalSecretsProvider resolves each
+    # ref from the env vars set above, and the lifespan builds a real (no-I/O) NetboxClient.
+    # set_netbox_client stays patched so the importer's global client stays None — tests that
+    # exercise NetBox paths set their own. Only true side effects (scheduler/workers/SSE) are
+    # stubbed so the in-process app doesn't spawn background tasks or open NSO streams.
     with (
-        patch("nso_adapter.main.make_provider", return_value=_mock_provider()),
-        patch("nso_adapter.bindings.netbox.client.NetboxClient") as MockNb,
         patch("nso_adapter.main.set_netbox_client"),
         patch("nso_adapter.main.start_scheduler"),
         patch("nso_adapter.main.stop_scheduler"),
@@ -68,7 +65,6 @@ database_url: sqlite+aiosqlite:///{tmp_path}/test.db
         patch("nso_adapter.main.stop_workers", new=AsyncMock()),
         patch("nso_adapter.main.persistent_subscriber", new=AsyncMock()),
     ):
-        MockNb.return_value = MagicMock()
         # ASGITransport does not call lifespan — run it manually so init_db() fires.
         async with app.router.lifespan_context(app):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -111,9 +107,10 @@ database_url: sqlite+aiosqlite:///{tmp_path}/test.db
 
     app = create_app()
 
+    # See adapter_client: real LocalSecretsProvider + real (no-I/O) NetboxClient; only the
+    # background side effects are stubbed. This fixture additionally has one NSO instance, so
+    # the lifespan resolves NSO_USERNAME/NSO_PASSWORD and registers a real NsoClient for it.
     with (
-        patch("nso_adapter.main.make_provider", return_value=_mock_provider()),
-        patch("nso_adapter.bindings.netbox.client.NetboxClient") as MockNb,
         patch("nso_adapter.main.set_netbox_client"),
         patch("nso_adapter.main.start_scheduler"),
         patch("nso_adapter.main.stop_scheduler"),
@@ -121,7 +118,6 @@ database_url: sqlite+aiosqlite:///{tmp_path}/test.db
         patch("nso_adapter.main.stop_workers", new=AsyncMock()),
         patch("nso_adapter.main.persistent_subscriber", new=AsyncMock()),
     ):
-        MockNb.return_value = MagicMock()
         async with app.router.lifespan_context(app):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
                 yield client
