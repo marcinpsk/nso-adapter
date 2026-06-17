@@ -6,6 +6,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from nso_adapter.nso import apply as apply_mod
@@ -20,6 +21,7 @@ from nso_adapter.nso.apply import (
     apply_static_routes,
     build_isis_process_payload,
 )
+from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import (
     IsisFlexAlgoIntent,
     IsisProcessIntent,
@@ -30,36 +32,49 @@ from nso_adapter.store.models import (
 
 
 def _make_nso_client(base="http://nso"):
-    # mock-ok: external NSO RESTCONF client boundary — only _base/_action_timeout are read;
-    # each test fakes the actual HTTP round-trip via client._client (see _mock_http_ctx).
-    client = MagicMock()
+    # The NSO RESTCONF client is a real external HTTP boundary; bind the fake to NsoClient
+    # via spec= so a renamed member can't be fabricated. Only _base/_action_timeout are read
+    # directly; each test fakes the HTTP round-trip via client._client() (see _stub_pool).
+    client = MagicMock(spec=NsoClient)
     client._base = base
     client._action_timeout = 120.0
     return client
 
 
-def _mock_httpx_response(status: int = 204, json_data=None):
-    resp = MagicMock()
-    resp.status_code = status
-    resp.json.return_value = json_data or {}
-    resp.text = "error body"
-    return resp
+def _httpx_response(status: int = 204, json_data=None) -> httpx.Response:
+    """A REAL httpx.Response. With json_data, .json() returns it (.text is the JSON dump);
+    without, the body is non-JSON so .json() raises and the apply error path falls back to
+    .text — exactly how a real NSO 4xx/5xx with a non-JSON body behaves."""
+    req = httpx.Request("PATCH", "http://nso/apply")
+    if json_data is not None:
+        return httpx.Response(status, json=json_data, request=req)
+    return httpx.Response(status, text="error body", request=req)
 
 
-def _mock_http_ctx(response):
-    mock_http = AsyncMock()
-    mock_http.patch.return_value = response
-    ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=mock_http)
-    ctx.__aexit__ = AsyncMock(return_value=None)
-    return ctx
+def _stub_pool(client, http):
+    """Wire client._client() as an async context manager yielding *http* (the pooled-client
+    stand-in) WITHOUT a bare MagicMock CM — the spec'd client's auto-created child already
+    supports async-with. __aexit__ returns False so exceptions in the body propagate.
+    Returns *http* for call-assertion convenience."""
+    cm = client._client.return_value
+    cm.__aenter__.return_value = http
+    cm.__aexit__.return_value = False
+    return http
+
+
+def _mock_http_ctx(client, response):
+    """Single-response convenience: wire client._client() to an http whose .patch returns
+    *response*; returns the http object."""
+    http = AsyncMock()
+    http.patch.return_value = response
+    return _stub_pool(client, http)
 
 
 @pytest.mark.asyncio
 async def test_apply_description_success():
     """Applies description attribute without raising."""
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(204))
+    _mock_http_ctx(client, _httpx_response(204))
 
     await apply_interface_attribute(client, "core-rtr-01", "GigabitEthernet0/0", "description", "uplink")
 
@@ -83,7 +98,7 @@ async def test_apply_description_success():
 async def test_apply_enabled_true():
     """enabled='True' string maps to boolean True."""
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(200))
+    _mock_http_ctx(client, _httpx_response(200))
 
     await apply_interface_attribute(client, "rtr", "ge-0/0/0", "enabled", "True")
 
@@ -102,7 +117,7 @@ async def test_apply_enabled_lowercase_true():
     deliberately-enabled interface was silently written as disabled.
     """
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(200))
+    _mock_http_ctx(client, _httpx_response(200))
 
     await apply_interface_attribute(client, "rtr", "ge-0/0/0", "enabled", "true")
 
@@ -117,7 +132,7 @@ async def test_apply_enabled_lowercase_true():
 async def test_apply_enabled_false():
     """enabled != 'True' string maps to boolean False."""
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(201))
+    _mock_http_ctx(client, _httpx_response(201))
 
     await apply_interface_attribute(client, "rtr", "ge-0/0/0", "enabled", "False")
 
@@ -132,7 +147,7 @@ async def test_apply_enabled_false():
 async def test_apply_description_none_uses_empty_string():
     """None description is converted to empty string in the payload."""
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(204))
+    _mock_http_ctx(client, _httpx_response(204))
 
     await apply_interface_attribute(client, "rtr", "ge-0/0/0", "description", None)
 
@@ -160,7 +175,7 @@ async def test_apply_nso_error_status_raises():
     """Non-2xx NSO response raises NsoApplyError."""
     client = _make_nso_client()
     error_body = {"error": {"code": "locked", "message": "device locked"}}
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(409, json_data=error_body))
+    _mock_http_ctx(client, _httpx_response(409, json_data=error_body))
 
     with pytest.raises(NsoApplyError) as exc_info:
         await apply_interface_attribute(client, "rtr", "ge-0/0/0", "description", "x")
@@ -173,9 +188,9 @@ async def test_apply_nso_error_status_raises():
 async def test_apply_nso_error_non_json_body():
     """Non-JSON NSO error body is captured as raw text."""
     client = _make_nso_client()
-    resp = _mock_httpx_response(500)
-    resp.json.side_effect = Exception("not json")
-    client._client.return_value = _mock_http_ctx(resp)
+    # A real 500 whose body is non-JSON: resp.json() raises naturally, so the apply error
+    # path must fall back to resp.text (no need to fake the JSON failure).
+    _mock_http_ctx(client, _httpx_response(500))
 
     with pytest.raises(NsoApplyError) as exc_info:
         await apply_interface_attribute(client, "rtr", "ge-0/0/0", "description", "x")
@@ -201,7 +216,7 @@ async def test_apply_l2_saps_builds_patch_body():
     from nso_adapter.nso.apply import apply_l2_saps
 
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(204))
+    _mock_http_ctx(client, _httpx_response(204))
 
     rows = [
         _SapRow("TL", "epipe", "lag-60:3999", port="lag-60", outer_tag=3999),
@@ -228,7 +243,7 @@ async def test_apply_l2_saps_nso_error_raises():
     from nso_adapter.nso.apply import apply_l2_saps
 
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(409, json_data={"error": {}}))
+    _mock_http_ctx(client, _httpx_response(409, json_data={"error": {}}))
 
     with pytest.raises(NsoApplyError) as exc_info:
         await apply_l2_saps(client=client, device_name="ra1", sap_intent_rows=[_SapRow("TL", "epipe", "lag-60:1")])
@@ -243,7 +258,7 @@ async def test_apply_lag_config_builds_patch_body():
     from nso_adapter.nso.apply import apply_lag_config
 
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(204))
+    _mock_http_ctx(client, _httpx_response(204))
 
     bundles = [
         {
@@ -273,7 +288,7 @@ async def test_apply_lag_config_nso_error_raises():
     from nso_adapter.nso.apply import apply_lag_config
 
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(409, json_data={"error": {}}))
+    _mock_http_ctx(client, _httpx_response(409, json_data={"error": {}}))
 
     with pytest.raises(NsoApplyError) as exc_info:
         await apply_lag_config(client=client, device_name="sw03", bundles=[{"name": "Port-channel1", "lag-id": 1}])
@@ -297,21 +312,18 @@ def test_nso_apply_error_default_detail():
 # ── apply_interface_ips ──────────────────────────────────────────────────────
 
 
-def _make_ip_row(address: str, family: str = "ipv4", secondary: bool = False, vrf: str = "") -> MagicMock:
-    row = MagicMock()
-    row.address = address
-    row.family = family
-    row.secondary = secondary
-    row.vrf = vrf
-    return row
+def _make_ip_row(address: str, family: str = "ipv4", secondary: bool = False, vrf: str = "") -> SimpleNamespace:
+    # A plain record stand-in — apply reads .address/.family/.secondary/.vrf. SimpleNamespace
+    # does not fabricate attributes, so a renamed field surfaces as AttributeError.
+    return SimpleNamespace(address=address, family=family, secondary=secondary, vrf=vrf)
 
 
 @pytest.mark.asyncio
 async def test_apply_interface_ips_ipv4_primary():
     """Single IPv4 primary address produces correct PATCH body."""
     client = _make_nso_client()
-    resp = _mock_httpx_response(204)
-    client._client.return_value = _mock_http_ctx(resp)
+    resp = _httpx_response(204)
+    _mock_http_ctx(client, resp)
 
     row = _make_ip_row("10.0.0.1/24", family="ipv4", secondary=False, vrf="")
     await apply_interface_ips(client, "rtr-a", "GigabitEthernet0/1", [row])
@@ -331,8 +343,8 @@ async def test_apply_interface_ips_ipv4_primary():
 async def test_apply_interface_ips_ipv6():
     """IPv6 address produces correct PATCH body."""
     client = _make_nso_client()
-    resp = _mock_httpx_response(204)
-    client._client.return_value = _mock_http_ctx(resp)
+    resp = _httpx_response(204)
+    _mock_http_ctx(client, resp)
 
     row = _make_ip_row("2001:db8::1/64", family="ipv6")
     await apply_interface_ips(client, "rtr-b", "GigabitEthernet0/2", [row])
@@ -350,8 +362,8 @@ async def test_apply_interface_ips_ipv6():
 async def test_apply_interface_ips_sets_vrf():
     """Non-empty vrf field is included in the PATCH body."""
     client = _make_nso_client()
-    resp = _mock_httpx_response(204)
-    client._client.return_value = _mock_http_ctx(resp)
+    resp = _httpx_response(204)
+    _mock_http_ctx(client, resp)
 
     row = _make_ip_row("10.1.1.1/30", family="ipv4", vrf="MGMT")
     await apply_interface_ips(client, "rtr-c", "GigabitEthernet0/3", [row])
@@ -369,7 +381,7 @@ async def test_apply_interface_ips_nokia_routed_context():
     """Nokia routed-interface metadata (M27) is included in the PATCH so the reconciler
     targets the router/service interface, not the port."""
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(204))
+    _mock_http_ctx(client, _httpx_response(204))
 
     row = _make_ip_row("7.7.7.7/32", family="ipv4", vrf="CRPD-VPN")
     await apply_interface_ips(
@@ -398,7 +410,7 @@ async def test_apply_interface_ips_nokia_routed_context():
 async def test_apply_interface_ips_no_kind_omits_routed_fields():
     """IOS/Junos (no kind) PATCH carries no Nokia routed-interface fields."""
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(204))
+    _mock_http_ctx(client, _httpx_response(204))
 
     row = _make_ip_row("10.0.0.1/24")
     await apply_interface_ips(client, "rtr-a", "GigabitEthernet0/1", [row])
@@ -415,8 +427,8 @@ async def test_apply_interface_ips_no_kind_omits_routed_fields():
 async def test_apply_interface_ips_nso_error_raises():
     """Non-2xx response from NSO raises NsoApplyError."""
     client = _make_nso_client()
-    resp = _mock_httpx_response(500, json_data={"error": {"code": "internal"}})
-    client._client.return_value = _mock_http_ctx(resp)
+    resp = _httpx_response(500, json_data={"error": {"code": "internal"}})
+    _mock_http_ctx(client, resp)
 
     row = _make_ip_row("10.2.0.1/24")
     with pytest.raises(NsoApplyError) as exc_info:
@@ -434,7 +446,7 @@ async def test_apply_switchport_config_builds_patch_body():
     from nso_adapter.nso.apply import apply_switchport_config
 
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(204))
+    _mock_http_ctx(client, _httpx_response(204))
     ifaces = [
         {"interface-name": "GigabitEthernet0/1", "mode": "access", "untagged-vlan": 10},
         {"interface-name": "GigabitEthernet0/2", "mode": "trunk", "untagged-vlan": 99, "tagged-vlan": [20, 30]},
@@ -456,7 +468,7 @@ async def test_apply_switchport_config_nso_error_raises():
     from nso_adapter.nso.apply import apply_switchport_config
 
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(409, json_data={"error": {}}))
+    _mock_http_ctx(client, _httpx_response(409, json_data={"error": {}}))
     with pytest.raises(NsoApplyError) as exc_info:
         await apply_switchport_config(client=client, device_name="sw03", interfaces=[{"interface-name": "Gi0/1"}])
     assert exc_info.value.code == "nso_patch_failed"
@@ -499,7 +511,7 @@ async def test_verify_raises_on_nonempty_delta():
     body = {
         "dry-run-result": {"native": {"device": [{"name": "sw03", "data": "ip route 1.0.0.0 255.0.0.0 2.2.2.2 1\n"}]}}
     }
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(200, json_data=body))
+    _mock_http_ctx(client, _httpx_response(200, json_data=body))
 
     with pytest.raises(NsoApplyError) as exc_info:
         await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="static_route")
@@ -510,9 +522,7 @@ async def test_verify_raises_on_nonempty_delta():
 @pytest.mark.asyncio
 async def test_verify_passes_on_empty_delta():
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(
-        _mock_httpx_response(200, json_data={"dry-run-result": {"native": {}}})
-    )
+    _mock_http_ctx(client, _httpx_response(200, json_data={"dry-run-result": {"native": {}}}))
     await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="vlan")  # no raise
 
 
@@ -520,7 +530,7 @@ async def test_verify_passes_on_empty_delta():
 async def test_verify_inconclusive_does_not_raise():
     """Unexpected/garbage dry-run body is fail-safe (no raise, apply stands)."""
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(200, json_data={"weird": 1}))
+    _mock_http_ctx(client, _httpx_response(200, json_data={"weird": 1}))
     await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="vlan")  # no raise
 
 
@@ -529,7 +539,7 @@ async def test_verify_disabled_by_toggle(monkeypatch):
     """When VERIFY_AFTER_APPLY is off, no dry-run call is made."""
     monkeypatch.setattr(apply_mod, "VERIFY_AFTER_APPLY", False)
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(200))
+    _mock_http_ctx(client, _httpx_response(200))
     await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="vlan")
     client._client.assert_not_called()
 
@@ -538,16 +548,13 @@ async def test_verify_disabled_by_toggle(monkeypatch):
 async def test_apply_static_routes_verify_mismatch_raises():
     """End-to-end: real PATCH succeeds (204) but the verify dry-run shows a delta → raise."""
     client = _make_nso_client()
-    real_resp = _mock_httpx_response(204)
-    dry_resp = _mock_httpx_response(
+    real_resp = _httpx_response(204)
+    dry_resp = _httpx_response(
         200, json_data={"dry-run-result": {"native": {"device": [{"name": "sw03", "data": "ip route ...\n"}]}}}
     )
     mock_http = AsyncMock()
     mock_http.patch.side_effect = [real_resp, dry_resp]
-    ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=mock_http)
-    ctx.__aexit__ = AsyncMock(return_value=None)
-    client._client.return_value = ctx
+    _stub_pool(client, mock_http)
 
     row = SimpleNamespace(vrf="", prefix="100.64.0.0/10", next_hop="172.16.0.1", metric=1, permanent=False, tag=None)
     with pytest.raises(NsoApplyError) as exc_info:
@@ -568,15 +575,12 @@ async def test_apply_bgp_config_uses_correct_yang_keys():
     from nso_adapter.nso.apply import apply_bgp_config
 
     client = _make_nso_client()
-    real_resp = _mock_httpx_response(204)
+    real_resp = _httpx_response(204)
     # Verify dry-run with no device delta → guard passes.
-    dry_resp = _mock_httpx_response(200, json_data={"dry-run-result": {"native": {"device": []}}})
+    dry_resp = _httpx_response(200, json_data={"dry-run-result": {"native": {"device": []}}})
     mock_http = AsyncMock()
     mock_http.patch.side_effect = [real_resp, dry_resp]
-    ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=mock_http)
-    ctx.__aexit__ = AsyncMock(return_value=None)
-    client._client.return_value = ctx
+    _stub_pool(client, mock_http)
 
     paf = SimpleNamespace(
         af="ipv4-unicast",
@@ -851,11 +855,8 @@ async def test_replace_isis_service_puts_keyed_instance():
 
     client = _make_nso_client()
     mock_http = AsyncMock()
-    mock_http.put.return_value = _mock_httpx_response(204)
-    ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=mock_http)
-    ctx.__aexit__ = AsyncMock(return_value=None)
-    client._client.return_value = ctx
+    mock_http.put.return_value = _httpx_response(204)
+    _stub_pool(client, mock_http)
     await replace_isis_service(client=client, device_name="rc1", interfaces=[{"interface-name": "ae2.0"}], processes=[])
 
     (url,) = mock_http.put.call_args[0]
@@ -874,11 +875,8 @@ async def test_replace_service_instance_puts_keyed_instance():
 
     client = _make_nso_client()
     mock_http = AsyncMock()
-    mock_http.put.return_value = _mock_httpx_response(204)
-    ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=mock_http)
-    ctx.__aexit__ = AsyncMock(return_value=None)
-    client._client.return_value = ctx
+    mock_http.put.return_value = _httpx_response(204)
+    _stub_pool(client, mock_http)
 
     await replace_service_instance(
         client,
@@ -904,11 +902,8 @@ async def test_apply_vlan_config_replace_puts_remaining_list():
 
     client = _make_nso_client()
     mock_http = AsyncMock()
-    mock_http.put.return_value = _mock_httpx_response(204)
-    ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=mock_http)
-    ctx.__aexit__ = AsyncMock(return_value=None)
-    client._client.return_value = ctx
+    mock_http.put.return_value = _httpx_response(204)
+    _stub_pool(client, mock_http)
 
     rows = [SimpleNamespace(vlan_id=10, name="keep")]  # 3366 dropped → absent from body
     await apply_vlan_config(client=client, device_name="sw3", vlan_intent_rows=rows, replace=True)
@@ -930,11 +925,8 @@ async def test_apply_static_routes_replace_puts_keyed_instance():
 
     client = _make_nso_client()
     mock_http = AsyncMock()
-    mock_http.put.return_value = _mock_httpx_response(204)
-    ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=mock_http)
-    ctx.__aexit__ = AsyncMock(return_value=None)
-    client._client.return_value = ctx
+    mock_http.put.return_value = _httpx_response(204)
+    _stub_pool(client, mock_http)
 
     rows = [SimpleNamespace(vrf="", prefix="10.0.0.0/8", next_hop="1.1.1.1", metric=1, permanent=False, tag=None)]
     await apply_static_routes(client=client, device_name="sw3", route_intent_rows=rows, replace=True)
@@ -958,11 +950,8 @@ async def test_apply_route_policy_translates_and_skips_members_per_ned():
 
     client = _make_nso_client()
     mock_http = AsyncMock()
-    mock_http.patch.return_value = _mock_httpx_response(204)
-    ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=mock_http)
-    ctx.__aexit__ = AsyncMock(return_value=None)
-    client._client.return_value = ctx
+    mock_http.patch.return_value = _httpx_response(204)
+    _stub_pool(client, mock_http)
 
     entries = [
         {"sequence": 10, "action": "permit", "community": "6830:1234"},
@@ -1002,11 +991,8 @@ async def test_apply_route_policy_carries_invert_match_and_amp_large_on_nokia():
 
     client = _make_nso_client()
     mock_http = AsyncMock()
-    mock_http.patch.return_value = _mock_httpx_response(204)
-    ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=mock_http)
-    ctx.__aexit__ = AsyncMock(return_value=None)
-    client._client.return_value = ctx
+    mock_http.patch.return_value = _httpx_response(204)
+    _stub_pool(client, mock_http)
 
     entries = [
         {"sequence": 10, "action": "permit", "community": "no-export"},
@@ -1039,11 +1025,8 @@ async def test_apply_route_policy_keeps_all_members_on_identity_ned():
 
     client = _make_nso_client()
     mock_http = AsyncMock()
-    mock_http.patch.return_value = _mock_httpx_response(204)
-    ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=mock_http)
-    ctx.__aexit__ = AsyncMock(return_value=None)
-    client._client.return_value = ctx
+    mock_http.patch.return_value = _httpx_response(204)
+    _stub_pool(client, mock_http)
 
     entries = [
         {"sequence": 10, "action": "permit", "community": "color:0:128"},
@@ -1105,7 +1088,7 @@ async def test_apply_ospf_always_asserts_enabled_delete_guard():
     from nso_adapter.nso.apply import apply_ospf_config
 
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(204))
+    _mock_http_ctx(client, _httpx_response(204))
 
     rows = [
         SimpleNamespace(process_id="1", router_id="10.0.0.1", vrf="", enabled=None),
@@ -1132,11 +1115,8 @@ async def test_apply_ospf_replace_body_keeps_enabled():
 
     client = _make_nso_client()
     mock_http = AsyncMock()
-    mock_http.put.return_value = _mock_httpx_response(204)
-    ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=mock_http)
-    ctx.__aexit__ = AsyncMock(return_value=None)
-    client._client.return_value = ctx
+    mock_http.put.return_value = _httpx_response(204)
+    _stub_pool(client, mock_http)
 
     rows = [SimpleNamespace(process_id="1", router_id="10.0.0.1", vrf="", enabled=None)]
     await apply_ospf_config(
@@ -1192,7 +1172,7 @@ async def test_apply_real_commit_carries_reconcile_and_dry_run_does_too(monkeypa
     both dry-run=native and reconcile so the preview matches the commit."""
     monkeypatch.setattr(apply_mod, "RECONCILE_COMMIT", "keep-non-service-config")
     client = _make_nso_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(204))
+    _mock_http_ctx(client, _httpx_response(204))
 
     await apply_interface_attribute(client, "core-rtr-01", "Gi0/0", "description", "uplink")
 
