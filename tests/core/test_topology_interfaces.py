@@ -13,9 +13,17 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
+from nso_adapter.bindings.netbox.client import NetboxClient
 from tests.conftest import seed_device
 
 TS = datetime(2026, 6, 2, 12, 0, 0, tzinfo=UTC).replace(tzinfo=None)
+
+
+def _nb_client():
+    # NetboxClient is a real external HTTP boundary; bind the stand-in to its interface via
+    # spec=. ensure_topology_interfaces only threads it to bulk_ensure_interfaces (stubbed
+    # here), so it is never dereferenced — spec= keeps it from fabricating a renamed member.
+    return MagicMock(spec=NetboxClient)
 
 
 async def _seed_topology(device_id: int) -> None:
@@ -123,19 +131,25 @@ async def _run_ensure(device_id: int, nb_client) -> set[str]:
     captured: dict = {}
 
     async def _fake_bulk(client, nb_device_id, names):
+        captured["client"] = client
         captured["names"] = names
         captured["nb_device_id"] = nb_device_id
         return {n: i for i, n in enumerate(names)}
 
     orig = mod.bulk_ensure_interfaces
     mod.bulk_ensure_interfaces = _fake_bulk
+    expected_nb_id = None
     try:
         async for db in get_session():
             device = await db.get(Device, device_id)
+            expected_nb_id = device.netbox_device_id
             await mod.ensure_topology_interfaces(db, device, nb_client)
             break
     finally:
         mod.bulk_ensure_interfaces = orig
+    # The resolved NetBox client + the device's netbox id must actually reach bulk_ensure.
+    assert captured["client"] is nb_client
+    assert captured["nb_device_id"] == expected_nb_id
     return set(captured.get("names", []))
 
 
@@ -143,7 +157,7 @@ async def test_unions_and_filters_sources(adapter_client):
     device_id = await seed_device(nso_device_name="topo-nokia", netbox_device_id=900)
     await _seed_topology(device_id)
 
-    names = await _run_ensure(device_id, MagicMock())
+    names = await _run_ensure(device_id, _nb_client())
 
     assert names == {
         "1/1/c22/1",  # cfg.port base
@@ -163,7 +177,7 @@ async def test_no_netbox_binding_returns_empty(adapter_client):
     device_id = await seed_device(nso_device_name="topo-nonb", netbox_device_id=None)
     await _seed_topology(device_id)
 
-    nb = MagicMock()
+    nb = _nb_client()
     from nso_adapter.core.topology_interfaces import ensure_topology_interfaces
     from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device
@@ -204,7 +218,7 @@ async def test_empty_topology_does_not_call_bulk_ensure(adapter_client):
     try:
         async for db in get_session():
             device = await db.get(Device, device_id)
-            result = await mod.ensure_topology_interfaces(db, device, MagicMock())
+            result = await mod.ensure_topology_interfaces(db, device, _nb_client())
             break
     finally:
         mod.bulk_ensure_interfaces = orig
