@@ -486,6 +486,95 @@ async def test_collect_apply_diff_scope_failure_is_isolated(adapter_client):
     assert diffs == {"static_route": "STATIC DELTA"}
 
 
+async def test_collect_apply_diff_interface_scope_failures_and_skips(adapter_client):
+    """The interface attr/IP previews skip non-eligible attrs and swallow per-slice dry-run errors."""
+    from nso_adapter.core.apply import collect_apply_diff
+    from nso_adapter.store.models import InterfaceIpIntent
+
+    device_id = await _seed_device("rtr-diff-ifaceerr", 194)
+    async for db in get_session():
+        iface = DbInterface(device_id=device_id, name="GigabitEthernet0/0", netbox_interface_id=910)
+        db.add(iface)
+        await db.flush()
+        # eligible description slice — its dry-run will be made to raise
+        db.add(
+            InterfaceIntent(
+                interface_id=iface.id, attribute="description", intent_value="up", accepted_at=datetime.utcnow()
+            )
+        )
+        # non-eligible attribute (skipped before any dry-run)
+        db.add(
+            InterfaceIntent(interface_id=iface.id, attribute="mtu", intent_value="9000", accepted_at=datetime.utcnow())
+        )
+        # eligible attribute but not accepted (also skipped)
+        db.add(InterfaceIntent(interface_id=iface.id, attribute="enabled", intent_value="true"))
+        # IP intent whose dry-run will be made to raise
+        db.add(
+            InterfaceIpIntent(
+                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.utcnow()
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch(
+            "nso_adapter.nso.apply.apply_interface_attribute",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("attr dry-run boom"),
+        ),
+        patch(
+            "nso_adapter.nso.apply.apply_interface_ips",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("ip dry-run boom"),
+        ),
+    ):
+        async for db in get_session():
+            diffs = await collect_apply_diff(db, device_id)
+            break
+
+    # both interface scopes failed → omitted; preview never raised
+    assert diffs == {}
+
+
+async def test_collect_apply_diff_interface_in_sync_yields_no_entry(adapter_client):
+    """An interface already in sync (empty dry-run delta) contributes no preview entry."""
+    from nso_adapter.core.apply import collect_apply_diff
+    from nso_adapter.store.models import InterfaceIpIntent
+
+    device_id = await _seed_device("rtr-diff-insync", 193)
+    async for db in get_session():
+        iface = DbInterface(device_id=device_id, name="GigabitEthernet0/0", netbox_interface_id=911)
+        db.add(iface)
+        await db.flush()
+        db.add(
+            InterfaceIntent(
+                interface_id=iface.id, attribute="description", intent_value="up", accepted_at=datetime.utcnow()
+            )
+        )
+        db.add(
+            InterfaceIpIntent(
+                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.utcnow()
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_interface_attribute", new_callable=AsyncMock, return_value=""),
+        patch("nso_adapter.nso.apply.apply_interface_ips", new_callable=AsyncMock, return_value=None),
+    ):
+        async for db in get_session():
+            diffs = await collect_apply_diff(db, device_id)
+            break
+
+    assert diffs == {}
+
+
 async def test_run_apply_all_succeed(adapter_client):
     """run_apply marks job succeeded when all attributes apply successfully."""
     device_id = await _seed_device("rtr-a13", 113)
