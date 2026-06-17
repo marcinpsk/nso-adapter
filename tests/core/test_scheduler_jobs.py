@@ -17,8 +17,16 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.core import scheduler as sched
+from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import DbInterface, Device, InterfaceIntent, ManagedScope
+
+
+def _nso_client():
+    # The NSO client is a real external HTTP boundary; bind the stand-in to NsoClient via
+    # spec=. The scheduled jobs thread it straight to the (stubbed) per-family refresh, so it
+    # is never dereferenced — spec= keeps a renamed member from being fabricated.
+    return MagicMock(spec=NsoClient)
 
 
 async def _seed_devices(*specs: tuple[str, int]) -> dict[str, int]:
@@ -58,13 +66,16 @@ _WRAPPERS = [
 async def test_family_refresh_wrapper_refreshes_all_devices(adapter_client, monkeypatch, fn_name, refresh_target):
     await _seed_devices(("d1", 4001), ("d2", 4002))
     refresh = AsyncMock()
-    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: MagicMock())
+    nso_client = _nso_client()
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: nso_client)
     monkeypatch.setattr(refresh_target, refresh)
 
     await getattr(sched, fn_name)()
 
     assert refresh.await_count == 2
     assert all(c.kwargs["refresh_source"] == "poll" for c in refresh.await_args_list)
+    # The resolved client must reach refresh as the 3rd positional arg (db, device, nso_client, ...).
+    assert all(c.args[2] is nso_client for c in refresh.await_args_list)
 
 
 @pytest.mark.anyio
@@ -235,18 +246,22 @@ async def test_intent_reconcile_deletes_existing_when_no_records(adapter_client,
 async def test_capability_refresh_probes_each_device(adapter_client, monkeypatch):
     await _seed_devices(("c1", 9001), ("c2", 9002))
     refresh = AsyncMock()
-    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: MagicMock())
+    nso_client = _nso_client()
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: nso_client)
     monkeypatch.setattr("nso_adapter.core.capability.refresh_device_capability", refresh)
 
     await sched._scheduled_capability_refresh()
     assert refresh.await_count == 2
+    # refresh_device_capability(db, nso_client, device_name, device) — assert the client lands.
+    assert all(c.args[1] is nso_client for c in refresh.await_args_list)
 
 
 @pytest.mark.anyio
 async def test_capability_refresh_isolates_per_device_failures(adapter_client, monkeypatch):
     await _seed_devices(("c1", 9101), ("c2", 9102))
     refresh = AsyncMock(side_effect=RuntimeError("probe failed"))
-    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: MagicMock())
+    nso_client = _nso_client()
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: nso_client)
     monkeypatch.setattr("nso_adapter.core.capability.refresh_device_capability", refresh)
 
     await sched._scheduled_capability_refresh()  # one failure must not abort the fleet

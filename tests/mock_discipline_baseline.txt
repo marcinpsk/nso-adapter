@@ -6,9 +6,6 @@
 # mock, or add an inline `# mock-ok: <reason>`. Regenerate after an intentional
 # change with:  python -m tests.mock_discipline --update-baseline
 
-core/test_scheduler_jobs.py::test_capability_refresh_isolates_per_device_failures	1
-core/test_scheduler_jobs.py::test_capability_refresh_probes_each_device	1
-core/test_scheduler_jobs.py::test_family_refresh_wrapper_refreshes_all_devices	1
 nso/test_client.py::_make_cfg	1
 nso/test_interface_attrs_client.py::_make_cfg	1
 nso/test_lag_topology_client.py::_make_cfg	1
