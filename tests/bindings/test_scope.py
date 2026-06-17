@@ -5,26 +5,26 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
+from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.bindings.netbox.scope import PluginScopeRecord, fetch_all_scope
 
 
 def _make_nb_client(base="http://netbox"):
-    client = MagicMock()
+    # NetboxClient is a real external HTTP boundary; bind the fake to its interface via
+    # spec= so a renamed/removed method can't be fabricated. fetch_all_scope reads ._base
+    # and calls ._client() — both real members.
+    client = MagicMock(spec=NetboxClient)
     client._base = base
     return client
 
 
-def _mock_httpx_response(json_data: dict | list, status: int = 200):
-    resp = MagicMock()
-    resp.status_code = status
-    resp.json.return_value = json_data
-    if status >= 400:
-        resp.raise_for_status.side_effect = Exception(f"HTTP {status}")
-    else:
-        resp.raise_for_status.return_value = None
-    return resp
+def _httpx_response(json_data: dict | list, status: int = 200) -> httpx.Response:
+    """A REAL httpx.Response (real status_code/.json()/.raise_for_status), not a mock —
+    so .raise_for_status() raises a genuine httpx.HTTPStatusError on 4xx/5xx."""
+    return httpx.Response(status, json=json_data, request=httpx.Request("GET", "http://netbox/scope"))
 
 
 def _mock_http_ctx(response):
@@ -49,7 +49,7 @@ async def test_fetch_all_scope_results_key():
         ],
     }
     client = _make_nb_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(data))
+    client._client.return_value = _mock_http_ctx(_httpx_response(data))
 
     records = await fetch_all_scope(client)
 
@@ -63,7 +63,7 @@ async def test_fetch_all_scope_bare_list():
     """Handles bare list response (no `results` key)."""
     data = [{"netbox_device_id": 42, "attributes": ["enabled"]}]
     client = _make_nb_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(data))
+    client._client.return_value = _mock_http_ctx(_httpx_response(data))
 
     records = await fetch_all_scope(client)
 
@@ -76,7 +76,7 @@ async def test_fetch_all_scope_device_as_int():
     """Handles `device` field as bare integer."""
     data = {"results": [{"device": 77, "managed_attributes": ["description"]}]}
     client = _make_nb_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(data))
+    client._client.return_value = _mock_http_ctx(_httpx_response(data))
 
     records = await fetch_all_scope(client)
 
@@ -88,7 +88,7 @@ async def test_fetch_all_scope_device_id_key():
     """Handles `device` as dict with only `id` key."""
     data = {"results": [{"device": {"id": 33}, "managed_attributes": []}]}
     client = _make_nb_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(data))
+    client._client.return_value = _mock_http_ctx(_httpx_response(data))
 
     records = await fetch_all_scope(client)
 
@@ -100,7 +100,7 @@ async def test_fetch_all_scope_skips_non_dict_items():
     """Non-dict items in the list are skipped."""
     data = {"results": ["garbage", {"device": 1, "managed_attributes": ["description"]}]}
     client = _make_nb_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(data))
+    client._client.return_value = _mock_http_ctx(_httpx_response(data))
 
     records = await fetch_all_scope(client)
 
@@ -112,7 +112,7 @@ async def test_fetch_all_scope_skips_missing_device_id():
     """Items with no resolvable device id are skipped."""
     data = {"results": [{"managed_attributes": ["description"]}]}  # no device field
     client = _make_nb_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response(data))
+    client._client.return_value = _mock_http_ctx(_httpx_response(data))
 
     records = await fetch_all_scope(client)
 
@@ -121,11 +121,11 @@ async def test_fetch_all_scope_skips_missing_device_id():
 
 @pytest.mark.asyncio
 async def test_fetch_all_scope_raises_on_http_error():
-    """HTTP error propagates to caller."""
+    """HTTP error propagates to caller (raise_for_status → httpx.HTTPStatusError)."""
     client = _make_nb_client()
-    client._client.return_value = _mock_http_ctx(_mock_httpx_response({}, status=500))
+    client._client.return_value = _mock_http_ctx(_httpx_response({}, status=500))
 
-    with pytest.raises(Exception):
+    with pytest.raises(httpx.HTTPStatusError):
         await fetch_all_scope(client)
 
 
@@ -137,7 +137,7 @@ async def test_fetch_all_scope_uses_pooled_client_directly():
     aborted the scope reconcile. fetch_all_scope must use the client directly."""
     data = {"results": [{"device": {"id": 10}, "managed_attributes": ["description"]}]}
     mock_http = AsyncMock()
-    mock_http.get.return_value = _mock_httpx_response(data)
+    mock_http.get.return_value = _httpx_response(data)
     # Mimic httpx: re-entering an already-opened client raises.
     mock_http.__aenter__.side_effect = RuntimeError("Cannot open a client instance more than once.")
     client = _make_nb_client()
