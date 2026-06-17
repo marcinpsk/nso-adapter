@@ -4,13 +4,12 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
-
 import pytest
 
 from nso_adapter.config import ApiConfig, AppConfig, EnvSettings, NetboxConfig, SecretsConfig, VaultConfig
 from nso_adapter.secrets import make_provider
 from nso_adapter.secrets.local import LocalSecretsProvider
+from nso_adapter.secrets.vault import VaultSecretsProvider
 
 
 def _app_config(provider: str, vault: VaultConfig | None = None) -> AppConfig:
@@ -43,37 +42,35 @@ def test_make_provider_vault_no_vault_block_raises():
 
 
 def test_make_provider_vault_with_config_returns_vault_provider():
-    """provider=vault with vault block → VaultSecretsProvider is returned."""
+    """provider=vault with vault block → a REAL VaultSecretsProvider with the mapped config.
+
+    __init__ is pure (lazy client, no Vault I/O until get()), so we build the real provider
+    and assert the config landed — covering both make_provider's kwarg mapping AND the
+    provider's own field assignment (e.g. an empty namespace collapses to None).
+    """
     vault_cfg = VaultConfig(address="https://vault.example.com", kv_mount="secret")
     cfg = _app_config("vault", vault=vault_cfg)
 
-    with patch("nso_adapter.secrets.VaultSecretsProvider") as MockVault:
-        mock_instance = MagicMock()
-        MockVault.return_value = mock_instance
+    result = make_provider(cfg, _env())
 
-        result = make_provider(cfg, _env())
-
-        MockVault.assert_called_once_with(
-            addr="https://vault.example.com",
-            role_id="role-id-abc",
-            secret_id="secret-id-abc",
-            mount="secret",
-            namespace="",
-            verify_ssl=True,
-        )
-        assert result is mock_instance
+    assert isinstance(result, VaultSecretsProvider)
+    assert result._addr == "https://vault.example.com"
+    assert result._role_id == "role-id-abc"
+    assert result._secret_id == "secret-id-abc"
+    assert result._mount == "secret"
+    assert result._namespace is None  # config namespace=None → "" → None in __init__
+    assert result._verify_ssl is True
 
 
 def test_make_provider_vault_namespace_passed_through():
-    """provider=vault with namespace → namespace forwarded to VaultSecretsProvider."""
+    """provider=vault with namespace → namespace forwarded into the real provider."""
     vault_cfg = VaultConfig(address="https://vault.example.com", kv_mount="secret", namespace="prod")
     cfg = _app_config("vault", vault=vault_cfg)
 
-    with patch("nso_adapter.secrets.VaultSecretsProvider") as MockVault:
-        MockVault.return_value = MagicMock()
-        make_provider(cfg, _env())
-        _, kwargs = MockVault.call_args
-        assert kwargs["namespace"] == "prod"
+    result = make_provider(cfg, _env())
+
+    assert isinstance(result, VaultSecretsProvider)
+    assert result._namespace == "prod"
 
 
 def test_make_provider_unknown_provider_raises():

@@ -10,5 +10,3 @@ nso/test_client.py::_make_cfg	1
 nso/test_interface_attrs_client.py::_make_cfg	1
 nso/test_lag_topology_client.py::_make_cfg	1
 nso/test_nso_client_methods.py::_make_cfg	1
-test_secrets.py::test_make_provider_vault_namespace_passed_through	1
-test_secrets.py::test_make_provider_vault_with_config_returns_vault_provider	1
