@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.bindings.netbox.mapper import _guess_netbox_type, resolve_or_create_interface
 from nso_adapter.domain.models import Interface as DomainInterface
 
@@ -129,7 +130,10 @@ class TestSplitUnit:
 
 
 def _make_nb_client():
-    client = MagicMock()
+    # NetboxClient is a real external HTTP boundary; bind the fake to its interface via
+    # spec= so a renamed/removed method can't be fabricated. (For end-to-end fidelity see
+    # _real_client below, which drives a real NetboxClient over httpx.MockTransport.)
+    client = MagicMock(spec=NetboxClient)
     client._base = "http://netbox"
     client.get_interface = AsyncMock()
     client.create_interface = AsyncMock()
@@ -327,7 +331,8 @@ async def test_base_creation_failure_creates_unit_parentless():
 
 
 def _make_bulk_client():
-    client = MagicMock()
+    # spec=NetboxClient bounds the boundary fake to the real client interface.
+    client = MagicMock(spec=NetboxClient)
     client.list_interfaces = AsyncMock(return_value=[])
     client.bulk_create_interfaces = AsyncMock(return_value=[])
     client.bulk_patch_interfaces = AsyncMock(return_value=[])
@@ -730,8 +735,6 @@ def _fake_netbox(existing: list[dict], *, first_id: int = 1000):
 
 def _real_client(handler):
     import httpx
-
-    from nso_adapter.bindings.netbox.client import NetboxClient
 
     client = NetboxClient(url="http://netbox.local", token="tok")
     client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
