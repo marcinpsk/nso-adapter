@@ -71,6 +71,17 @@ class SyncState(str, enum.Enum):
     drifted = "drifted"  # device has changed since intent was deployed
 
 
+class ActiveAddress(str, enum.Enum):
+    """Which management address NSO is currently dialing for a device.
+
+    Stored as a plain String column (the house style for incremental tables — only the
+    baseline uses native PG enums), with these constants for code-level clarity.
+    """
+
+    primary = "primary"  # NSO is on the device's primary management IP
+    oob = "oob"  # failed over to the out-of-band IP
+
+
 class Device(Base):
     __tablename__ = "devices"
 
@@ -97,6 +108,9 @@ class Device(Base):
     jobs: Mapped[list[Job]] = relationship("Job", back_populates="device", lazy="raise")
     settings: Mapped[DeviceSettings | None] = relationship(
         "DeviceSettings", back_populates="device", uselist=False, cascade="all, delete-orphan", lazy="raise"
+    )
+    failover: Mapped[DeviceFailover | None] = relationship(
+        "DeviceFailover", back_populates="device", uselist=False, cascade="all, delete-orphan", lazy="raise"
     )
     lag_interfaces: Mapped[list[LagInterface]] = relationship(
         "LagInterface", back_populates="device", cascade="all, delete-orphan", lazy="raise"
@@ -327,6 +341,48 @@ class DeviceSettings(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
 
     device: Mapped[Device] = relationship("Device", back_populates="settings")
+
+
+class DeviceFailover(Base):
+    """Management-IP failover state for a device — one row per device.
+
+    The primary/OOB IPs are plugin-sourced (from NetBox) and the rest is failover oper
+    state maintained by the scheduler probe loop. Kept separate from ``Device`` so the
+    plugin-sourced inputs and the failover bookkeeping stay obviously failover-scoped.
+    See the mgmt-IP-failover plan: NSO probes reachability, the adapter switches the
+    device address between primary and OOB with hysteresis.
+    """
+
+    __tablename__ = "device_failover"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    # Plugin-sourced management addresses (NetBox primary_ip / oob_ip, host only).
+    primary_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    oob_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Which address NSO is currently dialing (ActiveAddress value).
+    active_address: Mapped[str] = mapped_column(
+        String(16), default=ActiveAddress.primary.value, server_default=text("'primary'")
+    )
+    # Hysteresis counters (reset to 0 on any real state transition).
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    consecutive_successes: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    # Operator set the NSO address to something we don't manage → stop fighting them.
+    manual_override: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    # Proactive fallback-health: is the OOB path known-good while we're on primary? (None=unknown)
+    oob_healthy: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    oob_health_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_probe_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_probe_result: Mapped[str | None] = mapped_column(String(16), nullable=True)  # "ok" | "fail"
+    last_switch_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Staggering bookkeeping — per-address due times so the fleet isn't probed in lockstep.
+    next_primary_probe_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_oob_probe_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+
+    device: Mapped[Device] = relationship("Device", back_populates="failover")
 
 
 class InterfaceIntent(Base):

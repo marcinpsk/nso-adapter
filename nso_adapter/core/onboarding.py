@@ -14,9 +14,37 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.config import get_config
-from nso_adapter.store.models import DbInterface, Device, ManagedScope, MappingStatus
+from nso_adapter.store.models import ActiveAddress, DbInterface, Device, ManagedScope, MappingStatus
 
 logger = structlog.get_logger(__name__)
+
+
+async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str | None) -> tuple[str, dict | None]:
+    """Reachability-aware initial management address.
+
+    When failover is enabled and a fresh device's primary IP is unreachable but its OOB IP
+    works, point NSO at the OOB address so the device is configurable immediately (it fails
+    back to primary once the in-band address comes up). Returns ``(active_address, step|None)``.
+    """
+    cfg = get_config().scheduler
+    if not (cfg.enable_failover and oob_ip and oob_ip != primary):
+        return ActiveAddress.primary.value, None
+    from nso_adapter.nso.actions import probe_reachable
+
+    reachable, _detail, _elapsed = await probe_reachable(client, device_name, cfg.failover_probe_timeout)
+    if reachable:
+        return ActiveAddress.primary.value, {"step": "failover_bootstrap", "status": "primary"}
+    try:
+        await client.set_address(device_name, oob_ip)
+        await client.disconnect(device_name)
+    except Exception as exc:
+        return ActiveAddress.primary.value, {"step": "failover_bootstrap", "status": "failed", "detail": repr(exc)}
+    return ActiveAddress.oob.value, {
+        "step": "failover_bootstrap",
+        "status": "oob",
+        "detail": f"primary {primary} unreachable; using OOB {oob_ip}",
+    }
+
 
 # Some devices (observed on IOS-XR) reset the FIRST southbound connection right
 # after the node is created/unlocked; a single backed-off retry clears it.
@@ -98,6 +126,7 @@ async def provision_nso_device(
     port: int | None = None,
     admin_state: str = "unlocked",
     do_sync: bool = True,
+    oob_ip: str | None = None,
 ) -> dict:
     """Provision a device INTO NSO and bring it up, then map it in the adapter.
 
@@ -157,6 +186,13 @@ async def provision_nso_device(
         _step("admin_state", "failed", repr(exc))
         return _result(False)
 
+    # 2b. reachability-aware address: bootstrap a fresh device over OOB if primary is
+    #     unreachable (failover only). MUST precede fetch-host-keys so keys/sync use the
+    #     reachable address. Best-effort — falls back to primary on any probe error.
+    active_address, fo_step = await _bootstrap_address(client, device_name, address, oob_ip)
+    if fo_step:
+        steps.append(fo_step)
+
     # 3. fetch host keys (needs the device reachable AND unlocked) — blocking,
     #    with one backed-off retry for the first-connect reset.
     try:
@@ -185,8 +221,29 @@ async def provision_nso_device(
         except LookupError as exc:
             _step("adapter_mapping", "exists", repr(exc))
 
+    # 6. seed the failover row (IPs + bootstrapped address) so the failover loop can manage it.
+    fo_seed = await _seed_onboarding_failover(db, device_id, address, oob_ip, active_address)
+    if fo_seed:
+        steps.append(fo_seed)
+
     logger.info("device.provisioned", nso_device=device_name, instance=nso_instance, steps=steps)
     return _result(True, device_id)
+
+
+async def _seed_onboarding_failover(
+    db: AsyncSession, device_id: int | None, primary: str, oob_ip: str | None, active_address: str
+) -> dict | None:
+    """Seed the failover row at onboarding (when enabled). Returns a step dict, or None."""
+    if not (get_config().scheduler.enable_failover and device_id is not None and (oob_ip or primary)):
+        return None
+    from nso_adapter.core.failover import set_initial_failover_state
+
+    try:
+        await set_initial_failover_state(db, device_id, primary, oob_ip, active_address)
+        await db.commit()
+        return {"step": "failover_seed", "status": "ok", "detail": active_address}
+    except Exception as exc:
+        return {"step": "failover_seed", "status": "failed", "detail": repr(exc)}
 
 
 async def rekey_device(

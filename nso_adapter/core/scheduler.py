@@ -56,6 +56,7 @@ async def _scheduled_scope_reconcile() -> None:
     from sqlalchemy import select
 
     from nso_adapter.bindings.netbox.scope import fetch_all_scope
+    from nso_adapter.core.failover import upsert_failover_ips
     from nso_adapter.core.importer import get_netbox_client
     from nso_adapter.core.onboarding import offboard_device, set_scope
     from nso_adapter.store.db import get_session
@@ -89,6 +90,7 @@ async def _scheduled_scope_reconcile() -> None:
                 await offboard_device(db, device)
             else:
                 await set_scope(db, device, plugin_rec.attributes)
+                await upsert_failover_ips(db, device, plugin_rec.primary_ip, plugin_rec.oob_ip)
 
 
 async def _scheduled_intent_reconcile() -> None:
@@ -607,6 +609,43 @@ async def _scheduled_topology_interfaces_refresh() -> None:
                 logger.error("scheduler.topology_interfaces.error", device_id=device.id, error=repr(exc))
 
 
+async def _scheduled_failover_probe() -> None:
+    """Mgmt-IP failover base tick: probe due linked devices, switch primary↔OOB with hysteresis.
+
+    Iterates only devices that are NetBox-linked AND have a DeviceFailover row with a primary
+    IP (the IPs are plugin-sourced). Each device's switch is deferred when a sync/apply job
+    holds its one-per-device lane; the read-only probe is always safe.
+    """
+    from sqlalchemy import select
+
+    from nso_adapter.core.failover import run_failover_tick
+    from nso_adapter.core.importer import get_nso_client
+    from nso_adapter.core.jobs import get_active_job
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device, DeviceFailover
+
+    cfg = get_config().scheduler
+    async for db in get_session():
+        result = await db.execute(
+            select(Device, DeviceFailover)
+            .join(DeviceFailover, DeviceFailover.device_id == Device.id)
+            .where(Device.netbox_device_id.is_not(None), DeviceFailover.primary_ip.is_not(None))
+        )
+        for device, fo in result.all():
+            try:
+                nso_client = get_nso_client(device.nso_instance)
+            except RuntimeError:
+                logger.debug("scheduler.failover.skipped", device_id=device.id, reason="no_nso_client")
+                continue
+            try:
+                active_job = await get_active_job(device.id, db)
+                await run_failover_tick(device, fo, nso_client, cfg, job_active=active_job is not None)
+                await db.commit()
+            except Exception as exc:
+                await db.rollback()
+                logger.warning("scheduler.failover.error", device_id=device.id, error=repr(exc))
+
+
 class _JobSpec(NamedTuple):
     """One periodic job's registration rule.
 
@@ -698,6 +737,7 @@ _JOB_SPECS: tuple[_JobSpec, ...] = (
         "enable_topology_interface_sync",
         True,
     ),
+    _JobSpec(_scheduled_failover_probe, "failover_probe", "failover_base_tick", "enable_failover", True),
 )
 
 

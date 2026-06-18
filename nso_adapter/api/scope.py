@@ -44,6 +44,10 @@ class ScopeUpdate(BaseModel):
     attributes: list[str]
     auto_apply: bool = False
     sync_before_apply: bool = True
+    # Fast-path mgmt-IP failover inputs (NetBox primary_ip / oob_ip, host only). Optional so
+    # an older plugin that omits them doesn't clear stored IPs; an explicit null DOES clear.
+    primary_ip: str | None = None
+    oob_ip: str | None = None
 
 
 @router.put("/{device_id}/scope", dependencies=[Depends(verify_token)])
@@ -68,6 +72,12 @@ async def update_scope(device_id: int, body: ScopeUpdate, db: AsyncSession = Dep
     else:
         settings.auto_apply = body.auto_apply
         settings.sync_before_apply = body.sync_before_apply
+
+    # Only touch failover IPs when the caller actually sent them (an explicit null clears).
+    if body.model_fields_set & {"primary_ip", "oob_ip"}:
+        from nso_adapter.core.failover import upsert_failover_ips
+
+        await upsert_failover_ips(db, device, body.primary_ip, body.oob_ip)
     await db.commit()
 
     return _scope_out(device_id, attrs, settings)

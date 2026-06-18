@@ -91,6 +91,8 @@ def test_start_scheduler_registers_lag_refresh_job(monkeypatch: pytest.MonkeyPat
                 subinterface_poll_interval=300,
                 enable_topology_interface_sync=False,
                 topology_interface_poll_interval=120,
+                enable_failover=False,
+                failover_base_tick=1,
             )
         ),
     )
@@ -161,6 +163,8 @@ def test_start_scheduler_skips_lag_refresh_when_disabled(monkeypatch: pytest.Mon
                 subinterface_poll_interval=300,
                 enable_topology_interface_sync=False,
                 topology_interface_poll_interval=120,
+                enable_failover=False,
+                failover_base_tick=1,
             )
         ),
     )
@@ -217,6 +221,8 @@ def _full_scheduler_config(**overrides) -> SimpleNamespace:
         capability_refresh_interval=20,
         enable_topology_interface_sync=True,
         topology_interface_poll_interval=21,
+        enable_failover=True,
+        failover_base_tick=22,
     )
     base.update(overrides)
     return SimpleNamespace(scheduler=SimpleNamespace(**base))
@@ -254,6 +260,7 @@ def test_start_scheduler_registers_every_job_with_correct_interval(monkeypatch: 
         "route_policy_refresh": 19,
         "capability_refresh": 20,
         "topology_interfaces_refresh": 21,
+        "failover_probe": 22,
     }
     scheduler_module.stop_scheduler()
 

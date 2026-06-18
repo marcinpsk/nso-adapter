@@ -112,6 +112,18 @@ class SchedulerConfig(BaseModel):
     # Default off. (Follow-up: fold members-only LAG creation into the new path.)
     enable_topology_interface_sync: bool = False
     topology_interface_poll_interval: int = 120
+    # ── Management-IP failover (Phase 0: OFF by default; hardcoded fast test cadence).
+    # NSO probes reachability; the adapter switches the device address primary↔OOB with
+    # hysteresis. A frequent base tick processes only devices whose per-address probe is due.
+    # Prod cadence (set after the perf spike): primary ~15m, OOB ~6–12h.
+    enable_failover: bool = False
+    failover_base_tick: int = 1  # minutes — how often the loop wakes to process due probes
+    failover_primary_probe_interval: int = 2  # minutes — probe the primary IP
+    failover_oob_probe_interval: int = 15  # minutes — probe/verify the OOB fallback IP
+    failover_failure_threshold: int = 3  # consecutive failures before primary→OOB
+    failover_success_threshold: int = 5  # consecutive successes before OOB→primary
+    failover_probe_timeout: float = 10.0  # seconds — short, so an unreachable connect can't hang
+    failover_sync_from_after_switch: bool = True
 
 
 class AppConfig(BaseModel):

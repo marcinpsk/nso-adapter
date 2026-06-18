@@ -98,6 +98,7 @@ class DeviceProvision(BaseModel):
     port: int | None = None
     admin_state: str = "unlocked"
     sync: bool = True
+    oob_ip: str | None = None  # mgmt-IP failover fallback — bootstrap over OOB if primary is unreachable
 
 
 @router.post("/provision", dependencies=[Depends(verify_token)])
@@ -123,6 +124,7 @@ async def provision_device(body: DeviceProvision, db: AsyncSession = Depends(get
             port=body.port,
             admin_state=body.admin_state,
             do_sync=body.sync,
+            oob_ip=body.oob_ip,
         )
     except ValueError as exc:
         raise api_error(422, "validation_error", str(exc))

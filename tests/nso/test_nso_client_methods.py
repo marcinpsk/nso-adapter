@@ -439,3 +439,72 @@ async def test_list_ned_packages_raises_on_http_error(patch_client):
     with patch_client(client, 503, {"error": "unavailable"}):
         with pytest.raises(httpx.HTTPStatusError):
             await client.list_ned_packages()
+
+
+# ── Management-address failover: get_address / set_address / disconnect ───────
+
+
+def _capturing(nso_client: NsoClient, status: int = 204, body: dict | None = None) -> list[httpx.Request]:
+    """Patch _client() with a request-capturing MockTransport; returns the captured requests.
+
+    The real NsoClient builds the URL/method/body; only the socket is faked, so a regression
+    in request construction surfaces as a failed assertion rather than a fabricated call.
+    """
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(status, json=body if body is not None else {}, request=request)
+
+    transport = httpx.MockTransport(handler)
+    nso_client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url="http://nso:8080")
+    return captured
+
+
+async def test_get_address_returns_address():
+    client = _make_client()
+    _capturing(client, 200, {"tailf-ncs:device": [{"name": "rtr", "address": "10.0.0.1"}]})
+    assert await client.get_address("rtr") == "10.0.0.1"
+
+
+async def test_get_address_404_returns_none():
+    client = _make_client()
+    _capturing(client, 404)
+    assert await client.get_address("rtr") is None
+
+
+async def test_set_address_patches_only_address():
+    client = _make_client()
+    captured = _capturing(client, 204)
+    await client.set_address("rtr", "192.0.2.5")
+    assert len(captured) == 1
+    req = captured[0]
+    assert req.method == "PATCH"
+    assert "device=rtr" in str(req.url)
+    body = json.loads(req.content)
+    entry = body["tailf-ncs:device"][0]
+    assert entry == {"name": "rtr", "address": "192.0.2.5"}  # no port key when unset
+
+
+async def test_set_address_includes_port_when_given():
+    client = _make_client()
+    captured = _capturing(client, 204)
+    await client.set_address("rtr", "192.0.2.5", port=2022)
+    entry = json.loads(captured[0].content)["tailf-ncs:device"][0]
+    assert entry["port"] == 2022
+
+
+async def test_set_address_raises_on_http_error():
+    client = _make_client()
+    _capturing(client, 409, {"error": "conflict"})
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.set_address("rtr", "192.0.2.5")
+
+
+async def test_disconnect_posts_disconnect_action():
+    client = _make_client()
+    captured = _capturing(client, 200, {})
+    await client.disconnect("rtr")
+    req = captured[0]
+    assert req.method == "POST"
+    assert str(req.url).endswith("device=rtr/disconnect")

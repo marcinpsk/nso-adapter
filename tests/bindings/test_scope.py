@@ -147,3 +147,22 @@ async def test_fetch_all_scope_uses_pooled_client_directly():
 
     assert len(records) == 1
     mock_http.__aenter__.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fetch_all_scope_parses_failover_ips():
+    """primary_ip / oob_ip ride along for the mgmt-IP failover loop; absent → None."""
+    data = {
+        "results": [
+            {"device": {"id": 10}, "managed_attributes": [], "primary_ip": "10.0.0.1", "oob_ip": "192.0.2.5"},
+            {"device": {"id": 20}, "managed_attributes": []},  # no IPs → both None
+        ]
+    }
+    client = _make_nb_client()
+    client._client.return_value = _mock_http_ctx(_httpx_response(data))
+
+    records = await fetch_all_scope(client)
+
+    by_id = {r.netbox_device_id: r for r in records}
+    assert (by_id[10].primary_ip, by_id[10].oob_ip) == ("10.0.0.1", "192.0.2.5")
+    assert (by_id[20].primary_ip, by_id[20].oob_ip) == (None, None)

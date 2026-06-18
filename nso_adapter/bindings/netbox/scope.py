@@ -29,6 +29,10 @@ _PLUGIN_SCOPE_PATH = "/api/plugins/nso/device-management/"
 class PluginScopeRecord:
     netbox_device_id: int
     attributes: list[str]
+    # Plugin-sourced management addresses (NetBox primary_ip / oob_ip, host only) — feed
+    # the mgmt-IP failover loop. None when the device has no such IP in NetBox.
+    primary_ip: str | None = None
+    oob_ip: str | None = None
 
 
 async def fetch_all_scope(client: NetboxClient) -> list[PluginScopeRecord]:
@@ -62,7 +66,14 @@ async def fetch_all_scope(client: NetboxClient) -> list[PluginScopeRecord]:
             nb_id = item.get("netbox_device_id")
         attrs = item.get("managed_attributes") or item.get("attributes", [])
         if nb_id is not None:
-            records.append(PluginScopeRecord(netbox_device_id=int(nb_id), attributes=list(attrs)))
+            records.append(
+                PluginScopeRecord(
+                    netbox_device_id=int(nb_id),
+                    attributes=list(attrs),
+                    primary_ip=item.get("primary_ip"),
+                    oob_ip=item.get("oob_ip"),
+                )
+            )
 
     logger.debug("netbox.scope.fetched", count=len(records))
     return records

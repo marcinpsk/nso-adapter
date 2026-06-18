@@ -8,7 +8,13 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from nso_adapter.nso.actions import check_sync, compare_config, connect, sync_from
+from nso_adapter.nso.actions import (
+    check_sync,
+    compare_config,
+    connect,
+    probe_reachable,
+    sync_from,
+)
 from nso_adapter.nso.client import NsoClient
 
 
@@ -168,3 +174,58 @@ async def test_connect_empty_output():
     result = await connect(client, "rtr")
 
     assert result == {}
+
+
+# ── probe_reachable — reachability as NSO sees it ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_probe_reachable_connected():
+    """A connect that returns result=connected is reachable, with no detail."""
+    client = _make_nso_client()
+    _mock_http_ctx(client, _resp(200, {"tailf-ncs:output": {"result": "connected"}}))
+
+    reachable, detail, elapsed = await probe_reachable(client, "rtr")
+
+    assert reachable is True
+    assert detail == ""
+    assert isinstance(elapsed, float) and elapsed >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_probe_reachable_result_false_is_unreachable():
+    """The crux: NSO can answer HTTP 200 with {"result": false, "info": ...} for an
+    unreachable device. A raise-only classifier would call this reachable — it MUST be
+    treated as unreachable, and the info surfaced as the detail."""
+    client = _make_nso_client()
+    _mock_http_ctx(client, _resp(200, {"tailf-ncs:output": {"result": False, "info": "connection refused"}}))
+
+    reachable, detail, _ = await probe_reachable(client, "rtr")
+
+    assert reachable is False
+    assert "connection refused" in detail
+
+
+@pytest.mark.asyncio
+async def test_probe_reachable_http_error_is_unreachable():
+    """An RPC/HTTP error (here a 502) is also unreachable — connect's raise_for_status
+    raises httpx.HTTPStatusError, which probe_reachable swallows into (False, detail)."""
+    client = _make_nso_client()
+    _mock_http_ctx(client, _resp(502, {"tailf-ncs:output": {"result": "connected"}}))
+
+    reachable, detail, _ = await probe_reachable(client, "rtr")
+
+    assert reachable is False
+    assert detail  # carries the error repr
+
+
+@pytest.mark.asyncio
+async def test_probe_reachable_passes_probe_timeout():
+    """The short probe timeout is plumbed through connect → _client(timeout=...), so an
+    unreachable connect cannot block on the 120s action timeout."""
+    client = _make_nso_client()
+    _mock_http_ctx(client, _resp(200, {"tailf-ncs:output": {"result": "connected"}}))
+
+    await probe_reachable(client, "rtr", timeout=7.5)
+
+    assert client._client.call_args.kwargs["timeout"] == 7.5

@@ -509,3 +509,43 @@ class NsoClient:
         """Pull the device's running config into NSO's CDB. Returns the result bool."""
         out = await self._device_action(device_name, "sync-from")
         return bool(out.get("tailf-ncs:output", {}).get("result", False))
+
+    # ── Management-address failover (read/write/action) ───────────────────────
+
+    async def get_address(self, device_name: str) -> str | None:
+        """Return the device's configured management address, or None if absent.
+
+        Uses a ``fields=address`` filter so NSO returns only the address leaf (see
+        get_device_ned_id for why the unfiltered device query is unsafe).
+        """
+        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={device_name}"
+        async with self._client() as c:
+            resp = await c.get(url, params={"fields": "address"})
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            raw = resp.json().get("tailf-ncs:device", {})
+            dev = raw[0] if isinstance(raw, list) else raw
+            return dev.get("address")
+
+    async def set_address(self, device_name: str, address: str, port: int | None = None) -> None:
+        """PATCH the device's management address (and optional port).
+
+        Mirrors set_admin_state: a list-wrapped device node touching only the address
+        (+ port) leaf, leaving the rest of the device untouched.
+        """
+        entry: dict = {"name": device_name, "address": address}
+        if port is not None:
+            entry["port"] = port
+        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={device_name}"
+        async with self._client() as c:
+            resp = await c.patch(url, json={"tailf-ncs:device": [entry]})
+            resp.raise_for_status()
+
+    async def disconnect(self, device_name: str) -> dict:
+        """POST disconnect — drop NSO's cached management session for the device.
+
+        After changing a device's address, NSO keeps its live session pinned to the OLD
+        address; disconnecting forces NSO to dial the new address on the next connect.
+        """
+        return await self._device_action(device_name, "disconnect")

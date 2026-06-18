@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from sqlalchemy import select
 
+from nso_adapter.bindings.netbox.scope import PluginScopeRecord
 from nso_adapter.core import scheduler as sched
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.db import get_session
@@ -158,7 +159,7 @@ async def test_scope_reconcile_offboards_absent_and_sets_present(adapter_client,
     monkeypatch.setattr("nso_adapter.core.importer.get_netbox_client", lambda: object())
     monkeypatch.setattr(
         "nso_adapter.bindings.netbox.scope.fetch_all_scope",
-        AsyncMock(return_value=[SimpleNamespace(netbox_device_id=7001, attributes=["description"])]),
+        AsyncMock(return_value=[PluginScopeRecord(netbox_device_id=7001, attributes=["description"])]),
     )
     monkeypatch.setattr("nso_adapter.core.onboarding.set_scope", set_scope)
     monkeypatch.setattr("nso_adapter.core.onboarding.offboard_device", offboard)
