@@ -14,6 +14,7 @@ from nso_adapter.api.actions import router as actions_router
 from nso_adapter.api.bfd import router as bfd_router
 from nso_adapter.api.bgp import router as bgp_router
 from nso_adapter.api.capability import router as capability_router
+from nso_adapter.api.config import router as config_router
 from nso_adapter.api.devices import router as devices_router
 from nso_adapter.api.errors import ApiError, api_error_handler
 from nso_adapter.api.health import router as health_router
@@ -252,6 +253,7 @@ def create_app() -> FastAPI:
     app.include_router(ospf_router)
     app.include_router(redistribution_router)
     app.include_router(jobs_router)
+    app.include_router(config_router)
     return app
 
 

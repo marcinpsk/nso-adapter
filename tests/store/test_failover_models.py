@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from nso_adapter.store.models import ActiveAddress, Base, Device, DeviceFailover, MappingStatus
+from nso_adapter.store.models import ActiveAddress, Base, Device, DeviceFailover, FailoverConfig, MappingStatus
 
 
 @pytest.fixture
@@ -79,3 +79,49 @@ def test_device_failover_relationship(db):
     fo = db.execute(select(DeviceFailover).where(DeviceFailover.device_id == loaded.id)).scalars().one()
     assert fo.device_id == dev.id
     assert fo.oob_ip == "192.0.2.5"
+
+
+def test_failover_config_defaults(db):
+    """A fresh FailoverConfig row carries the spike-derived prod defaults (enabled, 15m/6h,
+    3/5 thresholds, 10s timeout, concurrency 8, 8 flips/tick, sync-from on)."""
+    cfg = FailoverConfig()
+    db.add(cfg)
+    db.commit()
+
+    row = db.execute(select(FailoverConfig)).scalars().one()
+    assert row.id == 1  # singleton
+    assert row.enabled is True
+    assert row.primary_probe_interval == 15
+    assert row.oob_probe_interval == 360
+    assert row.failure_threshold == 3
+    assert row.success_threshold == 5
+    assert row.probe_timeout == 10.0
+    assert row.probe_concurrency == 8
+    assert row.max_flips_per_tick == 8
+    assert row.sync_from_after_switch is True
+    assert row.updated_at is not None
+
+
+def test_failover_config_overrides_persist(db):
+    """Operator-set values round-trip (the plugin pushes these via the config endpoint)."""
+    db.add(
+        FailoverConfig(
+            enabled=False,
+            primary_probe_interval=5,
+            oob_probe_interval=720,
+            failure_threshold=2,
+            success_threshold=4,
+            probe_timeout=7.5,
+            probe_concurrency=12,
+            max_flips_per_tick=10,
+            sync_from_after_switch=False,
+        )
+    )
+    db.commit()
+    row = db.execute(select(FailoverConfig)).scalars().one()
+    assert row.enabled is False
+    assert (row.primary_probe_interval, row.oob_probe_interval) == (5, 720)
+    assert (row.failure_threshold, row.success_threshold) == (2, 4)
+    assert row.probe_timeout == 7.5
+    assert (row.probe_concurrency, row.max_flips_per_tick) == (12, 10)
+    assert row.sync_from_after_switch is False

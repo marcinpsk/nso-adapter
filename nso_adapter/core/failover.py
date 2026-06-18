@@ -14,6 +14,7 @@ them. ``upsert_failover_ips`` ingests the plugin-sourced IPs without touching fa
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -22,7 +23,7 @@ import structlog
 from sqlalchemy import select
 
 from nso_adapter.nso.actions import probe_reachable
-from nso_adapter.store.models import ActiveAddress, DeviceFailover
+from nso_adapter.store.models import ActiveAddress, DeviceFailover, FailoverConfig
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,6 +36,95 @@ logger = structlog.get_logger(__name__)
 
 _PRIMARY = ActiveAddress.primary.value
 _OOB = ActiveAddress.oob.value
+
+
+# ── Live failover config (DB FailoverConfig singleton, or static fallback) ─────
+
+
+@dataclass(frozen=True)
+class EffectiveFailoverConfig:
+    """The live failover knobs the tick reads.
+
+    The DB ``FailoverConfig`` row when present, else the static ``SchedulerConfig`` fallback.
+    Field names mirror ``SchedulerConfig``'s ``failover_*`` knobs on purpose, so the tick and
+    its helpers read either a ``SchedulerConfig`` (static / tests) or this (live) interchangeably.
+    """
+
+    enabled: bool
+    failover_primary_probe_interval: int
+    failover_oob_probe_interval: int
+    failover_failure_threshold: int
+    failover_success_threshold: int
+    failover_probe_timeout: float
+    failover_sync_from_after_switch: bool
+    probe_concurrency: int
+    max_flips_per_tick: int
+
+
+async def load_failover_config_row(db: AsyncSession) -> FailoverConfig | None:
+    """Return the one-row FailoverConfig singleton, or None if not yet written."""
+    return (await db.execute(select(FailoverConfig).limit(1))).scalar_one_or_none()
+
+
+async def get_effective_failover_config(db: AsyncSession, scheduler_cfg: SchedulerConfig) -> EffectiveFailoverConfig:
+    """Resolve the live failover config: the DB row if present, else SchedulerConfig fallbacks."""
+    row = await load_failover_config_row(db)
+    if row is None:
+        return EffectiveFailoverConfig(
+            enabled=True,  # the deployment-level enable_failover already gates job registration
+            failover_primary_probe_interval=scheduler_cfg.failover_primary_probe_interval,
+            failover_oob_probe_interval=scheduler_cfg.failover_oob_probe_interval,
+            failover_failure_threshold=scheduler_cfg.failover_failure_threshold,
+            failover_success_threshold=scheduler_cfg.failover_success_threshold,
+            failover_probe_timeout=scheduler_cfg.failover_probe_timeout,
+            failover_sync_from_after_switch=scheduler_cfg.failover_sync_from_after_switch,
+            probe_concurrency=scheduler_cfg.failover_probe_concurrency,
+            max_flips_per_tick=scheduler_cfg.failover_max_flips_per_tick,
+        )
+    return EffectiveFailoverConfig(
+        enabled=row.enabled,
+        failover_primary_probe_interval=row.primary_probe_interval,
+        failover_oob_probe_interval=row.oob_probe_interval,
+        failover_failure_threshold=row.failure_threshold,
+        failover_success_threshold=row.success_threshold,
+        failover_probe_timeout=row.probe_timeout,
+        failover_sync_from_after_switch=row.sync_from_after_switch,
+        probe_concurrency=row.probe_concurrency,
+        max_flips_per_tick=row.max_flips_per_tick,
+    )
+
+
+async def upsert_failover_config(db: AsyncSession, **fields) -> FailoverConfig:
+    """Create-or-update the FailoverConfig singleton; sets only the non-None fields passed.
+
+    Field names are the FailoverConfig columns (``primary_probe_interval``, ``enabled``, …).
+    Caller commits. Returns the row.
+    """
+    row = await load_failover_config_row(db)
+    if row is None:
+        row = FailoverConfig()
+        db.add(row)
+    for key, value in fields.items():
+        if value is not None:
+            setattr(row, key, value)
+    return row
+
+
+class FlipBudget:
+    """A per-tick allowance of disruptive flips, shared across concurrently-probed devices.
+
+    A flip = set_address + connect. Cooperative single-threaded (asyncio) so ``take`` needs no
+    lock. A flip-probe that can't get budget is skipped and left due, retried on the next tick.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.remaining = limit
+
+    def take(self) -> bool:
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
 
 
 def _utcnow() -> datetime:
@@ -86,6 +176,22 @@ def step_failback(reachable: bool, successes: int, threshold: int) -> CounterSte
 
 def _due(next_at: datetime | None, now: datetime) -> bool:
     return next_at is None or next_at <= now
+
+
+def _take_flip(flip_budget: FlipBudget | None) -> bool:
+    """Return True when a disruptive flip is allowed — no budget (unlimited) or budget remains."""
+    return flip_budget is None or flip_budget.take()
+
+
+def _next_due(now: datetime, interval_minutes: int, jitter_fraction: float) -> datetime:
+    """When the next probe of this address is due: interval + a random forward jitter.
+
+    The jitter (a fraction of the interval) de-aligns the fleet so devices don't all come due
+    on the same tick. ``jitter_fraction=0`` (the default for direct/unit callers) is exact.
+    """
+    base = interval_minutes * 60.0
+    jitter = random.uniform(0, base * jitter_fraction) if jitter_fraction > 0 else 0.0
+    return now + timedelta(seconds=base + jitter)
 
 
 async def _safe_disconnect(client: NsoClient, name: str) -> None:
@@ -164,7 +270,7 @@ async def _commit_failback(
 # ── Per-address probe handlers ────────────────────────────────────────────────
 
 
-async def _probe_primary(
+async def _active_primary_probe(
     client: NsoClient,
     fo: DeviceFailover,
     name: str,
@@ -172,33 +278,57 @@ async def _probe_primary(
     now: datetime,
     has_oob: bool,
     job_active: bool,
-) -> None:
-    """Probe the primary IP and drive the failover/failback decision."""
-    if fo.active_address == _PRIMARY:
-        # Cheap read-only liveness of the active primary.
-        reachable, detail, elapsed = await probe_reachable(client, name, cfg.failover_probe_timeout)
-        logger.debug("failover.probe", device=name, target=_PRIMARY, active=True, reachable=reachable, elapsed=elapsed)
-        _record_probe(fo, now, reachable)
-        step = step_failover(reachable, fo.consecutive_failures, has_oob, cfg.failover_failure_threshold)
-        fo.consecutive_failures, fo.consecutive_successes = step.failures, step.successes
-        if step.act:
-            if job_active or await _is_manual_override(client, fo, name):
-                # Don't switch mid-apply or over an operator's manual address — re-arm and retry.
-                fo.manual_override = not job_active
-                fo.consecutive_failures = cfg.failover_failure_threshold
-                return
-            fo.manual_override = False
-            await _switch_to_oob(client, fo, name, cfg, now)
-        return
+    flip_budget: FlipBudget | None,
+) -> bool:
+    """Cheap liveness of the active primary; switch to OOB when failures cross the threshold.
 
-    # On OOB → failback flip-probe of primary. Mutates the address, so defer under a job.
+    Returns True (probe ran → advance due-time) unless a needed switch is flip-budget-capped,
+    in which case it returns False so the device stays due and retries the switch next tick.
+    """
+    reachable, _detail, elapsed = await probe_reachable(client, name, cfg.failover_probe_timeout)
+    logger.debug("failover.probe", device=name, target=_PRIMARY, active=True, reachable=reachable, elapsed=elapsed)
+    _record_probe(fo, now, reachable)
+    step = step_failover(reachable, fo.consecutive_failures, has_oob, cfg.failover_failure_threshold)
+    fo.consecutive_failures, fo.consecutive_successes = step.failures, step.successes
+    if not step.act:
+        return True
+    if job_active or await _is_manual_override(client, fo, name):
+        # Don't switch mid-apply or over an operator's manual address — re-arm, retry next interval.
+        fo.manual_override = not job_active
+        fo.consecutive_failures = cfg.failover_failure_threshold
+        return True
+    if not _take_flip(flip_budget):
+        # Over the per-tick flip cap — keep armed and retry the switch promptly (next tick).
+        fo.consecutive_failures = cfg.failover_failure_threshold
+        return False
+    fo.manual_override = False
+    await _switch_to_oob(client, fo, name, cfg, now)
+    return True
+
+
+async def _failback_flip_probe(
+    client: NsoClient,
+    fo: DeviceFailover,
+    name: str,
+    cfg: SchedulerConfig,
+    now: datetime,
+    job_active: bool,
+    flip_budget: FlipBudget | None,
+) -> bool:
+    """On OOB → flip to primary and probe; fail back after the success threshold, else revert.
+
+    A disruptive flip: deferred under a job, and skipped (return False, retry next tick) when
+    the per-tick flip budget is exhausted.
+    """
     if job_active:
-        return
+        return True
     if await _is_manual_override(client, fo, name):
         fo.manual_override = True
-        return
+        return True
+    if not _take_flip(flip_budget):
+        return False
     fo.manual_override = False
-    reachable, detail, elapsed = await _flip_and_probe(client, name, fo.primary_ip, cfg.failover_probe_timeout)
+    reachable, _detail, elapsed = await _flip_and_probe(client, name, fo.primary_ip, cfg.failover_probe_timeout)
     logger.debug("failover.flip_probe", device=name, target=_PRIMARY, reachable=reachable, elapsed=elapsed)
     _record_probe(fo, now, reachable)
     step = step_failback(reachable, fo.consecutive_successes, cfg.failover_success_threshold)
@@ -208,11 +338,34 @@ async def _probe_primary(
     else:
         # Threshold not met (or primary still down) → revert to OOB to keep the device reachable.
         await _set_address(client, name, fo.oob_ip)
+    return True
+
+
+async def _probe_primary(
+    client: NsoClient,
+    fo: DeviceFailover,
+    name: str,
+    cfg: SchedulerConfig,
+    now: datetime,
+    has_oob: bool,
+    job_active: bool,
+    flip_budget: FlipBudget | None,
+) -> bool:
+    """Probe the primary IP and drive the failover/failback decision. Returns whether it ran."""
+    if fo.active_address == _PRIMARY:
+        return await _active_primary_probe(client, fo, name, cfg, now, has_oob, job_active, flip_budget)
+    return await _failback_flip_probe(client, fo, name, cfg, now, job_active, flip_budget)
 
 
 async def _probe_oob(
-    client: NsoClient, fo: DeviceFailover, name: str, cfg: SchedulerConfig, now: datetime, job_active: bool
-) -> None:
+    client: NsoClient,
+    fo: DeviceFailover,
+    name: str,
+    cfg: SchedulerConfig,
+    now: datetime,
+    job_active: bool,
+    flip_budget: FlipBudget | None,
+) -> bool:
     """Probe the OOB IP — liveness when on OOB, proactive fallback-health flip when on primary."""
     if fo.active_address == _OOB:
         # Cheap liveness of the active OOB (surfaces the both-down case; no state change).
@@ -221,14 +374,16 @@ async def _probe_oob(
         _record_probe(fo, now, reachable)
         fo.oob_healthy = reachable
         fo.oob_health_checked_at = now
-        return
+        return True
 
-    # On primary → proactive fallback-health flip-probe of OOB. Mutates address; defer under a job.
+    # On primary → proactive fallback-health flip-probe of OOB. Mutates address; defer/cap.
     if job_active:
-        return
+        return True
     if await _is_manual_override(client, fo, name):
         fo.manual_override = True
-        return
+        return True
+    if not _take_flip(flip_budget):
+        return False
     fo.manual_override = False
     reachable, _detail, elapsed = await _flip_and_probe(client, name, fo.oob_ip, cfg.failover_probe_timeout)
     logger.debug("failover.flip_probe", device=name, target=_OOB, reachable=reachable, elapsed=elapsed)
@@ -236,6 +391,7 @@ async def _probe_oob(
     fo.oob_health_checked_at = now
     # Always flip back to primary — this was only a fallback-health check.
     await _set_address(client, name, fo.primary_ip)
+    return True
 
 
 # ── Tick orchestrator ─────────────────────────────────────────────────────────
@@ -249,11 +405,15 @@ async def run_failover_tick(
     *,
     now: datetime | None = None,
     job_active: bool = False,
+    flip_budget: FlipBudget | None = None,
+    jitter_fraction: float = 0.0,
 ) -> None:
     """Process one failover tick for *device*, mutating *fo* in place (caller commits).
 
     Runs only the per-address probes that are *due*; switches/flips are deferred when a
-    sync/apply job holds the device's one-per-device lane (*job_active*).
+    sync/apply job holds the device's one-per-device lane (*job_active*) or when the per-tick
+    *flip_budget* is exhausted. A budget-skipped flip leaves the address due (retry next tick);
+    a probe that ran advances the due-time by the interval plus *jitter_fraction* forward jitter.
     """
     now = now or _utcnow()
     name = device.nso_device_name
@@ -267,12 +427,14 @@ async def run_failover_tick(
     has_oob = bool(fo.oob_ip) and fo.oob_ip != fo.primary_ip
 
     if _due(fo.next_primary_probe_at, now):
-        await _probe_primary(client, fo, name, cfg, now, has_oob, job_active)
-        fo.next_primary_probe_at = now + timedelta(minutes=cfg.failover_primary_probe_interval)
+        ran = await _probe_primary(client, fo, name, cfg, now, has_oob, job_active, flip_budget)
+        if ran:
+            fo.next_primary_probe_at = _next_due(now, cfg.failover_primary_probe_interval, jitter_fraction)
 
     if has_oob and _due(fo.next_oob_probe_at, now):
-        await _probe_oob(client, fo, name, cfg, now, job_active)
-        fo.next_oob_probe_at = now + timedelta(minutes=cfg.failover_oob_probe_interval)
+        ran = await _probe_oob(client, fo, name, cfg, now, job_active, flip_budget)
+        if ran:
+            fo.next_oob_probe_at = _next_due(now, cfg.failover_oob_probe_interval, jitter_fraction)
 
 
 # ── IP ingestion (plugin → adapter) ───────────────────────────────────────────

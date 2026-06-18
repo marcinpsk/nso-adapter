@@ -15,7 +15,7 @@ import pytest
 
 import nso_adapter.core.failover as failover
 from nso_adapter.config import SchedulerConfig
-from nso_adapter.core.failover import run_failover_tick, step_failback, step_failover
+from nso_adapter.core.failover import FlipBudget, _next_due, run_failover_tick, step_failback, step_failover
 from nso_adapter.store.models import ActiveAddress, Device, DeviceFailover
 
 _BASE = datetime(2026, 6, 18, 12, 0, 0)
@@ -376,3 +376,89 @@ async def test_bootstrap_primary_unreachable_switches_to_oob(monkeypatch):
     assert ("set_address", "192.0.2.5") in client.calls
     assert client.address == "192.0.2.5"
     assert step["status"] == "oob"
+
+
+# ── Phase-1: flip budget + jitter (staggering) ────────────────────────────────
+
+
+def test_flip_budget_take():
+    """FlipBudget hands out exactly *limit* permits then refuses; 0 refuses immediately."""
+    b = FlipBudget(2)
+    assert (b.take(), b.take(), b.take()) == (True, True, False)
+    assert FlipBudget(0).take() is False
+
+
+def test_next_due_no_jitter_is_exact():
+    assert _next_due(_BASE, 15, 0.0) == _BASE + timedelta(minutes=15)
+
+
+def test_next_due_jitter_within_bounds():
+    """Jittered due-time lands in [now+interval, now+interval*(1+fraction)]."""
+    lo = _BASE + timedelta(minutes=10)
+    hi = _BASE + timedelta(minutes=10, seconds=10 * 60 * 0.2)
+    for _ in range(50):
+        assert lo <= _next_due(_BASE, 10, 0.2) <= hi
+
+
+async def test_flip_budget_blocks_switch_and_leaves_due(monkeypatch):
+    """An exhausted flip budget defers the primary→OOB switch and keeps the device due."""
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=False)
+    dev = _device()
+    fo = _failover_row(consecutive_failures=cfg.failover_failure_threshold - 1)
+    fo.next_primary_probe_at = None  # due
+    client = FakeNso()
+
+    await run_failover_tick(dev, fo, client, cfg, now=_BASE, flip_budget=FlipBudget(0))
+
+    assert fo.active_address == ActiveAddress.primary.value  # NOT switched
+    assert all(c[0] != "set_address" for c in client.calls)
+    assert fo.consecutive_failures == cfg.failover_failure_threshold  # re-armed
+    assert fo.next_primary_probe_at is None  # left due → retry next tick (prompt failover)
+
+
+async def test_flip_budget_allows_switch_when_available(monkeypatch):
+    """With budget, the switch proceeds and the budget is consumed."""
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=False)
+    dev = _device()
+    fo = _failover_row(consecutive_failures=cfg.failover_failure_threshold - 1)
+    fo.next_primary_probe_at = None
+    budget = FlipBudget(1)
+    client = FakeNso()
+
+    await run_failover_tick(dev, fo, client, cfg, now=_BASE, flip_budget=budget)
+
+    assert fo.active_address == ActiveAddress.oob.value  # switched
+    assert budget.remaining == 0  # consumed
+    assert fo.next_primary_probe_at is not None  # advanced (probe ran)
+
+
+async def test_flip_budget_blocks_failback_probe_and_leaves_due(monkeypatch):
+    """An exhausted budget skips the disruptive failback flip-probe and keeps it due."""
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=True)  # primary would be reachable
+    dev = _device()
+    fo = _failover_row(active=ActiveAddress.oob.value)
+    fo.next_primary_probe_at = None
+    client = FakeNso(address="192.0.2.5")
+
+    await run_failover_tick(dev, fo, client, cfg, now=_BASE, flip_budget=FlipBudget(0))
+
+    assert fo.active_address == ActiveAddress.oob.value  # no failback
+    assert client.calls == []  # never flipped
+    assert fo.next_primary_probe_at is None  # left due
+
+
+async def test_jitter_advances_primary_due_within_window(monkeypatch):
+    """A probe that runs advances the due-time by interval + bounded forward jitter."""
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=True)
+    dev, fo, client = _device(), _failover_row(), FakeNso()
+    fo.next_primary_probe_at = None
+
+    await run_failover_tick(dev, fo, client, cfg, now=_BASE, jitter_fraction=0.5)
+
+    lo = _BASE + timedelta(minutes=cfg.failover_primary_probe_interval)
+    hi = lo + timedelta(seconds=cfg.failover_primary_probe_interval * 60 * 0.5)
+    assert lo <= fo.next_primary_probe_at <= hi

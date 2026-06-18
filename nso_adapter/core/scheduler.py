@@ -609,12 +609,53 @@ async def _scheduled_topology_interfaces_refresh() -> None:
                 logger.error("scheduler.topology_interfaces.error", device_id=device.id, error=repr(exc))
 
 
-async def _scheduled_failover_probe() -> None:
-    """Mgmt-IP failover base tick: probe due linked devices, switch primary↔OOB with hysteresis.
+# Forward jitter applied to each probe's next due-time (fraction of the interval) so the fleet
+# de-aligns instead of probing in lockstep. See the perf-spike writeup.
+_FAILOVER_JITTER_FRACTION = 0.15
 
-    Iterates only devices that are NetBox-linked AND have a DeviceFailover row with a primary
-    IP (the IPs are plugin-sourced). Each device's switch is deferred when a sync/apply job
-    holds its one-per-device lane; the read-only probe is always safe.
+
+def _utcnow_naive():
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+async def _due_failover_device_ids(db, now) -> list[int]:
+    """Device IDs whose primary- or OOB-probe is due (linked + plugin-sourced primary IP).
+
+    Pre-filtering in SQL keeps the tick from spinning up a session/task per not-due device.
+    """
+    from sqlalchemy import and_, or_, select
+
+    from nso_adapter.store.models import Device, DeviceFailover
+
+    stmt = (
+        select(Device.id)
+        .join(DeviceFailover, DeviceFailover.device_id == Device.id)
+        .where(
+            Device.netbox_device_id.is_not(None),
+            DeviceFailover.primary_ip.is_not(None),
+            or_(
+                DeviceFailover.next_primary_probe_at.is_(None),
+                DeviceFailover.next_primary_probe_at <= now,
+                and_(
+                    DeviceFailover.oob_ip.is_not(None),
+                    or_(
+                        DeviceFailover.next_oob_probe_at.is_(None),
+                        DeviceFailover.next_oob_probe_at <= now,
+                    ),
+                ),
+            ),
+        )
+    )
+    return list((await db.execute(stmt)).scalars().all())
+
+
+async def _probe_one_failover_device(device_id: int, eff, now, flip_budget, sem) -> None:
+    """Probe one device on its own DB session (safe under concurrency), bounded by *sem*.
+
+    Each task owns its AsyncSession + commit so the gather'd probes don't share session state;
+    the shared *flip_budget* caps disruptive flips across the whole tick.
     """
     from sqlalchemy import select
 
@@ -624,26 +665,70 @@ async def _scheduled_failover_probe() -> None:
     from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device, DeviceFailover
 
-    cfg = get_config().scheduler
-    async for db in get_session():
-        result = await db.execute(
-            select(Device, DeviceFailover)
-            .join(DeviceFailover, DeviceFailover.device_id == Device.id)
-            .where(Device.netbox_device_id.is_not(None), DeviceFailover.primary_ip.is_not(None))
-        )
-        for device, fo in result.all():
+    async with sem:
+        async for db in get_session():
+            pair = (
+                await db.execute(
+                    select(Device, DeviceFailover)
+                    .join(DeviceFailover, DeviceFailover.device_id == Device.id)
+                    .where(Device.id == device_id)
+                )
+            ).first()
+            if pair is None:
+                return
+            device, fo = pair
             try:
                 nso_client = get_nso_client(device.nso_instance)
             except RuntimeError:
-                logger.debug("scheduler.failover.skipped", device_id=device.id, reason="no_nso_client")
-                continue
+                logger.debug("scheduler.failover.skipped", device_id=device_id, reason="no_nso_client")
+                return
             try:
                 active_job = await get_active_job(device.id, db)
-                await run_failover_tick(device, fo, nso_client, cfg, job_active=active_job is not None)
+                await run_failover_tick(
+                    device,
+                    fo,
+                    nso_client,
+                    eff,
+                    now=now,
+                    job_active=active_job is not None,
+                    flip_budget=flip_budget,
+                    jitter_fraction=_FAILOVER_JITTER_FRACTION,
+                )
                 await db.commit()
             except Exception as exc:
                 await db.rollback()
-                logger.warning("scheduler.failover.error", device_id=device.id, error=repr(exc))
+                logger.warning("scheduler.failover.error", device_id=device_id, error=repr(exc))
+            return
+
+
+async def _scheduled_failover_probe() -> None:
+    """Mgmt-IP failover base tick: probe due linked devices, switch primary↔OOB with hysteresis.
+
+    Reads the live FailoverConfig each run (so a plugin settings change applies on the next tick
+    without rescheduling APScheduler). Probes due devices CONCURRENTLY under a semaphore — the
+    perf-spike load lever, since an unreachable connect blocks ~probe_timeout — and caps disruptive
+    flips per tick via a shared budget. ``enabled=False`` makes the tick a no-op (live off-switch).
+    """
+    import asyncio
+
+    from nso_adapter.core.failover import FlipBudget, get_effective_failover_config
+    from nso_adapter.store.db import get_session
+
+    cfg = get_config().scheduler
+    now = _utcnow_naive()
+    eff = None
+    due_ids: list[int] = []
+    async for db in get_session():
+        eff = await get_effective_failover_config(db, cfg)
+        if eff.enabled:
+            due_ids = await _due_failover_device_ids(db, now)
+        break
+    if eff is None or not eff.enabled or not due_ids:
+        return
+
+    flip_budget = FlipBudget(eff.max_flips_per_tick)
+    sem = asyncio.Semaphore(eff.probe_concurrency)
+    await asyncio.gather(*(_probe_one_failover_device(did, eff, now, flip_budget, sem) for did in due_ids))
 
 
 class _JobSpec(NamedTuple):

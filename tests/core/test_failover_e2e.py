@@ -16,7 +16,7 @@ from sqlalchemy import select
 from nso_adapter.core import scheduler as sched
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.db import get_session
-from nso_adapter.store.models import ActiveAddress, Device, DeviceFailover
+from nso_adapter.store.models import ActiveAddress, Device, DeviceFailover, FailoverConfig
 
 
 class _NsoSim:
@@ -30,6 +30,7 @@ class _NsoSim:
     def __init__(self, address: str = "10.0.0.1"):
         self.address = address
         self.reachable_addrs: set[str] = set()
+        self.always_reachable = False  # address-agnostic "always up" — for multi-device tests
         self.patches: list[str] = []
         self.connects = 0
 
@@ -37,7 +38,7 @@ class _NsoSim:
         url, method = str(request.url), request.method
         if method == "POST" and url.endswith("/connect"):
             self.connects += 1
-            if self.address in self.reachable_addrs:
+            if self.always_reachable or self.address in self.reachable_addrs:
                 out = {"result": "connected"}
             else:
                 out = {"result": False, "info": "no route to host"}
@@ -186,3 +187,140 @@ async def test_upsert_skips_empty_row_creation(adapter_client):
         row = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == dev.id))).scalar_one_or_none()
         assert row is None  # no empty row created
         break
+
+
+async def _seed_config(**kw) -> None:
+    """Insert the FailoverConfig singleton with overrides (the plugin would PUT these)."""
+    async for db in get_session():
+        db.add(FailoverConfig(**kw))
+        await db.commit()
+        return
+    raise AssertionError("no session")
+
+
+async def _seed_extra(name: str, netbox_id: int, primary: str, oob: str, active: str = "primary") -> int:
+    async for db in get_session():
+        dev = Device(nso_instance="nso-dev", nso_device_name=name, netbox_device_id=netbox_id)
+        db.add(dev)
+        await db.flush()
+        db.add(DeviceFailover(device_id=dev.id, primary_ip=primary, oob_ip=oob, active_address=active))
+        await db.commit()
+        return dev.id
+    raise AssertionError("no session")
+
+
+async def _load(device_id: int) -> DeviceFailover:
+    async for db in get_session():
+        row = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device_id))).scalar_one()
+        db.expunge(row)
+        return row
+    raise AssertionError("no session")
+
+
+async def _arm(device_id: int, *, primary_due: bool = True, oob_due: bool = False) -> None:
+    """Set each address's due-time precisely (None = due now, far-future = not due)."""
+    from datetime import datetime
+
+    far = datetime(2030, 1, 1)
+    async for db in get_session():
+        row = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device_id))).scalar_one()
+        row.next_primary_probe_at = None if primary_due else far
+        row.next_oob_probe_at = None if oob_due else far
+        await db.commit()
+        return
+    raise AssertionError("no session")
+
+
+async def test_effective_config_falls_back_then_reads_db(adapter_client):
+    """get_effective_failover_config returns SchedulerConfig fallbacks with no row, the row after."""
+    from nso_adapter.config import get_config
+    from nso_adapter.core.failover import get_effective_failover_config
+
+    async for db in get_session():
+        eff = await get_effective_failover_config(db, get_config().scheduler)
+        assert eff.enabled is True
+        assert eff.failover_failure_threshold == get_config().scheduler.failover_failure_threshold
+        break
+
+    await _seed_config(enabled=False, failure_threshold=2, probe_concurrency=3, max_flips_per_tick=1)
+    async for db in get_session():
+        eff = await get_effective_failover_config(db, get_config().scheduler)
+        assert eff.enabled is False
+        assert eff.failover_failure_threshold == 2
+        assert eff.probe_concurrency == 3
+        assert eff.max_flips_per_tick == 1
+        break
+
+
+async def test_disabled_config_makes_tick_a_noop(adapter_client, monkeypatch):
+    """FailoverConfig.enabled=False → the base tick probes nothing (live off-switch)."""
+    sim = _NsoSim(address="10.0.0.1")  # primary unreachable (empty reachable_addrs)
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    device_id = await _seed()
+    await _seed_config(enabled=False)
+
+    for _ in range(5):
+        await _arm_and_load(device_id)
+        await sched._scheduled_failover_probe()
+
+    assert sim.connects == 0  # never probed
+    assert (await _load(device_id)).active_address == ActiveAddress.primary.value
+
+
+async def test_live_db_threshold_drives_failover(adapter_client, monkeypatch):
+    """A DB failure_threshold=2 fails the device over after 2 ticks (not the static default 3)."""
+    sim = _NsoSim(address="10.0.0.1")
+    sim.reachable_addrs = {"192.0.2.5"}  # only OOB works
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    device_id = await _seed()
+    await _seed_config(failure_threshold=2)
+
+    for _ in range(2):
+        await _arm_and_load(device_id)
+        await sched._scheduled_failover_probe()
+
+    assert (await _load(device_id)).active_address == ActiveAddress.oob.value  # switched at 2, per DB
+
+
+async def test_concurrency_probes_all_due_devices(adapter_client, monkeypatch):
+    """One tick probes every due device (each on its own session, gathered under the semaphore)."""
+    sim = _NsoSim()
+    sim.always_reachable = True  # address-agnostic up, so the shared sim serves all devices
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    ids = [
+        await _seed_extra("ra1", 42, "10.0.0.1", "192.0.2.5"),
+        await _seed_extra("rb1", 43, "10.0.1.1", "192.0.2.6"),
+        await _seed_extra("rc1", 44, "10.0.2.1", "192.0.2.7"),
+    ]
+    for did in ids:
+        await _arm(did, primary_due=True, oob_due=False)  # only the cheap primary liveness is due
+
+    await sched._scheduled_failover_probe()
+
+    assert sim.connects == 3  # all three probed in the one tick (one cheap connect each)
+    for did in ids:
+        assert (await _load(did)).next_primary_probe_at is not None  # each advanced (staggered)
+
+
+async def test_flip_budget_caps_flips_across_tick(adapter_client, monkeypatch):
+    """max_flips_per_tick=1 lets only one of two OOB devices run its (disruptive) failback flip."""
+    sim = _NsoSim()
+    sim.always_reachable = True  # primary "recovered" for both
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    a_id = await _seed_extra("fa1", 51, "10.0.0.1", "192.0.2.5", active="oob")
+    b_id = await _seed_extra("fb1", 52, "10.0.0.2", "192.0.2.6", active="oob")
+    # success_threshold=1 → a single good flip-probe commits failback; budget=1 → only one flips.
+    await _seed_config(success_threshold=1, max_flips_per_tick=1)
+    # Only the failback (primary) probe is due — keep the OOB liveness out so the count is exact.
+    await _arm(a_id, primary_due=True, oob_due=False)
+    await _arm(b_id, primary_due=True, oob_due=False)
+
+    await sched._scheduled_failover_probe()
+
+    actives = sorted([(await _load(a_id)).active_address, (await _load(b_id)).active_address])
+    assert actives == [ActiveAddress.oob.value, ActiveAddress.primary.value]  # exactly one failed back
+    assert sim.connects == 1  # the budget-skipped device never even probed

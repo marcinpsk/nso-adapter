@@ -16,6 +16,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -383,6 +384,37 @@ class DeviceFailover(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
 
     device: Mapped[Device] = relationship("Device", back_populates="failover")
+
+
+class FailoverConfig(Base):
+    """Global mgmt-IP failover tuning — a one-row singleton (id=1), operator-editable.
+
+    The plugin's ``NSOFailoverSettings`` singleton pushes these here; the base-tick reads
+    them **live** each run, so a change takes effect on the next tick without rescheduling
+    APScheduler (the per-device ``next_*_probe_at`` due-times make "reschedule" a config read).
+    When no row exists, the scheduler falls back to the static ``SchedulerConfig`` defaults.
+    Defaults below are the prod values confirmed by the perf spike (see docs/failover-perf-spike.md):
+    probe concurrently (the load lever, since an unreachable connect blocks ~probe_timeout).
+    """
+
+    __tablename__ = "failover_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Operator live on/off (distinct from the deployment-level ``enable_failover`` static flag
+    # that registers the base-tick job at all). When False the tick is a no-op.
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    primary_probe_interval: Mapped[int] = mapped_column(Integer, default=15, server_default=text("15"))  # minutes
+    oob_probe_interval: Mapped[int] = mapped_column(Integer, default=360, server_default=text("360"))  # minutes (6h)
+    failure_threshold: Mapped[int] = mapped_column(Integer, default=3, server_default=text("3"))
+    success_threshold: Mapped[int] = mapped_column(Integer, default=5, server_default=text("5"))
+    probe_timeout: Mapped[float] = mapped_column(Float, default=10.0, server_default=text("10.0"))  # seconds
+    # Spike-derived: probe due devices concurrently under this cap so simultaneously-down
+    # devices cost ceil(n/concurrency)·timeout, not n·timeout.
+    probe_concurrency: Mapped[int] = mapped_column(Integer, default=8, server_default=text("8"))
+    # Safety belt: at most this many disruptive flips (set_address+disconnect+connect) per tick.
+    max_flips_per_tick: Mapped[int] = mapped_column(Integer, default=8, server_default=text("8"))
+    sync_from_after_switch: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
 
 
 class InterfaceIntent(Base):
