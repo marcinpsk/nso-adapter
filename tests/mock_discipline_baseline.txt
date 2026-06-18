@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-# Mock-discipline baseline — grandfathered spec-less MagicMock/Mock usages.
+# Mock-discipline baseline — grandfathered spec-less MagicMock/Mock (and object-
+# shaped AsyncMock) usages.
 # Each line: <relpath-from-tests>::<qualname>\t<allowed-count>.
 # Shrink this file over time: replace a mock with a real object or a spec=-bounded
 # mock, or add an inline `# mock-ok: <reason>`. Regenerate after an intentional

@@ -92,6 +92,72 @@ def test_asyncmock_not_flagged_by_default():
     assert scan_source(src, "t.py") == []
 
 
+def test_asyncmock_spy_with_one_attr_is_not_flagged():
+    """A 0/1-attribute AsyncMock is an idiomatic callable/spy — not object-shaped."""
+    src = (
+        "from unittest.mock import AsyncMock\n\n"
+        "def test_x():\n"
+        "    m = AsyncMock()\n"
+        "    m.return_value = 1\n"  # configuring the call, one attr → still a callable
+        "    return m\n"
+    )
+    assert scan_source(src, "t.py") == []
+
+
+def test_object_shaped_asyncmock_is_flagged():
+    """An AsyncMock given >=2 distinct attributes is an object stand-in → flagged."""
+    src = (
+        "from unittest.mock import AsyncMock\n\n"
+        "def test_x():\n"
+        "    client = AsyncMock()\n"
+        "    client.list_devices = AsyncMock(return_value=[])\n"
+        "    client.get_interface = AsyncMock(return_value=None)\n"
+        "    return client\n"
+    )
+    hits = scan_source(src, "t.py")
+    assert [h.mock for h in hits] == ["AsyncMock"]
+    assert hits[0].site == "t.py::test_x"
+
+
+def test_spec_bound_object_shaped_asyncmock_is_not_flagged():
+    src = (
+        "from unittest.mock import AsyncMock\nclass C: ...\n\n"
+        "def test_x():\n"
+        "    client = AsyncMock(spec=C)\n"
+        "    client.a = 1\n"
+        "    client.b = 2\n"
+        "    return client\n"
+    )
+    assert scan_source(src, "t.py") == []
+
+
+def test_marked_object_shaped_asyncmock_is_not_flagged():
+    src = (
+        "from unittest.mock import AsyncMock\n\n"
+        "def test_x():\n"
+        "    client = AsyncMock()  # mock-ok: boundary\n"
+        "    client.a = 1\n"
+        "    client.b = 2\n"
+        "    return client\n"
+    )
+    assert scan_source(src, "t.py") == []
+
+
+def test_object_shaped_attrs_in_nested_scope_do_not_count():
+    """Attributes set inside a nested function belong to a different scope — the outer
+    AsyncMock is not treated as object-shaped by them."""
+    src = (
+        "from unittest.mock import AsyncMock\n\n"
+        "def test_x():\n"
+        "    m = AsyncMock()\n"
+        "    def _inner():\n"
+        "        m.a = 1\n"
+        "        m.b = 2\n"
+        "    return m, _inner\n"
+    )
+    assert scan_source(src, "t.py") == []
+
+
 def test_marker_in_comment_block_above_statement_is_honoured():
     src = (
         "from unittest.mock import MagicMock\n\n"

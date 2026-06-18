@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.core.apply import _nokia_routed_kind, enqueue_apply, run_apply
+from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import (
     DbInterface,
@@ -764,7 +765,7 @@ async def test_run_apply_ip_intent_success(adapter_client):
     job_id = await _seed_apply_job(device_id)
     await _seed_ip_intent(iface_id, address="10.0.0.1/24", family="ipv4")
 
-    mock_nso = AsyncMock()
+    mock_nso = AsyncMock(spec=NsoClient)  # opaque token: apply_interface_ips is patched below
     mock_nso._base = "http://fake-nso"
     mock_nso._action_timeout = 30
 

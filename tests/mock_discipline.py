@@ -23,9 +23,14 @@ fabricating mock class, then lets you carve out the legitimate cases three ways 
 
          python -m tests.mock_discipline --update-baseline
 
-``AsyncMock`` is intentionally NOT flagged by default (set ``INCLUDE_ASYNCMOCK = True`` to
-opt in): it is the idiomatic way to stub an awaitable boundary, and flagging all of them
-would bury the signal. Tune the policy by editing the constants below as the suite evolves.
+``AsyncMock`` gets a narrower rule. A bare ``AsyncMock()`` standing in for a single awaitable
+(a coroutine/function stub or a spy you ``assert``-on) is idiomatic and exempt — there is no
+object interface to ``spec=``. But an ``AsyncMock`` used as an *object* stand-in — one the test
+configures with **two or more distinct attributes** (``client.list_devices = ...;
+client.get_interface = ...``) — is the same fabrication footgun as a bare ``MagicMock`` and
+**is** flagged (``FLAG_OBJECT_SHAPED_ASYNCMOCK``); bind it ``AsyncMock(spec=NetboxClient)``.
+Set ``INCLUDE_ASYNCMOCK = True`` to additionally flag *every* AsyncMock (noisy; off by
+default). Tune the policy by editing the constants below as the suite evolves.
 """
 
 from __future__ import annotations
@@ -41,8 +46,13 @@ _BASELINE_PATH = TESTS_ROOT / "mock_discipline_baseline.txt"
 
 # Mock classes that fabricate arbitrary attributes when unspecced — the dangerous kind.
 _FABRICATING_MOCKS = {"MagicMock", "NonCallableMagicMock", "Mock", "NonCallableMock"}
-# Flip to also flag AsyncMock (idiomatic for awaitable boundaries — noisy, off by default).
+# Flip to also flag *every* AsyncMock at its call site (idiomatic for awaitable stubs — noisy).
 INCLUDE_ASYNCMOCK = False
+# Flag an AsyncMock used as an OBJECT stand-in: assigned to a name that then receives this
+# many or more distinct attribute assignments (so a renamed method on the faked interface
+# would be silently fabricated). A 0/1-attribute AsyncMock (pure callable/spy) stays exempt.
+FLAG_OBJECT_SHAPED_ASYNCMOCK = True
+_OBJECT_SHAPE_MIN_ATTRS = 2
 # Keyword args that bound a mock to a real interface (or delegate to a real object).
 _BOUNDING_KWARGS = {"spec", "spec_set", "autospec", "wraps"}
 # Inline opt-out marker (in a comment): `# mock-ok` or `# mock-ok: reason`.
@@ -85,6 +95,15 @@ def _comment_lines(src: str) -> dict[int, str]:
     return comments
 
 
+def _walk_own_scope(node: ast.AST):
+    """Yield descendants of *node* in its OWN lexical scope — i.e. stop at (do not descend
+    into) nested function/class definitions, which are analysed as their own scopes."""
+    for child in ast.iter_child_nodes(node):
+        yield child
+        if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            yield from _walk_own_scope(child)
+
+
 def _mock_import_aliases(tree: ast.AST) -> dict[str, str]:
     """Local-name → canonical-class for ``from unittest.mock import MagicMock [as MM]``."""
     aliases: dict[str, str] = {}
@@ -111,6 +130,7 @@ class _Scanner(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._scope.append(node.name)
+        self._collect_object_shaped_async(node)
         self.generic_visit(node)
         self._scope.pop()
 
@@ -137,6 +157,38 @@ class _Scanner(ast.NodeVisitor):
             if canonical in targets:
                 return canonical  # imported (possibly aliased) name
         return None
+
+    # ── object-shaped AsyncMock check ───────────────────────────────────────────
+    def _collect_object_shaped_async(self, fn: ast.AST) -> None:
+        """Flag a spec-less ``AsyncMock()`` bound to a name that, within this same scope,
+        receives ``_OBJECT_SHAPE_MIN_ATTRS`` or more distinct attribute assignments — it is
+        being used as a multi-method object stand-in, not a single awaitable stub."""
+        if INCLUDE_ASYNCMOCK or not FLAG_OBJECT_SHAPED_ASYNCMOCK:
+            return  # blanket mode already covers AsyncMock, or the rule is disabled
+        assigns: dict[str, ast.Call] = {}  # var name → the AsyncMock() call it's bound to
+        attrs: dict[str, set[str]] = {}  # var name → distinct attribute names assigned on it
+        for n in _walk_own_scope(fn):
+            if not isinstance(n, ast.Assign) or len(n.targets) != 1:
+                continue
+            target = n.targets[0]
+            if isinstance(target, ast.Name) and self._is_unbounded_asyncmock(n.value):
+                assigns[target.id] = n.value
+            elif isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                attrs.setdefault(target.value.id, set()).add(target.attr)
+        for name, call in assigns.items():
+            if len(attrs.get(name, ())) >= _OBJECT_SHAPE_MIN_ATTRS:
+                self.hits.append(Violation(self._rel, call.lineno, self._qual(), "AsyncMock"))
+
+    def _is_unbounded_asyncmock(self, node: ast.expr) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        name = (
+            func.attr
+            if isinstance(func, ast.Attribute)
+            else (self._aliases.get(func.id) if isinstance(func, ast.Name) else None)
+        )
+        return name == "AsyncMock" and not self._is_bounded(node) and not self._is_marked(node)
 
     @staticmethod
     def _is_bounded(node: ast.Call) -> bool:
@@ -202,7 +254,8 @@ def save_baseline(counts: dict[str, int], path: Path = _BASELINE_PATH) -> None:
     header = [
         "# SPDX-License-Identifier: Apache-2.0",
         "# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>",
-        "# Mock-discipline baseline — grandfathered spec-less MagicMock/Mock usages.",
+        "# Mock-discipline baseline — grandfathered spec-less MagicMock/Mock (and object-",
+        "# shaped AsyncMock) usages.",
         "# Each line: <relpath-from-tests>::<qualname>\\t<allowed-count>.",
         "# Shrink this file over time: replace a mock with a real object or a spec=-bounded",
         "# mock, or add an inline `# mock-ok: <reason>`. Regenerate after an intentional",

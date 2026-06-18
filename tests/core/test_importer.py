@@ -13,7 +13,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
+from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.core.importer import _attrs_to_interface_list, sync_device
+from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import Base, DbInterface, Device, InterfaceAttrState, ManagedScope, MappingStatus
 
 
@@ -29,8 +31,10 @@ async def db_session():
 
 
 def _make_nso_client(iface_entry=None):
-    """Build a mock NsoClient. iface_entry is the dict | None returned by get_interface_attributes."""
-    client = AsyncMock()
+    """Build a fake NsoClient (spec-bound to the real interface — get_device_ned_id /
+    get_interface_attributes are real async methods). iface_entry is the dict | None
+    returned by get_interface_attributes."""
+    client = AsyncMock(spec=NsoClient)
     client.get_device_ned_id = AsyncMock(return_value="cisco-ios-cli-6.95")
     client.get_interface_attributes = AsyncMock(return_value=iface_entry)
     return client
@@ -295,7 +299,7 @@ async def test_detect_drift_sees_value_set_directly_in_netbox(db_session: AsyncS
     imp._nso_clients["nso-dev"] = _make_nso_client(iface_entry)
 
     # LIVE NetBox carries a description the device lacks.
-    nb = AsyncMock()
+    nb = AsyncMock(spec=NetboxClient)
     nb.list_interfaces = AsyncMock(
         return_value=[{"id": 1382, "name": "ae2.0", "description": "Core Link", "enabled": True}]
     )
@@ -342,7 +346,7 @@ async def test_sync_change_detection_skips_unchanged_on_resync(db_session: Async
 
     # Mock NetBox client: bulk_ensure resolves the interface; bulk_patch echoes
     # the patched rows back (confirming the writes), capturing payloads.
-    nb = AsyncMock()
+    nb = AsyncMock(spec=NetboxClient)
     nb.list_interfaces = AsyncMock(return_value=[{"id": 500, "name": "GigabitEthernet0/1", "parent": None}])
     nb.bulk_create_interfaces = AsyncMock(return_value=[])
     patched_batches = []
@@ -392,7 +396,7 @@ async def test_sync_failed_patch_not_marked_synced(db_session: AsyncSession):
     }
     imp._nso_clients["nso-dev"] = _make_nso_client(iface_entry)
 
-    nb = AsyncMock()
+    nb = AsyncMock(spec=NetboxClient)
     nb.list_interfaces = AsyncMock(return_value=[{"id": 600, "name": "GigabitEthernet0/1", "parent": None}])
     nb.bulk_create_interfaces = AsyncMock(return_value=[])
     # Simulate a failed/timed-out batch: confirm NOTHING.
@@ -668,7 +672,7 @@ async def test_sync_device_swallows_bulk_ensure_error(db_session: AsyncSession):
     iface_entry = {"interface": [{"interface-name": "Gi0/0", "description": "x", "enabled": True}]}
     imp._nso_clients["nso-dev"] = _make_nso_client(iface_entry)
 
-    nb = AsyncMock()
+    nb = AsyncMock(spec=NetboxClient)
     nb.list_interfaces = AsyncMock(side_effect=RuntimeError("netbox down"))  # bulk_ensure blows up
     nb.notify_sync_complete = AsyncMock()
     imp._netbox_client = nb
@@ -708,7 +712,7 @@ async def test_sync_device_skips_enabled_write_when_nso_omits_it(db_session: Asy
 
     # NSO now reports the interface WITHOUT 'enabled' (None) — prev "True" != None, but no value to write.
     imp._nso_clients["nso-dev"] = _make_nso_client({"interface": [{"interface-name": "Gi0/0", "description": "x"}]})
-    nb = AsyncMock()
+    nb = AsyncMock(spec=NetboxClient)
     nb.list_interfaces = AsyncMock(return_value=[{"id": 700, "name": "Gi0/0", "parent": None}])
     nb.bulk_create_interfaces = AsyncMock(return_value=[])
     nb.bulk_patch_interfaces = AsyncMock(return_value=[])
@@ -795,7 +799,7 @@ async def test_sync_device_swallows_notify_failure(db_session: AsyncSession):
     imp._nso_clients["nso-dev"] = _make_nso_client(
         {"interface": [{"interface-name": "Gi0/0", "description": "x", "enabled": True}]}
     )
-    nb = AsyncMock()
+    nb = AsyncMock(spec=NetboxClient)
     nb.list_interfaces = AsyncMock(return_value=[])
     nb.bulk_create_interfaces = AsyncMock(return_value=[])
     nb.bulk_patch_interfaces = AsyncMock(return_value=[])
@@ -847,7 +851,7 @@ async def test_detect_drift_falls_back_to_cache_on_netbox_read_error(db_session:
     await db_session.commit()
 
     imp._nso_clients["nso-dev"] = _make_nso_client({"interface": [{"interface-name": "Gi0/0", "description": "same"}]})
-    nb = AsyncMock()
+    nb = AsyncMock(spec=NetboxClient)
     nb.list_interfaces = AsyncMock(side_effect=RuntimeError("netbox down"))  # live read fails → cache fallback
     nb.notify_sync_complete = AsyncMock()
     imp._netbox_client = nb
@@ -913,7 +917,7 @@ async def test_detect_drift_swallows_notify_failure(db_session: AsyncSession):
     await db_session.commit()
 
     imp._nso_clients["nso-dev"] = _make_nso_client({"interface": []})
-    nb = AsyncMock()
+    nb = AsyncMock(spec=NetboxClient)
     nb.list_interfaces = AsyncMock(return_value=[])
     nb.notify_sync_complete = AsyncMock(side_effect=RuntimeError("plugin down"))
     imp._netbox_client = nb

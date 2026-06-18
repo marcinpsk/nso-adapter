@@ -11,11 +11,11 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import httpx
 import pytest
 
+from nso_adapter.config import NsoInstanceConfig
 from nso_adapter.nso.apply import (
     NsoApplyError,
     _send_service_config,
@@ -69,12 +69,16 @@ class _RecordingTransport(httpx.AsyncBaseTransport):
 
 
 def _client_with(transport: _RecordingTransport) -> NsoClient:
-    # mock-ok: NsoInstanceConfig stub — only base_url/ca_cert/host_header are read; the
-    # real NsoClient + apply code run for real over the httpx MockTransport below.
-    cfg = MagicMock()
-    cfg.base_url = "http://nso"
-    cfg.ca_cert = None
-    cfg.host_header = None
+    # Real NsoInstanceConfig (NsoClient reads base_url/ca_cert/host_header off it); the real
+    # NsoClient + apply code then run for real over the httpx MockTransport below.
+    cfg = NsoInstanceConfig(
+        name="nso-dev",
+        base_url="http://nso",
+        ca_cert=None,
+        username_ref="NSO_USERNAME",
+        password_ref="NSO_PASSWORD",
+        host_header=None,
+    )
     client = NsoClient(cfg, "admin", "secret")
     client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url="http://nso")
     return client
