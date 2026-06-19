@@ -954,10 +954,10 @@ async def test_apply_route_policy_translates_and_skips_members_per_ned():
     _stub_pool(client, mock_http)
 
     entries = [
-        {"sequence": 10, "action": "permit", "community": "6830:1234"},
-        {"sequence": 20, "action": "permit", "community": "6830:.*"},  # digit-domain regex kept
-        {"sequence": 30, "action": "permit", "community": "target:6830:1234"},
-        {"sequence": 40, "action": "permit", "community": "large:6830:6370:1234"},  # exact → strip large:
+        {"sequence": 10, "action": "permit", "community": "64500:1234"},
+        {"sequence": 20, "action": "permit", "community": "64500:.*"},  # digit-domain regex kept
+        {"sequence": 30, "action": "permit", "community": "target:64500:1234"},
+        {"sequence": 40, "action": "permit", "community": "large:64500:6370:1234"},  # exact → strip large:
         {"sequence": 50, "action": "permit", "community": "color:0:128"},  # exact color → ext:030b hex
         {"sequence": 60, "action": "permit", "community": "color:0:12."},  # regex color → dropped
         {"sequence": 70, "action": "permit", "community": "no-export"},
@@ -970,10 +970,10 @@ async def test_apply_route_policy_translates_and_skips_members_per_ned():
     cl = body["route-policy-reconciler:route-policy-config"][0]["community-list"][0]
     members = [e["community"] for e in cl["entry"]]
     assert members == [
-        "6830:1234",
-        "6830:.*",
-        "target:6830:1234",
-        "6830:6370:1234",
+        "64500:1234",
+        "64500:.*",
+        "target:64500:1234",
+        "64500:6370:1234",
         "ext:030b:000000000080",
         "no-export",
     ]
@@ -996,8 +996,8 @@ async def test_apply_route_policy_carries_invert_match_and_amp_large_on_nokia():
 
     entries = [
         {"sequence": 10, "action": "permit", "community": "no-export"},
-        {"sequence": 20, "action": "permit", "community": "6830:21000"},
-        {"sequence": 30, "action": "permit", "community": "large:6830:.*:[0-4]"},  # regex large → &
+        {"sequence": 20, "action": "permit", "community": "64500:21000"},
+        {"sequence": 30, "action": "permit", "community": "large:64500:.*:[0-4]"},  # regex large → &
         {"sequence": 40, "action": "permit", "community": "color:0:128"},  # exact color → ext:030b hex
     ]
     rows = [SimpleNamespace(family="community_list", name="SCRUBBER", entries=entries, invert_match=True)]
@@ -1009,8 +1009,8 @@ async def test_apply_route_policy_carries_invert_match_and_amp_large_on_nokia():
     assert cl["invert-match"] is True
     assert [e["community"] for e in cl["entry"]] == [
         "no-export",
-        "6830:21000",
-        "6830&.*&[0-4]",
+        "64500:21000",
+        "64500&.*&[0-4]",
         "ext:030b:000000000080",
     ]
 
@@ -1030,7 +1030,7 @@ async def test_apply_route_policy_keeps_all_members_on_identity_ned():
 
     entries = [
         {"sequence": 10, "action": "permit", "community": "color:0:128"},
-        {"sequence": 20, "action": "permit", "community": "large:6830:6370:.*"},
+        {"sequence": 20, "action": "permit", "community": "large:64500:6370:.*"},
     ]
     rows = [SimpleNamespace(family="community_list", name="cnad-test", entries=entries)]
 
@@ -1040,7 +1040,7 @@ async def test_apply_route_policy_keeps_all_members_on_identity_ned():
     members = [
         e["community"] for e in body["route-policy-reconciler:route-policy-config"][0]["community-list"][0]["entry"]
     ]
-    assert members == ["color:0:128", "large:6830:6370:.*"]  # untouched
+    assert members == ["color:0:128", "large:64500:6370:.*"]  # untouched
 
 
 def test_normalize_route_map_entry_yang_shape_passthrough():

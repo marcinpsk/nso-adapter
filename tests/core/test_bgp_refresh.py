@@ -234,7 +234,7 @@ async def test_peer_source_imported(adapter_client):
                 {
                     "vrf": "",
                     "address-family": [{"af": "ipv4-unicast"}],
-                    "peer": [{"peer-address": "10.0.0.1", "source": "84.116.255.1"}],
+                    "peer": [{"peer-address": "10.0.0.1", "source": "198.18.255.1"}],
                 }
             ],
         }
@@ -243,7 +243,7 @@ async def test_peer_source_imported(adapter_client):
         device = await db.get(Device, device_id)
         await _upsert_bgp_data(db, device, routers, "test")
         peers = (await db.execute(select(DeviceBgpPeer))).scalars().all()
-        assert peers[0].source == "84.116.255.1"
+        assert peers[0].source == "198.18.255.1"
         break
 
 

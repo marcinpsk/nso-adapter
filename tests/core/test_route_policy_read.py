@@ -27,12 +27,12 @@ async def test_read_carries_invert_match_and_canonicalizes_amp_large(adapter_cli
                 "invert-match": True,
                 "entry": [
                     {"sequence": 10, "action": "permit", "community": "no-export"},
-                    {"sequence": 20, "action": "permit", "community": "6830&.*&[0-4]"},
+                    {"sequence": 20, "action": "permit", "community": "64500&.*&[0-4]"},
                 ],
             },
             {
                 "name": "PLAIN",
-                "entry": [{"sequence": 10, "action": "permit", "community": "6830:100"}],
+                "entry": [{"sequence": 10, "action": "permit", "community": "64500:100"}],
             },
         ]
     }
@@ -74,7 +74,7 @@ async def test_read_carries_invert_match_and_canonicalizes_amp_large(adapter_cli
             .all()
         )
         # `&`-large is canonicalized to large:a:b:c on read (timos dialect).
-        assert [e.community for e in entries] == ["no-export", "large:6830:.*:[0-4]"]
+        assert [e.community for e in entries] == ["no-export", "large:64500:.*:[0-4]"]
         return
 
 

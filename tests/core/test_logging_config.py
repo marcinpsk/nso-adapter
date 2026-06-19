@@ -38,13 +38,13 @@ async def test_refresh_inserts_hosts(adapter_client):
         nso_client = AsyncMock()
         nso_client.get_logging_config.return_value = {
             "device-name": "log-sw01",
-            "host": [{"address": "84.116.251.86", "severity": "warning", "facility": "any", "source": "1.1.1.1"}],
+            "host": [{"address": "198.18.251.86", "severity": "warning", "facility": "any", "source": "1.1.1.1"}],
         }
         await refresh_logging_config_for_device(db, device, nso_client, refresh_source="test")
         hosts = await _hosts(db, device_id)
-        assert "84.116.251.86" in hosts
-        assert hosts["84.116.251.86"].severity == "warning"
-        assert hosts["84.116.251.86"].source == "1.1.1.1"
+        assert "198.18.251.86" in hosts
+        assert hosts["198.18.251.86"].severity == "warning"
+        assert hosts["198.18.251.86"].source == "1.1.1.1"
 
 
 @pytest.mark.anyio

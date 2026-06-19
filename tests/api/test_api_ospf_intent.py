@@ -23,7 +23,7 @@ async def test_put_ospf_intent_string_process_id(adapter_client):
 
     device_id = await seed_device(nso_device_name="ospf-intent-dev", netbox_device_id=920)
     payload = {
-        "instances": [{"process_id": "1", "router_id": "84.116.250.117", "vrf": "", "areas": []}],
+        "instances": [{"process_id": "1", "router_id": "198.18.250.117", "vrf": "", "areas": []}],
         "interfaces": [{"interface_name": "LAG99:99", "process_id": "1", "area_id": "0", "passive": False}],
     }
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH, json=payload)
@@ -34,7 +34,7 @@ async def test_put_ospf_intent_string_process_id(adapter_client):
             await db.execute(select(OspfInstanceIntent).where(OspfInstanceIntent.device_id == device_id))
         ).scalar_one()
         assert inst.process_id == "1"
-        assert inst.router_id == "84.116.250.117"
+        assert inst.router_id == "198.18.250.117"
         iface = (
             await db.execute(select(OspfInterfaceIntent).where(OspfInterfaceIntent.device_id == device_id))
         ).scalar_one()

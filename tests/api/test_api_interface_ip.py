@@ -271,7 +271,7 @@ async def test_put_ip_intent_greenfield_routed_creates_interface(adapter_client)
         "addresses": [
             {
                 "interface": "LAG99:99",
-                "address": "84.116.249.160/31",
+                "address": "198.18.249.160/31",
                 "family": "ipv4",
                 "routed": True,
                 "parent_binding": "lag-99",
@@ -298,7 +298,7 @@ async def test_put_ip_intent_greenfield_routed_creates_interface(adapter_client)
             .all()
         )
         assert len(rows) == 1
-        assert rows[0].address == "84.116.249.160/31"
+        assert rows[0].address == "198.18.249.160/31"
         break
 
 

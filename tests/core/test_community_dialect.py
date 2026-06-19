@@ -40,7 +40,7 @@ def test_timos_selects_nokia_dialect(ned_id):
 )
 def test_other_neds_get_identity_default(ned_id):
     d = community_dialect_for(ned_id)
-    for m in ("6830:1234", "target:6830:1", "color:0:128", "large:1:2:3", "no-export"):
+    for m in ("64500:1234", "target:64500:1", "color:0:128", "large:1:2:3", "no-export"):
         assert d.to_canonical(m) == m
         assert d.from_canonical(m) == m  # identity never declares anything unrepresentable
 
@@ -51,12 +51,12 @@ def test_other_neds_get_identity_default(ned_id):
 @pytest.mark.parametrize(
     "member",
     [
-        "6830:1234",  # exact standard
-        "6830:1113.",  # dot regex (live on device)
-        "6830:.*",  # star regex (live on device)
-        "6830:1.3.",
-        "target:6830:1234",  # exact route-target
-        "origin:6830:1234",  # exact route-origin
+        "64500:1234",  # exact standard
+        "64500:1113.",  # dot regex (live on device)
+        "64500:.*",  # star regex (live on device)
+        "64500:1.3.",
+        "target:64500:1234",  # exact route-target
+        "origin:64500:1234",  # exact route-origin
         "ext:4300:0000075bcd15",  # non-color ext-community hex → round-trips raw
         "no-export",
         "no-advertise",
@@ -73,20 +73,20 @@ def test_nokia_passes_supported_members_verbatim(member):
 
 
 def test_nokia_exact_large_strips_keyword():
-    assert _nokia().from_canonical("large:6830:6370:1234") == "6830:6370:1234"
+    assert _nokia().from_canonical("large:64500:6370:1234") == "64500:6370:1234"
 
 
 def test_nokia_large_round_trips_through_canonical():
     d = _nokia()
-    assert d.to_canonical(d.from_canonical("large:6830:6370:1234")) == "large:6830:6370:1234"
+    assert d.to_canonical(d.from_canonical("large:64500:6370:1234")) == "large:64500:6370:1234"
 
 
 def test_nokia_reads_bare_three_part_member_as_large():
-    assert _nokia().to_canonical("6830:6370:1234") == "large:6830:6370:1234"
+    assert _nokia().to_canonical("64500:6370:1234") == "large:64500:6370:1234"
 
 
 def test_nokia_two_part_standard_is_not_misread_as_large():
-    assert _nokia().to_canonical("6830:1234") == "6830:1234"
+    assert _nokia().to_canonical("64500:1234") == "64500:1234"
 
 
 def test_nokia_non_color_ext_round_trips_verbatim():
@@ -153,25 +153,25 @@ def test_nokia_regex_color_stays_unrepresentable():
 
 # ── Nokia: regex large community = 3 ``&``-separated parts (from live config) ──
 # `&` is SR OS's large-community part separator; exact large uses `:`, regex uses `&`.
-# Source: live `expression expr "NOT (… OR 6830&.*&[0-4])"` ⇄ Junos `large:6830:.*:[0-4]`.
+# Source: live `expression expr "NOT (… OR 64500&.*&[0-4])"` ⇄ Junos `large:64500:.*:[0-4]`.
 
 
 def test_nokia_reads_amp_large_as_canonical_large():
-    assert _nokia().to_canonical("6830&.*&[0-4]") == "large:6830:.*:[0-4]"
+    assert _nokia().to_canonical("64500&.*&[0-4]") == "large:64500:.*:[0-4]"
 
 
 def test_nokia_writes_regex_large_with_amp_separators():
-    assert _nokia().from_canonical("large:6830:.*:[0-4]") == "6830&.*&[0-4]"
+    assert _nokia().from_canonical("large:64500:.*:[0-4]") == "64500&.*&[0-4]"
 
 
 def test_nokia_regex_large_round_trips_through_canonical():
     d = _nokia()
-    assert d.to_canonical(d.from_canonical("large:6830:.*:[0-4]")) == "large:6830:.*:[0-4]"
+    assert d.to_canonical(d.from_canonical("large:64500:.*:[0-4]")) == "large:64500:.*:[0-4]"
 
 
 def test_nokia_exact_large_still_uses_colons():
     # Exact (no regex) large communities keep the colon form, not `&`.
-    assert _nokia().from_canonical("large:6830:6370:1234") == "6830:6370:1234"
+    assert _nokia().from_canonical("large:64500:6370:1234") == "64500:6370:1234"
 
 
 # ── Nokia: members not representable in `community member` are reported ───────
@@ -184,8 +184,8 @@ def test_nokia_exact_large_still_uses_colons():
     "member",
     [
         "color:0:12.",  # regex color — no single hex value
-        "bandwidth:6830:100",
-        "soo:6830:1",
+        "bandwidth:64500:100",
+        "soo:64500:1",
     ],
 )
 def test_nokia_reports_unrepresentable_keywords(member):

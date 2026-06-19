@@ -25,7 +25,7 @@ live device (apply commit results) + SR OS 23.10 route-policy docs:
 - exact ``asn:val``, ``target:…``, ``origin:…`` and the well-known names sit on
   the device verbatim → pass through unchanged;
 - ``.`` / ``*`` / ``[]`` / ``()`` / ``-`` regex over the digit:colon domain are
-  accepted verbatim (e.g. ``6830:1113.``, ``6830:.*`` and ``6830:*`` commit live);
+  accepted verbatim (e.g. ``64500:1113.``, ``64500:.*`` and ``64500:*`` commit live);
 - ``ext:`` is a raw RFC 4360 extended community in hex (type+value, e.g.
   ``ext:030b:000000000080``); it sits on the device verbatim → round-trips
   unchanged on Nokia. The ``030b`` sub-type is the Color Ext-Community, so an
@@ -43,8 +43,8 @@ live device (apply commit results) + SR OS 23.10 route-policy docs:
   large community is three **colon** parts with NO keyword (``large:a:b:c`` ⇄ Nokia
   ``a:b:c`` — verified live: ``a:b:c`` commits, ``large:a:b:c`` rejected); a large
   community carrying a **regex** is three **``&``**-separated parts
-  (``large:6830:.*:[0-4]`` ⇄ Nokia ``6830&.*&[0-4]`` — straight from the live
-  ``expression`` config, and the exact Junos ``large:6830:.*:[0-4]`` member). My
+  (``large:64500:.*:[0-4]`` ⇄ Nokia ``64500&.*&[0-4]`` — straight from the live
+  ``expression`` config, and the exact Junos ``large:64500:.*:[0-4]`` member). My
   earlier probe wrongly doubled the separator (``a&&b&&c`` → MGMT_CORE #2301); the
   separator is a single ``&``. On READ a bare 3-part member (colon or ``&``) is
   re-prefixed to canonical ``large:``.
@@ -76,8 +76,8 @@ _REGEX_METACHARS: frozenset[str] = frozenset(".*[]()?+^$|\\")
 def _typed_keyword(member: str) -> str | None:
     """Return the extended/large keyword (lowercased) of a typed member, else None.
 
-    ``target:6830:1234`` → ``"target"``; ``large:1:2:3`` → ``"large"``;
-    ``6830:1234`` → None (standard, head is numeric); ``no-export`` → None.
+    ``target:64500:1234`` → ``"target"``; ``large:1:2:3`` → ``"large"``;
+    ``64500:1234`` → None (standard, head is numeric); ``no-export`` → None.
     """
     head, sep, _rest = member.partition(":")
     if not sep or not head or head[0].isdigit():
