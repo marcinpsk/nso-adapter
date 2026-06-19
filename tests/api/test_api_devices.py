@@ -8,6 +8,49 @@ from tests.conftest import VALID_TOKEN, seed_device
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 
+async def test_get_device_includes_failover_block(adapter_client):
+    """GET /devices/{id} carries the failover status block the plugin's NSO tab renders."""
+    from datetime import UTC, datetime
+
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import ActiveAddress, DeviceFailover
+
+    device_id = await seed_device(nso_instance="nso-dev", nso_device_name="fo-rtr", netbox_device_id=70)
+    async for db in get_session():
+        db.add(
+            DeviceFailover(
+                device_id=device_id,
+                primary_ip="10.0.0.1",
+                oob_ip="192.0.2.5",
+                active_address=ActiveAddress.oob.value,
+                last_probe_result="fail",
+                oob_healthy=True,
+                last_switch_at=datetime.now(UTC).replace(tzinfo=None),
+            )
+        )
+        await db.commit()
+        break
+
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}", headers=AUTH)
+    assert resp.status_code == 200
+    fo = resp.json()["failover"]
+    assert fo["active_address"] == "oob"
+    assert fo["primary_ip"] == "10.0.0.1"
+    assert fo["oob_ip"] == "192.0.2.5"
+    assert fo["last_probe_result"] == "fail"
+    assert fo["oob_healthy"] is True
+    assert fo["last_switch_at"] is not None
+    assert fo["manual_override"] is False
+
+
+async def test_get_device_failover_null_when_unmanaged(adapter_client):
+    """A device with no DeviceFailover row → failover is null (tab shows nothing)."""
+    device_id = await seed_device(nso_instance="nso-dev", nso_device_name="nofo-rtr", netbox_device_id=71)
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}", headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["failover"] is None
+
+
 async def test_get_by_nso_hit_returns_device_object(adapter_client):
     """by-nso with matching (instance, name) → 200 with same shape as GET /devices/{id}."""
     device_id = await seed_device(

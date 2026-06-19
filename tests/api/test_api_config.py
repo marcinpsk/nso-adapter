@@ -71,6 +71,16 @@ async def test_put_failover_config_rejects_out_of_range(adapter_client):
     assert resp.status_code == 422
 
 
+async def test_put_failover_config_caps_concurrency_to_pool(adapter_client):
+    """probe_concurrency is capped (≤16) so it can't exceed the DB pool and starve API/sync."""
+    assert (
+        await adapter_client.put("/api/v1/config/failover", json={"probe_concurrency": 17}, headers=AUTH)
+    ).status_code == 422
+    assert (
+        await adapter_client.put("/api/v1/config/failover", json={"probe_concurrency": 16}, headers=AUTH)
+    ).status_code == 200
+
+
 async def test_failover_config_requires_auth(adapter_client):
     """Both verbs require the adapter token."""
     assert (await adapter_client.get("/api/v1/config/failover")).status_code == 401

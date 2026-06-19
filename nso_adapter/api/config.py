@@ -49,7 +49,10 @@ class FailoverConfigUpdate(BaseModel):
     failure_threshold: int | None = Field(None, ge=1)
     success_threshold: int | None = Field(None, ge=1)
     probe_timeout: float | None = Field(None, gt=0, le=120)  # seconds
-    probe_concurrency: int | None = Field(None, ge=1, le=64)
+    # Ceiling kept ≤ the DB pool headroom (store/db.py sizes the pool at 30): each concurrent
+    # probe holds a session for the full unreachable-probe timeout, so a higher value would
+    # starve the pool that API/sync traffic shares.
+    probe_concurrency: int | None = Field(None, ge=1, le=16)
     max_flips_per_tick: int | None = Field(None, ge=1, le=256)
     sync_from_after_switch: bool | None = None
 

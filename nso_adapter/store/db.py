@@ -14,10 +14,15 @@ _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 def init_db(database_url: str) -> None:
     global _engine, _session_factory
-    connect_args = {}
     if database_url.startswith("sqlite"):
-        connect_args = {"check_same_thread": False}
-    _engine = create_async_engine(database_url, connect_args=connect_args, echo=False)
+        # SQLite (tests) — leave pooling at the driver default; sizing it risks "database is locked".
+        _engine = create_async_engine(database_url, connect_args={"check_same_thread": False}, echo=False)
+    else:
+        # The failover base tick can hold one session per concurrent probe for the full
+        # unreachable-probe timeout (~10s), and normal API/sync traffic shares this pool. Keep
+        # it comfortably above failover_probe_concurrency (capped at 16 in api/config.py) so a
+        # worst-case tick can't starve the pool: 20 + 10 overflow = 30, leaving 14 for everyone else.
+        _engine = create_async_engine(database_url, pool_size=20, max_overflow=10, pool_pre_ping=True, echo=False)
 
     if database_url.startswith("sqlite"):
 

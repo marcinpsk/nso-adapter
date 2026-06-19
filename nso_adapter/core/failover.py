@@ -32,6 +32,12 @@ if TYPE_CHECKING:
     from nso_adapter.nso.client import NsoClient
     from nso_adapter.store.models import Device
 
+    # What the tick + its helpers actually accept for ``cfg``: either the static SchedulerConfig
+    # (defaults / tests) or the live EffectiveFailoverConfig (DB-sourced). Both expose the
+    # ``failover_*`` knobs the tick reads — the honest type for those signatures. Quoted because
+    # EffectiveFailoverConfig is defined below (forward ref; only read by type checkers).
+    TickConfig = "SchedulerConfig | EffectiveFailoverConfig"
+
 logger = structlog.get_logger(__name__)
 
 _PRIMARY = ActiveAddress.primary.value
@@ -46,8 +52,11 @@ class EffectiveFailoverConfig:
     """The live failover knobs the tick reads.
 
     The DB ``FailoverConfig`` row when present, else the static ``SchedulerConfig`` fallback.
-    Field names mirror ``SchedulerConfig``'s ``failover_*`` knobs on purpose, so the tick and
-    its helpers read either a ``SchedulerConfig`` (static / tests) or this (live) interchangeably.
+    The tick-consumed fields deliberately mirror ``SchedulerConfig``'s ``failover_*`` names, so
+    the tick and its helpers read either a ``SchedulerConfig`` (static / tests) or this (live)
+    interchangeably (see the ``TickConfig`` alias). The two scheduler-only knobs the tick does
+    *not* read — ``probe_concurrency`` / ``max_flips_per_tick`` — use the canonical model/API
+    names instead (the scheduler reads them straight off this dataclass).
     """
 
     enabled: bool
@@ -215,10 +224,17 @@ async def _set_address(client: NsoClient, name: str, address: str) -> None:
     await _safe_disconnect(client, name)
 
 
-async def _flip_and_probe(client: NsoClient, name: str, address: str, timeout: float):
-    """Point NSO at *address*, drop the session, and probe — returns probe_reachable()."""
-    await _set_address(client, name, address)
-    return await probe_reachable(client, name, timeout)
+async def _revert_address(client: NsoClient, name: str, address: str) -> None:
+    """Best-effort restore of NSO's address after a flip-probe — must not mask the original error.
+
+    Called from the ``finally`` of every flip-probe so a raised probe/decision can't strand NSO
+    on the temporary address. Its own failure is logged loudly (the device may then be
+    unreachable) but swallowed so it doesn't replace any in-flight exception.
+    """
+    try:
+        await _set_address(client, name, address)
+    except Exception as exc:
+        logger.error("failover.revert_failed", device=name, address=address, error=repr(exc))
 
 
 async def _is_manual_override(client: NsoClient, fo: DeviceFailover, name: str) -> bool:
@@ -235,6 +251,24 @@ async def _is_manual_override(client: NsoClient, fo: DeviceFailover, name: str) 
     return current not in (fo.primary_ip, fo.oob_ip)
 
 
+async def _maybe_clear_manual_override(client: NsoClient, fo: DeviceFailover, name: str) -> None:
+    """Clear a stale ``manual_override`` once NSO is back on a managed address.
+
+    The flag is only ever *set* mid-switch (when NSO points at a foreign address), so without
+    this it would linger in the UI until the next switch attempt — even after the operator
+    restored a managed address. Costs one GET, and only while the flag is set.
+    """
+    if not fo.manual_override:
+        return
+    try:
+        current = await client.get_address(name)
+    except Exception:
+        return  # can't tell → leave the flag, retry next tick
+    if current in (fo.primary_ip, fo.oob_ip):
+        fo.manual_override = False
+        logger.info("failover.manual_override_cleared", device=name, address=current)
+
+
 def _record_probe(fo: DeviceFailover, now: datetime, reachable: bool) -> None:
     fo.last_probe_at = now
     fo.last_probe_result = "ok" if reachable else "fail"
@@ -243,7 +277,7 @@ def _record_probe(fo: DeviceFailover, now: datetime, reachable: bool) -> None:
 # ── State transitions (the switch + failback commit) ──────────────────────────
 
 
-async def _switch_to_oob(client: NsoClient, fo: DeviceFailover, name: str, cfg: SchedulerConfig, now: datetime) -> None:
+async def _switch_to_oob(client: NsoClient, fo: DeviceFailover, name: str, cfg: TickConfig, now: datetime) -> None:
     await _set_address(client, name, fo.oob_ip)
     fo.active_address = _OOB
     fo.consecutive_failures = 0
@@ -254,9 +288,7 @@ async def _switch_to_oob(client: NsoClient, fo: DeviceFailover, name: str, cfg: 
     logger.info("failover.switch", device=name, to=_OOB, address=fo.oob_ip)
 
 
-async def _commit_failback(
-    client: NsoClient, fo: DeviceFailover, name: str, cfg: SchedulerConfig, now: datetime
-) -> None:
+async def _commit_failback(client: NsoClient, fo: DeviceFailover, name: str, cfg: TickConfig, now: datetime) -> None:
     # The flip already physically set the address to primary — just commit the state.
     fo.active_address = _PRIMARY
     fo.consecutive_failures = 0
@@ -274,7 +306,7 @@ async def _active_primary_probe(
     client: NsoClient,
     fo: DeviceFailover,
     name: str,
-    cfg: SchedulerConfig,
+    cfg: TickConfig,
     now: datetime,
     has_oob: bool,
     job_active: bool,
@@ -310,7 +342,7 @@ async def _failback_flip_probe(
     client: NsoClient,
     fo: DeviceFailover,
     name: str,
-    cfg: SchedulerConfig,
+    cfg: TickConfig,
     now: datetime,
     job_active: bool,
     flip_budget: FlipBudget | None,
@@ -328,16 +360,22 @@ async def _failback_flip_probe(
     if not _take_flip(flip_budget):
         return False
     fo.manual_override = False
-    reachable, _detail, elapsed = await _flip_and_probe(client, name, fo.primary_ip, cfg.failover_probe_timeout)
-    logger.debug("failover.flip_probe", device=name, target=_PRIMARY, reachable=reachable, elapsed=elapsed)
-    _record_probe(fo, now, reachable)
-    step = step_failback(reachable, fo.consecutive_successes, cfg.failover_success_threshold)
-    fo.consecutive_failures, fo.consecutive_successes = step.failures, step.successes
-    if step.act:
-        await _commit_failback(client, fo, name, cfg, now)
-    else:
-        # Threshold not met (or primary still down) → revert to OOB to keep the device reachable.
-        await _set_address(client, name, fo.oob_ip)
+    await _set_address(client, name, fo.primary_ip)  # flip to primary for the probe
+    committed = False
+    try:
+        reachable, _detail, elapsed = await probe_reachable(client, name, cfg.failover_probe_timeout)
+        logger.debug("failover.flip_probe", device=name, target=_PRIMARY, reachable=reachable, elapsed=elapsed)
+        _record_probe(fo, now, reachable)
+        step = step_failback(reachable, fo.consecutive_successes, cfg.failover_success_threshold)
+        fo.consecutive_failures, fo.consecutive_successes = step.failures, step.successes
+        if step.act:
+            await _commit_failback(client, fo, name, cfg, now)
+            committed = True
+    finally:
+        if not committed:
+            # Threshold not met, primary still down, OR the probe/decision raised → guaranteed
+            # revert to OOB so the device stays reachable (never stranded on a flipped address).
+            await _revert_address(client, name, fo.oob_ip)
     return True
 
 
@@ -345,7 +383,7 @@ async def _probe_primary(
     client: NsoClient,
     fo: DeviceFailover,
     name: str,
-    cfg: SchedulerConfig,
+    cfg: TickConfig,
     now: datetime,
     has_oob: bool,
     job_active: bool,
@@ -361,7 +399,7 @@ async def _probe_oob(
     client: NsoClient,
     fo: DeviceFailover,
     name: str,
-    cfg: SchedulerConfig,
+    cfg: TickConfig,
     now: datetime,
     job_active: bool,
     flip_budget: FlipBudget | None,
@@ -385,12 +423,15 @@ async def _probe_oob(
     if not _take_flip(flip_budget):
         return False
     fo.manual_override = False
-    reachable, _detail, elapsed = await _flip_and_probe(client, name, fo.oob_ip, cfg.failover_probe_timeout)
-    logger.debug("failover.flip_probe", device=name, target=_OOB, reachable=reachable, elapsed=elapsed)
-    fo.oob_healthy = reachable
-    fo.oob_health_checked_at = now
-    # Always flip back to primary — this was only a fallback-health check.
-    await _set_address(client, name, fo.primary_ip)
+    await _set_address(client, name, fo.oob_ip)  # flip to OOB for the health probe
+    try:
+        reachable, _detail, elapsed = await probe_reachable(client, name, cfg.failover_probe_timeout)
+        logger.debug("failover.flip_probe", device=name, target=_OOB, reachable=reachable, elapsed=elapsed)
+        fo.oob_healthy = reachable
+        fo.oob_health_checked_at = now
+    finally:
+        # Always flip back to primary (even if the probe raised) — this was only a health check.
+        await _revert_address(client, name, fo.primary_ip)
     return True
 
 
@@ -401,7 +442,7 @@ async def run_failover_tick(
     device: Device,
     fo: DeviceFailover,
     client: NsoClient,
-    cfg: SchedulerConfig,
+    cfg: TickConfig,
     *,
     now: datetime | None = None,
     job_active: bool = False,
@@ -425,6 +466,10 @@ async def run_failover_tick(
     fo.consecutive_failures = fo.consecutive_failures or 0
     fo.consecutive_successes = fo.consecutive_successes or 0
     has_oob = bool(fo.oob_ip) and fo.oob_ip != fo.primary_ip
+
+    # Drop a stale manual-override flag the moment NSO is back on a managed address (only a GET,
+    # and only while flagged) so the UI doesn't show "manual override" after the operator restores.
+    await _maybe_clear_manual_override(client, fo, name)
 
     if _due(fo.next_primary_probe_at, now):
         ran = await _probe_primary(client, fo, name, cfg, now, has_oob, job_active, flip_budget)

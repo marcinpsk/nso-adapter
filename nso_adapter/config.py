@@ -125,7 +125,7 @@ class SchedulerConfig(BaseModel):
     failover_probe_timeout: float = 10.0  # seconds — short, so an unreachable connect can't hang
     failover_sync_from_after_switch: bool = True
     # Spike-derived staggering knobs (static fallback when no FailoverConfig row exists).
-    failover_probe_concurrency: int = 8  # probe due devices concurrently — the load lever
+    failover_probe_concurrency: int = 8  # probe due devices concurrently — the load lever (keep ≤ DB pool; store/db.py)
     failover_max_flips_per_tick: int = 8  # cap disruptive flips per tick (safety belt)
 
 

@@ -33,11 +33,16 @@ class _NsoSim:
         self.always_reachable = False  # address-agnostic "always up" — for multi-device tests
         self.patches: list[str] = []
         self.connects = 0
+        # When set, a connect while NSO is dialing this address raises an *unexpected* error
+        # (not an httpx error probe_reachable swallows) — models a probe blowing up mid-flip.
+        self.raise_on_connect_addr: str | None = None
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         url, method = str(request.url), request.method
         if method == "POST" and url.endswith("/connect"):
             self.connects += 1
+            if self.address == self.raise_on_connect_addr:
+                raise RuntimeError(f"nso connect blew up for {self.address}")
             if self.always_reachable or self.address in self.reachable_addrs:
                 out = {"result": "connected"}
             else:
@@ -324,3 +329,58 @@ async def test_flip_budget_caps_flips_across_tick(adapter_client, monkeypatch):
     actives = sorted([(await _load(a_id)).active_address, (await _load(b_id)).active_address])
     assert actives == [ActiveAddress.oob.value, ActiveAddress.primary.value]  # exactly one failed back
     assert sim.connects == 1  # the budget-skipped device never even probed
+
+
+async def test_failback_flip_reverts_to_oob_when_probe_blows_up(adapter_client, monkeypatch):
+    """A failback flip-probe that raises mid-flight must still revert NSO to OOB (not strand it).
+
+    Guards the try/finally guaranteed revert: the device is on OOB, the flip points NSO at the
+    primary, then the connect blows up. NSO must end back on the OOB address it can reach.
+    """
+    sim = _NsoSim(address="192.0.2.5")  # physically on OOB (where the device lives)
+    sim.raise_on_connect_addr = "10.0.0.1"  # the primary probe blows up after the flip
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    device_id = await _seed(active="oob")
+    await _arm(device_id, primary_due=True, oob_due=False)
+
+    await sched._scheduled_failover_probe()  # the RuntimeError is caught + rolled back by the tick
+
+    assert sim.address == "192.0.2.5"  # reverted to OOB despite the blow-up (not left on primary)
+    assert sim.patches[-1] == "192.0.2.5"  # last write was the guaranteed revert
+    assert (await _load(device_id)).active_address == ActiveAddress.oob.value  # state unchanged
+
+
+async def test_proactive_oob_flip_reverts_to_primary_when_probe_blows_up(adapter_client, monkeypatch):
+    """A proactive OOB health flip-probe that raises must still flip NSO back to primary."""
+    sim = _NsoSim(address="10.0.0.1")  # physically on primary
+    sim.raise_on_connect_addr = "192.0.2.5"  # the OOB health probe blows up after the flip
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    device_id = await _seed(active="primary")
+    await _arm(device_id, primary_due=False, oob_due=True)  # only the proactive OOB probe is due
+
+    await sched._scheduled_failover_probe()
+
+    assert sim.address == "10.0.0.1"  # flipped back to primary despite the blow-up
+    assert sim.patches[-1] == "10.0.0.1"  # last write was the guaranteed flip-back
+    assert (await _load(device_id)).active_address == ActiveAddress.primary.value
+
+
+async def test_manual_override_clears_once_address_restored(adapter_client, monkeypatch):
+    """A stale manual_override flag clears as soon as NSO is back on a managed address."""
+    sim = _NsoSim(address="10.0.0.1")  # operator restored the managed (primary) address
+    sim.always_reachable = True
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    device_id = await _seed(active="primary")
+    async for db in get_session():
+        row = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device_id))).scalar_one()
+        row.manual_override = True  # left over from an earlier foreign-address detection
+        await db.commit()
+        break
+    await _arm(device_id, primary_due=True, oob_due=False)
+
+    await sched._scheduled_failover_probe()
+
+    assert (await _load(device_id)).manual_override is False  # cleared (current address is managed)

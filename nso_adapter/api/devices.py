@@ -10,7 +10,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import api_error
-from nso_adapter.store.models import DbInterface, Device, InterfaceAttrState, Job, ManagedScope, SyncState
+from nso_adapter.store.models import (
+    DbInterface,
+    Device,
+    DeviceFailover,
+    InterfaceAttrState,
+    Job,
+    ManagedScope,
+    SyncState,
+)
 
 router = APIRouter(prefix="/api/v1/devices", tags=["devices"])
 
@@ -51,6 +59,31 @@ def _device_out(d: Device) -> dict:
         "last_sync_at": d.last_sync_at.isoformat() + "Z" if d.last_sync_at else None,
         "last_sync_status": d.last_sync_status.value if d.last_sync_status else None,
     }
+
+
+def _iso(dt) -> str | None:
+    return dt.isoformat() + "Z" if dt else None
+
+
+def _failover_out(fo: DeviceFailover | None) -> dict | None:
+    """Serialize the device's failover status for the plugin's NSO tab, or None if not managed."""
+    if fo is None:
+        return None
+    return {
+        "active_address": fo.active_address,
+        "primary_ip": fo.primary_ip,
+        "oob_ip": fo.oob_ip,
+        "last_probe_result": fo.last_probe_result,
+        "last_probe_at": _iso(fo.last_probe_at),
+        "oob_healthy": fo.oob_healthy,
+        "oob_health_checked_at": _iso(fo.oob_health_checked_at),
+        "last_switch_at": _iso(fo.last_switch_at),
+        "manual_override": fo.manual_override,
+    }
+
+
+async def _load_failover(device_id: int, db: AsyncSession) -> DeviceFailover | None:
+    return (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device_id))).scalar_one_or_none()
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -166,6 +199,7 @@ async def get_device(device_id: int, db: AsyncSession = Depends(get_db)):
     out = _device_out(device)
     out["scope"] = {"attributes": scope_attrs}
     out["last_job_id"] = await _last_job_id(device_id, db)
+    out["failover"] = _failover_out(await _load_failover(device_id, db))
     return out
 
 
