@@ -141,8 +141,11 @@ async def resolve_capability_key(db: AsyncSession, nso_client: NsoClient, device
     """
     if refresh:
         return await refresh_device_capability(db, nso_client, device.nso_device_name, device)
-    if device.ned_id and device.sw_version:
-        return {"ned_id": device.ned_id, "sw_version": device.sw_version, "count": 0}
+    # ned_id alone identifies the key — sw_version may legitimately be "" (NEDs like Nokia timos
+    # report no version, and their matrix rows are stored under sw_version=""). Requiring a
+    # non-empty sw_version here left those devices reading 'unknown' forever even after a probe.
+    if device.ned_id:
+        return {"ned_id": device.ned_id, "sw_version": device.sw_version or "", "count": 0}
     return {}
 
 

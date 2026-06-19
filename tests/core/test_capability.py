@@ -132,6 +132,41 @@ async def test_refresh_persists_key_then_cache_only_resolve(adapter_client, monk
         break
 
 
+async def test_empty_sw_version_resolves_on_cache_read(adapter_client, monkeypatch):  # noqa: F811
+    """A NED that reports no software version (e.g. Nokia timos) stores its rows under
+    ``sw_version=''`` and must still resolve on the cheap panel read — otherwise its capability
+    reads 'unknown' forever even after a probe (the panel can't find the coverage row)."""
+    from nso_adapter.core import capability
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device
+    from tests.conftest import seed_device
+
+    device_id = await seed_device(nso_device_name="nokia-ra1")
+
+    async def fake_probe(_client, _name):
+        return {
+            "ned-id": "timos-nc-23.10",
+            "sw-version": "",  # Nokia NED reports no version
+            "element": [{"scope": "coverage", "name": "timos-nc-23.10", "status": "unknown", "detail": ""}],
+        }
+
+    monkeypatch.setattr(capability.actions, "capability_probe", fake_probe)
+
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        info = await capability.resolve_capability_key(db, object(), device, refresh=True)
+        assert info["ned_id"] == "timos-nc-23.10" and info["sw_version"] == ""
+
+        refreshed = await db.get(Device, device_id)
+        # The cache-only read MUST resolve the (ned, "") key, not bail to {} → 'unknown'.
+        cached = await capability.resolve_capability_key(db, object(), refreshed, refresh=False)
+        assert cached == {"ned_id": "timos-nc-23.10", "sw_version": "", "count": 0}
+        # and the coverage row is findable → 'unassessed', not 'unknown'.
+        rows = await capability.get_device_capability(db, "timos-nc-23.10", "")
+        assert capability.coverage_unknown(rows)
+        break
+
+
 def _row(scope, name, status, source="probe", detail=""):
     from nso_adapter.store.models import DeviceCapability
 
