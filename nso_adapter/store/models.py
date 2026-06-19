@@ -56,6 +56,7 @@ class JobType(str, enum.Enum):
     connect = "connect"
     apply = "apply"  # Phase 2: push accepted intent to NSO
     removal = "removal"  # async PUT-replace to revert removed intent (see core/removal.py)
+    provision = "provision"  # async device onboarding into NSO (see core/onboarding.provision_nso_device)
 
 
 class SyncState(str, enum.Enum):

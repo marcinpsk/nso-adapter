@@ -57,6 +57,45 @@ async def enqueue_job(
     return job, True
 
 
+async def get_active_provision_job(nso_instance: str, device_name: str, db: AsyncSession) -> Job | None:
+    """Return the queued/running provision job for (instance, device_name), or None.
+
+    Provision jobs run *before* the adapter ``Device`` row exists, so they carry no
+    ``device_id`` — the de-dup key lives in ``Job.context`` instead. Scoped to the
+    two context fields that uniquely identify the in-flight onboarding.
+    """
+    result = await db.execute(
+        select(Job).where(
+            Job.job_type == JobType.provision,
+            Job.status.in_([JobStatus.queued, JobStatus.running]),
+        )
+    )
+    for job in result.scalars().all():
+        ctx = job.context or {}
+        if ctx.get("nso_instance") == nso_instance and ctx.get("device_name") == device_name:
+            return job
+    return None
+
+
+async def enqueue_provision_job(params: dict, db: AsyncSession) -> tuple[Job, bool]:
+    """Create a queued provision (device-onboarding) job.  Returns (job, created).
+
+    Unlike :func:`enqueue_job`, a provision runs before the device exists, so the job
+    has ``device_id=None`` and carries its parameters in ``context``; de-dup is on
+    (nso_instance, device_name) via :func:`get_active_provision_job` so a double-click
+    returns the in-flight job (created=False) instead of provisioning twice.
+    """
+    active = await get_active_provision_job(params["nso_instance"], params["device_name"], db)
+    if active:
+        return active, False
+
+    job = Job(job_type=JobType.provision, device_id=None, status=JobStatus.queued, context=params)
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    return job, True
+
+
 # ── Job runners ───────────────────────────────────────────────────────────────
 
 
@@ -167,10 +206,54 @@ async def _run_removal(job_id: int, device_id: int) -> None:
     await run_removal(job_id, device_id)
 
 
+async def _run_provision(job_id: int, device_id: int | None) -> None:
+    """Run a queued device-onboarding job from its stored ``context`` parameters.
+
+    Provision has no ``device_id`` (the adapter Device row may be created mid-job);
+    the parameters live in ``Job.context``. The whole create→fetch-keys→unlock→
+    sync-from sequence can be slow (probe-then-OOB-bootstrap + a full sync-from), so it
+    runs under the same 600s guard as the other long jobs. The provision core never
+    raises for a blocking step — it returns ``{ok: False, steps: [...]}`` — so the job
+    *succeeds* (the work ran) and the caller inspects ``result.ok``; only an unexpected
+    crash or the timeout marks the job failed.
+    """
+    from nso_adapter.core.onboarding import provision_nso_device
+    from nso_adapter.store.db import get_session
+
+    _JOB_TIMEOUT = 600.0
+    logger.info("job.provision.start", job_id=job_id)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        if not job:
+            return
+        params = dict(job.context or {})
+        job.status = JobStatus.running
+        await db.commit()
+        try:
+            result = await asyncio.wait_for(provision_nso_device(db, **params), timeout=_JOB_TIMEOUT)
+            job.status = JobStatus.succeeded
+            job.result = result
+            # Link the job to the device it created so history/lookup works post-onboard.
+            if result.get("device_id") is not None:
+                job.device_id = result["device_id"]
+        except TimeoutError:
+            logger.error("job.provision.timeout", job_id=job_id, timeout=_JOB_TIMEOUT)
+            job.status = JobStatus.failed
+            job.error = {"code": "timeout", "message": f"Provision exceeded {int(_JOB_TIMEOUT)}s timeout", "detail": {}}
+        except Exception as exc:
+            logger.exception("job.provision.failed", job_id=job_id, error=repr(exc))
+            job.status = JobStatus.failed
+            job.error = {"code": "internal", "message": repr(exc), "detail": {}}
+        finally:
+            await db.commit()
+
+
 _JOB_RUNNERS = {
     JobType.sync: _run_sync,
     JobType.detect_drift: _run_detect_drift,
     JobType.connect: _run_connect,
     JobType.apply: _run_apply,
     JobType.removal: _run_removal,
+    JobType.provision: _run_provision,
 }

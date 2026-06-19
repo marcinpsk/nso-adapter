@@ -134,34 +134,39 @@ class DeviceProvision(BaseModel):
     oob_ip: str | None = None  # mgmt-IP failover fallback — bootstrap over OOB if primary is unreachable
 
 
-@router.post("/provision", dependencies=[Depends(verify_token)])
+@router.post("/provision", status_code=202, dependencies=[Depends(verify_token)])
 async def provision_device(body: DeviceProvision, db: AsyncSession = Depends(get_db)):
-    """Provision a device INTO NSO, then create the adapter mapping.
+    """Enqueue a device-onboarding job and return immediately.
 
-    Steps: create node → fetch-host-keys → unlock → sync-from. Returns the step-by-step
-    result (200 even on a blocking step failure — inspect ``ok``/``steps``; the device is
-    left for retry).
+    Provisioning (create node → fetch-host-keys → unlock → sync-from) can be slow — it may
+    probe an unreachable primary, bootstrap over OOB, then run a full sync-from — and used to
+    run inline, overrunning the plugin client's 30s read timeout. It now runs as a background
+    ``provision`` job; this endpoint validates the instance and returns ``202`` with a
+    ``job_id`` the caller polls (``GET /api/v1/jobs/{id}``). A double-submit for the same
+    (instance, device_name) returns the in-flight job rather than provisioning twice.
     """
-    from nso_adapter.core.onboarding import provision_nso_device
+    from nso_adapter.config import get_config
+    from nso_adapter.core.jobs import enqueue_provision_job
 
-    try:
-        result = await provision_nso_device(
-            db,
-            nso_instance=body.nso_instance,
-            device_name=body.device_name,
-            address=body.address,
-            ned_id=body.ned_id,
-            authgroup=body.authgroup,
-            netbox_device_id=body.netbox_device_id,
-            ned_type=body.ned_type,
-            port=body.port,
-            admin_state=body.admin_state,
-            do_sync=body.sync,
-            oob_ip=body.oob_ip,
-        )
-    except ValueError as exc:
-        raise api_error(422, "validation_error", str(exc))
-    return result
+    known = {inst.name for inst in get_config().nso_instances}
+    if body.nso_instance not in known:
+        raise api_error(422, "validation_error", f"NSO instance {body.nso_instance!r} not found in config")
+
+    params = {
+        "nso_instance": body.nso_instance,
+        "device_name": body.device_name,
+        "address": body.address,
+        "ned_id": body.ned_id,
+        "authgroup": body.authgroup,
+        "netbox_device_id": body.netbox_device_id,
+        "ned_type": body.ned_type,
+        "port": body.port,
+        "admin_state": body.admin_state,
+        "do_sync": body.sync,
+        "oob_ip": body.oob_ip,
+    }
+    job, _created = await enqueue_provision_job(params, db)
+    return {"job_id": str(job.id), "nso_device_name": body.device_name, "status": job.status.value}
 
 
 @router.get("/by-nso", dependencies=[Depends(verify_token)])
