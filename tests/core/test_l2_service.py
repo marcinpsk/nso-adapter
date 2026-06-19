@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Tests for L2-service refresh + SSE handler (M37 P1)."""
+"""Tests for L2-service refresh + SSE handler."""
 
 from __future__ import annotations
 

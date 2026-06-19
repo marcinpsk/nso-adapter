@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M36: GET /api/v1/devices/{id}/subinterface + PUT /subinterface-intent."""
+"""GET /api/v1/devices/{id}/subinterface + PUT /subinterface-intent."""
 
 from __future__ import annotations
 

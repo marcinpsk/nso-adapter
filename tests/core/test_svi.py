@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M35: core/svi.py — refresh + full-replace."""
+"""core/svi.py — refresh + full-replace."""
 
 from __future__ import annotations
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""LAG config apply — writes accepted LACP/LAG intent to the lag-reconciler service (M33)."""
+"""LAG config apply — writes accepted LACP/LAG intent to the lag-reconciler service."""
 
 from __future__ import annotations
 

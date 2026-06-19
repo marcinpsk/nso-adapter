@@ -378,7 +378,7 @@ async def test_apply_interface_ips_sets_vrf():
 
 @pytest.mark.asyncio
 async def test_apply_interface_ips_nokia_routed_context():
-    """Nokia routed-interface metadata (M27) is included in the PATCH so the reconciler
+    """Nokia routed-interface metadata is included in the PATCH so the reconciler
     targets the router/service interface, not the port."""
     client = _make_nso_client()
     _mock_http_ctx(client, _httpx_response(204))
@@ -440,7 +440,7 @@ async def test_apply_interface_ips_nso_error_raises():
 
 @pytest.mark.asyncio
 async def test_apply_switchport_config_builds_patch_body():
-    """apply_switchport_config PATCHes switchport-reconciler with the interface list (M34)."""
+    """apply_switchport_config PATCHes switchport-reconciler with the interface list."""
     import json
 
     from nso_adapter.nso.apply import apply_switchport_config

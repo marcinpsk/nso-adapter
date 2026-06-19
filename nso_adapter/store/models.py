@@ -470,7 +470,7 @@ class LagMember(Base):
 
 
 class LagBundleConfig(Base):
-    """Read-mirror of LACP bundle configuration parameters from NSO (M33)."""
+    """Read-mirror of LACP bundle configuration parameters from NSO."""
 
     __tablename__ = "lag_bundle_config"
     __table_args__ = (UniqueConstraint("device_id", "lag_id", name="uq_lag_bundle_config_device_lag"),)
@@ -495,7 +495,7 @@ class LagBundleConfig(Base):
 
 
 class LagMemberConfig(Base):
-    """Read-mirror of LACP member port parameters from NSO (M33)."""
+    """Read-mirror of LACP member port parameters from NSO."""
 
     __tablename__ = "lag_member_config"
     __table_args__ = (UniqueConstraint("lag_bundle_id", "interface_name", name="uq_lag_member_config_bundle_iface"),)
@@ -512,7 +512,7 @@ class LagMemberConfig(Base):
 
 
 class DeviceVlan(Base):
-    """Read mirror of a device's VLAN database (M34). Full-replace per refresh."""
+    """Read mirror of a device's VLAN database. Full-replace per refresh."""
 
     __tablename__ = "device_vlan"
     __table_args__ = (UniqueConstraint("device_id", "vlan_id", name="uq_devicevlan_identity"),)
@@ -529,7 +529,7 @@ class DeviceVlan(Base):
 
 
 class VlanIntent(Base):
-    """Write-path intent for a VLAN-database entry (vid + name) accepted by the operator (M34)."""
+    """Write-path intent for a VLAN-database entry (vid + name) accepted by the operator."""
 
     __tablename__ = "vlan_intent"
     __table_args__ = (UniqueConstraint("device_id", "vlan_id", name="uq_vlanintent_identity"),)
@@ -548,7 +548,7 @@ class VlanIntent(Base):
 
 
 class DeviceSwitchport(Base):
-    """Read mirror of a device's per-interface L2 switchport state (M34)."""
+    """Read mirror of a device's per-interface L2 switchport state."""
 
     __tablename__ = "device_switchport"
     __table_args__ = (UniqueConstraint("device_id", "interface_name", name="uq_deviceswitchport_identity"),)
@@ -573,7 +573,7 @@ class DeviceSwitchport(Base):
 
 
 class DeviceSwitchportTaggedVlan(Base):
-    """Join table: tagged VLANs on a trunk switchport (M34)."""
+    """Join table: tagged VLANs on a trunk switchport."""
 
     __tablename__ = "device_switchport_tagged_vlan"
     __table_args__ = (UniqueConstraint("switchport_id", "vlan_id", name="uq_swtaggedvlan_identity"),)
@@ -771,7 +771,7 @@ class SnmpSystemInfo(Base):
 
 
 # ---------------------------------------------------------------------------
-# SNMP intent write-path models (M11 B2)
+# SNMP intent write-path models
 # ---------------------------------------------------------------------------
 
 
@@ -913,7 +913,7 @@ class StaticRouteIntent(Base):
 
 
 class DeviceSvi(Base):
-    """Read mirror of one L3 VLAN interface (SVI / IRB) — M35, read-only.
+    """Read mirror of one L3 VLAN interface (SVI / IRB) —, read-only.
 
     No IPs (those ride interface-ip). One row per (device, interface-name).
     """
@@ -957,7 +957,7 @@ class SviIntent(Base):
 
 
 class DeviceSubinterface(Base):
-    """Read mirror of one dot1q L3 subinterface — M36, read-only.
+    """Read mirror of one dot1q L3 subinterface —, read-only.
 
     No IPs (those ride interface-ip). One row per (device, interface-name). The
     dot1q tag is interface-local encapsulation, deliberately NOT a foreign key.
@@ -1009,7 +1009,7 @@ class DeviceInterfaceMtu(Base):
 
 
 class SubinterfaceIntent(Base):
-    """Write-path intent for a dot1q L3 subinterface accepted by the operator (M36)."""
+    """Write-path intent for a dot1q L3 subinterface accepted by the operator."""
 
     __tablename__ = "subinterface_intent"
     __table_args__ = (UniqueConstraint("device_id", "interface_name", name="uq_subifintent_identity"),)
@@ -1055,7 +1055,7 @@ class LoggingHostIntent(Base):
 
 
 class DeviceL2Sap(Base):
-    """Read mirror of one Nokia L2 SAP (epipe/vpls service member) — M37 P1, read-only.
+    """Read mirror of one Nokia L2 SAP (epipe/vpls service member) —, read-only.
 
     One flat row per SAP, carrying its parent service. The dot1q tag is per-SAP
     interface-local encap parsed from the sap-id ``port:tag[.inner]`` (not a device VLAN).
@@ -1082,7 +1082,7 @@ class DeviceL2Sap(Base):
 
 
 class L2SapIntent(Base):
-    """Write-path intent for one Nokia L2 SAP accepted by the NetBox operator (M37 P2b).
+    """Write-path intent for one Nokia L2 SAP accepted by the NetBox operator.
 
     Mirrors DeviceL2Sap's identity but carries the apply lifecycle. SAP-only:
     the apply path adds/adopts the SAP under an EXISTING epipe/vpls service.
@@ -1130,7 +1130,7 @@ class DeviceIsisProcess(Base):
     domain_auth_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     domain_auth_present: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     domain_auth_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    # M33 P1: cross-vendor instance scalars (read mirror of netbox_routing columns).
+    # cross-vendor instance scalars (read mirror of netbox_routing columns).
     spf_initial_wait: Mapped[int | None] = mapped_column(Integer, nullable=True)
     spf_max_wait: Mapped[int | None] = mapped_column(Integer, nullable=True)
     lsp_initial_wait: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -1148,11 +1148,11 @@ class DeviceIsisProcess(Base):
     reference_bandwidth: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # EAV long-tail mirror: {key: value} for ISISSettingChoices keys.
     settings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    # M33 P2: per-level child rows [{level, default-metric, wide-metrics-only, ...}]
+    # per-level child rows [{level, default-metric, wide-metrics-only,...}]
     # and the segment-routing object {enabled, prefix-sid-range, ...}.
     levels: Mapped[list | None] = mapped_column(JSON, nullable=True)
     segment_routing: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    # M33 P2b: flex-algo child rows [{algo-id, metric-type, priority, ...}].
+    # flex-algo child rows [{algo-id, metric-type, priority,...}].
     flex_algos: Mapped[list | None] = mapped_column(JSON, nullable=True)
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
@@ -1186,14 +1186,14 @@ class DeviceIsisInterface(Base):
     hello_auth_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     hello_auth_present: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     bfd_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)  # BFD enabled for IS-IS on this iface
-    # M33 P1: per-interface scalars (read mirror of netbox_routing columns).
+    # per-interface scalars (read mirror of netbox_routing columns).
     csnp_interval: Mapped[int | None] = mapped_column(Integer, nullable=True)
     retransmit_interval: Mapped[int | None] = mapped_column(Integer, nullable=True)
     lsp_interval: Mapped[int | None] = mapped_column(Integer, nullable=True)
     mesh_group: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # EAV long-tail mirror: {key: value} for ISISSettingChoices keys.
     settings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    # M33 P2: per-level child rows [{level, metric, hello-interval, ...}].
+    # per-level child rows [{level, metric, hello-interval,...}].
     levels: Mapped[list | None] = mapped_column(JSON, nullable=True)
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
@@ -1292,7 +1292,7 @@ class IsisInterfaceIntent(Base):
 
 
 class IsisProcessIntent(Base):
-    """Write-path intent for an IS-IS process accepted by the NetBox operator (M18)."""
+    """Write-path intent for an IS-IS process accepted by the NetBox operator."""
 
     __tablename__ = "isis_process_intent"
     __table_args__ = (UniqueConstraint("device_id", "process_tag", name="uq_isisprocessintent_identity"),)
@@ -1443,7 +1443,7 @@ class DeviceBgpPeerAddressFamily(Base):
     )
     af: Mapped[str] = mapped_column(String(32), nullable=False)  # e.g. "ipv4-unicast"
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    # M17 read-path: per-neighbor-AF policy references from device config.
+    # read-path: per-neighbor-AF policy references from device config.
     routemap_in: Mapped[str | None] = mapped_column(String(255), nullable=True)
     routemap_out: Mapped[str | None] = mapped_column(String(255), nullable=True)
     prefixlist_in: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -1500,7 +1500,7 @@ class DeviceBgpPeerGroupAddressFamily(Base):
 
 
 # ---------------------------------------------------------------------------
-# BGP intent tables (M16 write path)
+# BGP intent tables (write path)
 # ---------------------------------------------------------------------------
 
 
@@ -1610,7 +1610,7 @@ class BgpPeerAfIntent(Base):
     peer: Mapped[BgpPeerIntent] = relationship("BgpPeerIntent", back_populates="peer_address_families")
 
 
-# ── Route-policy read-mirror (M17 A2) ─────────────────────────────────────────
+# ── Route-policy read-mirror (A2) ─────────────────────────────────────────
 
 
 class DeviceRoutePolicyPrefixList(Base):
@@ -1808,7 +1808,7 @@ class RoutePolicyObjectIntent(Base):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# M19 OSPF models
+# OSPF models
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -1910,7 +1910,7 @@ class OspfInterfaceIntent(Base):
     device: Mapped[Device] = relationship("Device", back_populates="ospf_interface_intents")
 
 
-# M20 Redistribution ──────────────────────────────────────────────────────────
+# Redistribution ──────────────────────────────────────────────────────────
 
 
 class DeviceRedistribution(Base):

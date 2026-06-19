@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""dot1q subinterface read mirror (M36).
+"""dot1q subinterface read mirror.
 
 - refresh_subinterface_for_device() — read the device's subinterface oper-data
   from NSO and full-replace the device_subinterface rows.

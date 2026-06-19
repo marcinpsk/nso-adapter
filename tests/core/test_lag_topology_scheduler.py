@@ -396,7 +396,7 @@ async def test_scheduled_l2_service_refresh_refreshes_all_devices(adapter_client
     ],
 )
 async def test_l2l3_family_refresh_refreshes_all_devices(adapter_client, monkeypatch, scheduled_fn, refresh_target):
-    """M34/M35/M36: the L2/L3 interface-family poll jobs refresh every managed device."""
+    """//: the L2/L3 interface-family poll jobs refresh every managed device."""
     async for db in get_session():
         db.add_all(
             [

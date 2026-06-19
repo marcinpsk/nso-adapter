@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""NSO reconcile-commit apply operations (Phase 2, M4/M5).
+"""NSO reconcile-commit apply operations (Phase 2, /).
 
 Uses NSO RESTCONF transactions with the ``reconcile`` commit option so that
 the interface-reconciler service adopts pre-existing brownfield config instead
@@ -11,7 +11,7 @@ Protocol summary:
 2. PATCH /restconf/data/interface-reconciler:interface-config  with intent
 3. POST  /restconf/operations/tailf-netconf-transactions:commit with reconcile option
 
-For simplicity in Phase 2 M5 we use the NSO RESTCONF PATCH directly on the
+For simplicity in Phase 2 we use the NSO RESTCONF PATCH directly on the
 interface-reconciler service path with the native commit API.
 """
 
@@ -334,7 +334,7 @@ async def apply_interface_ips(
     Builds a full interface-reconciler PATCH body from the supplied rows,
     one PATCH call per interface covering all IPv4, IPv6, and VRF intent.
 
-    ``kind``/``service``/``parent_binding``/``encap_tag`` carry the Nokia M27
+    ``kind``/``service``/``parent_binding``/``encap_tag`` carry the Nokia
     routed-interface context so the reconciler writes the IP to the SR OS
     ``configure router Base`` / ``configure service {ies,vprn} <service>``
     interface (bound to its port) instead of to the port.  They are ignored by
@@ -352,7 +352,7 @@ async def apply_interface_ips(
     if vrf:
         entry["vrf"] = vrf
 
-    # Nokia routed-interface context (M27 apply): route the IP to the router/service
+    # Nokia routed-interface context (apply): route the IP to the router/service
     # interface, not the port. Only emitted when kind is set (Nokia L3 interfaces).
     if kind:
         entry["kind"] = kind
@@ -428,13 +428,13 @@ _STATIC_ROUTE_SERVICE_PATH = "/restconf/data/static-route-reconciler:static-rout
 # RESTCONF path to the logging-reconciler service list (remote syslog write path)
 _LOGGING_SERVICE_PATH = "/restconf/data/logging-reconciler:logging-config"
 
-# RESTCONF path to the svi-reconciler service list (SVI/IRB write path, M35)
+# RESTCONF path to the svi-reconciler service list (SVI/IRB write path)
 _SVI_SERVICE_PATH = "/restconf/data/svi-reconciler:svi-config"
 
-# RESTCONF path to the subinterface-reconciler service list (dot1q write path, M36)
+# RESTCONF path to the subinterface-reconciler service list (dot1q write path)
 _SUBIF_SERVICE_PATH = "/restconf/data/subinterface-reconciler:subif-config"
 
-# RESTCONF path to the vlan-reconciler service list (VLAN-database write path, M34)
+# RESTCONF path to the vlan-reconciler service list (VLAN-database write path)
 _VLAN_SERVICE_PATH = "/restconf/data/vlan-reconciler:vlan-config"
 
 # RESTCONF path to the bfd-reconciler service list (per-interface BFD write path)
@@ -443,7 +443,7 @@ _BFD_SERVICE_PATH = "/restconf/data/bfd-reconciler:bfd-config"
 # RESTCONF path to the mtu-reconciler service list (per-interface MTU write path, Phase 2b)
 _MTU_SERVICE_PATH = "/restconf/data/mtu-reconciler:mtu-config"
 
-# RESTCONF path to the l2-sap-reconciler service list (M37 P2b)
+# RESTCONF path to the l2-sap-reconciler service list
 _L2_SAP_SERVICE_PATH = "/restconf/data/l2-sap-reconciler:l2-sap-config"
 
 _LAG_SERVICE_PATH = "/restconf/data/lag-reconciler:lag-config"
@@ -623,7 +623,7 @@ async def apply_svi_config(
     replace: bool = False,
     dry_run: bool = False,
 ) -> str | None:
-    """Write the SVI/IRB intent snapshot for a device to NSO (M35).
+    """Write the SVI/IRB intent snapshot for a device to NSO.
 
     Materialises interface VlanN / interfaces irb unit N via the svi-reconciler;
     IPs ride the interface-reconciler. Reconcile mode (brownfield adoption).
@@ -656,7 +656,7 @@ async def apply_subinterface_config(
     replace: bool = False,
     dry_run: bool = False,
 ) -> str | None:
-    """Write the dot1q subinterface intent snapshot for a device to NSO (M36).
+    """Write the dot1q subinterface intent snapshot for a device to NSO.
 
     Materialises <parent>.<unit> (encapsulation dot1Q + vrf forwarding) / Junos
     unit vlan-id via the subinterface-reconciler; IPs ride the interface-reconciler.
@@ -695,7 +695,7 @@ async def apply_vlan_config(
     replace: bool = False,
     dry_run: bool = False,
 ) -> str | None:
-    """Write the VLAN-database intent snapshot for a device to NSO (M34 write path).
+    """Write the VLAN-database intent snapshot for a device to NSO (write path).
 
     Materialises 'vlan <id> / name <name>' (IOS) / 'vlans <name> vlan-id <id>'
     (Junos) via the vlan-reconciler. Reconcile mode (brownfield adoption).
@@ -806,7 +806,7 @@ async def apply_l2_saps(
     replace: bool = False,
     dry_run: bool = False,
 ) -> str | None:
-    """Write Nokia L2 SAP intent for a single device to NSO (M37 P2b).
+    """Write Nokia L2 SAP intent for a single device to NSO.
 
     Builds a full l2-sap-reconciler body from the supplied rows and commits in
     reconcile mode so pre-existing SAPs are adopted. The NSO service adds each SAP
@@ -848,7 +848,7 @@ async def apply_lag_config(
     replace: bool = False,
     dry_run: bool = False,
 ) -> str | None:
-    """Write LACP/LAG bundle intent for a single device to NSO (M33).
+    """Write LACP/LAG bundle intent for a single device to NSO.
 
     Builds a full lag-reconciler body from the supplied bundle dicts and commits in
     reconcile mode so pre-existing LAGs are adopted. ``replace=True`` PUT-replaces the
@@ -880,7 +880,7 @@ async def apply_switchport_config(
     replace: bool = False,
     dry_run: bool = False,
 ) -> str | None:
-    """Write L2 switchport intent for a single device to NSO (M34).
+    """Write L2 switchport intent for a single device to NSO.
 
     Builds a full switchport-reconciler body and commits in reconcile mode. Each
     interface dict uses YANG-style keys: ``interface-name`` (key), optional ``mode``

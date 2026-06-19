@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M36: DeviceSubinterface + SubinterfaceIntent ORM models + unique constraints."""
+"""DeviceSubinterface + SubinterfaceIntent ORM models + unique constraints."""
 
 from __future__ import annotations
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the DeviceL2Sap ORM model (M37 P1)."""
+"""Unit tests for the DeviceL2Sap ORM model."""
 
 from datetime import UTC, datetime
 

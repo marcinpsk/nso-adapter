@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M35: GET /api/v1/devices/{id}/svi."""
+"""GET /api/v1/devices/{id}/svi."""
 
 from __future__ import annotations
 

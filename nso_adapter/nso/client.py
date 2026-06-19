@@ -154,7 +154,7 @@ class NsoClient:
             return entries[0] if entries else None
 
     async def get_svi(self, device_name: str) -> dict | None:
-        """Return the svi entry for *device_name* from the NSO package oper-data (M35).
+        """Return the svi entry for *device_name* from the NSO package oper-data.
 
         Returns None if the device has no SVI/IRB data (404).
         Raises httpx.HTTPStatusError on other errors.
@@ -170,7 +170,7 @@ class NsoClient:
             return entries[0] if entries else None
 
     async def get_subinterface(self, device_name: str) -> dict | None:
-        """Return the subinterface entry for *device_name* from the NSO oper-data (M36).
+        """Return the subinterface entry for *device_name* from the NSO oper-data.
 
         Returns None if the device has no dot1q subinterface data (404).
         Raises httpx.HTTPStatusError on other errors.
@@ -218,7 +218,7 @@ class NsoClient:
             return entries[0] if entries else None
 
     async def get_vlan_database(self, device_name: str) -> dict | None:
-        """Return the vlan-database entry for *device_name* (None on 404). M34."""
+        """Return the vlan-database entry for *device_name* (None on 404).."""
         url = f"{self._base}/restconf/data/network-state-export:vlan-database/device={device_name}"
         async with self._client() as c:
             resp = await c.get(url)
@@ -230,7 +230,7 @@ class NsoClient:
             return entries[0] if entries else None
 
     async def get_switchport(self, device_name: str) -> dict | None:
-        """Return the switchport entry for *device_name* (None on 404). M34."""
+        """Return the switchport entry for *device_name* (None on 404).."""
         url = f"{self._base}/restconf/data/network-state-export:switchport/device={device_name}"
         async with self._client() as c:
             resp = await c.get(url)

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M34: GET /api/v1/devices/{id}/vlan-database and /switchport."""
+"""GET /api/v1/devices/{id}/vlan-database and /switchport."""
 
 from __future__ import annotations
 
@@ -95,7 +95,7 @@ async def apply_switchport(
 
 
 # ---------------------------------------------------------------------------
-# PUT /{device_id}/vlan-intent  (M34 VLAN-database write path — deferred apply)
+# PUT /{device_id}/vlan-intent (VLAN-database write path — deferred apply)
 # ---------------------------------------------------------------------------
 
 

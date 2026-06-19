@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""SVI/IRB read mirror (M35).
+"""SVI/IRB read mirror.
 
 - refresh_svi_for_device() — read the device's svi oper-data from NSO and
   full-replace the device_svi rows.

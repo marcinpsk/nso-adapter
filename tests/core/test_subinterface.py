@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M36: core/subinterface.py — refresh + full-replace."""
+"""core/subinterface.py — refresh + full-replace."""
 
 from __future__ import annotations
 

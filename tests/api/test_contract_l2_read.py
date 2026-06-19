@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Contract tests — producer side of the L2/L3-interface read-mirrors (M34–M36).
+"""Contract tests — producer side of the L2/L3-interface read-mirrors.
 
 Covers GET /vlan-database, /switchport, /svi, /subinterface — the four read-only
 endpoints the plugin consumes in vlan_reconciler / svi_reconciler /
@@ -8,7 +8,7 @@ subinterface_reconciler. These four share a trait the routing endpoints don't: t
 response has **no** top-level ``last_refreshed_at``/``refresh_source`` and every level
 emits a **fixed** key set (no optional/omitted keys).
 
-Canonical contract: ``docs/api-contract.md`` (the M34–M36 sections).
+Canonical contract: ``docs/api-contract.md`` (the sections).
 Mirror (consumer side): ``netbox-nso-plugin/.../tests/test_contract_l2_read.py`` — the
 ``*_KEYS`` sets MUST stay identical across both files.
 """

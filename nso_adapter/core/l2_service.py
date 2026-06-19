@@ -6,7 +6,7 @@ Entry points:
 - refresh_l2_services_for_device() — on-demand refresh (scheduler)
 - handle_l2_service_change()        — SSE config-change hook (make_handler)
 
-Read-only mirror (M37 P1): one flat DeviceL2Sap row per SAP, carrying its parent service.
+Read-only mirror: one flat DeviceL2Sap row per SAP, carrying its parent service.
 """
 
 from __future__ import annotations

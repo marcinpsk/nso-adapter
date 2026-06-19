@@ -517,8 +517,8 @@ async def _scheduled_capability_refresh() -> None:
 async def _refresh_all_devices(refresh_fn, label: str) -> None:
     """Run *refresh_fn(db, device, nso_client, refresh_source='poll')* for every NSO device.
 
-    Shared body for the L2/L3 interface-family poll jobs (M34 VLAN-db + switchport,
-    M35 SVI/IRB, M36 dot1q subinterface), which would otherwise be byte-for-byte
+    Shared body for the L2/L3 interface-family poll jobs (VLAN-db + switchport,
+     SVI/IRB, dot1q subinterface), which would otherwise be byte-for-byte
     copies of each other.
     """
     from sqlalchemy import select
@@ -544,28 +544,28 @@ async def _refresh_all_devices(refresh_fn, label: str) -> None:
 
 
 async def _scheduled_vlan_refresh() -> None:
-    """Periodic fallback: refresh the VLAN database for all managed devices (M34)."""
+    """Periodic fallback: refresh the VLAN database for all managed devices."""
     from nso_adapter.core.vlan import refresh_vlan_database_for_device
 
     await _refresh_all_devices(refresh_vlan_database_for_device, "vlan")
 
 
 async def _scheduled_switchport_refresh() -> None:
-    """Periodic fallback: refresh L2 switchport config for all managed devices (M34)."""
+    """Periodic fallback: refresh L2 switchport config for all managed devices."""
     from nso_adapter.core.vlan import refresh_switchport_for_device
 
     await _refresh_all_devices(refresh_switchport_for_device, "switchport")
 
 
 async def _scheduled_svi_refresh() -> None:
-    """Periodic fallback: refresh SVIs/IRBs for all managed devices (M35)."""
+    """Periodic fallback: refresh SVIs/IRBs for all managed devices."""
     from nso_adapter.core.svi import refresh_svi_for_device
 
     await _refresh_all_devices(refresh_svi_for_device, "svi")
 
 
 async def _scheduled_subinterface_refresh() -> None:
-    """Periodic fallback: refresh dot1q subinterfaces for all managed devices (M36)."""
+    """Periodic fallback: refresh dot1q subinterfaces for all managed devices."""
     from nso_adapter.core.subinterface import refresh_subinterface_for_device
 
     await _refresh_all_devices(refresh_subinterface_for_device, "subinterface")

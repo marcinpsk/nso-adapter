@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Tests for GET /api/v1/devices/{id}/bgp-config (M15 A3)."""
+"""Tests for GET /api/v1/devices/{id}/bgp-config (A3)."""
 
 from __future__ import annotations
 
@@ -152,7 +152,7 @@ async def test_bgp_config_password_included_when_set(adapter_client):
     assert peer["password"] == "bgpS3cr3t"
 
 
-# ── M17 policy refs ───────────────────────────────────────────────────────────
+# ── policy refs ───────────────────────────────────────────────────────────
 
 
 @pytest.mark.anyio

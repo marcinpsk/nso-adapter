@@ -260,7 +260,7 @@ async def test_put_ip_intent_unknown_interface_skipped(adapter_client):
 
 
 async def test_put_ip_intent_greenfield_routed_creates_interface(adapter_client):
-    """An unknown interface carrying Nokia routed binding → DbInterface is materialised (M27)."""
+    """An unknown interface carrying Nokia routed binding → DbInterface is materialised."""
     from sqlalchemy import select
 
     from nso_adapter.store.db import get_session

@@ -3,10 +3,10 @@
 """Contract test — producer side of GET /api/v1/devices/{id}/l2-services.
 
 Nokia epipe/vpls services with their SAPs; every level emits a fixed key set. Like the
-M34-36 read endpoints, the response has NO top-level last_refreshed_at/refresh_source.
+-36 read endpoints, the response has NO top-level last_refreshed_at/refresh_source.
 Consumed by the plugin in ``l2_service_reconciler.reconcile_l2_services``.
 
-Canonical contract: ``docs/api-contract.md`` (M37 L2 services §).
+Canonical contract: ``docs/api-contract.md`` (L2 services §).
 Mirror (consumer side): ``netbox-nso-plugin/.../tests/test_contract_l2_services.py``.
 """
 

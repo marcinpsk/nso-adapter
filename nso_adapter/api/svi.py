@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""GET /api/v1/devices/{id}/svi — L3 VLAN interfaces (SVIs / IRBs), read (M35)."""
+"""GET /api/v1/devices/{id}/svi — L3 VLAN interfaces (SVIs / IRBs), read."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ async def get_svi(device_id: int, db: AsyncSession = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# PUT /{device_id}/svi-intent  (M35 write path)
+# PUT /{device_id}/svi-intent (write path)
 # ---------------------------------------------------------------------------
 
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for BGP config read-mirror ORM models (M15 A2)."""
+"""Unit tests for BGP config read-mirror ORM models (A2)."""
 
 import pytest
 from sqlalchemy import create_engine, select

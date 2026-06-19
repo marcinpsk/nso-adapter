@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Apply worker — push accepted intent to NSO (Phase 2, M5).
+"""Apply worker — push accepted intent to NSO (Phase 2).
 
 Follows the flow described in docs/nso-adapter.md §7a:
   1. Snapshot intent into job.context
@@ -74,7 +74,7 @@ _NO_FORCE_ELIGIBLE = {
 
 
 def _nokia_routed_kind(iface) -> str | None:
-    """Derive the SR OS router context (base|ies|vprn) for a Nokia routed interface (M27).
+    """Derive the SR OS router context (base|ies|vprn) for a Nokia routed interface.
 
     The adapter's ``DbInterface.kind`` is the interface *type* (physical/logical/loopback/
     lag); the router context comes from ``service``/``vrf``:

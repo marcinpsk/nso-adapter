@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M34: DeviceVlan / DeviceSwitchport / DeviceSwitchportTaggedVlan model tests."""
+"""DeviceVlan / DeviceSwitchport / DeviceSwitchportTaggedVlan model tests."""
 
 from __future__ import annotations
 

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""GET /api/v1/devices/{id}/subinterface — dot1q L3 subinterfaces, read (M36).
+"""GET /api/v1/devices/{id}/subinterface — dot1q L3 subinterfaces, read.
 
-PUT /api/v1/devices/{id}/subinterface-intent — write path (M36).
+PUT /api/v1/devices/{id}/subinterface-intent — write path.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ async def get_subinterface(device_id: int, db: AsyncSession = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# PUT /{device_id}/subinterface-intent  (M36 write path)
+# PUT /{device_id}/subinterface-intent (write path)
 # ---------------------------------------------------------------------------
 
 

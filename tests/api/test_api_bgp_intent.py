@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Tests for PUT /api/v1/devices/{id}/bgp-intent (M16 B2)."""
+"""Tests for PUT /api/v1/devices/{id}/bgp-intent."""
 
 from __future__ import annotations
 

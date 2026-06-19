@@ -134,7 +134,7 @@ async def test_refresh_persists_isis_bfd_enabled(adapter_client):
 
 @pytest.mark.anyio
 async def test_refresh_persists_p1_scalars_and_settings(adapter_client):
-    """M33 P1: cross-vendor instance/interface scalars + EAV settings are mirrored."""
+    """cross-vendor instance/interface scalars + EAV settings are mirrored."""
     device_id = await seed_device(nso_device_name="isis-p1-01", netbox_device_id=965)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
@@ -191,7 +191,7 @@ async def test_refresh_persists_p1_scalars_and_settings(adapter_client):
 
 
 async def test_refresh_persists_p2_levels_and_sr(adapter_client):
-    """M33 P2: per-level child lists + segment-routing object are mirrored."""
+    """per-level child lists + segment-routing object are mirrored."""
     device_id = await seed_device(nso_device_name="isis-p2-01", netbox_device_id=967)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()

@@ -248,7 +248,7 @@ async def test_peer_source_imported(adapter_client):
 
 
 async def test_peer_group_object_imported(adapter_client):
-    """Peer-group objects + their per-AF policies are mirrored (M15 B1, full-B)."""
+    """Peer-group objects + their per-AF policies are mirrored (full-B)."""
     from nso_adapter.core.bgp import _upsert_bgp_data
     from nso_adapter.store.db import get_session
     from nso_adapter.store.models import (

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Tests for GET /api/v1/devices/{id}/l2-services (M37 P1)."""
+"""Tests for GET /api/v1/devices/{id}/l2-services."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ async def test_l2_services_unknown_device_is_404(adapter_client):
     assert resp.json()["error"]["code"] == "not_found"
 
 
-# ── PUT /api/v1/devices/{id}/l2-sap-intent (M37 P2b) ────────────────────────
+# ── PUT /api/v1/devices/{id}/l2-sap-intent ────────────────────────
 
 
 async def _get_intents(device_id: int):

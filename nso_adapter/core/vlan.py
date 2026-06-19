@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""M34: VLAN database + L2 switchport refresh — reads NSO oper-data and upserts the DB.
+"""VLAN database + L2 switchport refresh — reads NSO oper-data and upserts the DB.
 
 Mirrors core/snmp.py (refresh_*_for_device) + core/lag_topology.py (SSE handlers).
 The switchport refresh resolves untagged/tagged VLAN links to the device's

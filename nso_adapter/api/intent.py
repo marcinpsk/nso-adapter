@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Intent API — manage per-device intent mirror (Phase 2, M5).
+"""Intent API — manage per-device intent mirror (Phase 2).
 
 PUT /api/v1/devices/{id}/intent  — full snapshot replace (idempotent)
 GET /api/v1/devices/{id}/intent  — read current mirror

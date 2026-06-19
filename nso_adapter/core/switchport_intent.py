@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Switchport apply — writes accepted L2 switchport intent to the switchport-reconciler (M34)."""
+"""Switchport apply — writes accepted L2 switchport intent to the switchport-reconciler."""
 
 from __future__ import annotations
 

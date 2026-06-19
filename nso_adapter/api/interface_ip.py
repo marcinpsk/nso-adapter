@@ -94,7 +94,7 @@ class IpAddressEntry(BaseModel):
     secondary: bool = False
     vrf: str = ""  # "" = global/default routing table
     accepted_at: datetime | None = None
-    # Greenfield Nokia routed-interface binding (M27): for an operator-created routed
+    # Greenfield Nokia routed-interface binding: for an operator-created routed
     # sub-interface the adapter never imported, the plugin supplies the SR OS binding so
     # the apply can create `router Base interface <name> port <parent-binding>:<encap-tag>`.
     routed: bool = False  # this is a Nokia routed logical interface (create DbInterface if absent)
@@ -121,7 +121,7 @@ async def put_ip_intent(device_id: int, body: IpIntentUpdate, db: AsyncSession =
     ifaces_result = await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))
     ifaces = {iface.name: iface for iface in ifaces_result.scalars().all()}
 
-    # Greenfield Nokia routed sub-interface (M27): the operator created it in NetBox, so the
+    # Greenfield Nokia routed sub-interface: the operator created it in NetBox, so the
     # adapter never imported a DbInterface for it. Materialise a minimal routed row from the
     # binding the plugin supplied, so the intent FK resolves and the apply emits the SR OS
     # `router Base interface <name> port <parent-binding>:<encap-tag>`. Existing rows missing

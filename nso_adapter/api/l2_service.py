@@ -55,7 +55,7 @@ async def get_l2_services(device_id: int, db: AsyncSession = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# PUT /{device_id}/l2-sap-intent  (M37 P2b write path)
+# PUT /{device_id}/l2-sap-intent (write path)
 # ---------------------------------------------------------------------------
 
 

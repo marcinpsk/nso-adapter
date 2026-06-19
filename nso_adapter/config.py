@@ -89,7 +89,7 @@ class SchedulerConfig(BaseModel):
     capability_refresh_interval: int = 1440  # minutes (daily)
     enable_l2_service_sync: bool = True
     l2_service_poll_interval: int = 300
-    # L2/L3 interface family (M34 VLAN-db + switchport, M35 SVI/IRB, M36 dot1q
+    # L2/L3 interface family (VLAN-db + switchport, SVI/IRB, dot1q
     # subinterface). These otherwise refresh ONLY on an SSE config-change event, so
     # without a periodic poll their mirror never populates / self-heals on a device
     # that hasn't changed since the adapter started.
