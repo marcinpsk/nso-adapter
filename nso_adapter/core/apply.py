@@ -629,6 +629,75 @@ async def _apply_ips(by_iface, ifaces, apply_fn, *, client, device_name, job_id,
     return ok, failed, failures
 
 
+async def _apply_subif_ip_atomic(
+    subif_rows, ip_by_iface, ifaces, *, client, device_name, job_id, now
+) -> tuple[tuple[int, int, list], tuple[int, int, list]]:
+    """Stage subinterface + interface-IP intent into ONE NSO transaction (atomic apply).
+
+    The flagged (``NSO_ADAPTER_ATOMIC_APPLY``) replacement for the separate subif scope +
+    per-interface IP commits: one ``apply_combined`` PATCH to ``/restconf/data`` so the
+    subif unit and its IP land in a single device transaction (dissolving the greenfield
+    ordering dependency — a Junos unit and its ``family inet address`` are created together).
+
+    All-or-nothing: on a successful commit every subif + IP row is stamped ``last_apply_at``
+    with the error cleared; on failure every row records the error. Returns
+    ``(ip_outcome, subif_outcome)`` each as ``(in_sync, apply_failed, failures)`` so the
+    caller feeds them into the existing per-row result model unchanged.
+    """
+    from nso_adapter.nso.apply import (
+        apply_combined,
+        build_interface_ip_entry,
+        build_subif_interfaces,
+    )
+
+    modules: dict[str, list] = {}
+    if subif_rows:
+        modules["subinterface-reconciler:subif-config"] = [
+            {"device": device_name, "interface": build_subif_interfaces(subif_rows)}
+        ]
+    ip_entries: list[dict] = []
+    flat_ip_rows: list = []
+    for iface_id, rows in ip_by_iface.items():
+        iface = ifaces[iface_id]
+        routed_kind = _nokia_routed_kind(iface)
+        ip_entries.append(
+            build_interface_ip_entry(
+                device_name,
+                iface.name,
+                rows,
+                kind=routed_kind,
+                service=iface.service if routed_kind in ("ies", "vprn") else None,
+                parent_binding=iface.parent_binding,
+                encap_tag=iface.encap_tag,
+            )
+        )
+        flat_ip_rows.extend(rows)
+    if ip_entries:
+        modules["interface-reconciler:interface-config"] = ip_entries
+
+    all_rows = [*subif_rows, *flat_ip_rows]
+    try:
+        await apply_combined(client=client, device_name=device_name, modules=modules)
+    except NsoApplyError as exc:
+        logger.error("apply.atomic_subif_ip_failed", job_id=job_id, device=device_name, error=exc.message)
+        err = {"code": exc.code, "message": exc.message, "detail": exc.detail}
+        for row in all_rows:
+            row.last_apply_error = err
+        fail = [{"error": exc.message}]
+        return (0, len(flat_ip_rows), fail if flat_ip_rows else []), (0, len(subif_rows), fail if subif_rows else [])
+    except Exception as exc:
+        logger.exception("apply.atomic_subif_ip_unexpected_error", job_id=job_id)
+        err = {"code": "internal", "message": repr(exc), "detail": {}}
+        for row in all_rows:
+            row.last_apply_error = err
+        fail = [{"error": repr(exc)}]
+        return (0, len(flat_ip_rows), fail if flat_ip_rows else []), (0, len(subif_rows), fail if subif_rows else [])
+    for row in all_rows:
+        row.last_apply_at = now
+        row.last_apply_error = None
+    return (len(flat_ip_rows), 0, []), (len(subif_rows), 0, [])
+
+
 async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_error=None) -> tuple[int, int, list]:
     """Push one scope's batch coroutine and stamp the outcome onto every row in *rows*.
 
@@ -768,6 +837,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         apply_subinterface_config,
         apply_svi_config,
         apply_vlan_config,
+        atomic_apply_enabled,
     )
 
     device = await db.get(Device, device_id)
@@ -831,15 +901,32 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     attr_outcome = await _apply_attributes(
         attr_eligible, apply_interface_attribute, client=client, device_name=device_name, job_id=job_id, now=now
     )
-    ip_outcome = await _apply_ips(
-        ip_eligible_by_iface,
-        ifaces,
-        apply_interface_ips,
-        client=client,
-        device_name=device_name,
-        job_id=job_id,
-        now=now,
-    )
+
+    # Atomic apply (I3a): stage the subinterface + interface-IP pair into ONE NSO
+    # transaction so a greenfield subif unit and its IP land together. When off, the
+    # subif scope is applied below in the per-scope loop and IPs commit per-interface.
+    atomic = atomic_apply_enabled() and bool(subif_eligible or ip_eligible_by_iface)
+    subif_atomic_outcome: tuple[int, int, list] | None = None
+    if atomic:
+        ip_outcome, subif_atomic_outcome = await _apply_subif_ip_atomic(
+            subif_eligible,
+            ip_eligible_by_iface,
+            ifaces,
+            client=client,
+            device_name=device_name,
+            job_id=job_id,
+            now=now,
+        )
+    else:
+        ip_outcome = await _apply_ips(
+            ip_eligible_by_iface,
+            ifaces,
+            apply_interface_ips,
+            client=client,
+            device_name=device_name,
+            job_id=job_id,
+            now=now,
+        )
 
     async def _record_rp_capability(exc: NsoApplyError) -> None:
         # The device parser only rejects an unsupported construct on a real commit
@@ -973,6 +1060,9 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     scope_outcomes: dict[str, tuple[int, int]] = {}
     scope_failures: dict[str, list] = {}
     for sc in scopes:
+        # The subinterface scope is committed atomically with IPs above when the flag is on.
+        if atomic and sc.key == "subinterface":
+            continue
         if not sc.rows:
             scope_outcomes[sc.key] = (0, 0)
             continue
@@ -988,6 +1078,12 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         scope_outcomes[sc.key] = (scope_ok, scope_failed)
         if fails:
             scope_failures[sc.key] = fails
+
+    if subif_atomic_outcome is not None:
+        s_ok, s_failed, s_fails = subif_atomic_outcome
+        scope_outcomes["subinterface"] = (s_ok, s_failed)
+        if s_fails:
+            scope_failures["subinterface"] = s_fails
 
     # ── Step 7: finalize ──
     # "Nothing eligible" mirrors the historical flag set exactly (note: it keys off the

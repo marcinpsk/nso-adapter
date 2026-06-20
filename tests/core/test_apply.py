@@ -1375,3 +1375,142 @@ async def test_run_apply_ip_unexpected_exception(adapter_client):
         assert rows[0].last_apply_error["code"] == "internal"
         assert "transport exploded" in rows[0].last_apply_error["message"]
         break
+
+
+# ── Atomic apply (NSO_ADAPTER_ATOMIC_APPLY): subif + IP in one transaction ─────
+
+
+async def _seed_subif_and_ip(device_id: int, iface_name: str = "ae99.999") -> int:
+    """Seed a DbInterface + accepted SubinterfaceIntent (device-keyed) + accepted
+    InterfaceIpIntent (interface-keyed) — the greenfield subif+IP pair. Returns iface_id."""
+    from nso_adapter.store.models import InterfaceIpIntent, SubinterfaceIntent
+
+    async for db in get_session():
+        iface = DbInterface(device_id=device_id, netbox_interface_id=999, name=iface_name, kind="logical")
+        db.add(iface)
+        await db.flush()
+        db.add(
+            SubinterfaceIntent(
+                device_id=device_id,
+                interface_name=iface_name,
+                parent_interface="ae99",
+                dot1q_vlan=999,
+                sub_type="subinterface",
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        db.add(
+            InterfaceIpIntent(
+                interface_id=iface.id,
+                address="33.1.1.1/24",
+                family="ipv4",
+                secondary=False,
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        return iface.id
+    raise RuntimeError("no session")
+
+
+async def _ip_and_subif_rows(device_id: int):
+    from nso_adapter.store.models import InterfaceIpIntent, SubinterfaceIntent
+
+    async for db in get_session():
+        subif = (
+            (await db.execute(select(SubinterfaceIntent).where(SubinterfaceIntent.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        ip = (await db.execute(select(InterfaceIpIntent))).scalars().all()
+        return subif, ip
+    raise RuntimeError("no session")
+
+
+@pytest.mark.asyncio
+async def test_run_apply_atomic_stages_subif_and_ip_in_one_commit(adapter_client, monkeypatch):
+    """With NSO_ADAPTER_ATOMIC_APPLY on, the subif + IP pair is committed via ONE
+    apply_combined call (both module bodies), and the per-scope writers are bypassed."""
+    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+    device_id = await _seed_device(name="sw01")
+    await _seed_subif_and_ip(device_id)
+    job_id = await _seed_apply_job(device_id)
+
+    mock_client = AsyncMock()
+    combined = AsyncMock(return_value=None)
+    with ExitStack() as stack:
+        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
+        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", combined))
+        per_subif = stack.enter_context(
+            patch("nso_adapter.nso.apply.apply_subinterface_config", new_callable=AsyncMock)
+        )
+        per_ip = stack.enter_context(patch("nso_adapter.nso.apply.apply_interface_ips", new_callable=AsyncMock))
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    combined.assert_awaited_once()
+    modules = combined.await_args.kwargs["modules"]
+    assert set(modules) == {"subinterface-reconciler:subif-config", "interface-reconciler:interface-config"}
+    # The IP rides ae99.999 in the SAME edit as the subif that defines its unit.
+    assert modules["interface-reconciler:interface-config"][0]["interface-name"] == "ae99.999"
+    assert modules["subinterface-reconciler:subif-config"][0]["interface"][0]["interface-name"] == "ae99.999"
+    per_subif.assert_not_called()
+    per_ip.assert_not_called()
+
+    subif_rows, ip_rows = await _ip_and_subif_rows(device_id)
+    assert all(r.last_apply_at is not None and r.last_apply_error is None for r in subif_rows + ip_rows)
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        break
+
+
+@pytest.mark.asyncio
+async def test_run_apply_atomic_off_uses_per_scope(adapter_client, monkeypatch):
+    """Flag off (default): apply_combined is never used; the per-scope subif + IP writers run."""
+    monkeypatch.delenv("NSO_ADAPTER_ATOMIC_APPLY", raising=False)
+    device_id = await _seed_device(name="sw01")
+    await _seed_subif_and_ip(device_id)
+    job_id = await _seed_apply_job(device_id)
+
+    mock_client = AsyncMock()
+    combined = AsyncMock(return_value=None)
+    with ExitStack() as stack:
+        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
+        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", combined))
+        per_subif = stack.enter_context(
+            patch("nso_adapter.nso.apply.apply_subinterface_config", new_callable=AsyncMock, return_value=None)
+        )
+        per_ip = stack.enter_context(
+            patch("nso_adapter.nso.apply.apply_interface_ips", new_callable=AsyncMock, return_value=None)
+        )
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    combined.assert_not_called()
+    per_subif.assert_awaited_once()
+    per_ip.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_apply_atomic_failure_marks_both_subif_and_ip(adapter_client, monkeypatch):
+    """An atomic commit failure is all-or-nothing: every subif AND IP row records the
+    error and the job fails (the whole pair rolled back together)."""
+    from nso_adapter.nso.apply import NsoApplyError
+
+    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+    device_id = await _seed_device(name="sw01")
+    await _seed_subif_and_ip(device_id)
+    job_id = await _seed_apply_job(device_id)
+
+    mock_client = AsyncMock()
+    boom = AsyncMock(side_effect=NsoApplyError("nso_patch_failed", "device said no"))
+    with ExitStack() as stack:
+        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
+        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", boom))
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    subif_rows, ip_rows = await _ip_and_subif_rows(device_id)
+    assert all(r.last_apply_error is not None and r.last_apply_at is None for r in subif_rows + ip_rows)
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        break

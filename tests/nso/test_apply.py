@@ -1185,3 +1185,95 @@ async def test_apply_real_commit_carries_reconcile_and_dry_run_does_too(monkeypa
     # Verify dry-run: both params.
     assert "dry-run=native" in verify_url
     assert "reconcile=keep-non-service-config" in verify_url
+
+
+# ── apply_combined (atomic single-transaction multi-module PATCH) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_apply_combined_single_patch_to_data_root():
+    """apply_combined PATCHes /restconf/data ONCE with every module body in one edit —
+    the atomic unit (one NSO transaction → one device commit) — carrying reconcile."""
+    import json
+
+    client = _make_nso_client()
+    _mock_http_ctx(client, _httpx_response(204))
+
+    modules = {
+        "subinterface-reconciler:subif-config": [{"device": "sw01", "interface": [{"interface-name": "ae99.999"}]}],
+        "interface-reconciler:interface-config": [{"device": "sw01", "interface-name": "ae99.999"}],
+    }
+    await apply_mod.apply_combined(client, "sw01", modules)
+
+    mock_http = client._client.return_value.__aenter__.return_value
+    # Exactly one real PATCH (call 0); call 1 is the post-apply verify dry-run.
+    url = mock_http.patch.call_args_list[0][0][0]
+    assert url.endswith("/restconf/data?reconcile=keep-non-service-config")
+    body = json.loads(mock_http.patch.call_args_list[0].kwargs["content"])
+    assert set(body) == {"subinterface-reconciler:subif-config", "interface-reconciler:interface-config"}
+
+
+@pytest.mark.asyncio
+async def test_apply_combined_drops_empty_modules():
+    """A module whose body list is empty is omitted from the combined edit."""
+    import json
+
+    client = _make_nso_client()
+    _mock_http_ctx(client, _httpx_response(204))
+
+    await apply_mod.apply_combined(
+        client,
+        "sw01",
+        {
+            "interface-reconciler:interface-config": [{"device": "sw01"}],
+            "subinterface-reconciler:subif-config": [],
+        },
+    )
+    mock_http = client._client.return_value.__aenter__.return_value
+    body = json.loads(mock_http.patch.call_args_list[0].kwargs["content"])
+    assert set(body) == {"interface-reconciler:interface-config"}
+
+
+@pytest.mark.asyncio
+async def test_apply_combined_dry_run_returns_delta(monkeypatch):
+    """dry_run computes the native delta and never commits (no reconcile-only PATCH)."""
+    client = _make_nso_client()
+    dry_resp = _httpx_response(
+        200, json_data={"dry-run-result": {"native": {"device": [{"name": "sw01", "data": "X"}]}}}
+    )
+    _mock_http_ctx(client, dry_resp)
+
+    delta = await apply_mod.apply_combined(
+        client, "sw01", {"interface-reconciler:interface-config": [{"device": "sw01"}]}, dry_run=True
+    )
+    assert delta == "X"
+    mock_http = client._client.return_value.__aenter__.return_value
+    assert "dry-run=native" in mock_http.patch.call_args_list[0][0][0]
+
+
+@pytest.mark.asyncio
+async def test_apply_combined_raises_on_error():
+    """A non-2xx combined commit raises NsoApplyError (all-or-nothing surfaces)."""
+    client = _make_nso_client()
+    _mock_http_ctx(client, _httpx_response(500))
+    with pytest.raises(NsoApplyError):
+        await apply_mod.apply_combined(client, "sw01", {"interface-reconciler:interface-config": [{"device": "sw01"}]})
+
+
+def test_build_subif_interfaces_shapes_rows():
+    rows = [
+        SimpleNamespace(
+            interface_name="ae99.999", parent_interface="ae99", dot1q_vlan=999, sub_type="subinterface", vrf=""
+        )
+    ]
+    out = apply_mod.build_subif_interfaces(rows)
+    assert out == [
+        {"interface-name": "ae99.999", "parent-interface": "ae99", "dot1q-vlan": 999, "type": "subinterface"}
+    ]
+
+
+def test_build_interface_ip_entry_ipv4():
+    rows = [_make_ip_row("33.1.1.1/24", family="ipv4")]
+    entry = apply_mod.build_interface_ip_entry("sw01", "ae99.999", rows)
+    assert entry["interface-name"] == "ae99.999"
+    assert entry["ipv4-address"] == [{"address": "33.1.1.1", "prefix-length": 24, "secondary": False}]

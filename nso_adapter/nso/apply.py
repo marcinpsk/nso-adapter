@@ -7,12 +7,14 @@ the interface-reconciler service adopts pre-existing brownfield config instead
 of creating conflicts.
 
 Protocol summary:
-1. POST  /restconf/data/tailf-ncs:devices/device={}/config  → ensure service exists
-2. PATCH /restconf/data/interface-reconciler:interface-config  with intent
-3. POST  /restconf/operations/tailf-netconf-transactions:commit with reconcile option
-
-For simplicity in Phase 2 we use the NSO RESTCONF PATCH directly on the
-interface-reconciler service path with the native commit API.
+1. PATCH a reconciler-service path (e.g. ``interface-reconciler:interface-config``)
+   with the desired intent body, carrying the ``reconcile`` commit query param so NSO
+   adopts pre-existing brownfield config (see ``_commit_url``). Each such PATCH is its
+   own NSO transaction → its own device commit.
+2. The atomic path (``NSO_ADAPTER_ATOMIC_APPLY`` → :func:`apply_combined`) instead PATCHes
+   several module bodies to ``/restconf/data`` in one request → one transaction → one
+   device commit. NSO RESTCONF is stateless (no cross-request transaction handle), so a
+   single multi-module edit is the atomic unit.
 """
 
 from __future__ import annotations
@@ -53,8 +55,24 @@ RECONCILE_COMMIT = "" if _RAW_RECONCILE.lower() in ("", "0", "off", "false", "no
 # RESTCONF path to the interface-reconciler service list
 _SERVICE_PATH = "/restconf/data/interface-reconciler:interface-config"
 
-# RESTCONF path to open a write transaction and commit with reconcile
-_COMMIT_PATH = "/restconf/operations/tailf-netconf-transactions:commit"
+# RESTCONF datastore root. The atomic apply path (NSO_ADAPTER_ATOMIC_APPLY) PATCHes
+# several reconciler-service module bodies here in ONE request → ONE NSO transaction →
+# ONE device commit. NSO RESTCONF has no cross-request transaction handle
+# (``tailf-netconf-transactions`` is NETCONF-session-only and is not exposed under
+# ``/restconf/operations``), so a single multi-module edit *is* the atomic unit. Verified
+# live on sw01: a combined subif+IP PATCH renders one ``<edit-config>`` to the device.
+_DATA_PATH = "/restconf/data"
+
+
+def atomic_apply_enabled() -> bool:
+    """Whether to stage an apply's scopes into ONE transaction (NSO_ADAPTER_ATOMIC_APPLY).
+
+    Off by default — the per-scope PATCH+commit path stays the fallback until the
+    whole-apply atomic path (I3b) is proven. When on, ``run_apply`` stages the
+    subinterface + interface-IP pair into a single :func:`apply_combined` commit so the
+    subif unit and its IP land together (dissolving the greenfield ordering dependency).
+    """
+    return os.environ.get("NSO_ADAPTER_ATOMIC_APPLY", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _commit_url(url: str, *, dry_run: bool = False) -> str:
@@ -231,6 +249,56 @@ async def _send_service_config(
     return None
 
 
+async def apply_combined(
+    client: NsoClient,
+    device_name: str,
+    modules: dict[str, list[dict]],
+    *,
+    dry_run: bool = False,
+) -> str | None:
+    """Stage several reconciler-service bodies into ONE ``/restconf/data`` PATCH.
+
+    *modules* maps a module-qualified service root key (e.g.
+    ``"subinterface-reconciler:subif-config"``) to its list of service-instance bodies.
+    Empty lists are dropped. The single PATCH commits as ONE NSO transaction → ONE device
+    commit, so FASTMAP resolves intra-transaction dependencies (a subif unit and its IP
+    land together). Carries the ``reconcile`` commit param like every other write.
+
+    ``dry_run=True`` returns the native device delta the combined commit would push (no
+    commit). Otherwise commits, runs the post-apply verify guard, and returns None.
+    Raises NsoApplyError on a non-2xx commit.
+    """
+    body = {root: bodies for root, bodies in modules.items() if bodies}
+    payload = json.dumps(body)
+    url = f"{client._base}{_DATA_PATH}"
+
+    if dry_run:
+        return await native_dry_run(client, url, payload, device_name, method="patch")
+
+    async with client._client(timeout=client._action_timeout) as c:
+        resp = await c.patch(_commit_url(url), content=payload, headers={"Content-Type": "application/yang-data+json"})
+        if resp.status_code not in (200, 201, 204):
+            try:
+                err = resp.json()
+            except Exception:
+                err = {"raw": resp.text}
+            logger.error(
+                "nso.apply.combined_failed",
+                device=device_name,
+                modules=list(body),
+                status=resp.status_code,
+                body=err,
+            )
+            raise NsoApplyError(
+                "nso_patch_failed",
+                f"NSO combined PATCH failed with status {resp.status_code}",
+                detail={"nso_error": err},
+            )
+    logger.info("nso.apply.combined_sent", device=device_name, modules=list(body))
+    await _verify_native_or_raise(client, url, payload, device_name, scope="combined", method="patch")
+    return None
+
+
 async def apply_interface_attribute(
     client: NsoClient,
     device_name: str,
@@ -317,8 +385,7 @@ async def apply_interface_attribute(
     return None
 
 
-async def apply_interface_ips(
-    client: NsoClient,
+def build_interface_ip_entry(
     device_name: str,
     interface_name: str,
     ip_intent_rows: list,
@@ -327,25 +394,14 @@ async def apply_interface_ips(
     service: str | None = None,
     parent_binding: str | None = None,
     encap_tag: str | None = None,
-    dry_run: bool = False,
-) -> str | None:
-    """Write IP addresses and VRF for a single interface to NSO.
+) -> dict:
+    """Shape one interface-reconciler service-instance body from a device's IP rows.
 
-    Builds a full interface-reconciler PATCH body from the supplied rows,
-    one PATCH call per interface covering all IPv4, IPv6, and VRF intent.
-
-    ``kind``/``service``/``parent_binding``/``encap_tag`` carry the Nokia
-    routed-interface context so the reconciler writes the IP to the SR OS
-    ``configure router Base`` / ``configure service {ies,vprn} <service>``
-    interface (bound to its port) instead of to the port.  They are ignored by
-    the IOS/Junos handlers.
-
-    Raises NsoApplyError on failure.
+    Shared by :func:`apply_interface_ips` (per-scope path) and the atomic combined path,
+    so both emit byte-identical IP bodies. ``kind``/``service``/``parent_binding``/
+    ``encap_tag`` carry the Nokia routed-interface context (ignored by IOS/Junos).
     """
-    entry: dict = {
-        "device": device_name,
-        "interface-name": interface_name,
-    }
+    entry: dict = {"device": device_name, "interface-name": interface_name}
 
     # VRF is an interface-level concept; take the first non-empty VRF value.
     vrf = next((r.vrf for r in ip_intent_rows if r.vrf), None)
@@ -377,6 +433,43 @@ async def apply_interface_ips(
         entry["ipv4-address"] = ipv4_entries
     if ipv6_entries:
         entry["ipv6-address"] = ipv6_entries
+    return entry
+
+
+async def apply_interface_ips(
+    client: NsoClient,
+    device_name: str,
+    interface_name: str,
+    ip_intent_rows: list,
+    *,
+    kind: str | None = None,
+    service: str | None = None,
+    parent_binding: str | None = None,
+    encap_tag: str | None = None,
+    dry_run: bool = False,
+) -> str | None:
+    """Write IP addresses and VRF for a single interface to NSO.
+
+    Builds a full interface-reconciler PATCH body from the supplied rows,
+    one PATCH call per interface covering all IPv4, IPv6, and VRF intent.
+
+    ``kind``/``service``/``parent_binding``/``encap_tag`` carry the Nokia
+    routed-interface context so the reconciler writes the IP to the SR OS
+    ``configure router Base`` / ``configure service {ies,vprn} <service>``
+    interface (bound to its port) instead of to the port.  They are ignored by
+    the IOS/Junos handlers.
+
+    Raises NsoApplyError on failure.
+    """
+    entry = build_interface_ip_entry(
+        device_name,
+        interface_name,
+        ip_intent_rows,
+        kind=kind,
+        service=service,
+        parent_binding=parent_binding,
+        encap_tag=encap_tag,
+    )
 
     url = f"{client._base}{_SERVICE_PATH}"
     payload = json.dumps({"interface-reconciler:interface-config": [entry]})
@@ -412,8 +505,8 @@ async def apply_interface_ips(
         "nso.apply.ip_ok",
         device=device_name,
         interface=interface_name,
-        ipv4_count=len(ipv4_entries),
-        ipv6_count=len(ipv6_entries),
+        ipv4_count=len(entry.get("ipv4-address", [])),
+        ipv6_count=len(entry.get("ipv6-address", [])),
     )
 
     await _verify_native_or_raise(client, url, payload, device_name, scope="interface_ip")
@@ -648,6 +741,26 @@ async def apply_svi_config(
     )
 
 
+def build_subif_interfaces(subif_intent_rows: list) -> list[dict]:
+    """Shape the subinterface-reconciler ``interface`` list from a device's subif rows.
+
+    Shared by :func:`apply_subinterface_config` (per-scope path) and the atomic combined
+    path so both emit byte-identical subif bodies.
+    """
+    interfaces = []
+    for row in subif_intent_rows:
+        entry: dict = {
+            "interface-name": row.interface_name,
+            "parent-interface": row.parent_interface,
+            "dot1q-vlan": row.dot1q_vlan,
+            "type": row.sub_type,
+        }
+        if row.vrf:
+            entry["vrf"] = row.vrf
+        interfaces.append(entry)
+    return interfaces
+
+
 async def apply_subinterface_config(
     client: NsoClient,
     device_name: str,
@@ -663,24 +776,12 @@ async def apply_subinterface_config(
     Reconcile mode (brownfield adoption). ``replace=True`` PUT-replaces the keyed
     instance so removed subinterfaces are reverted.
     """
-    interfaces = []
-    for row in subif_intent_rows:
-        entry: dict = {
-            "interface-name": row.interface_name,
-            "parent-interface": row.parent_interface,
-            "dot1q-vlan": row.dot1q_vlan,
-            "type": row.sub_type,
-        }
-        if row.vrf:
-            entry["vrf"] = row.vrf
-        interfaces.append(entry)
-
     return await _send_service_config(
         client,
         _SUBIF_SERVICE_PATH,
         "subinterface-reconciler:subif-config",
         device_name,
-        {"device": device_name, "interface": interfaces},
+        {"device": device_name, "interface": build_subif_interfaces(subif_intent_rows)},
         scope="subinterface",
         replace=replace,
         dry_run=dry_run,
