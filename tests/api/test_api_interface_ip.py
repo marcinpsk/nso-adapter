@@ -244,10 +244,21 @@ async def test_put_ip_intent_full_replace(adapter_client):
     assert rows[0].address == "10.0.0.1/24"
 
 
-async def test_put_ip_intent_unknown_interface_skipped(adapter_client):
-    """Entries referencing unknown interface names are silently skipped."""
+async def test_put_ip_intent_unknown_interface_lands(adapter_client):
+    """Intent for an unknown (greenfield) interface must LAND, not be silently dropped.
+
+    Silently skipping was a disaster waiting to happen: the operator accepts an IP, it
+    looks applied, but it vanished at the adapter with no trace. The intent must be stored
+    (a minimal interface row materialised) so it's visible; the *apply* then reports whether
+    the interface can be realised on the device.
+    """
+    from sqlalchemy import select
+
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import DbInterface, InterfaceIpIntent
+
     device_id = await seed_device(nso_device_name="ip-intent-dev-03", netbox_device_id=902)
-    # No interfaces seeded
+    # No interfaces seeded — GigabitEthernet99/99 is unknown to the adapter.
 
     payload = {
         "addresses": [
@@ -256,7 +267,23 @@ async def test_put_ip_intent_unknown_interface_skipped(adapter_client):
     }
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=payload)
     assert resp.status_code == 200
-    assert resp.json()["address_count"] == 0
+    assert resp.json()["address_count"] == 1  # landed, not dropped
+
+    async for db in get_session():
+        iface = (
+            await db.execute(
+                select(DbInterface).where(
+                    DbInterface.device_id == device_id, DbInterface.name == "GigabitEthernet99/99"
+                )
+            )
+        ).scalar_one()
+        rows = (
+            (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface.id)))
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1 and rows[0].address == "192.168.1.1/30"
+        break
 
 
 async def test_put_ip_intent_greenfield_routed_creates_interface(adapter_client):
