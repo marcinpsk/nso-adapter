@@ -255,6 +255,33 @@ async def test_oob_liveness_probe_records_health_on_oob(monkeypatch):
     assert client.calls == []  # cheap liveness, no address change
 
 
+async def test_oob_active_refreshes_at_primary_cadence(monkeypatch):
+    """On OOB, the active address's liveness refreshes at the primary (active) cadence —
+    NOT the slow proactive-fallback cadence, which left a device-on-OOB showing health
+    'not checked' for up to a full OOB interval (the live sw01 observation)."""
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=True)
+    dev = _device()
+    fo = _failover_row(active=ActiveAddress.oob.value)
+    client = FakeNso(address="192.0.2.5")
+    await _tick(dev, fo, client, cfg, now=_BASE, primary_due=False, oob_due=True)
+    assert fo.oob_healthy is True
+    assert fo.next_oob_probe_at == _BASE + timedelta(minutes=cfg.failover_primary_probe_interval)
+
+
+async def test_switch_to_oob_probes_health_in_same_tick(monkeypatch):
+    """Switching to OOB schedules its health probe immediately (next_oob_probe_at=now), so
+    a device freshly moved onto OOB is probed in that tick instead of showing 'not checked'
+    until the next scheduled OOB probe (up to a full OOB interval away)."""
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=False)  # primary down → switch to OOB
+    dev, fo, client = _device(), _failover_row(), FakeNso()
+    for i in range(cfg.failover_failure_threshold):
+        await _tick(dev, fo, client, cfg, now=_BASE + timedelta(minutes=3 * i), oob_due=False)
+    assert fo.active_address == ActiveAddress.oob.value
+    assert fo.oob_healthy is not None  # probed in the switching tick, not left None for hours
+
+
 async def test_proactive_oob_health_unreachable_reverts_to_primary(monkeypatch):
     """On primary, a proactive OOB flip-probe that fails records oob_healthy=False and
     still flips back to primary (the check must never strand the device on a dead OOB)."""

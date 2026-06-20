@@ -283,6 +283,9 @@ async def _switch_to_oob(client: NsoClient, fo: DeviceFailover, name: str, cfg: 
     fo.consecutive_failures = 0
     fo.consecutive_successes = 0
     fo.last_switch_at = now
+    # Probe the OOB's health promptly now that it's the active address — don't leave it
+    # "not checked" until the next scheduled OOB probe (up to a full OOB interval away).
+    fo.next_oob_probe_at = now
     if cfg.failover_sync_from_after_switch:
         await _safe_sync_from(client, name)
     logger.info("failover.switch", device=name, to=_OOB, address=fo.oob_ip)
@@ -479,7 +482,14 @@ async def run_failover_tick(
     if has_oob and _due(fo.next_oob_probe_at, now):
         ran = await _probe_oob(client, fo, name, cfg, now, job_active, flip_budget)
         if ran:
-            fo.next_oob_probe_at = _next_due(now, cfg.failover_oob_probe_interval, jitter_fraction)
+            # When OOB is the ACTIVE address the operator is connecting through it, so its
+            # liveness must stay as fresh as a primary probe — use the active (primary)
+            # cadence, not the slow proactive-fallback cadence used while sitting on primary
+            # (which left a device-on-OOB showing "not checked" for up to a full OOB interval).
+            oob_interval = (
+                cfg.failover_primary_probe_interval if fo.active_address == _OOB else cfg.failover_oob_probe_interval
+            )
+            fo.next_oob_probe_at = _next_due(now, oob_interval, jitter_fraction)
 
 
 # ── IP ingestion (plugin → adapter) ───────────────────────────────────────────
