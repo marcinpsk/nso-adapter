@@ -1427,10 +1427,29 @@ async def _ip_and_subif_rows(device_id: int):
     raise RuntimeError("no session")
 
 
+async def _seed_snmp_and_static_route(device_id: int) -> None:
+    from nso_adapter.store.models import SnmpCommunityIntent, StaticRouteIntent
+
+    async for db in get_session():
+        db.add(
+            SnmpCommunityIntent(
+                device_id=device_id, label="public", vault_ref="m/p#k", access="RO", accepted_at=datetime.utcnow()
+            )
+        )
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id, vrf="", prefix="10.9.9.0/24", next_hop="1.1.1.1", accepted_at=datetime.utcnow()
+            )
+        )
+        await db.commit()
+        return
+    raise RuntimeError("no session")
+
+
 @pytest.mark.asyncio
 async def test_run_apply_atomic_stages_subif_and_ip_in_one_commit(adapter_client, monkeypatch):
-    """With NSO_ADAPTER_ATOMIC_APPLY on, the subif + IP pair is committed via ONE
-    apply_combined call (both module bodies), and the per-scope writers are bypassed."""
+    """With NSO_ADAPTER_ATOMIC_APPLY on, subif + IP are staged (by the REAL body-builders)
+    and committed via ONE apply_combined call carrying both module bodies in one transaction."""
     monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01")
     await _seed_subif_and_ip(device_id)
@@ -1440,27 +1459,126 @@ async def test_run_apply_atomic_stages_subif_and_ip_in_one_commit(adapter_client
     combined = AsyncMock(return_value=None)
     with ExitStack() as stack:
         stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
+        # Only the NSO commit boundary is mocked — the real scope body-builders run, staging
+        # their bodies into the combined modules dict that apply_combined receives.
         stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", combined))
-        per_subif = stack.enter_context(
-            patch("nso_adapter.nso.apply.apply_subinterface_config", new_callable=AsyncMock)
-        )
-        per_ip = stack.enter_context(patch("nso_adapter.nso.apply.apply_interface_ips", new_callable=AsyncMock))
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     combined.assert_awaited_once()
-    modules = combined.await_args.kwargs["modules"]
+    modules = combined.await_args.args[2]
     assert set(modules) == {"subinterface-reconciler:subif-config", "interface-reconciler:interface-config"}
     # The IP rides ae99.999 in the SAME edit as the subif that defines its unit.
-    assert modules["interface-reconciler:interface-config"][0]["interface-name"] == "ae99.999"
+    iface_entry = modules["interface-reconciler:interface-config"][0]
+    assert iface_entry["interface-name"] == "ae99.999"
+    assert iface_entry["ipv4-address"][0]["address"] == "33.1.1.1"
     assert modules["subinterface-reconciler:subif-config"][0]["interface"][0]["interface-name"] == "ae99.999"
-    per_subif.assert_not_called()
-    per_ip.assert_not_called()
 
     subif_rows, ip_rows = await _ip_and_subif_rows(device_id)
     assert all(r.last_apply_at is not None and r.last_apply_error is None for r in subif_rows + ip_rows)
     async for db in get_session():
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
+        break
+
+
+@pytest.mark.asyncio
+async def test_run_apply_atomic_stages_all_scopes_in_one_commit(adapter_client, monkeypatch):
+    """I3b: every scope (not just subif+IP) lands in ONE apply_combined transaction."""
+    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+    device_id = await _seed_device(name="sw01")
+    await _seed_subif_and_ip(device_id)
+    await _seed_snmp_and_static_route(device_id)
+    job_id = await _seed_apply_job(device_id)
+
+    mock_client = AsyncMock()
+    combined = AsyncMock(return_value=None)
+    with ExitStack() as stack:
+        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
+        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", combined))
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    combined.assert_awaited_once()
+    modules = combined.await_args.args[2]
+    assert {
+        "subinterface-reconciler:subif-config",
+        "interface-reconciler:interface-config",
+        "snmp-reconciler:snmp-config",
+        "static-route-reconciler:static-route-config",
+    } <= set(modules)
+    async for db in get_session():
+        assert (await db.get(Job, job_id)).status == JobStatus.succeeded
+        break
+
+
+@pytest.mark.asyncio
+async def test_run_apply_atomic_merges_attr_and_ip_into_one_interface_entry(adapter_client, monkeypatch):
+    """Attribute + IP intent on the SAME interface merge into ONE interface-config entry
+    (they share the (device, interface-name) key — two list items would conflict)."""
+    from nso_adapter.store.models import InterfaceIpIntent
+
+    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+    device_id = await _seed_device(name="sw01")
+    iface_id, _attr_id = await _seed_interface_with_intent(
+        device_id, "Gi0/1", "description", "uplink", SyncState.accepted
+    )
+    async for db in get_session():
+        db.add(
+            InterfaceIpIntent(
+                interface_id=iface_id,
+                address="10.0.0.1/30",
+                family="ipv4",
+                secondary=False,
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+    job_id = await _seed_apply_job(device_id)
+
+    mock_client = AsyncMock()
+    combined = AsyncMock(return_value=None)
+    with ExitStack() as stack:
+        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
+        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", combined))
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    entries = combined.await_args.args[2]["interface-reconciler:interface-config"]
+    gi = [e for e in entries if e["interface-name"] == "Gi0/1"]
+    assert len(gi) == 1  # ONE merged entry, not two
+    assert gi[0]["description"] == "uplink"
+    assert gi[0]["ipv4-address"][0]["address"] == "10.0.0.1"
+
+
+@pytest.mark.asyncio
+async def test_run_apply_atomic_failure_localizes_offender_others_pending(adapter_client, monkeypatch):
+    """An atomic failure fails only the localised offender scope; non-offenders are pending
+    (rolled back, untouched → retried next apply). The job fails."""
+    from nso_adapter.nso.apply import NsoApplyError
+    from nso_adapter.store.models import SnmpCommunityIntent, StaticRouteIntent
+
+    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+    device_id = await _seed_device(name="sw01")
+    await _seed_snmp_and_static_route(device_id)
+    job_id = await _seed_apply_job(device_id)
+
+    mock_client = AsyncMock()
+    boom = AsyncMock(side_effect=NsoApplyError("nso_patch_failed", "static route rejected"))
+
+    async def _fake_localize(*_a, **_k):
+        return {"static-route-reconciler:static-route-config"}
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
+        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", boom))
+        stack.enter_context(patch("nso_adapter.core.apply._localize_atomic_failure", _fake_localize))
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        sr = (await db.execute(select(StaticRouteIntent))).scalars().all()
+        sc = (await db.execute(select(SnmpCommunityIntent))).scalars().all()
+        assert sr and all(r.last_apply_error is not None for r in sr)  # offender → failed
+        assert sc and all(r.last_apply_error is None and r.last_apply_at is None for r in sc)  # pending
+        assert (await db.get(Job, job_id)).status == JobStatus.failed
         break
 
 

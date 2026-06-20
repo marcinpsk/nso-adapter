@@ -203,6 +203,7 @@ async def _send_service_config(
     scope: str,
     replace: bool = False,
     dry_run: bool = False,
+    stage: dict[str, list] | None = None,
 ) -> str | None:
     """Send a reconciler service instance body to NSO — the shared apply/removal tail.
 
@@ -211,7 +212,15 @@ async def _send_service_config(
     instance (``<service_path>=<device>``) so omitted list entries are dropped and
     FASTMAP reverts them — merge-PATCH never drops, and a node-level DELETE 404s on
     empty-string list keys. On replace, *body* must be the FULL desired state.
+
+    ``stage`` (atomic apply, I3b): when given, capture this scope's instance body into
+    ``stage[root_key]`` and return WITHOUT any HTTP — the caller commits every staged
+    scope in one :func:`apply_combined` transaction. Mutually exclusive with the commit
+    here; ignores ``replace``/``dry_run`` (atomic apply is merge-PATCH only).
     """
+    if stage is not None:
+        stage[root_key] = [body]
+        return None
     payload = json.dumps({root_key: [body]})
     if replace:
         url = f"{client._base}{service_path}={device_name}"
@@ -563,6 +572,7 @@ async def apply_snmp_config(
     *,
     replace: bool = False,
     dry_run: bool = False,
+    stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write the full SNMP intent snapshot for a device to the snmp-reconciler service.
 
@@ -620,6 +630,7 @@ async def apply_snmp_config(
         scope="snmp",
         replace=replace,
         dry_run=dry_run,
+        stage=stage,
     )
 
 
@@ -630,6 +641,7 @@ async def apply_static_routes(
     *,
     replace: bool = False,
     dry_run: bool = False,
+    stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write static route intent for a single device to NSO.
 
@@ -662,6 +674,7 @@ async def apply_static_routes(
         scope="static_route",
         replace=replace,
         dry_run=dry_run,
+        stage=stage,
     )
 
 
@@ -672,6 +685,7 @@ async def apply_logging_config(
     *,
     replace: bool = False,
     dry_run: bool = False,
+    stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write the full remote-syslog intent snapshot for a device to NSO.
 
@@ -705,6 +719,7 @@ async def apply_logging_config(
         scope="logging",
         replace=replace,
         dry_run=dry_run,
+        stage=stage,
     )
 
 
@@ -715,6 +730,7 @@ async def apply_svi_config(
     *,
     replace: bool = False,
     dry_run: bool = False,
+    stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write the SVI/IRB intent snapshot for a device to NSO.
 
@@ -738,6 +754,7 @@ async def apply_svi_config(
         scope="svi",
         replace=replace,
         dry_run=dry_run,
+        stage=stage,
     )
 
 
@@ -768,6 +785,7 @@ async def apply_subinterface_config(
     *,
     replace: bool = False,
     dry_run: bool = False,
+    stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write the dot1q subinterface intent snapshot for a device to NSO.
 
@@ -785,6 +803,7 @@ async def apply_subinterface_config(
         scope="subinterface",
         replace=replace,
         dry_run=dry_run,
+        stage=stage,
     )
 
 
@@ -795,6 +814,7 @@ async def apply_vlan_config(
     *,
     replace: bool = False,
     dry_run: bool = False,
+    stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write the VLAN-database intent snapshot for a device to NSO (write path).
 
@@ -819,6 +839,7 @@ async def apply_vlan_config(
         scope="vlan",
         replace=replace,
         dry_run=dry_run,
+        stage=stage,
     )
 
 
@@ -829,6 +850,7 @@ async def apply_bfd_config(
     *,
     replace: bool = False,
     dry_run: bool = False,
+    stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write the per-interface BFD intent snapshot for a device to NSO.
 
@@ -857,6 +879,7 @@ async def apply_bfd_config(
         scope="bfd",
         replace=replace,
         dry_run=dry_run,
+        stage=stage,
     )
 
 
@@ -867,6 +890,7 @@ async def apply_mtu_config(
     *,
     replace: bool = False,
     dry_run: bool = False,
+    stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write the per-interface MTU intent snapshot for a device to NSO (Phase 2b).
 
@@ -896,6 +920,7 @@ async def apply_mtu_config(
         scope="interface_mtu",
         replace=replace,
         dry_run=dry_run,
+        stage=stage,
     )
 
 
@@ -906,6 +931,7 @@ async def apply_l2_saps(
     *,
     replace: bool = False,
     dry_run: bool = False,
+    stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write Nokia L2 SAP intent for a single device to NSO.
 
@@ -938,6 +964,7 @@ async def apply_l2_saps(
         scope="l2_sap",
         replace=replace,
         dry_run=dry_run,
+        stage=stage,
     )
 
 
@@ -948,6 +975,7 @@ async def apply_lag_config(
     *,
     replace: bool = False,
     dry_run: bool = False,
+    stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write LACP/LAG bundle intent for a single device to NSO.
 
@@ -970,6 +998,7 @@ async def apply_lag_config(
         scope="lag",
         replace=replace,
         dry_run=dry_run,
+        stage=stage,
     )
 
 
@@ -980,6 +1009,7 @@ async def apply_switchport_config(
     *,
     replace: bool = False,
     dry_run: bool = False,
+    stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write L2 switchport intent for a single device to NSO.
 
@@ -998,6 +1028,7 @@ async def apply_switchport_config(
         scope="switchport",
         replace=replace,
         dry_run=dry_run,
+        stage=stage,
     )
 
 
@@ -1104,6 +1135,7 @@ async def apply_isis_interfaces(
     flex_algo_rows: list | None = None,
     *,
     dry_run: bool = False,
+    stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write IS-IS interface-enablement and process intent for a single device to NSO.
 
@@ -1128,6 +1160,10 @@ async def apply_isis_interfaces(
         service_body["interface-config"] = interfaces
     if processes:
         service_body["process-config"] = processes
+
+    if stage is not None:
+        stage["isis-reconciler:isis-config"] = [service_body]
+        return None
 
     payload = json.dumps({"isis-reconciler:isis-config": [service_body]})
 
@@ -1264,6 +1300,7 @@ async def apply_bgp_config(
     *,
     replace: bool = False,
     dry_run: bool = False,
+    stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write BGP intent for a single device to NSO via the bgp-reconciler.
 
@@ -1349,6 +1386,7 @@ async def apply_bgp_config(
         scope="bgp",
         replace=replace,
         dry_run=dry_run,
+        stage=stage,
     )
 
 
@@ -1394,6 +1432,7 @@ async def apply_route_policy_config(
     ned_id: str | None = None,
     replace: bool = False,
     dry_run: bool = False,
+    stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write route-policy intent for a single device to NSO via the route-policy-reconciler.
 
@@ -1459,6 +1498,7 @@ async def apply_route_policy_config(
         scope="route_policy",
         replace=replace,
         dry_run=dry_run,
+        stage=stage,
     )
 
 
@@ -1514,6 +1554,7 @@ async def apply_ospf_config(
     *,
     replace: bool = False,
     dry_run: bool = False,
+    stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write OSPF process and interface intent for a single device to NSO.
 
@@ -1554,4 +1595,5 @@ async def apply_ospf_config(
         scope="ospf",
         replace=replace,
         dry_run=dry_run,
+        stage=stage,
     )

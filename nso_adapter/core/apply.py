@@ -629,73 +629,315 @@ async def _apply_ips(by_iface, ifaces, apply_fn, *, client, device_name, job_id,
     return ok, failed, failures
 
 
-async def _apply_subif_ip_atomic(
-    subif_rows, ip_by_iface, ifaces, *, client, device_name, job_id, now
-) -> tuple[tuple[int, int, list], tuple[int, int, list]]:
-    """Stage subinterface + interface-IP intent into ONE NSO transaction (atomic apply).
+_IFACE_CONFIG_ROOT = "interface-reconciler:interface-config"
 
-    The flagged (``NSO_ADAPTER_ATOMIC_APPLY``) replacement for the separate subif scope +
-    per-interface IP commits: one ``apply_combined`` PATCH to ``/restconf/data`` so the
-    subif unit and its IP land in a single device transaction (dissolving the greenfield
-    ordering dependency — a Junos unit and its ``family inet address`` are created together).
 
-    All-or-nothing: on a successful commit every subif + IP row is stamped ``last_apply_at``
-    with the error cleared; on failure every row records the error. Returns
-    ``(ip_outcome, subif_outcome)`` each as ``(in_sync, apply_failed, failures)`` so the
-    caller feeds them into the existing per-row result model unchanged.
+def _build_interface_config_entries(attr_eligible, ip_by_iface, ifaces, device_name: str) -> list[dict]:
+    """Merge interface description/enabled + IP intent into one entry per interface.
+
+    Both ride the same ``(device, interface-name)``-keyed interface-reconciler instance, so in
+    a single atomic edit they MUST be one list item — two items with a duplicate key conflict.
     """
-    from nso_adapter.nso.apply import (
-        apply_combined,
-        build_interface_ip_entry,
-        build_subif_interfaces,
-    )
+    from nso_adapter.nso.apply import build_interface_ip_entry
 
-    modules: dict[str, list] = {}
-    if subif_rows:
-        modules["subinterface-reconciler:subif-config"] = [
-            {"device": device_name, "interface": build_subif_interfaces(subif_rows)}
-        ]
-    ip_entries: list[dict] = []
-    flat_ip_rows: list = []
+    by_name: dict[str, dict] = {}
+
+    def _entry(name: str) -> dict:
+        return by_name.setdefault(name, {"device": device_name, "interface-name": name})
+
+    for _attr_state, intent_row, iface in attr_eligible:
+        entry = _entry(iface.name)
+        if intent_row.attribute == "description":
+            entry["description"] = intent_row.intent_value if intent_row.intent_value is not None else ""
+        elif intent_row.attribute == "enabled":
+            val = intent_row.intent_value
+            entry["enabled"] = val is True or str(val).strip().lower() == "true"
+
     for iface_id, rows in ip_by_iface.items():
         iface = ifaces[iface_id]
         routed_kind = _nokia_routed_kind(iface)
-        ip_entries.append(
-            build_interface_ip_entry(
-                device_name,
-                iface.name,
-                rows,
-                kind=routed_kind,
-                service=iface.service if routed_kind in ("ies", "vprn") else None,
-                parent_binding=iface.parent_binding,
-                encap_tag=iface.encap_tag,
-            )
+        ip_entry = build_interface_ip_entry(
+            device_name,
+            iface.name,
+            rows,
+            kind=routed_kind,
+            service=iface.service if routed_kind in ("ies", "vprn") else None,
+            parent_binding=iface.parent_binding,
+            encap_tag=iface.encap_tag,
         )
-        flat_ip_rows.extend(rows)
-    if ip_entries:
-        modules["interface-reconciler:interface-config"] = ip_entries
+        entry = _entry(iface.name)
+        for key, value in ip_entry.items():
+            if key not in ("device", "interface-name"):
+                entry[key] = value
 
-    all_rows = [*subif_rows, *flat_ip_rows]
+    return list(by_name.values())
+
+
+async def _localize_atomic_failure(db, client, device, device_name, modules, exc, job_id) -> set[str]:
+    """Return the set of offending module root-keys after a failed atomic commit.
+
+    Two complementary signals: (1) a per-scope dry-run — a module NSO rejects at validation
+    re-runs to an inconclusive (``None``) delta in isolation; (2) the route-policy
+    device-parser rejection, which renders clean in dry-run but is named in the commit error
+    — parsed and recorded into the capability matrix (I2 reuse). When neither localises the
+    offender, the caller falls back to failing every staged scope (the commit rolled back).
+    """
+    from nso_adapter.nso.apply import apply_combined
+
+    offenders: set[str] = set()
+    for root_key, bodies in modules.items():
+        try:
+            delta = await apply_combined(client, device_name, {root_key: bodies}, dry_run=True)
+        except Exception:  # noqa: BLE001 — a raising dry-run is itself an offender signal
+            delta = None
+        if delta is None:
+            offenders.add(root_key)
+
+    # Route-policy device-parser rejection (renders clean in dry-run): parse + record capability.
     try:
-        await apply_combined(client=client, device_name=device_name, modules=modules)
+        from nso_adapter.core.capability import (
+            parse_rejected_construct,
+            record_capability_rejection,
+            refresh_device_capability,
+        )
+
+        scope, name = parse_rejected_construct(exc.message)
+        if name:
+            info = await refresh_device_capability(db, client, device_name, device)
+            if info:
+                await record_capability_rejection(
+                    db, info["ned_id"], info["sw_version"], scope, name, exc.message[:256]
+                )
+            if "route-policy-reconciler:route-policy-config" in modules:
+                offenders.add("route-policy-reconciler:route-policy-config")
+    except Exception:  # noqa: BLE001 — capability recording is best-effort
+        logger.debug("apply.atomic.capability_record_skipped", job_id=job_id)
+
+    return offenders
+
+
+# Maps a staged module root-key → its result/scope key. interface-config is handled
+# separately (it carries the attribute + IP scopes, which the result model splits out).
+_ATOMIC_SCOPE_ROOTS: dict[str, str] = {
+    "subinterface-reconciler:subif-config": "subinterface",
+    "snmp-reconciler:snmp-config": "snmp",
+    "static-route-reconciler:static-route-config": "static_route",
+    "logging-reconciler:logging-config": "logging",
+    "svi-reconciler:svi-config": "svi",
+    "vlan-reconciler:vlan-config": "vlan",
+    "bfd-reconciler:bfd-config": "bfd",
+    "mtu-reconciler:mtu-config": "interface_mtu",
+    "l2-sap-reconciler:l2-sap-config": "l2_sap",
+    "isis-reconciler:isis-config": "isis",
+    "bgp-reconciler:bgp-config": "bgp",
+    "route-policy-reconciler:route-policy-config": "route_policy",
+    "ospf-reconciler:ospf-config": "ospf",
+}
+
+
+async def _stage_atomic_modules(elig, client, device, device_name) -> tuple[dict, list, dict]:
+    """Build the combined ``/restconf/data`` body across every scope.
+
+    Returns ``(modules, iface_entries, scope_rows)``. Each scope stages its body via
+    ``stage=modules`` (reusing its own body-builder, no HTTP); the interface-config module
+    merges attribute + IP intent per interface.
+    """
+    from nso_adapter.nso.apply import (
+        apply_bfd_config,
+        apply_bgp_config,
+        apply_isis_interfaces,
+        apply_l2_saps,
+        apply_logging_config,
+        apply_mtu_config,
+        apply_ospf_config,
+        apply_route_policy_config,
+        apply_snmp_config,
+        apply_static_routes,
+        apply_subinterface_config,
+        apply_svi_config,
+        apply_vlan_config,
+    )
+
+    modules: dict[str, list] = {}
+    iface_entries = _build_interface_config_entries(elig["attr"], elig["ip_by_iface"], elig["ifaces"], device_name)
+    if iface_entries:
+        modules[_IFACE_CONFIG_ROOT] = iface_entries
+
+    stagers: list[tuple[str, list, object]] = [
+        (
+            "subinterface",
+            elig["subif"],
+            lambda: apply_subinterface_config(client, device_name, elig["subif"], stage=modules),
+        ),
+        (
+            "snmp",
+            elig["snmp_rows"],
+            lambda: apply_snmp_config(
+                client,
+                device_name,
+                elig["snmp_comm"],
+                elig["snmp_user"],
+                elig["snmp_host"],
+                elig["snmp_sysinfo"],
+                stage=modules,
+            ),
+        ),
+        (
+            "static_route",
+            elig["static_route"],
+            lambda: apply_static_routes(client, device_name, elig["static_route"], stage=modules),
+        ),
+        ("logging", elig["logging"], lambda: apply_logging_config(client, device_name, elig["logging"], stage=modules)),
+        ("svi", elig["svi"], lambda: apply_svi_config(client, device_name, elig["svi"], stage=modules)),
+        ("vlan", elig["vlan"], lambda: apply_vlan_config(client, device_name, elig["vlan"], stage=modules)),
+        ("bfd", elig["bfd"], lambda: apply_bfd_config(client, device_name, elig["bfd"], stage=modules)),
+        ("interface_mtu", elig["mtu"], lambda: apply_mtu_config(client, device_name, elig["mtu"], stage=modules)),
+        ("l2_sap", elig["l2_sap"], lambda: apply_l2_saps(client, device_name, elig["l2_sap"], stage=modules)),
+        (
+            "isis",
+            [*elig["isis_iface"], *elig["isis_proc"], *elig["redist_isis"], *elig["isis_flex"]],
+            lambda: apply_isis_interfaces(
+                client,
+                device_name,
+                elig["isis_iface"],
+                elig["isis_proc"],
+                elig["redist_isis"],
+                elig["isis_flex"],
+                stage=modules,
+            ),
+        ),
+        (
+            "bgp",
+            [*elig["bgp"], *elig["redist_bgp"]],
+            lambda: apply_bgp_config(client, device_name, elig["bgp"], elig["redist_bgp"], stage=modules),
+        ),
+        (
+            "route_policy",
+            elig["rp"],
+            lambda: apply_route_policy_config(client, device_name, elig["rp"], ned_id=device.ned_id, stage=modules),
+        ),
+        (
+            "ospf",
+            [*elig["ospf_inst"], *elig["ospf_iface"], *elig["redist_ospf"]],
+            lambda: apply_ospf_config(
+                client, device_name, elig["ospf_inst"], elig["ospf_iface"], elig["redist_ospf"], stage=modules
+            ),
+        ),
+    ]
+    scope_rows = {key: rows for key, rows, _fn in stagers}
+    for _key, rows, stage_fn in stagers:
+        if rows:
+            await stage_fn()
+    return modules, iface_entries, scope_rows
+
+
+def _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot) -> tuple[int, int, list]:
+    """Stamp interface-attribute rows from the single atomic outcome.
+
+    Pending (rolled-back, non-offender) attrs revert from ``deploying`` to their pre-apply
+    snapshot state.
+    """
+    ok = failed = 0
+    failures: list[dict] = []
+    for attr_state, intent_row, iface in attr_eligible:
+        if commit_error is None:
+            attr_state.sync_state = SyncState.in_sync
+            intent_row.last_apply_at = now
+            intent_row.last_apply_error = None
+            ok += 1
+        elif iface_failed:
+            attr_state.sync_state = SyncState.apply_failed
+            intent_row.last_apply_error = err
+            failed += 1
+            failures.append({"interface": iface.name, "attribute": intent_row.attribute, "error": msg})
+        else:
+            attr_state.sync_state = snapshot[attr_state]
+    return ok, failed, failures
+
+
+def _stamp_ip_atomic(ip_rows_flat, commit_error, iface_failed, err, msg, now) -> tuple[int, int, list]:
+    """Stamp IP rows from the single atomic outcome (pending rows untouched, retried next apply)."""
+    if commit_error is None:
+        for row in ip_rows_flat:
+            row.last_apply_at = now
+            row.last_apply_error = None
+        return len(ip_rows_flat), 0, []
+    if iface_failed:
+        for row in ip_rows_flat:
+            row.last_apply_error = err
+        return 0, len(ip_rows_flat), ([{"error": msg}] if ip_rows_flat else [])
+    return 0, 0, []
+
+
+def _stamp_batch_scopes_atomic(scope_rows, offenders, commit_error, err, msg, now) -> tuple[dict, dict]:
+    """Stamp every batch scope from the single atomic outcome → (scope_outcomes, scope_failures).
+
+    Offending scopes fail; non-offending scopes are pending (rows untouched, retried next apply).
+    """
+    scope_outcomes: dict[str, tuple[int, int]] = {key: (0, 0) for key in _SCOPE_RESULT_ORDER}
+    scope_failures: dict[str, list] = {}
+    for root_key, scope_key in _ATOMIC_SCOPE_ROOTS.items():
+        rows = scope_rows.get(scope_key) or []
+        if not rows:
+            continue
+        if commit_error is None:
+            for row in rows:
+                row.last_apply_at = now
+                row.last_apply_error = None
+            scope_outcomes[scope_key] = (len(rows), 0)
+        elif root_key in offenders:
+            for row in rows:
+                row.last_apply_error = err
+            scope_outcomes[scope_key] = (0, len(rows))
+            scope_failures[scope_key] = [{"error": msg}]
+    return scope_outcomes, scope_failures
+
+
+async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, elig) -> None:
+    """I3b atomic apply: stage every scope into one transaction and commit once.
+
+    On success, stamp every row in_sync; on failure the whole transaction rolled back —
+    localise the offending scope(s), fail those rows (+ record capability), and leave
+    non-offending scopes pending (untouched → retried next apply).
+    """
+    from nso_adapter.nso.apply import apply_combined
+
+    attr_eligible = elig["attr"]
+    ip_rows_flat = [r for rows in elig["ip_by_iface"].values() for r in rows]
+
+    # Snapshot attr states, then mark deploying (parity with the per-scope path); a pending
+    # (rolled-back, non-offender) attr is reverted to its snapshot rather than left deploying.
+    snapshot = {attr_state: attr_state.sync_state for attr_state, _ir, _if in attr_eligible}
+    for attr_state, _ir, _if in attr_eligible:
+        attr_state.sync_state = SyncState.deploying
+    await db.commit()
+
+    modules, iface_entries, scope_rows = await _stage_atomic_modules(elig, client, device, device_name)
+
+    commit_error: NsoApplyError | None = None
+    try:
+        await apply_combined(client, device_name, modules)
     except NsoApplyError as exc:
-        logger.error("apply.atomic_subif_ip_failed", job_id=job_id, device=device_name, error=exc.message)
-        err = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-        for row in all_rows:
-            row.last_apply_error = err
-        fail = [{"error": exc.message}]
-        return (0, len(flat_ip_rows), fail if flat_ip_rows else []), (0, len(subif_rows), fail if subif_rows else [])
-    except Exception as exc:
-        logger.exception("apply.atomic_subif_ip_unexpected_error", job_id=job_id)
-        err = {"code": "internal", "message": repr(exc), "detail": {}}
-        for row in all_rows:
-            row.last_apply_error = err
-        fail = [{"error": repr(exc)}]
-        return (0, len(flat_ip_rows), fail if flat_ip_rows else []), (0, len(subif_rows), fail if subif_rows else [])
-    for row in all_rows:
-        row.last_apply_at = now
-        row.last_apply_error = None
-    return (len(flat_ip_rows), 0, []), (len(subif_rows), 0, [])
+        commit_error = exc
+    except Exception as exc:  # noqa: BLE001 — surface as a job-level failure
+        commit_error = NsoApplyError("internal", repr(exc))
+
+    if commit_error is not None:
+        logger.error("apply.atomic_failed", job_id=job_id, device=device_name, error=commit_error.message)
+        offenders = await _localize_atomic_failure(db, client, device, device_name, modules, commit_error, job_id)
+        if not offenders:  # could not localise → the whole rolled-back commit is the failure
+            offenders = set(modules.keys())
+        err = {"code": commit_error.code, "message": commit_error.message, "detail": commit_error.detail}
+        msg = commit_error.message
+    else:
+        offenders, err, msg = set(), None, ""
+
+    iface_failed = (_IFACE_CONFIG_ROOT in offenders) if iface_entries else False
+    attr_outcome = _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot)
+    ip_outcome = _stamp_ip_atomic(ip_rows_flat, commit_error, iface_failed, err, msg, now)
+    scope_outcomes, scope_failures = _stamp_batch_scopes_atomic(scope_rows, offenders, commit_error, err, msg, now)
+
+    await _finalize_job(db, job, job_id, device.id, True, attr_outcome, ip_outcome, scope_outcomes, scope_failures)
 
 
 async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_error=None) -> tuple[int, int, list]:
@@ -892,6 +1134,63 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     job.context = {"force": force, "intent_snapshot": intent_snapshot, "ip_snapshot": ip_snapshot}
     now = datetime.now(UTC).replace(tzinfo=None)
 
+    any_eligible = any(
+        [
+            attr_eligible,
+            ip_eligible_by_iface,
+            snmp_rows,
+            sr_eligible,
+            logging_eligible,
+            svi_eligible,
+            subif_eligible,
+            vlan_eligible,
+            bfd_eligible,
+            mtu_eligible,
+            l2_eligible,
+            isis_eligible,
+            bgp_eligible,
+            rp_eligible,
+            ospf_instance_eligible,
+            ospf_iface_eligible,
+            redist_eligible,
+        ]
+    )
+
+    # Atomic apply (I3b): stage EVERY scope's accepted intent into ONE NSO transaction and
+    # commit once. Self-contained (stages, commits, stamps, finalises). When off, the
+    # per-scope commit path below runs (per-item attr/IP + one batch commit per scope).
+    if atomic_apply_enabled() and any_eligible:
+        elig = {
+            "ifaces": ifaces,
+            "attr": attr_eligible,
+            "ip_by_iface": ip_eligible_by_iface,
+            "subif": subif_eligible,
+            "snmp_rows": snmp_rows,
+            "snmp_comm": snmp_comm,
+            "snmp_user": snmp_user,
+            "snmp_host": snmp_host,
+            "snmp_sysinfo": snmp_sysinfo,
+            "static_route": sr_eligible,
+            "logging": logging_eligible,
+            "svi": svi_eligible,
+            "vlan": vlan_eligible,
+            "bfd": bfd_eligible,
+            "mtu": mtu_eligible,
+            "l2_sap": l2_eligible,
+            "isis_iface": isis_eligible,
+            "isis_proc": isis_process_eligible,
+            "isis_flex": isis_flex_eligible,
+            "bgp": bgp_eligible,
+            "rp": rp_eligible,
+            "ospf_inst": ospf_instance_eligible,
+            "ospf_iface": ospf_iface_eligible,
+            "redist_ospf": redist_ospf,
+            "redist_isis": redist_isis,
+            "redist_bgp": redist_bgp,
+        }
+        await _run_atomic_apply(db, device, client, device_name, job, job_id, now, elig)
+        return
+
     # ── Step 2: mark attribute states deploying ──
     for attr_state, _intent_row, _iface in attr_eligible:
         attr_state.sync_state = SyncState.deploying
@@ -901,32 +1200,15 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     attr_outcome = await _apply_attributes(
         attr_eligible, apply_interface_attribute, client=client, device_name=device_name, job_id=job_id, now=now
     )
-
-    # Atomic apply (I3a): stage the subinterface + interface-IP pair into ONE NSO
-    # transaction so a greenfield subif unit and its IP land together. When off, the
-    # subif scope is applied below in the per-scope loop and IPs commit per-interface.
-    atomic = atomic_apply_enabled() and bool(subif_eligible or ip_eligible_by_iface)
-    subif_atomic_outcome: tuple[int, int, list] | None = None
-    if atomic:
-        ip_outcome, subif_atomic_outcome = await _apply_subif_ip_atomic(
-            subif_eligible,
-            ip_eligible_by_iface,
-            ifaces,
-            client=client,
-            device_name=device_name,
-            job_id=job_id,
-            now=now,
-        )
-    else:
-        ip_outcome = await _apply_ips(
-            ip_eligible_by_iface,
-            ifaces,
-            apply_interface_ips,
-            client=client,
-            device_name=device_name,
-            job_id=job_id,
-            now=now,
-        )
+    ip_outcome = await _apply_ips(
+        ip_eligible_by_iface,
+        ifaces,
+        apply_interface_ips,
+        client=client,
+        device_name=device_name,
+        job_id=job_id,
+        now=now,
+    )
 
     async def _record_rp_capability(exc: NsoApplyError) -> None:
         # The device parser only rejects an unsupported construct on a real commit
@@ -1060,9 +1342,6 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     scope_outcomes: dict[str, tuple[int, int]] = {}
     scope_failures: dict[str, list] = {}
     for sc in scopes:
-        # The subinterface scope is committed atomically with IPs above when the flag is on.
-        if atomic and sc.key == "subinterface":
-            continue
         if not sc.rows:
             scope_outcomes[sc.key] = (0, 0)
             continue
@@ -1079,37 +1358,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         if fails:
             scope_failures[sc.key] = fails
 
-    if subif_atomic_outcome is not None:
-        s_ok, s_failed, s_fails = subif_atomic_outcome
-        scope_outcomes["subinterface"] = (s_ok, s_failed)
-        if s_fails:
-            scope_failures["subinterface"] = s_fails
-
-    # ── Step 7: finalize ──
-    # "Nothing eligible" mirrors the historical flag set exactly (note: it keys off the
-    # IS-IS *interface* list and the OSPF instance/interface lists, not the process/flex
-    # rows), so the outcome is byte-identical to the pre-refactor worker.
-    any_eligible = any(
-        [
-            attr_eligible,
-            ip_eligible_by_iface,
-            snmp_rows,
-            sr_eligible,
-            logging_eligible,
-            svi_eligible,
-            subif_eligible,
-            vlan_eligible,
-            bfd_eligible,
-            mtu_eligible,
-            l2_eligible,
-            isis_eligible,
-            bgp_eligible,
-            rp_eligible,
-            ospf_instance_eligible,
-            ospf_iface_eligible,
-            redist_eligible,
-        ]
-    )
+    # ── Step 7: finalize ── (any_eligible computed up front, before the atomic branch)
     await _finalize_job(
         db, job, job_id, device_id, any_eligible, attr_outcome, ip_outcome, scope_outcomes, scope_failures
     )
