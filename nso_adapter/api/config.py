@@ -22,10 +22,18 @@ from nso_adapter.core.failover import (
 router = APIRouter(prefix="/api/v1/config", tags=["config"])
 
 
-def _config_out(eff: EffectiveFailoverConfig) -> dict:
-    """Serialize the effective config with the canonical (un-prefixed) field names."""
+def _config_out(eff: EffectiveFailoverConfig, deployment_enabled: bool) -> dict:
+    """Serialize the effective config with the canonical (un-prefixed) field names.
+
+    ``deployment_enabled`` is the deployment-level master switch
+    (``scheduler.enable_failover`` from the adapter's static config). It gates the whole
+    feature — both the failover probe loop's job registration AND onboarding's OOB
+    bootstrap — so when it is False the runtime ``enabled`` toggle has no effect. The
+    plugin surfaces this so enabling failover there isn't silently a no-op.
+    """
     return {
         "enabled": eff.enabled,
+        "deployment_enabled": deployment_enabled,
         "primary_probe_interval": eff.failover_primary_probe_interval,
         "oob_probe_interval": eff.failover_oob_probe_interval,
         "failure_threshold": eff.failover_failure_threshold,
@@ -60,8 +68,9 @@ class FailoverConfigUpdate(BaseModel):
 @router.get("/failover", dependencies=[Depends(verify_token)])
 async def get_failover_config(db: AsyncSession = Depends(get_db)):
     """Return the live failover config (the stored singleton, or the static fallback)."""
-    eff = await get_effective_failover_config(db, get_config().scheduler)
-    return _config_out(eff)
+    sched = get_config().scheduler
+    eff = await get_effective_failover_config(db, sched)
+    return _config_out(eff, sched.enable_failover)
 
 
 @router.put("/failover", dependencies=[Depends(verify_token)])
@@ -69,5 +78,6 @@ async def put_failover_config(body: FailoverConfigUpdate, db: AsyncSession = Dep
     """Upsert the failover tuning singleton; the next base-tick reads the new values."""
     await upsert_failover_config(db, **body.model_dump(exclude_unset=True))
     await db.commit()
-    eff = await get_effective_failover_config(db, get_config().scheduler)
-    return _config_out(eff)
+    sched = get_config().scheduler
+    eff = await get_effective_failover_config(db, sched)
+    return _config_out(eff, sched.enable_failover)

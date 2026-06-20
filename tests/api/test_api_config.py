@@ -18,6 +18,9 @@ async def test_get_failover_config_defaults_when_unset(adapter_client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["enabled"] is True
+    # The deployment master switch (static scheduler.enable_failover) defaults off; the plugin
+    # surfaces this so enabling failover there isn't a silent no-op.
+    assert body["deployment_enabled"] is False
     # SchedulerConfig test defaults (no DB row yet): primary 2m, oob 15m, thresholds 3/5.
     assert body["primary_probe_interval"] == 2
     assert body["oob_probe_interval"] == 15
@@ -41,13 +44,15 @@ async def test_put_failover_config_persists_and_get_reflects(adapter_client):
         "max_flips_per_tick": 10,
         "sync_from_after_switch": False,
     }
+    # The response echoes the tuning plus the read-only deployment master switch (off in tests).
+    expected = {**payload, "deployment_enabled": False}
     put = await adapter_client.put("/api/v1/config/failover", json=payload, headers=AUTH)
     assert put.status_code == 200
-    assert put.json() == payload
+    assert put.json() == expected
 
     got = await adapter_client.get("/api/v1/config/failover", headers=AUTH)
     assert got.status_code == 200
-    assert got.json() == payload
+    assert got.json() == expected
 
 
 async def test_put_failover_config_is_partial(adapter_client):
@@ -79,6 +84,20 @@ async def test_put_failover_config_caps_concurrency_to_pool(adapter_client):
     assert (
         await adapter_client.put("/api/v1/config/failover", json={"probe_concurrency": 16}, headers=AUTH)
     ).status_code == 200
+
+
+async def test_deployment_enabled_reflects_static_master_switch(adapter_client):
+    """deployment_enabled mirrors the static scheduler.enable_failover (the deployment master switch).
+
+    When the deployment switch is ON, the runtime ``enabled`` toggle is meaningful; the plugin
+    only warns when this is OFF. Proven by flipping the live (cached) config the endpoint reads.
+    """
+    from nso_adapter.config import get_config
+
+    get_config().scheduler.enable_failover = True
+    resp = await adapter_client.get("/api/v1/config/failover", headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["deployment_enabled"] is True
 
 
 async def test_failover_config_requires_auth(adapter_client):
