@@ -32,6 +32,10 @@ class PreflightRequest(BaseModel):
     aspath_names: list[str] = []
 
 
+class ApplyPreflightRequest(BaseModel):
+    scopes: list[str] = []
+
+
 async def _device_and_client(device_id: int, db: AsyncSession):
     device = await db.get(Device, device_id)
     if not device:
@@ -92,3 +96,30 @@ async def preflight_route_policy(
     rows = await capability.get_device_capability(db, info["ned_id"], info["sw_version"])
     result = capability.preflight(rows, body.community_members, body.set_keys, body.match_keys, body.aspath_names)
     return {"known": True, "ned_id": info["ned_id"], "sw_version": info["sw_version"], **result}
+
+
+@router.post("/{device_id}/apply/preflight", dependencies=[Depends(verify_token)])
+async def preflight_apply(
+    device_id: int, body: ApplyPreflightRequest, refresh: bool = False, db: AsyncSession = Depends(get_db)
+):
+    """Check the scopes the next apply will push against this device's capability matrix.
+
+    The generic analog of ``/route-policy/preflight``: the plugin passes the scopes from its
+    apply diff; any the matrix marks ``unsupported``/``skipped`` (recorded reactively on a prior
+    apply failure, see ``_record_atomic_capability``) are returned so the operator is warned
+    BEFORE a device write. ``refresh=false`` (default) is the cheap cache-only read; the device
+    must have a known ``(ned, sw)`` key (probed at least once) or the result is fail-open.
+    """
+    device, client = await _device_and_client(device_id, db)
+    info = await capability.resolve_capability_key(db, client, device, refresh=refresh)
+    if not info:
+        return {"known": False, "fully_supported": True, "unsupported": [], "coverage_unknown": False}
+    rows = await capability.get_device_capability(db, info["ned_id"], info["sw_version"])
+    result = capability.preflight_scopes(rows, body.scopes)
+    return {
+        "known": True,
+        "ned_id": info["ned_id"],
+        "sw_version": info["sw_version"],
+        "coverage_unknown": capability.coverage_unknown(rows),
+        **result,
+    }

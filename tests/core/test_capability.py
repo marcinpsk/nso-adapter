@@ -253,3 +253,42 @@ def test_parse_rejected_construct():
     assert parse_rejected_construct("command: match as-path AP-X\n") == ("rm-match", "match as-path")
     assert parse_rejected_construct("command: set comm-list FOO delete\n") == ("rm-set", "set comm-list delete")
     assert parse_rejected_construct("no command here") == (None, None)
+
+
+# ── preflight_scopes (generic apply-preflight: scope-level matrix check) ────────
+
+
+def test_preflight_scopes_flags_unsupported_and_skipped():
+    from types import SimpleNamespace
+
+    from nso_adapter.core.capability import preflight_scopes
+
+    rows = [
+        SimpleNamespace(scope="static_route", name="static_route", status="unsupported", detail="NED rejected"),
+        SimpleNamespace(scope="snmp", name="snmp", status="skipped", detail="no home"),
+        SimpleNamespace(scope="bgp", name="bgp", status="native", detail=""),
+    ]
+    result = preflight_scopes(rows, ["static_route", "snmp", "bgp", "ospf"])
+    assert result["fully_supported"] is False
+    flagged = {(u["scope"], u["status"]) for u in result["unsupported"]}
+    assert flagged == {("static_route", "unsupported"), ("snmp", "skipped")}
+    # bgp is native (not flagged); ospf has no matrix row (not flagged)
+
+
+def test_preflight_scopes_only_checks_requested_scopes():
+    from types import SimpleNamespace
+
+    from nso_adapter.core.capability import preflight_scopes
+
+    rows = [SimpleNamespace(scope="static_route", name="static_route", status="unsupported", detail="x")]
+    # static_route is unsupported but NOT requested → not flagged
+    assert preflight_scopes(rows, ["bgp"]) == {"fully_supported": True, "unsupported": []}
+
+
+def test_preflight_scopes_empty_request_is_fully_supported():
+    from types import SimpleNamespace
+
+    from nso_adapter.core.capability import preflight_scopes
+
+    rows = [SimpleNamespace(scope="static_route", name="static_route", status="unsupported", detail="x")]
+    assert preflight_scopes(rows, []) == {"fully_supported": True, "unsupported": []}

@@ -163,3 +163,47 @@ async def test_preflight_unknown_device_is_fail_open(adapter_client_with_nso, mo
     assert body["known"] is False
     assert body["fully_supported"] is True
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_apply_preflight_flags_unsupported_scope(adapter_client_with_nso, monkeypatch):  # noqa: F811
+    """The generic apply-preflight flags a scope the matrix recorded unsupported (reactively,
+    from a prior apply failure) when the plugin asks about it before a device write."""
+    from nso_adapter.core.capability import record_capability_rejection
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device
+
+    device_id = await seed_device(nso_device_name="rg03")
+    async for db in get_session():  # known (ned, sw) + a reactively-recorded scope gap
+        dev = await db.get(Device, device_id)
+        dev.ned_id, dev.sw_version = _NED, "17.15.4c"
+        await db.commit()
+        break
+    async for db in get_session():
+        await record_capability_rejection(db, _NED, "17.15.4c", "static_route", "static_route", "NED rejected")
+        break
+
+    resp = await adapter_client_with_nso.post(
+        f"/api/v1/devices/{device_id}/apply/preflight?refresh=false",
+        headers=AUTH,
+        json={"scopes": ["static_route", "bgp"]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["known"] is True
+    assert body["fully_supported"] is False
+    assert [(u["scope"], u["status"]) for u in body["unsupported"]] == [("static_route", "unsupported")]
+
+
+@pytest.mark.asyncio
+async def test_apply_preflight_unknown_device_is_fail_open(adapter_client_with_nso, monkeypatch):  # noqa: F811
+    """A never-probed device (no (ned, sw) key) is fail-open — never blocks the apply."""
+    device_id = await seed_device(nso_device_name="rg03")
+    resp = await adapter_client_with_nso.post(
+        f"/api/v1/devices/{device_id}/apply/preflight?refresh=false",
+        headers=AUTH,
+        json={"scopes": ["static_route"]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"known": False, "fully_supported": True, "unsupported": [], "coverage_unknown": False}

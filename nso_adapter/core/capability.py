@@ -280,6 +280,25 @@ def preflight(rows, community_members=(), set_keys=(), match_keys=(), aspath_nam
     }
 
 
+def preflight_scopes(rows, scopes) -> dict:
+    """Check a set of about-to-apply scope names against the capability matrix.
+
+    The generic analog of :func:`preflight` (which is route-policy-construct granular).
+    A scope the matrix marks ``unsupported``/``skipped`` — recorded reactively when a prior
+    apply's per-scope dry-run was rejected by the NED (see ``core/apply.py``
+    ``_record_atomic_capability``) — is flagged so the plugin can warn before a device write.
+    The plugin passes the scopes from its apply diff. Returns
+    ``{fully_supported, unsupported:[{scope,name,status,detail}]}``.
+    """
+    requested = {str(s) for s in scopes}
+    unsupported = [
+        {"scope": r.scope, "name": r.name, "status": r.status, "detail": r.detail}
+        for r in rows
+        if r.scope in requested and r.status in ("skipped", "unsupported")
+    ]
+    return {"fully_supported": not unsupported, "unsupported": unsupported}
+
+
 # Rejected-command → (scope, construct-name) for the accepted half. Names match the
 # preflight candidate names so a later preflight surfaces the device's real rejection.
 _REJECTION_CONSTRUCTS = (
