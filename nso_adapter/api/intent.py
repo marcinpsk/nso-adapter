@@ -95,8 +95,17 @@ async def put_intent(device_id: int, body: IntentUpdate, db: AsyncSession = Depe
     for item in body.attributes:
         iface = ifaces.get(item.interface)
         if iface is None:
-            logger.warning("intent.put.unknown_interface", device_id=device_id, interface=item.interface)
-            continue
+            # Intent must ALWAYS land. The operator may reference an interface the adapter never
+            # imported (a greenfield interface created in NetBox). Materialise a minimal interface
+            # row so the attribute intent is stored + visible, never silently dropped (the old
+            # behaviour lost it with only a warning — it looked accepted but vanished). The apply
+            # decides whether the interface can be realised and reports that explicitly; ingest
+            # never judges capability. Mirrors put_ip_intent's greenfield handling.
+            iface = DbInterface(device_id=device_id, name=item.interface, kind="logical")
+            db.add(iface)
+            await db.flush()  # assign id before the intent + attr_state FK it
+            ifaces[item.interface] = iface
+            logger.info("intent.put.greenfield_interface", device_id=device_id, interface=item.interface)
         value = str(item.intent_value) if item.intent_value is not None else None
         row = InterfaceIntent(
             interface_id=iface.id,
@@ -108,8 +117,10 @@ async def put_intent(device_id: int, body: IntentUpdate, db: AsyncSession = Depe
         count += 1
 
         # Stamp the attr_state as accepted so the apply job finds it eligible.
-        # Transition imported/changed → accepted; leave in_sync/drifted/apply_failed
-        # alone so force-apply on already-deployed intent still works.
+        # Transition imported/changed/unknown → accepted; leave in_sync/drifted/apply_failed
+        # alone so force-apply on already-deployed intent still works. A greenfield interface
+        # (or an attribute the device was never imported with) has no state yet → create it
+        # accepted, so the freshly-landed intent is also apply-eligible (not stored-but-inert).
         attr_result = await db.execute(
             select(InterfaceAttrState).where(
                 InterfaceAttrState.interface_id == iface.id,
@@ -117,11 +128,9 @@ async def put_intent(device_id: int, body: IntentUpdate, db: AsyncSession = Depe
             )
         )
         attr_state = attr_result.scalar_one_or_none()
-        if attr_state and attr_state.sync_state in {
-            SyncState.imported,
-            SyncState.changed,
-            SyncState.unknown,
-        }:
+        if attr_state is None:
+            db.add(InterfaceAttrState(interface_id=iface.id, attribute=item.attribute, sync_state=SyncState.accepted))
+        elif attr_state.sync_state in {SyncState.imported, SyncState.changed, SyncState.unknown}:
             attr_state.sync_state = SyncState.accepted
 
     await db.flush()

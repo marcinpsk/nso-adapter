@@ -104,18 +104,42 @@ async def test_put_intent_replaces_existing(adapter_client):
     assert attrs[0]["intent_value"] == "second-value"
 
 
-async def test_put_intent_unknown_interface_skipped(adapter_client):
-    """Intent for an interface not tracked by the adapter is silently skipped."""
-    device_id = await seed_device(nso_instance="nso-dev", nso_device_name="intent-skip", netbox_device_id=502)
+async def test_put_intent_unknown_interface_lands(adapter_client):
+    """Intent for an interface the adapter never imported still LANDS (I1): a minimal interface
+    is materialised so the attribute intent is stored, visible, and apply-eligible — never
+    silently dropped (the old behaviour lost it with only a warning)."""
+    device_id = await seed_device(nso_instance="nso-dev", nso_device_name="intent-greenfield", netbox_device_id=502)
 
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
-        json={"attributes": [{"interface": "DoesNotExist0/0", "attribute": "description", "intent_value": "whatever"}]},
+        json={"attributes": [{"interface": "ae99.999", "attribute": "description", "intent_value": "greenfield"}]},
         headers=AUTH,
     )
     assert resp.status_code == 200
-    # count is 0 — unknown interface skipped, not an error
-    assert resp.json()["attribute_count"] == 0
+    assert resp.json()["attribute_count"] == 1  # landed, not skipped
+
+    # the intent is visible on read-back
+    get_resp = await adapter_client.get(f"/api/v1/devices/{device_id}/intent", headers=AUTH)
+    attrs = get_resp.json()["attributes"]
+    assert len(attrs) == 1
+    assert attrs[0]["interface"] == "ae99.999" and attrs[0]["intent_value"] == "greenfield"
+
+    # the materialised interface carries an accepted attr_state (apply-eligible, not inert)
+    from sqlalchemy import select
+
+    from nso_adapter.store.db import get_session
+
+    async for db in get_session():
+        iface = (
+            await db.execute(
+                select(DbInterface).where(DbInterface.device_id == device_id, DbInterface.name == "ae99.999")
+            )
+        ).scalar_one()
+        state = (
+            await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id == iface.id))
+        ).scalar_one()
+        assert state.sync_state == SyncState.accepted
+        break
 
 
 async def test_put_intent_stamps_accepted_on_imported(adapter_client):

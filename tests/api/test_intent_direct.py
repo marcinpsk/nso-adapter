@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy import select
 
 from nso_adapter.api.errors import ApiError
 from nso_adapter.api.intent import IntentAttribute, IntentUpdate, get_intent, put_intent
@@ -17,6 +18,7 @@ from nso_adapter.store.models import (
     Device,
     DeviceSettings,
     InterfaceAttrState,
+    InterfaceIntent,
     ManagedScope,
     SyncState,
 )
@@ -75,15 +77,29 @@ async def test_put_intent_inserts_known_interface(adapter_client):
         break
 
 
-async def test_put_intent_unknown_interface_logged_and_skipped(adapter_client):
-    """put_intent() skips unknown interfaces (warns) and returns count=0."""
+async def test_put_intent_unknown_interface_lands(adapter_client):
+    """put_intent() materialises a minimal interface for an unknown ref so the attribute intent
+    LANDS (I1): stored + apply-eligible (attr_state accepted), never silently dropped."""
     device_id, _ = await _seed_device_with_interface("intent-dev-03", 1220)
     async for db in get_session():
         body = IntentUpdate(
-            attributes=[IntentAttribute(interface="no-such-iface", attribute="description", intent_value="val")]
+            attributes=[IntentAttribute(interface="ae0.7", attribute="description", intent_value="val")]
         )
         result = await put_intent(device_id=device_id, body=body, db=db)
-        assert result["attribute_count"] == 0
+        assert result["attribute_count"] == 1  # landed, not skipped
+        break
+    async for db in get_session():
+        iface = (
+            await db.execute(select(DbInterface).where(DbInterface.device_id == device_id, DbInterface.name == "ae0.7"))
+        ).scalar_one()
+        intents = (
+            (await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface.id))).scalars().all()
+        )
+        assert len(intents) == 1 and intents[0].intent_value == "val"
+        state = (
+            await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id == iface.id))
+        ).scalar_one()
+        assert state.sync_state == SyncState.accepted
         break
 
 
