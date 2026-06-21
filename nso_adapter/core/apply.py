@@ -676,15 +676,31 @@ def _build_interface_config_entries(attr_eligible, ip_by_iface, ifaces, device_n
 _RP_ROOT = "route-policy-reconciler:route-policy-config"
 
 
-async def _localize_atomic_failure(db, client, device, device_name, modules, exc, job_id) -> set[str]:
-    """Return the set of offending module root-keys after a failed atomic commit.
+def _device_error_message(exc) -> str | None:
+    """Extract the device-parser error text from a failed atomic commit (``exc.detail['nso_error']``).
 
-    Two complementary signals: (1) a per-scope dry-run — a module the NED cannot compile
-    re-runs to an inconclusive (``None``) delta in isolation; (2) the route-policy
-    device-parser rejection, which renders clean in dry-run but is named in the commit error.
-    Every localised offender is recorded into the capability matrix (I2 — capability explicit
-    for every scope, not just route-policy). When neither signal localises an offender, the
-    caller falls back to failing every staged scope (the commit rolled back).
+    Returns ``None`` when the failure was transport/internal (no device rejection) — so a
+    transient failure (timeout, unreachable) never records a FALSE capability verdict. Only a
+    real device rejection (the NED/device refused the commit) carries an ``nso_error`` payload.
+    """
+    nso_error = (getattr(exc, "detail", None) or {}).get("nso_error")
+    if not isinstance(nso_error, dict):
+        return None
+    errors = (nso_error.get("ietf-restconf:errors") or {}).get("error") or []
+    for e in errors:
+        if isinstance(e, dict) and e.get("error-message"):
+            return str(e["error-message"])
+    return None
+
+
+async def _localize_atomic_failure(client, device_name, modules, device_err) -> tuple[set[str], tuple]:
+    """Localise a failed atomic commit → (offending module root-keys, route-policy (scope, name)).
+
+    Two complementary signals: (1) a per-scope dry-run — a module the NED cannot compile re-runs
+    to an inconclusive (``None``) delta in isolation; (2) the route-policy device-parser rejection,
+    which renders clean in dry-run but is named in the *device* error (``device_err``). No recording
+    here — the caller decides attribution (including the fall-back to all staged scopes) and
+    whether it is a real device rejection before recording capability.
     """
     from nso_adapter.core.capability import parse_rejected_construct
     from nso_adapter.nso.apply import apply_combined
@@ -698,17 +714,10 @@ async def _localize_atomic_failure(db, client, device, device_name, modules, exc
         if delta is None:
             offenders.add(root_key)
 
-    # Route-policy renders clean in dry-run; its device-parser rejection is named in the error.
-    rp = parse_rejected_construct(exc.message)
+    rp = parse_rejected_construct(device_err or "")
     if rp[1] and _RP_ROOT in modules:
         offenders.add(_RP_ROOT)
-
-    try:
-        await _record_atomic_capability(db, client, device, device_name, offenders, exc, rp)
-    except Exception:  # noqa: BLE001 — capability recording is best-effort
-        logger.debug("apply.atomic.capability_record_skipped", job_id=job_id)
-
-    return offenders
+    return offenders, rp
 
 
 # Maps a staged module root-key → its result/scope key. interface-config is handled
@@ -737,14 +746,15 @@ def _capability_scope_for(root_key: str) -> str | None:
     return _ATOMIC_SCOPE_ROOTS.get(root_key)
 
 
-async def _record_atomic_capability(db, client, device, device_name, offenders, exc, rp) -> None:
-    """Record a capability rejection for every localised offender.
+async def _record_atomic_capability(db, client, device, device_name, offenders, exc, rp, device_err) -> None:
+    """Record a capability rejection for the attributed offender scopes.
 
     A per-scope dry-run rejection means the NED cannot compile that scope's intent on this
-    ``(ned, sw)`` — a real, reactive capability gap — so it is recorded at scope granularity;
-    route-policy (``rp = (scope, name)`` from the commit error, since it renders clean in
-    dry-run) is recorded fine-grained. The ``(ned, sw)`` key is read from the device row,
-    learned + persisted via the capability probe only when not already known.
+    ``(ned, sw)``; a device-parser rejection (``device_err``) means the device itself refused
+    the commit — both are real, reactive capability gaps, recorded at scope granularity (or
+    fine-grained for route-policy when ``rp = (scope, name)`` parses). ``device_err`` (the real
+    device error) is the detail. The ``(ned, sw)`` key is read from the device row, learned +
+    persisted via the capability probe only when not already known.
     """
     from nso_adapter.core.capability import record_capability_rejection, refresh_device_capability
 
@@ -757,7 +767,7 @@ async def _record_atomic_capability(db, client, device, device_name, offenders, 
     if not ned_id:
         return
 
-    detail = (exc.message or "")[:256]
+    detail = (device_err or exc.message or "")[:256]
     rp_scope, rp_name = rp
     for root_key in offenders:
         if root_key == _RP_ROOT and rp_name:
@@ -957,7 +967,21 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
 
     if commit_error is not None:
         logger.error("apply.atomic_failed", job_id=job_id, device=device_name, error=commit_error.message)
-        offenders = await _localize_atomic_failure(db, client, device, device_name, modules, commit_error, job_id)
+        device_err = _device_error_message(commit_error)
+        offenders, rp = await _localize_atomic_failure(client, device_name, modules, device_err)
+        # Capability (I2): record ONLY reliably-localised offenders — a per-scope dry-run the NED
+        # cannot compile, or a parse_rejected_construct match (a known-unsupported construct named
+        # in the device error). A generic device rejection is NOT a capability signal: it may be a
+        # MISCONFIGURATION (e.g. a route-map referencing a prefix-list not included in the push),
+        # not a NED limit — recording it would be a false "unsupported" verdict. Such failures
+        # still fail the job + stamp last_apply_error (the operator sees the real device error).
+        if offenders:
+            try:
+                await _record_atomic_capability(
+                    db, client, device, device_name, offenders, commit_error, rp, device_err
+                )
+            except Exception:  # noqa: BLE001 — capability recording is best-effort
+                logger.debug("apply.atomic.capability_record_skipped", job_id=job_id)
         if not offenders:  # could not localise → the whole rolled-back commit is the failure
             offenders = set(modules.keys())
         err = {"code": commit_error.code, "message": commit_error.message, "detail": commit_error.detail}

@@ -1565,7 +1565,7 @@ async def test_run_apply_atomic_failure_localizes_offender_others_pending(adapte
     boom = AsyncMock(side_effect=NsoApplyError("nso_patch_failed", "static route rejected"))
 
     async def _fake_localize(*_a, **_k):
-        return {"static-route-reconciler:static-route-config"}
+        return {"static-route-reconciler:static-route-config"}, (None, None)
 
     with ExitStack() as stack:
         stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
@@ -1627,6 +1627,93 @@ async def test_run_apply_atomic_failure_records_scope_capability(adapter_client,
         sc = (await db.execute(select(SnmpCommunityIntent))).scalars().all()
         assert all(r.last_apply_error is not None for r in sr)
         assert all(r.last_apply_error is None and r.last_apply_at is None for r in sc)
+        assert (await db.get(Job, job_id)).status == JobStatus.failed
+        break
+
+
+async def _seed_route_map_intent(device_id, ned_id):
+    from nso_adapter.store.models import Device, RoutePolicyObjectIntent
+
+    async for db in get_session():
+        dev = await db.get(Device, device_id)
+        dev.ned_id, dev.sw_version = ned_id, ""
+        db.add(
+            RoutePolicyObjectIntent(
+                device_id=device_id,
+                family="route_map",
+                name="TEST-RM",
+                entries=[{"sequence": 10, "action": "permit"}],
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+
+
+@pytest.mark.asyncio
+async def test_run_apply_atomic_misconfig_device_rejection_records_no_capability(adapter_client, monkeypatch):
+    """A generic device rejection that no per-scope dry-run localises — e.g. a route-map
+    referencing a prefix-list not included in the push (a MISCONFIGURATION, not a NED limit) —
+    must NOT record capability; that would be a false 'unsupported' verdict. The job still fails
+    and last_apply_error carries the real device error. (The live IOS-XR-route-map→Junos case:
+    'prefix-list referenced but not defined'.)"""
+    from nso_adapter.nso.apply import NsoApplyError
+    from nso_adapter.store.models import DeviceCapability, RoutePolicyObjectIntent
+
+    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+    device_id = await _seed_device(name="sw01")
+    await _seed_route_map_intent(device_id, "juniper-junos-nc-4.19:junos")
+    job_id = await _seed_apply_job(device_id)
+
+    device_err = "RPC error towards sw01: Policy error: PL-X prefix-list referenced (in term 10) but not defined"
+
+    async def _combined(client, device_name, modules, *, dry_run=False):
+        if not dry_run:
+            raise NsoApplyError(
+                "nso_patch_failed",
+                "NSO combined PATCH failed with status 400",
+                detail={"nso_error": {"ietf-restconf:errors": {"error": [{"error-message": device_err}]}}},
+            )
+        return "rendered-delta"  # route-policy renders clean in dry-run → not localised
+
+    mock_client = AsyncMock()
+    with ExitStack() as stack:
+        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
+        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        assert (await db.execute(select(DeviceCapability))).scalars().all() == []  # NOT a capability gap
+        rp = (await db.execute(select(RoutePolicyObjectIntent))).scalars().all()
+        assert all(r.last_apply_error is not None for r in rp)  # but the apply did fail + recorded the error
+        assert (await db.get(Job, job_id)).status == JobStatus.failed
+        break
+
+
+@pytest.mark.asyncio
+async def test_run_apply_atomic_transient_failure_records_no_capability(adapter_client, monkeypatch):
+    """A transport/internal failure (no device rejection) records NO capability — no false verdict."""
+    from nso_adapter.nso.apply import NsoApplyError
+    from nso_adapter.store.models import DeviceCapability
+
+    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+    device_id = await _seed_device(name="sw01")
+    await _seed_route_map_intent(device_id, "juniper-junos-nc-4.19:junos")
+    job_id = await _seed_apply_job(device_id)
+
+    async def _combined(client, device_name, modules, *, dry_run=False):
+        if not dry_run:
+            raise NsoApplyError("internal", "connection timed out")  # transport — no nso_error
+        return "rendered-delta"
+
+    mock_client = AsyncMock()
+    with ExitStack() as stack:
+        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
+        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        assert (await db.execute(select(DeviceCapability))).scalars().all() == []  # nothing recorded
         assert (await db.get(Job, job_id)).status == JobStatus.failed
         break
 
