@@ -1583,6 +1583,55 @@ async def test_run_apply_atomic_failure_localizes_offender_others_pending(adapte
 
 
 @pytest.mark.asyncio
+async def test_run_apply_atomic_failure_records_scope_capability(adapter_client, monkeypatch):
+    """An atomic failure records a capability rejection for the localised offender scope —
+    generalised beyond route-policy. The NED rejecting a scope's dry-run is a real capability
+    gap, so the matrix learns ``(ned, sw, static_route) = unsupported``; the scope that
+    compiled fine (snmp) gets no row."""
+    from nso_adapter.nso.apply import NsoApplyError
+    from nso_adapter.store.models import Device, DeviceCapability, SnmpCommunityIntent, StaticRouteIntent
+
+    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+    device_id = await _seed_device(name="sw01")
+    await _seed_snmp_and_static_route(device_id)
+    async for db in get_session():  # give the device a known (ned, sw) so no probe is needed
+        dev = await db.get(Device, device_id)
+        dev.ned_id, dev.sw_version = "cisco-ios-cli:cisco-ios", "15.7"
+        await db.commit()
+        break
+    job_id = await _seed_apply_job(device_id)
+
+    async def _combined(client, device_name, modules, *, dry_run=False):
+        if not dry_run:
+            raise NsoApplyError("nso_patch_failed", "static route rejected by NED")
+        # per-scope dry-run localisation: only static-route fails to compile
+        return None if "static-route-reconciler:static-route-config" in modules else "delta"
+
+    mock_client = AsyncMock()
+    with ExitStack() as stack:
+        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
+        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        caps = (
+            (await db.execute(select(DeviceCapability).where(DeviceCapability.ned_id == "cisco-ios-cli:cisco-ios")))
+            .scalars()
+            .all()
+        )
+        by_scope = {c.scope: c for c in caps}
+        assert "static_route" in by_scope and by_scope["static_route"].status == "unsupported"
+        assert "snmp" not in by_scope  # compiled fine → not an offender → no capability row
+        # offender failed, snmp pending, job failed
+        sr = (await db.execute(select(StaticRouteIntent))).scalars().all()
+        sc = (await db.execute(select(SnmpCommunityIntent))).scalars().all()
+        assert all(r.last_apply_error is not None for r in sr)
+        assert all(r.last_apply_error is None and r.last_apply_at is None for r in sc)
+        assert (await db.get(Job, job_id)).status == JobStatus.failed
+        break
+
+
+@pytest.mark.asyncio
 async def test_run_apply_atomic_off_uses_per_scope(adapter_client, monkeypatch):
     """Flag off (default): apply_combined is never used; the per-scope subif + IP writers run."""
     monkeypatch.delenv("NSO_ADAPTER_ATOMIC_APPLY", raising=False)

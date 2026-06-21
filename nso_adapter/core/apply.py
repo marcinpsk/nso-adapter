@@ -673,15 +673,20 @@ def _build_interface_config_entries(attr_eligible, ip_by_iface, ifaces, device_n
     return list(by_name.values())
 
 
+_RP_ROOT = "route-policy-reconciler:route-policy-config"
+
+
 async def _localize_atomic_failure(db, client, device, device_name, modules, exc, job_id) -> set[str]:
     """Return the set of offending module root-keys after a failed atomic commit.
 
-    Two complementary signals: (1) a per-scope dry-run — a module NSO rejects at validation
+    Two complementary signals: (1) a per-scope dry-run — a module the NED cannot compile
     re-runs to an inconclusive (``None``) delta in isolation; (2) the route-policy
-    device-parser rejection, which renders clean in dry-run but is named in the commit error
-    — parsed and recorded into the capability matrix (I2 reuse). When neither localises the
-    offender, the caller falls back to failing every staged scope (the commit rolled back).
+    device-parser rejection, which renders clean in dry-run but is named in the commit error.
+    Every localised offender is recorded into the capability matrix (I2 — capability explicit
+    for every scope, not just route-policy). When neither signal localises an offender, the
+    caller falls back to failing every staged scope (the commit rolled back).
     """
+    from nso_adapter.core.capability import parse_rejected_construct
     from nso_adapter.nso.apply import apply_combined
 
     offenders: set[str] = set()
@@ -693,23 +698,13 @@ async def _localize_atomic_failure(db, client, device, device_name, modules, exc
         if delta is None:
             offenders.add(root_key)
 
-    # Route-policy device-parser rejection (renders clean in dry-run): parse + record capability.
-    try:
-        from nso_adapter.core.capability import (
-            parse_rejected_construct,
-            record_capability_rejection,
-            refresh_device_capability,
-        )
+    # Route-policy renders clean in dry-run; its device-parser rejection is named in the error.
+    rp = parse_rejected_construct(exc.message)
+    if rp[1] and _RP_ROOT in modules:
+        offenders.add(_RP_ROOT)
 
-        scope, name = parse_rejected_construct(exc.message)
-        if name:
-            info = await refresh_device_capability(db, client, device_name, device)
-            if info:
-                await record_capability_rejection(
-                    db, info["ned_id"], info["sw_version"], scope, name, exc.message[:256]
-                )
-            if "route-policy-reconciler:route-policy-config" in modules:
-                offenders.add("route-policy-reconciler:route-policy-config")
+    try:
+        await _record_atomic_capability(db, client, device, device_name, offenders, exc, rp)
     except Exception:  # noqa: BLE001 — capability recording is best-effort
         logger.debug("apply.atomic.capability_record_skipped", job_id=job_id)
 
@@ -733,6 +728,44 @@ _ATOMIC_SCOPE_ROOTS: dict[str, str] = {
     "route-policy-reconciler:route-policy-config": "route_policy",
     "ospf-reconciler:ospf-config": "ospf",
 }
+
+
+def _capability_scope_for(root_key: str) -> str | None:
+    """Capability-matrix scope name for a staged module root-key (None if not tracked)."""
+    if root_key == _IFACE_CONFIG_ROOT:
+        return "interface_ip"
+    return _ATOMIC_SCOPE_ROOTS.get(root_key)
+
+
+async def _record_atomic_capability(db, client, device, device_name, offenders, exc, rp) -> None:
+    """Record a capability rejection for every localised offender.
+
+    A per-scope dry-run rejection means the NED cannot compile that scope's intent on this
+    ``(ned, sw)`` — a real, reactive capability gap — so it is recorded at scope granularity;
+    route-policy (``rp = (scope, name)`` from the commit error, since it renders clean in
+    dry-run) is recorded fine-grained. The ``(ned, sw)`` key is read from the device row,
+    learned + persisted via the capability probe only when not already known.
+    """
+    from nso_adapter.core.capability import record_capability_rejection, refresh_device_capability
+
+    ned_id = str(device.ned_id or "")
+    sw = str(device.sw_version or "")
+    if not ned_id:
+        info = await refresh_device_capability(db, client, device_name, device)
+        if info:
+            ned_id, sw = info.get("ned_id", ""), info.get("sw_version", "")
+    if not ned_id:
+        return
+
+    detail = (exc.message or "")[:256]
+    rp_scope, rp_name = rp
+    for root_key in offenders:
+        if root_key == _RP_ROOT and rp_name:
+            await record_capability_rejection(db, ned_id, sw, rp_scope, rp_name, detail)
+            continue
+        scope = _capability_scope_for(root_key)
+        if scope:
+            await record_capability_rejection(db, ned_id, sw, scope, scope, detail)
 
 
 async def _stage_atomic_modules(elig, client, device, device_name) -> tuple[dict, list, dict]:
