@@ -1584,6 +1584,8 @@ class BgpPeerIntent(Base):
     local_as: Mapped[str | None] = mapped_column(String(32), nullable=True)
     ttl: Mapped[int | None] = mapped_column(Integer, nullable=True)
     password: Mapped[str | None] = mapped_column(String(256), nullable=True)  # plaintext by design
+    # BGP session source: IOS/IOS-XR update-source interface, Junos/Nokia local-address IP.
+    source: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     scope: Mapped[BgpScopeIntent] = relationship("BgpScopeIntent", back_populates="peers")
     peer_address_families: Mapped[list[BgpPeerAfIntent]] = relationship(

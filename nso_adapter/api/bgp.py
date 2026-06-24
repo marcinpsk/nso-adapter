@@ -215,6 +215,7 @@ class BgpPeerModel(BaseModel):
     local_as: str | None = None
     ttl: int | None = None
     password: str | None = None
+    source: str | None = None
     address_families: list[BgpPeerAfModel] = []
 
 
@@ -277,6 +278,7 @@ async def _insert_peer(db: AsyncSession, scope_id: int, peer_data: BgpPeerModel)
         local_as=peer_data.local_as,
         ttl=peer_data.ttl,
         password=peer_data.password,
+        source=peer_data.source,
     )
     db.add(peer_row)
     await db.flush()

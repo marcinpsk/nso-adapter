@@ -598,6 +598,7 @@ async def test_apply_bgp_config_uses_correct_yang_keys():
         local_as=None,
         ttl=None,
         password=None,
+        source=None,
         peer_address_families=[paf],
     )
     scope = SimpleNamespace(
@@ -619,6 +620,46 @@ async def test_apply_bgp_config_uses_correct_yang_keys():
     peer_out = scope_out["peer"][0]
     assert "address-family" not in peer_out
     assert peer_out["peer-address-family"][0]["afi"] == "ipv4-unicast"
+
+
+@pytest.mark.anyio
+async def test_apply_bgp_config_sends_peer_source():
+    """A peer's `source` (update-source iface / local-address IP) is sent under `peer/source`.
+
+    Without it the bgp-reconciler never receives the session source even though the reader
+    exported it and the adapter stored it — the BGP session source was silently un-pushable.
+    """
+    import json
+
+    from nso_adapter.nso.apply import apply_bgp_config
+
+    client = _make_nso_client()
+    mock_http = AsyncMock()
+    mock_http.patch.side_effect = [
+        _httpx_response(204),
+        _httpx_response(200, json_data={"dry-run-result": {"native": {"device": []}}}),
+    ]
+    _stub_pool(client, mock_http)
+
+    peer = SimpleNamespace(
+        peer_address="192.0.2.7",
+        enabled=True,
+        peer_group=None,
+        remote_as=65100,
+        local_as=None,
+        ttl=None,
+        password=None,
+        source="Loopback0",
+        peer_address_families=[],
+    )
+    scope = SimpleNamespace(vrf="", address_families=[], peers=[peer])
+    router = SimpleNamespace(asn=65100, scopes=[scope])
+
+    await apply_bgp_config(client=client, device_name="rg03", router_intent_rows=[router])
+
+    payload = json.loads(mock_http.patch.call_args_list[0][1]["content"])
+    peer_out = payload["bgp-reconciler:bgp-config"][0]["router"][0]["scope"][0]["peer"][0]
+    assert peer_out["source"] == "Loopback0"
 
 
 # ── build_isis_process_payload (pure builder; tested against real ORM rows so a

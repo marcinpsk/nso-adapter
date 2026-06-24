@@ -212,6 +212,48 @@ async def test_put_bgp_intent_with_password(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_put_bgp_intent_with_source(adapter_client):
+    """Peer source (update-source iface / local-address IP) survives the PUT → intent rebuild.
+
+    Was dropped because BgpPeerModel/BgpPeerIntent had no source field, so apply_bgp_config could
+    never send it to the reconciler — the BGP session source was lost on every push.
+    """
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import BgpPeerIntent, BgpRouterIntent, BgpScopeIntent
+
+    device_id = await seed_device(nso_device_name="bgp-intent-src", netbox_device_id=2009)
+    payload = {
+        "routers": [
+            {
+                "asn": "65100",
+                "scopes": [
+                    {
+                        "vrf": "",
+                        "address_families": [],
+                        "peers": [
+                            {
+                                "peer_address": "10.0.0.2",
+                                "source": "Loopback0",
+                                "address_families": [],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/bgp-intent", json=payload, headers=AUTH)
+    assert resp.status_code == 200
+
+    async for db in get_session():
+        router = (await db.execute(select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))).scalar_one()
+        scope = (await db.execute(select(BgpScopeIntent).where(BgpScopeIntent.router_id == router.id))).scalar_one()
+        peer = (await db.execute(select(BgpPeerIntent).where(BgpPeerIntent.scope_id == scope.id))).scalar_one()
+        assert peer.source == "Loopback0"
+        break
+
+
+@pytest.mark.anyio
 async def test_put_bgp_intent_auto_apply_enqueues_job(adapter_client):
     """PUT with auto_apply=True creates an apply job row."""
     from sqlalchemy import select

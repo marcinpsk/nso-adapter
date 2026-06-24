@@ -1356,6 +1356,8 @@ async def apply_bgp_config(
                     peer_entry["ttl"] = peer.ttl
                 if peer.password is not None:
                     peer_entry["password"] = peer.password
+                if peer.source is not None:
+                    peer_entry["source"] = peer.source
                 peer_entry["peer-address-family"] = [
                     {
                         "afi": paf.af,

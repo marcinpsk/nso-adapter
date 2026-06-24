@@ -405,6 +405,7 @@ async def test_apply_bgp_config_builds_router_scope_peer_tree():
         local_as=None,
         ttl=None,
         password="s3c",
+        source=None,
         peer_address_families=[paf],
     )
     af = SimpleNamespace(af="ipv4-unicast")
