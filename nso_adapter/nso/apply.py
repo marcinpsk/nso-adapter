@@ -1510,7 +1510,9 @@ _OSPF_SERVICE_PATH = "/restconf/data/ospf-reconciler:ospf-config"
 
 def _ospf_process_entry(row, proc_redist: list[dict]) -> dict:
     """One OSPF ``process-config`` entry from a process row plus its nested redistribute list."""
-    entry: dict = {"process-id": int(row.process_id)}
+    # process-id is sent as a STRING: the ospf-reconciler YANG leaf is a string so named
+    # IOS-XR processes (e.g. 'test') round-trip; int() would crash on a non-numeric id.
+    entry: dict = {"process-id": str(row.process_id)}
     if row.router_id:
         entry["router-id"] = row.router_id
     if row.vrf:
@@ -1530,7 +1532,8 @@ def _ospf_interface_entry(row) -> dict:
     """One OSPF ``interface-config`` entry; optional priority/cost/network-type/auth when set."""
     entry: dict = {
         "interface-name": row.interface_name,
-        "process-id": int(row.process_id),
+        # string process-id — see _ospf_process_entry (named IOS-XR processes round-trip).
+        "process-id": str(row.process_id),
         "area-id": row.area_id,
         "passive": bool(row.passive) if row.passive is not None else False,
     }

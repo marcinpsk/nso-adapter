@@ -349,7 +349,7 @@ async def test_apply_ospf_config_builds_process_interface_and_redistribute():
 
     body = _sent_body(transport)["ospf-reconciler:ospf-config"][0]
     p = body["process-config"][0]
-    assert p["process-id"] == 1
+    assert p["process-id"] == "1"
     assert p["enabled"] is True  # delete-guard default-enable
     assert p["redistribute"] == [
         {"source-protocol": "connected", "source-ref": "", "route-map": "RM", "metric": 20, "metric-type": "type-1"}

@@ -802,7 +802,7 @@ def test_ospf_process_entry_full_fields_and_redistribute():
     row = OspfInstanceIntent(process_id="5", router_id="2.2.2.2", vrf="RED", enabled=True)
     redist = [{"source-protocol": "connected", "source-ref": ""}]
     assert _ospf_process_entry(row, redist) == {
-        "process-id": 5,
+        "process-id": "5",
         "router-id": "2.2.2.2",
         "vrf": "RED",
         "enabled": True,
@@ -810,10 +810,20 @@ def test_ospf_process_entry_full_fields_and_redistribute():
     }
 
 
+def test_ospf_process_entry_named_process_id_round_trips():
+    """A named (non-numeric) IOS-XR process-id is emitted verbatim as a string.
+
+    The ospf-reconciler YANG leaf is a string; int() would have crashed here. This is
+    the adapter half of the named-process round-trip (e.g. 'router ospf test').
+    """
+    row = OspfInstanceIntent(process_id="test", router_id="1.1.1.1", vrf="")
+    assert _ospf_process_entry(row, [])["process-id"] == "test"
+
+
 def test_ospf_process_entry_minimal_defaults_enabled_true():
     """Empty router-id/vrf and unset `enabled` → delete-guard defaults enabled True, no redistribute."""
     row = OspfInstanceIntent(process_id="1", router_id="", vrf="")
-    assert _ospf_process_entry(row, []) == {"process-id": 1, "enabled": True}
+    assert _ospf_process_entry(row, []) == {"process-id": "1", "enabled": True}
 
 
 def test_ospf_process_entry_explicit_disable_is_preserved():
@@ -837,7 +847,7 @@ def test_ospf_interface_entry_full_fields():
     )
     assert _ospf_interface_entry(row) == {
         "interface-name": "Gi0/1",
-        "process-id": 5,
+        "process-id": "5",
         "area-id": "0",
         "passive": True,
         "priority": 10,
@@ -853,7 +863,7 @@ def test_ospf_interface_entry_minimal_omits_optionals():
     row = OspfInterfaceIntent(interface_name="Gi0/2", process_id="1", area_id="0", passive=None)
     assert _ospf_interface_entry(row) == {
         "interface-name": "Gi0/2",
-        "process-id": 1,
+        "process-id": "1",
         "area-id": "0",
         "passive": False,
     }
@@ -1141,8 +1151,8 @@ async def test_apply_ospf_always_asserts_enabled_delete_guard():
     payload = json.loads(mock_http.patch.call_args[1]["content"])
     procs = payload["ospf-reconciler:ospf-config"][0]["process-config"]
     by_pid = {p["process-id"]: p for p in procs}
-    assert by_pid[1]["enabled"] is True  # None → default enable (guard)
-    assert by_pid[2]["enabled"] is False  # explicit disable preserved
+    assert by_pid["1"]["enabled"] is True  # None → default enable (guard)
+    assert by_pid["2"]["enabled"] is False  # explicit disable preserved
 
 
 @pytest.mark.asyncio
