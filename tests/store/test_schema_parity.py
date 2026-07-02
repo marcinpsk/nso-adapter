@@ -39,7 +39,9 @@ def _snapshot(engine) -> dict:
         if table == "alembic_version":
             continue
         snap[table] = {
-            "cols": {c["name"]: (str(c["type"]), c["nullable"]) for c in insp.get_columns(table)},
+            # (type, nullable, server_default) — the server default is included so a
+            # create_all-vs-alembic DEFAULT divergence is caught, not passed green.
+            "cols": {c["name"]: (str(c["type"]), c["nullable"], c.get("default")) for c in insp.get_columns(table)},
             "pk": tuple(insp.get_pk_constraint(table)["constrained_columns"]),
             "fks": sorted(
                 (tuple(f["constrained_columns"]), f["referred_table"], tuple(f["referred_columns"]))
@@ -47,7 +49,12 @@ def _snapshot(engine) -> dict:
             ),
             "uqs": sorted(tuple(u["column_names"]) for u in insp.get_unique_constraints(table)),
             "ixs": sorted((tuple(i["column_names"]), i["unique"]) for i in insp.get_indexes(table)),
+            # CHECK constraints compared by their reflected SQL text (names may be generated).
+            "checks": sorted(c["sqltext"] for c in insp.get_check_constraints(table)),
         }
+    # PostgreSQL ENUM types are schema-level, not per-table: compare their label sets so an
+    # enum value-set divergence (a migration adding/renaming a member) is caught too.
+    snap["__enums__"] = {e["name"]: tuple(e["labels"]) for e in insp.get_enums()}
     return snap
 
 
