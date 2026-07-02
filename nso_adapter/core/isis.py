@@ -15,6 +15,7 @@ import structlog
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.core.isis_canon import isis_level
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import Device, DeviceIsisInterface, DeviceIsisProcess
 
@@ -85,7 +86,7 @@ async def _upsert_isis_data(
                 device_id=device.id,
                 process_tag=proc.get("process-tag", ""),
                 net=proc.get("net"),
-                is_type=proc.get("is-type"),
+                is_type=isis_level(proc.get("is-type")),
                 metric_style=proc.get("metric-style"),
                 overload_bit=proc.get("overload-bit"),
                 area_auth_type=proc.get("area-auth-type"),
@@ -115,7 +116,7 @@ async def _upsert_isis_data(
                 interface_name=iface_name,
                 af=af,
                 process_tag=iface.get("process-tag", ""),
-                circuit_type=iface.get("circuit-type"),
+                circuit_type=isis_level(iface.get("circuit-type")),
                 network_type=iface.get("network-type"),
                 metric=iface.get("metric"),
                 passive=bool(iface.get("passive", False)),

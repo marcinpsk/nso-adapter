@@ -27,6 +27,34 @@ async def _device_session(device_id: int):
 
 
 @pytest.mark.anyio
+async def test_refresh_normalizes_level_2_alias(adapter_client):
+    """s2-12: the reader folds the free-text is-type/circuit-type alias 'level-2' to the
+    canonical YANG 'level-2-only', matching the writer so it can't drive phantom drift."""
+    device_id = await seed_device(nso_device_name="isis-lvl2", netbox_device_id=968)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_isis_interfaces.return_value = {
+            "process": [{"process-tag": "0", "is-type": "level-2"}],
+            "interface": [{"interface-name": "Gi0/1", "af": "ipv4", "circuit-type": "level-2"}],
+        }
+
+        await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
+
+        proc = (
+            (await db.execute(select(DeviceIsisProcess).where(DeviceIsisProcess.device_id == device.id)))
+            .scalars()
+            .one()
+        )
+        iface = (
+            (await db.execute(select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id)))
+            .scalars()
+            .one()
+        )
+        assert proc.is_type == "level-2-only"
+        assert iface.circuit_type == "level-2-only"
+
+
+@pytest.mark.anyio
 async def test_refresh_persists_bound_port_for_nokia(adapter_client):
     """Nokia IS-IS interfaces carry bound-port; it is stored on the read row.
     Loopback/unbound interfaces (no bound-port) store None."""
