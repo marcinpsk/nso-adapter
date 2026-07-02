@@ -132,11 +132,20 @@ def _device_delta_from_dry_run(body: object, device_name: str) -> str | None:
     for entry in devices:
         if isinstance(entry, dict) and entry.get("name") == device_name:
             return str(entry.get("data") or "")
+    # A device with no delta is omitted from NSO's native result, so our device being
+    # absent from a non-empty list normally means "no delta" (""). Log it though: if the
+    # names simply MISMATCH (NSO normalised the device name), our delta is hiding under a
+    # different key and this "" is a false "verified" — the log makes that observable.
+    logger.debug(
+        "nso.apply.dry_run_device_absent",
+        device=device_name,
+        present=[e.get("name") for e in devices if isinstance(e, dict)],
+    )
     return ""
 
 
 async def native_dry_run(
-    client: NsoClient, url: str, payload: str, device_name: str, *, method: str = "patch"
+    client: NsoClient, url: str, payload: str, device_name: str, *, method: str = "patch", strict: bool = False
 ) -> str | None:
     """Issue *payload* to *url* as a native dry-run (``?dry-run=native``) and return the delta.
 
@@ -144,6 +153,11 @@ async def native_dry_run(
     returns it. The returned string is the device-native delta (``""`` = no change), or
     ``None`` when the dry-run was inconclusive (non-2xx / transport / unparseable / wrong
     shape). Same machinery as the post-apply verify guard, surfaced for the pre-apply preview.
+
+    ``strict=True`` (the post-apply verify path): a CONCLUSIVE ``4xx`` rejection raises
+    :class:`NsoApplyError` (carrying the RESTCONF error body) rather than being swallowed as
+    an inconclusive ``None`` — a 4xx means NSO/the device would reject the intent, i.e. the
+    apply did NOT land. Transport errors and ``5xx`` stay inconclusive (never block) either way.
     """
     dry_url = _commit_url(url, dry_run=True)
     try:
@@ -153,10 +167,25 @@ async def native_dry_run(
                 content=payload,
                 headers={"Content-Type": "application/yang-data+json"},
             )
-        if resp.status_code not in (200, 201, 204):
-            return None
+    except Exception:  # network/transport — inconclusive, never block
+        return None
+    if resp.status_code not in (200, 201, 204):
+        # Surface the device error rather than silently discarding it as "inconclusive".
+        try:
+            err = resp.json()
+        except Exception:
+            err = {"raw": resp.text}
+        logger.warning("nso.apply.dry_run_non_2xx", device=device_name, status=resp.status_code, body=err)
+        if strict and 400 <= resp.status_code < 500:
+            raise NsoApplyError(
+                "dry_run_rejected",
+                f"dry-run for {device_name!r} rejected with status {resp.status_code}",
+                detail={"nso_error": err},
+            )
+        return None
+    try:
         body = resp.json()
-    except Exception:  # network/transport/parse — inconclusive, never block
+    except Exception:  # unparseable body — inconclusive
         return None
     return _device_delta_from_dry_run(body, device_name)
 
@@ -179,7 +208,9 @@ async def _verify_native_or_raise(
     if not VERIFY_AFTER_APPLY:
         return
 
-    delta = await native_dry_run(client, url, payload, device_name, method=method)
+    # strict=True: a conclusive 4xx on the re-dry-run raises (the apply did not land),
+    # rather than being swallowed as an inconclusive false success.
+    delta = await native_dry_run(client, url, payload, device_name, method=method, strict=True)
     if delta is None:
         logger.warning("nso.apply.verify_inconclusive_or_unexpected", scope=scope, device=device_name)
         return

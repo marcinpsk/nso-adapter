@@ -537,6 +537,39 @@ async def test_verify_inconclusive_does_not_raise():
 
 
 @pytest.mark.asyncio
+async def test_verify_raises_on_conclusive_4xx_rejection():
+    """A 4xx on the post-apply verify dry-run is a CONCLUSIVE device rejection, not an
+    inconclusive blip: the apply must be reported failed (not a silent false success),
+    and the RESTCONF error body carried on the raise."""
+    client = _make_nso_client()
+    err_body = {"ietf-restconf:errors": {"error": [{"error-message": "unknown command"}]}}
+    _mock_http_ctx(client, _httpx_response(400, json_data=err_body))
+    with pytest.raises(NsoApplyError) as exc_info:
+        await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="route_policy")
+    assert exc_info.value.detail.get("nso_error") == err_body
+
+
+@pytest.mark.asyncio
+async def test_verify_inconclusive_on_5xx_does_not_raise():
+    """A 5xx / transport error on the verify dry-run stays fail-safe (inconclusive, no
+    raise) — only a conclusive 4xx fails the apply."""
+    client = _make_nso_client()
+    _mock_http_ctx(client, _httpx_response(503))
+    await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="vlan")  # no raise
+
+
+@pytest.mark.asyncio
+async def test_native_dry_run_non_strict_returns_none_on_4xx():
+    """The preview/localize callers (strict=False) still treat a 4xx as inconclusive None —
+    only the verify path opts into raising."""
+    from nso_adapter.nso.apply import native_dry_run
+
+    client = _make_nso_client()
+    _mock_http_ctx(client, _httpx_response(400, json_data={"ietf-restconf:errors": {}}))
+    assert await native_dry_run(client, "http://nso/x", "{}", "sw03") is None
+
+
+@pytest.mark.asyncio
 async def test_verify_disabled_by_toggle(monkeypatch):
     """When VERIFY_AFTER_APPLY is off, no dry-run call is made."""
     monkeypatch.setattr(apply_mod, "VERIFY_AFTER_APPLY", False)
