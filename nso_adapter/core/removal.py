@@ -50,8 +50,9 @@ _SCOPE_BY_MODEL: dict[str, str] = {model: scope for scope, (model, _) in _SIMPLE
 # (route-policy communities). Kept as an explicit set so it survives mocking/refactors.
 _NED_DIALECT_SCOPES: frozenset[str] = frozenset({"route_policy"})
 
-# OSPF and BGP have multi-row applies, so they get bespoke handlers below.
-VALID_REMOVAL_SCOPES: set[str] = set(_SIMPLE_TARGETS) | {"ospf", "bgp"}
+# OSPF/BGP have multi-row applies; interface_config is a compound-key (device,interface)
+# list whose removal PUT-replaces/deletes per-interface instances — all bespoke below.
+VALID_REMOVAL_SCOPES: set[str] = set(_SIMPLE_TARGETS) | {"ospf", "bgp", "interface_config"}
 
 
 async def _replace_simple(db: AsyncSession, device, client, scope: str) -> None:
@@ -151,32 +152,101 @@ async def _replace_bgp(db: AsyncSession, device, client) -> None:
     await apply_bgp_config(client, device.nso_device_name, routers, redist, replace=True)
 
 
-async def _dispatch_scope(db: AsyncSession, device, client, scope: str) -> None:
+async def _replace_interface_config(db: AsyncSession, device, client, interface_names: list[str]) -> None:
+    """Propagate interface attribute/IP removal for each affected interface.
+
+    interface-reconciler is keyed by ``(device, interface-name)``, so each interface is its
+    own service instance. For an interface that still has accepted attr/IP intent, PUT-replace
+    the instance with its full remaining desired state (FASTMAP reverts the dropped address).
+    For an interface with NO remaining accepted intent, DELETE the instance (FASTMAP reverts
+    everything it created there — the operator wants nothing managed).
+    """
+    from nso_adapter.core.apply import _nokia_routed_kind
+    from nso_adapter.nso.apply import build_interface_config_entry, delete_interface_config, replace_interface_config
+    from nso_adapter.store.models import DbInterface, InterfaceIntent, InterfaceIpIntent
+
+    for name in interface_names:
+        iface = (
+            (await db.execute(select(DbInterface).where(DbInterface.device_id == device.id, DbInterface.name == name)))
+            .scalars()
+            .first()
+        )
+        if iface is None:
+            await delete_interface_config(client, device.nso_device_name, name)
+            continue
+        ip_rows = (
+            (
+                await db.execute(
+                    select(InterfaceIpIntent).where(
+                        InterfaceIpIntent.interface_id == iface.id, InterfaceIpIntent.accepted_at.is_not(None)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        attr_rows = (
+            (
+                await db.execute(
+                    select(InterfaceIntent).where(
+                        InterfaceIntent.interface_id == iface.id,
+                        InterfaceIntent.accepted_at.is_not(None),
+                        InterfaceIntent.attribute.in_(("description", "enabled")),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not ip_rows and not attr_rows:
+            await delete_interface_config(client, device.nso_device_name, name)
+            continue
+        routed_kind = _nokia_routed_kind(iface)
+        entry = build_interface_config_entry(
+            device.nso_device_name,
+            name,
+            attr_rows,
+            ip_rows,
+            kind=routed_kind,
+            service=iface.service if routed_kind in ("ies", "vprn") else None,
+            parent_binding=iface.parent_binding,
+            encap_tag=iface.encap_tag,
+        )
+        await replace_interface_config(client, device.nso_device_name, name, entry)
+
+
+async def _dispatch_scope(db: AsyncSession, device, client, scope: str, context: dict | None = None) -> None:
     if scope == "ospf":
         await _replace_ospf(db, device, client)
     elif scope == "bgp":
         await _replace_bgp(db, device, client)
+    elif scope == "interface_config":
+        await _replace_interface_config(db, device, client, (context or {}).get("interfaces") or [])
     elif scope in _SIMPLE_TARGETS:
         await _replace_simple(db, device, client, scope)
     else:
         raise ValueError(f"Unknown removal scope {scope!r}")
 
 
-async def enqueue_removal(db: AsyncSession, device_id: int, scope: str):
+async def enqueue_removal(db: AsyncSession, device_id: int, scope: str, *, interfaces: list[str] | None = None):
     """Queue an async ``removal`` job that PUT-replaces *scope*'s service.
 
     Non-blocking: the intent PUT returns immediately and the worker runs the
     (potentially slow) device commit in the background via :func:`run_removal`.
+    *interfaces* scopes an ``interface_config`` removal to the affected interface names.
     """
     from nso_adapter.store.models import Job, JobStatus, JobType
 
     if scope not in VALID_REMOVAL_SCOPES:
         raise ValueError(f"Unknown removal scope {scope!r}")
+    context: dict = {"scope": scope}
+    if interfaces:
+        context["interfaces"] = interfaces
     job = Job(
         job_type=JobType.removal,
         device_id=device_id,
         status=JobStatus.queued,
-        context={"scope": scope},
+        context=context,
     )
     db.add(job)
     await db.flush()
@@ -200,13 +270,14 @@ async def run_removal(job_id: int, device_id: int) -> None:
             return
         job.status = JobStatus.running
         await db.commit()
-        scope = (job.context or {}).get("scope")
+        context = job.context or {}
+        scope = context.get("scope")
         try:
             device = await db.get(Device, device_id)
             if not device:
                 raise ValueError(f"Device {device_id} not found")
             client = get_nso_client(device.nso_instance)
-            await _dispatch_scope(db, device, client, scope)
+            await _dispatch_scope(db, device, client, scope, context)
             job.status = JobStatus.succeeded
             job.result = {"scope": scope}
         except Exception as exc:  # noqa: BLE001 — record on the job, never crash the worker

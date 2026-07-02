@@ -241,6 +241,41 @@ async def test_dispatch_scope_route_policy_passes_ned_id(adapter_client):
     assert kwargs.get("replace") is True
 
 
+async def test_dispatch_interface_config_puts_remaining_and_deletes_empty(adapter_client):
+    """interface_config removal PUT-replaces an interface that still has accepted intent, and
+    DELETEs one with none — so a removed IP is reverted on the device (#5)."""
+    from nso_adapter.store.models import DbInterface, InterfaceIpIntent
+
+    device_id = await _seed_device(nso_device_name="sw3")
+    async for db in get_session():
+        keep = DbInterface(device_id=device_id, name="Gi0/0")  # still has an accepted IP → PUT
+        gone = DbInterface(device_id=device_id, name="Gi0/1")  # no remaining intent → DELETE
+        db.add(keep)
+        db.add(gone)
+        await db.flush()
+        db.add(InterfaceIpIntent(interface_id=keep.id, address="10.0.0.1/24", family="ipv4", vrf="", accepted_at=_NOW))
+        await db.commit()
+        break
+
+    replace_fn = AsyncMock()
+    delete_fn = AsyncMock()
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        with (
+            patch("nso_adapter.nso.apply.replace_interface_config", replace_fn),
+            patch("nso_adapter.nso.apply.delete_interface_config", delete_fn),
+        ):
+            await removal_mod._dispatch_scope(
+                db, device, _CLIENT, "interface_config", {"interfaces": ["Gi0/0", "Gi0/1"]}
+            )
+        break
+
+    replace_fn.assert_awaited_once()
+    assert replace_fn.await_args.args[1] == "sw3" and replace_fn.await_args.args[2] == "Gi0/0"
+    delete_fn.assert_awaited_once()
+    assert delete_fn.await_args.args[1] == "sw3" and delete_fn.await_args.args[2] == "Gi0/1"
+
+
 async def test_dispatch_scope_unknown_raises(adapter_client):
     device_id = await _seed_device()
     async for db in get_session():

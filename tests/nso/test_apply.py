@@ -960,6 +960,29 @@ async def test_apply_interface_attribute_enabled_accepts_boolean_tokens():
         await apply_interface_attribute(client, "d", "Gi0/0", "enabled", good, dry_run=True)
 
 
+async def test_replace_interface_config_uses_two_key_instance_url():
+    """The interface-config PUT-replace targets the compound-key instance
+    (device,interface-name), both segments percent-encoded (#5)."""
+    from nso_adapter.nso.apply import replace_interface_config
+
+    client = _make_nso_client()
+    seen: dict = {}
+
+    class _Recorder(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            seen["url"] = str(request.url)
+            return httpx.Response(200, json={"dry-run-result": {"native": {}}}, request=request)
+
+    client._client = lambda timeout=None: httpx.AsyncClient(transport=_Recorder(), base_url="http://nso")
+    entry = {
+        "device": "sw01",
+        "interface-name": "Gi0/0",
+        "ipv4-address": [{"address": "10.0.0.1", "prefix-length": 24}],
+    }
+    await replace_interface_config(client, "sw01", "Gi0/0", entry, dry_run=True)
+    assert "interface-reconciler:interface-config=sw01,Gi0%2F0" in seen["url"]
+
+
 def test_normalize_route_map_entry_collision_is_deterministic():
     """When both the canonical YANG key and a legacy spelling map to the same leaf with
     DIFFERENT values, the canonical key wins deterministically (never dict-order roulette)."""

@@ -170,10 +170,15 @@ async def put_ip_intent(device_id: int, body: IpIntentUpdate, db: AsyncSession =
         if iface:
             new_keys.add((iface.id, item.address, item.vrf))
 
-    # Delete rows absent from the new payload.
+    # Delete rows absent from the new payload, tracking which interfaces lost intent so the
+    # removal can be propagated to the device (a merge-PATCH apply never drops the address).
+    iface_name_by_id = {i.id: i.name for i in ifaces.values()}
+    removed_interfaces: set[str] = set()
     for key, row in existing_rows.items():
         if key not in new_keys:
+            removed_interfaces.add(iface_name_by_id.get(row.interface_id, ""))
             await db.delete(row)
+    removed_interfaces.discard("")
     await db.flush()
 
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -209,6 +214,24 @@ async def put_ip_intent(device_id: int, body: IpIntentUpdate, db: AsyncSession =
 
         await enqueue_apply(db, device_id, force=True)
 
+    # Removal propagation: a merge-PATCH apply can't drop an address the payload removed, so
+    # enqueue an interface_config removal (PUT-replace/DELETE per affected interface) — mirrors
+    # every other service's replace_on_removal, and always runs (removal is not auto_apply-gated).
+    replaced = False
+    if removed_interfaces:
+        from nso_adapter.core.removal import enqueue_removal
+
+        await enqueue_removal(db, device_id, "interface_config", interfaces=sorted(removed_interfaces))
+        replaced = True
+
     await db.commit()
-    logger.info("ip_intent.put.ok", device_id=device_id, address_count=count)
-    return {"device_id": device_id, "address_count": count, "updated_at": now.isoformat() + "Z"}
+    logger.info(
+        "ip_intent.put.ok", device_id=device_id, address_count=count, removed_interfaces=len(removed_interfaces)
+    )
+    return {
+        "device_id": device_id,
+        "address_count": count,
+        "removed_interfaces": len(removed_interfaces),
+        "replaced": replaced,
+        "updated_at": now.isoformat() + "Z",
+    }

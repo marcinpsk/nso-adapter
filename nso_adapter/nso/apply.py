@@ -235,6 +235,7 @@ async def _send_service_config(
     replace: bool = False,
     dry_run: bool = False,
     stage: dict[str, list] | None = None,
+    instance_key: str | None = None,
 ) -> str | None:
     """Send a reconciler service instance body to NSO — the shared apply/removal tail.
 
@@ -254,7 +255,9 @@ async def _send_service_config(
         return None
     payload = json.dumps({root_key: [body]})
     if replace:
-        url = f"{client._base}{service_path}={_url_key(device_name)}"
+        # instance_key overrides the single-key default for a compound-key list (e.g.
+        # interface-config is keyed by "device interface-name" → "<device>,<iface>").
+        url = f"{client._base}{service_path}={instance_key or _url_key(device_name)}"
         method = "put"
     else:
         url = f"{client._base}{service_path}"
@@ -524,6 +527,92 @@ def build_interface_ip_entry(
     if ipv6_entries:
         entry["ipv6-address"] = ipv6_entries
     return entry
+
+
+def build_interface_config_entry(
+    device_name: str,
+    interface_name: str,
+    attr_intent_rows,
+    ip_intent_rows,
+    *,
+    kind: str | None = None,
+    service: str | None = None,
+    parent_binding: str | None = None,
+    encap_tag: str | None = None,
+) -> dict:
+    """Build ONE interface-reconciler entry merging attribute + IP intent for an interface.
+
+    Used by the removal path to PUT-replace a single ``(device, interface-name)`` instance
+    with its full remaining desired state.
+    """
+    entry = build_interface_ip_entry(
+        device_name,
+        interface_name,
+        list(ip_intent_rows),
+        kind=kind,
+        service=service,
+        parent_binding=parent_binding,
+        encap_tag=encap_tag,
+    )
+    for row in attr_intent_rows:
+        if row.attribute == "description":
+            entry["description"] = row.intent_value if row.intent_value is not None else ""
+        elif row.attribute == "enabled":
+            entry["enabled"] = _coerce_enabled_intent(row.intent_value)
+    return entry
+
+
+async def replace_interface_config(
+    client: NsoClient, device_name: str, interface_name: str, entry: dict, *, dry_run: bool = False
+) -> str | None:
+    """PUT-replace the ``(device, interface-name)`` interface-reconciler instance with *entry*.
+
+    FASTMAP reverts any address/attribute the previous deploy created that is no longer in
+    the full desired state — how a removed IP is propagated to the device (merge-PATCH can
+    never drop a list entry). Raises NsoApplyError on failure.
+    """
+    instance_key = f"{_url_key(device_name)},{_url_key(interface_name)}"
+    return await _send_service_config(
+        client,
+        _SERVICE_PATH,
+        "interface-reconciler:interface-config",
+        device_name,
+        entry,
+        scope="interface_config",
+        replace=True,
+        dry_run=dry_run,
+        instance_key=instance_key,
+    )
+
+
+async def delete_interface_config(client: NsoClient, device_name: str, interface_name: str) -> None:
+    """DELETE the ``(device, interface-name)`` instance → FASTMAP reverts all config it created.
+
+    Used when an interface has NO remaining accepted attr/IP intent (the operator wants
+    nothing managed there). A 404 is treated as success (already gone — idempotent).
+    """
+    instance_key = f"{_url_key(device_name)},{_url_key(interface_name)}"
+    url = f"{client._base}{_SERVICE_PATH}={instance_key}"
+    async with client._client(timeout=client._action_timeout) as c:
+        resp = await c.delete(_commit_url(url))
+        if resp.status_code not in (200, 204, 404):
+            try:
+                err = resp.json()
+            except Exception:
+                err = {"raw": resp.text}
+            logger.error(
+                "nso.apply.interface_config_delete_failed",
+                device=device_name,
+                interface=interface_name,
+                status=resp.status_code,
+                body=err,
+            )
+            raise NsoApplyError(
+                "nso_delete_failed",
+                f"NSO DELETE for interface_config {device_name}/{interface_name} failed with status {resp.status_code}",
+                detail={"nso_error": err},
+            )
+    logger.info("nso.apply.interface_config_deleted", device=device_name, interface=interface_name)
 
 
 async def apply_interface_ips(

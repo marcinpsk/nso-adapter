@@ -244,6 +244,38 @@ async def test_put_ip_intent_full_replace(adapter_client):
     assert rows[0].address == "10.0.0.1/24"
 
 
+async def test_put_ip_intent_removal_enqueues_interface_config_job(adapter_client):
+    """Dropping an address on a re-PUT enqueues an interface_config removal (scoped to the
+    affected interface) so the device address is actually removed — a merge-PATCH apply can
+    never drop it (#5)."""
+    from sqlalchemy import select
+
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Job, JobType
+
+    device_id = await seed_device(nso_device_name="ip-rm-dev", netbox_device_id=905)
+    await _seed_interface(device_id, "Gi0/3")
+
+    p1 = {
+        "addresses": [
+            {"interface": "Gi0/3", "address": "10.0.0.1/24", "family": "ipv4"},
+            {"interface": "Gi0/3", "address": "10.0.0.2/24", "family": "ipv4"},
+        ]
+    }
+    await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=p1)
+
+    p2 = {"addresses": [{"interface": "Gi0/3", "address": "10.0.0.1/24", "family": "ipv4"}]}
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=p2)
+    assert resp.json()["removed_interfaces"] == 1
+    assert resp.json()["replaced"] is True
+
+    async for db in get_session():
+        removals = [j for j in (await db.execute(select(Job))).scalars().all() if j.job_type == JobType.removal]
+        assert len(removals) == 1
+        assert removals[0].context == {"scope": "interface_config", "interfaces": ["Gi0/3"]}
+        break
+
+
 async def test_put_ip_intent_unknown_interface_lands(adapter_client):
     """Intent for an unknown (greenfield) interface must LAND, not be silently dropped.
 
