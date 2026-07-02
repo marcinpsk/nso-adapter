@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import quote
+
 import httpx
 import structlog
 
@@ -11,6 +13,16 @@ from nso_adapter.nso.neds import _ned_oper_status
 from nso_adapter.nso.neds import extract_ned_component as _extract_ned_component
 
 logger = structlog.get_logger(__name__)
+
+
+def _url_key(value: str) -> str:
+    """Percent-encode a value for use as a RESTCONF list-key URL path segment (RFC 8040).
+
+    Device names are operator-set free strings; one containing ``/ # ? % space =`` would
+    otherwise corrupt the path (404 / wrong resource / swallowed query params).
+    """
+    return quote(str(value), safe="")
+
 
 RESTCONF_HEADERS = {
     "Accept": "application/yang-data+json",
@@ -105,7 +117,7 @@ class NsoClient:
 
         Returns an empty dict on 204 No Content (CDB not yet populated — run sync-from first).
         """
-        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={device_name}/config"
+        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={_url_key(device_name)}/config"
         async with self._client() as c:
             resp = await c.get(url)
             resp.raise_for_status()
@@ -123,7 +135,7 @@ class NsoClient:
         logs) — on a real device that can be ~900 KB and is streamed without a
         Content-Length, so it can truncate mid-body and raise a JSONDecodeError.
         """
-        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={device_name}"
+        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url, params={"fields": "device-type"})
             resp.raise_for_status()
@@ -143,7 +155,7 @@ class NsoClient:
         Returns None if the device has no LAG data (404).
         Raises httpx.HTTPStatusError on other errors.
         """
-        url = f"{self._base}/restconf/data/network-state-export:lag-topology/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:lag-topology/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -159,7 +171,7 @@ class NsoClient:
         Returns None if the device has no SVI/IRB data (404).
         Raises httpx.HTTPStatusError on other errors.
         """
-        url = f"{self._base}/restconf/data/network-state-export:svi/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:svi/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -175,7 +187,7 @@ class NsoClient:
         Returns None if the device has no dot1q subinterface data (404).
         Raises httpx.HTTPStatusError on other errors.
         """
-        url = f"{self._base}/restconf/data/network-state-export:subinterface/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:subinterface/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -191,7 +203,7 @@ class NsoClient:
         Returns None if the device has no interface with an explicit MTU (404).
         Raises httpx.HTTPStatusError on other errors.
         """
-        url = f"{self._base}/restconf/data/network-state-export:interface-mtu/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:interface-mtu/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -207,7 +219,7 @@ class NsoClient:
         Returns None if the device has no LAG config (404).
         Raises httpx.HTTPStatusError on other errors.
         """
-        url = f"{self._base}/restconf/data/network-state-export:lag-config/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:lag-config/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -219,7 +231,7 @@ class NsoClient:
 
     async def get_vlan_database(self, device_name: str) -> dict | None:
         """Return the vlan-database entry for *device_name* (None on 404).."""
-        url = f"{self._base}/restconf/data/network-state-export:vlan-database/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:vlan-database/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -231,7 +243,7 @@ class NsoClient:
 
     async def get_switchport(self, device_name: str) -> dict | None:
         """Return the switchport entry for *device_name* (None on 404).."""
-        url = f"{self._base}/restconf/data/network-state-export:switchport/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:switchport/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -247,7 +259,7 @@ class NsoClient:
         Returns None if the device has no IP data (404).
         Raises httpx.HTTPStatusError on other errors.
         """
-        url = f"{self._base}/restconf/data/network-state-export:interface-ip/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:interface-ip/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -263,7 +275,7 @@ class NsoClient:
         Returns None if the device has no interface-attribute data (404 or empty list).
         Raises httpx.HTTPStatusError on other errors.
         """
-        url = f"{self._base}/restconf/data/network-state-export:interface-attributes/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:interface-attributes/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -279,7 +291,7 @@ class NsoClient:
         Returns None if the device has no SNMP config (404).
         Raises httpx.HTTPStatusError on other errors.
         """
-        url = f"{self._base}/restconf/data/network-state-export:snmp-config/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:snmp-config/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -294,7 +306,7 @@ class NsoClient:
 
         Returns None if the device has no logging config (404).
         """
-        url = f"{self._base}/restconf/data/network-state-export:logging-config/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:logging-config/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -310,7 +322,7 @@ class NsoClient:
         Returns None if the device has no static routes (404 or empty).
         Raises httpx.HTTPStatusError on other errors.
         """
-        url = f"{self._base}/restconf/data/network-state-export:static-route/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:static-route/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -326,7 +338,7 @@ class NsoClient:
         Returns None if the device has no L2 services (404 or empty).
         Raises httpx.HTTPStatusError on other errors.
         """
-        url = f"{self._base}/restconf/data/network-state-export:l2-service/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:l2-service/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -342,7 +354,7 @@ class NsoClient:
         Returns None if the device has no IS-IS config (404 or empty).
         Raises httpx.HTTPStatusError on other errors.
         """
-        url = f"{self._base}/restconf/data/network-state-export:isis-interface/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:isis-interface/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -358,7 +370,7 @@ class NsoClient:
         Returns None if the device has no BGP config (404 or empty).
         Raises httpx.HTTPStatusError on other errors.
         """
-        url = f"{self._base}/restconf/data/network-state-export:bgp-config/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:bgp-config/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -374,7 +386,7 @@ class NsoClient:
         Returns None if the device has no route-policy config (404 or empty).
         Raises httpx.HTTPStatusError on other errors.
         """
-        url = f"{self._base}/restconf/data/network-state-export:route-policy/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:route-policy/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -390,7 +402,7 @@ class NsoClient:
         Returns None if the device has no OSPF config (404 or empty).
         Raises httpx.HTTPStatusError on other errors.
         """
-        url = f"{self._base}/restconf/data/network-state-export:ospf-config/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:ospf-config/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -405,7 +417,7 @@ class NsoClient:
 
         Returns None if the device has no BFD config (404 or empty).
         """
-        url = f"{self._base}/restconf/data/network-state-export:bfd-config/device={device_name}"
+        url = f"{self._base}/restconf/data/network-state-export:bfd-config/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -416,23 +428,24 @@ class NsoClient:
             return entries[0] if entries else None
 
     async def check_sync(self, device_name: str) -> bool:
-        """Return True if device is in-sync with NSO's internal CDB."""
-        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={device_name}/check-sync"
-        async with self._client() as c:
-            try:
-                resp = await c.post(url)
-                resp.raise_for_status()
-                result = resp.json()
-                sync_result = result.get("tailf-ncs:output", {}).get("result", "")
-                return sync_result == "in-sync"
-            except httpx.HTTPStatusError:
-                return False
+        """Return True if the device is in-sync with NSO's internal CDB.
+
+        Raises on an HTTP error (auth/unreachable/5xx) rather than reporting a false
+        'out-of-sync' — a real error must be distinguishable from genuine drift. Runs on
+        the action timeout (a check-sync round-trips to the device).
+        """
+        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={_url_key(device_name)}/check-sync"
+        async with self._client(self._action_timeout) as c:
+            resp = await c.post(url)
+            resp.raise_for_status()
+            result = resp.json()
+            return result.get("tailf-ncs:output", {}).get("result", "") == "in-sync"
 
     # ── Onboarding (write/action) — create the device node + bring it up ──────
 
     async def device_exists(self, device_name: str) -> bool:
         """Return True if a device with this name already exists in NSO."""
-        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={device_name}"
+        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url, params={"fields": "name"})
             if resp.status_code == 404:
@@ -463,22 +476,23 @@ class NsoClient:
         }
         if port is not None:
             entry["port"] = port
-        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={device_name}"
-        async with self._client() as c:
+        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={_url_key(device_name)}"
+        # Device create can commit to the device; use the action timeout, not the blanket 30s.
+        async with self._client(self._action_timeout) as c:
             resp = await c.put(url, json={"tailf-ncs:device": [entry]})
             resp.raise_for_status()
 
     async def set_admin_state(self, device_name: str, admin_state: str = "unlocked") -> None:
         """PATCH the device's admin-state (e.g. ``unlocked``)."""
-        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={device_name}"
+        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={_url_key(device_name)}"
         body = {"tailf-ncs:device": [{"name": device_name, "state": {"admin-state": admin_state}}]}
-        async with self._client() as c:
+        async with self._client(self._action_timeout) as c:
             resp = await c.patch(url, json=body)
             resp.raise_for_status()
 
     async def _device_action(self, device_name: str, action: str) -> dict:
         """POST a device action (e.g. ``ssh/fetch-host-keys``, ``sync-from``)."""
-        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={device_name}/{action}"
+        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={_url_key(device_name)}/{action}"
         async with self._client(self._action_timeout) as c:
             resp = await c.post(url)
             resp.raise_for_status()
@@ -518,7 +532,7 @@ class NsoClient:
         Uses a ``fields=address`` filter so NSO returns only the address leaf (see
         get_device_ned_id for why the unfiltered device query is unsafe).
         """
-        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={device_name}"
+        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url, params={"fields": "address"})
             if resp.status_code == 404:
@@ -537,8 +551,9 @@ class NsoClient:
         entry: dict = {"name": device_name, "address": address}
         if port is not None:
             entry["port"] = port
-        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={device_name}"
-        async with self._client() as c:
+        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={_url_key(device_name)}"
+        # Mgmt-address change commits to the device (failover path); use the action timeout.
+        async with self._client(self._action_timeout) as c:
             resp = await c.patch(url, json={"tailf-ncs:device": [entry]})
             resp.raise_for_status()
 

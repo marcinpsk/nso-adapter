@@ -251,12 +251,58 @@ async def test_check_sync_returns_false_when_out_of_sync(patch_client):
     assert result is False
 
 
-async def test_check_sync_returns_false_on_http_error(patch_client):
-    """check_sync returns False (does not raise) on HTTP error responses."""
+async def test_check_sync_raises_on_http_error(patch_client):
+    """check_sync must SURFACE an HTTP error (auth/unreachable/500), not silently report a
+    false 'out-of-sync' that is indistinguishable from genuine drift (#16a)."""
     client = _make_client()
-    with patch_client(client, 500, {"error": "internal"}):
-        result = await client.check_sync("core-rtr-01")
-    assert result is False
+    with patch_client(client, 500, {"error": "internal"}), pytest.raises(httpx.HTTPStatusError):
+        await client.check_sync("core-rtr-01")
+
+
+async def test_device_name_percent_encoded_in_url():
+    """A device name with a reserved char is percent-encoded in the RESTCONF URL path
+    segment (a raw '/' would 404 / hit the wrong resource) (#14)."""
+    client = _make_client()
+    seen: dict = {}
+
+    class _Recorder(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            seen["url"] = str(request.url)
+            return httpx.Response(200, json={}, request=request)
+
+    client._client = lambda timeout=None: httpx.AsyncClient(transport=_Recorder(), base_url="http://nso:8080")
+    await client.get_device_config("site/rtr1")
+    assert "device=site%2Frtr1" in seen["url"]
+    assert "device=site/rtr1" not in seen["url"]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda c: c.set_address("rtr", "10.0.0.1"),
+        lambda c: c.create_device("rtr", "10.0.0.1", "ned", "grp"),
+        lambda c: c.set_admin_state("rtr"),
+        lambda c: c.check_sync("rtr"),
+    ],
+)
+async def test_device_write_methods_use_action_timeout(call):
+    """Device-touching writes/probes must run on the 120s action timeout, not the blanket 30s
+    — a >30s device commit (e.g. Junos ~35s) would otherwise false-timeout (#15)."""
+    client = _make_client()
+    seen_timeouts: list = []
+
+    def _spy(timeout=None):
+        seen_timeouts.append(timeout)
+
+        class _T(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                return httpx.Response(200, json={"tailf-ncs:output": {"result": "in-sync"}}, request=request)
+
+        return httpx.AsyncClient(transport=_T(), base_url="http://nso:8080")
+
+    client._client = _spy
+    await call(client)
+    assert seen_timeouts == [client._action_timeout]
 
 
 async def test_check_sync_returns_false_on_missing_result_key(patch_client):
