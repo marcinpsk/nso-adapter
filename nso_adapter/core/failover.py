@@ -203,12 +203,19 @@ def _next_due(now: datetime, interval_minutes: int, jitter_fraction: float) -> d
     return now + timedelta(seconds=base + jitter)
 
 
-async def _safe_disconnect(client: NsoClient, name: str) -> None:
-    """Drop NSO's cached session so the new address is dialed. Absent session is fine."""
+async def _safe_disconnect(client: NsoClient, name: str) -> bool:
+    """Drop NSO's cached session so the new address is dialed. Absent session is fine.
+
+    Returns True when the drop completed (or there was nothing to drop as far as we can
+    tell), False when the disconnect RPC raised — the caller can surface that a stale
+    session may still be pinned to the old address.
+    """
     try:
         await client.disconnect(name)
-    except Exception as exc:  # no live session / already disconnected — not an error
+        return True
+    except Exception as exc:  # no live session / already disconnected — usually benign
         logger.debug("failover.disconnect_ignored", device=name, error=repr(exc))
+        return False
 
 
 async def _safe_sync_from(client: NsoClient, name: str) -> None:
@@ -219,9 +226,10 @@ async def _safe_sync_from(client: NsoClient, name: str) -> None:
         logger.warning("failover.sync_from_failed", device=name, error=repr(exc))
 
 
-async def _set_address(client: NsoClient, name: str, address: str) -> None:
+async def _set_address(client: NsoClient, name: str, address: str) -> bool:
+    """Point NSO at *address* and drop the cached session. Returns the disconnect outcome."""
     await client.set_address(name, address)
-    await _safe_disconnect(client, name)
+    return await _safe_disconnect(client, name)
 
 
 async def _revert_address(client: NsoClient, name: str, address: str) -> None:
@@ -278,14 +286,21 @@ def _record_probe(fo: DeviceFailover, now: datetime, reachable: bool) -> None:
 
 
 async def _switch_to_oob(client: NsoClient, fo: DeviceFailover, name: str, cfg: TickConfig, now: datetime) -> None:
-    await _set_address(client, name, fo.oob_ip)
+    dropped = await _set_address(client, name, fo.oob_ip)
     fo.active_address = _OOB
     fo.consecutive_failures = 0
     fo.consecutive_successes = 0
     fo.last_switch_at = now
-    # Probe the OOB's health promptly now that it's the active address — don't leave it
-    # "not checked" until the next scheduled OOB probe (up to a full OOB interval away).
+    # Make the OOB liveness probe due promptly now that OOB is the active address — but the
+    # tick runs it on the NEXT tick (once the session is redialed), not this one, so it never
+    # reads a session still pinned to the old primary.
     fo.next_oob_probe_at = now
+    if not dropped:
+        # The cached session to the OLD primary wasn't dropped; NSO may not dial the OOB
+        # address until it redials. The switch IS recorded (NSO's config is now on OOB) — but
+        # surface the uncertainty instead of swallowing it (the deferred next-tick OOB liveness
+        # verifies against a fresh session).
+        logger.warning("failover.switch.session_drop_failed", device=name, address=fo.oob_ip)
     if cfg.failover_sync_from_after_switch:
         await _safe_sync_from(client, name)
     logger.info("failover.switch", device=name, to=_OOB, address=fo.oob_ip)
@@ -297,6 +312,10 @@ async def _commit_failback(client: NsoClient, fo: DeviceFailover, name: str, cfg
     fo.consecutive_failures = 0
     fo.consecutive_successes = 0
     fo.last_switch_at = now
+    # Re-arm the proactive OOB health probe a normal interval out so failing back doesn't
+    # immediately re-flip primary→OOB→primary next tick for a health check right after the
+    # failback (separate the switch from its verification — s3-19).
+    fo.next_oob_probe_at = _next_due(now, cfg.failover_oob_probe_interval, 0.0)
     if cfg.failover_sync_from_after_switch:
         await _safe_sync_from(client, name)
     logger.info("failover.failback", device=name, address=fo.primary_ip)
@@ -474,12 +493,19 @@ async def run_failover_tick(
     # and only while flagged) so the UI doesn't show "manual override" after the operator restores.
     await _maybe_clear_manual_override(client, fo, name)
 
+    addr_before = fo.active_address
     if _due(fo.next_primary_probe_at, now):
         ran = await _probe_primary(client, fo, name, cfg, now, has_oob, job_active, flip_budget)
         if ran:
             fo.next_primary_probe_at = _next_due(now, cfg.failover_primary_probe_interval, jitter_fraction)
 
-    if has_oob and _due(fo.next_oob_probe_at, now):
+    # A primary-probe-driven switch/failback just changed the active address. Defer the OOB
+    # probe to the next tick so it runs against a freshly redialed session: no same-tick OOB
+    # liveness on a maybe-stale session (s3-18), and no failback→OOB re-flip (s3-19). The switch
+    # left next_oob_probe_at due, so the deferred probe fires on the very next tick.
+    address_changed = fo.active_address != addr_before
+
+    if has_oob and not address_changed and _due(fo.next_oob_probe_at, now):
         ran = await _probe_oob(client, fo, name, cfg, now, job_active, flip_budget)
         if ran:
             # When OOB is the ACTIVE address the operator is connecting through it, so its

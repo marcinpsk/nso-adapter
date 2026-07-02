@@ -269,17 +269,24 @@ async def test_oob_active_refreshes_at_primary_cadence(monkeypatch):
     assert fo.next_oob_probe_at == _BASE + timedelta(minutes=cfg.failover_primary_probe_interval)
 
 
-async def test_switch_to_oob_probes_health_in_same_tick(monkeypatch):
-    """Switching to OOB schedules its health probe immediately (next_oob_probe_at=now), so
-    a device freshly moved onto OOB is probed in that tick instead of showing 'not checked'
-    until the next scheduled OOB probe (up to a full OOB interval away)."""
+async def test_switch_to_oob_defers_health_probe_to_next_tick(monkeypatch):
+    """Switching to OOB leaves the health probe DUE but does not run it in the switching tick
+    (whose session may still be pinned to the old primary). It fires on the very next tick,
+    against a freshly redialed session — deferred by one tick, not left 'not checked' for a
+    full OOB interval (s3-18/s3-19)."""
     cfg = SchedulerConfig()
     _stub_probe(monkeypatch, reachable=False)  # primary down → switch to OOB
     dev, fo, client = _device(), _failover_row(), FakeNso()
     for i in range(cfg.failover_failure_threshold):
         await _tick(dev, fo, client, cfg, now=_BASE + timedelta(minutes=3 * i), oob_due=False)
+    switch_now = _BASE + timedelta(minutes=3 * (cfg.failover_failure_threshold - 1))
     assert fo.active_address == ActiveAddress.oob.value
-    assert fo.oob_healthy is not None  # probed in the switching tick, not left None for hours
+    # not probed in the switching tick, but left promptly due
+    assert fo.oob_healthy is None
+    assert fo.next_oob_probe_at is not None and fo.next_oob_probe_at <= switch_now
+    # the very next tick (fresh session) records the OOB health — not left "not checked" for hours
+    await run_failover_tick(dev, fo, client, cfg, now=switch_now + timedelta(minutes=1))
+    assert fo.oob_healthy is not None
 
 
 async def test_proactive_oob_health_unreachable_reverts_to_primary(monkeypatch):
@@ -489,3 +496,71 @@ async def test_jitter_advances_primary_due_within_window(monkeypatch):
     lo = _BASE + timedelta(minutes=cfg.failover_primary_probe_interval)
     hi = lo + timedelta(seconds=cfg.failover_primary_probe_interval * 60 * 0.5)
     assert lo <= fo.next_primary_probe_at <= hi
+
+
+# ── s3-18 / s3-19: separate a switch/failback from same-tick verification ──────
+
+
+async def test_failback_does_not_reflip_oob_same_tick(monkeypatch):
+    """s3-19: a failback (OOB→primary) must NOT trigger a proactive OOB health flip in the
+    same tick — that re-flips primary→OOB→primary (3 address changes, double flip budget)."""
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=True)  # primary is back
+    dev = _device()
+    fo = _failover_row(active=ActiveAddress.oob.value, consecutive_successes=cfg.failover_success_threshold - 1)
+    fo.next_primary_probe_at = None  # due → failback flip-probe
+    fo.next_oob_probe_at = None  # also due → would fire the proactive OOB flip same tick
+    client = FakeNso(address="192.0.2.5")
+
+    await run_failover_tick(dev, fo, client, cfg, now=_BASE)
+
+    assert fo.active_address == ActiveAddress.primary.value  # failed back
+    # the OOB proactive flip must NOT have run this tick (no set_address back to the OOB IP)
+    assert ("set_address", "192.0.2.5") not in client.calls
+
+
+async def test_switch_defers_oob_liveness_to_next_tick(monkeypatch):
+    """s3-18/s3-19: after switching primary→OOB the OOB liveness probe must not run in the
+    SAME tick (NSO's session may still be pinned to the old primary) — it is deferred to the
+    next tick (which redials) and stays promptly due."""
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=False)  # primary down → switch
+    dev = _device()
+    fo = _failover_row(consecutive_failures=cfg.failover_failure_threshold - 1)
+    fo.next_primary_probe_at = None  # due
+    fo.next_oob_probe_at = None  # would fire OOB liveness same tick
+    client = FakeNso()
+
+    await run_failover_tick(dev, fo, client, cfg, now=_BASE)
+
+    assert fo.active_address == ActiveAddress.oob.value  # switched
+    # OOB liveness did NOT run this tick (no health recorded) — deferred to a fresh-session tick
+    assert fo.oob_health_checked_at is None
+    # still due so it fires the very next tick
+    assert fo.next_oob_probe_at is not None and fo.next_oob_probe_at <= _BASE
+
+
+async def test_switch_surfaces_failed_session_drop(monkeypatch):
+    """s3-18: when the post-set_address disconnect fails (the session stays pinned to the old
+    address), the switch surfaces it (warning) rather than swallowing it silently."""
+    from structlog.testing import capture_logs
+
+    class DropFailsNso(FakeNso):
+        async def disconnect(self, name):
+            self.calls.append(("disconnect",))
+            raise RuntimeError("disconnect RPC failed")
+
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=False)
+    dev = _device()
+    fo = _failover_row(consecutive_failures=cfg.failover_failure_threshold - 1)
+    fo.next_primary_probe_at = None  # due
+    fo.next_oob_probe_at = _BASE + timedelta(days=1)  # not due — isolate the switch
+    client = DropFailsNso()
+
+    with capture_logs() as logs:
+        await run_failover_tick(dev, fo, client, cfg, now=_BASE)
+
+    assert fo.active_address == ActiveAddress.oob.value  # switch still recorded (config changed)
+    events = [e.get("event") for e in logs]
+    assert "failover.switch.session_drop_failed" in events
