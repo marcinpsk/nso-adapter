@@ -1218,6 +1218,17 @@ def _redistribute_entry(row) -> dict:
     return entry
 
 
+def _isis_level(value: str) -> str:
+    """Normalize an IS-IS level enum to its YANG form.
+
+    ``is-type`` and ``circuit-type`` share the YANG enum
+    ``level-1 | level-2-only | level-1-2``; ``level-2`` is a common free-text alias
+    the reconciler's from_canonical rejects (CodecError → the leaf is silently
+    skipped). Fold it to ``level-2-only`` before writing.
+    """
+    return "level-2-only" if value == "level-2" else value
+
+
 def _isis_process_entry(row, proc_redist: list[dict]) -> dict:
     """One ``process-config`` entry from a process row plus its nested redistribute list."""
     entry: dict = {"process-tag": row.process_tag or ""}
@@ -1225,7 +1236,7 @@ def _isis_process_entry(row, proc_redist: list[dict]) -> dict:
         entry["net"] = row.net
     # Enum leaves reject the empty string — omit when blank (not just None).
     if row.is_type:
-        entry["is-type"] = row.is_type
+        entry["is-type"] = _isis_level(row.is_type)
     if row.metric_style:
         entry["metric-style"] = row.metric_style
     if row.overload_bit is not None:
@@ -1396,9 +1407,7 @@ def build_isis_interface_payload(isis_intent_rows: list | None) -> list[dict]:
             "passive": bool(row.passive) if row.passive is not None else False,
         }
         if row.circuit_type:
-            # YANG enum is level-1 | level-2-only | level-1-2; "level-2" is a
-            # common alias that the reconciler rejects → normalise it.
-            entry["circuit-type"] = "level-2-only" if row.circuit_type == "level-2" else row.circuit_type
+            entry["circuit-type"] = _isis_level(row.circuit_type)
         if row.network_type:
             entry["network-type"] = row.network_type
         if row.metric is not None:

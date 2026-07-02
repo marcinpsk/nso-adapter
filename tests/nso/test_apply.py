@@ -756,6 +756,17 @@ def test_build_isis_process_payload_omits_empty_enums():
     assert procs[0]["net"] == "49.0001.00"
 
 
+def test_build_isis_process_payload_normalises_is_type():
+    """is-type 'level-2' (invalid enum, same YANG type as circuit-type) → 'level-2-only'.
+
+    The plugin stores is_type as free text; the reconciler's from_canonical rejects
+    'level-2' (CodecError → the leaf is silently skipped), so normalise it here like
+    circuit_type is on the interface payload."""
+    row = IsisProcessIntent(process_tag="0", net="49.0001.00", is_type="level-2")
+    procs = build_isis_process_payload([row])
+    assert procs[0]["is-type"] == "level-2-only"
+
+
 def test_build_isis_process_payload_full_process_fields():
     """Every populated process leaf (net/is-type/metric-style/overload/area+domain auth) emits."""
     row = IsisProcessIntent(
