@@ -854,7 +854,11 @@ _JOB_SPECS: tuple[_JobSpec, ...] = (
 def start_scheduler() -> None:
     global _scheduler
     cfg = get_config()
-    _scheduler = AsyncIOScheduler()
+    # Explicit job defaults (not the version-dependent APScheduler ones): never run the same
+    # fleet refresh concurrently (max_instances=1); collapse a backlog of missed fires into a
+    # single run (coalesce); and run a late/missed fire whenever the slot frees rather than
+    # silently dropping it after the default 1s grace (misfire_grace_time=None).
+    _scheduler = AsyncIOScheduler(job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": None})
     for spec in _JOB_SPECS:
         interval = getattr(cfg.scheduler, spec.interval_attr)
         enabled = spec.enable_attr is None or getattr(cfg.scheduler, spec.enable_attr)

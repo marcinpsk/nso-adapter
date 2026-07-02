@@ -237,6 +237,33 @@ async def test_scope_reconcile_isolates_one_device_failure(adapter_client, monke
     assert sorted(attempted) == [7200, 7201]
 
 
+async def test_start_scheduler_sets_safe_job_defaults(adapter_client, monkeypatch):
+    """APScheduler jobs must be registered with explicit coalesce / max_instances /
+    misfire_grace_time — not left to version-dependent defaults — so a slow fleet refresh
+    coalesces missed fires and never runs concurrently, instead of silently dropping them (s3-15)."""
+    captured: dict = {}
+
+    class _FakeScheduler:
+        def __init__(self, *a, **kw):
+            captured["job_defaults"] = kw.get("job_defaults")
+
+        def add_job(self, *a, **kw):
+            captured.setdefault("jobs", 0)
+            captured["jobs"] += 1
+
+        def start(self):
+            captured["started"] = True
+
+    monkeypatch.setattr(sched, "AsyncIOScheduler", _FakeScheduler)
+    sched.start_scheduler()
+
+    jd = captured["job_defaults"]
+    assert jd is not None, "AsyncIOScheduler created with no explicit job_defaults"
+    assert jd["coalesce"] is True
+    assert jd["max_instances"] == 1
+    assert jd["misfire_grace_time"] is None
+
+
 @pytest.mark.anyio
 async def test_intent_reconcile_skips_without_netbox_client(adapter_client, monkeypatch):
     monkeypatch.setattr("nso_adapter.core.importer.get_netbox_client", lambda: None)

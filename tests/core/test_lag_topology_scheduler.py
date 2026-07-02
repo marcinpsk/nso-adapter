@@ -47,7 +47,7 @@ def test_scheduler_config_from_yaml():
 
 def test_start_scheduler_registers_lag_refresh_job(monkeypatch: pytest.MonkeyPatch):
     fake_scheduler = _FakeScheduler()
-    monkeypatch.setattr(scheduler_module, "AsyncIOScheduler", lambda: fake_scheduler)
+    monkeypatch.setattr(scheduler_module, "AsyncIOScheduler", lambda **_kw: fake_scheduler)
     monkeypatch.setattr(
         scheduler_module,
         "get_config",
@@ -119,7 +119,7 @@ def test_start_scheduler_registers_lag_refresh_job(monkeypatch: pytest.MonkeyPat
 
 def test_start_scheduler_skips_lag_refresh_when_disabled(monkeypatch: pytest.MonkeyPatch):
     fake_scheduler = _FakeScheduler()
-    monkeypatch.setattr(scheduler_module, "AsyncIOScheduler", lambda: fake_scheduler)
+    monkeypatch.setattr(scheduler_module, "AsyncIOScheduler", lambda **_kw: fake_scheduler)
     monkeypatch.setattr(
         scheduler_module,
         "get_config",
@@ -231,7 +231,7 @@ def _full_scheduler_config(**overrides) -> SimpleNamespace:
 def test_start_scheduler_registers_every_job_with_correct_interval(monkeypatch: pytest.MonkeyPatch):
     """All flags on → every job registers, each mapped to its own config interval (minutes)."""
     fake_scheduler = _FakeScheduler()
-    monkeypatch.setattr(scheduler_module, "AsyncIOScheduler", lambda: fake_scheduler)
+    monkeypatch.setattr(scheduler_module, "AsyncIOScheduler", lambda **_kw: fake_scheduler)
     monkeypatch.setattr(scheduler_module, "get_config", _full_scheduler_config)
 
     scheduler_module.start_scheduler()
@@ -268,7 +268,7 @@ def test_start_scheduler_registers_every_job_with_correct_interval(monkeypatch: 
 def test_start_scheduler_interval_only_gate_skips_lag_when_zero(monkeypatch: pytest.MonkeyPatch):
     """The lag jobs have no enable flag — a 0 interval alone must skip them."""
     fake_scheduler = _FakeScheduler()
-    monkeypatch.setattr(scheduler_module, "AsyncIOScheduler", lambda: fake_scheduler)
+    monkeypatch.setattr(scheduler_module, "AsyncIOScheduler", lambda **_kw: fake_scheduler)
     monkeypatch.setattr(
         scheduler_module,
         "get_config",
