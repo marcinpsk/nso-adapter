@@ -18,6 +18,7 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -311,6 +312,20 @@ class InterfaceAttrState(Base):
 
 class Job(Base):
     __tablename__ = "jobs"
+    __table_args__ = (
+        # At most one active (queued/running) job per device. Closes the enqueue_job
+        # TOCTOU: the check-then-insert can't materialise two active rows even under
+        # concurrent schedulers/SSE/API (device_id is NULL for provision jobs — NULLs
+        # are distinct, so those dedup by context instead). Partial index → terminal
+        # (succeeded/failed) jobs are excluded and never block a fresh enqueue.
+        Index(
+            "uq_job_active_per_device",
+            "device_id",
+            unique=True,
+            sqlite_where=text("status IN ('queued', 'running')"),
+            postgresql_where=text("status IN ('queued', 'running')"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     job_type: Mapped[JobType] = mapped_column(Enum(JobType))

@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from sqlalchemy import select
 
 from nso_adapter.core.jobs import (
     _run_apply,
@@ -119,6 +120,79 @@ async def test_enqueue_job_returns_existing_when_active(adapter_client):
         job, created = await enqueue_job(device_id, JobType.sync, db)
         assert created is False
         assert job.id == existing_id
+        break
+
+
+async def test_active_job_partial_unique_index_rejects_second(adapter_client):
+    """s3-17: the DB enforces at most one active (queued/running) job per device, so a
+    TOCTOU race between the enqueue check and the insert cannot materialise two active jobs."""
+    from sqlalchemy.exc import IntegrityError
+
+    device_id = await _seed_device("dup-active", 4100)
+    await _seed_job(device_id, JobStatus.queued)
+
+    async for db in get_session():
+        db.add(Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.running))
+        with pytest.raises(IntegrityError):
+            await db.commit()
+        await db.rollback()
+        break
+
+
+async def test_active_job_index_allows_new_after_terminal(adapter_client):
+    """A finished (succeeded/failed) job must not block a fresh active job for the device."""
+    device_id = await _seed_device("dup-terminal", 4101)
+    await _seed_job(device_id, JobStatus.succeeded)
+
+    async for db in get_session():
+        db.add(Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued))
+        await db.commit()  # no IntegrityError — succeeded job is not "active"
+        actives = (
+            (await db.execute(select(Job).where(Job.device_id == device_id, Job.status == JobStatus.queued)))
+            .scalars()
+            .all()
+        )
+        assert len(actives) == 1
+        break
+
+
+async def test_enqueue_job_recovers_from_lost_race(adapter_client, monkeypatch):
+    """s3-17: when the pre-insert check loses the race (stale read → None) and the unique
+    index rejects the duplicate insert, enqueue_job re-reads and returns the winning active
+    job (created=False) instead of surfacing the IntegrityError as a 500."""
+    from nso_adapter.core import jobs as jobs_mod
+
+    device_id = await _seed_device("race", 4102)
+    existing_id = await _seed_job(device_id, JobStatus.queued)
+
+    real = jobs_mod.get_active_job
+    calls = {"n": 0}
+
+    async def flaky(dev_id, db):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None  # simulate the stale read that lost the TOCTOU race
+        return await real(dev_id, db)
+
+    monkeypatch.setattr(jobs_mod, "get_active_job", flaky)
+
+    async for db in get_session():
+        job, created = await enqueue_job(device_id, JobType.sync, db)
+        assert created is False
+        assert job.id == existing_id
+        actives = (
+            (
+                await db.execute(
+                    select(Job).where(
+                        Job.device_id == device_id,
+                        Job.status.in_([JobStatus.queued, JobStatus.running]),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(actives) == 1
         break
 
 

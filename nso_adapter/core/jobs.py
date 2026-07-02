@@ -14,6 +14,7 @@ import asyncio
 
 import structlog
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.store.models import Job, JobStatus, JobType
@@ -52,7 +53,18 @@ async def enqueue_job(
 
     job = Job(job_type=job_type, device_id=device_id, status=JobStatus.queued)
     db.add(job)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Lost the check-then-insert race: a concurrent enqueue committed the active
+        # job for this device first, and uq_job_active_per_device rejected ours. Recover
+        # by returning the winner instead of surfacing a 500.
+        await db.rollback()
+        winner = await get_active_job(device_id, db)
+        if winner is not None:
+            logger.debug("job.enqueue.race_lost", device_id=device_id, winner_id=winner.id)
+            return winner, False
+        raise
     await db.refresh(job)
     return job, True
 
