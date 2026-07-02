@@ -253,6 +253,47 @@ def test_parse_rejected_construct():
     assert parse_rejected_construct("command: match as-path AP-X\n") == ("rm-match", "match as-path")
     assert parse_rejected_construct("command: set comm-list FOO delete\n") == ("rm-set", "set comm-list delete")
     assert parse_rejected_construct("no command here") == (None, None)
+    # A rejection whose command is the LAST line (no trailing newline) must still parse (#20).
+    assert parse_rejected_construct("aborted: command: set tag 5") == ("rm-set", "set tag")
+
+
+@pytest.mark.asyncio
+async def test_refresh_ned_id_literal_none_not_persisted(adapter_client, monkeypatch):  # noqa: F811
+    """A probe reporting the literal string 'None' for ned-id (an unselected device_type.cli)
+    must NOT become a capability key or be persisted onto the device (#13)."""
+    from nso_adapter.core import capability
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device
+    from tests.conftest import seed_device
+
+    device_id = await seed_device(nso_device_name="rgX")
+
+    async def fake_probe(_client, _name):
+        return {"ned-id": "None", "sw-version": "None", "element": []}
+
+    monkeypatch.setattr(capability.actions, "capability_probe", fake_probe)
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        res = await capability.refresh_device_capability(db, object(), "rgX", device)
+        assert res == {}  # 'None' ned-id → treated as no NED, nothing recorded
+        assert device.ned_id != "None"  # never persisted as a bogus key
+        break
+
+
+@pytest.mark.asyncio
+async def test_record_probe_capability_tolerates_single_element_dict(adapter_client):  # noqa: F811
+    """RESTCONF may render a singleton `element` list as a bare object; record_probe_capability
+    must coerce it, not crash iterating dict keys (#24)."""
+    from nso_adapter.core.capability import get_device_capability, record_probe_capability
+    from nso_adapter.store.db import get_session
+
+    single = {"scope": "rm-set", "name": "set extcommunity", "status": "native", "detail": ""}
+    async for db in get_session():
+        count = await record_probe_capability(db, _NED, "1.0", single)  # a dict, not a list
+        assert count == 1
+        rows = await get_device_capability(db, _NED, "1.0")
+        assert {(r.scope, r.name) for r in rows} == {("rm-set", "set extcommunity")}
+        break
 
 
 # ── preflight_scopes (generic apply-preflight: scope-level matrix check) ────────

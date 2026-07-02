@@ -770,10 +770,16 @@ async def _record_atomic_capability(db, client, device, device_name, offenders, 
     device error) is the detail. The ``(ned, sw)`` key is read from the device row, learned +
     persisted via the capability probe only when not already known.
     """
-    from nso_adapter.core.capability import record_capability_rejection, refresh_device_capability
+    from nso_adapter.core.capability import (
+        _clean_capability_key,
+        record_capability_rejection,
+        refresh_device_capability,
+    )
 
-    ned_id = str(device.ned_id or "")
-    sw = str(device.sw_version or "")
+    # Guard both keys against the literal 'None' (see _clean_capability_key) so a device row
+    # carrying a stringified-None ned_id never becomes a bogus capability key.
+    ned_id = _clean_capability_key(device.ned_id)
+    sw = _clean_capability_key(device.sw_version)
     if not ned_id:
         info = await refresh_device_capability(db, client, device_name, device)
         if info:

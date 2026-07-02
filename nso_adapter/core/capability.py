@@ -59,10 +59,26 @@ async def _upsert(
     row.status, row.detail, row.source = status, detail, source
 
 
+def _clean_capability_key(value) -> str:
+    """Normalise a ``(ned_id | sw_version)`` key value.
+
+    The literal string ``"None"`` (an unselected ``device_type.cli`` / absent platform
+    stringified to a truthy value) must never become a real cache key.
+    """
+    s = str(value or "").strip()
+    return "" if s == "None" else s
+
+
 async def record_probe_capability(db: AsyncSession, ned_id: str, sw_version: str, elements) -> int:
     """Store the representable-half verdict (list of ``{scope,name,status,detail}``)."""
+    # RESTCONF may render a singleton YANG list as a bare object — coerce so we never
+    # iterate a dict's string keys (which would AttributeError on ``el.get``).
+    if isinstance(elements, dict):
+        elements = [elements]
     count = 0
     for el in elements:
+        if not isinstance(el, dict):
+            continue
         await _upsert(
             db,
             ned_id,
@@ -115,10 +131,10 @@ async def refresh_device_capability(
     Returns ``{ned_id, sw_version, count}`` (or ``{}`` when the probe reports no NED).
     """
     out = await actions.capability_probe(nso_client, device_name)
-    ned_id = str(out.get("ned-id", "") or "")
-    sw_version = str(out.get("sw-version", "") or "")
-    if sw_version == "None":  # defensive: an absent platform/version must not become a key
-        sw_version = ""
+    # Both keys defended against the literal 'None' (an unselected device_type.cli / absent
+    # platform stringifies to a truthy "None"); neither may become a bogus cache key.
+    ned_id = _clean_capability_key(out.get("ned-id"))
+    sw_version = _clean_capability_key(out.get("sw-version"))
     if not ned_id:
         logger.debug("capability.refresh.no_ned", device=device_name)
         return {}
@@ -181,8 +197,10 @@ _MATCH_KEY_CONSTRUCTS = {
 
 def _community_kind(member: str) -> str:
     """Coarse kind of a community member — the granularity the matrix groups by."""
-    m = str(member).strip()
-    head, sep, _rest = m.partition(":")
+    # NB: not `m` — that is the module-level `import models as m` alias; shadowing it here
+    # would silently break any future `m.<Model>` reference in this function.
+    member_str = str(member).strip()
+    head, sep, _rest = member_str.partition(":")
     keyword = head.lower() if sep and head and not head[0].isdigit() else None
     if keyword in _RT_KW:
         return "rt"
@@ -190,7 +208,7 @@ def _community_kind(member: str) -> str:
         return "soo"
     if keyword in ("large", "color", "bandwidth", "encapsulation"):
         return keyword
-    return "regex" if any(c in _REGEX_META for c in m) else "standard"
+    return "regex" if any(c in _REGEX_META for c in member_str) else "standard"
 
 
 def _index_rows(rows):
@@ -324,7 +342,9 @@ def parse_rejected_construct(message: str):
     Pulls the offending ``command: <cmd>`` from the NED error and normalises it to a known
     construct so the accepted-half rejection matches what the preflight checks.
     """
-    match = re.search(r"command:\s*(.+?)[\r\n]", message or "")
+    # Capture the command up to end-of-line OR end-of-string, so a rejection whose command
+    # is the final line (no trailing newline) still parses (`.` excludes newline by default).
+    match = re.search(r"command:\s*(.+)", message or "")
     cmd = (match.group(1) if match else "").strip()
     if not cmd:
         return None, None
