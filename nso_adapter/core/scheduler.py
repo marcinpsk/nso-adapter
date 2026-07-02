@@ -92,6 +92,11 @@ async def _scheduled_scope_reconcile() -> None:
                 await set_scope(db, device, plugin_rec.attributes)
                 await upsert_failover_ips(db, device, plugin_rec.primary_ip, plugin_rec.oob_ip)
 
+        # set_scope / upsert_failover_ips document "caller commits" and get_session never
+        # commits on exit, so without this the plugin-sourced scope + primary/OOB IPs are
+        # silently discarded (matches _scheduled_intent_reconcile, which commits here).
+        await db.commit()
+
 
 async def _scheduled_intent_reconcile() -> None:
     """Self-healing path: reconcile the adapter's intent mirror from the NetBox plugin.

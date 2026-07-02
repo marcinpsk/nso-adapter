@@ -171,6 +171,45 @@ async def test_scope_reconcile_offboards_absent_and_sets_present(adapter_client,
 
 
 @pytest.mark.anyio
+async def test_scope_reconcile_persists_failover_ips(adapter_client, monkeypatch):
+    """The reconcile must COMMIT its session — otherwise the plugin-sourced primary/OOB IPs
+    (and scope) are silently discarded when get_session closes uncommitted (s3-3).
+
+    Runs the real set_scope + upsert_failover_ips, then reads back in a FRESH session so the
+    assertion only passes if the change was actually committed, not just left pending.
+    """
+    from nso_adapter.store.models import DeviceFailover
+
+    ids = await _seed_devices(("fo-persist", 7100))
+    device_id = ids["fo-persist"]
+    monkeypatch.setattr("nso_adapter.core.importer.get_netbox_client", lambda: object())
+    monkeypatch.setattr(
+        "nso_adapter.bindings.netbox.scope.fetch_all_scope",
+        AsyncMock(
+            return_value=[
+                PluginScopeRecord(
+                    netbox_device_id=7100,
+                    attributes=["description"],
+                    primary_ip="10.0.0.1",
+                    oob_ip="192.0.2.5",
+                )
+            ]
+        ),
+    )
+
+    await sched._scheduled_scope_reconcile()
+
+    async for db in get_session():
+        fo = (
+            await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device_id))
+        ).scalar_one_or_none()
+        assert fo is not None, "failover row not persisted — reconcile never committed"
+        assert fo.primary_ip == "10.0.0.1"
+        assert fo.oob_ip == "192.0.2.5"
+        break
+
+
+@pytest.mark.anyio
 async def test_intent_reconcile_skips_without_netbox_client(adapter_client, monkeypatch):
     monkeypatch.setattr("nso_adapter.core.importer.get_netbox_client", lambda: None)
     await sched._scheduled_intent_reconcile()
