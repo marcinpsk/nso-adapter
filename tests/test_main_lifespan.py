@@ -138,7 +138,7 @@ async def test_dispatch_skips_gated_handlers_when_flags_off(monkeypatch):
 
 async def test_sse_handler_ignores_unparseable_frame(monkeypatch):
     calls = _patch_recording_handlers(monkeypatch)
-    handler = _make_sse_event_handler(SimpleNamespace(scheduler=_scheduler()), {"i": object()})
+    handler = _make_sse_event_handler(SimpleNamespace(scheduler=_scheduler()), {"i": object()}, set())
 
     before = asyncio.all_tasks()
     assert handler("raw-frame", None) is None
@@ -162,15 +162,42 @@ async def test_sse_handler_dispatches_parsed_frame(monkeypatch):
             enable_interface_mtu_sync=True,
         )
     )
-    handler = _make_sse_event_handler(cfg, {"i": object()})
+    dispatch_tasks: set[asyncio.Task] = set()
+    handler = _make_sse_event_handler(cfg, {"i": object()}, dispatch_tasks)
 
     before = asyncio.all_tasks()
     handler("raw-frame", {"k": 1})
     spawned = [t for t in asyncio.all_tasks() if t not in before and t is not asyncio.current_task()]
     assert len(spawned) == 1
+    assert len(dispatch_tasks) == 1  # retained (not GC'd), trackable for shutdown
 
     await asyncio.gather(*spawned)
     assert calls == [_handler_name(e) for e in _HANDLERS]
+    assert dispatch_tasks == set()  # done-callback discarded it
+
+
+async def test_sse_handler_logs_and_does_not_leak_failed_dispatch(monkeypatch):
+    """A dispatch that raises must be surfaced via the done-callback and removed from the
+    tracking set — not silently swallowed by a fire-and-forget create_task (s3-12)."""
+    from unittest.mock import AsyncMock
+
+    async def fake_session():
+        yield "DB-SESSION"
+
+    monkeypatch.setattr("nso_adapter.main.get_session", fake_session)
+    monkeypatch.setattr(
+        "nso_adapter.main._dispatch_netconf_change", AsyncMock(side_effect=RuntimeError("dispatch boom"))
+    )
+    dispatch_tasks: set[asyncio.Task] = set()
+    handler = _make_sse_event_handler(SimpleNamespace(scheduler=_scheduler()), {"i": object()}, dispatch_tasks)
+
+    handler("raw-frame", {"k": 1})
+    assert len(dispatch_tasks) == 1
+    task = next(iter(dispatch_tasks))
+    await asyncio.gather(task, return_exceptions=True)  # must not raise out of the handler/task
+
+    assert dispatch_tasks == set()  # discarded despite the failure
+    assert isinstance(task.exception(), RuntimeError)  # captured, not lost
 
 
 # --------------------------------------------------------------------------- #
@@ -215,7 +242,7 @@ def test_build_nso_clients_empty_is_noop(clean_nso_registry):
 
 def test_start_sse_streams_disabled_returns_empty():
     cfg = SimpleNamespace(scheduler=_scheduler(enable_nso_streams=False), nso_instances=[_instance("x")])
-    assert _start_sse_streams(cfg, _Provider(), {}, asyncio.Event()) == []
+    assert _start_sse_streams(cfg, _Provider(), {}, asyncio.Event(), set()) == []
 
 
 async def test_start_sse_streams_enabled_spawns_one_task_per_instance(monkeypatch):
@@ -232,7 +259,7 @@ async def test_start_sse_streams_enabled_spawns_one_task_per_instance(monkeypatc
     nso_clients = {"nso-dev": object()}
     stop = asyncio.Event()
 
-    tasks = _start_sse_streams(cfg, _Provider(), nso_clients, stop)
+    tasks = _start_sse_streams(cfg, _Provider(), nso_clients, stop, set())
     try:
         assert len(tasks) == 1
         await asyncio.sleep(0)  # let the subscriber coroutine start
@@ -257,16 +284,29 @@ async def test_shutdown_sse_sets_stop_and_cancels_tasks():
     task = asyncio.ensure_future(runner())
     await asyncio.sleep(0)  # let it start running
 
-    await _shutdown_sse(stop, [task])
+    await _shutdown_sse(stop, [task], set())
 
     assert stop.is_set()
     assert task.done()
     assert task.cancelled()
 
 
+async def test_shutdown_sse_cancels_in_flight_dispatch_tasks():
+    """In-flight dispatch tasks are cancelled + drained at shutdown, not orphaned (s3-12)."""
+    stop = asyncio.Event()
+
+    async def runner():
+        await asyncio.sleep(30)
+
+    dispatch = asyncio.ensure_future(runner())
+    await asyncio.sleep(0)
+    await _shutdown_sse(stop, [], {dispatch})
+    assert dispatch.cancelled()
+
+
 async def test_shutdown_sse_no_tasks_just_signals():
     stop = asyncio.Event()
-    await _shutdown_sse(stop, [])
+    await _shutdown_sse(stop, [], set())
     assert stop.is_set()
 
 

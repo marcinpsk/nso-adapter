@@ -117,8 +117,18 @@ async def _dispatch_netconf_change(cfg, parsed: dict, db, clients: dict[str, Nso
         await handle_interface_mtu_change(parsed, db, clients)
 
 
-def _make_sse_event_handler(cfg, clients: dict[str, NsoClient]):
-    """Build the SSE on-event callback: ignore unparseable frames, else dispatch on its own task/session."""
+def _make_sse_event_handler(cfg, clients: dict[str, NsoClient], dispatch_tasks: set[asyncio.Task]):
+    """Build the SSE on-event callback: ignore unparseable frames, else dispatch on its own task/session.
+
+    Each dispatch task is retained in *dispatch_tasks* (a bare create_task can be garbage-
+    collected mid-flight and its exception swallowed) with a done-callback that logs failures
+    and discards it; the set is cancelled at shutdown so a device change can't be lost silently.
+    """
+
+    def _on_done(task: asyncio.Task) -> None:
+        dispatch_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning("sse.dispatch_failed", error=repr(task.exception()))
 
     def on_event(raw: str, parsed: dict | None) -> None:
         if parsed is None:
@@ -128,12 +138,20 @@ def _make_sse_event_handler(cfg, clients: dict[str, NsoClient]):
             async for db in get_session():
                 await _dispatch_netconf_change(cfg, parsed, db, clients)
 
-        asyncio.create_task(_run())
+        task = asyncio.create_task(_run())
+        dispatch_tasks.add(task)
+        task.add_done_callback(_on_done)
 
     return on_event
 
 
-def _start_sse_streams(cfg, provider, nso_clients: dict[str, NsoClient], sse_stop: asyncio.Event) -> list[asyncio.Task]:
+def _start_sse_streams(
+    cfg,
+    provider,
+    nso_clients: dict[str, NsoClient],
+    sse_stop: asyncio.Event,
+    dispatch_tasks: set[asyncio.Task],
+) -> list[asyncio.Task]:
     """Start one persistent NETCONF SSE subscriber per instance (when enabled); return the spawned tasks."""
     sse_tasks: list[asyncio.Task] = []
     if not cfg.scheduler.enable_nso_streams:
@@ -152,7 +170,7 @@ def _start_sse_streams(cfg, provider, nso_clients: dict[str, NsoClient], sse_sto
             persistent_subscriber(
                 subscriber,
                 stream_url,
-                _make_sse_event_handler(cfg, {inst.name: nso_clients[inst.name]}),
+                _make_sse_event_handler(cfg, {inst.name: nso_clients[inst.name]}, dispatch_tasks),
                 stop_event=sse_stop,
             )
         )
@@ -161,12 +179,14 @@ def _start_sse_streams(cfg, provider, nso_clients: dict[str, NsoClient], sse_sto
     return sse_tasks
 
 
-async def _shutdown_sse(sse_stop: asyncio.Event, sse_tasks: list[asyncio.Task]) -> None:
-    """Signal stop, cancel every SSE task and wait (bounded) for them to drain."""
+async def _shutdown_sse(
+    sse_stop: asyncio.Event, sse_tasks: list[asyncio.Task], dispatch_tasks: set[asyncio.Task]
+) -> None:
+    """Signal stop, cancel every SSE subscriber + in-flight dispatch task, and drain (bounded)."""
     sse_stop.set()
-    for task in sse_tasks:
+    for task in (*sse_tasks, *tuple(dispatch_tasks)):
         task.cancel()
-    for task in sse_tasks:
+    for task in (*sse_tasks, *tuple(dispatch_tasks)):
         try:
             await asyncio.wait_for(task, timeout=5.0)
         except (asyncio.CancelledError, TimeoutError):
@@ -204,9 +224,11 @@ async def lifespan(app: FastAPI):
     netbox_client = _build_netbox_client(app, cfg, provider)
 
     sse_stop = asyncio.Event()
-    sse_tasks = _start_sse_streams(cfg, provider, nso_clients, sse_stop)
+    sse_dispatch_tasks: set[asyncio.Task] = set()
+    sse_tasks = _start_sse_streams(cfg, provider, nso_clients, sse_stop, sse_dispatch_tasks)
     app.state.sse_stop = sse_stop
     app.state.sse_tasks = sse_tasks
+    app.state.sse_dispatch_tasks = sse_dispatch_tasks
 
     # Start the durable worker pool first: it reconciles orphaned jobs from a
     # previous process (requeue idempotent / fail interrupted apply) before the
@@ -219,7 +241,7 @@ async def lifespan(app: FastAPI):
     finally:
         stop_scheduler()
         await stop_workers()
-        await _shutdown_sse(sse_stop, sse_tasks)
+        await _shutdown_sse(sse_stop, sse_tasks, sse_dispatch_tasks)
         await _close_netbox(netbox_client)
         await _dispose_engine()
 
