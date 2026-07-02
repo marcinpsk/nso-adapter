@@ -47,6 +47,17 @@ async def _seed_job(device_id: int, status: JobStatus = JobStatus.queued) -> int
     raise RuntimeError("no session")
 
 
+# ── JobType enum invariant ──────────────────────────────────────────────────────
+
+
+def test_job_type_value_equals_name_for_all_members():
+    """Every JobType value must equal its name: SQLAlchemy's Enum(JobType) persists the member
+    NAME, so a divergent value (detect_drift = "detect-drift") silently misses a raw-value
+    filter/write against the DB or DataErrors (s3-9)."""
+    diverged = {m.name: m.value for m in JobType if m.value != m.name}
+    assert not diverged, f"JobType members whose value != name: {diverged}"
+
+
 # ── get_active_job ────────────────────────────────────────────────────────────
 
 

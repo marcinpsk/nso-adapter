@@ -55,7 +55,9 @@ class JobStatus(str, enum.Enum):
 
 class JobType(str, enum.Enum):
     sync = "sync"
-    detect_drift = "detect-drift"
+    # value MUST equal the name: Enum(JobType) persists the member NAME, so a divergent
+    # value silently misses a raw-value filter/write or DataErrors (was "detect-drift").
+    detect_drift = "detect_drift"
     connect = "connect"
     apply = "apply"  # Phase 2: push accepted intent to NSO
     removal = "removal"  # async PUT-replace to revert removed intent (see core/removal.py)
