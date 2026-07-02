@@ -279,3 +279,82 @@ async def test_put_ospf_intent_interface_full_replace_and_update(adapter_client)
     assert [i.interface_name for i in ifaces] == ["GE0/0"]  # GE0/1 dropped
     assert (ifaces[0].cost, ifaces[0].passive) == (50, True)  # updated in place
     assert job is not None
+
+
+async def test_put_ospf_intent_auto_apply_enqueues_apply_job(adapter_client):
+    """PUT with auto_apply=True and a non-empty payload enqueues an apply job, so accepted
+    OSPF config actually reaches the device — parity with every other intent scope (s3-2)."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import DeviceSettings, Job, JobType
+
+    device_id = await seed_device(nso_device_name="ospf-intent-autoapply", netbox_device_id=930)
+    async for db in get_session():
+        db.add(DeviceSettings(device_id=device_id, auto_apply=True))
+        await db.commit()
+        break
+
+    payload = {
+        "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
+        "interfaces": [{"interface_name": "GE0/0", "process_id": "1", "area_id": "0", "passive": False}],
+    }
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH, json=payload)
+    assert resp.status_code == 200
+
+    async for db in get_session():
+        job = (
+            await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.apply))
+        ).scalar_one_or_none()
+        assert job is not None
+        break
+
+
+async def test_put_ospf_intent_no_apply_job_when_auto_apply_disabled(adapter_client):
+    """auto_apply=False → no apply job enqueued (operator applies manually)."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import DeviceSettings, Job, JobType
+
+    device_id = await seed_device(nso_device_name="ospf-intent-noapply", netbox_device_id=931)
+    async for db in get_session():
+        db.add(DeviceSettings(device_id=device_id, auto_apply=False))
+        await db.commit()
+        break
+
+    payload = {
+        "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
+        "interfaces": [],
+    }
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH, json=payload)
+    assert resp.status_code == 200
+
+    async for db in get_session():
+        job = (
+            await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.apply))
+        ).scalar_one_or_none()
+        assert job is None
+        break
+
+
+async def test_put_ospf_intent_empty_payload_no_apply_job(adapter_client):
+    """auto_apply=True but an empty payload → no apply job (nothing to push)."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import DeviceSettings, Job, JobType
+
+    device_id = await seed_device(nso_device_name="ospf-intent-empty", netbox_device_id=932)
+    async for db in get_session():
+        db.add(DeviceSettings(device_id=device_id, auto_apply=True))
+        await db.commit()
+        break
+
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ospf-intent",
+        headers=AUTH,
+        json={"instances": [], "interfaces": []},
+    )
+    assert resp.status_code == 200
+
+    async for db in get_session():
+        job = (
+            await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.apply))
+        ).scalar_one_or_none()
+        assert job is None
+        break

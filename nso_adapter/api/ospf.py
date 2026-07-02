@@ -19,6 +19,7 @@ from nso_adapter.store.models import (
     Device,
     DeviceOspfInstance,
     DeviceOspfInterface,
+    DeviceSettings,
     OspfInstanceIntent,
     OspfInterfaceIntent,
     RedistributionIntent,
@@ -243,14 +244,29 @@ async def _sync_ospf_redistribution(
     return removed
 
 
+async def _maybe_enqueue_apply(db: AsyncSession, device_id: int, count: int) -> None:
+    """Enqueue an apply job when the payload is non-empty and the device has auto_apply on."""
+    if count <= 0:
+        return
+    settings = (
+        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    ).scalar_one_or_none()
+    if settings and settings.auto_apply:
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True)
+
+
 @router.put("/{device_id}/ospf-intent", dependencies=[Depends(verify_token)])
 async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's OSPF intent mirror for this device atomically.
 
     Full-replace semantics per device for instances, interfaces and (instance-scoped)
-    redistribution. If any of the three dropped a row, a `removal` job is queued so the
-    ospf-reconciler PUT-replace reverts it on-device (a merge-PATCH apply would not).
-    The removal runs in the background so this PUT never blocks on the device commit.
+    redistribution. If ``auto_apply`` is enabled and the new payload is non-empty, an
+    apply job is enqueued so the accepted config reaches the device. If any of the three
+    dropped a row, a `removal` job is queued so the ospf-reconciler PUT-replace reverts it
+    on-device (a merge-PATCH apply would not). Both jobs run in the background so this PUT
+    never blocks on the device commit.
     """
     device = await db.get(Device, device_id)
     if not device:
@@ -281,6 +297,8 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
         ),
     )
     removed_redist = await _sync_ospf_redistribution(db, device_id, payload.instances, now)
+
+    await _maybe_enqueue_apply(db, device_id, len(payload.instances) + len(payload.interfaces))
 
     if removed_inst or removed_iface or removed_redist:
         from nso_adapter.core.removal import enqueue_removal
