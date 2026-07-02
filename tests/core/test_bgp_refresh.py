@@ -16,7 +16,7 @@ async def _scope_with_peers(*peer_addrs: str) -> list[dict]:
             "scope": [
                 {
                     "vrf": "",
-                    "address-family": [{"af": "ipv4-unicast"}],
+                    "address-family": [{"afi": "ipv4-unicast"}],
                     "peer": [{"peer-address": a, "peer-group": f"G-{i}"} for i, a in enumerate(peer_addrs)],
                 }
             ],
@@ -56,7 +56,7 @@ async def test_duplicate_peer_merges_address_families(adapter_client):
             "scope": [
                 {
                     "vrf": "",
-                    "address-family": [{"af": "ipv4-unicast"}],
+                    "address-family": [{"afi": "ipv4-unicast"}],
                     "peer": [
                         {
                             "peer-address": "10.0.0.1",
@@ -98,7 +98,7 @@ async def test_inactive_peer_stored_disabled(adapter_client):
             "scope": [
                 {
                     "vrf": "",
-                    "address-family": [{"af": "ipv4-unicast"}],
+                    "address-family": [{"afi": "ipv4-unicast"}],
                     "peer": [
                         {"peer-address": "10.0.0.1", "peer-group": "up", "enabled": True},
                         {"peer-address": "10.0.0.2", "peer-group": "down", "enabled": False},
@@ -128,7 +128,7 @@ async def test_peer_enabled_in_any_group_wins_on_merge(adapter_client):
             "scope": [
                 {
                     "vrf": "",
-                    "address-family": [{"af": "ipv4-unicast"}],
+                    "address-family": [{"afi": "ipv4-unicast"}],
                     "peer": [
                         # deactivated occurrence first, active second — OR must win.
                         {"peer-address": "10.0.0.9", "peer-group": "down", "enabled": False},
@@ -160,7 +160,7 @@ async def test_disabled_duplicate_does_not_disable_active_peer(adapter_client):
             "scope": [
                 {
                     "vrf": "",
-                    "address-family": [{"af": "ipv4-unicast"}],
+                    "address-family": [{"afi": "ipv4-unicast"}],
                     "peer": [
                         {"peer-address": "10.0.0.5", "peer-group": "up", "enabled": True},
                         {"peer-address": "10.0.0.5", "peer-group": "down", "enabled": False},
@@ -191,7 +191,7 @@ async def test_peer_af_policy_in_maps_to_routemap(adapter_client):
             "scope": [
                 {
                     "vrf": "",
-                    "address-family": [{"af": "ipv4-unicast"}],
+                    "address-family": [{"afi": "ipv4-unicast"}],
                     "peer": [
                         {
                             "peer-address": "10.0.0.1",
@@ -233,7 +233,7 @@ async def test_peer_source_imported(adapter_client):
             "scope": [
                 {
                     "vrf": "",
-                    "address-family": [{"af": "ipv4-unicast"}],
+                    "address-family": [{"afi": "ipv4-unicast"}],
                     "peer": [{"peer-address": "10.0.0.1", "source": "198.18.255.1"}],
                 }
             ],
@@ -264,7 +264,7 @@ async def test_peer_group_object_imported(adapter_client):
             "scope": [
                 {
                     "vrf": "",
-                    "address-family": [{"af": "ipv4-unicast"}],
+                    "address-family": [{"afi": "ipv4-unicast"}],
                     "peer": [],
                     "peer-group": [
                         {
@@ -352,7 +352,7 @@ async def test_malformed_entries_are_skipped(adapter_client):
             "scope": [
                 {
                     "vrf": "",
-                    "address-family": [{"af": ""}, {"af": "ipv4-unicast"}],  # empty af skipped
+                    "address-family": [{"afi": ""}, {"afi": "ipv4-unicast"}],  # empty af skipped
                     "peer": [{"peer-address": ""}, {"peer-address": "10.0.0.1"}],  # nameless peer skipped
                     "peer-group": [{"name": ""}, {"name": "PG"}],  # empty pg name skipped
                 }
@@ -389,7 +389,7 @@ async def test_duplicate_afis_and_peer_group_names_deduped(adapter_client):
             "scope": [
                 {
                     "vrf": "",
-                    "address-family": [{"af": "ipv4-unicast"}],
+                    "address-family": [{"afi": "ipv4-unicast"}],
                     "peer": [
                         {
                             "peer-address": "10.0.0.1",
@@ -462,7 +462,7 @@ async def test_refresh_happy_path_upserts_rows(adapter_client):
             {
                 "asn": "65100",
                 "scope": [
-                    {"vrf": "", "address-family": [{"af": "ipv4-unicast"}], "peer": [{"peer-address": "10.0.0.1"}]}
+                    {"vrf": "", "address-family": [{"afi": "ipv4-unicast"}], "peer": [{"peer-address": "10.0.0.1"}]}
                 ],
             }
         ]

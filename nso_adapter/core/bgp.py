@@ -144,7 +144,10 @@ async def _insert_bgp_scope(db: AsyncSession, router_id: int, scope_data: dict, 
     await db.flush()
 
     for af_data in scope_data.get("address-family", []):
-        af_name = af_data.get("af", "")
+        # network-state-export keys the scope address-family on "afi" (yang:1090), same as the
+        # peer / peer-group address-family lists — not "af" (the DB column name). Reading "af"
+        # here meant DeviceBgpAddressFamily rows were never created on real oper-data.
+        af_name = af_data.get("afi", "")
         if af_name:
             db.add(DeviceBgpAddressFamily(scope_id=scope.id, af=af_name))
 
