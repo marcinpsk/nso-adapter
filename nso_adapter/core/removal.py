@@ -44,6 +44,12 @@ _SIMPLE_TARGETS: dict[str, tuple[str, str]] = {
 # replace_on_removal(store_model, apply_callable) callers need no change.
 _SCOPE_BY_MODEL: dict[str, str] = {model: scope for scope, (model, _) in _SIMPLE_TARGETS.items()}
 
+# Scopes whose apply function translates values to the device's NED dialect and so
+# takes a ``ned_id`` kwarg. The PUT-replace MUST thread it — otherwise the identity
+# dialect pushes canonical (wrong) wire form and fails to skip unrepresentable members
+# (route-policy communities). Kept as an explicit set so it survives mocking/refactors.
+_NED_DIALECT_SCOPES: frozenset[str] = frozenset({"route_policy"})
+
 # OSPF and BGP have multi-row applies, so they get bespoke handlers below.
 VALID_REMOVAL_SCOPES: set[str] = set(_SIMPLE_TARGETS) | {"ospf", "bgp"}
 
@@ -61,18 +67,38 @@ async def _replace_simple(db: AsyncSession, device, client, scope: str) -> None:
         .scalars()
         .all()
     )
-    await apply_fn(client, device.nso_device_name, rows, replace=True)
+    kwargs: dict = {"replace": True}
+    if scope in _NED_DIALECT_SCOPES:
+        kwargs["ned_id"] = device.ned_id
+    await apply_fn(client, device.nso_device_name, rows, **kwargs)
 
 
 async def _replace_ospf(db: AsyncSession, device, client) -> None:
     from nso_adapter.nso.apply import apply_ospf_config
     from nso_adapter.store.models import OspfInstanceIntent, OspfInterfaceIntent, RedistributionIntent
 
+    # A PUT-replace re-asserts the FULL desired state, so it must include only accepted
+    # rows — never not-yet-accepted (imported/staged) intent, which would deploy
+    # un-reviewed config to the device (matches _replace_simple / _replace_bgp).
     insts = (
-        (await db.execute(select(OspfInstanceIntent).where(OspfInstanceIntent.device_id == device.id))).scalars().all()
+        (
+            await db.execute(
+                select(OspfInstanceIntent).where(
+                    OspfInstanceIntent.device_id == device.id, OspfInstanceIntent.accepted_at.is_not(None)
+                )
+            )
+        )
+        .scalars()
+        .all()
     )
     ifaces = (
-        (await db.execute(select(OspfInterfaceIntent).where(OspfInterfaceIntent.device_id == device.id)))
+        (
+            await db.execute(
+                select(OspfInterfaceIntent).where(
+                    OspfInterfaceIntent.device_id == device.id, OspfInterfaceIntent.accepted_at.is_not(None)
+                )
+            )
+        )
         .scalars()
         .all()
     )
@@ -82,6 +108,7 @@ async def _replace_ospf(db: AsyncSession, device, client) -> None:
                 select(RedistributionIntent).where(
                     RedistributionIntent.device_id == device.id,
                     RedistributionIntent.dest_protocol == "ospf",
+                    RedistributionIntent.accepted_at.is_not(None),
                 )
             )
         )
@@ -114,6 +141,7 @@ async def _replace_bgp(db: AsyncSession, device, client) -> None:
                 select(RedistributionIntent).where(
                     RedistributionIntent.device_id == device.id,
                     RedistributionIntent.dest_protocol == "bgp",
+                    RedistributionIntent.accepted_at.is_not(None),
                 )
             )
         )

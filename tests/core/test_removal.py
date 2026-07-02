@@ -29,6 +29,7 @@ from nso_adapter.store.models import (
     OspfInstanceIntent,
     OspfInterfaceIntent,
     RedistributionIntent,
+    RoutePolicyObjectIntent,
     VlanIntent,
 )
 
@@ -168,13 +169,30 @@ async def test_dispatch_scope_simple_calls_apply_replace_true(adapter_client):
 
 
 async def test_dispatch_scope_ospf_uses_multi_row_apply(adapter_client):
-    """OSPF dispatch fetches instances+interfaces+redist(ospf only) and applies replace=True."""
+    """OSPF dispatch fetches ONLY accepted instances+interfaces+redist(ospf only), replace=True.
+
+    A PUT-replace re-asserts the full desired state, so it must never include
+    not-yet-accepted (imported/staged) rows — that would deploy un-reviewed config.
+    """
     device_id = await _seed_device(nso_device_name="ra1")
     async for db in get_session():
-        db.add(OspfInstanceIntent(device_id=device_id, process_id="1", vrf=""))
-        db.add(OspfInterfaceIntent(device_id=device_id, interface_name="Gi0/0", passive=False))
-        db.add(RedistributionIntent(device_id=device_id, dest_protocol="ospf", source_protocol="connected"))
-        db.add(RedistributionIntent(device_id=device_id, dest_protocol="bgp", source_protocol="connected"))
+        db.add(OspfInstanceIntent(device_id=device_id, process_id="1", vrf="", accepted_at=_NOW))
+        db.add(OspfInstanceIntent(device_id=device_id, process_id="9", vrf="", accepted_at=None))  # excluded
+        db.add(OspfInterfaceIntent(device_id=device_id, interface_name="Gi0/0", passive=False, accepted_at=_NOW))
+        db.add(OspfInterfaceIntent(device_id=device_id, interface_name="Gi0/9", passive=False, accepted_at=None))
+        db.add(
+            RedistributionIntent(
+                device_id=device_id, dest_protocol="ospf", source_protocol="connected", accepted_at=_NOW
+            )
+        )
+        db.add(
+            RedistributionIntent(device_id=device_id, dest_protocol="ospf", source_protocol="static", accepted_at=None)
+        )  # excluded
+        db.add(
+            RedistributionIntent(
+                device_id=device_id, dest_protocol="bgp", source_protocol="connected", accepted_at=_NOW
+            )
+        )
         await db.commit()
         break
 
@@ -189,10 +207,38 @@ async def test_dispatch_scope_ospf_uses_multi_row_apply(adapter_client):
     args, kwargs = apply_fn.await_args
     # apply_ospf_config(client, name, insts, ifaces, redist, replace=True)
     assert args[0] is _CLIENT and args[1] == "ra1"
-    assert [i.process_id for i in args[2]] == ["1"]
-    assert [i.interface_name for i in args[3]] == ["Gi0/0"]
-    assert [r.dest_protocol for r in args[4]] == ["ospf"]  # the bgp redist row is filtered out
+    assert [i.process_id for i in args[2]] == ["1"]  # un-accepted process 9 filtered out
+    assert [i.interface_name for i in args[3]] == ["Gi0/0"]  # un-accepted Gi0/9 filtered out
+    # only the accepted ospf redist row survives (bgp + un-accepted ospf filtered)
+    assert [(r.dest_protocol, r.source_protocol) for r in args[4]] == [("ospf", "connected")]
     assert kwargs == {"replace": True}
+
+
+async def test_dispatch_scope_route_policy_passes_ned_id(adapter_client):
+    """Route-policy removal MUST thread the device's ned_id so community members are
+    translated to the device's NED dialect (identity dialect on ned_id=None pushes the
+    wrong wire form / fails to skip unrepresentable members)."""
+    device_id = await _seed_device(nso_device_name="ra1")
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        device.ned_id = "cisco-iosxr-nc-7.3"
+        db.add(RoutePolicyObjectIntent(device_id=device_id, family="rpl", name="RP-IN", entries=[], accepted_at=_NOW))
+        await db.commit()
+        break
+
+    apply_fn = AsyncMock()
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        with patch("nso_adapter.nso.apply.apply_route_policy_config", apply_fn):
+            await removal_mod._dispatch_scope(db, device, _CLIENT, "route_policy")
+        break
+
+    apply_fn.assert_awaited_once()
+    args, kwargs = apply_fn.await_args
+    assert args[0] is _CLIENT and args[1] == "ra1"
+    assert [r.name for r in args[2]] == ["RP-IN"]
+    assert kwargs.get("ned_id") == "cisco-iosxr-nc-7.3"
+    assert kwargs.get("replace") is True
 
 
 async def test_dispatch_scope_unknown_raises(adapter_client):
