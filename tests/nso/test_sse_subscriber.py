@@ -241,6 +241,23 @@ async def test_subscribe_skips_event_type_and_comment_lines():
     assert received[0][1] == {"msg": "hello"}
 
 
+async def test_subscribe_does_not_log_raw_body_at_info():
+    """s3-27: the INFO sse_event must not carry the raw body — it can contain sensitive leaf
+    values (cleartext leak). Only path/size at INFO; the truncated body stays at DEBUG."""
+    from structlog.testing import capture_logs
+
+    payload = json.dumps({"secret-leaf": "hunter2"})
+    sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    with capture_logs() as logs, patch_subscriber_sse(sub, [payload]):
+        await sub.subscribe(STREAM_URL, lambda *_: None, duration=5.0)
+
+    info_events = [e for e in logs if e.get("event") == "sse_event"]
+    assert info_events, "expected an sse_event log at INFO"
+    for e in info_events:
+        assert "raw" not in e  # no cleartext body at INFO
+        assert "hunter2" not in str(list(e.values()))
+
+
 async def test_subscribe_idle_read_timeout_unwedges_half_open_connection():
     """s3-13: a half-open connection (200 headers sent, then no bytes — no event and no
     keep-alive) must not wedge aiter_lines forever. Exercised against a REAL socket that
