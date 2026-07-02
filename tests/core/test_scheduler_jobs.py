@@ -210,6 +210,34 @@ async def test_scope_reconcile_persists_failover_ips(adapter_client, monkeypatch
 
 
 @pytest.mark.anyio
+async def test_scope_reconcile_isolates_one_device_failure(adapter_client, monkeypatch):
+    """One device raising (FK/constraint/etc.) must not abort the whole tick and skip every
+    later device — the per-device body is isolated + rolled back and the loop carries on (s3-14)."""
+    await _seed_devices(("iso-a", 7200), ("iso-b", 7201))
+    attempted: list[int] = []
+
+    async def _boom_set_scope(db, device, attributes):
+        attempted.append(device.netbox_device_id)
+        raise RuntimeError("scope write failed")
+
+    monkeypatch.setattr("nso_adapter.core.importer.get_netbox_client", lambda: object())
+    monkeypatch.setattr(
+        "nso_adapter.bindings.netbox.scope.fetch_all_scope",
+        AsyncMock(
+            return_value=[
+                PluginScopeRecord(netbox_device_id=7200, attributes=["description"]),
+                PluginScopeRecord(netbox_device_id=7201, attributes=["description"]),
+            ]
+        ),
+    )
+    monkeypatch.setattr("nso_adapter.core.onboarding.set_scope", _boom_set_scope)
+
+    # Must not raise, and must have ATTEMPTED both devices despite the first failing.
+    await sched._scheduled_scope_reconcile()
+    assert sorted(attempted) == [7200, 7201]
+
+
+@pytest.mark.anyio
 async def test_intent_reconcile_skips_without_netbox_client(adapter_client, monkeypatch):
     monkeypatch.setattr("nso_adapter.core.importer.get_netbox_client", lambda: None)
     await sched._scheduled_intent_reconcile()

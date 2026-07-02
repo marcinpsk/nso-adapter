@@ -76,26 +76,36 @@ async def _scheduled_scope_reconcile() -> None:
     plugin_by_nb_id = {r.netbox_device_id: r for r in plugin_records}
 
     async for db in get_session():
-        result = await db.execute(select(Device).where(Device.netbox_device_id.is_not(None)))
-        devices = result.scalars().all()
+        # Select ids only (not ORM rows): the per-device commit/rollback below would expire
+        # pre-loaded Device instances, and touching an expired attr later triggers a lazy
+        # load that fails in the async greenlet context. Re-fetch a fresh row per iteration.
+        device_ids = (await db.execute(select(Device.id).where(Device.netbox_device_id.is_not(None)))).scalars().all()
 
-        for device in devices:
-            plugin_rec = plugin_by_nb_id.get(device.netbox_device_id)
-            if plugin_rec is None:
-                logger.warning(
-                    "scheduler.scope_reconcile.offboarding",
-                    device_id=device.id,
-                    netbox_device_id=device.netbox_device_id,
-                )
-                await offboard_device(db, device)
-            else:
-                await set_scope(db, device, plugin_rec.attributes)
-                await upsert_failover_ips(db, device, plugin_rec.primary_ip, plugin_rec.oob_ip)
-
-        # set_scope / upsert_failover_ips document "caller commits" and get_session never
-        # commits on exit, so without this the plugin-sourced scope + primary/OOB IPs are
-        # silently discarded (matches _scheduled_intent_reconcile, which commits here).
-        await db.commit()
+        for device_id in device_ids:
+            # Isolate + commit per device: set_scope/upsert_failover_ips document "caller
+            # commits" (and get_session never commits on exit), so each device's scope +
+            # primary/OOB IPs must be committed here or they're silently discarded. Per-device
+            # so one device raising (FK/constraint) can't abort the tick and skip every later
+            # device — roll its partial/poisoned work back and carry on with the rest.
+            try:
+                device = await db.get(Device, device_id)
+                if device is None:
+                    continue
+                plugin_rec = plugin_by_nb_id.get(device.netbox_device_id)
+                if plugin_rec is None:
+                    logger.warning(
+                        "scheduler.scope_reconcile.offboarding",
+                        device_id=device.id,
+                        netbox_device_id=device.netbox_device_id,
+                    )
+                    await offboard_device(db, device)
+                else:
+                    await set_scope(db, device, plugin_rec.attributes)
+                    await upsert_failover_ips(db, device, plugin_rec.primary_ip, plugin_rec.oob_ip)
+                await db.commit()
+            except Exception as exc:
+                logger.warning("scheduler.scope_reconcile.device_failed", device_id=device_id, error=repr(exc))
+                await db.rollback()
 
 
 async def _scheduled_intent_reconcile() -> None:
@@ -133,55 +143,65 @@ async def _scheduled_intent_reconcile() -> None:
         by_nb_device.setdefault(rec.netbox_device_id, []).append(rec)
 
     async for db in get_session():
-        result = await db.execute(select(Device).where(Device.netbox_device_id.is_not(None)))
-        devices = result.scalars().all()
+        # ids only + re-fetch per iteration: the per-device commit/rollback expires pre-loaded
+        # ORM rows, and a later expired-attr access does a lazy load that fails under asyncio.
+        device_ids = (await db.execute(select(Device.id).where(Device.netbox_device_id.is_not(None)))).scalars().all()
 
-        for device in devices:
-            records = by_nb_device.get(device.netbox_device_id, [])
-
-            # Load all interfaces for this device
-            ifaces_result = await db.execute(select(DbInterface).where(DbInterface.device_id == device.id))
-            iface_by_name = {i.name: i for i in ifaces_result.scalars().all()}
-
-            # Full-replace: delete all existing intent rows for this device
-            existing = await db.execute(
-                select(InterfaceIntent).where(InterfaceIntent.interface_id.in_([i.id for i in iface_by_name.values()]))
-            )
-            for row in existing.scalars().all():
-                await db.delete(row)
-            await db.flush()
-
-            now = datetime.now(UTC).replace(tzinfo=None)
-            count = 0
-            for rec in records:
-                iface = iface_by_name.get(rec.interface_name)
-                if iface is None:
-                    logger.debug(
-                        "scheduler.intent_reconcile.unknown_interface",
-                        device_id=device.id,
-                        interface=rec.interface_name,
-                    )
+        for device_id in device_ids:
+            # Isolate + commit per device so one device raising (FK/constraint) can't abort the
+            # tick and skip every later device — roll its partial work back and carry on.
+            try:
+                device = await db.get(Device, device_id)
+                if device is None:
                     continue
-                value = str(rec.intent_value) if rec.intent_value is not None else None
-                db.add(
-                    InterfaceIntent(
-                        interface_id=iface.id,
-                        attribute=rec.attribute,
-                        intent_value=value,
-                        accepted_at=rec.accepted_at or now,
+                records = by_nb_device.get(device.netbox_device_id, [])
+
+                # Load all interfaces for this device
+                ifaces_result = await db.execute(select(DbInterface).where(DbInterface.device_id == device.id))
+                iface_by_name = {i.name: i for i in ifaces_result.scalars().all()}
+
+                # Full-replace: delete all existing intent rows for this device
+                existing = await db.execute(
+                    select(InterfaceIntent).where(
+                        InterfaceIntent.interface_id.in_([i.id for i in iface_by_name.values()])
                     )
                 )
-                count += 1
-
-            if count > 0:
+                for row in existing.scalars().all():
+                    await db.delete(row)
                 await db.flush()
-                logger.info(
-                    "scheduler.intent_reconcile.updated",
-                    device_id=device.id,
-                    attribute_count=count,
-                )
 
-        await db.commit()
+                now = datetime.now(UTC).replace(tzinfo=None)
+                count = 0
+                for rec in records:
+                    iface = iface_by_name.get(rec.interface_name)
+                    if iface is None:
+                        logger.debug(
+                            "scheduler.intent_reconcile.unknown_interface",
+                            device_id=device.id,
+                            interface=rec.interface_name,
+                        )
+                        continue
+                    value = str(rec.intent_value) if rec.intent_value is not None else None
+                    db.add(
+                        InterfaceIntent(
+                            interface_id=iface.id,
+                            attribute=rec.attribute,
+                            intent_value=value,
+                            accepted_at=rec.accepted_at or now,
+                        )
+                    )
+                    count += 1
+
+                if count > 0:
+                    logger.info(
+                        "scheduler.intent_reconcile.updated",
+                        device_id=device.id,
+                        attribute_count=count,
+                    )
+                await db.commit()
+            except Exception as exc:
+                logger.warning("scheduler.intent_reconcile.device_failed", device_id=device.id, error=repr(exc))
+                await db.rollback()
 
 
 async def _scheduled_lag_topology_refresh() -> None:
