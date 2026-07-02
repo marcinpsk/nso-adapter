@@ -138,7 +138,14 @@ async def refresh_redistribution_for_device(
 
     # ── Upsert ───────────────────────────────────────────────────────────────
     await db.execute(delete(DeviceRedistribution).where(DeviceRedistribution.device_id == device.id))
+    # First-wins in-refresh dedup: a duplicate identity tuple in the export would otherwise
+    # IntegrityError on commit and roll back the whole full-replace (uq_deviceredistribution_identity).
+    seen: set[tuple[str, str, str, str]] = set()
     for row in rows:
+        key = (row.dest_protocol, row.dest_ref, row.source_protocol, row.source_ref)
+        if key in seen:
+            continue
+        seen.add(key)
         db.add(row)
     await db.commit()
 

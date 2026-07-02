@@ -239,3 +239,35 @@ async def test_refresh_skipped_when_no_nso_device_name(adapter_client):
         nso_client.get_ospf.assert_not_awaited()
         result = await db.execute(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id))
         assert len(result.scalars().all()) == 0
+
+
+@pytest.mark.anyio
+async def test_refresh_dedups_duplicate_identity(adapter_client):
+    """s2-9: a duplicate redistribute identity tuple in the export must not IntegrityError and
+    roll back the whole full-replace refresh — it is deduped (first occurrence wins)."""
+    device_id = await seed_device(nso_device_name="rd-dup-sw01", netbox_device_id=7710)
+    async with _device_session(device_id) as (db, device):
+        nso_client = _nso_client_with_data(
+            ospf={
+                "instance": [
+                    {
+                        "process-id": 1,
+                        "redistribute": [
+                            {"source-protocol": "connected", "source-ref": "", "metric": 10},
+                            {"source-protocol": "connected", "source-ref": "", "metric": 20},  # dup identity
+                        ],
+                    }
+                ]
+            }
+        )
+
+        await refresh_redistribution_for_device(db, device, nso_client, refresh_source="test")
+
+        rows = (
+            (await db.execute(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+        assert rows[0].source_protocol == "connected"
+        assert rows[0].metric == 10  # first wins

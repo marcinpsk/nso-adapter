@@ -257,3 +257,29 @@ async def test_refresh_persists_p2_levels_and_sr(adapter_client):
             await db.execute(select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id))
         ).scalar_one()
         assert iface.levels == [{"level": 2, "metric": 10}]
+
+
+@pytest.mark.anyio
+async def test_refresh_dedups_duplicate_interface(adapter_client):
+    """s2-9: a duplicate (interface, af) in the export must not IntegrityError and roll back the
+    whole full-replace — deduped (first occurrence wins)."""
+    device_id = await seed_device(nso_device_name="isis-dup01", netbox_device_id=969)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_isis_interfaces.return_value = {
+            "process": [],
+            "interface": [
+                {"interface-name": "Gi0/1", "af": "ipv4", "metric": 10},
+                {"interface-name": "Gi0/1", "af": "ipv4", "metric": 20},  # duplicate identity
+            ],
+        }
+
+        await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
+
+        rows = (
+            (await db.execute(select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id)))
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+        assert rows[0].metric == 10  # first wins

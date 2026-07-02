@@ -80,11 +80,21 @@ async def _upsert_isis_data(
 
     now = datetime.now(UTC).replace(tzinfo=None)
 
+    # First-wins in-refresh dedup: a duplicate identity tuple in the export would otherwise
+    # IntegrityError on commit and roll back the whole full-replace (uq_deviceisisprocess_identity
+    # is device_id+process_tag; the interface constraint adds af).
+    seen_procs: set[str] = set()
+    seen_ifaces: set[tuple[str, str]] = set()
+
     for proc in processes:
+        proc_tag = proc.get("process-tag", "")
+        if proc_tag in seen_procs:
+            continue
+        seen_procs.add(proc_tag)
         db.add(
             DeviceIsisProcess(
                 device_id=device.id,
-                process_tag=proc.get("process-tag", ""),
+                process_tag=proc_tag,
                 net=proc.get("net"),
                 is_type=isis_level(proc.get("is-type")),
                 metric_style=proc.get("metric-style"),
@@ -110,6 +120,9 @@ async def _upsert_isis_data(
         af = iface.get("af", "")
         if not iface_name or not af:
             continue
+        if (iface_name, af) in seen_ifaces:
+            continue
+        seen_ifaces.add((iface_name, af))
         db.add(
             DeviceIsisInterface(
                 device_id=device.id,
