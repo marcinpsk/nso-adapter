@@ -14,6 +14,11 @@ from nso_adapter.config import get_config
 logger = structlog.get_logger(__name__)
 _scheduler: AsyncIOScheduler | None = None
 
+# Scope reconcile safety valve: never auto-offboard more than this fraction of the managed
+# fleet in a single tick. A partial/empty (but 200-OK) plugin response would otherwise mass-
+# delete devices — the root cause of a past silent device disappearance.
+_OFFBOARD_MAX_FRACTION = 0.5
+
 
 async def _scheduled_sync_all() -> None:
     """Sync every device that has at least one attribute in scope.
@@ -47,11 +52,35 @@ async def _scheduled_sync_all() -> None:
                 logger.error("scheduler.sync_error", device_id=device.id, error=repr(exc))
 
 
+async def _journal_offboard(nb_client, device) -> None:
+    """Best-effort: record an auto-offboard on the NetBox device's journal (audit trail).
+
+    Skips silently when the device is gone from NetBox (nothing to journal to). Never
+    blocks the offboard — a journaling error is logged and swallowed.
+    """
+    try:
+        if not await nb_client.device_exists(device.netbox_device_id):
+            return
+        await nb_client.create_journal_entry(
+            device.netbox_device_id,
+            comments=(
+                f"NSO adapter auto-offboarded this device (adapter id {device.id}, NSO name "
+                f"{device.nso_device_name}): it is no longer in the plugin's NSO-managed scope, "
+                f"so its adapter-side mirror and intent were removed. Re-enable NSO management "
+                f"on this device to re-onboard it."
+            ),
+            kind="warning",
+        )
+    except Exception as exc:  # noqa: BLE001 — journaling is best-effort, never block the offboard
+        logger.warning("scheduler.scope_reconcile.journal_failed", device_id=device.id, error=repr(exc))
+
+
 async def _scheduled_scope_reconcile() -> None:
     """Self-healing path: reconcile managed scope from the NetBox plugin model.
 
     Aborts on any error — never interpret a NetBox outage as "everything deleted".
-    On success, offboards devices present in the adapter but absent from the plugin.
+    On success, offboards devices present in the adapter but absent from the plugin —
+    guarded so a partial/empty (but non-error) plugin response can never mass-delete.
     """
     from sqlalchemy import select
 
@@ -76,12 +105,32 @@ async def _scheduled_scope_reconcile() -> None:
     plugin_by_nb_id = {r.netbox_device_id: r for r in plugin_records}
 
     async for db in get_session():
-        # Select ids only (not ORM rows): the per-device commit/rollback below would expire
-        # pre-loaded Device instances, and touching an expired attr later triggers a lazy
-        # load that fails in the async greenlet context. Re-fetch a fresh row per iteration.
-        device_ids = (await db.execute(select(Device.id).where(Device.netbox_device_id.is_not(None)))).scalars().all()
+        # (id, netbox_device_id) pairs — not ORM rows: the per-device commit/rollback below
+        # would expire pre-loaded Device instances, and touching an expired attr later triggers
+        # a lazy load that fails in the async greenlet context. Re-fetch a fresh row per iter.
+        rows = (
+            await db.execute(select(Device.id, Device.netbox_device_id).where(Device.netbox_device_id.is_not(None)))
+        ).all()
 
-        for device_id in device_ids:
+        # SAFETY: a partial/empty (but 200-OK, so not caught above) plugin response must NEVER
+        # trigger a mass offboard — that once silently deleted managed devices. fetch_all_scope
+        # now follows pagination, so this only fires on a genuinely broken/partial body. Suppress
+        # ALL offboards this tick when the plugin returned nothing, or when offboarding would
+        # remove more than half the managed fleet at once; a legit single/handful offboard still
+        # proceeds (intentional bulk removal stays available via the explicit devices API).
+        offboard_candidates = [nb_id for (_id, nb_id) in rows if nb_id not in plugin_by_nb_id]
+        suppress_offboard = bool(offboard_candidates) and (
+            not plugin_records or len(offboard_candidates) > len(rows) * _OFFBOARD_MAX_FRACTION
+        )
+        if suppress_offboard:
+            logger.warning(
+                "scheduler.scope_reconcile.offboard_suppressed",
+                candidate_count=len(offboard_candidates),
+                managed_total=len(rows),
+                plugin_count=len(plugin_records),
+            )
+
+        for device_id, _nb_id in rows:
             # Isolate + commit per device: set_scope/upsert_failover_ips document "caller
             # commits" (and get_session never commits on exit), so each device's scope +
             # primary/OOB IPs must be committed here or they're silently discarded. Per-device
@@ -93,6 +142,9 @@ async def _scheduled_scope_reconcile() -> None:
                     continue
                 plugin_rec = plugin_by_nb_id.get(device.netbox_device_id)
                 if plugin_rec is None:
+                    if suppress_offboard:
+                        continue  # keep the device — the plugin read looks under-complete
+                    await _journal_offboard(nb_client, device)
                     logger.warning(
                         "scheduler.scope_reconcile.offboarding",
                         device_id=device.id,

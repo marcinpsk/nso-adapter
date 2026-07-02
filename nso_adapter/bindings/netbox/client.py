@@ -67,6 +67,32 @@ class NetboxClient:
         resp = await self._client().post(url, json={"netbox_device_id": netbox_device_id})
         resp.raise_for_status()
 
+    async def device_exists(self, netbox_device_id: int) -> bool:
+        """Return whether the NetBox device still exists.
+
+        A 404 maps to ``False`` (device removed from NetBox), distinct from a transport
+        error, which still raises.
+        """
+        resp = await self._client().get(f"{self._base}/api/dcim/devices/{netbox_device_id}/")
+        if resp.status_code == 404:
+            return False
+        resp.raise_for_status()
+        return True
+
+    async def create_journal_entry(self, netbox_device_id: int, comments: str, kind: str = "info") -> None:
+        """POST a JournalEntry onto a NetBox device — an operator-visible audit trail."""
+        url = f"{self._base}/api/extras/journal-entries/"
+        resp = await self._client().post(
+            url,
+            json={
+                "assigned_object_type": "dcim.device",
+                "assigned_object_id": netbox_device_id,
+                "kind": kind,
+                "comments": comments,
+            },
+        )
+        resp.raise_for_status()
+
     async def get_interface(self, netbox_device_id: int, interface_name: str) -> dict | None:
         """Return a NetBox interface object or None."""
         url = f"{self._base}/api/dcim/interfaces/"

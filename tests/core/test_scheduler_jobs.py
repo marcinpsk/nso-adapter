@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from sqlalchemy import select
 
+from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.bindings.netbox.scope import PluginScopeRecord
 from nso_adapter.core import scheduler as sched
 from nso_adapter.nso.client import NsoClient
@@ -235,6 +236,66 @@ async def test_scope_reconcile_isolates_one_device_failure(adapter_client, monke
     # Must not raise, and must have ATTEMPTED both devices despite the first failing.
     await sched._scheduled_scope_reconcile()
     assert sorted(attempted) == [7200, 7201]
+
+
+@pytest.mark.anyio
+async def test_scope_reconcile_suppresses_offboard_on_empty_plugin(adapter_client, monkeypatch):
+    """A partial/empty plugin scope response must NOT mass-offboard. A truncated read once
+    silently deleted managed devices (rg03/Nokia) — the guard refuses to delete the whole
+    fleet when the plugin returns nothing (or > half would go)."""
+    await _seed_devices(("keep-a", 7301), ("keep-b", 7302))
+    offboard = AsyncMock()
+    monkeypatch.setattr("nso_adapter.core.importer.get_netbox_client", lambda: object())
+    monkeypatch.setattr("nso_adapter.bindings.netbox.scope.fetch_all_scope", AsyncMock(return_value=[]))
+    monkeypatch.setattr("nso_adapter.core.onboarding.offboard_device", offboard)
+
+    await sched._scheduled_scope_reconcile()
+
+    offboard.assert_not_awaited()  # both devices preserved despite absence from the empty response
+
+
+@pytest.mark.anyio
+async def test_scope_reconcile_journals_offboard_when_device_exists(adapter_client, monkeypatch):
+    """A legit single offboard writes an audit JournalEntry onto the NetBox device."""
+    await _seed_devices(("present", 7401), ("absent", 7402))
+    offboard = AsyncMock()
+    nb = AsyncMock(spec=NetboxClient)
+    nb.device_exists.return_value = True
+    monkeypatch.setattr("nso_adapter.core.importer.get_netbox_client", lambda: nb)
+    monkeypatch.setattr(
+        "nso_adapter.bindings.netbox.scope.fetch_all_scope",
+        AsyncMock(return_value=[PluginScopeRecord(netbox_device_id=7401, attributes=["description"])]),
+    )
+    monkeypatch.setattr("nso_adapter.core.onboarding.set_scope", AsyncMock())
+    monkeypatch.setattr("nso_adapter.core.onboarding.offboard_device", offboard)
+
+    await sched._scheduled_scope_reconcile()
+
+    offboard.assert_awaited_once()
+    nb.create_journal_entry.assert_awaited_once()
+    # journaled onto the device being offboarded (7402), not the one kept (7401)
+    assert nb.create_journal_entry.await_args.args[0] == 7402
+
+
+@pytest.mark.anyio
+async def test_scope_reconcile_skips_journal_when_device_removed_from_netbox(adapter_client, monkeypatch):
+    """If the device is gone from NetBox entirely, offboard silently — nothing to journal to."""
+    await _seed_devices(("present", 7501), ("gone", 7502))
+    offboard = AsyncMock()
+    nb = AsyncMock(spec=NetboxClient)
+    nb.device_exists.return_value = False
+    monkeypatch.setattr("nso_adapter.core.importer.get_netbox_client", lambda: nb)
+    monkeypatch.setattr(
+        "nso_adapter.bindings.netbox.scope.fetch_all_scope",
+        AsyncMock(return_value=[PluginScopeRecord(netbox_device_id=7501, attributes=["description"])]),
+    )
+    monkeypatch.setattr("nso_adapter.core.onboarding.set_scope", AsyncMock())
+    monkeypatch.setattr("nso_adapter.core.onboarding.offboard_device", offboard)
+
+    await sched._scheduled_scope_reconcile()
+
+    offboard.assert_awaited_once()
+    nb.create_journal_entry.assert_not_awaited()  # device gone → no journal
 
 
 async def test_start_scheduler_sets_safe_job_defaults(adapter_client, monkeypatch):

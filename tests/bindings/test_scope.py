@@ -59,6 +59,31 @@ async def test_fetch_all_scope_results_key():
 
 
 @pytest.mark.asyncio
+async def test_fetch_all_scope_follows_pagination():
+    """Follows DRF ``next`` across pages. A single-page read UNDER-reports the managed fleet,
+    and the scope reconcile offboards every adapter device absent from this list — so a
+    truncated read silently deletes every device beyond page 1 (the rg03/Nokia disappearance)."""
+    page1 = {
+        "count": 3,
+        "next": "http://netbox/api/plugins/nso/device-management/?limit=2&offset=2",
+        "results": [
+            {"device": 10, "managed_attributes": ["description"]},
+            {"device": 20, "managed_attributes": ["enabled"]},
+        ],
+    }
+    page2 = {"count": 3, "next": None, "results": [{"device": 30, "managed_attributes": ["description"]}]}
+    client = _make_nb_client()
+    http = AsyncMock()
+    http.get.side_effect = [_httpx_response(page1), _httpx_response(page2)]
+    client._client.return_value = http
+
+    records = await fetch_all_scope(client)
+
+    assert [r.netbox_device_id for r in records] == [10, 20, 30]
+    assert http.get.await_count == 2  # both pages fetched
+
+
+@pytest.mark.asyncio
 async def test_fetch_all_scope_bare_list():
     """Handles bare list response (no `results` key)."""
     data = [{"netbox_device_id": 42, "attributes": ["enabled"]}]
