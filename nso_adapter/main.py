@@ -72,8 +72,12 @@ async def _init_database(cfg) -> None:
     """Initialise the engine/sessionmaker and ensure the schema exists."""
     init_db(cfg.database_url)
     engine = get_engine()
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)  # pragma: no cover
+    # create_all only on the sqlite/test path. Production runs on PostgreSQL where the
+    # entrypoint has already applied `alembic upgrade head`; running create_all there is the
+    # documented DuplicateTable hazard (two schema sources materialising the schema).
+    if engine.dialect.name == "sqlite":
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
     logger.info("db.ready", url=cfg.database_url)
 
 
@@ -95,7 +99,11 @@ def _build_netbox_client(app: FastAPI, cfg, provider):
     from nso_adapter.bindings.netbox.client import NetboxClient
 
     netbox_token = provider.get(cfg.netbox.api_token_ref)
-    netbox_client = NetboxClient(url=cfg.netbox.base_url, token=netbox_token)
+    netbox_client = NetboxClient(
+        url=cfg.netbox.base_url,
+        token=netbox_token,
+        verify=cfg.netbox.ca_cert if cfg.netbox.ca_cert else True,
+    )
     app.state.netbox_client = netbox_client
     set_netbox_client(netbox_client)
     return netbox_client

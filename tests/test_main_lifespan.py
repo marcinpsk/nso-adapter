@@ -17,10 +17,12 @@ from types import SimpleNamespace
 import pytest
 
 from nso_adapter.main import (
+    _build_netbox_client,
     _build_nso_clients,
     _close_netbox,
     _dispatch_netconf_change,
     _dispose_engine,
+    _init_database,
     _make_sse_event_handler,
     _shutdown_sse,
     _start_sse_streams,
@@ -356,3 +358,52 @@ async def test_dispose_engine_disposes_real_engine(monkeypatch):
     monkeypatch.setattr("nso_adapter.main.get_engine", lambda: engine)
 
     await _dispose_engine()  # real engine, real dispose
+
+
+# --------------------------------------------------------------------------- #
+# _build_netbox_client — ca_cert wiring (s3-28) + _init_database gate (s3-25)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def clean_netbox_registry():
+    from nso_adapter.core import importer
+
+    snapshot = importer._netbox_client
+    yield
+    importer._netbox_client = snapshot
+
+
+def _netbox_cfg(ca_cert):
+    return SimpleNamespace(
+        netbox=SimpleNamespace(base_url="https://netbox.example", ca_cert=ca_cert, api_token_ref="TOK")
+    )
+
+
+def test_build_netbox_client_pins_ca_cert(clean_netbox_registry):
+    """s3-28: a configured NetboxConfig.ca_cert must be passed as the client's TLS verify
+    (a private-CA endpoint can be pinned) instead of being a silent no-op."""
+    app = SimpleNamespace(state=SimpleNamespace())
+    client = _build_netbox_client(app, _netbox_cfg("/etc/ssl/netbox-ca.pem"), _Provider())
+    assert client._verify == "/etc/ssl/netbox-ca.pem"
+
+
+def test_build_netbox_client_defaults_verify_true(clean_netbox_registry):
+    """No ca_cert configured → verify defaults to True (system trust store)."""
+    app = SimpleNamespace(state=SimpleNamespace())
+    client = _build_netbox_client(app, _netbox_cfg(None), _Provider())
+    assert client._verify is True
+
+
+async def test_init_database_skips_create_all_on_postgres(monkeypatch):
+    """s3-25: on PostgreSQL the entrypoint already ran `alembic upgrade head`, so the lifespan
+    must NOT run create_all (two schema sources → DuplicateTable). The fake engine has no
+    .begin(); reaching the create_all block would raise, so a clean return proves the gate."""
+    import nso_adapter.main as main_mod
+
+    fake_pg_engine = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+    monkeypatch.setattr(main_mod, "init_db", lambda url: None)
+    monkeypatch.setattr(main_mod, "get_engine", lambda: fake_pg_engine)
+
+    await _init_database(SimpleNamespace(database_url="postgresql+asyncpg://u:p@db/adapter"))
+    # no AttributeError on fake_pg_engine.begin → the create_all block was skipped

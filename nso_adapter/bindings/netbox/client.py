@@ -20,10 +20,13 @@ _BULK_TIMEOUT = 120.0
 
 
 class NetboxClient:
-    def __init__(self, url: str, token: str, timeout: float = 30.0) -> None:
+    def __init__(self, url: str, token: str, timeout: float = 30.0, verify: str | bool = True) -> None:
         self._base = url.rstrip("/")
         self._token = token
         self._timeout = timeout
+        # TLS verification: True (system CAs), False (skip), or a CA-bundle path so a
+        # private-CA NetBox endpoint can be pinned (mirrors the NSO/SSE clients).
+        self._verify = verify
         # Persistent pooled client (keep-alive). Built lazily so construction
         # stays sync; reused across all calls instead of one connection per call.
         self._http: httpx.AsyncClient | None = None
@@ -43,6 +46,7 @@ class NetboxClient:
                     "X-NSO-Adapter-Import": "1",
                 },
                 timeout=self._timeout,
+                verify=self._verify,
             )
         return self._http
 
