@@ -35,8 +35,6 @@ _PROC_SCALAR_KEYS = (
     "overload-on-startup",
     "overload-timeout",
     "te-enabled",
-    "sr-enabled",
-    "sr-node-msd",
     "distance",
     "maximum-paths",
     "reference-bandwidth",

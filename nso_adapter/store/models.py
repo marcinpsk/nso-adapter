@@ -1167,8 +1167,9 @@ class DeviceIsisProcess(Base):
     overload_on_startup: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     overload_timeout: Mapped[int | None] = mapped_column(Integer, nullable=True)
     te_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    sr_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    sr_node_msd: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # NB: segment-routing state lives in the `segment_routing` JSON bag (the plugin
+    # reconciles it into the ISISSegmentRouting child); the old top-level sr_enabled/
+    # sr_node_msd scalars were stale read-surface and were dropped (s3-21).
     distance: Mapped[int | None] = mapped_column(Integer, nullable=True)
     maximum_paths: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reference_bandwidth: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

@@ -59,8 +59,6 @@ _PROCESS_OPTIONAL_FIELDS = (
     "overload_on_startup",
     "overload_timeout",
     "te_enabled",
-    "sr_enabled",
-    "sr_node_msd",
     "distance",
     "maximum_paths",
     "reference_bandwidth",

@@ -176,7 +176,6 @@ async def test_refresh_persists_p1_scalars_and_settings(adapter_client):
                     "spf-initial-wait": 1000,
                     "spf-max-wait": 10000,
                     "te-enabled": True,
-                    "sr-enabled": True,
                     "setting": [
                         {"key": "spf_second_wait", "value": "1000"},
                         {"key": "lsp_second_wait", "value": "1000"},
@@ -206,7 +205,6 @@ async def test_refresh_persists_p1_scalars_and_settings(adapter_client):
         assert proc.spf_initial_wait == 1000
         assert proc.spf_max_wait == 10000
         assert proc.te_enabled is True
-        assert proc.sr_enabled is True
         assert proc.settings == {"spf_second_wait": "1000", "lsp_second_wait": "1000"}
 
         iface = (
