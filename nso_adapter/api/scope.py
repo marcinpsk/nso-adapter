@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
@@ -18,7 +18,7 @@ router = APIRouter(prefix="/api/v1/devices", tags=["scope"])
 
 
 def _scope_out(device_id: int, attrs: list[ManagedScope], settings: DeviceSettings | None) -> dict:
-    updated_at = max((s.updated_at for s in attrs), default=datetime.utcnow())
+    updated_at = max((s.updated_at for s in attrs), default=datetime.now(UTC).replace(tzinfo=None))
     return {
         "device_id": device_id,
         "attributes": [s.attribute for s in attrs],

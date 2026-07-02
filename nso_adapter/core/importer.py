@@ -11,7 +11,7 @@ Sync flow (docs/nso-adapter.md §7):
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import NamedTuple
 
 import structlog
@@ -39,6 +39,11 @@ logger = structlog.get_logger(__name__)
 
 _nso_clients: dict[str, NsoClient] = {}
 _netbox_client = None  # set at startup via set_netbox_client
+
+
+def _utcnow() -> datetime:
+    """Naive-UTC now — the timestamp columns are timezone-naive (datetime.utcnow() is deprecated)."""
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def _attrs_to_interface_list(data: dict | None) -> list[Interface]:
@@ -216,7 +221,7 @@ async def _resolve_ned_id(db: AsyncSession, device: Device, client: NsoClient) -
     device.ned_id = await client.get_device_ned_id(device.nso_device_name)
     if not device.ned_id:
         device.mapping_status = MappingStatus.unmatched_device
-        device.last_sync_at = datetime.utcnow()
+        device.last_sync_at = _utcnow()
         device.last_sync_status = LastSyncStatus.failed
         await db.commit()
         raise ValueError(f"NSO device {device.nso_device_name!r} not found or has no NED ID")
@@ -304,7 +309,7 @@ def _reconcile_attr(db, db_iface, attr, iface, intent_by_attr, existing_attrs, c
     else:
         # Phase 1: "imported" when values match (netbox_value lags one flush — self-heals).
         attr_state.sync_state = SyncState.imported if attr_state.netbox_value == nso_str else status
-    attr_state.last_checked_at = datetime.utcnow()
+    attr_state.last_checked_at = _utcnow()
     return changed
 
 
@@ -381,7 +386,7 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
     # last_sync_status until after the fan-out so a silently-failed surface read cannot
     # hide under a premature 'succeeded'.
     device.mapping_status = MappingStatus.mapped if interfaces else MappingStatus.unmatched_interfaces
-    device.last_sync_at = datetime.utcnow()
+    device.last_sync_at = _utcnow()
     await db.commit()
 
     # Fan out to the routing/extra surfaces so one sync refreshes everything the device
@@ -488,9 +493,9 @@ async def detect_drift(device_id: int, db: AsyncSession) -> dict:
                 changes_detected += 1
             attr_state.nso_value = nso_str
             attr_state.sync_state = status
-            attr_state.last_checked_at = datetime.utcnow()
+            attr_state.last_checked_at = _utcnow()
 
-    device.last_sync_at = datetime.utcnow()
+    device.last_sync_at = _utcnow()
     await db.commit()
 
     # Refresh the netbox-nso-plugin display cache so Detect Drift results are
