@@ -295,6 +295,7 @@ async def apply_combined(
     modules: dict[str, list[dict]],
     *,
     dry_run: bool = False,
+    strict: bool = False,
 ) -> str | None:
     """Stage several reconciler-service bodies into ONE ``/restconf/data`` PATCH.
 
@@ -306,14 +307,16 @@ async def apply_combined(
 
     ``dry_run=True`` returns the native device delta the combined commit would push (no
     commit). Otherwise commits, runs the post-apply verify guard, and returns None.
-    Raises NsoApplyError on a non-2xx commit.
+    Raises NsoApplyError on a non-2xx commit. ``strict`` (dry-run only) makes a conclusive
+    4xx dry-run rejection raise instead of returning None — used by atomic-failure
+    localisation to tell a real NED rejection apart from a transient/inconclusive blip.
     """
     body = {root: bodies for root, bodies in modules.items() if bodies}
     payload = json.dumps(body)
     url = f"{client._base}{_DATA_PATH}"
 
     if dry_run:
-        return await native_dry_run(client, url, payload, device_name, method="patch")
+        return await native_dry_run(client, url, payload, device_name, method="patch", strict=strict)
 
     async with client._client(timeout=client._action_timeout) as c:
         resp = await c.patch(_commit_url(url), content=payload, headers={"Content-Type": "application/yang-data+json"})

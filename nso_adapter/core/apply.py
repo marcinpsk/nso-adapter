@@ -151,6 +151,8 @@ async def _diff_interface_ips(db, nso_apply, client, device_name: str, ifaces: d
     )
     by_iface: dict[int, list] = {}
     for r in ip_rows:
+        if r.accepted_at is None:
+            continue  # gate on accepted_at, like the attribute preview and real apply eligibility
         by_iface.setdefault(r.interface_id, []).append(r)
     ip_delta = ""
     for iface_id, rows in by_iface.items():
@@ -638,7 +640,7 @@ def _build_interface_config_entries(attr_eligible, ip_by_iface, ifaces, device_n
     Both ride the same ``(device, interface-name)``-keyed interface-reconciler instance, so in
     a single atomic edit they MUST be one list item — two items with a duplicate key conflict.
     """
-    from nso_adapter.nso.apply import build_interface_ip_entry
+    from nso_adapter.nso.apply import _coerce_enabled_intent, build_interface_ip_entry
 
     by_name: dict[str, dict] = {}
 
@@ -650,8 +652,9 @@ def _build_interface_config_entries(attr_eligible, ip_by_iface, ifaces, device_n
         if intent_row.attribute == "description":
             entry["description"] = intent_row.intent_value if intent_row.intent_value is not None else ""
         elif intent_row.attribute == "enabled":
-            val = intent_row.intent_value
-            entry["enabled"] = val is True or str(val).strip().lower() == "true"
+            # Shared strict coercion (raises on garbage) — same as the per-scope path, so a
+            # corrupt value never silently disables the interface in the atomic body either.
+            entry["enabled"] = _coerce_enabled_intent(intent_row.intent_value)
 
     for iface_id, rows in ip_by_iface.items():
         iface = ifaces[iface_id]
@@ -703,16 +706,20 @@ async def _localize_atomic_failure(client, device_name, modules, device_err) -> 
     whether it is a real device rejection before recording capability.
     """
     from nso_adapter.core.capability import parse_rejected_construct
-    from nso_adapter.nso.apply import apply_combined
+    from nso_adapter.nso.apply import NsoApplyError, apply_combined
 
     offenders: set[str] = set()
     for root_key, bodies in modules.items():
         try:
-            delta = await apply_combined(client, device_name, {root_key: bodies}, dry_run=True)
-        except Exception:  # noqa: BLE001 — a raising dry-run is itself an offender signal
-            delta = None
-        if delta is None:
+            # strict=True: only a CONCLUSIVE 4xx rejection in isolation flags this scope as an
+            # offender. A transient/transport error (or 5xx) returns None / raises a non-NsoApplyError
+            # — inconclusive, NOT an offender, so it never brands the scope a false 'unsupported'
+            # that a later probe can't downgrade.
+            await apply_combined(client, device_name, {root_key: bodies}, dry_run=True, strict=True)
+        except NsoApplyError:
             offenders.add(root_key)
+        except Exception:  # noqa: BLE001 — transient/transport during localisation → inconclusive
+            logger.debug("apply.localize.inconclusive", device=device_name, root_key=root_key)
 
     rp = parse_rejected_construct(device_err or "")
     if rp[1] and _RP_ROOT in modules:
@@ -739,11 +746,18 @@ _ATOMIC_SCOPE_ROOTS: dict[str, str] = {
 }
 
 
-def _capability_scope_for(root_key: str) -> str | None:
-    """Capability-matrix scope name for a staged module root-key (None if not tracked)."""
+def _capability_scopes_for(root_key: str) -> list[str]:
+    """Capability-matrix scope name(s) for a staged module root-key ([] if not tracked).
+
+    The merged interface-config module carries BOTH the interface_attribute and interface_ip
+    scopes (collect_apply_diff / preflight treat them separately), so a rejection of it must
+    record capability under both — else a preflight for interface_attribute sees a false
+    'fully supported'.
+    """
     if root_key == _IFACE_CONFIG_ROOT:
-        return "interface_ip"
-    return _ATOMIC_SCOPE_ROOTS.get(root_key)
+        return ["interface_attribute", "interface_ip"]
+    scope = _ATOMIC_SCOPE_ROOTS.get(root_key)
+    return [scope] if scope else []
 
 
 async def _record_atomic_capability(db, client, device, device_name, offenders, exc, rp, device_err) -> None:
@@ -773,8 +787,7 @@ async def _record_atomic_capability(db, client, device, device_name, offenders, 
         if root_key == _RP_ROOT and rp_name:
             await record_capability_rejection(db, ned_id, sw, rp_scope, rp_name, detail)
             continue
-        scope = _capability_scope_for(root_key)
-        if scope:
+        for scope in _capability_scopes_for(root_key):
             await record_capability_rejection(db, ned_id, sw, scope, scope, detail)
 
 
@@ -955,7 +968,16 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
         attr_state.sync_state = SyncState.deploying
     await db.commit()
 
-    modules, iface_entries, scope_rows = await _stage_atomic_modules(elig, client, device, device_name)
+    try:
+        modules, iface_entries, scope_rows = await _stage_atomic_modules(elig, client, device, device_name)
+    except Exception:
+        # A body-builder raised while building the combined body (before any commit). Revert
+        # the attrs we just marked 'deploying' so they aren't stuck forever, then re-raise so
+        # run_apply fails the job with the real error.
+        for attr_state, _ir, _if in attr_eligible:
+            attr_state.sync_state = snapshot[attr_state]
+        await db.commit()
+        raise
 
     commit_error: NsoApplyError | None = None
     try:
@@ -1437,6 +1459,13 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
             await _execute_apply(db, job, job_id, device_id, force)
         except Exception as exc:
             logger.exception("apply.unexpected_error", job_id=job_id, device_id=device_id)
-            job.status = JobStatus.failed
-            job.error = {"code": "internal", "message": repr(exc), "detail": {}}
-            await db.commit()
+            # Roll back first: if the failure came from a DB error the session is in a
+            # needs-rollback state and the failed-status commit below would itself throw,
+            # leaving the job stuck 'running' and masking the real error. Re-fetch the job
+            # after rollback (it may have been expired) so the status change persists.
+            await db.rollback()
+            job = await db.get(Job, job_id)
+            if job is not None:
+                job.status = JobStatus.failed
+                job.error = {"code": "internal", "message": repr(exc), "detail": {}}
+                await db.commit()

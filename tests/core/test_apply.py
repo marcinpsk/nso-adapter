@@ -1601,11 +1601,13 @@ async def test_run_apply_atomic_failure_records_scope_capability(adapter_client,
         break
     job_id = await _seed_apply_job(device_id)
 
-    async def _combined(client, device_name, modules, *, dry_run=False):
+    async def _combined(client, device_name, modules, *, dry_run=False, strict=False):
         if not dry_run:
             raise NsoApplyError("nso_patch_failed", "static route rejected by NED")
-        # per-scope dry-run localisation: only static-route fails to compile
-        return None if "static-route-reconciler:static-route-config" in modules else "delta"
+        # per-scope dry-run localisation (strict): only static-route conclusively rejects
+        if "static-route-reconciler:static-route-config" in modules:
+            raise NsoApplyError("dry_run_rejected", "static route cannot compile on this NED")
+        return "delta"
 
     mock_client = AsyncMock()
     with ExitStack() as stack:
@@ -1667,7 +1669,7 @@ async def test_run_apply_atomic_misconfig_device_rejection_records_no_capability
 
     device_err = "RPC error towards sw01: Policy error: PL-X prefix-list referenced (in term 10) but not defined"
 
-    async def _combined(client, device_name, modules, *, dry_run=False):
+    async def _combined(client, device_name, modules, *, dry_run=False, strict=False):
         if not dry_run:
             raise NsoApplyError(
                 "nso_patch_failed",
@@ -1701,7 +1703,7 @@ async def test_run_apply_atomic_transient_failure_records_no_capability(adapter_
     await _seed_route_map_intent(device_id, "juniper-junos-nc-4.19:junos")
     job_id = await _seed_apply_job(device_id)
 
-    async def _combined(client, device_name, modules, *, dry_run=False):
+    async def _combined(client, device_name, modules, *, dry_run=False, strict=False):
         if not dry_run:
             raise NsoApplyError("internal", "connection timed out")  # transport — no nso_error
         return "rendered-delta"
@@ -1716,6 +1718,132 @@ async def test_run_apply_atomic_transient_failure_records_no_capability(adapter_
         assert (await db.execute(select(DeviceCapability))).scalars().all() == []  # nothing recorded
         assert (await db.get(Job, job_id)).status == JobStatus.failed
         break
+
+
+@pytest.mark.asyncio
+async def test_run_apply_atomic_transient_during_localize_records_no_capability(adapter_client, monkeypatch):
+    """A transient transport error DURING per-scope localisation must NOT brand the scope
+    'unsupported' — only a conclusive rejection is a capability signal (finding #10)."""
+    from nso_adapter.nso.apply import NsoApplyError
+    from nso_adapter.store.models import Device, DeviceCapability
+
+    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+    device_id = await _seed_device(name="sw01")
+    await _seed_snmp_and_static_route(device_id)
+    async for db in get_session():
+        dev = await db.get(Device, device_id)
+        dev.ned_id, dev.sw_version = "cisco-ios-cli:cisco-ios", "15.7"
+        await db.commit()
+        break
+    job_id = await _seed_apply_job(device_id)
+
+    device_err = "RPC error: something rejected"
+
+    async def _combined(client, device_name, modules, *, dry_run=False, strict=False):
+        if not dry_run:
+            raise NsoApplyError(
+                "nso_patch_failed",
+                "rejected",
+                detail={"nso_error": {"ietf-restconf:errors": {"error": [{"error-message": device_err}]}}},
+            )
+        raise ConnectionError("transient blip during localisation")  # transport, not a conclusive reject
+
+    mock_client = AsyncMock()
+    with ExitStack() as stack:
+        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
+        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        assert (await db.execute(select(DeviceCapability))).scalars().all() == []  # no false 'unsupported'
+        assert (await db.get(Job, job_id)).status == JobStatus.failed
+        break
+
+
+@pytest.mark.asyncio
+async def test_run_apply_marks_failed_even_when_session_poisoned(adapter_client, monkeypatch):
+    """run_apply's failure handler must rollback the poisoned session before committing the
+    failed-status, or the status commit itself throws and the job is stuck 'running' (#11)."""
+    device_id = await _seed_device(name="rtr-poison")
+    job_id = await _seed_apply_job(device_id)
+
+    async def _poison(db, job, job_id, device_id, force):
+        # A real DB error (duplicate PK) puts the AsyncSession into a needs-rollback state,
+        # exactly like a failed flush mid-apply; the failure handler must rollback first.
+        db.add(Job(id=job_id, job_type=JobType.apply, device_id=device_id, status=JobStatus.queued))
+        await db.flush()  # IntegrityError → session poisoned; propagates to run_apply's handler
+
+    with patch("nso_adapter.core.apply._execute_apply", _poison):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        assert (await db.get(Job, job_id)).status == JobStatus.failed
+        break
+
+
+@pytest.mark.asyncio
+async def test_run_apply_atomic_staging_failure_reverts_deploying(adapter_client, monkeypatch):
+    """If a body-builder raises during staging (e.g. a malformed IP address), the attr states
+    just marked 'deploying' must be reverted, not left stuck deploying forever (#12)."""
+    from nso_adapter.store.models import InterfaceAttrState
+
+    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+    device_id = await _seed_device(name="sw01")
+    iface_id, attr_id = await _seed_interface_with_intent(
+        device_id, "Gi0/0", "description", "uplink", SyncState.accepted
+    )
+    await _seed_ip_intent(iface_id, address="10.0.0.1", accepted=True)  # malformed: no /prefix → build raises
+    job_id = await _seed_apply_job(device_id)
+
+    mock_client = AsyncMock()
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        assert (await db.get(Job, job_id)).status == JobStatus.failed
+        attr_state = await db.get(InterfaceAttrState, attr_id)
+        assert attr_state.sync_state != SyncState.deploying  # reverted, not stuck deploying
+        assert attr_state.sync_state == SyncState.accepted
+        break
+
+
+def test_capability_scopes_for_interface_config_covers_attribute_and_ip():
+    """The merged interface-config module carries BOTH the attribute and IP scopes, so a
+    rejection must record capability under both (else a preflight for interface_attribute
+    sees a false 'fully supported') (#17)."""
+    from nso_adapter.core.apply import _IFACE_CONFIG_ROOT, _capability_scopes_for
+
+    assert _capability_scopes_for(_IFACE_CONFIG_ROOT) == ["interface_attribute", "interface_ip"]
+    assert _capability_scopes_for("snmp-reconciler:snmp-config") == ["snmp"]
+    assert _capability_scopes_for("no-such-root") == []
+
+
+@pytest.mark.asyncio
+async def test_diff_interface_ips_preview_excludes_unaccepted(adapter_client):
+    """The Apply-diff IP preview must gate on accepted_at like the attribute preview and the
+    real apply eligibility — an un-accepted IP intent must not appear in the preview (#19)."""
+    from types import SimpleNamespace
+
+    from nso_adapter.core.apply import _diff_interface_ips
+
+    device_id = await _seed_device("rtr-diff", 301)
+    iface_id = await _seed_iface(device_id, "Gi0/1")
+    await _seed_ip_intent(iface_id, address="10.0.0.1/24", accepted=True)
+    await _seed_ip_intent(iface_id, address="10.0.0.2/24", accepted=False)
+
+    seen_rows: list = []
+
+    async def _apply_ips(*, client, device_name, interface_name, ip_intent_rows, **kw):
+        seen_rows.extend(ip_intent_rows)
+        return ""
+
+    nso_apply = SimpleNamespace(apply_interface_ips=_apply_ips)
+    async for db in get_session():
+        iface = await db.get(DbInterface, iface_id)
+        await _diff_interface_ips(db, nso_apply, object(), "rtr-diff", {iface_id: iface})
+        break
+
+    assert {r.address for r in seen_rows} == {"10.0.0.1/24"}  # un-accepted 10.0.0.2/24 excluded
 
 
 @pytest.mark.asyncio
