@@ -121,7 +121,7 @@ async def refresh_routing_surfaces_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "sync",
-) -> None:
+) -> list[str]:
     """Best-effort fan-out: refresh every enabled routing/extra surface for one device.
 
     A device "sync" historically only refreshed interface attributes; the routing
@@ -130,6 +130,11 @@ async def refresh_routing_surfaces_for_device(
     runs each enabled surface's existing per-device refresh on demand, gated by the same
     scheduler enable flags. Every surface is isolated — one failing (or a NED that does
     not serve it) must not abort the others or the sync. The caller commits.
+
+    Returns the names of surfaces that FAILED to refresh — either the refresher raised,
+    or it signalled a swallowed NSO read failure with ``return False`` (its last-known
+    rows are now stale). The caller records these so the device reports ``partial``
+    rather than a misleading ``succeeded``.
     """
     cfg = get_config().scheduler
 
@@ -171,9 +176,12 @@ async def refresh_routing_surfaces_for_device(
 
         surfaces.append(("bfd", refresh_bfd_interfaces_for_device))
 
+    failed: list[str] = []
     for name, fn in surfaces:
         try:
-            await fn(db, device, nso_client, refresh_source=refresh_source)
+            ok = await fn(db, device, nso_client, refresh_source=refresh_source)
+            if ok is False:
+                failed.append(name)
         except Exception as exc:
             logger.warning(
                 "sync.surface_refresh_failed",
@@ -181,6 +189,8 @@ async def refresh_routing_surfaces_for_device(
                 surface=name,
                 error=repr(exc),
             )
+            failed.append(name)
+    return failed
 
 
 class _WriteCtx(NamedTuple):
@@ -365,16 +375,28 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
     # Phase 2 flush: push queued attribute updates, batched + isolated.
     interfaces_written = await _flush_netbox_patches(nb_client, ctx.attr_patches, ctx.pending_by_id)
 
-    # Update device sync state
+    # The interface sync itself is done; its mapping + timestamp are accurate regardless
+    # of what the routing surfaces do next. Commit that work now, but defer the final
+    # last_sync_status until after the fan-out so a silently-failed surface read cannot
+    # hide under a premature 'succeeded'.
     device.mapping_status = MappingStatus.mapped if interfaces else MappingStatus.unmatched_interfaces
     device.last_sync_at = datetime.utcnow()
-    device.last_sync_status = LastSyncStatus.succeeded
     await db.commit()
 
     # Fan out to the routing/extra surfaces so one sync refreshes everything the device
     # exposes (IS-IS/BGP/OSPF/route-policy/...), not just interface attributes. Done
     # before the plugin notify so its reconcile sees the fresh surface state in one pass.
-    await refresh_routing_surfaces_for_device(db, device, client, refresh_source="sync")
+    degraded = await refresh_routing_surfaces_for_device(db, device, client, refresh_source="sync")
+
+    # Record the outcome only AFTER the fan-out. A surface whose NSO read failed leaves a
+    # stale mirror, so the device reports 'partial' (naming the offending surfaces) rather
+    # than a misleading 'succeeded'; a clean sync clears any prior degraded marker.
+    if degraded:
+        device.last_sync_status = LastSyncStatus.partial
+        device.degraded_surfaces = sorted(degraded)
+    else:
+        device.last_sync_status = LastSyncStatus.succeeded
+        device.degraded_surfaces = None
     await db.commit()
 
     # Notify the netbox-nso-plugin so it refreshes its NSO*State display cache off

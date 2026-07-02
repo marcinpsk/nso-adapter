@@ -80,20 +80,24 @@ async def refresh_redistribution_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "poll",
-) -> None:
+) -> bool:
     """Read OSPF/ISIS/BGP oper-data for *device* and upsert redistribution rows.
 
     Performs a full-replace: deletes all existing DeviceRedistribution rows for the
     device, then re-inserts from fresh oper-data.  Three NSO requests are made —
     get_ospf, get_isis_interfaces, get_bgp_config.  Individual failures are logged
     and skipped; the remaining protocols still get upserted.
+
+    Returns True when all three source reads succeeded; False when any of them failed
+    (the surface is degraded — the upserted rows are missing that protocol's data).
     """
     if not device.nso_device_name:
         logger.debug("redistribution.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
-        return
+        return True
 
     now = datetime.now(UTC).replace(tzinfo=None)
     rows: list[DeviceRedistribution] = []
+    ok = True
 
     # ── OSPF ─────────────────────────────────────────────────────────────────
     try:
@@ -103,6 +107,7 @@ async def refresh_redistribution_for_device(
             rows.extend(_build_rows(device.id, "ospf", dest_ref, inst.get("redistribute", []), now, refresh_source))
     except Exception as exc:
         logger.warning("redistribution.refresh.ospf_error", device_id=device.id, error=repr(exc))
+        ok = False
 
     # ── ISIS ─────────────────────────────────────────────────────────────────
     try:
@@ -112,6 +117,7 @@ async def refresh_redistribution_for_device(
             rows.extend(_build_rows(device.id, "isis", dest_ref, proc.get("redistribute", []), now, refresh_source))
     except Exception as exc:
         logger.warning("redistribution.refresh.isis_error", device_id=device.id, error=repr(exc))
+        ok = False
 
     # ── BGP ──────────────────────────────────────────────────────────────────
     try:
@@ -128,6 +134,7 @@ async def refresh_redistribution_for_device(
                     )
     except Exception as exc:
         logger.warning("redistribution.refresh.bgp_error", device_id=device.id, error=repr(exc))
+        ok = False
 
     # ── Upsert ───────────────────────────────────────────────────────────────
     await db.execute(delete(DeviceRedistribution).where(DeviceRedistribution.device_id == device.id))
@@ -142,3 +149,4 @@ async def refresh_redistribution_for_device(
         row_count=len(rows),
         refresh_source=refresh_source,
     )
+    return ok

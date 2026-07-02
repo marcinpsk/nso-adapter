@@ -140,17 +140,21 @@ async def refresh_isis_interfaces_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "poll",
-) -> None:
-    """Read IS-IS oper-data for *device* from NSO and upsert DB rows."""
+) -> bool:
+    """Read IS-IS oper-data for *device* from NSO and upsert DB rows.
+
+    Returns True when the read succeeded (or there was nothing to read); False when the
+    NSO read failed and the last-known rows were left untouched (a degraded surface).
+    """
     if not device.nso_device_name:
         logger.debug("isis.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
-        return
+        return True
 
     try:
         entry = await nso_client.get_isis_interfaces(device.nso_device_name)
     except Exception as exc:
         logger.warning("isis.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return
+        return False
 
     processes = entry.get("process", []) if entry else []
     interfaces = entry.get("interface", []) if entry else []
@@ -163,6 +167,7 @@ async def refresh_isis_interfaces_for_device(
         interface_count=len(interfaces),
         refresh_source=refresh_source,
     )
+    return True
 
 
 async def handle_isis_interface_change(

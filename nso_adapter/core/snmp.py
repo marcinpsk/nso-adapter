@@ -95,21 +95,25 @@ async def refresh_snmp_config_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "poll",
-) -> None:
-    """Read SNMP oper-data for *device* from NSO and upsert DB rows."""
+) -> bool:
+    """Read SNMP oper-data for *device* from NSO and upsert DB rows.
+
+    Returns True on a successful read (or nothing to read); False when the NSO read
+    failed and the last-known rows were left untouched (a degraded surface).
+    """
     if not device.nso_device_name:
         logger.debug("snmp.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
-        return
+        return True
 
     try:
         entry = await nso_client.get_snmp_config(device.nso_device_name)
     except Exception as exc:
         logger.warning("snmp.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return
+        return False
 
     if not entry:
         logger.debug("snmp.refresh.no_data", device_id=device.id)
-        return
+        return True
 
     await _upsert_snmp_config(db, device, entry, refresh_source)
     logger.info(
@@ -121,6 +125,7 @@ async def refresh_snmp_config_for_device(
         hosts=len(entry.get("host", [])),
         source=refresh_source,
     )
+    return True
 
 
 async def handle_snmp_config_change(

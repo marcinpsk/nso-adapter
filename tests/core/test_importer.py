@@ -456,6 +456,7 @@ async def test_sync_device_fans_out_to_routing_surfaces(db_session: AsyncSession
         patch(
             "nso_adapter.core.importer.refresh_routing_surfaces_for_device",
             new_callable=AsyncMock,
+            return_value=[],
         ) as fanout,
     ):
         await sync_device(device.id, db_session)
@@ -492,6 +493,132 @@ async def test_refresh_routing_surfaces_isolates_failures(db_session: AsyncSessi
     # every surface was attempted, including the one that raised
     for m in targets.values():
         m.assert_awaited_once()
+
+
+async def test_surface_refresher_returns_false_on_read_error(db_session: AsyncSession):
+    """A surface refresher must SIGNAL a swallowed NSO read failure (return False), so the
+    fan-out can mark the device partial instead of hiding a stale mirror under 'succeeded'."""
+    from nso_adapter.core.bgp import refresh_bgp_config_for_device
+
+    device = Device(nso_instance="nso-dev", nso_device_name="sw01", ned_id="x", netbox_device_id=1)
+    db_session.add(device)
+    await db_session.commit()
+
+    client = AsyncMock(spec=NsoClient)
+    client.get_bgp_config = AsyncMock(side_effect=RuntimeError("nso down"))
+    ok = await refresh_bgp_config_for_device(db_session, device, client, refresh_source="sync")
+    assert ok is False
+
+
+async def test_surface_refresher_returns_true_on_success(db_session: AsyncSession):
+    """A clean read returns True (not degraded), even with no config present."""
+    from nso_adapter.core.bgp import refresh_bgp_config_for_device
+
+    device = Device(nso_instance="nso-dev", nso_device_name="sw01", ned_id="x", netbox_device_id=1)
+    db_session.add(device)
+    await db_session.commit()
+
+    client = AsyncMock(spec=NsoClient)
+    client.get_bgp_config = AsyncMock(return_value={"router": []})
+    ok = await refresh_bgp_config_for_device(db_session, device, client, refresh_source="sync")
+    assert ok is True
+
+
+async def test_refresh_routing_surfaces_returns_failed_surfaces(db_session: AsyncSession):
+    """The fan-out returns the names of surfaces that failed — whether they RAISED or
+    signalled a read failure with return False — so the caller can record them."""
+    from nso_adapter.core.importer import refresh_routing_surfaces_for_device
+
+    device = Device(nso_instance="nso-dev", nso_device_name="sw01", ned_id="x", netbox_device_id=1)
+    db_session.add(device)
+    await db_session.commit()
+
+    targets = {
+        "nso_adapter.core.static_route.refresh_static_routes_for_device": AsyncMock(return_value=True),
+        "nso_adapter.core.isis.refresh_isis_interfaces_for_device": AsyncMock(side_effect=RuntimeError("boom")),
+        "nso_adapter.core.bgp.refresh_bgp_config_for_device": AsyncMock(return_value=False),  # signalled failure
+        "nso_adapter.core.ospf.refresh_ospf_for_device": AsyncMock(return_value=True),
+        "nso_adapter.core.redistribution.refresh_redistribution_for_device": AsyncMock(return_value=True),
+        "nso_adapter.core.route_policy.refresh_route_policy_for_device": AsyncMock(return_value=True),
+        "nso_adapter.core.snmp.refresh_snmp_config_for_device": AsyncMock(return_value=True),
+        "nso_adapter.core.logging_config.refresh_logging_config_for_device": AsyncMock(return_value=True),
+        "nso_adapter.core.bfd.refresh_bfd_interfaces_for_device": AsyncMock(return_value=True),
+    }
+    with contextlib.ExitStack() as stack:
+        for path, m in targets.items():
+            stack.enter_context(patch(path, m))
+        failed = await refresh_routing_surfaces_for_device(db_session, device, AsyncMock(), refresh_source="sync")
+
+    # isis raised, bgp returned False → both reported; the True ones are not.
+    assert sorted(failed) == ["bgp", "isis"]
+
+
+async def test_sync_device_marks_partial_when_a_surface_fails(db_session: AsyncSession):
+    """sync_device records last_sync_status=partial + degraded_surfaces when the fan-out
+    reports failures — the interface sync succeeded but some routing surfaces are stale."""
+    from nso_adapter.store.models import LastSyncStatus
+
+    device = Device(nso_instance="nso-dev", nso_device_name="sw01", ned_id="cisco-ios-cli-6.95", netbox_device_id=1)
+    db_session.add(device)
+    db_session.add(ManagedScope(device=device, attribute="description"))
+    await db_session.commit()
+
+    nso_client = _make_nso_client({"device-name": "sw01", "interface": []})
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = nso_client
+    imp._netbox_client = None
+
+    with (
+        patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock),
+        patch(
+            "nso_adapter.core.importer.refresh_routing_surfaces_for_device",
+            new_callable=AsyncMock,
+            return_value=["bgp", "ospf"],
+        ),
+    ):
+        await sync_device(device.id, db_session)
+
+    await db_session.refresh(device)
+    assert device.last_sync_status == LastSyncStatus.partial
+    assert sorted(device.degraded_surfaces) == ["bgp", "ospf"]
+
+
+async def test_sync_device_succeeded_clears_degraded_surfaces(db_session: AsyncSession):
+    """When every surface refreshes cleanly the device is 'succeeded' and any prior
+    degraded_surfaces marker is cleared (not left stale from an earlier partial sync)."""
+    from nso_adapter.store.models import LastSyncStatus
+
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="sw01",
+        ned_id="cisco-ios-cli-6.95",
+        netbox_device_id=1,
+        degraded_surfaces=["bgp"],  # left over from a previous partial sync
+    )
+    db_session.add(device)
+    db_session.add(ManagedScope(device=device, attribute="description"))
+    await db_session.commit()
+
+    nso_client = _make_nso_client({"device-name": "sw01", "interface": []})
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = nso_client
+    imp._netbox_client = None
+
+    with (
+        patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock),
+        patch(
+            "nso_adapter.core.importer.refresh_routing_surfaces_for_device",
+            new_callable=AsyncMock,
+            return_value=[],
+        ),
+    ):
+        await sync_device(device.id, db_session)
+
+    await db_session.refresh(device)
+    assert device.last_sync_status == LastSyncStatus.succeeded
+    assert device.degraded_surfaces is None
 
 
 async def test_refresh_routing_surfaces_skips_all_when_disabled(db_session: AsyncSession, monkeypatch):

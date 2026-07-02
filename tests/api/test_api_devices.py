@@ -51,6 +51,27 @@ async def test_get_device_failover_null_when_unmanaged(adapter_client):
     assert resp.json()["failover"] is None
 
 
+async def test_get_device_exposes_partial_sync_and_degraded_surfaces(adapter_client):
+    """A partial sync surfaces last_sync_status='partial' + degraded_surfaces so the
+    plugin can warn that some routing surfaces are stale (finding s2-2)."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device, LastSyncStatus
+
+    device_id = await seed_device(nso_instance="nso-dev", nso_device_name="degraded-rtr", netbox_device_id=72)
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        device.last_sync_status = LastSyncStatus.partial
+        device.degraded_surfaces = ["bgp", "ospf"]
+        await db.commit()
+        break
+
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}", headers=AUTH)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["last_sync_status"] == "partial"
+    assert body["degraded_surfaces"] == ["bgp", "ospf"]
+
+
 async def test_get_by_nso_hit_returns_device_object(adapter_client):
     """by-nso with matching (instance, name) → 200 with same shape as GET /devices/{id}."""
     device_id = await seed_device(

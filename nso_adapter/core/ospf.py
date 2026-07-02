@@ -78,17 +78,21 @@ async def refresh_ospf_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "poll",
-) -> None:
-    """Read OSPF oper-data for *device* from NSO and upsert DB rows."""
+) -> bool:
+    """Read OSPF oper-data for *device* from NSO and upsert DB rows.
+
+    Returns True on a successful read (or nothing to read); False when the NSO read
+    failed and the last-known rows were left untouched (a degraded surface).
+    """
     if not device.nso_device_name:
         logger.debug("ospf.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
-        return
+        return True
 
     try:
         entry = await nso_client.get_ospf(device.nso_device_name)
     except Exception as exc:
         logger.warning("ospf.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return
+        return False
 
     instances = entry.get("instance", []) if entry else []
     interfaces = entry.get("interface", []) if entry else []
@@ -101,6 +105,7 @@ async def refresh_ospf_for_device(
         interface_count=len(interfaces),
         refresh_source=refresh_source,
     )
+    return True
 
 
 async def handle_ospf_change(

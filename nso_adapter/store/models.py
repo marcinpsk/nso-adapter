@@ -40,6 +40,9 @@ class MappingStatus(str, enum.Enum):
 
 class LastSyncStatus(str, enum.Enum):
     succeeded = "succeeded"
+    # Interface sync succeeded but one or more routing surfaces failed to read from NSO
+    # (their last-known rows are kept, so they may be stale). See Device.degraded_surfaces.
+    partial = "partial"
     failed = "failed"
 
 
@@ -98,6 +101,9 @@ class Device(Base):
     mapping_status: Mapped[MappingStatus] = mapped_column(Enum(MappingStatus), default=MappingStatus.mapped)
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_sync_status: Mapped[LastSyncStatus | None] = mapped_column(Enum(LastSyncStatus), nullable=True)
+    # When last_sync_status == partial: the routing surfaces that failed to read from NSO on the
+    # last sync (e.g. ["bgp", "ospf"]). Their mirror rows may be stale. NULL when nothing degraded.
+    degraded_surfaces: Mapped[list | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
 

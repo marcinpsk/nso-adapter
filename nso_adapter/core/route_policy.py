@@ -172,11 +172,15 @@ async def refresh_route_policy_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "poll",
-) -> None:
-    """Read route-policy oper-data for *device* from NSO and upsert DB rows."""
+) -> bool:
+    """Read route-policy oper-data for *device* from NSO and upsert DB rows.
+
+    Returns True on a successful read (or nothing to read); False when the NSO read
+    failed and the last-known rows were left untouched (a degraded surface).
+    """
     if not device.nso_device_name:
         logger.debug("route_policy.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
-        return
+        return True
 
     try:
         nso_data = await nso_client.get_route_policy(device.nso_device_name)
@@ -187,7 +191,7 @@ async def refresh_route_policy_for_device(
             device_name=device.nso_device_name,
             error=str(exc),
         )
-        return
+        return False
 
     if nso_data is None:
         # Device has no route-policy objects — clear any stale rows.
@@ -198,7 +202,7 @@ async def refresh_route_policy_for_device(
         await db.execute(delete(DeviceRoutePolicyASPath).where(DeviceRoutePolicyASPath.device_id == device.id))
         await db.execute(delete(DeviceRoutePolicyRouteMap).where(DeviceRoutePolicyRouteMap.device_id == device.id))
         await db.commit()
-        return
+        return True
 
     await _upsert_route_policy_data(db, device, nso_data, refresh_source)
 
@@ -216,6 +220,7 @@ async def refresh_route_policy_for_device(
         route_maps=rm_count,
         source=refresh_source,
     )
+    return True
 
 
 async def handle_route_policy_change(device_name: str, db: AsyncSession, nso_client: NsoClient) -> None:

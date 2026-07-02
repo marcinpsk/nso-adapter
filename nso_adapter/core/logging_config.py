@@ -48,15 +48,19 @@ async def refresh_logging_config_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "poll",
-) -> None:
-    """Read logging oper-data for *device* from NSO and upsert DB rows."""
+) -> bool:
+    """Read logging oper-data for *device* from NSO and upsert DB rows.
+
+    Returns True on a successful read (or nothing to read); False when the NSO read
+    failed and the last-known rows were left untouched (a degraded surface).
+    """
     if not device.nso_device_name:
-        return
+        return True
     try:
         entry = await nso_client.get_logging_config(device.nso_device_name)
     except Exception as exc:
         logger.warning("logging.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return
+        return False
     await _upsert_logging_config(db, device, entry, refresh_source)
     logger.info(
         "logging.refresh.done",
@@ -65,6 +69,7 @@ async def refresh_logging_config_for_device(
         host_count=len((entry or {}).get("host", []) if entry else []),
         source=refresh_source,
     )
+    return True
 
 
 async def handle_logging_config_change(db: AsyncSession, nso_device_name: str, nso_client: NsoClient) -> None:

@@ -58,6 +58,9 @@ def _device_out(d: Device) -> dict:
         "mapping_status": d.mapping_status.value,
         "last_sync_at": d.last_sync_at.isoformat() + "Z" if d.last_sync_at else None,
         "last_sync_status": d.last_sync_status.value if d.last_sync_status else None,
+        # Populated only when last_sync_status == "partial": the routing surfaces whose
+        # NSO read failed on the last sync (their mirror rows may be stale).
+        "degraded_surfaces": d.degraded_surfaces or None,
     }
 
 

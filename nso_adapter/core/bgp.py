@@ -191,17 +191,21 @@ async def refresh_bgp_config_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "poll",
-) -> None:
-    """Read BGP oper-data for *device* from NSO and upsert DB rows."""
+) -> bool:
+    """Read BGP oper-data for *device* from NSO and upsert DB rows.
+
+    Returns True on a successful read (or nothing to read); False when the NSO read
+    failed and the last-known rows were left untouched (a degraded surface).
+    """
     if not device.nso_device_name:
         logger.debug("bgp.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
-        return
+        return True
 
     try:
         entry = await nso_client.get_bgp_config(device.nso_device_name)
     except Exception as exc:
         logger.warning("bgp.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return
+        return False
 
     routers = entry.get("router", []) if entry else []
     await _upsert_bgp_data(db, device, routers, refresh_source)
@@ -215,6 +219,7 @@ async def refresh_bgp_config_for_device(
         peer_count=peer_count,
         refresh_source=refresh_source,
     )
+    return True
 
 
 async def handle_bgp_config_change(
