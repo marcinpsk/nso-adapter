@@ -1825,7 +1825,8 @@ class DeviceOspfInstance(Base):
     """Read mirror of an OSPF process instance as exported by network-state-export."""
 
     __tablename__ = "device_ospf_instance"
-    __table_args__ = (UniqueConstraint("device_id", "process_id", name="uq_deviceospfinstance_identity"),)
+    # vrf is part of the identity: the same process-id can run in multiple VRFs.
+    __table_args__ = (UniqueConstraint("device_id", "process_id", "vrf", name="uq_deviceospfinstance_identity"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     device_id: Mapped[int] = mapped_column(
@@ -1849,7 +1850,11 @@ class DeviceOspfInterface(Base):
     """Read mirror of an OSPF-enabled interface as exported by network-state-export."""
 
     __tablename__ = "device_ospf_interface"
-    __table_args__ = (UniqueConstraint("device_id", "interface_name", name="uq_deviceospfinterface_identity"),)
+    # process_id is part of the identity: one interface can be enabled under multiple
+    # OSPF processes, so the same (device, interface) legitimately appears more than once.
+    __table_args__ = (
+        UniqueConstraint("device_id", "interface_name", "process_id", name="uq_deviceospfinterface_identity"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     device_id: Mapped[int] = mapped_column(
