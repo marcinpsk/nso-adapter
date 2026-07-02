@@ -18,6 +18,7 @@ from sqlalchemy.orm import selectinload
 
 from nso_adapter.core.lag_topology import parse_changed_nso_devices
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
     Device,
     DeviceSwitchport,
@@ -77,7 +78,7 @@ async def refresh_vlan_database_for_device(
         logger.warning("vlan.refresh.nso_error", device_id=device.id, error=repr(exc))
         return
 
-    vlans = (entry or {}).get("vlan", []) or (entry or {}).get("vlans", [])
+    vlans = as_list((entry or {}).get("vlan") or (entry or {}).get("vlans"))
     existing = {
         r.vlan_id: r
         for r in (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))).scalars().all()
@@ -122,7 +123,7 @@ async def refresh_switchport_for_device(
         logger.warning("switchport.refresh.nso_error", device_id=device.id, error=repr(exc))
         return
 
-    interfaces = (entry or {}).get("interface", []) or (entry or {}).get("interfaces", [])
+    interfaces = as_list((entry or {}).get("interface") or (entry or {}).get("interfaces"))
     vlan_by_vid = {
         r.vlan_id: r
         for r in (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))).scalars().all()

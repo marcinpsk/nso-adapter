@@ -23,6 +23,7 @@ from nso_adapter.core.sync_state import compute_sync_state
 from nso_adapter.domain.models import Interface, InterfaceAttr
 from nso_adapter.nso import actions as nso_actions
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
     DbInterface,
     Device,
@@ -49,7 +50,7 @@ def _attrs_to_interface_list(data: dict | None) -> list[Interface]:
     if data is None:
         return []
     result = []
-    for entry in data.get("interface", []):
+    for entry in as_list(data.get("interface")):
         name = entry.get("interface-name")
         if not name:
             logger.warning("interface-attrs: skipping malformed entry (no interface-name)", entry=entry)

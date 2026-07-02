@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.lag_topology import parse_changed_nso_devices
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceSubinterface
 
 logger = structlog.get_logger(__name__)
@@ -38,7 +39,7 @@ async def refresh_subinterface_for_device(
         logger.warning("subinterface.refresh.error", device_id=device.id, error=repr(exc))
         return
 
-    interfaces = (entry or {}).get("interface", []) if entry else []
+    interfaces = as_list((entry or {}).get("interface")) if entry else []
     now = datetime.now(UTC).replace(tzinfo=None)
 
     await db.execute(delete(DeviceSubinterface).where(DeviceSubinterface.device_id == device.id))

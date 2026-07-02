@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.lag_topology import parse_changed_nso_devices
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, InterfaceIpAddress
 
 logger = structlog.get_logger(__name__)
@@ -35,7 +36,7 @@ async def _upsert_ip_addresses(
     for iface in interfaces_data:
         iface_name = iface.get("interface-name", "")
         bound_port = iface.get("bound-port") or None  # None for non-Nokia or unbound
-        for addr_entry in iface.get("address", []):
+        for addr_entry in as_list(iface.get("address")):
             address = addr_entry.get("address", "")
             # `or default` (not `.get(k, default)`): the export can carry an explicit null,
             # and None would violate these NOT-NULL columns (vrf is also in the dedup unique).
@@ -78,9 +79,9 @@ async def refresh_interface_ips_for_device(
         logger.warning("interface_ip.refresh.nso_error", device_id=device.id, error=repr(exc))
         return
 
-    interfaces_data = entry.get("interface", []) if entry else []
+    interfaces_data = as_list(entry.get("interface")) if entry else []
     await _upsert_ip_addresses(db, device, interfaces_data, refresh_source)
-    total_addrs = sum(len(iface.get("address", [])) for iface in interfaces_data)
+    total_addrs = sum(len(as_list(iface.get("address"))) for iface in interfaces_data)
     logger.info(
         "interface_ip.refresh.done",
         device_id=device.id,

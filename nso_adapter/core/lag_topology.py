@@ -18,6 +18,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, LagInterface, LagMember
 
 logger = structlog.get_logger(__name__)
@@ -67,7 +68,7 @@ async def _upsert_lags(
         )
         db.add(li)
         await db.flush()
-        for member in lag.get("member", []):
+        for member in as_list(lag.get("member")):
             db.add(
                 LagMember(
                     lag_interface_id=li.id,
@@ -96,7 +97,7 @@ async def refresh_lag_topology_for_device(
         logger.warning("lag.refresh.nso_error", device_id=device.id, error=repr(exc))
         return
 
-    lags_data = entry["lag"] if entry and "lag" in entry else []
+    lags_data = as_list(entry.get("lag")) if entry else []
     await _upsert_lags(db, device, lags_data, refresh_source)
     logger.info(
         "lag.refresh.done",

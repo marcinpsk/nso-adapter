@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.lag_topology import parse_changed_nso_devices
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceL2Sap
 
 logger = structlog.get_logger(__name__)
@@ -40,7 +41,7 @@ async def _upsert_l2_saps(
             continue
         service_type = service.get("service-type", "")
         service_id = service.get("service-id")
-        for sap in service.get("sap", []):
+        for sap in as_list(service.get("sap")):
             sap_id = sap.get("sap-id", "")
             if not sap_id:
                 continue
@@ -79,7 +80,7 @@ async def refresh_l2_services_for_device(
         logger.warning("l2_service.refresh.nso_error", device_id=device.id, error=repr(exc))
         return
 
-    services_data = entry.get("service", []) if entry else []
+    services_data = as_list(entry.get("service")) if entry else []
     await _upsert_l2_saps(db, device, services_data, refresh_source)
     logger.info(
         "l2_service.refresh.done",
