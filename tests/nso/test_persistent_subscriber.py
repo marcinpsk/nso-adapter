@@ -39,7 +39,9 @@ async def test_persistent_subscriber_reconnects_after_clean_eof(monkeypatch: pyt
     wait_for_calls: list[float] = []
     attempts = 0
 
-    async def subscribe_side_effect(stream_url: str, on_event: OnEvent, duration: float) -> None:
+    async def subscribe_side_effect(
+        stream_url: str, on_event: OnEvent, duration: float, idle_read_timeout_s: float | None = 90.0
+    ) -> None:
         nonlocal attempts
         attempts += 1
         assert stream_url == STREAM_URL
@@ -74,11 +76,15 @@ async def test_persistent_subscriber_retries_after_transport_error(monkeypatch: 
     wait_for_calls: list[float] = []
     attempts = 0
 
-    async def subscribe_side_effect(stream_url: str, on_event: OnEvent, duration: float) -> None:
+    async def subscribe_side_effect(
+        stream_url: str, on_event: OnEvent, duration: float, idle_read_timeout_s: float | None = 90.0
+    ) -> None:
         nonlocal attempts
         attempts += 1
         assert stream_url == STREAM_URL
         assert duration == float("inf")
+        # s3-13: the finite idle watchdog is threaded through to subscribe().
+        assert idle_read_timeout_s == 90.0
         if attempts == 1:
             raise httpx.RequestError("boom")
         stop_event.set()
@@ -104,7 +110,9 @@ async def test_persistent_subscriber_caps_exponential_backoff(monkeypatch: pytes
     stop_event = asyncio.Event()
     wait_for_calls: list[float] = []
 
-    async def subscribe_side_effect(stream_url: str, on_event: OnEvent, duration: float) -> None:
+    async def subscribe_side_effect(
+        stream_url: str, on_event: OnEvent, duration: float, idle_read_timeout_s: float | None = 90.0
+    ) -> None:
         assert stream_url == STREAM_URL
         assert duration == float("inf")
         raise httpx.RequestError("boom")
@@ -135,7 +143,9 @@ async def test_persistent_subscriber_returns_when_stopped_during_backoff(
     stop_event = asyncio.Event()
     wait_for_calls: list[float] = []
 
-    async def subscribe_side_effect(stream_url: str, on_event: OnEvent, duration: float) -> None:
+    async def subscribe_side_effect(
+        stream_url: str, on_event: OnEvent, duration: float, idle_read_timeout_s: float | None = 90.0
+    ) -> None:
         assert stream_url == STREAM_URL
         assert duration == float("inf")
         raise httpx.RequestError("boom")
@@ -160,7 +170,9 @@ async def test_persistent_subscriber_returns_after_stop_event_during_active_stre
     stop_event = asyncio.Event()
     stream_started = asyncio.Event()
 
-    async def subscribe_side_effect(stream_url: str, on_event: OnEvent, duration: float) -> None:
+    async def subscribe_side_effect(
+        stream_url: str, on_event: OnEvent, duration: float, idle_read_timeout_s: float | None = 90.0
+    ) -> None:
         assert stream_url == STREAM_URL
         assert duration == float("inf")
         stream_started.set()

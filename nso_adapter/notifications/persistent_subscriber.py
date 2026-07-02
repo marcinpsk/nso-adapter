@@ -23,12 +23,19 @@ async def persistent_subscriber(
     stop_event: asyncio.Event,
     initial_delay_s: float = 5.0,
     max_delay_s: float = 60.0,
+    idle_read_timeout_s: float | None = 90.0,
 ) -> None:
-    """Run subscribe() in a loop with exponential backoff on transport errors."""
+    """Run subscribe() in a loop with exponential backoff on transport errors.
+
+    *idle_read_timeout_s* bounds a silently half-open stream: with no idle watchdog
+    a wedged ``aiter_lines`` never returns and this reconnect loop is never reached.
+    """
     delay = initial_delay_s
     while not stop_event.is_set():
         try:
-            await subscriber.subscribe(stream_url, on_event, duration=float("inf"))
+            await subscriber.subscribe(
+                stream_url, on_event, duration=float("inf"), idle_read_timeout_s=idle_read_timeout_s
+            )
             delay = initial_delay_s
         except asyncio.CancelledError:
             raise

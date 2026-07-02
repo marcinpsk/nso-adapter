@@ -13,6 +13,11 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
+# Idle read-timeout watchdog: how long the stream may go without ANY bytes (an SSE
+# event OR a keep-alive comment) before httpx raises ReadTimeout. Must exceed NSO's
+# SSE keep-alive interval, or a healthy but quiet stream will reconnect needlessly.
+_DEFAULT_IDLE_READ_TIMEOUT_S = 90.0
+
 
 class SSESubscriber:
     """Discover and subscribe to NSO RESTCONF notification streams via SSE."""
@@ -55,16 +60,25 @@ class SSESubscriber:
         stream_url: str,
         on_event: Callable[[str, dict | None], None],
         duration: float = 30.0,
+        *,
+        idle_read_timeout_s: float | None = _DEFAULT_IDLE_READ_TIMEOUT_S,
     ) -> None:
         """Subscribe to *stream_url* for up to *duration* seconds.
 
         Calls *on_event(raw_data, parsed)* for each SSE event block.
         *parsed* is None when the data field is not valid JSON.
         Raises httpx.HTTPStatusError / httpx.RequestError on transport failure.
+
+        *idle_read_timeout_s* is the idle watchdog: if no bytes (an SSE event OR a
+        keep-alive comment) arrive within that window, httpx raises ReadTimeout so a
+        silently half-open connection (NAT idle drop / NSO restart without RST) is
+        surfaced as a transport error and the caller can reconnect, instead of
+        ``aiter_lines`` blocking forever. ``None`` disables it (the old unbounded
+        ``read=None`` behaviour — the stream can wedge indefinitely).
         """
 
         async def _run() -> None:
-            streaming_timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+            streaming_timeout = httpx.Timeout(connect=10.0, read=idle_read_timeout_s, write=10.0, pool=10.0)
             async with self._client(timeout=streaming_timeout) as c:
                 async with c.stream("GET", stream_url, headers={"Accept": "text/event-stream"}) as response:
                     response.raise_for_status()

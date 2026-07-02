@@ -241,6 +241,51 @@ async def test_subscribe_skips_event_type_and_comment_lines():
     assert received[0][1] == {"msg": "hello"}
 
 
+async def test_subscribe_idle_read_timeout_unwedges_half_open_connection():
+    """s3-13: a half-open connection (200 headers sent, then no bytes — no event and no
+    keep-alive) must not wedge aiter_lines forever. Exercised against a REAL socket that
+    accepts the connection and then goes silent:
+
+    * without the watchdog (idle_read_timeout_s=None, the old read=None) subscribe hangs
+      until the outer wait_for trips;
+    * with a finite idle read timeout httpx raises ReadTimeout (a RequestError) so the
+      persistent subscriber's reconnect/backoff is reached.
+    """
+    import asyncio as _asyncio
+
+    async def _handle(reader, writer):
+        with contextlib.suppress(Exception):
+            await reader.read(4096)  # consume the request line + headers
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+            await writer.drain()
+            # Send NOTHING; block until the client disconnects so the handler doesn't
+            # linger past the test (the half-open silence is what the watchdog catches).
+            await reader.read()
+        with contextlib.suppress(Exception):
+            writer.close()
+
+    server = await _asyncio.start_server(_handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    url = f"http://127.0.0.1:{port}/stream"
+    sub = SSESubscriber(f"http://127.0.0.1:{port}", ("admin", "secret"))
+    try:
+        # No watchdog → wedged: only the outer wait_for stops it (old read=None behaviour).
+        with pytest.raises(_asyncio.TimeoutError):
+            await _asyncio.wait_for(
+                sub.subscribe(url, lambda *_: None, duration=float("inf"), idle_read_timeout_s=None),
+                timeout=1.5,
+            )
+        # Watchdog → httpx surfaces ReadTimeout well before the 5s bound.
+        with pytest.raises(httpx.ReadTimeout):
+            await _asyncio.wait_for(
+                sub.subscribe(url, lambda *_: None, duration=float("inf"), idle_read_timeout_s=0.5),
+                timeout=5,
+            )
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
 async def test_subscribe_completes_on_timeout():
     """asyncio.TimeoutError is caught internally; subscribe() returns normally."""
     import asyncio as _asyncio
