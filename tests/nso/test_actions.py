@@ -138,18 +138,49 @@ async def test_check_sync_not_in_sync():
 
 
 @pytest.mark.asyncio
-async def test_check_sync_exception_returns_false():
-    """A non-2xx response makes check_sync swallow the error and report not-in-sync.
-
-    The 500 body deliberately says "in-sync": only a real raise_for_status() turns this
-    into False — if it were skipped, the body would be read and the result would be True.
-    """
+async def test_check_sync_raises_on_http_error():
+    """check_sync must SURFACE an HTTP error rather than swallow it into a false 'not in
+    sync' (indistinguishable from real drift) (#16b)."""
     client = _make_nso_client()
     _mock_http_ctx(client, _resp(500, {"tailf-ncs:output": {"result": "in-sync"}}))
 
-    result = await check_sync(client, "rtr")
+    with pytest.raises(httpx.HTTPStatusError):
+        await check_sync(client, "rtr")
 
-    assert result is False
+
+@pytest.mark.asyncio
+async def test_sync_from_200_no_body():
+    """A 200 with an empty body returns {} — never crashes on resp.json() (#21)."""
+    client = _make_nso_client()
+    _mock_http_ctx(client, _resp(200, has_content=False))
+    assert await sync_from(client, "rtr") == {}
+
+
+@pytest.mark.asyncio
+async def test_connect_200_no_body():
+    """A 200 with an empty body returns {} — never crashes on resp.json() (#21)."""
+    client = _make_nso_client()
+    _mock_http_ctx(client, _resp(200, has_content=False))
+    assert await connect(client, "rtr") == {}
+
+
+@pytest.mark.asyncio
+async def test_probe_reachable_empty_body_is_unreachable():
+    """An empty-body connect reply is treated as unreachable, never an escaping crash (#21)."""
+    client = _make_nso_client()
+    _mock_http_ctx(client, _resp(200, has_content=False))
+    reachable, _detail, _elapsed = await probe_reachable(client, "rtr")
+    assert reachable is False
+
+
+@pytest.mark.asyncio
+async def test_action_url_percent_encodes_device_name():
+    """A device name with a reserved char is percent-encoded in the action URL path (#14)."""
+    client = _make_nso_client()
+    http = _mock_http_ctx(client, _resp(200, {"tailf-ncs:output": {}}))
+    await sync_from(client, "site/rtr1")
+    url = http.post.call_args[0][0]
+    assert "device=site%2Frtr1" in url and "device=site/rtr1" not in url
 
 
 @pytest.mark.asyncio

@@ -24,7 +24,7 @@ import os
 
 import structlog
 
-from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.client import NsoClient, _url_key
 
 logger = structlog.get_logger(__name__)
 
@@ -254,7 +254,7 @@ async def _send_service_config(
         return None
     payload = json.dumps({root_key: [body]})
     if replace:
-        url = f"{client._base}{service_path}={device_name}"
+        url = f"{client._base}{service_path}={_url_key(device_name)}"
         method = "put"
     else:
         url = f"{client._base}{service_path}"
@@ -1338,7 +1338,7 @@ async def replace_service_instance(
     The PUT carries the ``reconcile`` commit option (see ``_commit_url``) so the replace
     still adopts brownfield config rather than conflicting with it.
     """
-    url = f"{client._base}{service_path}={device_name}"
+    url = f"{client._base}{service_path}={_url_key(device_name)}"
     payload = json.dumps({root_key: [body]})
     async with client._client(timeout=client._action_timeout) as c:
         resp = await c.put(_commit_url(url), content=payload, headers={"Content-Type": "application/yang-data+json"})

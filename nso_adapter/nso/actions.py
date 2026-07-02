@@ -12,25 +12,32 @@ import time
 import httpx
 import structlog
 
-from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.client import NsoClient, _url_key
 
 logger = structlog.get_logger(__name__)
 
 _DEVICE_BASE = "/restconf/data/tailf-ncs:devices/device={name}"
 
 
+def _device_base(client: NsoClient, device_name: str) -> str:
+    """Device action URL base with the device name percent-encoded (RFC 8040 list key)."""
+    return f"{client._base}{_DEVICE_BASE.format(name=_url_key(device_name))}"
+
+
 async def sync_from(client: NsoClient, device_name: str) -> dict:
     """POST sync-from — refresh NSO CDB from the live device."""
-    url = f"{client._base}{_DEVICE_BASE.format(name=device_name)}/sync-from"
+    url = f"{_device_base(client, device_name)}/sync-from"
     async with client._client(timeout=client._action_timeout) as c:
         resp = await c.post(url)
         resp.raise_for_status()
+        if resp.status_code == 204 or not resp.content:
+            return {}
         return resp.json().get("tailf-ncs:output", {})
 
 
 async def compare_config(client: NsoClient, device_name: str) -> dict:
     """POST compare-config — return diff between CDB and live device."""
-    url = f"{client._base}{_DEVICE_BASE.format(name=device_name)}/compare-config"
+    url = f"{_device_base(client, device_name)}/compare-config"
     async with client._client(timeout=client._action_timeout) as c:
         resp = await c.post(url)
         resp.raise_for_status()
@@ -40,16 +47,18 @@ async def compare_config(client: NsoClient, device_name: str) -> dict:
 
 
 async def check_sync(client: NsoClient, device_name: str) -> bool:
-    """POST check-sync — return True if device is in-sync with NSO CDB."""
-    url = f"{client._base}{_DEVICE_BASE.format(name=device_name)}/check-sync"
+    """POST check-sync — return True if device is in-sync with NSO CDB.
+
+    Raises on an HTTP error rather than swallowing it into a false 'not in sync'
+    (indistinguishable from real drift).
+    """
+    url = f"{_device_base(client, device_name)}/check-sync"
     async with client._client(timeout=client._action_timeout) as c:
-        try:
-            resp = await c.post(url)
-            resp.raise_for_status()
-            result = resp.json().get("tailf-ncs:output", {}).get("result", "")
-            return result == "in-sync"
-        except Exception:
+        resp = await c.post(url)
+        resp.raise_for_status()
+        if resp.status_code == 204 or not resp.content:
             return False
+        return resp.json().get("tailf-ncs:output", {}).get("result", "") == "in-sync"
 
 
 async def connect(client: NsoClient, device_name: str, timeout: float | None = None) -> dict:
@@ -58,10 +67,12 @@ async def connect(client: NsoClient, device_name: str, timeout: float | None = N
     *timeout* overrides the default action timeout — pass a short value for a reachability
     probe so an unreachable device cannot block on the full 2-minute action timeout.
     """
-    url = f"{client._base}{_DEVICE_BASE.format(name=device_name)}/connect"
+    url = f"{_device_base(client, device_name)}/connect"
     async with client._client(timeout=timeout if timeout is not None else client._action_timeout) as c:
         resp = await c.post(url)
         resp.raise_for_status()
+        if resp.status_code == 204 or not resp.content:
+            return {}
         return resp.json().get("tailf-ncs:output", {})
 
 
@@ -78,7 +89,9 @@ async def probe_reachable(client: NsoClient, device_name: str, timeout: float | 
     start = time.perf_counter()
     try:
         out = await connect(client, device_name, timeout=timeout)
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, ValueError) as exc:
+        # ValueError covers a JSONDecodeError from a malformed/empty reply — treat any of
+        # these as unreachable rather than letting the probe crash its caller.
         return False, repr(exc), time.perf_counter() - start
     elapsed = time.perf_counter() - start
     result = out.get("result")
