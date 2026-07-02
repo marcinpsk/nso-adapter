@@ -182,6 +182,58 @@ async def test_provision_aborts_on_fetch_host_keys_failure(adapter_client_with_n
     client.sync_from.assert_not_awaited()
 
 
+async def test_provision_seeds_failover_when_oob_bootstrap_then_fetch_fails(adapter_client_with_nso, monkeypatch):
+    """If the OOB bootstrap flipped NSO to the OOB address and fetch-host-keys then fails,
+    the device must still get a DeviceFailover row (active=oob) so the failover loop can fail
+    it back once in-band recovers — not be left stranded on OOB, unmanaged (s3-6)."""
+    from sqlalchemy import select
+
+    from nso_adapter.config import get_config
+    from nso_adapter.core.onboarding import provision_nso_device
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import ActiveAddress, Device, DeviceFailover
+
+    monkeypatch.setattr(get_config().scheduler, "enable_failover", True)
+
+    async def _probe_down(client, name, timeout=None):
+        return False, "down", 0.0
+
+    monkeypatch.setattr("nso_adapter.nso.actions.probe_reachable", _probe_down)
+
+    client = _mock_client(fetch=RuntimeError("still down over oob"))
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=client),
+        patch("nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()),
+    ):
+        async for db in get_session():
+            res = await provision_nso_device(
+                db,
+                nso_instance="nso-dev",
+                device_name="oob-strand",
+                address="10.0.0.5",
+                ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+                authgroup="network",
+                netbox_device_id=999,
+                oob_ip="192.0.2.5",
+            )
+            break
+
+    assert res["ok"] is False
+    assert _steps(res)["fetch_host_keys"] == "failed"
+    # The bootstrap flipped NSO onto the OOB address (primary probed unreachable).
+    client.set_address.assert_awaited_once_with("oob-strand", "192.0.2.5")
+
+    # A DeviceFailover row must exist so the loop manages + fails it back to primary.
+    async for db in get_session():
+        dev = (await db.execute(select(Device).where(Device.nso_device_name == "oob-strand"))).scalar_one_or_none()
+        assert dev is not None, "adapter mapping not created — failover can't manage the OOB-pinned device"
+        fo = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == dev.id))).scalar_one_or_none()
+        assert fo is not None, "device stranded on OOB with no failover row"
+        assert fo.active_address == ActiveAddress.oob.value
+        assert fo.oob_ip == "192.0.2.5"
+        break
+
+
 async def test_provision_unlocks_before_fetch_host_keys(adapter_client_with_nso):
     """Regression: unlock MUST happen before fetch-host-keys (locked device blocks SSH)."""
     from nso_adapter.core.onboarding import provision_nso_device

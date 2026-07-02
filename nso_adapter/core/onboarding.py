@@ -200,6 +200,13 @@ async def provision_nso_device(
         _step("fetch_host_keys", "ok")
     except Exception as exc:
         _step("fetch_host_keys", "failed", repr(exc))
+        # If the bootstrap pinned NSO to the OOB address, don't strand the device: map it and
+        # seed the failover row so the loop can fail it back to primary once in-band recovers.
+        if active_address == ActiveAddress.oob.value:
+            device_id = await _map_and_seed_failover(
+                db, nso_instance, device_name, netbox_device_id, address, oob_ip, active_address, steps
+            )
+            return _result(False, device_id)
         return _result(False)
 
     # 4. sync-from — non-fatal (the adapter's normal sync will retry), but give
@@ -211,23 +218,44 @@ async def provision_nso_device(
         except Exception as exc:
             _step("sync_from", "failed", repr(exc))
 
-    # 5. adapter mapping row (so the read pipeline manages it henceforth)
+    # 5-6. adapter mapping row (so the read pipeline manages it henceforth) + failover row
+    #      (IPs + bootstrapped address) so the failover loop can manage it.
+    device_id = await _map_and_seed_failover(
+        db, nso_instance, device_name, netbox_device_id, address, oob_ip, active_address, steps
+    )
+
+    logger.info("device.provisioned", nso_device=device_name, instance=nso_instance, steps=steps)
+    return _result(True, device_id)
+
+
+async def _map_and_seed_failover(
+    db: AsyncSession,
+    nso_instance: str,
+    device_name: str,
+    netbox_device_id: int | None,
+    address: str,
+    oob_ip: str | None,
+    active_address: str,
+    steps: list[dict],
+) -> int | None:
+    """Create the adapter mapping row and seed the failover row; return the device_id or None.
+
+    Shared by the happy path and the OOB-bootstrap failure recovery so a device NSO was pinned
+    to its OOB address is always handed to the failover loop — never stranded on OOB with no
+    DeviceFailover row to fail it back once the in-band address recovers.
+    """
     device_id = None
     if netbox_device_id is not None:
         try:
             row = await onboard_device(db, nso_instance, device_name, netbox_device_id)
             device_id = row.id
-            _step("adapter_mapping", "ok")
+            steps.append({"step": "adapter_mapping", "status": "ok"})
         except LookupError as exc:
-            _step("adapter_mapping", "exists", repr(exc))
-
-    # 6. seed the failover row (IPs + bootstrapped address) so the failover loop can manage it.
+            steps.append({"step": "adapter_mapping", "status": "exists", "detail": repr(exc)})
     fo_seed = await _seed_onboarding_failover(db, device_id, address, oob_ip, active_address)
     if fo_seed:
         steps.append(fo_seed)
-
-    logger.info("device.provisioned", nso_device=device_name, instance=nso_instance, steps=steps)
-    return _result(True, device_id)
+    return device_id
 
 
 async def _seed_onboarding_failover(
