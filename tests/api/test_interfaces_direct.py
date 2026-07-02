@@ -140,3 +140,58 @@ async def test_get_state_with_attrs(adapter_client):
         assert result["by_status"]["imported"] == 1
         assert result["last_checked_at"] is not None
         break
+
+
+async def _seed_many_interfaces(nso_device_name: str, netbox_id: int, count: int) -> int:
+    """Seed a device with *count* interfaces, each with one attr state + one intent row."""
+    async for db in get_session():
+        d = Device(nso_instance="nso-dev", nso_device_name=nso_device_name, netbox_device_id=netbox_id)
+        db.add(d)
+        await db.flush()
+        db.add(ManagedScope(device_id=d.id, attribute="description"))
+        for j in range(count):
+            iface = DbInterface(device_id=d.id, name=f"Gi0/{j}", netbox_interface_id=netbox_id * 100 + j)
+            db.add(iface)
+            await db.flush()
+            db.add(
+                InterfaceAttrState(
+                    interface_id=iface.id,
+                    attribute="description",
+                    nso_value="nso",
+                    netbox_value="nb",
+                    sync_state=SyncState.imported,
+                )
+            )
+            db.add(InterfaceIntent(interface_id=iface.id, attribute="description", intent_value="x"))
+        await db.commit()
+        return d.id
+    raise RuntimeError("no DB session")
+
+
+async def test_list_interfaces_is_not_n_plus_one(adapter_client):
+    """s3-10: list_interfaces must not run 2 queries per interface (attr + intent)."""
+    from tests.conftest import count_queries
+
+    device_id = await _seed_many_interfaces("iface-nplus", 1150, count=6)
+    async for db in get_session():
+        with count_queries() as qc:
+            result = await list_interfaces(device_id=device_id, db=db)
+        assert len(result) == 6
+        assert all(r["attrs"]["description"]["intent_value"] == "x" for r in result)
+        # was 1 (device) + 1 (interfaces) + 6×2; batched stays a small constant.
+        assert qc.count <= 5, f"list_interfaces ran {qc.count} queries — N+1 across interfaces"
+        break
+
+
+async def test_get_state_is_not_n_plus_one(adapter_client):
+    """s3-10: get_state must not run one attr query per interface."""
+    from tests.conftest import count_queries
+
+    device_id = await _seed_many_interfaces("state-nplus", 1160, count=6)
+    async for db in get_session():
+        with count_queries() as qc:
+            result = await get_state(device_id=device_id, db=db)
+        assert result["managed_interfaces"] == 6
+        assert result["by_status"]["imported"] == 6
+        assert qc.count <= 5, f"get_state ran {qc.count} queries — N+1 across interfaces"
+        break

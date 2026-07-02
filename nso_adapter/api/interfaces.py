@@ -35,13 +35,23 @@ async def list_interfaces(device_id: int, db: AsyncSession = Depends(get_db)):
 
     ifaces_result = await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))
     ifaces = ifaces_result.scalars().all()
+    iface_ids = [iface.id for iface in ifaces]
+
+    # Batch the per-interface children into two queries (not 2 per interface).
+    attrs_by_iface: dict[int, list[InterfaceAttrState]] = {}
+    intents_by_iface: dict[int, dict[str, InterfaceIntent]] = {}
+    if iface_ids:
+        attr_rows = await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id.in_(iface_ids)))
+        for a in attr_rows.scalars().all():
+            attrs_by_iface.setdefault(a.interface_id, []).append(a)
+        intent_rows = await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id.in_(iface_ids)))
+        for r in intent_rows.scalars().all():
+            intents_by_iface.setdefault(r.interface_id, {})[r.attribute] = r
 
     out = []
     for iface in ifaces:
-        attrs_result = await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id == iface.id))
-        intent_result = await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface.id))
-        intent_by_attr = {r.attribute: r for r in intent_result.scalars().all()}
-        attrs = {a.attribute: _attr_out(a, intent_by_attr.get(a.attribute)) for a in attrs_result.scalars().all()}
+        intent_by_attr = intents_by_iface.get(iface.id, {})
+        attrs = {a.attribute: _attr_out(a, intent_by_attr.get(a.attribute)) for a in attrs_by_iface.get(iface.id, [])}
         out.append(
             {
                 "name": iface.name,
@@ -64,8 +74,8 @@ async def get_state(device_id: int, db: AsyncSession = Depends(get_db)):
     if not device:
         raise api_error(404, "not_found", "Device not found")
 
-    ifaces_result = await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))
-    ifaces = ifaces_result.scalars().all()
+    ifaces_result = await db.execute(select(DbInterface.id).where(DbInterface.device_id == device_id))
+    iface_ids = ifaces_result.scalars().all()
 
     by_status: dict[str, int] = {
         "unknown": 0,
@@ -81,16 +91,17 @@ async def get_state(device_id: int, db: AsyncSession = Depends(get_db)):
     managed = 0
     last_checked_at = None
 
-    for iface in ifaces:
-        attrs_result = await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id == iface.id))
-        attrs = attrs_result.scalars().all()
-        if attrs:
-            managed += 1
-        for attr in attrs:
+    if iface_ids:
+        # One query for all attr states, aggregated in Python (not one query per interface).
+        attr_rows = await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id.in_(iface_ids)))
+        managed_ifaces: set[int] = set()
+        for attr in attr_rows.scalars().all():
+            managed_ifaces.add(attr.interface_id)
             key = attr.sync_state.value
             by_status[key] = by_status.get(key, 0) + 1
             if attr.last_checked_at and (last_checked_at is None or attr.last_checked_at > last_checked_at):
                 last_checked_at = attr.last_checked_at
+        managed = len(managed_ifaces)
 
     return {
         "device_id": device_id,

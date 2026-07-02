@@ -21,6 +21,35 @@ os.environ.pop("DATABASE_URL", None)
 VALID_TOKEN = "test-bearer-token"
 
 
+class count_queries:
+    """Context manager counting SQL statements executed on the app's async engine.
+
+    Guards against N+1 query patterns: assert the count does not scale with the
+    number of rows (interfaces/devices). Attaches a ``before_cursor_execute``
+    listener to the engine's sync facade for the duration of the block.
+    """
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def _on(self, *_args) -> None:
+        self.count += 1
+
+    def __enter__(self) -> count_queries:
+        from sqlalchemy import event
+
+        from nso_adapter.store.db import get_engine
+
+        self._engine = get_engine().sync_engine
+        event.listen(self._engine, "before_cursor_execute", self._on)
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        from sqlalchemy import event
+
+        event.remove(self._engine, "before_cursor_execute", self._on)
+
+
 @pytest.fixture
 async def adapter_client(tmp_path, monkeypatch):
     """FastAPI test client backed by in-memory SQLite.

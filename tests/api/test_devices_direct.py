@@ -92,6 +92,38 @@ async def test_list_devices_with_state_summary(adapter_client):
         break
 
 
+async def test_list_devices_state_summary_is_not_n_plus_one(adapter_client):
+    """s3-10: the summary must not run O(devices × interfaces) queries. Seed 3 devices,
+    each with 5 interfaces (× 1 attr state); the query count must stay bounded — it must
+    NOT grow with the interface fan-out (was 1 + Σ(1 + interfaces) per device)."""
+    from tests.conftest import count_queries
+
+    async for db in get_session():
+        for n in range(3):
+            d = Device(nso_instance="nso-dev", nso_device_name=f"nplus-{n}", netbox_device_id=740 + n)
+            db.add(d)
+            await db.flush()
+            for j in range(5):
+                iface = DbInterface(device_id=d.id, name=f"Gi0/{j}", netbox_interface_id=7400 + n * 10 + j)
+                db.add(iface)
+                await db.flush()
+                db.add(
+                    InterfaceAttrState(interface_id=iface.id, attribute="description", sync_state=SyncState.imported)
+                )
+        await db.commit()
+
+        with count_queries() as qc:
+            result = await list_devices(db=db)
+
+        seeded = [r for r in result if r["nso_device_name"].startswith("nplus-")]
+        assert len(seeded) == 3
+        assert all(r["sync_state_summary"]["managed_interfaces"] == 5 for r in seeded)
+        # 3 devices × 5 interfaces = 15 attr rows; N+1 would be ~1 + 3×(1+5) = 19 queries.
+        # Batched: a small constant, independent of the fan-out.
+        assert qc.count <= 5, f"list_devices ran {qc.count} queries — N+1 across interfaces"
+        break
+
+
 # ── get_device_by_nso ─────────────────────────────────────────────────────────
 
 

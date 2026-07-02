@@ -211,3 +211,27 @@ async def test_get_intent_returns_set_intent(adapter_client):
         assert row["attribute"] == "description"
         assert row["intent_value"] == "test-val"
         break
+
+
+async def test_get_intent_is_not_n_plus_one(adapter_client):
+    """s3-10: get_intent must not run one intent query per interface."""
+    from tests.conftest import count_queries
+
+    async for db in get_session():
+        d = Device(nso_instance="nso-dev", nso_device_name="intent-nplus", netbox_device_id=1170)
+        db.add(d)
+        await db.flush()
+        db.add(ManagedScope(device_id=d.id, attribute="description"))
+        for j in range(6):
+            iface = DbInterface(device_id=d.id, name=f"Gi0/{j}", netbox_interface_id=11700 + j)
+            db.add(iface)
+            await db.flush()
+            db.add(InterfaceIntent(interface_id=iface.id, attribute="description", intent_value=f"v{j}"))
+        await db.commit()
+        device_id = d.id
+
+        with count_queries() as qc:
+            result = await get_intent(device_id=device_id, db=db)
+        assert len(result["attributes"]) == 6
+        assert qc.count <= 5, f"get_intent ran {qc.count} queries — N+1 across interfaces"
+        break

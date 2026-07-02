@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
@@ -26,22 +26,37 @@ router = APIRouter(prefix="/api/v1/devices", tags=["devices"])
 # ── Response helpers ──────────────────────────────────────────────────────────
 
 
-async def _state_summary(device_id: int, db: AsyncSession) -> dict:
-    """Aggregate sync_state counts across all managed interfaces."""
-    ifaces_result = await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))
-    ifaces = ifaces_result.scalars().all()
+async def _state_summaries(device_ids: list[int], db: AsyncSession) -> dict[int, dict]:
+    """Aggregate per-device sync_state counts in two grouped queries (not per-device N+1).
 
-    by_status: dict[str, int] = {s.value: 0 for s in SyncState}
-    managed = 0
-    for iface in ifaces:
-        attrs_result = await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id == iface.id))
-        attrs = attrs_result.scalars().all()
-        if attrs:
-            managed += 1
-        for attr in attrs:
-            by_status[attr.sync_state.value] += 1
+    ``managed_interfaces`` is the count of interfaces carrying at least one attr-state
+    (distinct interface_id); the rest is a per-sync_state breakdown.
+    """
+    summaries: dict[int, dict] = {
+        did: {"managed_interfaces": 0, **{s.value: 0 for s in SyncState}} for did in device_ids
+    }
+    if not device_ids:
+        return summaries
 
-    return {"managed_interfaces": managed, **by_status}
+    status_rows = await db.execute(
+        select(DbInterface.device_id, InterfaceAttrState.sync_state, func.count())
+        .join(InterfaceAttrState, InterfaceAttrState.interface_id == DbInterface.id)
+        .where(DbInterface.device_id.in_(device_ids))
+        .group_by(DbInterface.device_id, InterfaceAttrState.sync_state)
+    )
+    for device_id, sync_state, cnt in status_rows.all():
+        summaries[device_id][sync_state.value] = cnt
+
+    managed_rows = await db.execute(
+        select(DbInterface.device_id, func.count(func.distinct(InterfaceAttrState.interface_id)))
+        .join(InterfaceAttrState, InterfaceAttrState.interface_id == DbInterface.id)
+        .where(DbInterface.device_id.in_(device_ids))
+        .group_by(DbInterface.device_id)
+    )
+    for device_id, managed in managed_rows.all():
+        summaries[device_id]["managed_interfaces"] = managed
+
+    return summaries
 
 
 async def _last_job_id(device_id: int, db: AsyncSession) -> int | None:
@@ -96,10 +111,11 @@ async def _load_failover(device_id: int, db: AsyncSession) -> DeviceFailover | N
 async def list_devices(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Device))
     devices = result.scalars().all()
+    summaries = await _state_summaries([d.id for d in devices], db)
     out = []
     for d in devices:
         row = _device_out(d)
-        row["sync_state_summary"] = await _state_summary(d.id, db)
+        row["sync_state_summary"] = summaries[d.id]
         out.append(row)
     return out
 

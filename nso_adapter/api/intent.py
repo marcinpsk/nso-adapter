@@ -162,10 +162,15 @@ async def get_intent(device_id: int, db: AsyncSession = Depends(get_db)):
     ifaces = {iface.id: iface for iface in ifaces_result.scalars().all()}
 
     rows = []
-    for iface in ifaces.values():
-        intent_result = await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface.id))
+    if ifaces:
+        # One query for all intent rows (not one per interface).
+        intent_result = await db.execute(
+            select(InterfaceIntent).where(InterfaceIntent.interface_id.in_(list(ifaces.keys())))
+        )
         for row in intent_result.scalars().all():
-            rows.append(_intent_row_out(row, iface.name))
+            iface = ifaces.get(row.interface_id)
+            if iface is not None:
+                rows.append(_intent_row_out(row, iface.name))
 
     updated_at = datetime.now(UTC).replace(tzinfo=None)
     return {
