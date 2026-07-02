@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hmac
 from collections.abc import AsyncGenerator
 
 import structlog
@@ -41,7 +42,9 @@ async def verify_token(
     if credentials is None:
         raise _UNAUTH
     expected: str = request.app.state.adapter_token
-    if credentials.credentials != expected:
+    # Constant-time compare: a plain != short-circuits on the first differing byte, leaking
+    # the shared secret's length/prefix to a timing attacker on this write/apply/push gate.
+    if not hmac.compare_digest(credentials.credentials, expected):
         raise _UNAUTH
     return credentials.credentials
 
