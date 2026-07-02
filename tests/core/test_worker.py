@@ -162,6 +162,38 @@ async def test_requeue_orphaned_recovers_stale_heartbeat(adapter_client):
     assert apply_job.error["code"] == "orphaned"
 
 
+async def test_heartbeat_survives_transient_db_error(adapter_client, monkeypatch):
+    """A transient DB error on one heartbeat tick must not silently kill the heartbeat task —
+    otherwise the heartbeat goes stale under a live job and the reaper (s3-4) later steals it,
+    breaking the module's 'hung job detectable via stale heartbeat' guarantee (s3-16)."""
+    device_id = await _seed_device("hb-rtr", 730)
+    job_id = await _seed_job(device_id, JobType.sync, JobStatus.running)
+
+    monkeypatch.setattr(worker, "_HEARTBEAT_INTERVAL", 0.001)
+    real_get_session = worker.get_session
+    calls = {"n": 0}
+
+    def flaky_get_session():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient db blip")  # first tick fails
+        return real_get_session()
+
+    monkeypatch.setattr(worker, "get_session", flaky_get_session)
+
+    task = asyncio.create_task(worker._heartbeat(job_id))
+    await asyncio.sleep(0.05)  # several ticks at the 1ms interval
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    # The loop survived the failed first tick and stamped heartbeat_at on a later one.
+    assert calls["n"] >= 2
+    assert (await _get_job(job_id)).heartbeat_at is not None
+
+
 # ── _mark_failed ────────────────────────────────────────────────────────────────
 
 

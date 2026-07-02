@@ -104,15 +104,23 @@ async def _mark_failed(job_id: int, code: str, message: str) -> None:
 
 
 async def _heartbeat(job_id: int) -> None:
-    """Refresh ``heartbeat_at`` every interval until cancelled."""
-    try:
-        while True:
+    """Refresh ``heartbeat_at`` every interval until cancelled.
+
+    A transient DB error on one tick must NOT kill the heartbeat: if it did, the heartbeat
+    would go stale under a still-running job and the startup reaper (which only recovers jobs
+    with a stale heartbeat) would eventually steal it. Log and keep looping; only cancellation
+    stops the heartbeat.
+    """
+    while True:
+        try:
             await asyncio.sleep(_HEARTBEAT_INTERVAL)
             async for db in get_session():
                 await db.execute(sa_update(Job).where(Job.id == job_id).values(heartbeat_at=_now()))
                 await db.commit()
-    except asyncio.CancelledError:
-        return
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.warning("worker.heartbeat_error", job_id=job_id, error=repr(exc))
 
 
 async def _worker_loop(worker_id: int, stop: asyncio.Event) -> None:
