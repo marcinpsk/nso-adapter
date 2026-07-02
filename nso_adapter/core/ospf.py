@@ -16,6 +16,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceOspfInstance, DeviceOspfInterface
 
 logger = structlog.get_logger(__name__)
@@ -44,7 +45,7 @@ async def _upsert_ospf_data(
                 process_id=process_id,
                 router_id=inst.get("router-id"),
                 vrf=inst.get("vrf", ""),
-                areas=inst.get("area", []),
+                areas=as_list(inst.get("area")),
                 enabled=inst.get("enabled"),
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
@@ -97,8 +98,8 @@ async def refresh_ospf_for_device(
         logger.warning("ospf.refresh.nso_error", device_id=device.id, error=repr(exc))
         return False
 
-    instances = entry.get("instance", []) if entry else []
-    interfaces = entry.get("interface", []) if entry else []
+    instances = as_list(entry.get("instance")) if entry else []
+    interfaces = as_list(entry.get("interface")) if entry else []
     await _upsert_ospf_data(db, device, instances, interfaces, refresh_source)
     logger.info(
         "ospf.refresh.done",

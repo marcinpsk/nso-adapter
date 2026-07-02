@@ -17,17 +17,28 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import select
 
+from nso_adapter.core.bgp import refresh_bgp_config_for_device
 from nso_adapter.core.importer import _attrs_to_interface_list
 from nso_adapter.core.interface_ip import refresh_interface_ips_for_device
 from nso_adapter.core.l2_service import refresh_l2_services_for_device
 from nso_adapter.core.lag_topology import refresh_lag_topology_for_device
+from nso_adapter.core.ospf import refresh_ospf_for_device
 from nso_adapter.core.subinterface import refresh_subinterface_for_device
 from nso_adapter.core.svi import refresh_svi_for_device
 from nso_adapter.core.vlan import refresh_switchport_for_device, refresh_vlan_database_for_device
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import (
     Device,
+    DeviceBgpAddressFamily,
+    DeviceBgpPeer,
+    DeviceBgpPeerAddressFamily,
+    DeviceBgpPeerGroup,
+    DeviceBgpPeerGroupAddressFamily,
+    DeviceBgpRouter,
+    DeviceBgpScope,
     DeviceL2Sap,
+    DeviceOspfInstance,
+    DeviceOspfInterface,
     DeviceSubinterface,
     DeviceSvi,
     DeviceSwitchport,
@@ -210,3 +221,94 @@ def test_attrs_to_interface_list_singleton_bare_object():
     assert len(result) == 1
     assert result[0].name == "GigabitEthernet0/1"
     assert result[0].nso.description == "uplink"
+
+
+@pytest.mark.anyio
+async def test_bgp_singleton_bare_objects(adapter_client):
+    """Every BGP child list (router / scope / address-family / peer / peer-group and
+    the per-AF lists nested under peer and peer-group) rendered as a bare object → one
+    row each. Without as_list the top-level ``for router_data in <dict>`` iterates the
+    dict keys and crashes on ``router_data.get("asn")``."""
+    device_id = await seed_device(nso_device_name="single-bgp", netbox_device_id=2610)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_bgp_config.return_value = {
+            "router": {
+                "asn": 65001,
+                "scope": {
+                    "vrf": "",
+                    "address-family": {"afi": "ipv4-unicast"},
+                    "peer": {
+                        "peer-address": "10.0.0.1",
+                        "remote-as": 65002,
+                        "peer-address-family": {"afi": "ipv4-unicast", "routemap-in": "RM_IN"},
+                    },
+                    "peer-group": {
+                        "name": "PG1",
+                        "remote-as": 65003,
+                        "peer-group-address-family": {"afi": "ipv6-unicast"},
+                    },
+                },
+            },
+        }
+
+        ok = await refresh_bgp_config_for_device(db, device, nso_client, refresh_source="poll")
+        assert ok is True
+
+        async def _count(model):
+            return (await db.execute(select(model))).scalars().all()
+
+        routers = await _count(DeviceBgpRouter)
+        assert len(routers) == 1
+        assert routers[0].asn == "65001"
+        assert len(await _count(DeviceBgpScope)) == 1
+        afs = await _count(DeviceBgpAddressFamily)
+        assert [a.af for a in afs] == ["ipv4-unicast"]
+        peers = await _count(DeviceBgpPeer)
+        assert [p.peer_address for p in peers] == ["10.0.0.1"]
+        pafs = await _count(DeviceBgpPeerAddressFamily)
+        assert [(p.af, p.routemap_in) for p in pafs] == [("ipv4-unicast", "RM_IN")]
+        pgs = await _count(DeviceBgpPeerGroup)
+        assert [g.name for g in pgs] == ["PG1"]
+        pgafs = await _count(DeviceBgpPeerGroupAddressFamily)
+        assert [g.af for g in pgafs] == ["ipv6-unicast"]
+
+
+@pytest.mark.anyio
+async def test_ospf_singleton_bare_objects(adapter_client):
+    """OSPF instance + interface rendered as bare objects → one row each, and a single
+    ``area`` under the instance is normalized to a one-element list (the ``areas`` JSON
+    column is a list of areas — a bare dict would break any downstream iteration)."""
+    device_id = await seed_device(nso_device_name="single-ospf", netbox_device_id=2611)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_ospf.return_value = {
+            "instance": {
+                "process-id": 1,
+                "router-id": "1.1.1.1",
+                "vrf": "",
+                "area": {"area-id": "0.0.0.0"},
+            },
+            "interface": {"interface-name": "GigabitEthernet0/0", "process-id": 1, "area-id": "0.0.0.0"},
+        }
+
+        ok = await refresh_ospf_for_device(db, device, nso_client, refresh_source="poll")
+        assert ok is True
+
+        instances = (
+            (await db.execute(select(DeviceOspfInstance).where(DeviceOspfInstance.device_id == device.id)))
+            .scalars()
+            .all()
+        )
+        assert len(instances) == 1
+        assert instances[0].process_id == "1"  # String(64) column
+        # the singleton area is stored as a one-element list, not a bare object
+        assert instances[0].areas == [{"area-id": "0.0.0.0"}]
+
+        interfaces = (
+            (await db.execute(select(DeviceOspfInterface).where(DeviceOspfInterface.device_id == device.id)))
+            .scalars()
+            .all()
+        )
+        assert len(interfaces) == 1
+        assert interfaces[0].interface_name == "GigabitEthernet0/0"

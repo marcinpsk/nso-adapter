@@ -16,6 +16,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
     Device,
     DeviceBgpAddressFamily,
@@ -136,7 +137,7 @@ async def _insert_bgp_peers(db: AsyncSession, scope_id: int, peer_dicts: list[di
         _add_peer_address_families(
             db,
             peer,
-            peer_data.get("peer-address-family", []),
+            as_list(peer_data.get("peer-address-family")),
             afis_by_addr[peer_addr],
             device_id=device_id,
             vrf=vrf,
@@ -179,7 +180,7 @@ async def _insert_bgp_peer_groups(db: AsyncSession, scope_id: int, pg_dicts: lis
         )
         db.add(pg)
         await db.flush()
-        _add_peer_group_address_families(db, pg, pg_data.get("peer-group-address-family", []))
+        _add_peer_group_address_families(db, pg, as_list(pg_data.get("peer-group-address-family")))
 
 
 async def _insert_bgp_scope(db: AsyncSession, router_id: int, scope_data: dict, device_id: int) -> None:
@@ -189,7 +190,7 @@ async def _insert_bgp_scope(db: AsyncSession, router_id: int, scope_data: dict, 
     db.add(scope)
     await db.flush()
 
-    for af_data in scope_data.get("address-family", []):
+    for af_data in as_list(scope_data.get("address-family")):
         # network-state-export keys the scope address-family on "afi" (yang:1090), same as the
         # peer / peer-group address-family lists — not "af" (the DB column name). Reading "af"
         # here meant DeviceBgpAddressFamily rows were never created on real oper-data.
@@ -197,8 +198,8 @@ async def _insert_bgp_scope(db: AsyncSession, router_id: int, scope_data: dict, 
         if af_name:
             db.add(DeviceBgpAddressFamily(scope_id=scope.id, af=af_name))
 
-    await _insert_bgp_peers(db, scope.id, scope_data.get("peer", []), device_id, vrf)
-    await _insert_bgp_peer_groups(db, scope.id, scope_data.get("peer-group", []))
+    await _insert_bgp_peers(db, scope.id, as_list(scope_data.get("peer")), device_id, vrf)
+    await _insert_bgp_peer_groups(db, scope.id, as_list(scope_data.get("peer-group")))
 
 
 async def _upsert_bgp_data(
@@ -225,7 +226,7 @@ async def _upsert_bgp_data(
         db.add(router)
         await db.flush()
 
-        for scope_data in router_data.get("scope", []):
+        for scope_data in as_list(router_data.get("scope")):
             await _insert_bgp_scope(db, router.id, scope_data, device.id)
 
     await db.commit()
@@ -253,10 +254,10 @@ async def refresh_bgp_config_for_device(
         logger.warning("bgp.refresh.nso_error", device_id=device.id, error=repr(exc))
         return False
 
-    routers = entry.get("router", []) if entry else []
+    routers = as_list(entry.get("router")) if entry else []
     await _upsert_bgp_data(db, device, routers, refresh_source)
 
-    peer_count = sum(len(scope_data.get("peer", [])) for r in routers for scope_data in r.get("scope", []))
+    peer_count = sum(len(as_list(scope_data.get("peer"))) for r in routers for scope_data in as_list(r.get("scope")))
     logger.info(
         "bgp.refresh.done",
         device_id=device.id,
