@@ -221,29 +221,6 @@ async def _sync_system_info(db: AsyncSession, device_id: int, entry: SnmpSystemI
     return False
 
 
-async def _propagate_snmp_removal(db: AsyncSession, device: Device) -> None:
-    """PUT-replace the snmp-reconciler with the full remaining intent so removed rows revert on-device."""
-    from nso_adapter.core.importer import get_nso_client
-    from nso_adapter.nso.apply import apply_snmp_config
-
-    device_id = device.id
-    comms = (
-        (await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)))
-        .scalars()
-        .all()
-    )
-    users = (await db.execute(select(SnmpV3UserIntent).where(SnmpV3UserIntent.device_id == device_id))).scalars().all()
-    hosts = (await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))).scalars().all()
-    sysinfo = (
-        await db.execute(select(SnmpSystemInfoIntent).where(SnmpSystemInfoIntent.device_id == device_id))
-    ).scalar_one_or_none()
-    try:
-        nso_client = get_nso_client(device.nso_instance)
-        await apply_snmp_config(nso_client, device.nso_device_name, comms, users, hosts, sysinfo, replace=True)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("snmp_intent.replace_failed", device_id=device_id, error=repr(exc))
-
-
 @router.put("/{device_id}/snmp-intent", dependencies=[Depends(verify_token)])
 async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's SNMP intent mirror for this device atomically.
@@ -319,10 +296,16 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
 
         await enqueue_apply(db, device_id, force=True)
 
-    await db.commit()
-
+    # A removal reverts on-device via an ASYNC removal job (like every other scope) — the
+    # PUT no longer blocks on a full replace-mode device commit (which could stall the PUT
+    # past the plugin client timeout). Enqueue before the commit so the job row lands with
+    # the trimmed intent it will re-apply.
     if removed:
-        await _propagate_snmp_removal(db, device)
+        from nso_adapter.core.removal import enqueue_removal
+
+        await enqueue_removal(db, device_id, "snmp")
+
+    await db.commit()
 
     logger.info(
         "snmp_intent.put.ok",

@@ -52,7 +52,7 @@ _NED_DIALECT_SCOPES: frozenset[str] = frozenset({"route_policy"})
 
 # OSPF/BGP have multi-row applies; interface_config is a compound-key (device,interface)
 # list whose removal PUT-replaces/deletes per-interface instances — all bespoke below.
-VALID_REMOVAL_SCOPES: set[str] = set(_SIMPLE_TARGETS) | {"ospf", "bgp", "interface_config"}
+VALID_REMOVAL_SCOPES: set[str] = set(_SIMPLE_TARGETS) | {"ospf", "bgp", "interface_config", "snmp"}
 
 
 async def _replace_simple(db: AsyncSession, device, client, scope: str) -> None:
@@ -215,11 +215,41 @@ async def _replace_interface_config(db: AsyncSession, device, client, interface_
         await replace_interface_config(client, device.nso_device_name, name, entry)
 
 
+async def _replace_snmp(db: AsyncSession, device, client) -> None:
+    """PUT-replace the snmp-reconciler with the device's full remaining intent (all collections).
+
+    Bespoke (not a _SIMPLE_TARGET) because apply_snmp_config takes four collections
+    — communities, v3 users, hosts, system-info — not a single model's rows.
+    """
+    from nso_adapter.nso.apply import apply_snmp_config
+    from nso_adapter.store.models import (
+        SnmpCommunityIntent,
+        SnmpHostIntent,
+        SnmpSystemInfoIntent,
+        SnmpV3UserIntent,
+    )
+
+    device_id = device.id
+    comms = (
+        (await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)))
+        .scalars()
+        .all()
+    )
+    users = (await db.execute(select(SnmpV3UserIntent).where(SnmpV3UserIntent.device_id == device_id))).scalars().all()
+    hosts = (await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))).scalars().all()
+    sysinfo = (
+        await db.execute(select(SnmpSystemInfoIntent).where(SnmpSystemInfoIntent.device_id == device_id))
+    ).scalar_one_or_none()
+    await apply_snmp_config(client, device.nso_device_name, comms, users, hosts, sysinfo, replace=True)
+
+
 async def _dispatch_scope(db: AsyncSession, device, client, scope: str, context: dict | None = None) -> None:
     if scope == "ospf":
         await _replace_ospf(db, device, client)
     elif scope == "bgp":
         await _replace_bgp(db, device, client)
+    elif scope == "snmp":
+        await _replace_snmp(db, device, client)
     elif scope == "interface_config":
         await _replace_interface_config(db, device, client, (context or {}).get("interfaces") or [])
     elif scope in _SIMPLE_TARGETS:

@@ -242,10 +242,15 @@ async def test_put_no_auto_apply_enqueues_nothing(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_put_removal_propagation_reapplies_in_replace_mode(adapter_client, monkeypatch):
-    """Dropping a row triggers a full-intent re-apply (replace=True) to revert it on-device."""
+async def test_put_removal_enqueues_async_removal_job(adapter_client, monkeypatch):
+    """s3-23: dropping a row must ENQUEUE an async removal job (not block the PUT on an inline
+    replace-mode device commit that can stall past the plugin timeout). The worker then
+    PUT-replaces the snmp service with the remaining accepted intent (replace=True)."""
+    from nso_adapter.core.removal import run_removal
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Job, JobType
+
     device_id = await seed_device(nso_device_name="snmp-prop-dev", netbox_device_id=967)
-    await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH)
 
     captured = {}
 
@@ -260,31 +265,51 @@ async def test_put_removal_propagation_reapplies_in_replace_mode(adapter_client,
     monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", _fake_get_client)
     monkeypatch.setattr("nso_adapter.nso.apply.apply_snmp_config", _fake_apply)
 
-    # Drop rw1 → a removal → propagation fires with the remaining intent.
+    await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH)
+    # No device call during a pure-add PUT.
+    assert captured == {}
+
+    # Drop rw1 → a removal → an async removal job is queued (the PUT does NOT call the device).
     trimmed = _full_body()
     trimmed["communities"] = [trimmed["communities"][0]]  # keep ro1 only
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=trimmed, headers=AUTH)
     assert resp.status_code == 200
+    assert captured == {}  # still no inline device commit — deferred to the worker
 
+    async for db in get_session():
+        jobs = (
+            (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal)))
+            .scalars()
+            .all()
+        )
+        assert len(jobs) == 1
+        assert jobs[0].context == {"scope": "snmp"}
+        job_id = jobs[0].id
+        break
+
+    # The worker runs the removal → PUT-replaces with the remaining intent.
+    await run_removal(job_id, device_id)
     assert captured["replace"] is True
     assert captured["device_name"] == "snmp-prop-dev"
     assert captured["labels"] == ["ro1"]  # rw1 gone from the re-applied set
 
 
 @pytest.mark.anyio
-async def test_put_no_removal_skips_propagation(adapter_client, monkeypatch):
-    """A pure-add/update PUT (no removals) must NOT trigger the re-apply path."""
+async def test_put_no_removal_enqueues_nothing(adapter_client):
+    """A pure-add/update PUT (no removals) must NOT enqueue a removal job."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Job, JobType
+
     device_id = await seed_device(nso_device_name="snmp-norm-dev", netbox_device_id=968)
-
-    called = False
-
-    def _boom(instance):
-        nonlocal called
-        called = True
-        return object()
-
-    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", _boom)
 
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH)
     assert resp.status_code == 200
-    assert called is False  # first write, nothing removed → no propagation
+
+    async for db in get_session():
+        jobs = (
+            (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal)))
+            .scalars()
+            .all()
+        )
+        assert jobs == []  # first write, nothing removed → no removal job
+        break
