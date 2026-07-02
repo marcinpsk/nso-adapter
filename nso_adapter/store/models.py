@@ -313,17 +313,19 @@ class InterfaceAttrState(Base):
 class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
-        # At most one active (queued/running) job per device. Closes the enqueue_job
-        # TOCTOU: the check-then-insert can't materialise two active rows even under
-        # concurrent schedulers/SSE/API (device_id is NULL for provision jobs — NULLs
-        # are distinct, so those dedup by context instead). Partial index → terminal
-        # (succeeded/failed) jobs are excluded and never block a fresh enqueue.
+        # At most one active (queued/running) job per device for the enqueue_job-managed
+        # types. Closes the enqueue_job TOCTOU: the check-then-insert can't materialise two
+        # active rows even under concurrent schedulers/SSE/API. Exclusions:
+        #   * removal jobs are intentionally per-scope (enqueue_removal queues one each for
+        #     bgp/isis/snmp/… on the same device), so they must NOT collide;
+        #   * provision jobs carry device_id=NULL (NULLs are distinct) and dedup by context.
+        # Partial index → terminal (succeeded/failed) jobs never block a fresh enqueue.
         Index(
             "uq_job_active_per_device",
             "device_id",
             unique=True,
-            sqlite_where=text("status IN ('queued', 'running')"),
-            postgresql_where=text("status IN ('queued', 'running')"),
+            sqlite_where=text("status IN ('queued', 'running') AND job_type <> 'removal'"),
+            postgresql_where=text("status IN ('queued', 'running') AND job_type <> 'removal'"),
         ),
     )
 

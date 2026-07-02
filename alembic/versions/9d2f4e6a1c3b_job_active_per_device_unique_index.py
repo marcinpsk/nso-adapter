@@ -6,8 +6,9 @@ enqueue_job's dedup was a check-then-insert (SELECT active, then INSERT) with no
 DB-level guard, so a scheduler tick + SSE + API could each pass the check and
 insert a second queued job for the same device (redundant syncs under worker
 concurrency > 1). Add a partial UNIQUE index on jobs(device_id) restricted to the
-active states so at most one queued/running job per device can exist; device_id
-is NULL for provision jobs (NULLs are distinct → those dedup by context instead).
+active states so at most one queued/running job per device can exist. Excludes
+removal jobs (enqueue_removal intentionally queues one per scope on the same
+device) and provision jobs (device_id NULL → NULLs distinct, dedup by context).
 
 Revision ID: 9d2f4e6a1c3b
 Revises: 7c2e5a9d4b18
@@ -35,7 +36,7 @@ def upgrade() -> None:
         "jobs",
         ["device_id"],
         unique=True,
-        postgresql_where=sa.text("status IN ('queued', 'running')"),
+        postgresql_where=sa.text("status IN ('queued', 'running') AND job_type <> 'removal'"),
     )
 
 

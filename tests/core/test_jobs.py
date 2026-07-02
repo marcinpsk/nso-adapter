@@ -139,6 +139,25 @@ async def test_active_job_partial_unique_index_rejects_second(adapter_client):
         break
 
 
+async def test_active_job_index_exempts_removal(adapter_client):
+    """s3-17: removal jobs are intentionally per-scope (enqueue_removal queues one each for
+    bgp/isis/snmp/…), so the one-active-per-device index must NOT block a second active
+    removal for the same device."""
+    device_id = await _seed_device("removal-multi", 4103)
+
+    async for db in get_session():
+        db.add(Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued, context={"scope": "bgp"}))
+        db.add(Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued, context={"scope": "isis"}))
+        await db.commit()  # no IntegrityError — removal is exempt from the active-job index
+        actives = (
+            (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal)))
+            .scalars()
+            .all()
+        )
+        assert len(actives) == 2
+        break
+
+
 async def test_active_job_index_allows_new_after_terminal(adapter_client):
     """A finished (succeeded/failed) job must not block a fresh active job for the device."""
     device_id = await _seed_device("dup-terminal", 4101)
