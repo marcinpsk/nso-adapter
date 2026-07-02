@@ -526,3 +526,94 @@ async def test_handle_bgp_change_known_device_refreshes(adapter_client):
         assert routers[0].refresh_source == "sse"
         break
     assert fake.calls == ["bgp-sse"]
+
+
+async def test_same_neighbor_af_conflict_across_groups_is_observable(adapter_client):
+    """s2-8: the same neighbor+afi listed under two groups with DIFFERENT policies can't
+    be stored twice (uq_devicebgppeeraf_identity). First occurrence wins on the row, but
+    the dropped second policy must be OBSERVABLE (logged), not silently swallowed."""
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.bgp import _upsert_bgp_data
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device, DeviceBgpPeerAddressFamily
+
+    device_id = await seed_device(nso_device_name="bgp-afconflict", netbox_device_id=898)
+    routers = [
+        {
+            "asn": "65100",
+            "scope": [
+                {
+                    "vrf": "",
+                    "address-family": [{"afi": "ipv4-unicast"}],
+                    "peer": [
+                        {
+                            "peer-address": "10.0.0.1",
+                            "peer-group": "v4-A",
+                            "peer-address-family": [{"afi": "ipv4-unicast", "routemap-in": "RM-A"}],
+                        },
+                        {
+                            "peer-address": "10.0.0.1",
+                            "peer-group": "v4-B",
+                            "peer-address-family": [{"afi": "ipv4-unicast", "routemap-in": "RM-B"}],
+                        },
+                    ],
+                }
+            ],
+        }
+    ]
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        with capture_logs() as logs:
+            await _upsert_bgp_data(db, device, routers, "test")
+        afs = (await db.execute(select(DeviceBgpPeerAddressFamily))).scalars().all()
+        # one row (unique constraint) — first occurrence wins
+        assert len(afs) == 1
+        assert afs[0].routemap_in == "RM-A"
+        # the dropped RM-B policy is surfaced, not silently swallowed
+        events = [e.get("event") for e in logs]
+        assert "bgp.peer_af_conflict_across_groups" in events
+        break
+
+
+async def test_same_neighbor_identical_af_across_groups_is_quiet(adapter_client):
+    """s2-8: an identical AF policy repeated across groups is a benign duplicate — no
+    conflict warning (only a genuinely different second policy is observable)."""
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.bgp import _upsert_bgp_data
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device, DeviceBgpPeerAddressFamily
+
+    device_id = await seed_device(nso_device_name="bgp-afsame", netbox_device_id=899)
+    routers = [
+        {
+            "asn": "65100",
+            "scope": [
+                {
+                    "vrf": "",
+                    "peer": [
+                        {
+                            "peer-address": "10.0.0.1",
+                            "peer-group": "v4-A",
+                            "peer-address-family": [{"afi": "ipv4-unicast", "routemap-in": "RM"}],
+                        },
+                        {
+                            "peer-address": "10.0.0.1",
+                            "peer-group": "v4-B",
+                            "peer-address-family": [{"afi": "ipv4-unicast", "routemap-in": "RM"}],
+                        },
+                    ],
+                }
+            ],
+        }
+    ]
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        with capture_logs() as logs:
+            await _upsert_bgp_data(db, device, routers, "test")
+        afs = (await db.execute(select(DeviceBgpPeerAddressFamily))).scalars().all()
+        assert len(afs) == 1
+        events = [e.get("event") for e in logs]
+        assert "bgp.peer_af_conflict_across_groups" not in events
+        break

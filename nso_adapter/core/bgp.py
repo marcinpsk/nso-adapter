@@ -30,26 +30,65 @@ from nso_adapter.store.models import (
 logger = structlog.get_logger(__name__)
 
 
+def _paf_policy(paf_data: dict) -> dict:
+    """Normalize a peer address-family's policy fields across NED dialects.
+
+    IOS splits route-map vs prefix-list; Junos/Timos use a single per-AF policy
+    (policy-in/out) which maps to a route-map.
+    """
+    return {
+        "enabled": bool(paf_data.get("enabled", True)),
+        "routemap_in": paf_data.get("routemap-in") or paf_data.get("policy-in") or None,
+        "routemap_out": paf_data.get("routemap-out") or paf_data.get("policy-out") or None,
+        "prefixlist_in": paf_data.get("prefixlist-in") or None,
+        "prefixlist_out": paf_data.get("prefixlist-out") or None,
+    }
+
+
 def _add_peer_address_families(
-    db: AsyncSession, peer: DeviceBgpPeer, paf_dicts: list[dict], seen_afis: set[str]
+    db: AsyncSession,
+    peer: DeviceBgpPeer,
+    paf_dicts: list[dict],
+    seen_afs: dict[str, dict],
+    *,
+    device_id: int,
+    vrf: str,
 ) -> None:
-    """Add a peer's per-AF policy rows, skipping blank/duplicate afis (merged across groups)."""
+    """Add a peer's per-AF policy rows, deduped by afi across the neighbor's groups.
+
+    A neighbor listed under >1 group can repeat an afi, but (peer_id, af) is unique
+    so only the FIRST occurrence's policy is stored. If a later occurrence carries a
+    genuinely DIFFERENT policy for that afi it cannot be represented — surface it
+    (``bgp.peer_af_conflict_across_groups``) instead of dropping it silently.
+    """
     for paf_data in paf_dicts:
         paf_name = paf_data.get("afi", "")
-        if not paf_name or paf_name in seen_afis:
+        if not paf_name:
             continue
-        seen_afis.add(paf_name)
+        policy = _paf_policy(paf_data)
+        prior = seen_afs.get(paf_name)
+        if prior is not None:
+            if prior != policy:
+                logger.warning(
+                    "bgp.peer_af_conflict_across_groups",
+                    device_id=device_id,
+                    vrf=vrf,
+                    peer_address=peer.peer_address,
+                    afi=paf_name,
+                    kept=prior,
+                    dropped=policy,
+                )
+            continue
+        seen_afs[paf_name] = policy
         db.add(
             DeviceBgpPeerAddressFamily(
                 peer_id=peer.id,
                 af=paf_name,
-                enabled=bool(paf_data.get("enabled", True)),
-                # IOS splits route-map vs prefix-list; Junos/Timos use a single
-                # per-AF policy (policy-in/out) which maps to a route-map.
-                routemap_in=paf_data.get("routemap-in") or paf_data.get("policy-in") or None,
-                routemap_out=paf_data.get("routemap-out") or paf_data.get("policy-out") or None,
-                prefixlist_in=paf_data.get("prefixlist-in") or None,
-                prefixlist_out=paf_data.get("prefixlist-out") or None,
+                enabled=policy["enabled"],
+                routemap_in=policy["routemap_in"],
+                routemap_out=policy["routemap_out"],
+                prefixlist_in=policy["prefixlist_in"],
+                prefixlist_out=policy["prefixlist_out"],
             )
         )
 
@@ -64,7 +103,7 @@ async def _insert_bgp_peers(db: AsyncSession, scope_id: int, peer_dicts: list[di
     peer fields: first occurrence wins; ``enabled`` is the OR across occurrences).
     """
     peers_by_addr: dict[str, DeviceBgpPeer] = {}
-    afis_by_addr: dict[str, set[str]] = {}
+    afis_by_addr: dict[str, dict[str, dict]] = {}
     for peer_data in peer_dicts:
         peer_addr = peer_data.get("peer-address", "")
         if not peer_addr:
@@ -86,7 +125,7 @@ async def _insert_bgp_peers(db: AsyncSession, scope_id: int, peer_dicts: list[di
             db.add(peer)
             await db.flush()
             peers_by_addr[peer_addr] = peer
-            afis_by_addr[peer_addr] = set()
+            afis_by_addr[peer_addr] = {}
         else:
             # Same peer in multiple groups (e.g. one active, one deactivated):
             # the peer is enabled if ANY occurrence is active.
@@ -94,7 +133,14 @@ async def _insert_bgp_peers(db: AsyncSession, scope_id: int, peer_dicts: list[di
                 peer.enabled = True
             logger.debug("bgp.peer_merged_across_groups", device_id=device_id, vrf=vrf, peer_address=peer_addr)
 
-        _add_peer_address_families(db, peer, peer_data.get("peer-address-family", []), afis_by_addr[peer_addr])
+        _add_peer_address_families(
+            db,
+            peer,
+            peer_data.get("peer-address-family", []),
+            afis_by_addr[peer_addr],
+            device_id=device_id,
+            vrf=vrf,
+        )
 
 
 def _add_peer_group_address_families(db: AsyncSession, pg: DeviceBgpPeerGroup, pgaf_dicts: list[dict]) -> None:
