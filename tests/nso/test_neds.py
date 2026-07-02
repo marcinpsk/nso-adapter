@@ -86,6 +86,16 @@ def test_ned_transport_generic_and_unknown():
     assert ned_transport("") is None
 
 
+def test_ned_transport_ignores_embedded_token_off_convention():
+    """The transport is anchored to the segment before the version — a transport-like token
+    elsewhere in the id (a vendor/model segment) must NOT be mistaken for it (#25)."""
+    from nso_adapter.nso.neds import ned_transport
+
+    # "cli" is a model/vendor segment; the conventional transport position ("bar") is not a
+    # recognised transport → None, rather than falsely resolving to "cli" via a leftward scan.
+    assert ned_transport("foo-cli-bar-9.9") is None
+
+
 def test_resolve_device_type_derives_from_ned_id():
     from nso_adapter.nso.neds import resolve_device_type
 

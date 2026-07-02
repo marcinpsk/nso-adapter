@@ -46,16 +46,22 @@ def ned_transport(ned_id: str) -> str | None:
     """Return the NSO ``device-type`` transport encoded in *ned_id*, or None.
 
     The transport (cli / netconf / generic / snmp) is part of the NED id naming
-    convention — e.g. ``juniper-junos-nc-4.19`` is a NETCONF NED (``-nc-``), not a
-    CLI one. Handles the doubled identityref form NSO RESTCONF returns
-    (``juniper-junos-nc-4.19:juniper-junos-nc-4.19``).
+    convention ``<vendor>-<os>-<transport>-<version>`` — e.g. ``juniper-junos-nc-4.19``
+    is a NETCONF NED (``-nc-``), not a CLI one. Handles the doubled identityref form NSO
+    RESTCONF returns (``juniper-junos-nc-4.19:juniper-junos-nc-4.19``).
+
+    The transport is ANCHORED to the segment immediately before the version (or the last
+    segment when there is no version suffix), so a transport-like token elsewhere in the
+    id (a vendor/model segment such as ``foo-cli-bar-9.9``) cannot be mistaken for it.
     """
-    core = ned_id.split(":")[-1]
-    for tok in reversed(core.split("-")):
-        transport = _NED_PROTO_TO_TRANSPORT.get(tok.lower())
-        if transport is not None:
-            return transport
-    return None
+    segments = ned_id.split(":")[-1].split("-")
+    if not segments:
+        return None
+    # A version suffix contains a digit (e.g. "6.114", "24.4"); when present the transport
+    # is the segment before it, otherwise it is the final segment.
+    has_version = any(ch.isdigit() for ch in segments[-1])
+    idx = -2 if (has_version and len(segments) >= 2) else -1
+    return _NED_PROTO_TO_TRANSPORT.get(segments[idx].lower())
 
 
 def resolve_device_type(ned_id: str, requested: str | None = None) -> str:
