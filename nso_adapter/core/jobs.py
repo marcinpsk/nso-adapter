@@ -99,6 +99,24 @@ async def enqueue_provision_job(params: dict, db: AsyncSession) -> tuple[Job, bo
 # ── Job runners ───────────────────────────────────────────────────────────────
 
 
+async def _mark_job_failed(db: AsyncSession, job_id: int, error: dict) -> None:
+    """Record a terminal ``failed`` status on *job_id*, tolerating a poisoned session.
+
+    A DB-origin error inside a runner's ``try`` leaves the AsyncSession in a
+    needs-rollback state; committing the failed status without rolling back first
+    would itself re-raise (PendingRollbackError) and strand the job in ``running``.
+    Roll back, re-fetch the (possibly expired) job, then commit the terminal status.
+    Same fix as :func:`core.apply.run_apply` (finding #11); shared so the other
+    runners stay consistent.
+    """
+    await db.rollback()
+    job = await db.get(Job, job_id)
+    if job is not None:
+        job.status = JobStatus.failed
+        job.error = error
+        await db.commit()
+
+
 async def _run_with_db(job_id: int, device_id: int, coro_factory) -> None:
     from nso_adapter.store.db import get_session
 
@@ -117,20 +135,17 @@ async def _run_with_db(job_id: int, device_id: int, coro_factory) -> None:
             result = await asyncio.wait_for(coro_factory(device_id, db), timeout=_JOB_TIMEOUT)
             job.status = JobStatus.succeeded
             job.result = result
+            await db.commit()
         except TimeoutError:
             logger.error("job.timeout", job_id=job_id, device_id=device_id, timeout=_JOB_TIMEOUT)
-            job.status = JobStatus.failed
-            job.error = {
-                "code": "timeout",
-                "message": f"Job exceeded {int(_JOB_TIMEOUT)}s timeout",
-                "detail": {},
-            }
+            await _mark_job_failed(
+                db,
+                job_id,
+                {"code": "timeout", "message": f"Job exceeded {int(_JOB_TIMEOUT)}s timeout", "detail": {}},
+            )
         except Exception as exc:
             logger.exception("job.failed", job_id=job_id, device_id=device_id, error=repr(exc))
-            job.status = JobStatus.failed
-            job.error = {"code": "internal", "message": repr(exc), "detail": {}}
-        finally:
-            await db.commit()
+            await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}})
 
 
 async def _run_sync(job_id: int, device_id: int) -> None:
@@ -176,20 +191,17 @@ async def _run_connect(job_id: int, device_id: int) -> None:
             result = await asyncio.wait_for(_do_connect(device_id, db), timeout=_JOB_TIMEOUT)
             job.status = JobStatus.succeeded
             job.result = result
+            await db.commit()
         except TimeoutError:
             logger.error("job.connect.timeout", job_id=job_id, timeout=_JOB_TIMEOUT)
-            job.status = JobStatus.failed
-            job.error = {
-                "code": "timeout",
-                "message": f"Connect exceeded {int(_JOB_TIMEOUT)}s timeout",
-                "detail": {},
-            }
+            await _mark_job_failed(
+                db,
+                job_id,
+                {"code": "timeout", "message": f"Connect exceeded {int(_JOB_TIMEOUT)}s timeout", "detail": {}},
+            )
         except Exception as exc:
             logger.exception("job.connect.failed", job_id=job_id, error=repr(exc))
-            job.status = JobStatus.failed
-            job.error = {"code": "internal", "message": repr(exc), "detail": {}}
-        finally:
-            await db.commit()
+            await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}})
 
 
 async def _run_apply(job_id: int, device_id: int) -> None:
@@ -237,16 +249,17 @@ async def _run_provision(job_id: int, device_id: int | None) -> None:
             # Link the job to the device it created so history/lookup works post-onboard.
             if result.get("device_id") is not None:
                 job.device_id = result["device_id"]
+            await db.commit()
         except TimeoutError:
             logger.error("job.provision.timeout", job_id=job_id, timeout=_JOB_TIMEOUT)
-            job.status = JobStatus.failed
-            job.error = {"code": "timeout", "message": f"Provision exceeded {int(_JOB_TIMEOUT)}s timeout", "detail": {}}
+            await _mark_job_failed(
+                db,
+                job_id,
+                {"code": "timeout", "message": f"Provision exceeded {int(_JOB_TIMEOUT)}s timeout", "detail": {}},
+            )
         except Exception as exc:
             logger.exception("job.provision.failed", job_id=job_id, error=repr(exc))
-            job.status = JobStatus.failed
-            job.error = {"code": "internal", "message": repr(exc), "detail": {}}
-        finally:
-            await db.commit()
+            await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}})
 
 
 _JOB_RUNNERS = {

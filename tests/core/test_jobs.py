@@ -14,6 +14,7 @@ from nso_adapter.core.jobs import (
     _run_apply,
     _run_connect,
     _run_detect_drift,
+    _run_provision,
     _run_sync,
     _run_with_db,
     enqueue_job,
@@ -192,6 +193,26 @@ async def test_run_with_db_job_not_found(adapter_client):
     await _run_with_db(99999, device_id, success_factory)
 
 
+async def test_run_with_db_marks_failed_even_when_session_poisoned(adapter_client):
+    """A DB-origin error inside the factory poisons the session (needs-rollback); the failure
+    handler must rollback before the failed-status commit, or that commit itself re-raises and
+    the job is stranded 'running' (s3-5 — same fix as run_apply #11)."""
+    device_id = await _seed_device("rtr-poison-db", 71)
+    job_id = await _seed_job(device_id, JobStatus.queued)
+
+    async def poison_factory(dev_id, db):
+        # A duplicate PK insert → IntegrityError → AsyncSession enters needs-rollback,
+        # exactly like a failed flush mid-sync.
+        db.add(Job(id=job_id, job_type=JobType.sync, device_id=dev_id, status=JobStatus.queued))
+        await db.flush()
+
+    await _run_with_db(job_id, device_id, poison_factory)
+
+    async for db in get_session():
+        assert (await db.get(Job, job_id)).status == JobStatus.failed
+        break
+
+
 # ── _run_sync and _run_detect_drift ───────────────────────────────────────
 
 
@@ -319,6 +340,40 @@ async def test_run_connect_timeout(adapter_client):
         break
 
 
+async def test_run_connect_marks_failed_even_when_session_poisoned(adapter_client):
+    """Same poisoned-session guard for _run_connect (s3-5). The connect boundary doesn't take
+    the runner's db, so a capturing get_session wrapper hands the poison stub the real session
+    to fail a flush on — proving the runner rolls back before committing the failed status."""
+    device_id = await _seed_device("rtr-poison-c", 72)
+    job_id = await _seed_job(device_id, JobStatus.queued)
+
+    from nso_adapter.store import db as db_mod
+
+    real_get_session = db_mod.get_session
+    captured: dict = {}
+
+    async def capturing_get_session():
+        async for db in real_get_session():
+            captured["db"] = db
+            yield db
+
+    async def poison_connect(client, name):
+        db = captured["db"]
+        db.add(Job(id=job_id, job_type=JobType.connect, device_id=device_id, status=JobStatus.queued))
+        await db.flush()  # duplicate PK → session poisoned
+
+    with (
+        patch("nso_adapter.store.db.get_session", capturing_get_session),
+        patch("nso_adapter.core.importer.get_nso_client", return_value=object()),
+        patch("nso_adapter.nso.actions.connect", poison_connect),
+    ):
+        await _run_connect(job_id, device_id)
+
+    async for db in get_session():
+        assert (await db.get(Job, job_id)).status == JobStatus.failed
+        break
+
+
 # ── _run_apply ────────────────────────────────────────────────────────────────
 
 
@@ -330,3 +385,35 @@ async def test_run_apply_calls_run_apply(adapter_client):
     with patch("nso_adapter.core.apply.run_apply", new_callable=AsyncMock) as mock_run:
         await _run_apply(job_id, device_id)
         mock_run.assert_called_once_with(job_id, device_id, force=True)
+
+
+# ── _run_provision ──────────────────────────────────────────────────────────────
+
+
+async def test_run_provision_marks_failed_even_when_session_poisoned(adapter_client):
+    """Same poisoned-session guard for _run_provision (s3-5). provision_nso_device takes the
+    runner's db, so a poisoning stub leaves the session needs-rollback; the runner must
+    rollback before committing the failed status or the provision job hangs 'running'."""
+    async for db in get_session():
+        j = Job(
+            job_type=JobType.provision,
+            device_id=None,
+            status=JobStatus.queued,
+            context={"nso_instance": "nso-dev", "device_name": "prov-poison"},
+        )
+        db.add(j)
+        await db.commit()
+        await db.refresh(j)
+        job_id = j.id
+        break
+
+    async def poison_provision(db, **params):
+        db.add(Job(id=job_id, job_type=JobType.provision, status=JobStatus.queued))
+        await db.flush()  # duplicate PK → session poisoned
+
+    with patch("nso_adapter.core.onboarding.provision_nso_device", poison_provision):
+        await _run_provision(job_id, None)
+
+    async for db in get_session():
+        assert (await db.get(Job, job_id)).status == JobStatus.failed
+        break

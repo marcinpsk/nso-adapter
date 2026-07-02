@@ -332,3 +332,31 @@ async def test_run_removal_records_failure(adapter_client):
         assert job.status == JobStatus.failed
         assert job.error["code"] == "removal_failed"
         break
+
+
+async def test_run_removal_marks_failed_even_when_session_poisoned(adapter_client):
+    """A DB-origin error in dispatch poisons the session (needs-rollback); the failure handler
+    must rollback before the failed-status commit, or that commit re-raises and the job is
+    stranded 'running' (s3-5 — same fix as run_apply #11)."""
+    from nso_adapter.core.removal import run_removal
+
+    device_id = await _seed_device(nso_device_name="sw-poison")
+    job_id = await _seed_removal_job(device_id, "vlan")
+
+    async def poison(db, device, client, scope, context=None):
+        # A duplicate PK insert → IntegrityError → AsyncSession enters needs-rollback,
+        # exactly like a failed flush during the PUT-replace's row bookkeeping.
+        db.add(Job(id=job_id, job_type=JobType.removal, device_id=device.id, status=JobStatus.queued))
+        await db.flush()
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_CLIENT),
+        patch("nso_adapter.core.removal._dispatch_scope", new=poison),
+    ):
+        await run_removal(job_id=job_id, device_id=device_id)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.error["code"] == "removal_failed"
+        break

@@ -280,12 +280,14 @@ async def run_removal(job_id: int, device_id: int) -> None:
             await _dispatch_scope(db, device, client, scope, context)
             job.status = JobStatus.succeeded
             job.result = {"scope": scope}
-        except Exception as exc:  # noqa: BLE001 — record on the job, never crash the worker
-            logger.error("removal.failed", job_id=job_id, device_id=device_id, scope=scope, error=repr(exc))
-            job.status = JobStatus.failed
-            job.error = {"code": "removal_failed", "message": repr(exc), "detail": {"scope": scope}}
-        finally:
             await db.commit()
+        except Exception as exc:  # noqa: BLE001 — record on the job, never crash the worker
+            from nso_adapter.core.jobs import _mark_job_failed
+
+            logger.error("removal.failed", job_id=job_id, device_id=device_id, scope=scope, error=repr(exc))
+            await _mark_job_failed(
+                db, job_id, {"code": "removal_failed", "message": repr(exc), "detail": {"scope": scope}}
+            )
 
 
 async def replace_on_removal(db: AsyncSession, device, removed, store_model, apply_callable=None) -> bool:
