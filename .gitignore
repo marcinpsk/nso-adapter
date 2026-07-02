@@ -31,7 +31,9 @@ htmlcov/
 .env
 .env.*
 !.env.example
-secrets/
+# Root-anchored: a top-level secrets/ dir of credential files — NOT the
+# nso_adapter/secrets/ source package or tests/secrets/.
+/secrets/
 *.pem
 *.key
 
