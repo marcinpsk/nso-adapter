@@ -31,10 +31,21 @@ async def _upsert_lag_configs(
 
     now = datetime.now(UTC).replace(tzinfo=None)
     for bundle in bundles_data:
+        # name + lag-id are the NOT-NULL identity; a bundle missing either (or a non-numeric
+        # lag-id) is malformed — skip it rather than KeyError/ValueError-abort the upsert
+        # (which runs outside the fetch try/except) and freeze the whole LAG mirror.
+        name = bundle.get("name")
+        lag_id_raw = bundle.get("lag-id")
+        if not name or lag_id_raw is None:
+            continue
+        try:
+            lag_id = int(lag_id_raw)
+        except (TypeError, ValueError):
+            continue
         b = LagBundleConfig(
             device_id=device.id,
-            name=bundle["name"],
-            lag_id=int(bundle["lag-id"]),
+            name=name,
+            lag_id=lag_id,
             min_links=bundle.get("min-links"),
             system_priority=bundle.get("system-priority"),
             system_id=bundle.get("system-id"),
@@ -46,10 +57,13 @@ async def _upsert_lag_configs(
         db.add(b)
         await db.flush()
         for member in bundle.get("member", []):
+            member_name = member.get("interface-name")
+            if not member_name:
+                continue  # NOT-NULL member key missing → skip this member
             db.add(
                 LagMemberConfig(
                     lag_bundle_id=b.id,
-                    interface_name=member["interface-name"],
+                    interface_name=member_name,
                     mode=member.get("mode"),
                     port_priority=member.get("port-priority"),
                 )

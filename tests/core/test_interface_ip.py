@@ -66,6 +66,34 @@ async def test_refresh_inserts_addresses(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_refresh_coerces_explicit_null_vrf_and_family(adapter_client):
+    """An explicit JSON null for vrf/family (not just an absent key) must coerce to the
+    defaults, not land None in the NOT-NULL columns and IntegrityError-abort the whole
+    full-replace (dict.get(key, default) only defaults an ABSENT key) — s3-8."""
+    device_id = await seed_device(nso_device_name="ip-nullvrf", netbox_device_id=915)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_interface_ips.return_value = {
+            "name": "ip-nullvrf",
+            "interface": [
+                {
+                    "interface-name": "GigabitEthernet0/1",
+                    "address": [{"address": "10.0.1.1/24", "vrf": None, "family": None, "secondary": False}],
+                }
+            ],
+        }
+
+        await refresh_interface_ips_for_device(db, device, nso_client, refresh_source="poll")
+
+        row = (
+            await db.execute(select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id))
+        ).scalar_one()
+        assert row.address == "10.0.1.1/24"
+        assert row.vrf == ""  # None coerced to the global-table default
+        assert row.family == "ipv4"  # None coerced to the ipv4 default
+
+
+@pytest.mark.anyio
 async def test_refresh_full_replaces_existing_rows(adapter_client):
     """Second refresh replaces previous rows entirely (no duplicates)."""
     device_id = await seed_device(nso_device_name="ip-sw02", netbox_device_id=911)

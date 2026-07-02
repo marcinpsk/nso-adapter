@@ -69,6 +69,39 @@ async def test_refresh_lag_config_happy(adapter_client):
         }
 
 
+async def test_refresh_lag_config_skips_malformed_bundles_and_members(adapter_client):
+    """A bundle missing name/lag-id, or a member missing interface-name, must be skipped —
+    not KeyError-abort the upsert (which sits OUTSIDE the fetch try/except) and freeze the
+    whole LAG mirror for the device (s2-6)."""
+    device_id = await seed_device(nso_device_name="sw-malformed", netbox_device_id=912)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_lag_config.return_value = {
+            "device-name": "sw-malformed",
+            "lag": [
+                {"lag-id": 9, "member": []},  # missing name → skip
+                {"name": "Port-channel3", "member": []},  # missing lag-id → skip
+                {
+                    "name": "Port-channel1",
+                    "lag-id": 1,
+                    "member": [
+                        {"mode": "active"},  # missing interface-name → skip
+                        {"interface-name": "GigabitEthernet0/1", "mode": "active"},
+                    ],
+                },
+            ],
+        }
+
+        await refresh_lag_config_for_device(db, device, nso_client, refresh_source="poll")
+
+        bundles = (
+            (await db.execute(select(LagBundleConfig).where(LagBundleConfig.device_id == device.id))).scalars().all()
+        )
+        members = (await db.execute(select(LagMemberConfig))).scalars().all()
+        assert [b.name for b in bundles] == ["Port-channel1"]  # only the well-formed bundle
+        assert [m.interface_name for m in members] == ["GigabitEthernet0/1"]  # nameless member skipped
+
+
 @pytest.mark.anyio
 async def test_refresh_lag_config_clears_on_404(adapter_client):
     device_id = await seed_device(nso_device_name="sw03", netbox_device_id=911)

@@ -35,10 +35,13 @@ async def _upsert_ospf_data(
     now = datetime.now(UTC).replace(tzinfo=None)
 
     for inst in instances:
+        process_id = inst.get("process-id")
+        if not process_id:
+            continue  # malformed instance with no process-id → nothing to key on; skip
         db.add(
             DeviceOspfInstance(
                 device_id=device.id,
-                process_id=inst["process-id"],
+                process_id=process_id,
                 router_id=inst.get("router-id"),
                 vrf=inst.get("vrf", ""),
                 areas=inst.get("area", []),

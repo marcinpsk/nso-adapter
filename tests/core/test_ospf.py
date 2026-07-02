@@ -68,3 +68,22 @@ async def test_ospf_two_instances_same_process_across_vrfs(adapter_client):
         )
         assert sorted((r.process_id, r.vrf) for r in rows) == [("1", ""), ("1", "BLUE")]
         break
+
+
+async def test_ospf_instance_without_process_id_is_skipped_not_crash(adapter_client):
+    """An OSPF instance dict missing its process-id must be skipped, not KeyError-abort the
+    whole full-replace (which would also drop the valid instances/interfaces) — s2-5."""
+    from nso_adapter.core.ospf import _upsert_ospf_data
+
+    device_id = await _seed_device(nso_device_name="ospf-noproc", netbox_device_id=502)
+    instances = [{"router-id": "1.1.1.1"}, {"process-id": "1"}]  # first is malformed
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        await _upsert_ospf_data(db, device, instances, [], "test")
+        rows = (
+            (await db.execute(select(DeviceOspfInstance).where(DeviceOspfInstance.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        assert [r.process_id for r in rows] == ["1"]  # malformed skipped, valid kept
+        break

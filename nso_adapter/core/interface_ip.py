@@ -37,8 +37,10 @@ async def _upsert_ip_addresses(
         bound_port = iface.get("bound-port") or None  # None for non-Nokia or unbound
         for addr_entry in iface.get("address", []):
             address = addr_entry.get("address", "")
-            vrf = addr_entry.get("vrf", "")
-            family = addr_entry.get("family", "ipv4")
+            # `or default` (not `.get(k, default)`): the export can carry an explicit null,
+            # and None would violate these NOT-NULL columns (vrf is also in the dedup unique).
+            vrf = addr_entry.get("vrf") or ""
+            family = addr_entry.get("family") or "ipv4"
             secondary = addr_entry.get("secondary", False)
             if not address:
                 continue
