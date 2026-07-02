@@ -122,3 +122,76 @@ async def test_duplicate_object_names_are_deduped_not_crashing(adapter_client): 
         assert [p.name for p in pls] == ["DUP"]  # deduped to one, refresh did not crash
         assert [a.name for a in aps] == ["AP"]
         return
+
+
+@pytest.mark.asyncio
+async def test_read_skips_malformed_entries_without_wiping_mirror(adapter_client):  # noqa: F811
+    """A malformed entry — a missing required leaf, a list without a name, or a null community
+    that would crash the dialect (None.strip()) — must be skipped, not KeyError/AttributeError-
+    abort the 4-family full-replace and wipe the whole mirror (s2-4)."""
+    from nso_adapter.core.route_policy import _upsert_route_policy_data
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import (
+        Device,
+        DeviceRoutePolicyCommunityListEntry,
+        DeviceRoutePolicyPrefixList,
+        DeviceRoutePolicyPrefixListEntry,
+    )
+
+    nso_data = {
+        "prefix-list": [
+            {
+                "name": "PL",
+                "family": 4,
+                "entry": [
+                    {"sequence": 10, "action": "permit"},  # missing prefix → skip entry
+                    {"sequence": 20, "action": "permit", "prefix": "10.0.0.0/8"},
+                ],
+            },
+            {"family": 4, "entry": []},  # missing name → skip whole list
+        ],
+        "community-list": [
+            {
+                "name": "CL",
+                "entry": [
+                    {"sequence": 10, "action": "permit", "community": None},  # null → skip, no crash
+                    {"sequence": 20, "action": "permit", "community": "no-export"},
+                ],
+            }
+        ],
+    }
+
+    async for db in get_session():
+        device = Device(
+            nso_instance="default", nso_device_name="ra-malformed", netbox_device_id=9993, ned_id="timos-nc-23.10"
+        )
+        db.add(device)
+        await db.flush()
+
+        await _upsert_route_policy_data(db, device, nso_data, "test")  # must not raise
+
+        pls = (
+            (
+                await db.execute(
+                    select(DeviceRoutePolicyPrefixList).where(DeviceRoutePolicyPrefixList.device_id == device.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [p.name for p in pls] == ["PL"]  # nameless list skipped
+        pl_entries = (
+            (
+                await db.execute(
+                    select(DeviceRoutePolicyPrefixListEntry).where(
+                        DeviceRoutePolicyPrefixListEntry.prefix_list_id == pls[0].id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [e.prefix for e in pl_entries] == ["10.0.0.0/8"]  # prefix-less entry skipped
+        cl_entries = (await db.execute(select(DeviceRoutePolicyCommunityListEntry))).scalars().all()
+        assert [e.community for e in cl_entries] == ["no-export"]  # null-community entry skipped
+        return

@@ -39,6 +39,15 @@ def _content_hash(obj: object) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
+def _required(entry: dict, *keys: str) -> bool:
+    """Report whether every required (NOT-NULL) leaf is present and non-null.
+
+    A malformed entry missing one of these would otherwise KeyError (direct subscript) or
+    land None in a NOT-NULL column — either way aborting and wiping the 4-family full-replace.
+    """
+    return all(entry.get(k) is not None for k in keys)
+
+
 def _dedup_by_name(items: list, family: str, device_name: str) -> list:
     """Drop objects repeating a name within one refresh (keep the first, log the rest).
 
@@ -60,6 +69,119 @@ def _dedup_by_name(items: list, family: str, device_name: str) -> list:
     return out
 
 
+async def _upsert_prefix_lists(db, device, items, now, refresh_source) -> None:
+    for pl_data in _dedup_by_name(items, "prefix-list", device.nso_device_name):
+        if not pl_data.get("name"):
+            continue  # list without a name → nothing to key on
+        pl = DeviceRoutePolicyPrefixList(
+            device_id=device.id,
+            name=pl_data["name"],
+            family=pl_data.get("family", 4),
+            content_hash=_content_hash(pl_data),
+            last_refreshed_at=now,
+            refresh_source=refresh_source,
+        )
+        db.add(pl)
+        await db.flush()
+        for e in pl_data.get("entry", []):
+            if not _required(e, "sequence", "action", "prefix"):
+                continue
+            db.add(
+                DeviceRoutePolicyPrefixListEntry(
+                    prefix_list_id=pl.id,
+                    sequence=e["sequence"],
+                    action=e["action"],
+                    prefix=e["prefix"],
+                    ge=e.get("ge"),
+                    le=e.get("le"),
+                )
+            )
+
+
+async def _upsert_community_lists(db, device, items, now, refresh_source, dialect) -> None:
+    for cl_data in _dedup_by_name(items, "community-list", device.nso_device_name):
+        if not cl_data.get("name"):
+            continue
+        cl = DeviceRoutePolicyCommunityList(
+            device_id=device.id,
+            name=cl_data["name"],
+            invert_match=bool(cl_data.get("invert-match", False)),
+            content_hash=_content_hash(cl_data),
+            last_refreshed_at=now,
+            refresh_source=refresh_source,
+        )
+        db.add(cl)
+        await db.flush()
+        for e in cl_data.get("entry", []):
+            # null/absent community would also crash dialect.to_canonical (None.strip()).
+            if not _required(e, "sequence", "action", "community"):
+                continue
+            db.add(
+                DeviceRoutePolicyCommunityListEntry(
+                    community_list_id=cl.id,
+                    sequence=e["sequence"],
+                    action=e["action"],
+                    community=dialect.to_canonical(e["community"]),
+                )
+            )
+
+
+async def _upsert_as_paths(db, device, items, now, refresh_source) -> None:
+    for ap_data in _dedup_by_name(items, "as-path", device.nso_device_name):
+        if not ap_data.get("name"):
+            continue
+        ap = DeviceRoutePolicyASPath(
+            device_id=device.id,
+            name=ap_data["name"],
+            content_hash=_content_hash(ap_data),
+            last_refreshed_at=now,
+            refresh_source=refresh_source,
+        )
+        db.add(ap)
+        await db.flush()
+        for e in ap_data.get("entry", []):
+            if not _required(e, "sequence", "action", "pattern"):
+                continue
+            db.add(
+                DeviceRoutePolicyASPathEntry(
+                    as_path_id=ap.id,
+                    sequence=e["sequence"],
+                    action=e["action"],
+                    pattern=e["pattern"],
+                )
+            )
+
+
+async def _upsert_route_maps(db, device, items, now, refresh_source) -> None:
+    for rm_data in _dedup_by_name(items, "route-map", device.nso_device_name):
+        if not rm_data.get("name"):
+            continue
+        rm = DeviceRoutePolicyRouteMap(
+            device_id=device.id,
+            name=rm_data["name"],
+            content_hash=_content_hash(rm_data),
+            last_refreshed_at=now,
+            refresh_source=refresh_source,
+        )
+        db.add(rm)
+        await db.flush()
+        for e in rm_data.get("entry", []):
+            if not _required(e, "sequence", "action"):
+                continue
+            db.add(
+                DeviceRoutePolicyRouteMapEntry(
+                    route_map_id=rm.id,
+                    sequence=e["sequence"],
+                    action=e["action"],
+                    match_prefix_lists=e.get("match-prefix-lists") or [],
+                    match_community_lists=e.get("match-community-lists") or [],
+                    match_as_paths=e.get("match-as-paths") or [],
+                    match_json=e.get("match-json") or "{}",
+                    set_json=e.get("set-json") or "{}",
+                )
+            )
+
+
 async def _upsert_route_policy_data(
     db: AsyncSession,
     device: Device,
@@ -79,89 +201,10 @@ async def _upsert_route_policy_data(
 
     now = datetime.now(UTC).replace(tzinfo=None)
 
-    for pl_data in _dedup_by_name(data.get("prefix-list", []), "prefix-list", device.nso_device_name):
-        pl = DeviceRoutePolicyPrefixList(
-            device_id=device.id,
-            name=pl_data["name"],
-            family=pl_data.get("family", 4),
-            content_hash=_content_hash(pl_data),
-            last_refreshed_at=now,
-            refresh_source=refresh_source,
-        )
-        db.add(pl)
-        await db.flush()
-        for e in pl_data.get("entry", []):
-            entry = DeviceRoutePolicyPrefixListEntry(
-                prefix_list_id=pl.id,
-                sequence=e["sequence"],
-                action=e["action"],
-                prefix=e["prefix"],
-                ge=e.get("ge"),
-                le=e.get("le"),
-            )
-            db.add(entry)
-
-    for cl_data in _dedup_by_name(data.get("community-list", []), "community-list", device.nso_device_name):
-        cl = DeviceRoutePolicyCommunityList(
-            device_id=device.id,
-            name=cl_data["name"],
-            invert_match=bool(cl_data.get("invert-match", False)),
-            content_hash=_content_hash(cl_data),
-            last_refreshed_at=now,
-            refresh_source=refresh_source,
-        )
-        db.add(cl)
-        await db.flush()
-        for e in cl_data.get("entry", []):
-            entry = DeviceRoutePolicyCommunityListEntry(
-                community_list_id=cl.id,
-                sequence=e["sequence"],
-                action=e["action"],
-                community=dialect.to_canonical(e["community"]),
-            )
-            db.add(entry)
-
-    for ap_data in _dedup_by_name(data.get("as-path", []), "as-path", device.nso_device_name):
-        ap = DeviceRoutePolicyASPath(
-            device_id=device.id,
-            name=ap_data["name"],
-            content_hash=_content_hash(ap_data),
-            last_refreshed_at=now,
-            refresh_source=refresh_source,
-        )
-        db.add(ap)
-        await db.flush()
-        for e in ap_data.get("entry", []):
-            entry = DeviceRoutePolicyASPathEntry(
-                as_path_id=ap.id,
-                sequence=e["sequence"],
-                action=e["action"],
-                pattern=e["pattern"],
-            )
-            db.add(entry)
-
-    for rm_data in _dedup_by_name(data.get("route-map", []), "route-map", device.nso_device_name):
-        rm = DeviceRoutePolicyRouteMap(
-            device_id=device.id,
-            name=rm_data["name"],
-            content_hash=_content_hash(rm_data),
-            last_refreshed_at=now,
-            refresh_source=refresh_source,
-        )
-        db.add(rm)
-        await db.flush()
-        for e in rm_data.get("entry", []):
-            entry = DeviceRoutePolicyRouteMapEntry(
-                route_map_id=rm.id,
-                sequence=e["sequence"],
-                action=e["action"],
-                match_prefix_lists=e.get("match-prefix-lists") or [],
-                match_community_lists=e.get("match-community-lists") or [],
-                match_as_paths=e.get("match-as-paths") or [],
-                match_json=e.get("match-json") or "{}",
-                set_json=e.get("set-json") or "{}",
-            )
-            db.add(entry)
+    await _upsert_prefix_lists(db, device, data.get("prefix-list", []), now, refresh_source)
+    await _upsert_community_lists(db, device, data.get("community-list", []), now, refresh_source, dialect)
+    await _upsert_as_paths(db, device, data.get("as-path", []), now, refresh_source)
+    await _upsert_route_maps(db, device, data.get("route-map", []), now, refresh_source)
 
     await db.commit()
 
