@@ -19,10 +19,12 @@ from nso_adapter.nso.apply import (
     apply_interface_attribute,
     apply_interface_ips,
     apply_static_routes,
+    build_interface_ip_entry,
     build_isis_process_payload,
 )
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import (
+    BgpRouterIntent,
     IsisFlexAlgoIntent,
     IsisProcessIntent,
     OspfInstanceIntent,
@@ -792,6 +794,150 @@ def test_build_isis_process_payload_nests_redistribute():
         "metric-type": "external",
     }
     assert redist[1] == {"source-protocol": "connected", "source-ref": ""}  # optionals omitted
+
+
+def test_build_isis_process_payload_orphan_redistribute_synthesizes_process():
+    """A redistribute row whose destination process has NO process row in this apply
+    (parent already applied cleanly → filtered out) must still land: synthesize a
+    minimal process-config entry rather than silently dropping the redistribute."""
+    redist = RedistributionIntent(
+        dest_protocol="isis", dest_ref="0", source_protocol="connected", source_ref="", route_map=None, metric=None
+    )
+    procs = build_isis_process_payload(isis_process_rows=[], redistribution_rows=[redist], flex_algo_rows=[])
+    assert len(procs) == 1
+    assert procs[0]["process-tag"] == "0"
+    assert procs[0]["redistribute"] == [{"source-protocol": "connected", "source-ref": ""}]
+
+
+async def test_apply_ospf_config_orphan_redistribute_synthesizes_process():
+    """OSPF: a redistribute row with no eligible process row still lands via a synthesized
+    minimal process-config entry (parity with IS-IS)."""
+    from nso_adapter.nso.apply import apply_ospf_config
+
+    redist = RedistributionIntent(
+        dest_protocol="ospf", dest_ref="1", source_protocol="connected", source_ref="", route_map=None, metric=None
+    )
+    stage: dict = {}
+    await apply_ospf_config(_make_nso_client(), "d", [], [], [redist], stage=stage)
+    body = stage["ospf-reconciler:ospf-config"][0]
+    procs = body["process-config"]
+    assert [p["process-id"] for p in procs] == ["1"]
+    assert procs[0]["redistribute"] == [{"source-protocol": "connected", "source-ref": ""}]
+
+
+async def test_apply_ospf_config_omits_empty_interface_config():
+    """A process-only OSPF apply must NOT send `interface-config: []` — on a merge/keyed
+    list that empty array can be read as 'replace with empty', over-deleting the device's
+    existing OSPF interfaces (IS-IS omits the list when empty; OSPF must match)."""
+    from nso_adapter.nso.apply import apply_ospf_config
+
+    proc = OspfInstanceIntent(process_id="1", vrf="", enabled=True)
+    stage: dict = {}
+    await apply_ospf_config(_make_nso_client(), "d", [proc], [], None, stage=stage)
+    body = stage["ospf-reconciler:ospf-config"][0]
+    assert "interface-config" not in body
+    assert body["process-config"][0]["process-id"] == "1"
+
+
+async def test_apply_bgp_config_orphan_redistribute_synthesizes_router():
+    """BGP: a redistribute row whose router/scope/AF is not in this apply still lands via a
+    synthesized router→scope→address-family skeleton carrying just the redistribute."""
+    from nso_adapter.nso.apply import apply_bgp_config
+
+    redist = RedistributionIntent(
+        dest_protocol="bgp",
+        dest_ref="65001:default:ipv4-unicast",
+        source_protocol="connected",
+        source_ref="",
+        route_map=None,
+        metric=None,
+    )
+    stage: dict = {}
+    await apply_bgp_config(_make_nso_client(), "d", [], [redist], stage=stage)
+    routers = stage["bgp-reconciler:bgp-config"][0]["router"]
+    assert len(routers) == 1
+    assert routers[0]["asn"] == 65001
+    scope = routers[0]["scope"][0]
+    assert scope["vrf"] == "default"
+    af = scope["address-family"][0]
+    assert af["afi"] == "ipv4-unicast"
+    assert af["redistribute"] == [{"source-protocol": "connected", "source-ref": ""}]
+
+
+async def test_apply_bgp_config_asn_asdot_notation():
+    """A 4-byte ASN in asdot notation ('1.100') must round-trip to its uint32 value, not
+    crash the whole BGP apply with a bare int() ValueError."""
+    from nso_adapter.nso.apply import apply_bgp_config
+
+    router = BgpRouterIntent(asn="1.100")
+    stage: dict = {}
+    await apply_bgp_config(_make_nso_client(), "d", [router], None, stage=stage)
+    routers = stage["bgp-reconciler:bgp-config"][0]["router"]
+    assert routers[0]["asn"] == 1 * 65536 + 100
+
+
+async def test_apply_bgp_config_asn_invalid_raises_clean_error():
+    """A non-numeric ASN raises a descriptive NsoApplyError, not an opaque ValueError."""
+    from nso_adapter.nso.apply import apply_bgp_config
+
+    router = BgpRouterIntent(asn="not-an-asn")
+    with pytest.raises(NsoApplyError, match="ASN"):
+        await apply_bgp_config(_make_nso_client(), "d", [router], None, stage={})
+
+
+def test_build_interface_ip_entry_rejects_address_without_prefix():
+    """An address missing '/prefix' raises a descriptive NsoApplyError (surfaced), not a
+    bare ValueError that would abort the whole atomic apply opaquely."""
+    row = SimpleNamespace(address="10.0.0.1", family="ipv4", vrf=None, secondary=False)
+    with pytest.raises(NsoApplyError, match="prefix"):
+        build_interface_ip_entry("d", "Gi0/0", [row])
+
+
+def test_build_interface_ip_entry_rejects_unknown_family():
+    """A row whose family is neither ipv4 nor ipv6 is NOT silently dropped — it raises so
+    the address can never be reported in_sync while never emitted."""
+    row = SimpleNamespace(address="10.0.0.1/24", family="inet", vrf=None, secondary=False)
+    with pytest.raises(NsoApplyError, match="family"):
+        build_interface_ip_entry("d", "Gi0/0", [row])
+
+
+def test_build_interface_ip_entry_secondary_none_is_boolean_not_null():
+    """A None `secondary` becomes JSON false, never null (a boolean YANG leaf rejects null)."""
+    row = SimpleNamespace(address="10.0.0.1/24", family="ipv4", vrf=None, secondary=None)
+    entry = build_interface_ip_entry("d", "Gi0/0", [row])
+    assert entry["ipv4-address"][0]["secondary"] is False
+
+
+async def test_apply_interface_attribute_enabled_rejects_garbage():
+    """A malformed `enabled` intent value must raise, never silently coerce to False and
+    shut the interface."""
+    client = _make_nso_client()
+    with pytest.raises(NsoApplyError, match="enabled"):
+        await apply_interface_attribute(client, "d", "Gi0/0", "enabled", None, dry_run=True)
+    with pytest.raises(NsoApplyError, match="enabled"):
+        await apply_interface_attribute(client, "d", "Gi0/0", "enabled", "yes", dry_run=True)
+
+
+async def test_apply_interface_attribute_enabled_accepts_boolean_tokens():
+    """The recognised boolean spellings still round-trip (true/false, True/False, bools)."""
+    client = _make_nso_client()
+    stage_true = await apply_interface_attribute(client, "d", "Gi0/0", "enabled", "true", dry_run=True)  # noqa: F841
+    # dry_run returns the native delta (client stubbed) — the point is it does NOT raise.
+    for good in ("false", "False", "True"):
+        await apply_interface_attribute(client, "d", "Gi0/0", "enabled", good, dry_run=True)
+
+
+def test_normalize_route_map_entry_collision_is_deterministic():
+    """When both the canonical YANG key and a legacy spelling map to the same leaf with
+    DIFFERENT values, the canonical key wins deterministically (never dict-order roulette)."""
+    entry = {
+        "sequence": 10,
+        "action": "permit",
+        "match-json": '{"canonical": true}',
+        "match": {"legacy": 1},  # both map to match-json
+    }
+    out = apply_mod._normalize_route_map_entry(entry)
+    assert out["match-json"] == '{"canonical": true}'
 
 
 # ── OSPF process / interface entry builders (pure; real ORM rows, no mocks) ─────

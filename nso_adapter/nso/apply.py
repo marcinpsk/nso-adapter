@@ -308,6 +308,33 @@ async def apply_combined(
     return None
 
 
+# Recognised boolean spellings for the `enabled` interface attribute. The intent value
+# is stored as a string whose case varies by source ("true" from a JSON boolean push,
+# "True" from str(bool)) — those are the ONLY values the system produces. Anything else
+# is a corrupt value that must NOT be coerced to a silent shutdown.
+_ENABLED_TRUE = frozenset({"true"})
+_ENABLED_FALSE = frozenset({"false"})
+
+
+def _coerce_enabled_intent(value) -> bool:
+    """Parse an `enabled` intent value to a bool, raising on an unrecognised token.
+
+    Never silently coerces garbage to ``False`` (which would shut the interface).
+    Shared by the per-scope apply and the atomic combined path so both agree.
+    """
+    if isinstance(value, bool):
+        return value
+    token = str(value).strip().lower()
+    if token in _ENABLED_TRUE:
+        return True
+    if token in _ENABLED_FALSE:
+        return False
+    raise NsoApplyError(
+        "invalid_enabled_value",
+        f"'enabled' intent value {value!r} is not a recognised boolean",
+    )
+
+
 async def apply_interface_attribute(
     client: NsoClient,
     device_name: str,
@@ -339,10 +366,7 @@ async def apply_interface_attribute(
     if attribute == "description":
         entry["description"] = value if value is not None else ""
     elif attribute == "enabled":
-        # intent_value is stored as a string and its case varies by source ("true"
-        # from a JSON boolean push, "True" from str(bool)); compare case-insensitively
-        # so an enabled interface is never silently written as disabled.
-        entry["enabled"] = value is True or str(value).strip().lower() == "true"
+        entry["enabled"] = _coerce_enabled_intent(value)
     else:
         raise NsoApplyError(
             "unsupported_attribute",
@@ -431,12 +455,35 @@ def build_interface_ip_entry(
     ipv4_entries = []
     ipv6_entries = []
     for row in ip_intent_rows:
+        # Validate ip/prefix up front: a malformed address would otherwise raise a bare
+        # ValueError that, on the atomic path, aborts the WHOLE combined commit with an
+        # opaque error. Surface a descriptive NsoApplyError naming the interface instead.
+        if "/" not in (row.address or ""):
+            raise NsoApplyError(
+                "invalid_ip_address",
+                f"{interface_name}: IP intent address {row.address!r} is not in ip/prefix-length form",
+            )
         addr, plen_str = row.address.rsplit("/", 1)
-        prefix_len = int(plen_str)
+        try:
+            prefix_len = int(plen_str)
+        except ValueError as exc:
+            raise NsoApplyError(
+                "invalid_ip_address",
+                f"{interface_name}: IP intent address {row.address!r} has a non-numeric prefix length",
+            ) from exc
         if row.family == "ipv4":
-            ipv4_entries.append({"address": addr, "prefix-length": prefix_len, "secondary": row.secondary})
+            # A None `secondary` must serialize as JSON false, never null (a boolean YANG
+            # leaf rejects null and would 400 the whole interface's IP apply).
+            ipv4_entries.append({"address": addr, "prefix-length": prefix_len, "secondary": bool(row.secondary)})
         elif row.family == "ipv6":
             ipv6_entries.append({"address": addr, "prefix-length": prefix_len})
+        else:
+            # Never silently drop an address whose family we don't recognise — it would be
+            # stamped in_sync while never emitted. Fail loud so the bad row is fixed.
+            raise NsoApplyError(
+                "unsupported_ip_family",
+                f"{interface_name}: unsupported IP family {row.family!r} for {row.address}",
+            )
 
     if ipv4_entries:
         entry["ipv4-address"] = ipv4_entries
@@ -1106,6 +1153,17 @@ def build_isis_process_payload(
     processes: list[dict] = [
         _isis_process_entry(row, redist_by_proc.get(row.process_tag or "", [])) for row in isis_process_rows or []
     ]
+    proc_by_tag = {p["process-tag"]: p for p in processes}
+
+    # Redistribute rows whose destination process has NO process row in this apply
+    # (e.g. the process already applied cleanly and was filtered out by force=False
+    # eligibility) must still land — synthesize a minimal process entry so the
+    # redistribute is never silently dropped (parity with the flex-algo orphan below).
+    for tag, redist_list in redist_by_proc.items():
+        if tag not in proc_by_tag:
+            proc = {"process-tag": tag, "redistribute": redist_list}
+            processes.append(proc)
+            proc_by_tag[tag] = proc
 
     # Attach Flex-Algo definitions to their process-config entry, creating a
     # minimal entry for any process-tag that has flex-algo but no process row.
@@ -1113,15 +1171,13 @@ def build_isis_process_payload(
     for row in flex_algo_rows or []:
         flex_by_proc.setdefault(row.process_tag or "", []).append(_isis_flex_algo_entry(row))
 
-    if flex_by_proc:
-        proc_by_tag = {p["process-tag"]: p for p in processes}
-        for tag, fa_list in flex_by_proc.items():
-            proc = proc_by_tag.get(tag)
-            if proc is None:
-                proc = {"process-tag": tag}
-                processes.append(proc)
-                proc_by_tag[tag] = proc
-            proc["flex-algo"] = fa_list
+    for tag, fa_list in flex_by_proc.items():
+        proc = proc_by_tag.get(tag)
+        if proc is None:
+            proc = {"process-tag": tag}
+            processes.append(proc)
+            proc_by_tag[tag] = proc
+        proc["flex-algo"] = fa_list
 
     return processes
 
@@ -1292,6 +1348,90 @@ async def replace_isis_service(
     await replace_service_instance(client, _ISIS_SERVICE_PATH, "isis-reconciler:isis-config", device_name, body)
 
 
+def _parse_asn(asn) -> int:
+    """Return the uint32 AS number for *asn*, accepting plain decimal or asdot ``X.Y``.
+
+    ``X.Y`` (4-byte asdot) → ``X * 65536 + Y``. Raises a descriptive NsoApplyError on an
+    unparseable value rather than a bare ``int()`` ValueError that would abort the whole
+    (possibly atomic) BGP apply with an opaque internal error.
+    """
+    s = str(asn).strip()
+    try:
+        if "." in s:
+            hi, lo = s.split(".", 1)
+            return int(hi) * 65536 + int(lo)
+        return int(s)
+    except ValueError as exc:
+        raise NsoApplyError("invalid_asn", f"BGP ASN {asn!r} is not a valid AS number") from exc
+
+
+def _bgp_redistribute_entry(row) -> dict:
+    """One BGP AF ``redistribute`` entry; route-map/metric emitted only when set."""
+    entry: dict = {"source-protocol": row.source_protocol, "source-ref": row.source_ref}
+    if row.route_map:
+        entry["route-map"] = row.route_map
+    if row.metric is not None:
+        entry["metric"] = row.metric
+    return entry
+
+
+def _bgp_peer_entry(peer) -> dict:
+    """One BGP ``peer`` entry incl. its peer-address-family list; optionals when set."""
+    entry: dict = {"peer-address": peer.peer_address, "enabled": peer.enabled}
+    for attr, key in (
+        ("peer_group", "peer-group"),
+        ("remote_as", "remote-as"),
+        ("local_as", "local-as"),
+        ("ttl", "ttl"),
+        ("password", "password"),
+        ("source", "source"),
+    ):
+        val = getattr(peer, attr)
+        if val is not None:
+            entry[key] = val
+    entry["peer-address-family"] = [
+        {
+            "afi": paf.af,
+            "enabled": paf.enabled,
+            **({"routemap-in": paf.routemap_in} if paf.routemap_in else {}),
+            **({"routemap-out": paf.routemap_out} if paf.routemap_out else {}),
+            **({"prefixlist-in": paf.prefixlist_in} if paf.prefixlist_in else {}),
+            **({"prefixlist-out": paf.prefixlist_out} if paf.prefixlist_out else {}),
+        }
+        for paf in peer.peer_address_families
+    ]
+    return entry
+
+
+def _attach_orphan_bgp_redistribute(routers, redist_by_af, router_by_asn, scope_by_key, af_seen) -> None:
+    """Synthesize router→scope→AF skeletons for orphan redistribute rows.
+
+    A redistribute row whose parent router/scope/AF is absent from this apply (parent
+    applied cleanly → filtered out by force=False eligibility) must still land, so build
+    the minimal skeleton carrying just the redistribute rather than dropping it silently.
+    Mutates *routers* and the index dicts in place.
+    """
+    for dest_ref, redist_list in redist_by_af.items():
+        parts = dest_ref.split(":", 2)
+        if len(parts) != 3:
+            continue
+        asn_str, vrf, af = parts
+        if (asn_str, vrf, af) in af_seen:
+            continue
+        router_dict = router_by_asn.get(asn_str)
+        if router_dict is None:
+            router_dict = {"asn": _parse_asn(asn_str), "scope": []}
+            routers.append(router_dict)
+            router_by_asn[asn_str] = router_dict
+        scope_dict = scope_by_key.get((asn_str, vrf))
+        if scope_dict is None:
+            scope_dict = {"vrf": vrf, "address-family": [], "peer": []}
+            router_dict["scope"].append(scope_dict)
+            scope_by_key[(asn_str, vrf)] = scope_dict
+        scope_dict["address-family"].append({"afi": af, "redistribute": redist_list})
+        af_seen.add((asn_str, vrf, af))
+
+
 async def apply_bgp_config(
     client: NsoClient,
     device_name: str,
@@ -1318,66 +1458,38 @@ async def apply_bgp_config(
     # Index redistribution by dest_ref
     redist_by_af: dict[str, list[dict]] = {}
     for row in redistribution_rows or []:
-        entry: dict = {
-            "source-protocol": row.source_protocol,
-            "source-ref": row.source_ref,
-        }
-        if row.route_map:
-            entry["route-map"] = row.route_map
-        if row.metric is not None:
-            entry["metric"] = row.metric
-        redist_by_af.setdefault(row.dest_ref, []).append(entry)
+        redist_by_af.setdefault(row.dest_ref, []).append(_bgp_redistribute_entry(row))
 
-    routers = []
+    routers: list[dict] = []
+    # Indexes for orphan-redistribute merge (below): keyed by the string ASN / (asn,vrf)
+    # forms that appear in a redistribution dest_ref.
+    router_by_asn: dict[str, dict] = {}
+    scope_by_key: dict[tuple[str, str], dict] = {}
+    af_seen: set[tuple[str, str, str]] = set()
     for r in router_intent_rows:
+        asn_str = str(r.asn)
         scopes_out = []
         for scope in r.scopes:
             afs_out = []
             for af in scope.address_families:
-                af_dest_ref = f"{r.asn}:{scope.vrf}:{af.af}"
                 af_entry: dict = {"afi": af.af}
-                af_redist = redist_by_af.get(af_dest_ref, [])
+                af_redist = redist_by_af.get(f"{asn_str}:{scope.vrf}:{af.af}", [])
                 if af_redist:
                     af_entry["redistribute"] = af_redist
                 afs_out.append(af_entry)
-            peers_out = []
-            for peer in scope.peers:
-                peer_entry: dict = {
-                    "peer-address": peer.peer_address,
-                    "enabled": peer.enabled,
-                }
-                if peer.peer_group is not None:
-                    peer_entry["peer-group"] = peer.peer_group
-                if peer.remote_as is not None:
-                    peer_entry["remote-as"] = peer.remote_as
-                if peer.local_as is not None:
-                    peer_entry["local-as"] = peer.local_as
-                if peer.ttl is not None:
-                    peer_entry["ttl"] = peer.ttl
-                if peer.password is not None:
-                    peer_entry["password"] = peer.password
-                if peer.source is not None:
-                    peer_entry["source"] = peer.source
-                peer_entry["peer-address-family"] = [
-                    {
-                        "afi": paf.af,
-                        "enabled": paf.enabled,
-                        **({"routemap-in": paf.routemap_in} if paf.routemap_in else {}),
-                        **({"routemap-out": paf.routemap_out} if paf.routemap_out else {}),
-                        **({"prefixlist-in": paf.prefixlist_in} if paf.prefixlist_in else {}),
-                        **({"prefixlist-out": paf.prefixlist_out} if paf.prefixlist_out else {}),
-                    }
-                    for paf in peer.peer_address_families
-                ]
-                peers_out.append(peer_entry)
-            scopes_out.append(
-                {
-                    "vrf": scope.vrf,
-                    "address-family": afs_out,
-                    "peer": peers_out,
-                }
-            )
-        routers.append({"asn": int(r.asn), "scope": scopes_out})
+                af_seen.add((asn_str, scope.vrf, af.af))
+            scope_dict = {
+                "vrf": scope.vrf,
+                "address-family": afs_out,
+                "peer": [_bgp_peer_entry(peer) for peer in scope.peers],
+            }
+            scopes_out.append(scope_dict)
+            scope_by_key[(asn_str, scope.vrf)] = scope_dict
+        router_dict = {"asn": _parse_asn(r.asn), "scope": scopes_out}
+        routers.append(router_dict)
+        router_by_asn[asn_str] = router_dict
+
+    _attach_orphan_bgp_redistribute(routers, redist_by_af, router_by_asn, scope_by_key, af_seen)
 
     return await _send_service_config(
         client,
@@ -1414,15 +1526,39 @@ _RM_ENTRY_KEY_MAP = {
 
 
 def _normalize_route_map_entry(entry: dict) -> dict:
-    """Map a stored route-map intent entry onto the reconciler's YANG leaf names."""
+    """Map a stored route-map intent entry onto the reconciler's YANG leaf names.
+
+    Unmapped keys are dropped (all config-bearing route-map content arrives via the
+    mapped refs or the match-json/set-json blobs, so an unmapped top-level key is benign
+    metadata that would otherwise 400 the RESTCONF call) — but logged, so a genuinely-new
+    reconciler leaf missing from the map is visible rather than silently swallowed.
+
+    Several source spellings can map to the same YANG leaf (``match`` / ``match_json`` /
+    ``match-json`` → ``match-json``). If two carry DIFFERENT values, the canonical YANG
+    spelling wins deterministically rather than letting dict iteration order decide.
+    """
     out: dict = {}
+    source_of: dict[str, str] = {}
     for key, value in entry.items():
         yang_key = _RM_ENTRY_KEY_MAP.get(key)
         if yang_key is None:
+            logger.warning("nso.apply.route_map_entry.dropped_key", key=key)
             continue
         if yang_key in ("match-json", "set-json") and not isinstance(value, str):
             value = json.dumps(value or {}, sort_keys=True)
+        if yang_key in out and out[yang_key] != value:
+            existing_is_canonical = source_of[yang_key] == yang_key
+            incoming_is_canonical = key == yang_key
+            logger.warning(
+                "nso.apply.route_map_entry.ambiguous_key",
+                yang_key=yang_key,
+                kept=source_of[yang_key] if existing_is_canonical or not incoming_is_canonical else key,
+                dropped=key if existing_is_canonical or not incoming_is_canonical else source_of[yang_key],
+            )
+            if existing_is_canonical or not incoming_is_canonical:
+                continue  # keep the canonical (or already-set) value
         out[yang_key] = value
+        source_of[yang_key] = key
     return out
 
 
@@ -1582,12 +1718,24 @@ async def apply_ospf_config(
         redist_by_proc.setdefault(row.dest_ref, []).append(_redistribute_entry(row))
 
     processes = [_ospf_process_entry(row, redist_by_proc.get(str(row.process_id), [])) for row in process_intent_rows]
+    emitted_pids = {p["process-id"] for p in processes}
+    # Redistribute rows whose OSPF process has no process row in this apply (parent already
+    # applied cleanly → filtered out) must still land via a minimal synthesized entry
+    # (parity with IS-IS/BGP). Only process-id + redistribute so a merge-PATCH doesn't
+    # touch the process's admin-state.
+    for pid, redist_list in redist_by_proc.items():
+        if pid not in emitted_pids:
+            processes.append({"process-id": pid, "redistribute": redist_list})
+            emitted_pids.add(pid)
+
     interfaces = [_ospf_interface_entry(row) for row in interface_intent_rows]
 
-    service_body: dict = {
-        "device": device_name,
-        "interface-config": interfaces,
-    }
+    service_body: dict = {"device": device_name}
+    # Only send interface-config when non-empty: an explicit `interface-config: []` on a
+    # keyed-list merge can be read as "replace with empty", over-deleting the device's
+    # existing OSPF interfaces on a process-only apply (IS-IS omits it the same way).
+    if interfaces:
+        service_body["interface-config"] = interfaces
     if processes:
         service_body["process-config"] = processes
 
