@@ -26,10 +26,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy import update as sa_update
 
 from nso_adapter.store.db import get_session
@@ -39,6 +39,11 @@ logger = structlog.get_logger(__name__)
 
 # Seconds between heartbeat refreshes while a job runs.
 _HEARTBEAT_INTERVAL = 15.0
+# A running job is only "orphaned" (recoverable at startup) once its heartbeat has gone
+# stale by this many seconds — several heartbeat intervals of margin. A job heartbeating
+# more recently than this belongs to a LIVE worker (rolling restart / two-process overlap)
+# and must not be stolen out from under it.
+_ORPHAN_STALE_AFTER = 60.0
 # Seconds a worker sleeps when the queue is empty before polling again.
 _EMPTY_POLL_INTERVAL = 2.0
 # Job types safe to auto-requeue after an orphaning restart: read-only or
@@ -159,20 +164,27 @@ async def _worker_loop(worker_id: int, stop: asyncio.Event) -> None:
 async def requeue_orphaned_jobs() -> None:
     """Recover jobs left non-terminal by a previous process.
 
-    Run once at startup, before workers begin draining:
-      * ``running`` idempotent jobs (sync/detect_drift/connect) → ``queued``.
-      * ``running`` ``apply`` jobs → ``failed`` (never silently re-push config).
+    Run once at startup, before workers begin draining. Only jobs whose heartbeat has
+    gone STALE (or was never stamped) are recovered — a job heartbeating within
+    ``_ORPHAN_STALE_AFTER`` is being actively run by a live worker (e.g. during a rolling
+    restart or an accidental two-process overlap) and is left untouched, so we never
+    double-run a sync/removal or falsely fail a live apply:
+      * stale ``running`` idempotent jobs (sync/detect_drift/connect/removal/provision) → ``queued``.
+      * stale ``running`` ``apply`` jobs → ``failed`` (never silently re-push config).
       * ``queued`` jobs are left as-is; a worker will pick them up.
     """
     async for db in get_session():
+        cutoff = _now() - timedelta(seconds=_ORPHAN_STALE_AFTER)
+        # NULL heartbeat = claimed by a prior process that never stamped one → treat as stale.
+        stale = or_(Job.heartbeat_at.is_(None), Job.heartbeat_at < cutoff)
         requeued = await db.execute(
             sa_update(Job)
-            .where(Job.status == JobStatus.running, Job.job_type.in_(_REQUEUE_ON_RESTART))
+            .where(Job.status == JobStatus.running, Job.job_type.in_(_REQUEUE_ON_RESTART), stale)
             .values(status=JobStatus.queued, started_at=None, heartbeat_at=None)
         )
         failed = await db.execute(
             sa_update(Job)
-            .where(Job.status == JobStatus.running, Job.job_type == JobType.apply)
+            .where(Job.status == JobStatus.running, Job.job_type == JobType.apply, stale)
             .values(
                 status=JobStatus.failed,
                 error={

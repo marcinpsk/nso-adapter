@@ -113,6 +113,55 @@ async def test_requeue_orphaned_leaves_terminal_and_queued(adapter_client):
     assert (await _get_job(done_id)).status == JobStatus.succeeded
 
 
+async def _set_heartbeat(job_id: int, hb) -> None:
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        job.heartbeat_at = hb
+        await db.commit()
+        break
+
+
+async def test_requeue_orphaned_leaves_live_heartbeating_job(adapter_client):
+    """A running job with a FRESH heartbeat belongs to a live worker (rolling restart /
+    two-process overlap) — startup recovery must NOT steal it (s3-4)."""
+    from datetime import UTC, datetime
+
+    device_id = await _seed_device("wrk-live-sync", 720)
+    sync_id = await _seed_job(device_id, JobType.sync, JobStatus.running)
+    apply_device = await _seed_device("wrk-live-apply", 721)
+    apply_id = await _seed_job(apply_device, JobType.apply, JobStatus.running)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    await _set_heartbeat(sync_id, now)
+    await _set_heartbeat(apply_id, now)
+
+    await worker.requeue_orphaned_jobs()
+
+    # Both are actively heartbeating → left running, not requeued/failed.
+    assert (await _get_job(sync_id)).status == JobStatus.running
+    assert (await _get_job(apply_id)).status == JobStatus.running
+
+
+async def test_requeue_orphaned_recovers_stale_heartbeat(adapter_client):
+    """A running job whose heartbeat went stale (worker died) is recovered: idempotent
+    types requeued, apply failed (s3-4)."""
+    from datetime import UTC, datetime, timedelta
+
+    device_id = await _seed_device("wrk-stale-sync", 722)
+    sync_id = await _seed_job(device_id, JobType.sync, JobStatus.running)
+    apply_device = await _seed_device("wrk-stale-apply", 723)
+    apply_id = await _seed_job(apply_device, JobType.apply, JobStatus.running)
+    stale = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=300)
+    await _set_heartbeat(sync_id, stale)
+    await _set_heartbeat(apply_id, stale)
+
+    await worker.requeue_orphaned_jobs()
+
+    assert (await _get_job(sync_id)).status == JobStatus.queued
+    apply_job = await _get_job(apply_id)
+    assert apply_job.status == JobStatus.failed
+    assert apply_job.error["code"] == "orphaned"
+
+
 # ── _mark_failed ────────────────────────────────────────────────────────────────
 
 
