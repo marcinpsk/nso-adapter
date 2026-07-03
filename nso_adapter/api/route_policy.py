@@ -1,0 +1,289 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+"""Route-policy endpoints: GET + PUT /api/v1/devices/{id}/route-policy(-intent)."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+import structlog
+from fastapi import APIRouter, Depends
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from nso_adapter.api.deps import get_db, verify_token
+from nso_adapter.api.errors import api_error
+from nso_adapter.store.models import (
+    Device,
+    DeviceRoutePolicyASPath,
+    DeviceRoutePolicyASPathEntry,
+    DeviceRoutePolicyCommunityList,
+    DeviceRoutePolicyCommunityListEntry,
+    DeviceRoutePolicyPrefixList,
+    DeviceRoutePolicyPrefixListEntry,
+    DeviceRoutePolicyRouteMap,
+    DeviceRoutePolicyRouteMapEntry,
+    RoutePolicyObjectIntent,
+)
+
+logger = structlog.get_logger(__name__)
+
+router = APIRouter(prefix="/api/v1/devices", tags=["route-policy"])
+
+
+async def _group_in(db: AsyncSession, model, fk_col, ids: list[int], key_attr: str, order_col) -> dict[int, list]:
+    """Load ``model`` rows where ``fk_col`` is in *ids*, grouped by ``key_attr`` (empty ids → {})."""
+    if not ids:
+        return {}
+    rows = (await db.execute(select(model).where(fk_col.in_(ids)).order_by(order_col))).scalars().all()
+    grouped: dict[int, list] = {}
+    for row in rows:
+        grouped.setdefault(getattr(row, key_attr), []).append(row)
+    return grouped
+
+
+def _serialize_prefix_list(pl: DeviceRoutePolicyPrefixList, entries: list) -> dict:
+    return {
+        "name": pl.name,
+        "family": pl.family,
+        "entries": [
+            {
+                "sequence": e.sequence,
+                "action": e.action,
+                "prefix": e.prefix,
+                **({"ge": e.ge} if e.ge is not None else {}),
+                **({"le": e.le} if e.le is not None else {}),
+            }
+            for e in entries
+        ],
+    }
+
+
+def _serialize_community_list(cl: DeviceRoutePolicyCommunityList, entries: list) -> dict:
+    return {
+        "name": cl.name,
+        "invert_match": cl.invert_match,
+        "entries": [{"sequence": e.sequence, "action": e.action, "community": e.community} for e in entries],
+    }
+
+
+def _serialize_as_path(ap: DeviceRoutePolicyASPath, entries: list) -> dict:
+    return {
+        "name": ap.name,
+        "entries": [{"sequence": e.sequence, "action": e.action, "pattern": e.pattern} for e in entries],
+    }
+
+
+def _serialize_route_map(rm: DeviceRoutePolicyRouteMap, entries: list) -> dict:
+    return {
+        "name": rm.name,
+        "entries": [
+            {
+                "sequence": e.sequence,
+                "action": e.action,
+                "match_prefix_lists": e.match_prefix_lists or [],
+                "match_community_lists": e.match_community_lists or [],
+                "match_as_paths": e.match_as_paths or [],
+                "match": e.match_json or "{}",
+                "set": e.set_json or "{}",
+            }
+            for e in entries
+        ],
+    }
+
+
+async def _load_named(db: AsyncSession, model, device_id: int) -> list:
+    """Load a route-policy family for a device, ordered by name."""
+    return (await db.execute(select(model).where(model.device_id == device_id).order_by(model.name))).scalars().all()
+
+
+@router.get("/{device_id}/route-policy", dependencies=[Depends(verify_token)])
+async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_db)):
+    """Return the route-policy config read-mirror for this device.
+
+    Response shape matches the YANG contract in m17-route-policy-contract.md §3.
+    """
+    device = await db.get(Device, device_id)
+    if not device:
+        raise api_error(404, "not_found", "Device not found")
+
+    prefix_lists = await _load_named(db, DeviceRoutePolicyPrefixList, device_id)
+    community_lists = await _load_named(db, DeviceRoutePolicyCommunityList, device_id)
+    as_paths = await _load_named(db, DeviceRoutePolicyASPath, device_id)
+    route_maps = await _load_named(db, DeviceRoutePolicyRouteMap, device_id)
+
+    # Bulk-load all entries in one query per family to avoid N+1.
+    pl_entries = await _group_in(
+        db,
+        DeviceRoutePolicyPrefixListEntry,
+        DeviceRoutePolicyPrefixListEntry.prefix_list_id,
+        [p.id for p in prefix_lists],
+        "prefix_list_id",
+        DeviceRoutePolicyPrefixListEntry.sequence,
+    )
+    cl_entries = await _group_in(
+        db,
+        DeviceRoutePolicyCommunityListEntry,
+        DeviceRoutePolicyCommunityListEntry.community_list_id,
+        [c.id for c in community_lists],
+        "community_list_id",
+        DeviceRoutePolicyCommunityListEntry.sequence,
+    )
+    ap_entries = await _group_in(
+        db,
+        DeviceRoutePolicyASPathEntry,
+        DeviceRoutePolicyASPathEntry.as_path_id,
+        [a.id for a in as_paths],
+        "as_path_id",
+        DeviceRoutePolicyASPathEntry.sequence,
+    )
+    rm_entries = await _group_in(
+        db,
+        DeviceRoutePolicyRouteMapEntry,
+        DeviceRoutePolicyRouteMapEntry.route_map_id,
+        [r.id for r in route_maps],
+        "route_map_id",
+        DeviceRoutePolicyRouteMapEntry.sequence,
+    )
+
+    last_refreshed_at = None
+    for obj in (*prefix_lists, *community_lists, *as_paths, *route_maps):
+        ts = obj.last_refreshed_at
+        if ts and (last_refreshed_at is None or ts > last_refreshed_at):
+            last_refreshed_at = ts
+
+    return {
+        "device_id": device_id,
+        "last_refreshed_at": last_refreshed_at.isoformat() + "Z" if last_refreshed_at else None,
+        "prefix_lists": [_serialize_prefix_list(pl, pl_entries.get(pl.id, [])) for pl in prefix_lists],
+        "community_lists": [_serialize_community_list(cl, cl_entries.get(cl.id, [])) for cl in community_lists],
+        "as_paths": [_serialize_as_path(ap, ap_entries.get(ap.id, [])) for ap in as_paths],
+        "route_maps": [_serialize_route_map(rm, rm_entries.get(rm.id, [])) for rm in route_maps],
+    }
+
+
+_VALID_FAMILIES = {"prefix_list", "community_list", "as_path", "route_map"}
+
+
+@router.put("/{device_id}/route-policy-intent", dependencies=[Depends(verify_token)])
+async def put_route_policy_intent(
+    device_id: int,
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """Store per-object route-policy intent for a device (full-replace per object).
+
+    Body shape:
+        {
+          "objects": [
+            {"family": "prefix_list", "name": "PL-RFC1918", "entries": [...], "accepted": true},
+            ...
+          ]
+        }
+
+    Each object with ``"accepted": true`` gets ``accepted_at`` stamped.
+    Full-replace semantics: the plugin always pushes the full owned set, so objects
+    absent from the payload are removed from the mirror.
+    """
+    device = await db.get(Device, device_id)
+    if not device:
+        raise api_error(404, "not_found", "Device not found")
+
+    objects = body.get("objects")
+    if not isinstance(objects, list):
+        raise api_error(422, "invalid_payload", "Body must contain an 'objects' list")
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    upserted = 0
+
+    # Full-replace: drop objects for this device that are absent from the payload
+    # (the plugin always pushes the full owned set).
+    incoming_keys = {(o.get("family"), o.get("name")) for o in objects}
+    existing_all = (
+        (await db.execute(select(RoutePolicyObjectIntent).where(RoutePolicyObjectIntent.device_id == device_id)))
+        .scalars()
+        .all()
+    )
+    removed = [(r.family, r.name) for r in existing_all if (r.family, r.name) not in incoming_keys]
+    for r in existing_all:
+        if (r.family, r.name) not in incoming_keys:
+            await db.delete(r)
+    await db.flush()
+
+    for obj in objects:
+        family = obj.get("family")
+        name = obj.get("name")
+        entries = obj.get("entries")
+        accepted = obj.get("accepted", False)
+        invert_match = bool(obj.get("invert_match", False))
+
+        if family not in _VALID_FAMILIES:
+            raise api_error(422, "invalid_family", f"Unknown family: {family!r}")
+        if not isinstance(name, str) or not name:
+            raise api_error(422, "invalid_name", "Each object must have a non-empty 'name'")
+        if not isinstance(entries, list):
+            raise api_error(422, "invalid_entries", f"'entries' for {name!r} must be a list")
+
+        existing_result = await db.execute(
+            select(RoutePolicyObjectIntent).where(
+                RoutePolicyObjectIntent.device_id == device_id,
+                RoutePolicyObjectIntent.family == family,
+                RoutePolicyObjectIntent.name == name,
+            )
+        )
+        row = existing_result.scalar_one_or_none()
+
+        if row is None:
+            row = RoutePolicyObjectIntent(
+                device_id=device_id,
+                family=family,
+                name=name,
+                entries=entries,
+                invert_match=invert_match,
+                accepted_at=now if accepted else None,
+            )
+            db.add(row)
+        else:
+            row.entries = entries
+            row.invert_match = invert_match
+            if accepted:
+                row.accepted_at = now
+
+        upserted += 1
+
+    await db.commit()
+    logger.info(
+        "route_policy_intent.put",
+        device_id=device_id,
+        upserted=upserted,
+        removed=len(removed),
+    )
+
+    if removed:
+        from nso_adapter.core.removal import replace_on_removal
+        from nso_adapter.nso.apply import apply_route_policy_config
+
+        await replace_on_removal(db, device, removed, RoutePolicyObjectIntent, apply_route_policy_config)
+
+    # Return updated intent state for all objects on this device.
+    result = await db.execute(
+        select(RoutePolicyObjectIntent)
+        .where(RoutePolicyObjectIntent.device_id == device_id)
+        .order_by(RoutePolicyObjectIntent.family, RoutePolicyObjectIntent.name)
+    )
+    rows = result.scalars().all()
+    return {
+        "device_id": device_id,
+        "objects": [
+            {
+                "id": r.id,
+                "family": r.family,
+                "name": r.name,
+                "entries": r.entries,
+                "accepted_at": r.accepted_at.isoformat() + "Z" if r.accepted_at else None,
+                "last_apply_at": r.last_apply_at.isoformat() + "Z" if r.last_apply_at else None,
+                "last_apply_error": r.last_apply_error,
+            }
+            for r in rows
+        ],
+    }

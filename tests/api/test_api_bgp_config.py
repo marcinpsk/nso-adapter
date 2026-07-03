@@ -1,0 +1,315 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+"""Tests for GET /api/v1/devices/{id}/bgp-config (A3)."""
+
+from __future__ import annotations
+
+import pytest
+
+from tests.conftest import VALID_TOKEN, seed_bgp_config, seed_device
+
+AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
+
+
+# ── empty / auth ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_bgp_config_no_data_returns_never(adapter_client):
+    """Device with no BGP rows → 200 with refresh_source='never', empty routers."""
+    device_id = await seed_device(nso_device_name="bgp-empty-dev", netbox_device_id=900)
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["device_id"] == device_id
+    assert body["refresh_source"] == "never"
+    assert body["last_refreshed_at"] is None
+    assert body["routers"] == []
+
+
+@pytest.mark.anyio
+async def test_bgp_config_requires_auth(adapter_client):
+    """Missing auth token → 401."""
+    device_id = await seed_device(nso_device_name="bgp-noauth-dev", netbox_device_id=901)
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config")
+    assert resp.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_bgp_config_device_not_found(adapter_client):
+    """Non-existent device id → 404."""
+    resp = await adapter_client.get("/api/v1/devices/99999/bgp-config", headers=AUTH)
+    assert resp.status_code == 404
+
+
+# ── populated data ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_bgp_config_basic_router_and_global_scope(adapter_client):
+    """Single router, global scope with two AFs and one peer."""
+    device_id = await seed_device(nso_device_name="bgp-basic-dev", netbox_device_id=902)
+    await seed_bgp_config(
+        device_id,
+        asn="65100",
+        scopes=[
+            {
+                "vrf": "",
+                "afs": ["ipv4-unicast", "ipv6-unicast"],
+                "peers": [
+                    {
+                        "peer_address": "192.0.2.1",
+                        "enabled": False,
+                        "peer_group": "UPSTREAM",
+                        "remote_as": "65001",
+                        "peer_afs": ["ipv4-unicast"],
+                    }
+                ],
+            }
+        ],
+    )
+
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body["device_id"] == device_id
+    assert body["refresh_source"] == "test"
+    assert len(body["routers"]) == 1
+    bgp_router = body["routers"][0]
+    assert bgp_router["asn"] == "65100"
+    assert len(bgp_router["scopes"]) == 1
+
+    scope = bgp_router["scopes"][0]
+    assert scope["vrf"] == ""
+    assert set(scope["address_families"]) == {"ipv4-unicast", "ipv6-unicast"}
+    assert len(scope["peers"]) == 1
+
+    peer = scope["peers"][0]
+    assert peer["peer_address"] == "192.0.2.1"
+    assert peer["enabled"] is False
+    assert peer["peer_group"] == "UPSTREAM"
+    assert peer["remote_as"] == "65001"
+    assert "local_as" not in peer  # omitted when None
+    assert "ttl" not in peer
+    assert "password" not in peer
+    assert len(peer["address_families"]) == 1
+    assert peer["address_families"][0]["af"] == "ipv4-unicast"
+    assert peer["address_families"][0]["enabled"] is True
+
+
+@pytest.mark.anyio
+async def test_bgp_config_multiple_vrf_scopes(adapter_client):
+    """Router with global + two VRF scopes returns all three scopes."""
+    device_id = await seed_device(nso_device_name="bgp-vrf-dev", netbox_device_id=903)
+    await seed_bgp_config(
+        device_id,
+        asn="65100",
+        scopes=[
+            {"vrf": "", "afs": ["ipv4-unicast"], "peers": []},
+            {
+                "vrf": "ASPAN",
+                "afs": ["ipv4-unicast"],
+                "peers": [{"peer_address": "10.0.0.1", "remote_as": "65200", "peer_afs": ["ipv4-unicast"]}],
+            },
+            {"vrf": "MTI", "afs": ["ipv4-unicast"], "peers": []},
+        ],
+    )
+
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
+    assert resp.status_code == 200
+    body = resp.json()
+
+    scopes = body["routers"][0]["scopes"]
+    assert len(scopes) == 3
+    vrfs = {s["vrf"] for s in scopes}
+    assert vrfs == {"", "ASPAN", "MTI"}
+
+    aspan_scope = next(s for s in scopes if s["vrf"] == "ASPAN")
+    assert len(aspan_scope["peers"]) == 1
+    assert aspan_scope["peers"][0]["remote_as"] == "65200"
+
+
+@pytest.mark.anyio
+async def test_bgp_config_password_included_when_set(adapter_client):
+    """Password is included in the response when present (plaintext by design)."""
+    device_id = await seed_device(nso_device_name="bgp-pw-dev", netbox_device_id=904)
+    await seed_bgp_config(
+        device_id,
+        asn="65100",
+        scopes=[
+            {
+                "vrf": "",
+                "afs": ["ipv4-unicast"],
+                "peers": [{"peer_address": "192.0.2.2", "password": "bgpS3cr3t", "peer_afs": []}],
+            }
+        ],
+    )
+
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
+    assert resp.status_code == 200
+    peer = resp.json()["routers"][0]["scopes"][0]["peers"][0]
+    assert peer["password"] == "bgpS3cr3t"
+
+
+# ── policy refs ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_bgp_config_peer_af_policy_refs_returned(adapter_client):
+    """Route-map and prefix-list policy refs on a peer AF are included in the response."""
+    device_id = await seed_device(nso_device_name="bgp-policy-dev", netbox_device_id=905)
+    await seed_bgp_config(
+        device_id,
+        asn="65100",
+        scopes=[
+            {
+                "vrf": "",
+                "afs": ["ipv4-unicast"],
+                "peers": [
+                    {
+                        "peer_address": "192.0.2.10",
+                        "remote_as": "65200",
+                        "peer_af_defs": [
+                            {
+                                "af": "ipv4-unicast",
+                                "enabled": True,
+                                "routemap_in": "RM_FROM_PEER",
+                                "routemap_out": "RM_TO_PEER",
+                                "prefixlist_in": "PL_ALLOW_IN",
+                                "prefixlist_out": None,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
+    assert resp.status_code == 200
+    af = resp.json()["routers"][0]["scopes"][0]["peers"][0]["address_families"][0]
+    assert af["af"] == "ipv4-unicast"
+    assert af["routemap_in"] == "RM_FROM_PEER"
+    assert af["routemap_out"] == "RM_TO_PEER"
+    assert af["prefixlist_in"] == "PL_ALLOW_IN"
+    assert af.get("prefixlist_out") is None
+
+
+@pytest.mark.anyio
+async def test_bgp_config_peer_groups_returned(adapter_client):
+    """Peer-group objects + their per-AF policies are serialized under the scope (full-B)."""
+    device_id = await seed_device(nso_device_name="bgp-pg-api-dev", netbox_device_id=907)
+    await seed_bgp_config(
+        device_id,
+        asn="65100",
+        scopes=[
+            {
+                "vrf": "",
+                "afs": ["ipv4-unicast"],
+                "peers": [],
+                "peer_groups": [
+                    {
+                        "name": "Arbor-IBGP",
+                        "remote_as": "65100",
+                        "source": "Loopback4",
+                        "af_defs": [
+                            {
+                                "af": "ipv4-unicast",
+                                "routemap_in": "Arbor-IBGP-in",
+                                "routemap_out": "Arbor-IBGP-out",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
+    assert resp.status_code == 200
+    scope = resp.json()["routers"][0]["scopes"][0]
+    assert len(scope["peer_groups"]) == 1
+    pg = scope["peer_groups"][0]
+    assert pg["name"] == "Arbor-IBGP"
+    assert pg["remote_as"] == "65100"
+    assert pg["source"] == "Loopback4"
+    assert len(pg["address_families"]) == 1
+    af = pg["address_families"][0]
+    assert af["af"] == "ipv4-unicast"
+    assert af["routemap_in"] == "Arbor-IBGP-in"
+    assert af["routemap_out"] == "Arbor-IBGP-out"
+    assert "prefixlist_in" not in af  # omitted when None
+
+
+@pytest.mark.anyio
+async def test_bgp_config_peer_af_policy_refs_omitted_when_null(adapter_client):
+    """Policy ref fields are absent (not null) in the response when all are None."""
+    device_id = await seed_device(nso_device_name="bgp-no-policy-dev", netbox_device_id=906)
+    await seed_bgp_config(
+        device_id,
+        asn="65100",
+        scopes=[
+            {
+                "vrf": "",
+                "afs": ["ipv4-unicast"],
+                "peers": [
+                    {
+                        "peer_address": "192.0.2.11",
+                        "peer_afs": ["ipv4-unicast"],
+                    }
+                ],
+            }
+        ],
+    )
+
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
+    assert resp.status_code == 200
+    af = resp.json()["routers"][0]["scopes"][0]["peers"][0]["address_families"][0]
+    assert af["af"] == "ipv4-unicast"
+    # Null policy fields must not appear in the serialized output
+    for field in ("routemap_in", "routemap_out", "prefixlist_in", "prefixlist_out"):
+        assert field not in af or af[field] is None
+
+
+# ── serializer edge cases ─────────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_bgp_config_router_with_no_scopes(adapter_client):
+    """A router with zero scopes serializes to an empty scopes list (no AF/peer queries)."""
+    device_id = await seed_device(nso_device_name="bgp-no-scopes-dev", netbox_device_id=908)
+    await seed_bgp_config(device_id, asn="65100", scopes=[])  # router, but no scopes at all
+
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
+    assert resp.status_code == 200
+    routers = resp.json()["routers"]
+    assert len(routers) == 1
+    assert routers[0]["asn"] == "65100"
+    assert routers[0]["scopes"] == []
+
+
+@pytest.mark.anyio
+async def test_bgp_config_peer_group_omits_null_remote_as_and_source(adapter_client):
+    """A peer group with no remote_as/source omits those keys in the response."""
+    device_id = await seed_device(nso_device_name="bgp-pg-bare-dev", netbox_device_id=909)
+    await seed_bgp_config(
+        device_id,
+        asn="65100",
+        scopes=[
+            {
+                "vrf": "",
+                "afs": ["ipv4-unicast"],
+                "peers": [],
+                "peer_groups": [{"name": "Bare-PG", "af_defs": []}],  # no remote_as, no source
+            }
+        ],
+    )
+
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
+    assert resp.status_code == 200
+    pg = resp.json()["routers"][0]["scopes"][0]["peer_groups"][0]
+    assert pg["name"] == "Bare-PG"
+    assert "remote_as" not in pg
+    assert "source" not in pg
+    assert pg["address_families"] == []

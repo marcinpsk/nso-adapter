@@ -1,0 +1,325 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+"""GET /api/v1/devices/{id}/snmp-config and PUT /api/v1/devices/{id}/snmp-intent endpoints."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from datetime import UTC, datetime
+
+import structlog
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from nso_adapter.api.deps import get_db, verify_token
+from nso_adapter.api.errors import api_error
+from nso_adapter.store.models import (
+    Device,
+    DeviceSettings,
+    SnmpCommunity,
+    SnmpCommunityIntent,
+    SnmpHost,
+    SnmpHostIntent,
+    SnmpSystemInfo,
+    SnmpSystemInfoIntent,
+    SnmpV3User,
+    SnmpV3UserIntent,
+)
+
+logger = structlog.get_logger(__name__)
+
+router = APIRouter(prefix="/api/v1/devices", tags=["snmp-config"])
+
+
+@router.get("/{device_id}/snmp-config", dependencies=[Depends(verify_token)])
+async def get_snmp_config(device_id: int, db: AsyncSession = Depends(get_db)):
+    device = await db.get(Device, device_id)
+    if not device:
+        raise api_error(404, "not_found", "Device not found")
+
+    communities_result = await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device_id))
+    communities = communities_result.scalars().all()
+
+    v3_users_result = await db.execute(select(SnmpV3User).where(SnmpV3User.device_id == device_id))
+    v3_users = v3_users_result.scalars().all()
+
+    hosts_result = await db.execute(select(SnmpHost).where(SnmpHost.device_id == device_id))
+    hosts = hosts_result.scalars().all()
+
+    system_info_result = await db.execute(select(SnmpSystemInfo).where(SnmpSystemInfo.device_id == device_id))
+    system_info = system_info_result.scalar_one_or_none()
+
+    all_rows = list(communities) + list(v3_users) + list(hosts)
+    if system_info:
+        all_rows.append(system_info)
+
+    if not all_rows:
+        return {
+            "device_id": device_id,
+            "last_refreshed_at": None,
+            "refresh_source": "never",
+            "communities": [],
+            "v3_users": [],
+            "hosts": [],
+            "system_info": None,
+        }
+
+    latest = max(all_rows, key=lambda r: r.last_refreshed_at)
+
+    return {
+        "device_id": device_id,
+        "last_refreshed_at": latest.last_refreshed_at.isoformat() + "Z",
+        "refresh_source": latest.refresh_source,
+        "communities": [{"community_hash": c.community_hash, "access": c.access, "acl": c.acl} for c in communities],
+        "v3_users": [
+            {
+                "username": u.username,
+                "has_auth_secret": u.has_auth_secret,
+                "has_priv_secret": u.has_priv_secret,
+            }
+            for u in v3_users
+        ],
+        "hosts": [
+            {
+                "address": h.address,
+                "version": h.version,
+                "notify_type": h.notify_type,
+                "port": h.port,
+            }
+            for h in hosts
+        ],
+        "system_info": ({"location": system_info.location, "contact": system_info.contact} if system_info else None),
+    }
+
+
+# ---------------------------------------------------------------------------
+# PUT /{device_id}/snmp-intent
+# ---------------------------------------------------------------------------
+
+
+class SnmpCommunityEntry(BaseModel):
+    label: str
+    vault_ref: str  # "mount/path#key"
+    access: str  # "RO" | "RW"
+    acl: str | None = None
+    accepted_at: datetime | None = None
+
+
+class SnmpV3UserEntry(BaseModel):
+    username: str
+    auth_vault_ref: str | None = None
+    priv_vault_ref: str | None = None
+    accepted_at: datetime | None = None
+
+
+class SnmpHostEntry(BaseModel):
+    address: str
+    version: str  # "1" | "2c" | "3"
+    notify_type: str  # "trap" | "inform"
+    community_or_user: str
+    accepted_at: datetime | None = None
+
+
+class SnmpSystemInfoEntry(BaseModel):
+    location: str | None = None
+    contact: str | None = None
+    accepted_at: datetime | None = None
+
+
+class SnmpIntentUpdate(BaseModel):
+    communities: list[SnmpCommunityEntry] = []
+    v3_users: list[SnmpV3UserEntry] = []
+    hosts: list[SnmpHostEntry] = []
+    system_info: SnmpSystemInfoEntry | None = None
+
+
+def _accepted_or_now(entry, now: datetime) -> datetime:
+    """Resolve an entry's ``accepted_at`` to a naive UTC datetime, defaulting to now."""
+    return entry.accepted_at.replace(tzinfo=None) if entry.accepted_at else now
+
+
+async def _sync_intent_collection(
+    db: AsyncSession,
+    model,
+    device_id: int,
+    *,
+    key_attr: str,
+    entries: list,
+    now: datetime,
+    apply_fields: Callable,
+    make_row: Callable,
+) -> tuple[int, list[str]]:
+    """Full-replace one keyed SNMP intent collection for a device.
+
+    Rows whose key is absent from *entries* are deleted; the rest are upserted
+    (``apply_fields`` mutates an existing row, ``make_row`` builds a new one).
+    Returns ``(upserted_count, removed_keys)``.
+    """
+    rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
+    existing = {getattr(r, key_attr): r for r in rows}
+    new_keys = {getattr(e, key_attr) for e in entries}
+    removed = [k for k in existing if k not in new_keys]
+    for k in removed:
+        await db.delete(existing[k])
+    await db.flush()
+
+    count = 0
+    for entry in entries:
+        accepted = _accepted_or_now(entry, now)
+        key = getattr(entry, key_attr)
+        if key in existing:
+            apply_fields(existing[key], entry, accepted)
+        else:
+            db.add(make_row(entry, accepted))
+        count += 1
+    return count, removed
+
+
+def _apply_community_fields(row: SnmpCommunityIntent, e: SnmpCommunityEntry, accepted: datetime) -> None:
+    row.vault_ref = e.vault_ref
+    row.access = e.access
+    row.acl = e.acl
+    row.accepted_at = accepted
+
+
+def _apply_v3_user_fields(row: SnmpV3UserIntent, e: SnmpV3UserEntry, accepted: datetime) -> None:
+    row.auth_vault_ref = e.auth_vault_ref
+    row.priv_vault_ref = e.priv_vault_ref
+    row.accepted_at = accepted
+
+
+def _apply_host_fields(row: SnmpHostIntent, e: SnmpHostEntry, accepted: datetime) -> None:
+    row.version = e.version
+    row.notify_type = e.notify_type
+    row.community_or_user = e.community_or_user
+    row.accepted_at = accepted
+
+
+async def _sync_system_info(db: AsyncSession, device_id: int, entry: SnmpSystemInfoEntry | None, now: datetime) -> bool:
+    """Upsert or delete the singleton system-info intent. Returns True iff a row was deleted."""
+    existing = (
+        await db.execute(select(SnmpSystemInfoIntent).where(SnmpSystemInfoIntent.device_id == device_id))
+    ).scalar_one_or_none()
+    if entry is None:
+        if existing:
+            await db.delete(existing)
+            return True
+        return False
+    accepted = _accepted_or_now(entry, now)
+    if existing:
+        existing.location = entry.location
+        existing.contact = entry.contact
+        existing.accepted_at = accepted
+    else:
+        db.add(
+            SnmpSystemInfoIntent(
+                device_id=device_id, location=entry.location, contact=entry.contact, accepted_at=accepted
+            )
+        )
+    return False
+
+
+@router.put("/{device_id}/snmp-intent", dependencies=[Depends(verify_token)])
+async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSession = Depends(get_db)):
+    """Replace the adapter's SNMP intent mirror for this device atomically.
+
+    Full-replace semantics: rows not present in the request body are deleted.
+    ``accepted_at`` defaults to now if not supplied.  If ``auto_apply`` is
+    enabled on the device, an apply job is enqueued after the upsert. Any
+    removal triggers a replace-mode re-apply so the drop reverts on-device.
+    """
+    device = await db.get(Device, device_id)
+    if not device:
+        raise api_error(404, "not_found", "Device not found")
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+
+    comm_count, removed = await _sync_intent_collection(
+        db,
+        SnmpCommunityIntent,
+        device_id,
+        key_attr="label",
+        entries=body.communities,
+        now=now,
+        apply_fields=_apply_community_fields,
+        make_row=lambda e, acc: SnmpCommunityIntent(
+            device_id=device_id, label=e.label, vault_ref=e.vault_ref, access=e.access, acl=e.acl, accepted_at=acc
+        ),
+    )
+    user_count, removed_users = await _sync_intent_collection(
+        db,
+        SnmpV3UserIntent,
+        device_id,
+        key_attr="username",
+        entries=body.v3_users,
+        now=now,
+        apply_fields=_apply_v3_user_fields,
+        make_row=lambda e, acc: SnmpV3UserIntent(
+            device_id=device_id,
+            username=e.username,
+            auth_vault_ref=e.auth_vault_ref,
+            priv_vault_ref=e.priv_vault_ref,
+            accepted_at=acc,
+        ),
+    )
+    host_count, removed_hosts = await _sync_intent_collection(
+        db,
+        SnmpHostIntent,
+        device_id,
+        key_attr="address",
+        entries=body.hosts,
+        now=now,
+        apply_fields=_apply_host_fields,
+        make_row=lambda e, acc: SnmpHostIntent(
+            device_id=device_id,
+            address=e.address,
+            version=e.version,
+            notify_type=e.notify_type,
+            community_or_user=e.community_or_user,
+            accepted_at=acc,
+        ),
+    )
+    removed += removed_users + removed_hosts
+
+    if await _sync_system_info(db, device_id, body.system_info, now):
+        removed.append("system-info")
+
+    await db.flush()
+
+    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    settings = settings_result.scalar_one_or_none()
+    total_count = comm_count + user_count + host_count + (1 if body.system_info else 0)
+    if settings and settings.auto_apply and total_count > 0:
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True)
+
+    # A removal reverts on-device via an ASYNC removal job (like every other scope) — the
+    # PUT no longer blocks on a full replace-mode device commit (which could stall the PUT
+    # past the plugin client timeout). Enqueue before the commit so the job row lands with
+    # the trimmed intent it will re-apply.
+    if removed:
+        from nso_adapter.core.removal import enqueue_removal
+
+        await enqueue_removal(db, device_id, "snmp")
+
+    await db.commit()
+
+    logger.info(
+        "snmp_intent.put.ok",
+        device_id=device_id,
+        community_count=comm_count,
+        v3_user_count=user_count,
+        host_count=host_count,
+        has_system_info=body.system_info is not None,
+    )
+    return {
+        "device_id": device_id,
+        "community_count": comm_count,
+        "v3_user_count": user_count,
+        "host_count": host_count,
+        "has_system_info": body.system_info is not None,
+        "updated_at": now.isoformat() + "Z",
+    }

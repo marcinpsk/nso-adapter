@@ -39,9 +39,9 @@ REST API for the plugin's models.
 | plugin → adapter | `POST /api/v1/devices/{id}/sync-notify` | scope/intent changed, sync now (push kicker) | 1+ |
 | plugin → adapter | `POST/PATCH/DELETE /api/v1/devices/...` | onboard, edit mapping, offboard | 1+ |
 | plugin → adapter | `PUT /api/v1/devices/{id}/scope` | push scope on save | 1+ |
-| plugin → adapter | `PUT /api/v1/devices/{id}/intent` | **push intent on accept** | 2 |
-| plugin → adapter | `POST /api/v1/devices/{id}/actions/{sync,check-compliance,connect,apply}` | trigger jobs | 1+, `apply` is 2 |
-| plugin → adapter | `GET /api/v1/devices/{id}/{interfaces,compliance,intent,scope}`, `GET /api/v1/jobs/...` | read state | 1+, `intent` is 2 |
+| plugin → adapter | `PUT /api/v1/devices/{id}/intent` (+ the per-scope `PUT …/*-intent` family) | **push intent on accept** | 2 |
+| plugin → adapter | `POST /api/v1/devices/{id}/actions/{sync,detect-drift,connect,apply}` | trigger jobs | 1+, `apply` is 2 |
+| plugin → adapter | `GET /api/v1/devices/{id}/{interfaces,state,intent,intent-summary,scope}` (+ the per-scope read mirrors), `GET /api/v1/jobs/...` | read state | 1+, `intent` is 2 |
 | adapter → NetBox | `GET /api/plugins/netbox-nso-plugin/device-management/` | reconcile mirrored scope (pull) | 1+ |
 | adapter → NetBox | `GET /api/plugins/netbox-nso-plugin/interface-state/` | **reconcile mirrored intent (pull)** | 2 |
 | adapter → NetBox | `PATCH dcim.Interface` (and create if missing) | write synced attribute values | 1+ |
@@ -57,7 +57,9 @@ in the spec.
 ## Enums
 
 - **`mapping_status`**: `mapped` · `unmatched_device` · `unmatched_interfaces`
-- **`job.type`**: `sync` · `check-compliance` · `connect` · `apply` (Phase 2)
+- **`job.type`**: `sync` · `detect-drift` · `connect` · `apply` (Phase 2) ·
+  `removal` (async PUT-replace that reverts dropped intent — see
+  [Removal propagation](#removal-propagation))
 - **`job.status`**: `queued` · `running` · `succeeded` · `failed`
 - **`compliance_status`** (per attribute) — full lifecycle:
   - `unknown` — known to the plugin but never synced.
@@ -71,7 +73,7 @@ in the spec.
   - `apply_failed` — last apply job failed for this attribute; error in
     `last_apply_error`. Intent state stays `accepted` underneath; the
     attribute is eligible for retry.
-  - `drifted` — was `in_sync`, then `check-compliance` found device value
+  - `drifted` — was `in_sync`, then `detect-drift` found device value
     diverging from intent. Post-deploy drift.
   - `error` — could not be evaluated (transient NSO/NetBox read error).
 
@@ -141,6 +143,36 @@ fields are always present (never omitted).
 `404` if `{id}` is not a configured NSO instance.
 `502` on NSO connectivity error.
 
+### `GET /api/v1/nso-instances/{id}/neds` → `200 | 404 | 502`
+
+Returns the **NED packages installed** on the named NSO instance (the *available*
+NEDs an operator can onboard a device with). Read live from
+`tailf-ncs:packages/package`; only packages exposing a `ned` component are
+returned — service/application packages (the reconcilers, auth, observability)
+are excluded.
+
+```json
+[
+  {
+    "ned_id":            "cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+    "package":           "cisco-ios-cli-6.114",
+    "version":           "6.114",
+    "oper_status":       "up",
+    "vendor":            "Cisco",
+    "operating_systems": ["IOS", "IOS-XE"],
+    "product_families":  ["Cisco ASR 1000 Series Aggregation Services Routers"],
+    "platform":          "ios"
+  }
+]
+```
+
+`platform` is the short family label (same derivation as `/devices`), `null` when
+the NED prefix is unrecognised. `vendor`/`operating_systems`/`product_families`
+come from the NED's `device` metadata and drive NetBox-platform → NED matching.
+
+`404` if `{id}` is not a configured NSO instance.
+`502` on NSO connectivity error.
+
 ## Devices
 
 A *device* is a NetBox device onboarded into the adapter and linked to an NSO
@@ -190,6 +222,35 @@ Request:
 ```
 → `201` device object (as above). `409 conflict` if the NetBox device or NSO
 device is already onboarded.
+
+This onboard only creates the adapter **mapping row**; it assumes the device node
+already exists in NSO. To create the device *in NSO* and bring it up, use
+`/provision` below.
+
+### `POST /api/v1/devices/provision` — create the device in NSO + bring it up
+Request:
+```json
+{ "nso_instance": "nso-prod", "device_name": "core-rtr-01",
+  "address": "10.0.0.1", "ned_id": "cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+  "authgroup": "network", "netbox_device_id": 42,
+  "ned_type": "cli", "port": null, "admin_state": "unlocked", "sync": true }
+```
+Runs the NSO onboarding sequence — **create** the device node (idempotent) →
+**ssh fetch-host-keys** (TOFU; needs the device reachable) → set **admin-state**
+(unlocked) → **sync-from** (non-fatal) → create the adapter **mapping** row (when
+`netbox_device_id` is given). Always `200` (even when a blocking step fails — the
+device is left in NSO for retry); inspect the body:
+```json
+{ "ok": true, "device_id": 17,
+  "steps": [ {"step": "create", "status": "ok"},
+             {"step": "fetch_host_keys", "status": "ok"},
+             {"step": "admin_state", "status": "ok", "detail": "unlocked"},
+             {"step": "sync_from", "status": "ok"},
+             {"step": "adapter_mapping", "status": "ok"} ] }
+```
+Step `status` ∈ `ok | exists | failed`; a `failed` blocking step (create /
+fetch_host_keys / admin_state) sets `ok=false` and stops. `422` if `nso_instance`
+is unknown.
 
 ### `GET /api/v1/devices/{id}` → `200`
 Device object plus `scope` (see below) and `last_job_id`.
@@ -274,13 +335,73 @@ Request:
 are non-blocking; the running apply uses its own pre-job snapshot.
 
 ### `GET /api/v1/devices/{id}/intent` → `200`
-Same shape as the `PUT` request body, plus `updated_at`.
+Same shape as the `PUT` request body, plus `updated_at`; rows additionally
+carry `last_apply_at` / `last_apply_error`.
 
-## Interfaces & compliance
+### `GET /api/v1/devices/{id}/intent-summary` → `200 | 404`
+
+Per-scope summary of the adapter's **entire intent mirror** for a device —
+one entry per non-empty `*_intent` table (interface attributes *and* every
+per-scope intent family: VLAN, SVI, subinterface, L2 SAP, BFD, MTU, IS-IS,
+OSPF, BGP, route-policy, static routes, SNMP, logging). Discovered from
+table metadata, so new `*_intent` tables appear automatically. Tables keyed
+by `interface_id` are resolved to the device via the `interfaces` table;
+child tables with neither key (`bgp_scope/af/peer*_intent`) are covered by
+their parent and skipped.
+
+```json
+{ "device_id": 1,
+  "scopes": {
+    "static_route_intent":  { "count": 4, "applied": 4, "failed": 0 },
+    "vlan_intent":          { "count": 12, "applied": 0, "failed": 0 }
+  } }
+```
+
+- `count` — intent rows the adapter holds for this device.
+- `applied` — rows with a non-null `last_apply_at`.
+- `failed` — rows with a non-null `last_apply_error`.
+
+Cheap by design (one count query per table): the plugin calls it on every
+device-tab render to detect intent split-brain (next section).
+
+### Intent split-brain & re-sync
+
+The adapter's `*_intent` tables mirror what the plugin last pushed; the
+plugin's `NSO*State` overlays are the source of truth for what NetBox
+*owns*. They can diverge — e.g. a NetBox-side migration reset overlays to
+`imported` while the adapter kept its accepted rows. Such **stale adapter
+intent** is invisible in the UI yet would be pushed to the device by a
+device-wide apply.
+
+Detection (plugin-side, `netbox_nso_plugin/intent_drift.py`, per scope on
+every device-tab render, fed by `GET intent-summary`):
+
+- **orphaned** — adapter holds intent, NetBox owns *nothing* in the scope;
+- **partial** — for scopes with count *parity* (one owned overlay row ↔ one
+  adapter intent row; all scopes except BGP): the adapter holds *more* rows
+  than NetBox owns, so the surplus is stale even though the scope looks
+  healthy.
+
+Recovery: the plugin re-pushes the scope's *current* owned snapshot through
+the normal `PUT *-intent` endpoint; full-replace semantics drop the stale
+rows (empty push → all removed). Re-sync **never writes to the device** —
+it only aligns the adapter mirror with NetBox ownership.
+
+Known limits (accepted): equal-count/different-rows drift is invisible;
+multi-table scopes (IS-IS, OSPF, SNMP) compare summed counts, so a surplus
+in one table can be masked by a deficit in another; BGP is detected at
+scope level only (one `bgp_router_intent` row covers N owned peers —
+counts aren't 1:1, but any BGP re-push rewrites the whole router tree and
+heals stale children). Design + per-scope parity audit:
+`docs/intent-split-brain-design.md`.
+
+## Interfaces & sync state
 
 ### `GET /api/v1/devices/{id}/interfaces` → `200`
 ```json
 [ { "name": "GigabitEthernet0/0/0/1", "netbox_interface_id": 555,
+    "parent_binding": null, "kind": null, "encap_tag": null,   // M27R logical-iface modeling;
+    "vrf": null, "service": null,                              //   null for physical / Cisco / Junos
     "attrs": {
       "description": {
         "nso_value":    "uplink to spine-1",
@@ -303,7 +424,11 @@ Phase 1 deployments will have `intent_value: null`, `last_apply_at: null`,
 imported, changed, error}`. The Phase 2 fields are reserved in the contract
 so the plugin doesn't need a Phase 1 / Phase 2 shape switch.
 
-### `GET /api/v1/devices/{id}/compliance` → `200`
+### `GET /api/v1/devices/{id}/state` → `200 | 404`
+
+Per-attribute sync-state rollup for the device's interface scope (the tab's
+status strip). Counts `interface_attr_state` rows by status.
+
 ```json
 { "device_id": 1, "managed_interfaces": 12,
   "by_status": { "unknown": 1, "imported": 22, "changed": 1, "accepted": 0,
@@ -325,9 +450,9 @@ device, the adapter returns `409 conflict` with the existing job's id in
 Runs NSO `sync-from`, reads managed attributes, writes them to NetBox,
 recomputes compliance.
 
-### `POST /api/v1/devices/{id}/actions/check-compliance`
-Runs `compare-config` / re-reads NSO and recomputes compliance **without**
-writing to NetBox. Used to detect out-of-band changes.
+### `POST /api/v1/devices/{id}/actions/detect-drift`
+Re-reads NSO and recomputes per-attribute sync state **without** writing to
+NetBox. Used to detect out-of-band changes (job type `detect-drift`).
 
 ### `POST /api/v1/devices/{id}/actions/connect`
 NSO `connect` — connectivity test only.
@@ -364,6 +489,41 @@ Once M4 lands, normal contract:
   - `not_implemented` (501) — pre-M4.
   - `nso_commit_failed` (502) — the apply ran but at least one attribute's
     commit failed; `error.detail.attributes` lists the failed ones.
+
+**Reconcile commit (brownfield guardrail).** Every reconciler-service write (apply,
+update, and removal PUT-replace) is committed with the NSO RESTCONF
+`?reconcile=keep-non-service-config` query parameter. When a service's footprint
+overlaps config the device already carries as *non-service* config (pulled into CDB
+by `sync-from`), `keep-non-service-config` tells NSO to **keep** (adopt without
+deleting) that config. Live testing (a Nokia route-target community on ra1) showed
+this is **equivalent to NSO's implicit default here** — a plain commit already adopts
+brownfield config rather than conflicting — so the param does **not** change current
+behaviour; it makes the safe choice explicit and immune to a deployment whose NSO
+global-settings (or a future default) is `discard`. What it locks out is
+`discard-non-service-config`, which actively **deletes** unmodeled config under the
+footprint: a partial/empty intent would, under discard, wipe the device's real
+config (verified live — an empty community intent emitted a `member delete` under
+discard, nothing under keep). NSO validates the value (unknown → `400 invalid-value`),
+so it is sent verbatim. The pre-apply dry-run preview (`apply-diff`) and the
+post-apply native verify carry the same param so the preview matches the commit.
+Controlled by `NSO_ADAPTER_RECONCILE_COMMIT` (default `keep-non-service-config`;
+`discard-non-service-config` to prune; `""`/`off` for a plain commit — same observed
+result as keep on this NSO).
+
+### `GET /api/v1/devices/{id}/actions/apply-diff` → `200 | 404`
+
+Preview the per-scope **native device diff** the next Apply would push (NSO
+`?dry-run=native&reconcile=keep-non-service-config`; nothing is committed — the
+reconcile param makes the preview match the real reconcile commit). Synchronous —
+no job. `diffs` maps
+scope → native delta; scopes already in sync yield an empty delta and are
+omitted. LAG/switchport have no preview (pushed out-of-band by the plugin,
+not from the intent store).
+
+```json
+{ "device_id": 1,
+  "diffs": { "interface": "interface GigabitEthernet0/1\n description uplink\n!" } }
+```
 
 ### `POST /api/v1/devices/{id}/sync-notify`
 **Served by the adapter; called by the plugin** (Django `post_save` on
@@ -718,14 +878,30 @@ Return the BGP config read-mirror for this device (populated from NSO via the
           "peers": [
             {
               "peer_address": "192.0.2.1",
-              "enabled": true,
+              "enabled": false,
               "peer_group": "UPSTREAM",
               "remote_as": "65001",
-              "local_as": null,
-              "ttl": null,
-              "password": null,
+              "local_as": "65100",
+              "ttl": 2,
+              "password": "s3cret",
+              "source": "Loopback0",
+              "bfd_enabled": true,
               "address_families": [
-                {"af": "ipv4-unicast", "enabled": true}
+                {"af": "ipv4-unicast", "enabled": true,
+                 "routemap_in": "RM-IN", "routemap_out": "RM-OUT",
+                 "prefixlist_in": "PL-IN", "prefixlist_out": "PL-OUT"}
+              ]
+            }
+          ],
+          "peer_groups": [
+            {
+              "name": "UPSTREAM",
+              "remote_as": "65001",
+              "source": "Loopback0",
+              "address_families": [
+                {"af": "ipv4-unicast",
+                 "routemap_in": "RM-IN", "routemap_out": "RM-OUT",
+                 "prefixlist_in": "PL-IN", "prefixlist_out": "PL-OUT"}
               ]
             }
           ]
@@ -738,7 +914,22 @@ Return the BGP config read-mirror for this device (populated from NSO via the
 
 When no BGP data exists: `{ "device_id": 1, "last_refreshed_at": null, "refresh_source": "never", "routers": [] }`.
 
-`password` is included when set (plaintext by design — BGP session passwords authenticate adjacencies, not config access).
+**Key contract (pinned by `tests/api/test_contract_bgp.py` ↔ plugin
+`tests/test_contract_bgp.py`).** Optional keys are **omitted when unset**, not emitted
+as `null`:
+
+| Level | Always present | Optional (omitted when unset) |
+|---|---|---|
+| top | `device_id`, `last_refreshed_at`, `refresh_source`, `routers` | — |
+| router | `asn`, `scopes` | — |
+| scope | `vrf`, `address_families` (list[str]), `peers`, `peer_groups` | — |
+| peer | `peer_address`, `enabled`, `address_families` | `peer_group`, `remote_as`, `local_as`, `ttl`, `password`, `source`, `bfd_enabled` |
+| peer AF | `af`, `enabled` | `routemap_in`, `routemap_out`, `prefixlist_in`, `prefixlist_out` |
+| peer_group | `name`, `address_families` | `remote_as`, `source` |
+| peer_group AF | `af` | `routemap_in`, `routemap_out`, `prefixlist_in`, `prefixlist_out` |
+
+`remote_as`/`local_as` are **strings** (ASN). `password` is included when set
+(plaintext by design — BGP session passwords authenticate adjacencies, not config access).
 
 ---
 
@@ -837,92 +1028,6 @@ The redistribution list is full-replace per `(dest_ref, source_protocol, source_
 
 ---
 
-### `GET /api/v1/devices/{id}/route-policy-state` → `200 | 404`
-
-Returns the route-policy read-mirror for a device.  Covers all four families:
-prefix-list, community-list, as-path, and route-map.
-
-```json
-{
-  "device_id": 1,
-  "last_refreshed_at": "2026-01-15T12:00:00Z",
-  "refresh_source": "sse",
-  "prefix_lists": [
-    {
-      "name": "ALLOWED-IN",
-      "entries": [
-        {"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8", "ge": null, "le": null}
-      ]
-    }
-  ],
-  "community_lists": [
-    {
-      "name": "LOCAL-COMMUNITY",
-      "entries": [{"value": "65100:100"}]
-    }
-  ],
-  "as_paths": [
-    {
-      "name": "ALLOW-PEERS",
-      "entries": [{"sequence": 10, "action": "permit", "regex": "^65001_"}]
-    }
-  ],
-  "route_maps": [
-    {
-      "name": "IMPORT-FROM-PEER",
-      "entries": [
-        {
-          "sequence": 10,
-          "action": "permit",
-          "match": {"ip-address": "ALLOWED-IN"},
-          "set": {"local-preference": 100}
-        }
-      ]
-    }
-  ]
-}
-```
-
----
-
-### `PUT /api/v1/devices/{id}/route-policy-intent` → `200 | 404`
-
-Push route-policy objects for this device.  Partial-update semantics: only objects
-present in the request body are modified; omitted names are untouched.
-
-```json
-[
-  {
-    "family": "prefix_list",
-    "name": "ALLOWED-IN",
-    "entries": [
-      {"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8", "ge": null, "le": null}
-    ]
-  },
-  {
-    "family": "route_map",
-    "name": "IMPORT-FROM-PEER",
-    "entries": [
-      {
-        "sequence": 10,
-        "action": "permit",
-        "match": {"ip-address": "ALLOWED-IN"},
-        "set": {"local-preference": 100}
-      }
-    ]
-  }
-]
-```
-
-Valid `family` values: `prefix_list`, `community_list`, `as_path`, `route_map`.
-
-Response: full route-policy intent state for the device (same shape as GET, but
-only `accepted_at` timestamps for modified objects).
-
-The `route-policy-reconciler` NSO service applies the intent objects to device
-configuration.  If `auto_apply` is `true` on device settings and at least one
-eligible object is present, an apply job is enqueued automatically.
-
 ## OSPF (M19)
 
 ### `GET /api/v1/devices/{id}/ospf` → `200 | 404`
@@ -936,28 +1041,32 @@ configuration as last observed from NSO.
   "last_refreshed_at": "2025-01-01T00:00:00",
   "refresh_source": "sse",
   "instances": [
-    {
-      "process_id": 1,
-      "router_id": "10.0.0.1",
-      "vrf": "",
-      "areas": [{"area_id": "0.0.0.0"}]
-    }
+    {"process_id": "1", "vrf": "", "areas": ["0.0.0.0"], "router_id": "10.0.0.1"}
   ],
   "interfaces": [
     {
       "interface_name": "GigabitEthernet0/0",
-      "process_id": 1,
-      "area_id": "0.0.0.0",
-      "passive": false,
-      "priority": null,
-      "cost": null,
-      "network_type": null,
-      "auth_type": null,
-      "auth_present": false
+      "passive": false, "auth_present": false,
+      "process_id": "1", "area_id": "0.0.0.0",
+      "priority": 10, "cost": 100,
+      "network_type": "point-to-point", "auth_type": "md5"
     }
   ]
 }
 ```
+
+**Key contract (pinned by `tests/api/test_contract_ospf.py` ↔ plugin
+`tests/test_contract_ospf.py`).** Optional keys are **omitted when unset**, not `null`:
+
+| Level | Always present | Optional (omitted when unset) |
+|---|---|---|
+| top | `device_id`, `last_refreshed_at`, `refresh_source`, `instances`, `interfaces` | — |
+| instance | `process_id`, `vrf`, `areas` | `router_id` |
+| interface | `interface_name`, `passive`, `auth_present` | `process_id`, `area_id`, `priority`, `cost`, `network_type`, `auth_type` |
+
+`process_id` is a **string** (named processes on IOS-XR/Junos). `areas` is an opaque
+list passthrough (the plugin stores it verbatim). `last_refreshed_at` on the OSPF
+endpoint is the raw datetime (no `Z` suffix, unlike BGP/ISIS).
 
 ### `PUT /api/v1/devices/{id}/ospf-intent` → `200 | 404`
 
@@ -996,5 +1105,541 @@ The `ospf-reconciler` NSO service applies the intent to device configuration.
 If the target OSPF process is absent on the device, interface entries
 referencing it are silently skipped (process-presence gate in the NSO package).
 
+**Admin-state delete-guard.** An OSPF instance is ALWAYS applied with an explicit
+`enabled` (Nokia SR OS `admin-state`): when the intent row leaves `enabled` unset
+(`None`) the apply body and the reconciler both default it to **enabled**. This is
+load-bearing on the removal path — a PUT-replace (see below) rebuilds the service
+footprint from the remaining rows, and an omitted `enabled` would drop `admin-state`
+from that footprint, which FASTMAP then deletes on the device, disabling OSPF
+entirely. An operator who genuinely wants an instance down must send `enabled: false`
+explicitly; `None` is treated as "unknown → keep enabled", never as "remove".
+
 If `auto_apply` is `true` on device settings and at least one eligible intent
-row is present, an apply job is enqueued automatically.
+row is present, an apply job is enqueued automatically. Removed instances/interfaces/
+redistribution are reverted on the device via an async removal job (see
+[Removal propagation](#removal-propagation)), not inline in this request.
+
+---
+
+## Redistribution (M20)
+
+### `GET /api/v1/devices/{id}/redistribution` → `200`
+
+Return all redistribution statements cached from NSO for this device (the flat
+read-mirror; the same data also appears nested under the BGP/OSPF/ISIS intent PUTs).
+The plugin consumes this in `redistribution_reconciler.reconcile_redistribution`.
+
+```json
+{
+  "device_id": 1,
+  "last_refreshed_at": "2026-06-01T10:00:00",
+  "refresh_source": "poll",
+  "entries": [
+    {
+      "dest_protocol": "ospf", "dest_ref": "1",
+      "source_protocol": "bgp", "source_ref": "65100",
+      "route_map": "RM-REDIST", "metric": 100, "metric_type": "type-1"
+    },
+    {"dest_protocol": "isis", "dest_ref": "", "source_protocol": "connected", "source_ref": ""}
+  ]
+}
+```
+
+When no data exists: `{ "device_id": 1, "last_refreshed_at": null, "refresh_source": "never", "entries": [] }`.
+
+**Key contract (pinned by `tests/api/test_contract_redistribution.py` ↔ plugin
+`tests/test_contract_redistribution.py`).** Optional keys are **omitted when unset**,
+not `null`:
+
+| Level | Always present | Optional (omitted when unset) |
+|---|---|---|
+| top | `device_id`, `last_refreshed_at`, `refresh_source`, `entries` | — |
+| entry | `dest_protocol`, `dest_ref`, `source_protocol`, `source_ref` | `route_map`, `metric`, `metric_type` |
+
+`source_ref` is blank for `connected`/`static`; populated for `ospf`/`isis`/`bgp`.
+
+---
+
+## Route Policy (M17)
+
+### `GET /api/v1/devices/{id}/route-policy` → `200 | 404`
+
+Return the route-policy read-mirror: the four policy-object families (prefix-list /
+community-list / as-path / route-map) each with their ordered entries. Consumed by the
+plugin in `route_policy_reconciler.reconcile_route_policy`. Full YANG-level detail in
+`m17-route-policy-contract.md`. **No top-level `refresh_source`** on this endpoint.
+
+```json
+{
+  "device_id": 1,
+  "last_refreshed_at": "2026-06-01T10:00:00Z",
+  "prefix_lists": [
+    {"name": "PL-1", "family": 4, "entries": [
+      {"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8", "ge": 16, "le": 24},
+      {"sequence": 20, "action": "deny", "prefix": "0.0.0.0/0"}
+    ]}
+  ],
+  "community_lists": [
+    {"name": "CL-1", "entries": [{"sequence": 10, "action": "permit", "community": "65000:100"}]}
+  ],
+  "as_paths": [
+    {"name": "AP-1", "entries": [{"sequence": 10, "action": "permit", "pattern": "^65000_"}]}
+  ],
+  "route_maps": [
+    {"name": "RM-1", "entries": [
+      {"sequence": 10, "action": "permit",
+       "match_prefix_lists": ["PL-1"], "match_community_lists": ["CL-1"], "match_as_paths": ["AP-1"],
+       "match": "{\"prefix\": \"PL-1\"}", "set": "{\"local_preference\": 200}"}
+    ]}
+  ]
+}
+```
+
+**Key contract (pinned by `tests/api/test_contract_route_policy.py` ↔ plugin
+`tests/test_contract_route_policy.py`).** Only the prefix-list entry has optional keys
+(`ge`/`le`, omitted when unset); every other level emits a fixed key set:
+
+| Level | Keys |
+|---|---|
+| top | `device_id`, `last_refreshed_at`, `prefix_lists`, `community_lists`, `as_paths`, `route_maps` |
+| prefix_list | `name`, `family` (int 4/6), `entries` |
+| prefix_list entry | `sequence`, `action`, `prefix` (+ optional `ge`, `le`) |
+| community_list / as_path | `name`, `entries` |
+| community_list entry | `sequence`, `action`, `community` |
+| as_path entry | `sequence`, `action`, `pattern` |
+| route_map | `name`, `entries` |
+| route_map entry | `sequence`, `action`, `match_prefix_lists`, `match_community_lists`, `match_as_paths`, `match`, `set` |
+
+`match_*` are `list[str]` (object names); `match`/`set` are **JSON strings** the plugin
+`json.loads`es. `action` is normalised to permit/deny by the plugin.
+
+### `PUT /api/v1/devices/{id}/route-policy-intent` → `200 | 404 | 422`
+
+Store route-policy object intent for the device. **Full-replace**: the plugin
+always pushes the full owned set; objects absent from the payload are deleted
+from the mirror. Each object with `"accepted": true` gets `accepted_at`
+stamped. If `auto_apply` is enabled on the device, an apply job is enqueued.
+
+```json
+{ "objects": [
+    { "family": "prefix_list", "name": "PL-RFC1918",
+      "entries": [ {"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8"} ],
+      "accepted": true }
+] }
+```
+
+Valid `family` values: `prefix_list` · `community_list` · `as_path` ·
+`route_map` (unknown family → `422 invalid_family`). The
+`route-policy-reconciler` NSO service applies the objects on the next Apply.
+
+`route_map` entries use the reconciler's YANG leaf names (passed verbatim
+into the service payload): `sequence`, `action`, `match-prefix-lists`,
+`match-community-lists`, `match-as-paths`, `match-json`, `set-json` (the
+JSON blobs are serialised strings, keys per m17-route-policy-contract.md §2).
+Legacy snake_case / `match`+`set` entries are normalised at apply time.
+
+### Capability matrix (route-policy pre-flight)
+
+A per-device compatibility cache that lets the plugin flag, **at attach time**, which parts
+of a route-map / community-list won't apply on a device — instead of the operator finding
+out only when it silently didn't land. Backed by the persisted `device_capability` table,
+keyed by **`(ned_id, sw_version)`** so identical boxes share one verdict (probe one, reuse
+for many). Design + rationale: `compatibility-matrix-plan.md`.
+
+Each verdict row has a `status` — `native` (applies as-is) · `translated` (dialect-rewritten,
+e.g. Nokia color→hex) · `skipped` (the NED can't model it) · `unsupported` (the device parser
+**refused** it at commit) — and a `source`: `probe` (representable half, from the NSO
+capability-probe action) or `apply` (accepted half, from a real `apply_failed` device
+rejection). **Apply wins** — a real rejection is never downgraded by a later probe.
+
+**Key resolution — `refresh`.** Resolving a device's `(ned_id, sw_version)` key normally needs
+a live NSO probe. The `refresh` query param controls this: `refresh=true` probes NSO now and
+persists the learned key on the device row (authoritative — "check now" / attach-time);
+`refresh=false` serves the **last-learned** key from the device row with no probe (the cheap
+panel read), reporting `"known": false` when the device has never been probed.
+
+All three endpoints return `409 no_nso_client` when the device's NSO instance has no client.
+
+#### `POST /api/v1/devices/{id}/capability/refresh` → `200 | 404 | 409`
+
+Force a probe now and persist the representable-half verdict. Returns the learned key + count:
+
+```json
+{ "ned_id": "cisco-ios-cli-6.114", "sw_version": "17.15.4c", "count": 23 }
+```
+
+A probe that reports no NED returns `{"ned_id": "", "sw_version": "", "count": 0}`.
+
+#### `GET /api/v1/devices/{id}/capability?refresh={bool}` → `200 | 404 | 409`
+
+Return the cached verdict rows for this device's key. **`refresh` defaults to `false`** (cache-only).
+
+```json
+{
+  "known": true,
+  "ned_id": "cisco-ios-cli-6.114", "sw_version": "15.2(4)E10",
+  "elements": [
+    {"scope": "community", "name": "color:0:128", "status": "skipped", "detail": "no IOS home", "source": "probe"},
+    {"scope": "rm-set", "name": "set extcommunity color", "status": "unsupported", "detail": "% Invalid input", "source": "apply"}
+  ]
+}
+```
+
+A never-probed device (cache-only) returns `{"known": false, "ned_id": "", "sw_version": "", "elements": []}`.
+`scope` is `community` · `rm-set` · `rm-match`.
+
+#### `POST /api/v1/devices/{id}/route-policy/preflight?refresh={bool}` → `200 | 404 | 409`
+
+Check a would-be attach against the matrix. **`refresh` defaults to `true`** (an attach is an
+explicit, authoritative check). Body — what the object would push (the plugin derives it from
+the netbox-routing object, mirroring the route-policy intent it would send):
+
+```json
+{ "community_members": ["color:0:200", "65000:9"],
+  "set_keys": ["extcommunity_color", "metric_type"],
+  "match_keys": ["local_preference"] }
+```
+
+`community_members` are matched by **KIND** (`color:0:200` inherits the verdict probed for any
+`color` member); `set_keys` / `match_keys` are the set-/match-json keys, mapped to construct
+names (`extcommunity_color` → `set extcommunity color`, `metric_type` → `set metric-type`, …).
+
+```json
+{ "known": true, "ned_id": "cisco-ios-cli-6.114", "sw_version": "15.2(4)E10",
+  "fully_supported": false,
+  "unsupported": [
+    {"scope": "community", "element": "color:0:200", "status": "skipped", "detail": "no IOS home"}
+  ] }
+```
+
+An element flags when its matched row is `skipped` or `unsupported`. **Block-only-on-known-negative:**
+an unknown device (cache-only, never probed) or unreachable adapter returns
+`{"known": false, "fully_supported": true, "unsupported": []}` — the plugin must **not** block on
+it, only on a `known` + `fully_supported: false` verdict.
+
+---
+
+## IS-IS (M18 / M33)
+
+### `GET /api/v1/devices/{id}/isis-interfaces` → `200 | 404`
+
+The deepest read-mirror: IS-IS `processes` and per-`interfaces` config. Processes carry a
+large optional scalar set plus four nested JSON-bag containers; interfaces carry their own
+scalars + `settings`/`levels`. Optional scalars and the containers are **omitted when
+unset**. The nested dicts are hyphen→snake normalised (`_snake`) and the plugin reads fixed
+key sets out of them. Consumed by the plugin in `template_content._reconcile_isis_process`
+/ `_reconcile_isis_interfaces`.
+
+```json
+{
+  "device_id": 1, "last_refreshed_at": "2026-06-01T10:00:00Z", "refresh_source": "poll",
+  "processes": [
+    {"process_tag": "1", "net": "49.0001...00", "is_type": "level-2", "sr_enabled": true,
+     "levels": [{"level": "2", "default_metric": 10, "wide_metrics_only": true, "preference": 7,
+                 "labeled_preference": 7, "disabled": false, "auth_type": "md5"}],
+     "segment_routing": {"enabled": true, "prefix_sid_range": "global", "srgb_start": 100000,
+                         "srgb_range": 200000, "node_sid_index": 100, "node_sid_label": 100100,
+                         "node_sid_v6_index": 200, "node_sid_v6_label": 100200,
+                         "maximum_sid_depth": 10, "tunnel_table_pref": 8},
+     "flex_algos": [{"algo_id": 128, "metric_type": "igp", "priority": 100,
+                     "admin_group_exclude": ["RED"], "admin_group_include_any": ["BLUE"],
+                     "admin_group_include_all": []}]}
+  ],
+  "interfaces": [
+    {"interface_name": "GE0/0", "af": "ipv4", "process_tag": "1", "passive": false,
+     "metric": 10, "network_type": "point-to-point",
+     "levels": [{"level": "2", "metric": 10, "hello_interval": 3, "hello_multiplier": 3,
+                 "priority": 64, "passive": false}]}
+  ]
+}
+```
+
+**Key contract (pinned by `tests/api/test_contract_isis.py` ↔ plugin
+`tests/test_contract_isis.py`).** Optional keys omitted when unset:
+
+| Level | Always present | Optional (omitted when unset) |
+|---|---|---|
+| top | `device_id`, `last_refreshed_at`, `refresh_source`, `processes`, `interfaces` | — |
+| process | `process_tag` | `net`, `is_type`, `metric_style`, `overload_bit`, `area_auth_type/present/key`, `domain_auth_type/present/key`, `spf_initial_wait`, `spf_max_wait`, `lsp_initial_wait`, `lsp_max_wait`, `lsp_lifetime`, `lsp_refresh_interval`, `lsp_mtu`, `overload_on_startup`, `overload_timeout`, `te_enabled`, `sr_enabled`, `sr_node_msd`, `distance`, `maximum_paths`, `reference_bandwidth`, `settings`, `levels`, `segment_routing`, `flex_algos` |
+| interface | `interface_name`, `af`, `process_tag`, `passive` | `circuit_type`, `network_type`, `metric`, `bound_port`, `hello_auth_type`, `hello_auth_present`, `bfd_enabled`, `csnp_interval`, `retransmit_interval`, `lsp_interval`, `mesh_group`, `settings`, `levels` |
+
+Nested-bag key sets (snake_case): **instance level** = `level`, `default_metric`,
+`wide_metrics_only`, `preference`, `labeled_preference`, `disabled`, `auth_type`;
+**interface level** = `level`, `metric`, `hello_interval`, `hello_multiplier`, `priority`,
+`passive`; **segment_routing** = `enabled`, `prefix_sid_range`, `srgb_start`, `srgb_range`,
+`node_sid_index`, `node_sid_label`, `node_sid_v6_index`, `node_sid_v6_label`,
+`maximum_sid_depth`, `tunnel_table_pref`; **flex_algos** = `algo_id`, `metric_type`,
+`priority`, `admin_group_exclude`, `admin_group_include_any`, `admin_group_include_all`.
+`process_tag` / `af` are strings; `settings` is an opaque EAV `{key: value}` bag.
+
+### `PUT /api/v1/devices/{id}/isis-flex-algo-intent` → `200 | 404`
+
+IS-IS Flex-Algorithm intent, keyed `(process_tag, algo_id)`. Standard
+*intent-mirror PUT* (see box below). `admin_group_*` are comma-joined
+strings (not lists) at this layer.
+
+```json
+{ "flex_algos": [
+    { "process_tag": "", "algo_id": 128, "metric_type": "igp", "priority": 100,
+      "admin_group_exclude": "RED", "admin_group_include_any": "BLUE,GREEN",
+      "admin_group_include_all": null, "accepted_at": "2026-06-01T10:00:00Z" }
+] }
+```
+
+---
+
+## The intent-mirror PUT pattern
+
+Every `PUT /api/v1/devices/{id}/*-intent` endpoint below (and `vlan-intent`,
+`svi-intent`, …) shares the same contract:
+
+- **Full-replace**: the plugin pushes the device's full owned snapshot; rows
+  absent from the body are deleted from the mirror. An empty list clears the
+  scope.
+- `accepted_at` per row; defaults to *now* when omitted.
+- Storing intent **never touches the device**. If `auto_apply` is enabled in
+  the device settings, an apply job is enqueued; otherwise the next explicit
+  `actions/apply` commits it via the scope's `*-reconciler` NSO service.
+- Where dropping a row from a keyed NSO service list requires it, the adapter
+  queues an async removal job (see [Removal propagation](#removal-propagation)).
+- → `200` `{ "device_id": 1, "count": <rows stored>, "removed": <rows dropped> }`.
+  The PUT returns as soon as the rows are stored; if rows were dropped a `removal`
+  job is queued and runs in the background (the response does not wait for it).
+- `404` unknown device; `422` invalid payload.
+
+### Removal propagation
+
+A merge-PATCH apply never drops a list entry the payload omits, so deleting a row
+from the intent store would otherwise leave the config orphaned on the device. To
+revert it, the owning `*-reconciler` service instance is **PUT-replaced** with the
+full remaining accepted state, which lets NSO FASTMAP delete the dropped entries.
+
+That PUT-replace is a synchronous device commit that can exceed the plugin's HTTP
+client timeout (~30s). So it does **not** run inline in the intent PUT: when an
+intent PUT drops one or more rows it enqueues a **`removal`** job (a new
+`jobtype` enum value), atomically with the row deletes, and returns immediately.
+A worker runs the job in the background, re-reading the **current** accepted rows
+and PUT-replacing the service — so the job is idempotent and is requeued (not
+failed) after a worker restart. Scope is carried in `Job.context.scope` (one of
+`route_policy · bfd · svi · subinterface · static_route · interface_mtu · vlan ·
+logging · l2_sap · ospf · bgp`). Job status is observable via `GET …/jobs` like
+any other job; a failed removal records `error.code = "removal_failed"`.
+
+---
+
+## LAG (M9 read / M33 write)
+
+### `GET /api/v1/devices/{id}/lag-topology` → `200 | 404`
+
+Read-mirror of LAG membership (M9 — topology only).
+
+```json
+{ "device_id": 1, "last_refreshed_at": "2026-06-01T10:00:00Z", "refresh_source": "poll",
+  "lags": [
+    { "name": "Port-channel1", "id": 1,
+      "members": [ { "interface": "GigabitEthernet0/1", "mode": "active" } ] }
+  ] }
+```
+
+### `GET /api/v1/devices/{id}/lag-config` → `200 | 404`
+
+Read-mirror of full LACP bundle config (M33). Optional keys omitted when
+unset: bundle `min_links`/`system_priority`/`system_id`/`timer`/`admin_key`;
+member `mode`/`port_priority`.
+
+```json
+{ "device_id": 1, "last_refreshed_at": "2026-06-01T10:00:00Z", "refresh_source": "poll",
+  "bundles": [
+    { "name": "lag-2", "lag_id": 2, "min_links": 1, "system_priority": 32768,
+      "members": [ { "interface_name": "1/1/c2/1", "mode": "active", "port_priority": 100 } ] }
+  ] }
+```
+
+### `POST /api/v1/devices/{id}/lag-config/apply` → `200 | 404`
+
+Synchronous direct apply (NOT the intent-mirror pattern — LAG is owned in
+NetBox and applied via the `lag-reconciler` service immediately). Body =
+the GET `bundles` shape.
+
+```json
+{ "status": "deployed", "device": "prod-lab03c-ra1", "bundle_count": 1 }
+```
+
+`status: "error"` (with `error`/`message`/`detail`) on NSO failure — the
+HTTP status stays 200; callers check `status`.
+
+---
+
+## VLAN database & switchport (M34)
+
+### `GET /api/v1/devices/{id}/vlan-database` → `200 | 404`
+
+```json
+{ "device_id": 1,
+  "vlans": [ { "vlan_id": 100, "name": "users", "source": "vlan-database" } ] }
+```
+
+### `GET /api/v1/devices/{id}/switchport` → `200 | 404`
+
+L2 switchport read-mirror. `mode` ∈ `access` · `trunk` · `""` (unset);
+`untagged_vlan` nullable int; `tagged_vlans` sorted list of ints.
+
+```json
+{ "device_id": 1,
+  "interfaces": [
+    { "interface_name": "GigabitEthernet1/0/1", "mode": "trunk",
+      "untagged_vlan": 1, "tagged_vlans": [100, 200], "source": "switchport" }
+  ] }
+```
+
+### `POST /api/v1/devices/{id}/switchport/apply` → `200 | 404`
+
+Synchronous direct apply (like `lag-config/apply` — switchport is owned in
+NetBox, not mirrored as adapter intent). Body = `{ "interfaces": [...] }`
+with the GET row shape minus `source`.
+
+```json
+{ "status": "deployed", "device": "sw03", "interface_count": 2 }
+```
+
+### `PUT /api/v1/devices/{id}/vlan-intent` → `200 | 404`
+
+VLAN-database intent, keyed `vlan_id`. Standard intent-mirror PUT.
+
+```json
+{ "vlans": [ { "vlan_id": 100, "name": "users", "accepted_at": "2026-06-01T10:00:00Z" } ] }
+```
+
+---
+
+## SVI / IRB (M35)
+
+### `GET /api/v1/devices/{id}/svi` → `200 | 404`
+
+L3 VLAN interfaces (Cisco `interface VlanN`, Junos `irb.N`). No IPs — those
+ride `interface-ips`.
+
+```json
+{ "device_id": 1,
+  "interfaces": [
+    { "interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "", "source": "svi" }
+  ] }
+```
+
+### `PUT /api/v1/devices/{id}/svi-intent` → `200 | 404`
+
+Keyed `interface_name`. Standard intent-mirror PUT; rows carry
+`interface_name`, `vlan_id`, `type`, `vrf`, `accepted_at`.
+
+---
+
+## dot1q subinterfaces (M36)
+
+### `GET /api/v1/devices/{id}/subinterface` → `200 | 404`
+
+```json
+{ "device_id": 1,
+  "interfaces": [
+    { "interface_name": "Port-channel10.200", "parent_interface": "Port-channel10",
+      "dot1q_vlan": 200, "type": "subinterface", "vrf": "", "source": "subinterface" }
+  ] }
+```
+
+### `PUT /api/v1/devices/{id}/subinterface-intent` → `200 | 404`
+
+Keyed `interface_name`. Standard intent-mirror PUT; rows carry
+`interface_name`, `parent_interface`, `dot1q_vlan`, `type`, `vrf`,
+`accepted_at`.
+
+---
+
+## L2 services (M37 — Nokia epipe/vpls + SAP)
+
+### `GET /api/v1/devices/{id}/l2-services` → `200 | 404`
+
+SAP rows grouped by service. `service_type` ∈ `epipe` · `vpls`.
+
+```json
+{ "device_id": 1,
+  "services": [
+    { "service_name": "CUST-A", "service_type": "epipe", "service_id": 1001,
+      "saps": [ { "sap_id": "1/1/c3/1:100", "port": "1/1/c3/1",
+                  "outer_tag": 100, "inner_tag": null } ] }
+  ] }
+```
+
+### `PUT /api/v1/devices/{id}/l2-sap-intent` → `200 | 404`
+
+Keyed `(service_name, sap_id)`. Standard intent-mirror PUT; rows carry
+`service_name`, `service_type`, `sap_id`, `port`, `outer_tag`, `inner_tag`,
+`accepted_at`.
+
+---
+
+## Interface MTU (Phase 2b)
+
+### `GET /api/v1/devices/{id}/interface-mtu` → `200 | 404`
+
+Per-interface `mtu` / `ip_mtu` / `mpls_mtu` (all nullable — read with
+NO_DEFAULTS, so only explicitly-configured values appear). `bound_port`
+carries the Nokia port whose L2 MTU governs a router interface (`""`
+elsewhere).
+
+```json
+{ "device_id": 1,
+  "interfaces": [
+    { "interface_name": "LAG99:99", "mtu": null, "ip_mtu": 9000,
+      "mpls_mtu": null, "bound_port": "lag-99" }
+  ] }
+```
+
+### `PUT /api/v1/devices/{id}/interface-mtu-intent` → `200 | 404`
+
+Keyed `interface_name`. Standard intent-mirror PUT; rows carry
+`interface_name`, `mtu`, `ip_mtu`, `mpls_mtu`, `accepted_at`.
+
+---
+
+## BFD (M32)
+
+### `GET /api/v1/devices/{id}/bfd` → `200 | 404`
+
+Per-interface BFD read-mirror. `micro_bfd` distinguishes LAG micro-BFD from
+plain interface BFD. Optional keys (`bound_port`, `min_tx`, `min_rx`,
+`multiplier`) omitted when unset.
+
+```json
+{ "device_id": 1, "last_refreshed_at": "2026-06-01T10:00:00Z", "refresh_source": "poll",
+  "interfaces": [
+    { "interface_name": "lag-2", "micro_bfd": true, "enabled": true,
+      "min_tx": 300, "min_rx": 300, "multiplier": 3 }
+  ] }
+```
+
+### `PUT /api/v1/devices/{id}/bfd-intent` → `200 | 404`
+
+Keyed `interface_name`. Standard intent-mirror PUT; rows carry
+`interface_name`, `min_tx`, `min_rx`, `multiplier`, `micro_bfd`,
+`accepted_at`. Applied via the `bfd-reconciler` NSO service.
+
+---
+
+## Logging / syslog
+
+### `GET /api/v1/devices/{id}/logging-config` → `200 | 404`
+
+Remote syslog hosts. Optional keys (`port`, `severity`, `facility`,
+`transport`, `vrf`, `source`) omitted when unset.
+
+```json
+{ "device_id": 1, "last_refreshed_at": "2026-06-01T10:00:00Z", "refresh_source": "poll",
+  "hosts": [
+    { "address": "10.0.0.50", "port": 514, "severity": "informational",
+      "transport": "udp", "vrf": "MGMT" } ] }
+```
+
+### `PUT /api/v1/devices/{id}/logging-intent` → `200 | 404`
+
+Keyed `address`. Standard intent-mirror PUT; rows carry `address`, `port`,
+`severity`, `facility`, `transport`, `vrf`, `source`, `accepted_at`.
+Applied via the `logging-reconciler` NSO service.

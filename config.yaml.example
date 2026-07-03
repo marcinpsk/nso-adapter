@@ -35,3 +35,4 @@ log_format: json
 scheduler:
   poll_interval: 15           # minutes between NSO device polls
   scope_reconcile_interval: 5 # minutes between scope reconciliation runs
+  orphan_reap_interval: 5     # minutes between reaps of jobs stranded 'running' by a dead worker (0 disables)
