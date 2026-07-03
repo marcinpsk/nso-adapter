@@ -56,6 +56,12 @@ class ApiConfig(BaseModel):
 class SchedulerConfig(BaseModel):
     poll_interval: int = 15
     scope_reconcile_interval: int = 5
+    # Layer B safety-net: how often (minutes) to reap jobs stranded 'running' by a dead worker
+    # WITHOUT a restart. The startup reaper only fires on (re)start; this periodic tick recovers a
+    # live-process orphan so the per-device active-job dedup can't 409 every future job for that
+    # device until the next restart. 0 disables it. Only touches jobs with a stale heartbeat, so it
+    # never disturbs a live worker.
+    orphan_reap_interval: int = 5
     # Layer B durable worker: number of in-process worker tasks draining the Job
     # table.  Default 1 (serial) — per-device dedup means cross-device parallelism
     # is the only thing >1 buys, at the cost of more concurrent NSO/NetBox load.

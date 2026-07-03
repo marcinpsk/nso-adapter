@@ -37,6 +37,7 @@ def test_scheduler_config_defaults():
     assert cfg.lag_config_poll_interval == 60
     assert cfg.enable_interface_ip_sync is True
     assert cfg.interface_ip_poll_interval == 60
+    assert cfg.orphan_reap_interval == 5
 
 
 def test_scheduler_config_from_yaml():
@@ -93,6 +94,7 @@ def test_start_scheduler_registers_lag_refresh_job(monkeypatch: pytest.MonkeyPat
                 topology_interface_poll_interval=120,
                 enable_failover=False,
                 failover_base_tick=1,
+                orphan_reap_interval=5,
             )
         ),
     )
@@ -104,6 +106,7 @@ def test_start_scheduler_registers_lag_refresh_job(monkeypatch: pytest.MonkeyPat
         "sync_all_devices",
         "scope_reconcile",
         "intent_reconcile",
+        "orphan_reap",
         "lag_topology_refresh",
         "lag_config_refresh",
         "interface_ip_refresh",
@@ -165,6 +168,7 @@ def test_start_scheduler_skips_lag_refresh_when_disabled(monkeypatch: pytest.Mon
                 topology_interface_poll_interval=120,
                 enable_failover=False,
                 failover_base_tick=1,
+                orphan_reap_interval=5,
             )
         ),
     )
@@ -172,10 +176,13 @@ def test_start_scheduler_skips_lag_refresh_when_disabled(monkeypatch: pytest.Mon
     scheduler_module.start_scheduler()
 
     assert fake_scheduler.started is True
+    # orphan_reap is a safety-net with no feature-enable flag: disabling every feature sync must
+    # NOT disable self-healing of stranded jobs — it stays registered (only interval=0 drops it).
     assert {job["id"] for job in fake_scheduler.jobs} == {
         "sync_all_devices",
         "scope_reconcile",
         "intent_reconcile",
+        "orphan_reap",
     }
     scheduler_module.stop_scheduler()
 
@@ -223,6 +230,7 @@ def _full_scheduler_config(**overrides) -> SimpleNamespace:
         topology_interface_poll_interval=21,
         enable_failover=True,
         failover_base_tick=22,
+        orphan_reap_interval=23,
     )
     base.update(overrides)
     return SimpleNamespace(scheduler=SimpleNamespace(**base))
@@ -241,6 +249,7 @@ def test_start_scheduler_registers_every_job_with_correct_interval(monkeypatch: 
         "sync_all_devices": 1,
         "scope_reconcile": 2,
         "intent_reconcile": 2,
+        "orphan_reap": 23,
         "lag_topology_refresh": 3,
         "lag_config_refresh": 4,
         "interface_ip_refresh": 5,

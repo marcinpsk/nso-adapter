@@ -256,6 +256,26 @@ async def _scheduled_intent_reconcile() -> None:
                 await db.rollback()
 
 
+async def _scheduled_orphan_reap() -> None:
+    """Safety-net tick: recover jobs stranded ``running`` by a dead worker between restarts.
+
+    The startup reaper (:func:`core.worker.requeue_orphaned_jobs`) only fires when the process
+    (re)starts. This periodic tick closes the gap where a job is stranded ``running`` WITHOUT a
+    restart — a worker task killed mid-run in a long-lived process. Left unreaped, the per-device
+    dedup (:func:`core.jobs.get_active_job`) would treat the orphan as in-flight and silently 409
+    every future job for that device until the next restart — the same 'orphan blocks the device
+    forever' failure the plugin's reconcile enqueue once had.
+
+    Delegates to the shared reaper, which only touches jobs whose heartbeat has gone stale (a live
+    worker refreshes it every ``_HEARTBEAT_INTERVAL``), so this is safe to run concurrently with the
+    worker pool: idempotent orphans → requeued, an interrupted apply → failed (never silently
+    re-pushed). APScheduler ``max_instances=1`` keeps two reaps from overlapping.
+    """
+    from nso_adapter.core.worker import requeue_orphaned_jobs
+
+    await requeue_orphaned_jobs()
+
+
 async def _scheduled_lag_topology_refresh() -> None:
     """Periodic fallback: refresh LAG topology for all managed devices."""
     from sqlalchemy import select
@@ -828,6 +848,9 @@ _JOB_SPECS: tuple[_JobSpec, ...] = (
     _JobSpec(_scheduled_sync_all, "sync_all_devices", "poll_interval", None, False),
     _JobSpec(_scheduled_scope_reconcile, "scope_reconcile", "scope_reconcile_interval", None, False),
     _JobSpec(_scheduled_intent_reconcile, "intent_reconcile", "scope_reconcile_interval", None, False),
+    # Safety-net: no enable flag (self-healing must not be switchable off by a feature toggle);
+    # gate_on_interval so an interval of 0 is the only way to disable it.
+    _JobSpec(_scheduled_orphan_reap, "orphan_reap", "orphan_reap_interval", None, True),
     _JobSpec(_scheduled_lag_topology_refresh, "lag_topology_refresh", "lag_topology_poll_interval", None, True),
     _JobSpec(_scheduled_lag_config_refresh, "lag_config_refresh", "lag_config_poll_interval", None, True),
     _JobSpec(

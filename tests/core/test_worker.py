@@ -162,6 +162,38 @@ async def test_requeue_orphaned_recovers_stale_heartbeat(adapter_client):
     assert apply_job.error["code"] == "orphaned"
 
 
+async def test_periodic_reap_recovers_stale_orphan_but_spares_live(adapter_client):
+    """The PERIODIC scheduler tick (not just startup) reaps a stale orphan while leaving a live
+    heartbeating job untouched — proving the reaper is safe to run concurrently with the worker
+    pool. This closes the 'orphan blocks the device forever' gap: without a periodic tick, a job
+    stranded 'running' in a long-lived process (worker task killed mid-run, no restart) would make
+    get_active_job treat it as in-flight and 409 every future job for that device until the next
+    restart — the same failure the plugin's reconcile enqueue once had."""
+    from datetime import UTC, datetime, timedelta
+
+    from nso_adapter.core import scheduler
+
+    live_device = await _seed_device("reap-live", 740)
+    live_id = await _seed_job(live_device, JobType.sync, JobStatus.running)
+    stale_device = await _seed_device("reap-stale", 741)
+    stale_id = await _seed_job(stale_device, JobType.sync, JobStatus.running)
+    apply_device = await _seed_device("reap-stale-apply", 742)
+    apply_id = await _seed_job(apply_device, JobType.apply, JobStatus.running)
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    await _set_heartbeat(live_id, now)  # fresh heartbeat → a live worker owns it
+    await _set_heartbeat(stale_id, now - timedelta(seconds=300))  # stale → orphaned
+    await _set_heartbeat(apply_id, now - timedelta(seconds=300))
+
+    await scheduler._scheduled_orphan_reap()
+
+    assert (await _get_job(live_id)).status == JobStatus.running  # spared — never steal a live job
+    assert (await _get_job(stale_id)).status == JobStatus.queued  # idempotent orphan → requeued
+    apply_job = await _get_job(apply_id)
+    assert apply_job.status == JobStatus.failed  # apply orphan → failed (never silently re-push)
+    assert apply_job.error["code"] == "orphaned"
+
+
 async def test_heartbeat_survives_transient_db_error(adapter_client, monkeypatch):
     """A transient DB error on one heartbeat tick must not silently kill the heartbeat task —
     otherwise the heartbeat goes stale under a live job and the reaper (s3-4) later steals it,
