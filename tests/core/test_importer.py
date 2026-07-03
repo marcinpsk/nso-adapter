@@ -650,6 +650,56 @@ async def test_refresh_routing_surfaces_skips_all_when_disabled(db_session: Asyn
     await refresh_routing_surfaces_for_device(db_session, device, AsyncMock(), refresh_source="sync")
 
 
+async def test_refresh_config_surfaces_isolates_failures(db_session: AsyncSession):
+    """The post-apply config-surface fan-out (VLAN/SVI/subinterface/MTU) is best-effort: one
+    surface raising must not abort the others, so every deploying-mark scope still gets re-read."""
+    from nso_adapter.core.importer import refresh_config_surfaces_for_device
+
+    device = Device(nso_instance="nso-dev", nso_device_name="sw-cfg", ned_id="x", netbox_device_id=40)
+    db_session.add(device)
+    await db_session.commit()
+
+    targets = {
+        "nso_adapter.core.vlan.refresh_vlan_database_for_device": AsyncMock(),
+        "nso_adapter.core.svi.refresh_svi_for_device": AsyncMock(side_effect=RuntimeError("boom")),
+        "nso_adapter.core.subinterface.refresh_subinterface_for_device": AsyncMock(),
+        "nso_adapter.core.interface_mtu.refresh_interface_mtu_for_device": AsyncMock(),
+    }
+    with contextlib.ExitStack() as stack:
+        for path, m in targets.items():
+            stack.enter_context(patch(path, m))
+        # must not raise even though the SVI surface blows up
+        await refresh_config_surfaces_for_device(db_session, device, AsyncMock(), refresh_source="apply")
+
+    # every surface was attempted, including the one that raised
+    for m in targets.values():
+        m.assert_awaited_once()
+
+
+async def test_refresh_config_surfaces_skips_all_when_disabled(db_session: AsyncSession, monkeypatch):
+    """With every config-surface flag off, the fan-out builds no surface list and is a clean no-op."""
+    import types
+
+    from nso_adapter.core.importer import refresh_config_surfaces_for_device
+
+    device = Device(nso_instance="nso-dev", nso_device_name="sw-cfg-off", ned_id="x", netbox_device_id=41)
+    db_session.add(device)
+    await db_session.commit()
+
+    cfg = types.SimpleNamespace(
+        scheduler=types.SimpleNamespace(
+            enable_vlan_sync=False,
+            enable_svi_sync=False,
+            enable_subinterface_sync=False,
+            enable_interface_mtu_sync=False,
+        )
+    )
+    monkeypatch.setattr("nso_adapter.core.importer.get_config", lambda: cfg)
+
+    # No surfaces enabled → the loop body never runs; must not raise.
+    await refresh_config_surfaces_for_device(db_session, device, AsyncMock(), refresh_source="apply")
+
+
 # ── discover_devices + helpers (paydown of the grandfathered coverage omit) ────
 
 import types  # noqa: E402

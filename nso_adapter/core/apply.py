@@ -1449,6 +1449,45 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     )
 
 
+async def _post_apply_refresh_and_notify(db: AsyncSession, device_id: int) -> None:
+    """Re-read the just-applied surfaces back into the adapter read-mirror and notify the plugin.
+
+    Apply commits config to NSO but — unlike ``sync_device`` — never refreshes the read-mirror
+    (``GET /route-policy`` & friends serve cached DB rows) and never fires the sync-complete
+    callback. So the plugin's own settle logic, which flips a ``deploying`` overlay row to
+    ``in_sync`` only once the applied object is *present* in the adapter payload, reads a stale
+    mirror on the immediate post-apply reconcile and re-marks the row ``deploying`` — it settles
+    only on the next periodic sync (observed for route-policy on rg03: the row sat ``deploying``
+    until the 15-min sync). Re-reading every surface that backs a ``deploying`` overlay — the
+    routing surfaces (route-policy / IS-IS / OSPF / BGP / BFD / …) plus the L2/interface config
+    surfaces (VLAN / SVI / subinterface / MTU) that ``sync_device`` does *not* fan out to — and
+    then notifying the plugin lets those rows settle right after Apply.
+
+    Best-effort: the Apply job is already finalized, so a refresh/notify failure must not fail it —
+    the periodic sync remains the backstop.
+    """
+    from nso_adapter.core.importer import (
+        get_netbox_client,
+        get_nso_client,
+        refresh_config_surfaces_for_device,
+        refresh_routing_surfaces_for_device,
+    )
+
+    try:
+        device = await db.get(Device, device_id)
+        if device is None:
+            return
+        client = get_nso_client(device.nso_instance)
+        await refresh_routing_surfaces_for_device(db, device, client, refresh_source="apply")
+        await refresh_config_surfaces_for_device(db, device, client, refresh_source="apply")
+        await db.commit()
+        nb_client = get_netbox_client()
+        if nb_client and device.netbox_device_id:
+            await nb_client.notify_sync_complete(device.netbox_device_id)
+    except Exception as exc:  # noqa: BLE001 — best-effort; never fail an already-finalized Apply
+        logger.warning("apply.post_refresh_failed", device_id=device_id, error=repr(exc))
+
+
 async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
     """Background task: execute the apply for *device_id* (see module docstring §7a)."""
     from nso_adapter.store.db import get_session
@@ -1475,3 +1514,8 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
                 job.status = JobStatus.failed
                 job.error = {"code": "internal", "message": repr(exc), "detail": {}}
                 await db.commit()
+        else:
+            # Apply finalized (succeeded/partial/failed-on-device, no unexpected error): re-read
+            # the applied surfaces into the mirror and notify the plugin so a 'deploying' row
+            # settles on the immediate post-apply reconcile, not only on the next periodic sync.
+            await _post_apply_refresh_and_notify(db, device_id)

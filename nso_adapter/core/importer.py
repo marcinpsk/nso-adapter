@@ -199,6 +199,55 @@ async def refresh_routing_surfaces_for_device(
     return failed
 
 
+async def refresh_config_surfaces_for_device(
+    db: AsyncSession,
+    device: Device,
+    nso_client: NsoClient,
+    *,
+    refresh_source: str = "apply",
+) -> None:
+    """Best-effort refresh of the L2 / interface config surfaces (VLAN / SVI / subinterface / MTU).
+
+    These back the plugin's ``accepted → deploying`` overlay rows that settle to ``in_sync`` only
+    once the applied object is *present* in the adapter read-mirror. Unlike the routing surfaces
+    they are NOT part of ``sync_device``'s fan-out (each refreshes on its own poll job), so after a
+    device Apply the plugin's post-apply reconcile would otherwise read a stale mirror and leave the
+    row ``deploying`` until that surface's next poll. Re-reading them here lets the row settle right
+    after Apply. Each surface is isolated + gated by the same scheduler enable flag; one failure
+    must not abort the others (the caller commits).
+    """
+    cfg = get_config().scheduler
+
+    surfaces: list[tuple[str, object]] = []
+    if cfg.enable_vlan_sync:
+        from nso_adapter.core.vlan import refresh_vlan_database_for_device
+
+        surfaces.append(("vlan", refresh_vlan_database_for_device))
+    if cfg.enable_svi_sync:
+        from nso_adapter.core.svi import refresh_svi_for_device
+
+        surfaces.append(("svi", refresh_svi_for_device))
+    if cfg.enable_subinterface_sync:
+        from nso_adapter.core.subinterface import refresh_subinterface_for_device
+
+        surfaces.append(("subinterface", refresh_subinterface_for_device))
+    if cfg.enable_interface_mtu_sync:
+        from nso_adapter.core.interface_mtu import refresh_interface_mtu_for_device
+
+        surfaces.append(("interface_mtu", refresh_interface_mtu_for_device))
+
+    for name, fn in surfaces:
+        try:
+            await fn(db, device, nso_client, refresh_source=refresh_source)
+        except Exception as exc:
+            logger.warning(
+                "apply.config_surface_refresh_failed",
+                device_id=device.id,
+                surface=name,
+                error=repr(exc),
+            )
+
+
 class _WriteCtx(NamedTuple):
     """NetBox write context threaded through the per-interface reconcile.
 

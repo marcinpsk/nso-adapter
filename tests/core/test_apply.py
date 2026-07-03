@@ -604,6 +604,85 @@ async def test_run_apply_all_succeed(adapter_client):
         break
 
 
+async def test_run_apply_refreshes_mirror_and_notifies_plugin(adapter_client):
+    """After a finalized Apply, run_apply re-reads the applied surfaces into the read-mirror and
+    fires the plugin sync-complete callback, so a 'deploying' overlay row settles on the immediate
+    post-apply reconcile instead of only on the next periodic sync (the route-policy rg03 race).
+
+    Before this, Apply pushed config to NSO but never refreshed the cache-only GET endpoints or
+    notified the plugin, so the plugin's presence-based settle read a stale mirror (applied object
+    not yet present) and re-marked the row 'deploying' — settling only on the next 15-min sync."""
+    from nso_adapter.bindings.netbox.client import NetboxClient
+    from nso_adapter.core import importer as imp
+
+    device_id = await _seed_device("rtr-settle", 321)
+    job_id = await _seed_apply_job(device_id)
+    await _seed_interface_with_intent(
+        device_id=device_id,
+        iface_name="GigabitEthernet0/0",
+        attribute="description",
+        intent_value="uplink",
+        sync_state=SyncState.accepted,
+        netbox_id=400,
+    )
+
+    mock_client = AsyncMock()
+    nb = AsyncMock(spec=NetboxClient)
+    nb.notify_sync_complete = AsyncMock()
+    imp._netbox_client = nb
+    try:
+        with (
+            patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+            patch("nso_adapter.nso.apply.apply_interface_attribute", new_callable=AsyncMock),
+        ):
+            await run_apply(job_id=job_id, device_id=device_id, force=True)
+    finally:
+        imp._netbox_client = None
+
+    # The read-mirror was re-read from NSO for both a routing surface (route-policy) and a config
+    # surface (SVI) — the two families that back a 'deploying' overlay row ...
+    mock_client.get_route_policy.assert_awaited()
+    mock_client.get_svi.assert_awaited()
+    # ... and the plugin was notified so its post-apply reconcile settles the deploying row.
+    nb.notify_sync_complete.assert_awaited_once_with(321)
+
+
+async def test_run_apply_post_refresh_failure_does_not_fail_job(adapter_client):
+    """The post-apply refresh/notify is best-effort: the Apply job is already finalized, so a
+    failure re-reading the mirror or notifying the plugin must NOT flip a succeeded job to failed
+    (the periodic sync is the backstop)."""
+    from nso_adapter.core import importer as imp
+
+    device_id = await _seed_device("rtr-settle-fail", 322)
+    job_id = await _seed_apply_job(device_id)
+    await _seed_interface_with_intent(
+        device_id=device_id,
+        iface_name="GigabitEthernet0/1",
+        attribute="description",
+        intent_value="uplink",
+        sync_state=SyncState.accepted,
+        netbox_id=401,
+    )
+
+    mock_client = AsyncMock()
+    imp._netbox_client = None  # get_netbox_client() -> None; helper must still not raise
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_interface_attribute", new_callable=AsyncMock),
+        patch(
+            "nso_adapter.core.importer.refresh_routing_surfaces_for_device",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("NSO unreachable"),
+        ),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)  # must not raise
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded  # unchanged by the best-effort post-refresh
+        break
+
+
 async def test_run_apply_partial_failure(adapter_client):
     """run_apply marks job failed when some attributes fail to apply."""
     from nso_adapter.nso.apply import NsoApplyError
