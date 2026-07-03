@@ -59,7 +59,8 @@ async def test_onboard_raises_for_duplicate_netbox_id(adapter_client_with_nso):
 
 
 async def test_onboard_raises_for_duplicate_nso_device_name(adapter_client_with_nso):
-    """onboard_device raises LookupError when (nso_instance, nso_device_name) already exists."""
+    """onboard_device raises LookupError when (nso_instance, nso_device_name) is already onboarded
+    to a DIFFERENT NetBox device — that is a genuine conflict; don't steal it."""
     from nso_adapter.core.onboarding import onboard_device
     from nso_adapter.store.db import get_session
     from tests.conftest import seed_device
@@ -69,6 +70,51 @@ async def test_onboard_raises_for_duplicate_nso_device_name(adapter_client_with_
     async for db in get_session():
         with pytest.raises(LookupError, match="already onboarded"):
             await onboard_device(db, "nso-dev", "taken-name", 201)
+        break
+
+
+async def test_onboard_adopts_unlinked_existing_device(adapter_client_with_nso):
+    """A device provisioned INTO NSO without a NetBox link (netbox_device_id IS NULL) must be
+    ADOPTED when the operator later marks it managed: onboard_device fills the mapping in on the
+    SAME row instead of raising a spurious 'already onboarded'. Regression — an unlinked leftover
+    row silently blocked linking (409 -> plugin swallowed it), so the plugin's adapter_device_id
+    stayed None and the device never onboarded (live: netbox device 23 / prod-lab03c-ri6 vs the
+    June-provisioned adapter device 343, netbox_device_id NULL)."""
+    from nso_adapter.core.onboarding import onboard_device
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import MappingStatus
+    from tests.conftest import seed_device
+
+    existing_id = await seed_device(nso_instance="nso-dev", nso_device_name="preprovisioned", netbox_device_id=None)
+
+    async for db in get_session():
+        device = await onboard_device(db, "nso-dev", "preprovisioned", 77)
+        assert device.id == existing_id  # adopted the SAME row — not a second device
+        assert device.netbox_device_id == 77
+        assert device.mapping_status == MappingStatus.mapped
+        break
+
+    # Exactly one row for that NSO node — adoption must not create a duplicate.
+    async for db in get_session():
+        rows = (await db.execute(select(Device).where(Device.nso_device_name == "preprovisioned"))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].netbox_device_id == 77
+        break
+
+
+async def test_onboard_is_idempotent_for_same_link(adapter_client_with_nso):
+    """Re-onboarding the same (instance, name) already linked to the SAME netbox_device_id returns
+    the existing row (idempotent no-op), not a 409 — so a re-fired manage signal is safe."""
+    from nso_adapter.core.onboarding import onboard_device
+    from nso_adapter.store.db import get_session
+    from tests.conftest import seed_device
+
+    existing_id = await seed_device(nso_instance="nso-dev", nso_device_name="already-linked", netbox_device_id=55)
+
+    async for db in get_session():
+        device = await onboard_device(db, "nso-dev", "already-linked", 55)
+        assert device.id == existing_id
+        assert device.netbox_device_id == 55
         break
 
 

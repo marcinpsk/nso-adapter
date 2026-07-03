@@ -75,10 +75,16 @@ async def onboard_device(
     nso_device_name: str,
     netbox_device_id: int,
 ) -> Device:
-    """Create a new device record.
+    """Onboard a device: link the NSO node (nso_instance + nso_device_name) to *netbox_device_id*.
+
+    Creates a new mapped Device row, or ADOPTS an existing unlinked one for the same NSO node
+    (a leftover provisioned into NSO without a NetBox link) by filling in netbox_device_id.
+    Idempotent when the node is already linked to the same NetBox device.
 
     Raises:
-        ValueError: if the NSO instance is unknown or the device is already registered.
+        ValueError: if the NSO instance is unknown.
+        LookupError: if netbox_device_id is already onboarded elsewhere, or the NSO node is already
+            linked to a DIFFERENT NetBox device.
 
     """
     cfg = get_config()
@@ -86,19 +92,49 @@ async def onboard_device(
     if nso_instance not in known_instances:
         raise ValueError(f"NSO instance {nso_instance!r} not found in config")
 
-    # Uniqueness: one netbox_device_id per adapter, one nso_device_name per instance
+    # Is this exact NSO node (instance + name) already tracked by the adapter?
+    existing = (
+        await db.execute(
+            select(Device).where(
+                Device.nso_instance == nso_instance,
+                Device.nso_device_name == nso_device_name,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        # Already linked to THIS NetBox device → idempotent no-op (e.g. a re-fired manage signal).
+        if existing.netbox_device_id == netbox_device_id:
+            return existing
+        # Linked to a DIFFERENT NetBox device → genuine conflict; never silently repoint it.
+        if existing.netbox_device_id is not None:
+            raise LookupError(
+                f"NSO device {nso_device_name!r} on {nso_instance!r} is already onboarded "
+                f"to NetBox device {existing.netbox_device_id}"
+            )
+        # Unlinked leftover — provisioned INTO NSO without a NetBox link (netbox_device_id NULL).
+        # ADOPT it: fill the mapping in on the same row. Rejecting here left the plugin's onboard
+        # POST failing with 409, which it swallowed, so the device never onboarded. The target
+        # netbox_device_id must still be free (not held by some OTHER device row).
+        dup_nb = (
+            await db.execute(
+                select(Device).where(Device.netbox_device_id == netbox_device_id, Device.id != existing.id)
+            )
+        ).scalar_one_or_none()
+        if dup_nb is not None:
+            raise LookupError(f"NetBox device {netbox_device_id} is already onboarded")
+        existing.netbox_device_id = netbox_device_id
+        existing.mapping_status = MappingStatus.mapped
+        await db.commit()
+        await db.refresh(existing)
+        logger.info(
+            "device.adopted", device_id=existing.id, nso_device=nso_device_name, netbox_device_id=netbox_device_id
+        )
+        return existing
+
+    # New NSO node → the target netbox_device_id must not already be onboarded elsewhere.
     dup_nb = await db.execute(select(Device).where(Device.netbox_device_id == netbox_device_id))
     if dup_nb.scalar_one_or_none():
         raise LookupError(f"NetBox device {netbox_device_id} is already onboarded")
-
-    dup_nso = await db.execute(
-        select(Device).where(
-            Device.nso_instance == nso_instance,
-            Device.nso_device_name == nso_device_name,
-        )
-    )
-    if dup_nso.scalar_one_or_none():
-        raise LookupError(f"NSO device {nso_device_name!r} on {nso_instance!r} is already onboarded")
 
     device = Device(
         nso_instance=nso_instance,
