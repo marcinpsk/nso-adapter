@@ -67,6 +67,34 @@ async def test_distinct_sw_version_is_separate_key(adapter_client):  # noqa: F81
 
 
 @pytest.mark.asyncio
+async def test_clear_capability_rejections_clears_only_applied_generic_scopes(adapter_client):  # noqa: F811
+    """A clean commit clears the coarse apply-sourced rejection for the applied scopes only —
+    a scope not in the applied set, and any route-policy fine-grained construct row, survive.
+    Without this a scope rejected once would stay 'unsupported' forever (a probe cannot downgrade
+    an apply-rejection)."""
+    from nso_adapter.core.capability import (
+        clear_capability_rejections,
+        get_device_capability,
+        record_capability_rejection,
+    )
+    from nso_adapter.store.db import get_session
+
+    sw = "15.7"
+    async for db in get_session():
+        await record_capability_rejection(db, _NED, sw, "snmp", "snmp", "old error")
+        await record_capability_rejection(db, _NED, sw, "isis", "isis", "old error")
+        await record_capability_rejection(db, _NED, sw, "rm-set", "set extcommunity color", "fine-grained")
+
+        cleared = await clear_capability_rejections(db, _NED, sw, {"snmp"})
+        assert cleared == 1
+        by_key = {(r.scope, r.name): r for r in await get_device_capability(db, _NED, sw)}
+        assert ("snmp", "snmp") not in by_key  # applied scope → stale rejection cleared
+        assert ("isis", "isis") in by_key  # NOT applied → untouched
+        assert ("rm-set", "set extcommunity color") in by_key  # fine-grained → never cleared
+        break
+
+
+@pytest.mark.asyncio
 async def test_refresh_parses_and_stores_probe_output(adapter_client, monkeypatch):  # noqa: F811
     from nso_adapter.core import capability
     from nso_adapter.store.db import get_session

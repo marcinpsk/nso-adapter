@@ -1712,6 +1712,76 @@ async def test_run_apply_atomic_failure_records_scope_capability(adapter_client,
         break
 
 
+@pytest.mark.asyncio
+async def test_run_apply_atomic_success_clears_stale_reactive_unsupported(adapter_client, monkeypatch):
+    """A clean atomic commit is the strongest positive signal — it clears a prior reactive
+    'unsupported' verdict for the applied scopes so the gap does not stick forever (a probe
+    cannot downgrade an apply-rejection). A scope that was NOT applied, and any route-policy
+    fine-grained construct row, are left untouched."""
+    from nso_adapter.store.models import Device, DeviceCapability
+
+    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+    device_id = await _seed_device(name="sw01")
+    await _seed_snmp_and_static_route(device_id)
+    ned = "cisco-ios-cli:cisco-ios"
+    async for db in get_session():
+        dev = await db.get(Device, device_id)
+        dev.ned_id, dev.sw_version = ned, "15.7"
+        # stale reactive rejections left by an earlier FAILED apply of these scopes
+        db.add_all(
+            [
+                DeviceCapability(
+                    ned_id=ned,
+                    sw_version="15.7",
+                    scope="snmp",
+                    name="snmp",
+                    status="unsupported",
+                    detail="old error",
+                    source="apply",
+                ),
+                DeviceCapability(
+                    ned_id=ned,
+                    sw_version="15.7",
+                    scope="route_policy",
+                    name="route_policy",
+                    status="unsupported",
+                    detail="old error",
+                    source="apply",
+                ),
+                DeviceCapability(
+                    ned_id=ned,
+                    sw_version="15.7",
+                    scope="rm-set",
+                    name="set extcommunity color",
+                    status="unsupported",
+                    detail="fine-grained",
+                    source="apply",
+                ),
+            ]
+        )
+        await db.commit()
+        break
+    job_id = await _seed_apply_job(device_id)
+
+    mock_client = AsyncMock()
+    combined = AsyncMock(return_value=None)  # clean commit (snmp + static_route both apply)
+    with ExitStack() as stack:
+        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
+        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", combined))
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        by_key = {
+            (c.scope, c.name): c
+            for c in (await db.execute(select(DeviceCapability).where(DeviceCapability.ned_id == ned))).scalars().all()
+        }
+        assert ("snmp", "snmp") not in by_key  # applied scope → stale rejection cleared
+        assert ("route_policy", "route_policy") in by_key  # NOT applied → untouched
+        assert ("rm-set", "set extcommunity color") in by_key  # fine-grained → never cleared
+        assert (await db.get(Job, job_id)).status == JobStatus.succeeded
+        break
+
+
 async def _seed_route_map_intent(device_id, ned_id):
     from nso_adapter.store.models import Device, RoutePolicyObjectIntent
 

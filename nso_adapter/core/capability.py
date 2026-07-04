@@ -104,6 +104,46 @@ async def record_capability_rejection(
     await db.commit()
 
 
+async def clear_capability_rejections(db: AsyncSession, ned_id: str, sw_version: str, scopes) -> int:
+    """Clear reactive (apply-sourced) rejections for scopes that just committed cleanly.
+
+    A successful device commit is the strongest positive signal — stronger than a probe (which
+    :func:`_upsert` deliberately cannot use to downgrade an apply-rejection). Without this, a
+    scope rejected once would stay ``unsupported`` forever, even after the device is fixed /
+    upgraded and the intent lands. Only the coarse generic rows (``name == scope``, as written by
+    ``core/apply.py`` ``_record_atomic_capability``) for the applied scopes are removed;
+    route-policy fine-grained constructs (scope ``rm-set`` / ``rm-match`` / ``community``) are
+    never touched — a clean ``route_policy`` apply does not prove any specific construct was
+    present. Returns the number of rows deleted.
+    """
+    if not ned_id:
+        return 0
+    scope_set = {str(s) for s in scopes}
+    if not scope_set:
+        return 0
+    rows = (
+        (
+            await db.execute(
+                select(m.DeviceCapability).where(
+                    m.DeviceCapability.ned_id == ned_id,
+                    m.DeviceCapability.sw_version == sw_version,
+                    m.DeviceCapability.source == "apply",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    cleared = 0
+    for row in rows:
+        if row.scope in scope_set and row.name == row.scope and row.status in ("unsupported", "skipped"):
+            await db.delete(row)
+            cleared += 1
+    if cleared:
+        await db.commit()
+    return cleared
+
+
 async def get_device_capability(db: AsyncSession, ned_id: str, sw_version: str) -> list[m.DeviceCapability]:
     """All cached capability rows for a ``(ned_id, sw_version)`` key."""
     return list(

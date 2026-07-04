@@ -797,6 +797,26 @@ async def _record_atomic_capability(db, client, device, device_name, offenders, 
             await record_capability_rejection(db, ned_id, sw, scope, scope, detail)
 
 
+async def _clear_atomic_capability(db, device, modules) -> None:
+    """Clear stale reactive capability rejections after a clean atomic commit.
+
+    A successful commit proves every staged scope applies on this ``(ned, sw)`` — the strongest
+    positive signal — so drop any coarse ``apply``-sourced ``unsupported`` recorded by an earlier
+    failed apply. Without this the gap would stick forever (a probe cannot downgrade an
+    apply-rejection). Best-effort; the ``(ned, sw)`` key is read from the device row (no probe).
+    """
+    from nso_adapter.core.capability import _clean_capability_key, clear_capability_rejections
+
+    ned_id = _clean_capability_key(device.ned_id)
+    if not ned_id:
+        return
+    sw = _clean_capability_key(device.sw_version)
+    scopes: set[str] = set()
+    for root_key in modules:
+        scopes.update(_capability_scopes_for(root_key))
+    await clear_capability_rejections(db, ned_id, sw, scopes)
+
+
 async def _stage_atomic_modules(elig, client, device, device_name) -> tuple[dict, list, dict]:
     """Build the combined ``/restconf/data`` body across every scope.
 
@@ -1016,6 +1036,13 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
         msg = commit_error.message
     else:
         offenders, err, msg = set(), None, ""
+        # Positive signal (I2): a clean commit clears any stale reactive 'unsupported' for the
+        # applied scopes — a probe cannot downgrade an apply-rejection, so without this the gap
+        # would stick forever even after the device is fixed / upgraded and the intent lands.
+        try:
+            await _clear_atomic_capability(db, device, modules)
+        except Exception:  # noqa: BLE001 — capability bookkeeping is best-effort
+            logger.debug("apply.atomic.capability_clear_skipped", job_id=job_id)
 
     iface_failed = (_IFACE_CONFIG_ROOT in offenders) if iface_entries else False
     attr_outcome = _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot)
