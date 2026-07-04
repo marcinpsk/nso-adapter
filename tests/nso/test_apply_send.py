@@ -208,6 +208,47 @@ async def test_apply_static_routes_builds_route_body():
     assert routes[1] == {"vrf": "MGMT", "prefix": "0.0.0.0/0", "next-hop": "192.0.2.254", "tag": 5}
 
 
+async def test_apply_static_routes_emits_interface_and_next_hop_vrf():
+    """IOS-XR next-hop forms round-trip: an interface next-hop and an inter-VRF (leaked)
+    next-hop VRF are carried into the reconciler body (VTEST-9). A row missing the attrs
+    entirely (the common plain-IP case) carries neither — getattr-defaulted, not required.
+    """
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+    rows = [
+        SimpleNamespace(
+            vrf="",
+            prefix="192.0.2.2/32",
+            next_hop="192.0.2.31",
+            next_hop_vrf="TMS-P",
+            interface_next_hop="",
+            metric=None,
+            permanent=False,
+            tag=None,
+        ),
+        SimpleNamespace(
+            vrf="",
+            prefix="172.30.61.0/24",
+            next_hop="172.30.150.1",
+            next_hop_vrf="",
+            interface_next_hop="MgmtEth0/RSP0/CPU0/0",
+            metric=None,
+            permanent=False,
+            tag=None,
+        ),
+        SimpleNamespace(vrf="", prefix="10.0.0.0/8", next_hop="192.0.2.1", metric=None, permanent=False, tag=None),
+    ]
+    await apply_static_routes(client, "ra1xr", rows, dry_run=True)
+
+    routes = _sent_body(transport)["static-route-reconciler:static-route-config"][0]["route"]
+    assert routes[0]["next-hop-vrf"] == "TMS-P"
+    assert "interface-next-hop" not in routes[0]  # empty string → omitted
+    assert routes[1]["interface-next-hop"] == "MgmtEth0/RSP0/CPU0/0"
+    assert "next-hop-vrf" not in routes[1]
+    # a plain row without the attrs at all carries neither (getattr default)
+    assert "next-hop-vrf" not in routes[2] and "interface-next-hop" not in routes[2]
+
+
 async def test_apply_bfd_config_builds_interface_body():
     transport = _RecordingTransport()
     client = _client_with(transport)

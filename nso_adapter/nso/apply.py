@@ -828,6 +828,12 @@ async def apply_static_routes(
             "prefix": row.prefix,
             "next-hop": row.next_hop,
         }
+        # Optional next-hop forms (IOS-XR): an egress/discard interface and an inter-VRF
+        # (leaked) next-hop VRF. Absent on a plain IP next-hop.
+        if getattr(row, "interface_next_hop", None):
+            entry["interface-next-hop"] = row.interface_next_hop
+        if getattr(row, "next_hop_vrf", None):
+            entry["next-hop-vrf"] = row.next_hop_vrf
         if row.metric is not None:
             entry["metric"] = row.metric
         if row.permanent is not None and row.permanent:
