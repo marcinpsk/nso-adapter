@@ -264,16 +264,29 @@ class _WriteCtx(NamedTuple):
 
 
 async def _resolve_ned_id(db: AsyncSession, device: Device, client: NsoClient) -> None:
-    """Resolve the device's NED ID from NSO if unset; mark unmatched + raise on failure."""
-    if device.ned_id:
+    """Resolve (and refresh) the device's NED ID from NSO; mark unmatched + raise if unresolvable.
+
+    Re-reads NSO on every sync so a NED change on the device is picked up — ``ned_id`` keys the
+    capability matrix, so a stale value silently mis-keys every verdict. A transient read that
+    returns nothing does NOT clobber a previously-known ned_id (only an *unset*-and-unresolvable
+    ned_id marks the device unmatched); the read is a small ``fields=device-type`` GET.
+    """
+    learned = await client.get_device_ned_id(device.nso_device_name)
+    if learned:
+        if device.ned_id != learned:
+            logger.info("importer.ned_id.changed", device=device.nso_device_name, old=device.ned_id, new=learned)
+            device.ned_id = learned
+            # Persist the corrected NED now, so a device whose later sync steps fail (e.g. an
+            # unsupported NED with no reader) still self-heals its ned_id on any sync attempt.
+            await db.commit()
         return
-    device.ned_id = await client.get_device_ned_id(device.nso_device_name)
-    if not device.ned_id:
-        device.mapping_status = MappingStatus.unmatched_device
-        device.last_sync_at = _utcnow()
-        device.last_sync_status = LastSyncStatus.failed
-        await db.commit()
-        raise ValueError(f"NSO device {device.nso_device_name!r} not found or has no NED ID")
+    if device.ned_id:
+        return  # keep the last-known value — a transient empty read must not wipe it
+    device.mapping_status = MappingStatus.unmatched_device
+    device.last_sync_at = _utcnow()
+    device.last_sync_status = LastSyncStatus.failed
+    await db.commit()
+    raise ValueError(f"NSO device {device.nso_device_name!r} not found or has no NED ID")
 
 
 async def _ensure_netbox_interfaces(nb_client, device: Device, device_id: int, interfaces) -> dict[str, int]:

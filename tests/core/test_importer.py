@@ -962,6 +962,58 @@ async def test_sync_device_resolves_ned_when_unset(db_session: AsyncSession):
     assert summary["interfaces_created"] == 1
 
 
+async def test_sync_device_updates_ned_when_changed_in_nso(db_session: AsyncSession):
+    """A device whose NED was CHANGED in NSO re-learns the new ned_id on sync.
+
+    ned_id keys the capability matrix, so a stale value silently mis-keys every verdict.
+    Regression: _resolve_ned_id used to bail on ``if device.ned_id`` and never refresh, so a
+    NED change on the device was never picked up (found via nso-vendor-test on the Arrcus dev 23:
+    NSO reported arcos-v8.1.2X-nc-1.0 while the adapter still held arrcus-arcos-nc-8.1.3).
+    """
+    from nso_adapter.core import importer as imp
+
+    device = Device(
+        nso_instance="nso-dev", nso_device_name="sw-rened", ned_id="arrcus-arcos-nc-8.1.3", netbox_device_id=16
+    )
+    db_session.add(device)
+    db_session.add(ManagedScope(device=device, attribute="description"))
+    await db_session.commit()
+
+    client = _make_nso_client({"interface": [{"interface-name": "Gi0/0", "description": "x", "enabled": True}]})
+    client.get_device_ned_id = AsyncMock(return_value="arcos-v8.1.2X-nc-1.0")  # NED changed in NSO
+    imp._nso_clients["nso-dev"] = client
+    imp._netbox_client = None
+
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+        await sync_device(device.id, db_session)
+
+    await db_session.refresh(device)
+    assert device.ned_id == "arcos-v8.1.2X-nc-1.0"  # re-learned, not stuck on the old value
+
+
+async def test_sync_device_keeps_ned_when_nso_read_returns_nothing(db_session: AsyncSession):
+    """A transient NSO read that returns no ned_id must NOT wipe a previously-known ned_id."""
+    from nso_adapter.core import importer as imp
+
+    device = Device(
+        nso_instance="nso-dev", nso_device_name="sw-keepned", ned_id="cisco-ios-cli-6.95", netbox_device_id=17
+    )
+    db_session.add(device)
+    db_session.add(ManagedScope(device=device, attribute="description"))
+    await db_session.commit()
+
+    client = _make_nso_client({"interface": [{"interface-name": "Gi0/0", "description": "x", "enabled": True}]})
+    client.get_device_ned_id = AsyncMock(return_value="")  # transient: NSO returned nothing
+    imp._nso_clients["nso-dev"] = client
+    imp._netbox_client = None
+
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+        await sync_device(device.id, db_session)
+
+    await db_session.refresh(device)
+    assert device.ned_id == "cisco-ios-cli-6.95"  # kept; a transient empty read must not clobber
+
+
 async def test_sync_device_swallows_notify_failure(db_session: AsyncSession):
     """A failing plugin sync-complete callback is best-effort — it must not fail the sync."""
     from nso_adapter.core import importer as imp
