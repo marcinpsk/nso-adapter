@@ -6,10 +6,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Literal
 
 import structlog
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -109,6 +110,10 @@ class SnmpCommunityEntry(BaseModel):
 
 class SnmpV3UserEntry(BaseModel):
     username: str
+    group: str | None = None
+    # snmp-reconciler YANG enum spellings; an absent protocol disables that leg
+    auth_protocol: Literal["md5", "sha", "sha-256", "sha-384", "sha-512"] | None = None
+    priv_protocol: Literal["des", "3des", "aes-128", "aes-192", "aes-256"] | None = None
     auth_vault_ref: str | None = None
     priv_vault_ref: str | None = None
     accepted_at: datetime | None = None
@@ -119,6 +124,7 @@ class SnmpHostEntry(BaseModel):
     version: str  # "1" | "2c" | "3"
     notify_type: str  # "trap" | "inform"
     community_or_user: str
+    port: int | None = Field(default=None, ge=1, le=65535)  # absent = NED default 162
     accepted_at: datetime | None = None
 
 
@@ -185,6 +191,9 @@ def _apply_community_fields(row: SnmpCommunityIntent, e: SnmpCommunityEntry, acc
 
 
 def _apply_v3_user_fields(row: SnmpV3UserIntent, e: SnmpV3UserEntry, accepted: datetime) -> None:
+    row.group_name = e.group
+    row.auth_protocol = e.auth_protocol
+    row.priv_protocol = e.priv_protocol
     row.auth_vault_ref = e.auth_vault_ref
     row.priv_vault_ref = e.priv_vault_ref
     row.accepted_at = accepted
@@ -194,6 +203,7 @@ def _apply_host_fields(row: SnmpHostIntent, e: SnmpHostEntry, accepted: datetime
     row.version = e.version
     row.notify_type = e.notify_type
     row.community_or_user = e.community_or_user
+    row.port = e.port
     row.accepted_at = accepted
 
 
@@ -259,6 +269,9 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
         make_row=lambda e, acc: SnmpV3UserIntent(
             device_id=device_id,
             username=e.username,
+            group_name=e.group,
+            auth_protocol=e.auth_protocol,
+            priv_protocol=e.priv_protocol,
             auth_vault_ref=e.auth_vault_ref,
             priv_vault_ref=e.priv_vault_ref,
             accepted_at=acc,
@@ -278,6 +291,7 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
             version=e.version,
             notify_type=e.notify_type,
             community_or_user=e.community_or_user,
+            port=e.port,
             accepted_at=acc,
         ),
     )

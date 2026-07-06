@@ -26,6 +26,7 @@ import structlog
 
 from nso_adapter.core.isis_canon import isis_level
 from nso_adapter.nso.client import NsoClient, _url_key
+from nso_adapter.secrets.refs import VaultRefError, parse_vault_ref
 
 logger = structlog.get_logger(__name__)
 
@@ -695,6 +696,43 @@ async def apply_interface_ips(
 
 _SNMP_SERVICE_PATH = "/restconf/data/snmp-reconciler:snmp-config"
 
+# Plugin/adapter spellings → snmp-reconciler YANG enum values.
+_SNMP_ACCESS = {"ro": "ro", "rw": "rw"}
+_SNMP_VERSION = {"1": "v1", "v1": "v1", "2c": "v2c", "v2c": "v2c", "3": "v3", "v3": "v3"}
+_SNMP_NOTIFY = {"trap": "traps", "traps": "traps", "inform": "informs", "informs": "informs"}
+
+
+def _snmp_enum(value, mapping: dict[str, str], field: str, owner: str) -> str:
+    """Normalize an SNMP intent enum to its YANG spelling; raise on unknown values."""
+    normalized = mapping.get(str(value).strip().lower())
+    if normalized is None:
+        raise NsoApplyError(
+            "invalid_snmp_intent",
+            f"SNMP intent {owner!r}: unsupported {field} value {value!r}",
+        )
+    return normalized
+
+
+def _snmp_vault_triple(vault_ref: str, prefix: str, owner: str) -> dict[str, str]:
+    """Split a fully-qualified ``mount/path#key`` ref into the YANG triple leaves.
+
+    The triples are mandatory for communities, so a ref that cannot be split must
+    fail the apply (a silent drop would remove the element on a replace apply).
+    """
+    try:
+        ref = parse_vault_ref(vault_ref, require_key=True)
+    except VaultRefError as exc:
+        raise NsoApplyError(
+            "invalid_vault_ref",
+            f"SNMP intent {owner!r}: bad vault_ref: {exc}",
+        ) from exc
+    return {
+        f"{prefix}vault-mount": ref.mount,
+        f"{prefix}vault-path": ref.path,
+        f"{prefix}vault-key": ref.key,
+    }
+
+
 # RESTCONF path to the static-route-reconciler service list
 _STATIC_ROUTE_SERVICE_PATH = "/restconf/data/static-route-reconciler:static-route-config"
 
@@ -747,20 +785,24 @@ async def apply_snmp_config(
 ) -> str | None:
     """Write the full SNMP intent snapshot for a device to the snmp-reconciler service.
 
-    Builds a single body covering all communities (by label + vault_ref), v3 users,
-    hosts, and system info.  The snmp-reconciler NSO service resolves Vault refs at
-    commit time — vault_refs are passed verbatim.  ``replace=True`` PUT-replaces the
-    keyed instance so removed elements are reverted.  Raises NsoApplyError on failure.
+    Builds a single body covering all communities, v3 users, hosts, and system info,
+    in the exact snmp-reconciler YANG shape: refs split into vault-mount/path/key
+    triples (the service resolves them from Vault at commit time), enums normalized
+    from the plugin spellings (RO/RW, trap/inform, 2c) to the YANG values.
+    ``replace=True`` PUT-replaces the keyed instance so removed elements are
+    reverted.  Raises NsoApplyError on failure — including any intent row whose
+    vault_ref cannot yield the mandatory triples (a silent drop would delete that
+    element from the device on a replace apply).
     """
     entry: dict = {"device": device_name}
 
     if community_intents:
         entry["community"] = [
             {
-                "label": c.label,
-                "vault-ref": c.vault_ref,
-                "access": c.access,
+                "name": c.label,
+                "access": _snmp_enum(c.access, _SNMP_ACCESS, "access", c.label),
                 **({"acl": c.acl} if c.acl else {}),
+                **_snmp_vault_triple(c.vault_ref, "", f"community {c.label}"),
             }
             for c in community_intents
         ]
@@ -769,8 +811,11 @@ async def apply_snmp_config(
         entry["v3-user"] = [
             {
                 "username": u.username,
-                **({"auth-vault-ref": u.auth_vault_ref} if u.auth_vault_ref else {}),
-                **({"priv-vault-ref": u.priv_vault_ref} if u.priv_vault_ref else {}),
+                **({"group": u.group_name} if u.group_name else {}),
+                **({"auth-protocol": u.auth_protocol} if u.auth_protocol else {}),
+                **({"priv-protocol": u.priv_protocol} if u.priv_protocol else {}),
+                **(_snmp_vault_triple(u.auth_vault_ref, "auth-", f"v3-user {u.username}") if u.auth_vault_ref else {}),
+                **(_snmp_vault_triple(u.priv_vault_ref, "priv-", f"v3-user {u.username}") if u.priv_vault_ref else {}),
             }
             for u in v3_user_intents
         ]
@@ -779,9 +824,10 @@ async def apply_snmp_config(
         entry["host"] = [
             {
                 "address": h.address,
-                "version": h.version,
-                "notify-type": h.notify_type,
+                "version": _snmp_enum(h.version, _SNMP_VERSION, "version", h.address),
+                "notify-type": _snmp_enum(h.notify_type, _SNMP_NOTIFY, "notify_type", h.address),
                 "community-or-user": h.community_or_user,
+                **({"port": h.port} if h.port is not None else {}),
             }
             for h in host_intents
         ]

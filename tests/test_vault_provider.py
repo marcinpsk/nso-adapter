@@ -20,18 +20,43 @@ class _FakeForbidden(Exception):
     """Stands in for hvac.exceptions.Forbidden (a 403 from Vault)."""
 
 
+class _FakeInvalidPath(Exception):
+    """Stands in for hvac.exceptions.InvalidPath (KV v2 read of a missing path)."""
+
+
 class _FakeKvV2:
     def __init__(self, store: dict[str, dict[str, str]]):
         self._store = store
         self.forbid_once: set[str] = set()
         self.read_paths: list[str] = []
+        self.read_mounts: list[str] = []
+        self.write_calls: list[tuple[str, str, dict]] = []
+        self.versions: dict[str, int] = {}
 
     def read_secret_version(self, *, mount_point, path, raise_on_deleted_version):
         self.read_paths.append(path)
+        self.read_mounts.append(mount_point)
         if path in self.forbid_once:
             self.forbid_once.discard(path)  # token "expired" exactly once
             raise _FakeForbidden()
-        return {"data": {"data": dict(self._store[path])}}
+        if path not in self._store:
+            raise _FakeInvalidPath(path)
+        return {
+            "data": {
+                "data": dict(self._store[path]),
+                "metadata": {"version": self.versions.get(path, 1)},
+            }
+        }
+
+    def create_or_update_secret(self, *, mount_point, path, secret):
+        # Mirrors real KV v2 semantics: the write REPLACES the whole data dict.
+        if path in self.forbid_once:
+            self.forbid_once.discard(path)
+            raise _FakeForbidden()
+        self.write_calls.append((mount_point, path, dict(secret)))
+        self._store[path] = dict(secret)
+        self.versions[path] = self.versions.get(path, 0) + 1
+        return {"data": {"version": self.versions[path]}}
 
 
 class _FakeApprole:
@@ -67,7 +92,7 @@ def fake_hvac(monkeypatch):
 
     fake = types.SimpleNamespace(
         Client=_client_factory,
-        exceptions=types.SimpleNamespace(Forbidden=_FakeForbidden),
+        exceptions=types.SimpleNamespace(Forbidden=_FakeForbidden, InvalidPath=_FakeInvalidPath),
     )
     monkeypatch.setattr("nso_adapter.secrets.vault.hvac", fake)
     return state, store, kv
@@ -143,3 +168,71 @@ def test_namespace_forwarded_to_client(fake_hvac):
     store["credentials/svc"] = {"netbox_token": "s3cr3t"}
     _provider(namespace="prod").get("credentials/svc#netbox_token")
     assert state["clients"][0].namespace == "prod"
+
+
+# ── mount-explicit read_path / write_path (SNMP secrets endpoints) ─────────────
+
+
+def test_write_path_merges_existing_fields(fake_hvac):
+    # KV v2 create_or_update REPLACES the whole path — a v3 user setting only a
+    # new auth password must not silently delete the priv field.
+    _, store, kv = fake_hvac
+    store["netbox/snmp/v3/nms"] = {"auth": "old-auth", "priv": "old-priv"}
+    kv.versions["netbox/snmp/v3/nms"] = 1
+
+    version = _provider().write_path("network", "netbox/snmp/v3/nms", {"auth": "new-auth"})
+
+    assert store["netbox/snmp/v3/nms"] == {"auth": "new-auth", "priv": "old-priv"}
+    assert version == 2
+    assert kv.write_calls[-1][0] == "network"  # mount-explicit, not the configured mount
+
+
+def test_write_path_replace_mode_drops_siblings(fake_hvac):
+    _, store, kv = fake_hvac
+    store["netbox/snmp/v3/nms"] = {"auth": "a", "stale": "x"}
+    kv.versions["netbox/snmp/v3/nms"] = 3
+
+    version = _provider().write_path("network", "netbox/snmp/v3/nms", {"auth": "b"}, merge=False)
+
+    assert store["netbox/snmp/v3/nms"] == {"auth": "b"}
+    assert version == 4
+
+
+def test_write_path_creates_missing_path(fake_hvac):
+    _, store, _ = fake_hvac
+    version = _provider().write_path("network", "netbox/snmp/community/abc", {"community": "s3cr3t"})
+    assert store["netbox/snmp/community/abc"] == {"community": "s3cr3t"}
+    assert version == 1
+
+
+def test_read_path_returns_fields_and_empty_for_missing(fake_hvac):
+    _, store, kv = fake_hvac
+    store["netbox/snmp/v3/nms"] = {"auth": "a", "priv": "p"}
+
+    provider = _provider()
+    assert provider.read_path("network", "netbox/snmp/v3/nms") == {"auth": "a", "priv": "p"}
+    assert provider.read_path("network", "netbox/snmp/v3/ghost") == {}
+    assert kv.read_mounts[-2:] == ["network", "network"]
+
+
+def test_write_path_invalidates_get_cache_on_configured_mount(fake_hvac):
+    # get() serves from a per-path cache within the CONFIGURED mount; a write to
+    # the same mount/path must not leave get() returning the pre-write value.
+    _, store, _ = fake_hvac
+    store["credentials/svc"] = {"tok": "old"}
+
+    provider = _provider(mount="network")
+    assert provider.get("credentials/svc#tok") == "old"
+    provider.write_path("network", "credentials/svc", {"tok": "new"})
+    assert provider.get("credentials/svc#tok") == "new"
+
+
+def test_write_path_reauthenticates_on_forbidden(fake_hvac):
+    state, store, kv = fake_hvac
+    store["p/q"] = {}
+    kv.forbid_once.add("p/q")  # merge pre-read 403s once → re-auth → retry
+
+    version = _provider().write_path("network", "p/q", {"k": "v"})
+
+    assert version == 1
+    assert len(state["logins"]) == 2

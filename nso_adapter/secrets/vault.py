@@ -94,3 +94,68 @@ class VaultSecretsProvider:
         if field not in data:
             raise KeyError(f"Field {field!r} not found at {self._mount}/{path}")
         return data[field]
+
+    # ── mount-explicit read/write (SNMP secrets endpoints) ────────────────────
+    #
+    # These take an explicit mount (the fully-qualified ``mount/path#key``
+    # dialect of nso_adapter.secrets.refs) and are deliberately cache-free —
+    # unlike ``get()``, whose refs and per-path cache live inside the single
+    # configured mount.
+
+    def _with_reauth(self, operation):
+        if self._client is None:
+            self._authenticate()
+        try:
+            return operation()
+        except hvac.exceptions.Forbidden:
+            logger.warning("Vault token expired, re-authenticating")
+            self._authenticate()
+            return operation()
+
+    def _read_raw_meta(self, mount: str, path: str) -> tuple[dict[str, str], int | None]:
+        assert self._client is not None
+        try:
+            secret = self._client.secrets.kv.v2.read_secret_version(
+                mount_point=mount,
+                path=path,
+                raise_on_deleted_version=True,
+            )
+        except hvac.exceptions.InvalidPath:
+            return {}, None
+        version = secret["data"].get("metadata", {}).get("version")
+        return dict(secret["data"]["data"]), int(version) if version is not None else None
+
+    def _read_raw(self, mount: str, path: str) -> dict[str, str]:
+        return self._read_raw_meta(mount, path)[0]
+
+    def read_path(self, mount: str, path: str) -> dict[str, str]:
+        """Read all fields at ``mount/path`` (KV v2); ``{}`` when the path doesn't exist."""
+        return self._with_reauth(lambda: self._read_raw(mount, path))
+
+    def read_path_meta(self, mount: str, path: str) -> tuple[dict[str, str], int | None]:
+        """Read fields + current KV v2 version at ``mount/path``; ``({}, None)`` when absent."""
+        return self._with_reauth(lambda: self._read_raw_meta(mount, path))
+
+    def write_path(self, mount: str, path: str, data: dict[str, str], merge: bool = True) -> int:
+        """Write fields at ``mount/path`` and return the new KV v2 version.
+
+        ``merge=True`` preserves existing sibling fields (a raw KV v2 write
+        replaces the whole data dict — setting only a v3 auth password must not
+        silently delete the priv field). Requires only read+create/update ACLs
+        (read-merge-write, no PATCH capability needed).
+        """
+
+        def _write() -> int:
+            assert self._client is not None
+            payload = {**self._read_raw(mount, path), **data} if merge else dict(data)
+            resp = self._client.secrets.kv.v2.create_or_update_secret(
+                mount_point=mount,
+                path=path,
+                secret=payload,
+            )
+            return int(resp["data"]["version"])
+
+        version = self._with_reauth(_write)
+        if mount == self._mount:
+            self._cache.pop(path, None)  # keep get()'s per-path cache coherent
+        return version

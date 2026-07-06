@@ -277,22 +277,123 @@ async def test_apply_mtu_config_builds_interface_body():
     assert ifaces[1] == {"interface-name": "Gi0/2", "mpls-mtu": 1500}
 
 
-async def test_apply_snmp_config_builds_full_snapshot_body():
+async def test_snmp_apply_body_uses_vault_triples_and_yang_enums():
+    """Real-shape intent rows (plugin spellings: access=RO, notify_type=trap, full
+    mount/path#key refs) must land as the exact snmp-reconciler YANG contract:
+    list key ``name``, split vault-mount/path/key triples, lowercase enums."""
     transport = _RecordingTransport()
     client = _client_with(transport)
-    communities = [SimpleNamespace(label="ro", vault_ref="kv/snmp#ro", access="ro", acl="ACL-NMS")]
-    v3_users = [SimpleNamespace(username="nms", auth_vault_ref="kv/snmp#auth", priv_vault_ref=None)]
-    hosts = [SimpleNamespace(address="192.0.2.9", version="3", notify_type="traps", community_or_user="nms")]
+    communities = [
+        SimpleNamespace(
+            label="9f2a41c3d0be77aa",
+            vault_ref="network/netbox/snmp/community/9f2a41c3d0be77aa#community",
+            access="RO",
+            acl="ACL-NMS",
+        )
+    ]
+    v3_users = [
+        SimpleNamespace(
+            username="nms",
+            group_name="v3-test-group",
+            auth_protocol="sha-256",
+            priv_protocol="aes-128",
+            auth_vault_ref="network/netbox/snmp/v3/nms#auth",
+            priv_vault_ref="network/netbox/snmp/v3/nms#priv",
+        ),
+        SimpleNamespace(
+            username="audit",
+            group_name=None,
+            auth_protocol="sha",
+            priv_protocol=None,
+            auth_vault_ref="network/netbox/snmp/v3/audit#auth",
+            priv_vault_ref=None,
+        ),
+    ]
+    hosts = [
+        SimpleNamespace(
+            address="192.0.2.9",
+            version="v2c",
+            notify_type="trap",
+            community_or_user="9f2a41c3d0be77aa",
+            port=None,
+        ),
+        SimpleNamespace(address="192.0.2.10", version="3", notify_type="informs", community_or_user="nms", port=1162),
+    ]
     system = SimpleNamespace(location="DC-A", contact=None)
 
     await apply_snmp_config(client, "sw03", communities, v3_users, hosts, system, dry_run=True)
 
     entry = _sent_body(transport)["snmp-reconciler:snmp-config"][0]
-    assert entry["community"] == [{"label": "ro", "vault-ref": "kv/snmp#ro", "access": "ro", "acl": "ACL-NMS"}]
-    assert entry["v3-user"] == [{"username": "nms", "auth-vault-ref": "kv/snmp#auth"}]  # priv omitted (None)
-    assert entry["host"][0]["address"] == "192.0.2.9"
+    assert entry["community"] == [
+        {
+            "name": "9f2a41c3d0be77aa",
+            "access": "ro",
+            "acl": "ACL-NMS",
+            "vault-mount": "network",
+            "vault-path": "netbox/snmp/community/9f2a41c3d0be77aa",
+            "vault-key": "community",
+        }
+    ]
+    assert entry["v3-user"] == [
+        {
+            "username": "nms",
+            "group": "v3-test-group",
+            "auth-protocol": "sha-256",
+            "priv-protocol": "aes-128",
+            "auth-vault-mount": "network",
+            "auth-vault-path": "netbox/snmp/v3/nms",
+            "auth-vault-key": "auth",
+            "priv-vault-mount": "network",
+            "priv-vault-path": "netbox/snmp/v3/nms",
+            "priv-vault-key": "priv",
+        },
+        {
+            "username": "audit",
+            "auth-protocol": "sha",
+            "auth-vault-mount": "network",
+            "auth-vault-path": "netbox/snmp/v3/audit",
+            "auth-vault-key": "auth",
+        },
+    ]
+    assert entry["host"][0] == {
+        "address": "192.0.2.9",
+        "version": "v2c",
+        "notify-type": "traps",
+        "community-or-user": "9f2a41c3d0be77aa",
+    }
+    assert entry["host"][1] == {
+        "address": "192.0.2.10",
+        "version": "v3",
+        "notify-type": "informs",
+        "community-or-user": "nms",
+        "port": 1162,
+    }
     assert entry["location"] == "DC-A"
     assert "contact" not in entry  # None contact omitted
+
+
+@pytest.mark.parametrize(
+    "bad_ref",
+    [
+        "",  # empty — a refless community can never satisfy the mandatory triples
+        "no-mount#community",  # no '/': mount cannot be determined
+        "network/netbox/snmp/ro",  # community refs must carry '#key'
+        "network/netbox#a#b",  # more than one '#'
+        "network//netbox#community",  # empty path segment
+        "network/netbox snmp#community",  # whitespace
+    ],
+)
+async def test_snmp_apply_rejects_malformed_vault_ref(bad_ref):
+    """A community that cannot produce the mandatory vault triples must fail the
+    apply with a structured error (never a silent drop: replace-mode would delete
+    the community from the device)."""
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+    communities = [SimpleNamespace(label="ro", vault_ref=bad_ref, access="RO", acl=None)]
+
+    with pytest.raises(NsoApplyError, match="vault_ref"):
+        await apply_snmp_config(client, "sw03", communities, [], [], None, dry_run=True)
+    assert not transport.requests  # rejected before anything was sent
 
 
 async def test_apply_logging_config_builds_host_body():

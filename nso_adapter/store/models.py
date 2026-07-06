@@ -841,6 +841,10 @@ class SnmpV3UserIntent(Base):
         Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
     )
     username: Mapped[str] = mapped_column(String(128), nullable=False)
+    group_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # snmp-reconciler YANG enum spellings; an absent protocol disables that leg
+    auth_protocol: Mapped[str | None] = mapped_column(String(16), nullable=True)  # md5|sha|sha-256|-384|-512
+    priv_protocol: Mapped[str | None] = mapped_column(String(16), nullable=True)  # des|3des|aes-128|-192|-256
     auth_vault_ref: Mapped[str | None] = mapped_column(String(512), nullable=True)  # "mount/path#key"
     priv_vault_ref: Mapped[str | None] = mapped_column(String(512), nullable=True)  # "mount/path#key"
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -864,6 +868,7 @@ class SnmpHostIntent(Base):
     version: Mapped[str] = mapped_column(String(4), nullable=False)  # "1" | "2c" | "3"
     notify_type: Mapped[str] = mapped_column(String(8), nullable=False)  # "trap" | "inform"
     community_or_user: Mapped[str] = mapped_column(String(128), nullable=False)
+    port: Mapped[int | None] = mapped_column(Integer, nullable=True)  # absent = NED default 162
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)

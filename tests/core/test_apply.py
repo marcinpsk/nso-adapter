@@ -380,7 +380,11 @@ async def test_collect_apply_diff_covers_every_scope(adapter_client):
         )
         db.add(
             m.SnmpCommunityIntent(
-                device_id=device_id, label="ro", vault_ref="vault://ro", access="ro", accepted_at=datetime.utcnow()
+                device_id=device_id,
+                label="ro",
+                vault_ref="network/netbox/snmp/community/ro#community",
+                access="ro",
+                accepted_at=datetime.utcnow(),
             )
         )
         db.add(
@@ -1029,7 +1033,7 @@ _SCOPE_CASES = [
     ),
     (
         "SnmpCommunityIntent",
-        dict(label="ro", vault_ref="vault://snmp/ro", access="ro"),
+        dict(label="ro", vault_ref="network/netbox/snmp/community/ro#community", access="ro"),
         "apply_snmp_config",
         "snmp",
     ),
@@ -1252,10 +1256,14 @@ async def test_run_apply_snmp_applies_all_row_types(adapter_client):
     async for db in get_session():
         db.add(
             SnmpCommunityIntent(
-                device_id=device_id, label="ro", vault_ref="vault://ro", access="ro", accepted_at=datetime.utcnow()
+                device_id=device_id,
+                label="ro",
+                vault_ref="network/netbox/snmp/community/ro#community",
+                access="ro",
+                accepted_at=datetime.utcnow(),
             )
         )
-        db.add(SnmpV3UserIntent(device_id=device_id, username="netops", accepted_at=datetime.utcnow()))
+        db.add(SnmpV3UserIntent(device_id=device_id, username="v3-test-group", accepted_at=datetime.utcnow()))
         db.add(
             SnmpHostIntent(
                 device_id=device_id,

@@ -53,7 +53,7 @@ async def test_snmp_config_contract(adapter_client):
         db.add(
             SnmpV3User(
                 device_id=device_id,
-                username="netops",
+                username="v3-test-group",
                 has_auth_secret=True,
                 has_priv_secret=False,
                 last_refreshed_at=ts,

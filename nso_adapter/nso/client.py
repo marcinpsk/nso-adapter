@@ -126,6 +126,25 @@ class NsoClient:
             data = resp.json()
             return data.get("tailf-ncs:config", data)
 
+    async def get_device_config_subtree(self, device_name: str, subpath: str) -> dict | None:
+        """Return one targeted subtree of *device_name*'s config mirror, or None.
+
+        ``subpath`` is a module-qualified RESTCONF path fragment under the
+        device's ``config`` node (e.g. ``tailf-ned-cisco-ios:snmp-server/community``).
+        Targeted reads only — the unfiltered device config can be ~900 KB (see
+        :meth:`get_device_ned_id`). None on 404 (path absent) or 204 (empty CDB
+        mirror — run sync-from first).
+        """
+        url = f"{self._base}/restconf/data/tailf-ncs:devices/device={_url_key(device_name)}/config/{subpath}"
+        async with self._client() as c:
+            resp = await c.get(url)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            if resp.status_code == 204 or not resp.content:
+                return None
+            return resp.json()
+
     async def get_device_ned_id(self, device_name: str) -> str | None:
         """Return the NED ID for *device_name* or None.
 

@@ -97,6 +97,46 @@ async def test_put_creates_all_collections(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_v3_protocol_and_host_port_fields_roundtrip(adapter_client):
+    """v3 users without protocols are unusable on-device (the reconciler skips
+    auth/priv entirely) — the intent must carry auth/priv protocols and group,
+    and hosts must carry the optional UDP port."""
+    device_id = await seed_device(nso_device_name="snmp-v3proto-dev", netbox_device_id=962)
+    body = {
+        "v3_users": [
+            {
+                "username": "monitor",
+                "group": "v3-test-group",
+                "auth_protocol": "sha-256",
+                "priv_protocol": "aes-128",
+                "auth_vault_ref": "network/netbox/snmp/v3/monitor#auth",
+                "priv_vault_ref": "network/netbox/snmp/v3/monitor#priv",
+            },
+        ],
+        "hosts": [
+            {
+                "address": "10.0.1.100",
+                "version": "2c",
+                "notify_type": "trap",
+                "community_or_user": "ro1",
+                "port": 1162,
+            },
+        ],
+    }
+
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH)
+    assert resp.status_code == 200
+
+    _, users, hosts, _ = await _read_intent(device_id)
+    assert (users[0].group_name, users[0].auth_protocol, users[0].priv_protocol) == (
+        "v3-test-group",
+        "sha-256",
+        "aes-128",
+    )
+    assert hosts[0].port == 1162
+
+
+@pytest.mark.anyio
 async def test_put_unknown_device_404(adapter_client):
     resp = await adapter_client.put("/api/v1/devices/9999/snmp-intent", json=_full_body(), headers=AUTH)
     assert resp.status_code == 404
