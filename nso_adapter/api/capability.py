@@ -9,9 +9,12 @@ didn't land). Backed by the persisted ``device_capability`` cache keyed by (ned,
 
 from __future__ import annotations
 
+from typing import Literal
+
 import structlog
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
@@ -34,6 +37,18 @@ class PreflightRequest(BaseModel):
 
 class ApplyPreflightRequest(BaseModel):
     scopes: list[str] = []
+
+
+class ReadCapabilityElement(BaseModel):
+    scope: str
+    status: Literal["native", "unsupported", "skipped", "unknown"]
+    detail: str = ""
+
+
+class ReadCapabilityReport(BaseModel):
+    nso_device_name: str
+    nso_instance: str = ""  # disambiguates when the same device name exists in several instances
+    elements: list[ReadCapabilityElement] = []
 
 
 async def _device_and_client(device_id: int, db: AsyncSession):
@@ -77,6 +92,36 @@ async def get_capability(device_id: int, refresh: bool = False, db: AsyncSession
             {"scope": r.scope, "name": r.name, "status": r.status, "detail": r.detail, "source": r.source} for r in rows
         ],
     }
+
+
+@router.post("/read-capability/report", dependencies=[Depends(verify_token)])
+async def report_read_capability(body: ReadCapabilityReport, db: AsyncSession = Depends(get_db)):
+    """Ingest the READ half of the capability matrix from an external read probe.
+
+    The vendor-test harness posts per-scope read states (observed against a live device) by
+    NSO device name; the adapter resolves the ``(ned_id, sw_version)`` key from the device
+    row (kept fresh by the importer's per-sync NED refresh) and records ``source='read'``
+    rows. This is how a brand-new NED emits capability signal before any apply has ever run.
+    409 when the device has no learned NED id yet (no key to record under).
+    """
+    stmt = select(Device).where(Device.nso_device_name == body.nso_device_name)
+    if body.nso_instance:
+        stmt = stmt.where(Device.nso_instance == body.nso_instance)
+    devices = (await db.execute(stmt)).scalars().all()
+    if not devices:
+        raise api_error(404, "not_found", f"No device named {body.nso_device_name!r}")
+    if len(devices) > 1:
+        raise api_error(
+            409, "ambiguous_device", f"{body.nso_device_name!r} exists in several instances — pass nso_instance"
+        )
+    device = devices[0]
+    ned_id = capability._clean_capability_key(device.ned_id)
+    sw_version = capability._clean_capability_key(device.sw_version)
+    if not ned_id:
+        raise api_error(409, "no_ned_id", "Device has no learned NED id yet — sync or probe it first")
+    count = await capability.record_read_capability(db, ned_id, sw_version, [el.model_dump() for el in body.elements])
+    logger.info("capability.read_report", device=body.nso_device_name, ned_id=ned_id, sw_version=sw_version, rows=count)
+    return {"ned_id": ned_id, "sw_version": sw_version, "count": count}
 
 
 @router.post("/{device_id}/route-policy/preflight", dependencies=[Depends(verify_token)])

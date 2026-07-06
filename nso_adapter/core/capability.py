@@ -3,12 +3,16 @@
 
 The cache (keyed by ``(ned_id, sw_version)``) lets the plugin flag, at attach time,
 which parts of a route-map / community-list won't apply on a device — instead of the
-operator finding out only when it silently didn't land. Two halves feed each verdict:
+operator finding out only when it silently didn't land. Three sources feed the matrix:
 
   - representable (``source='probe'``) — from the NSO ``capability-probe`` action (what
     the reconciler can model/send for this NED);
   - accepted (``source='apply'``) — from a real device-parser rejection at commit (what
     the box actually takes). Apply wins over probe.
+  - readable (``source='read'``) — per-scope read-support rows fed by an external read
+    probe (the vendor-test harness read matrix), keyed ``(scope, name='read')`` so they
+    never collide with the probe/apply construct rows. This is the only signal a
+    brand-new NED emits before any apply has ever run.
 """
 
 from __future__ import annotations
@@ -24,6 +28,15 @@ from nso_adapter.nso.client import NsoClient
 from nso_adapter.store import models as m
 
 logger = structlog.get_logger(__name__)
+
+# The READ half rows are keyed (scope, name=READ_ROW_NAME) so they can never collide with
+# the coarse apply rows (name == scope) or the route-policy construct rows.
+READ_ROW_NAME = "read"
+# native = surface returned real config · unsupported = read raised / expected config missing ·
+# skipped = scope not applicable on this platform · unknown = read empty with no belief
+# (no config or no reader — probed, but carries no verdict).
+_READ_STATUSES = frozenset({"native", "unsupported", "skipped", "unknown"})
+_READ_DEFINITE = frozenset({"native", "unsupported", "skipped"})
 
 
 async def _upsert(
@@ -55,6 +68,11 @@ async def _upsert(
     # An apply-sourced 'unsupported' is authoritative (a real device rejection) — a later
     # representable probe must NOT downgrade it back to native.
     if row.source == "apply" and row.status == "unsupported" and source == "probe":
+        return
+    # A no-information read observation ('unknown': the surface read empty on a device with
+    # no belief) must not clobber a definite read verdict learned from another device that
+    # HAS the config on the same (ned, sw) key.
+    if source == "read" and status == "unknown" and row.source == "read" and row.status in _READ_DEFINITE:
         return
     row.status, row.detail, row.source = status, detail, source
 
@@ -89,6 +107,32 @@ async def record_probe_capability(db: AsyncSession, ned_id: str, sw_version: str
             str(el.get("detail", ""))[:256],
             "probe",
         )
+        count += 1
+    await db.commit()
+    return count
+
+
+async def record_read_capability(db: AsyncSession, ned_id: str, sw_version: str, elements) -> int:
+    """Store the READ-half verdict — per-scope read-support fed by an external read probe.
+
+    *elements* is a list of ``{scope, status, detail}`` observed by the vendor-test harness
+    read matrix (statuses per ``_READ_STATUSES``). Rows land as ``(scope, name='read')``
+    with ``source='read'``, distinct from the probe/apply construct rows, so read-support
+    and write-rejection facts coexist for the same scope. Invalid elements (empty scope,
+    non-read status) are skipped; returns the number of rows recorded. ``_upsert`` keeps a
+    definite read verdict from being downgraded by a later no-information ``unknown``.
+    """
+    if isinstance(elements, dict):
+        elements = [elements]
+    count = 0
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        scope = str(el.get("scope", "")).strip()
+        status = str(el.get("status", "")).strip()
+        if not scope or status not in _READ_STATUSES:
+            continue
+        await _upsert(db, ned_id, sw_version, scope, READ_ROW_NAME, status, str(el.get("detail", ""))[:256], "read")
         count += 1
     await db.commit()
     return count
@@ -345,8 +389,11 @@ def preflight_scopes(rows, scopes) -> dict:
     A scope the matrix marks ``unsupported``/``skipped`` — recorded reactively when a prior
     apply's per-scope dry-run was rejected by the NED (see ``core/apply.py``
     ``_record_atomic_capability``) — is flagged so the plugin can warn before a device write.
-    The plugin passes the scopes from its apply diff. Returns
-    ``{fully_supported, unsupported:[{scope,name,status,detail}]}``.
+    Definite READ gaps (``(scope, 'read')`` unsupported/skipped) participate deliberately:
+    no reader for a scope on this NED strongly implies no writer either (per-NED handler
+    pairs), so the operator is warned before the write fails loudly. A read ``unknown``
+    carries no verdict and stays fail-open. The plugin passes the scopes from its apply
+    diff. Returns ``{fully_supported, unsupported:[{scope,name,status,detail}]}``.
     """
     requested = {str(s) for s in scopes}
     unsupported = [

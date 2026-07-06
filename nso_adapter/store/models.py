@@ -2026,11 +2026,14 @@ class DeviceCapability(Base):
     a route-map / community-list won't apply on a device, instead of the operator finding
     out only when it silently didn't land. Persisted so it survives an adapter restart.
 
-    Two sources feed each per-element verdict:
+    Three sources feed the per-element verdicts:
       - ``source='probe'`` — the REPRESENTABLE half, from the NSO ``capability-probe``
         action (what the reconciler can model/send for this NED).
       - ``source='apply'`` — the ACCEPTED half, from a real ``apply_failed`` device-parser
         rejection (what the box actually takes at commit). Apply wins over probe.
+      - ``source='read'`` — the READABLE half, per-scope rows (``name='read'``) fed by an
+        external read probe (the vendor-test harness) via ``/read-capability/report``.
+        The only signal a brand-new NED emits before any apply has ever run.
 
     Keyed by ``(ned_id, sw_version)`` so 20 identical boxes share one verdict; a box on a
     different software version (or NED) falls into a different key and is re-checked.
@@ -2042,9 +2045,9 @@ class DeviceCapability(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     ned_id: Mapped[str] = mapped_column(String(256), index=True)
     sw_version: Mapped[str] = mapped_column(String(128), index=True)
-    scope: Mapped[str] = mapped_column(String(32))  # community | rm-set | rm-match
-    name: Mapped[str] = mapped_column(String(128))  # member-kind / construct
-    status: Mapped[str] = mapped_column(String(16))  # native | translated | skipped | unsupported
+    scope: Mapped[str] = mapped_column(String(32))  # community | rm-set | rm-match | an apply scope (bgp, vlan, …)
+    name: Mapped[str] = mapped_column(String(128))  # member-kind / construct / scope (coarse apply) / 'read'
+    status: Mapped[str] = mapped_column(String(16))  # native | translated | skipped | unsupported | unknown (read)
     detail: Mapped[str] = mapped_column(String(256), default="")
-    source: Mapped[str] = mapped_column(String(16))  # probe | apply
+    source: Mapped[str] = mapped_column(String(16))  # probe | apply | read
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())

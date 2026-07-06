@@ -361,3 +361,128 @@ def test_preflight_scopes_empty_request_is_fully_supported():
 
     rows = [SimpleNamespace(scope="static_route", name="static_route", status="unsupported", detail="x")]
     assert preflight_scopes(rows, []) == {"fully_supported": True, "unsupported": []}
+
+
+# ── record_read_capability (the READ half, fed by the vendor-test read matrix) ──
+
+
+@pytest.mark.asyncio
+async def test_record_read_capability_writes_read_sourced_rows(adapter_client):  # noqa: F811
+    """Read elements land as (scope, name='read') rows with source='read'."""
+    from nso_adapter.core.capability import get_device_capability, record_read_capability
+    from nso_adapter.store.db import get_session
+
+    async for db in get_session():
+        count = await record_read_capability(
+            db,
+            _NED,
+            "17.15.4c",
+            [
+                {"scope": "bgp", "status": "native", "detail": "read 11 item(s) on rg03"},
+                {"scope": "vlan", "status": "skipped", "detail": "not applicable on this platform"},
+                {"scope": "isis", "status": "unknown", "detail": "reads empty on rg03"},
+                {"scope": "ospf", "status": "unsupported", "detail": "read raised: boom"},
+            ],
+        )
+        assert count == 4
+        rows = {(r.scope, r.name): r for r in await get_device_capability(db, _NED, "17.15.4c")}
+        assert rows[("bgp", "read")].status == "native"
+        assert rows[("bgp", "read")].source == "read"
+        assert rows[("vlan", "read")].status == "skipped"
+        assert rows[("isis", "read")].status == "unknown"
+        assert rows[("ospf", "read")].status == "unsupported"
+        break
+
+
+@pytest.mark.asyncio
+async def test_read_unknown_never_downgrades_a_definite_read_row(adapter_client):  # noqa: F811
+    """A no-information 'unknown' (empty read on a device without the config) must not
+    clobber a definite verdict learned from another device on the same (ned, sw) key;
+    a later definite observation upgrades an 'unknown'."""
+    from nso_adapter.core.capability import get_device_capability, record_read_capability
+    from nso_adapter.store.db import get_session
+
+    sw = "23.10.R3"
+    async for db in get_session():
+        await record_read_capability(db, _NED, sw, [{"scope": "bgp", "status": "native", "detail": "read on A"}])
+        await record_read_capability(db, _NED, sw, [{"scope": "bgp", "status": "unknown", "detail": "empty on B"}])
+        rows = {(r.scope, r.name): r for r in await get_device_capability(db, _NED, sw)}
+        assert rows[("bgp", "read")].status == "native"  # definite survives
+
+        await record_read_capability(db, _NED, sw, [{"scope": "isis", "status": "unknown", "detail": "empty on B"}])
+        await record_read_capability(db, _NED, sw, [{"scope": "isis", "status": "native", "detail": "read on A"}])
+        rows = {(r.scope, r.name): r for r in await get_device_capability(db, _NED, sw)}
+        assert rows[("isis", "read")].status == "native"  # definite upgrades unknown
+        break
+
+
+@pytest.mark.asyncio
+async def test_read_rows_coexist_with_apply_rows_for_the_same_scope(adapter_client):  # noqa: F811
+    """Read-support and write-rejection are different facts: a read row must not overwrite
+    the coarse apply row (name == scope), and a clean-commit clear removes only the apply row."""
+    from nso_adapter.core.capability import (
+        clear_capability_rejections,
+        get_device_capability,
+        record_capability_rejection,
+        record_read_capability,
+    )
+    from nso_adapter.store.db import get_session
+
+    sw = "7.11.2"
+    async for db in get_session():
+        await record_capability_rejection(db, _NED, sw, "bgp", "bgp", "NED rejected")
+        await record_read_capability(db, _NED, sw, [{"scope": "bgp", "status": "native", "detail": "read fine"}])
+        rows = {(r.scope, r.name): r for r in await get_device_capability(db, _NED, sw)}
+        assert rows[("bgp", "bgp")].status == "unsupported"  # the apply fact survives
+        assert rows[("bgp", "read")].status == "native"  # alongside the read fact
+
+        await clear_capability_rejections(db, _NED, sw, ["bgp"])
+        rows = {(r.scope, r.name): r for r in await get_device_capability(db, _NED, sw)}
+        assert ("bgp", "bgp") not in rows  # apply rejection cleared by the clean commit
+        assert rows[("bgp", "read")].status == "native"  # read fact untouched
+        break
+
+
+@pytest.mark.asyncio
+async def test_record_read_capability_skips_invalid_elements(adapter_client):  # noqa: F811
+    from nso_adapter.core.capability import get_device_capability, record_read_capability
+    from nso_adapter.store.db import get_session
+
+    sw = "9.9.9"
+    async for db in get_session():
+        count = await record_read_capability(
+            db,
+            _NED,
+            sw,
+            [
+                {"scope": "", "status": "native", "detail": ""},  # no scope
+                {"scope": "bgp", "status": "would_apply", "detail": ""},  # not a read status
+                "not-a-dict",
+                {"scope": "ospf", "status": "native", "detail": ""},
+            ],
+        )
+        assert count == 1
+        rows = await get_device_capability(db, _NED, sw)
+        assert [(r.scope, r.name, r.status) for r in rows] == [("ospf", "read", "native")]
+        break
+
+
+def test_preflight_scopes_flags_read_gap_rows():
+    """A definite read gap ((scope, 'read') unsupported/skipped) participates in the generic
+    apply-preflight: no reader for a scope on this NED strongly implies no writer either
+    (per-NED handler pairs), so the operator is warned before the write fails loudly."""
+    from types import SimpleNamespace
+
+    from nso_adapter.core.capability import preflight_scopes
+
+    rows = [
+        SimpleNamespace(scope="bgp", name="read", status="unsupported", detail="expected read but empty"),
+        SimpleNamespace(scope="vlan", name="read", status="skipped", detail="not applicable"),
+        SimpleNamespace(scope="isis", name="read", status="unknown", detail="empty, no belief"),
+        SimpleNamespace(scope="ospf", name="read", status="native", detail=""),
+    ]
+    result = preflight_scopes(rows, ["bgp", "vlan", "isis", "ospf"])
+    assert result["fully_supported"] is False
+    flagged = {(u["scope"], u["status"]) for u in result["unsupported"]}
+    # unknown carries no verdict (fail-open) and native is positive — only definite gaps flag
+    assert flagged == {("bgp", "unsupported"), ("vlan", "skipped")}

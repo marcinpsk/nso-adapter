@@ -207,3 +207,82 @@ async def test_apply_preflight_unknown_device_is_fail_open(adapter_client_with_n
     assert resp.status_code == 200
     body = resp.json()
     assert body == {"known": False, "fully_supported": True, "unsupported": [], "coverage_unknown": False}
+
+
+# ── POST /read-capability/report — ingest the READ half from the vendor-test harness ──
+
+
+async def _seed_device_with_key(name: str, ned: str = _NED, sw: str = "17.15.4c") -> int:
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device
+
+    device_id = await seed_device(nso_device_name=name)
+    async for db in get_session():
+        dev = await db.get(Device, device_id)
+        dev.ned_id, dev.sw_version = ned, sw
+        await db.commit()
+        break
+    return device_id
+
+
+@pytest.mark.asyncio
+async def test_read_capability_report_records_rows_under_the_device_key(adapter_client_with_nso):  # noqa: F811
+    """The harness posts per-scope read states by NSO device name; the adapter resolves the
+    (ned, sw) key from the device row and the rows come back via GET /capability."""
+    device_id = await _seed_device_with_key("rg03")
+
+    resp = await adapter_client_with_nso.post(
+        "/api/v1/devices/read-capability/report",
+        headers=AUTH,
+        json={
+            "nso_device_name": "rg03",
+            "elements": [
+                {"scope": "bgp", "status": "native", "detail": "read 11 item(s) on rg03"},
+                {"scope": "isis", "status": "unknown", "detail": "reads empty on rg03"},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"ned_id": _NED, "sw_version": "17.15.4c", "count": 2}
+
+    resp = await adapter_client_with_nso.get(f"/api/v1/devices/{device_id}/capability", headers=AUTH)
+    body = resp.json()
+    assert body["known"] is True
+    got = {(e["scope"], e["name"]): e for e in body["elements"]}
+    assert got[("bgp", "read")]["status"] == "native"
+    assert got[("bgp", "read")]["source"] == "read"
+    assert got[("isis", "read")]["status"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_read_capability_report_unknown_device_is_404(adapter_client_with_nso):  # noqa: F811
+    resp = await adapter_client_with_nso.post(
+        "/api/v1/devices/read-capability/report",
+        headers=AUTH,
+        json={"nso_device_name": "no-such-device", "elements": [{"scope": "bgp", "status": "native"}]},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_read_capability_report_device_without_ned_id_is_409(adapter_client_with_nso):  # noqa: F811
+    """A device that has never learned its NED id has no capability key — report an honest
+    conflict instead of writing rows under an empty key."""
+    await seed_device(nso_device_name="fresh-device")
+    resp = await adapter_client_with_nso.post(
+        "/api/v1/devices/read-capability/report",
+        headers=AUTH,
+        json={"nso_device_name": "fresh-device", "elements": [{"scope": "bgp", "status": "native"}]},
+    )
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_read_capability_report_rejects_non_read_status(adapter_client_with_nso):  # noqa: F811
+    await _seed_device_with_key("rg03-b")
+    resp = await adapter_client_with_nso.post(
+        "/api/v1/devices/read-capability/report",
+        headers=AUTH,
+        json={"nso_device_name": "rg03-b", "elements": [{"scope": "bgp", "status": "would_apply"}]},
+    )
+    assert resp.status_code == 422
