@@ -146,8 +146,8 @@ async def harvest_community(
 
     Reads ONLY the targeted per-NED community subtree of NSO's config mirror,
     matches by ``sha256[:16]``, and writes the plaintext to the supplied ref.
-    v3 secrets are never harvestable (engine-ID-localized); timos is gated
-    until the live plaintext-vs-hash2 check.
+    v3 secrets are never harvestable (engine-ID-localized); timos is excluded
+    (SR OS stores communities hash2-obfuscated — live-confirmed).
     """
     provider = _vault_provider(request)
     ref = _parse_ref(body.vault_ref)
@@ -164,8 +164,8 @@ async def harvest_community(
         raise api_error(
             409,
             "harvest_unsupported_ned",
-            f"NED {ned_id!r} is not harvest-capable (timos pending the live "
-            "plaintext-vs-hash2 check; v3 secrets are never harvestable)",
+            f"NED {ned_id!r} is not harvest-capable (SR OS stores communities "
+            "hash2-obfuscated — live-confirmed; v3 secrets are never harvestable)",
         )
 
     try:

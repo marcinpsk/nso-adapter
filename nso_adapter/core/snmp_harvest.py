@@ -8,8 +8,9 @@ reads ONLY the targeted per-NED community subtree (never the full device
 config) and matches by fingerprint, so the operator can move a device-held
 secret into Vault without ever typing it.
 
-timos (Nokia SR OS) is gated out until a live check confirms whether the config
-mirror carries the community plaintext or a hash2-obfuscated blob.
+timos (Nokia SR OS) is EXCLUDED — live-confirmed (SR OS lab, 2026-07-06): the
+config mirror stores communities as hash2-obfuscated blobs, never plaintext, so
+neither harvest nor vault-vs-device value comparison is possible there.
 SNMPv3 secrets are never harvestable (engine-ID-localized on every vendor).
 
 The per-NED JSON shapes mirror network-state-export's device-verified readers
