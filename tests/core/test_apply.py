@@ -1644,7 +1644,7 @@ async def test_run_apply_atomic_failure_localizes_offender_others_pending(adapte
     boom = AsyncMock(side_effect=NsoApplyError("nso_patch_failed", "static route rejected"))
 
     async def _fake_localize(*_a, **_k):
-        return {"static-route-reconciler:static-route-config"}, (None, None)
+        return {"static-route-reconciler:static-route-config": "static route rejected"}, (None, None)
 
     with ExitStack() as stack:
         stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
@@ -1709,6 +1709,124 @@ async def test_run_apply_atomic_failure_records_scope_capability(adapter_client,
         assert all(r.last_apply_error is not None for r in sr)
         assert all(r.last_apply_error is None and r.last_apply_at is None for r in sc)
         assert (await db.get(Job, job_id)).status == JobStatus.failed
+        break
+
+
+@pytest.mark.asyncio
+async def test_run_apply_atomic_iface_rejection_attributed_to_offending_half(adapter_client, monkeypatch):
+    """H2: a rejected merged interface-config module whose error names the IP half records
+    ONLY (interface_ip, <construct>) — interface_attribute no longer falsely warns (the old
+    coarse recording marked BOTH scopes on one rejection)."""
+    from datetime import datetime
+
+    from nso_adapter.nso.apply import NsoApplyError
+    from nso_adapter.store.models import Device, DeviceCapability, InterfaceIpIntent
+
+    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+    device_id = await _seed_device(name="sw01")
+    iface_id, _attr_id = await _seed_interface_with_intent(
+        device_id, "Gi0/1", "description", "uplink", SyncState.accepted
+    )
+    async for db in get_session():
+        db.add(
+            InterfaceIpIntent(
+                interface_id=iface_id,
+                address="10.0.0.1/30",
+                family="ipv4",
+                secondary=False,
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        dev = await db.get(Device, device_id)
+        dev.ned_id, dev.sw_version = "cisco-ios-cli:cisco-ios", "15.7"
+        await db.commit()
+        break
+    job_id = await _seed_apply_job(device_id)
+
+    # REAL sample shape (captured live on rg03): the 4xx names the ipv4-address node.
+    reject_msg = (
+        "invalid value for: prefix-length in /ir:interface-config[ir:device='sw01']"
+        "[ir:interface-name='Gi0/1']/ir:ipv4-address[ir:address='10.0.0.1']/ir:prefix-length:"
+        ' "99" is out of range.'
+    )
+
+    async def _combined(client, device_name, modules, *, dry_run=False, strict=False):
+        if not dry_run:
+            raise NsoApplyError("nso_patch_failed", reject_msg)
+        if "interface-reconciler:interface-config" in modules:
+            raise NsoApplyError("dry_run_rejected", reject_msg)
+        return "delta"
+
+    mock_client = AsyncMock()
+    with ExitStack() as stack:
+        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
+        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        caps = (
+            (await db.execute(select(DeviceCapability).where(DeviceCapability.ned_id == "cisco-ios-cli:cisco-ios")))
+            .scalars()
+            .all()
+        )
+        by_scope = {c.scope: c for c in caps}
+        assert "interface_ip" in by_scope
+        assert by_scope["interface_ip"].name == "ipv4-address"  # construct-named, not coarse
+        assert "interface_attribute" not in by_scope  # the attribute half no longer falsely warns
+        break
+
+
+@pytest.mark.asyncio
+async def test_run_apply_atomic_iface_rejection_unattributable_falls_back_to_both(adapter_client, monkeypatch):
+    """When the rejection names no known construct, the fail-safe records BOTH halves coarse —
+    losing precision, never losing the record."""
+    from datetime import datetime
+
+    from nso_adapter.nso.apply import NsoApplyError
+    from nso_adapter.store.models import Device, DeviceCapability, InterfaceIpIntent
+
+    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+    device_id = await _seed_device(name="sw01")
+    iface_id, _attr_id = await _seed_interface_with_intent(
+        device_id, "Gi0/2", "description", "uplink", SyncState.accepted
+    )
+    async for db in get_session():
+        db.add(
+            InterfaceIpIntent(
+                interface_id=iface_id,
+                address="10.0.0.5/30",
+                family="ipv4",
+                secondary=False,
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        dev = await db.get(Device, device_id)
+        dev.ned_id, dev.sw_version = "cisco-ios-cli:cisco-ios", "15.7"
+        await db.commit()
+        break
+    job_id = await _seed_apply_job(device_id)
+
+    async def _combined(client, device_name, modules, *, dry_run=False, strict=False):
+        if not dry_run:
+            raise NsoApplyError("nso_patch_failed", "opaque NED failure")
+        if "interface-reconciler:interface-config" in modules:
+            raise NsoApplyError("dry_run_rejected", "opaque NED failure")
+        return "delta"
+
+    mock_client = AsyncMock()
+    with ExitStack() as stack:
+        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
+        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        caps = (
+            (await db.execute(select(DeviceCapability).where(DeviceCapability.ned_id == "cisco-ios-cli:cisco-ios")))
+            .scalars()
+            .all()
+        )
+        by_scope = {c.scope: c for c in caps}
+        assert "interface_ip" in by_scope and "interface_attribute" in by_scope  # coarse fallback
         break
 
 

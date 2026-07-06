@@ -696,19 +696,22 @@ def _device_error_message(exc) -> str | None:
     return None
 
 
-async def _localize_atomic_failure(client, device_name, modules, device_err) -> tuple[set[str], tuple]:
-    """Localise a failed atomic commit → (offending module root-keys, route-policy (scope, name)).
+async def _localize_atomic_failure(client, device_name, modules, device_err) -> tuple[dict[str, str], tuple]:
+    """Localise a failed atomic commit → ({offender root-key: its rejection message}, rp).
 
-    Two complementary signals: (1) a per-scope dry-run — a module the NED cannot compile re-runs
+    ``rp`` is the route-policy ``(scope, name)`` construct parse. Two complementary signals: (1) a per-scope dry-run — a module the NED cannot compile re-runs
     to an inconclusive (``None``) delta in isolation; (2) the route-policy device-parser rejection,
-    which renders clean in dry-run but is named in the *device* error (``device_err``). No recording
-    here — the caller decides attribution (including the fall-back to all staged scopes) and
-    whether it is a real device rejection before recording capability.
+    which renders clean in dry-run but is named in the *device* error (``device_err``). Each
+    offender carries ITS OWN dry-run rejection message (H2): the combined-commit ``device_err``
+    may describe a different module's failure, so per-construct attribution must read the
+    message of the module that actually rejected. No recording here — the caller decides
+    attribution (including the fall-back to all staged scopes) and whether it is a real device
+    rejection before recording capability.
     """
     from nso_adapter.core.capability import parse_rejected_construct
     from nso_adapter.nso.apply import NsoApplyError, apply_combined
 
-    offenders: set[str] = set()
+    offenders: dict[str, str] = {}
     for root_key, bodies in modules.items():
         try:
             # strict=True: only a CONCLUSIVE 4xx rejection in isolation flags this scope as an
@@ -716,14 +719,14 @@ async def _localize_atomic_failure(client, device_name, modules, device_err) -> 
             # — inconclusive, NOT an offender, so it never brands the scope a false 'unsupported'
             # that a later probe can't downgrade.
             await apply_combined(client, device_name, {root_key: bodies}, dry_run=True, strict=True)
-        except NsoApplyError:
-            offenders.add(root_key)
+        except NsoApplyError as exc:
+            offenders[root_key] = str(exc.message or "")
         except Exception:  # noqa: BLE001 — transient/transport during localisation → inconclusive
             logger.debug("apply.localize.inconclusive", device=device_name, root_key=root_key)
 
     rp = parse_rejected_construct(device_err or "")
     if rp[1] and _RP_ROOT in modules:
-        offenders.add(_RP_ROOT)
+        offenders.setdefault(_RP_ROOT, device_err or "")
     return offenders, rp
 
 
@@ -766,12 +769,17 @@ async def _record_atomic_capability(db, client, device, device_name, offenders, 
     A per-scope dry-run rejection means the NED cannot compile that scope's intent on this
     ``(ned, sw)``; a device-parser rejection (``device_err``) means the device itself refused
     the commit — both are real, reactive capability gaps, recorded at scope granularity (or
-    fine-grained for route-policy when ``rp = (scope, name)`` parses). ``device_err`` (the real
-    device error) is the detail. The ``(ned, sw)`` key is read from the device row, learned +
-    persisted via the capability probe only when not already known.
+    fine-grained for route-policy when ``rp = (scope, name)`` parses). H2: the merged
+    interface-config module carries TWO scopes — when its OWN rejection message names a
+    construct, only the offending half is recorded (construct-named); an unattributable
+    message falls back to the coarse both-scopes record. Detail prefers each offender's own
+    localisation message over the combined ``device_err`` (which may describe a different
+    module). The ``(ned, sw)`` key is read from the device row, learned + persisted via the
+    capability probe only when not already known.
     """
     from nso_adapter.core.capability import (
         _clean_capability_key,
+        parse_rejected_iface_construct,
         record_capability_rejection,
         refresh_device_capability,
     )
@@ -787,12 +795,18 @@ async def _record_atomic_capability(db, client, device, device_name, offenders, 
     if not ned_id:
         return
 
-    detail = (device_err or exc.message or "")[:256]
     rp_scope, rp_name = rp
     for root_key in offenders:
+        own_msg = offenders.get(root_key, "") if isinstance(offenders, dict) else ""
+        detail = (own_msg or device_err or exc.message or "")[:256]
         if root_key == _RP_ROOT and rp_name:
             await record_capability_rejection(db, ned_id, sw, rp_scope, rp_name, detail)
             continue
+        if root_key == _IFACE_CONFIG_ROOT:
+            scope, name = parse_rejected_iface_construct(own_msg or device_err or exc.message or "")
+            if scope:
+                await record_capability_rejection(db, ned_id, sw, scope, name, detail)
+                continue
         for scope in _capability_scopes_for(root_key):
             await record_capability_rejection(db, ned_id, sw, scope, scope, detail)
 
@@ -1031,11 +1045,11 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
             except Exception:  # noqa: BLE001 — capability recording is best-effort
                 logger.debug("apply.atomic.capability_record_skipped", job_id=job_id)
         if not offenders:  # could not localise → the whole rolled-back commit is the failure
-            offenders = set(modules.keys())
+            offenders = dict.fromkeys(modules.keys(), "")
         err = {"code": commit_error.code, "message": commit_error.message, "detail": commit_error.detail}
         msg = commit_error.message
     else:
-        offenders, err, msg = set(), None, ""
+        offenders, err, msg = {}, None, ""
         # Positive signal (I2): a clean commit clears any stale reactive 'unsupported' for the
         # applied scopes — a probe cannot downgrade an apply-rejection, so without this the gap
         # would stick forever even after the device is fixed / upgraded and the intent lands.

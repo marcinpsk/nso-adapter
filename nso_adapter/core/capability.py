@@ -154,11 +154,13 @@ async def clear_capability_rejections(db: AsyncSession, ned_id: str, sw_version:
     A successful device commit is the strongest positive signal — stronger than a probe (which
     :func:`_upsert` deliberately cannot use to downgrade an apply-rejection). Without this, a
     scope rejected once would stay ``unsupported`` forever, even after the device is fixed /
-    upgraded and the intent lands. Only the coarse generic rows (``name == scope``, as written by
-    ``core/apply.py`` ``_record_atomic_capability``) for the applied scopes are removed;
-    route-policy fine-grained constructs (scope ``rm-set`` / ``rm-match`` / ``community``) are
-    never touched — a clean ``route_policy`` apply does not prove any specific construct was
-    present. Returns the number of rows deleted.
+    upgraded and the intent lands. Every ``apply``-sourced row under an applied scope is
+    removed — the coarse generic rows (``name == scope``) AND the construct-named rows H2
+    attribution writes (e.g. ``(interface_ip, 'ipv4-address')``), which would otherwise stick
+    one granularity finer. Route-policy fine-grained constructs live under their own scope
+    names (``rm-set`` / ``rm-match`` / ``community``), never in the applied-scope set, so they
+    are still never touched — a clean ``route_policy`` apply does not prove any specific
+    construct was present. Returns the number of rows deleted.
     """
     if not ned_id:
         return 0
@@ -180,7 +182,7 @@ async def clear_capability_rejections(db: AsyncSession, ned_id: str, sw_version:
     )
     cleared = 0
     for row in rows:
-        if row.scope in scope_set and row.name == row.scope and row.status in ("unsupported", "skipped"):
+        if row.scope in scope_set and row.status in ("unsupported", "skipped"):
             await db.delete(row)
             cleared += 1
     if cleared:
@@ -421,6 +423,61 @@ _REJECTION_CONSTRUCTS = (
     ("rm-match", "match as-path", "match as-path"),
     ("community", "ip large-community-list", "ip large-community-list"),
 )
+
+
+# H2: attribute a rejected merged interface-config module to its offending half.
+# Two observed rejection formats feed this (both captured live):
+#   - NSO service/NED validation 4xx names the model node, e.g.
+#     "invalid value for: prefix-length in /ir:interface-config[...]/ir:ipv4-address[...]"
+#   - CLI-NED device-parser rejections name the offending command ("command: ip address ..."),
+#     the same format parse_rejected_construct greps for route-policy.
+# Path tokens map a model node → scope; command prefixes map a CLI line → scope. vrf/kind/
+# service/parent-binding/encap-tag ride the IP half of the merged module (see
+# build_interface_ip_entry), so they attribute to interface_ip.
+_IFACE_PATH_CONSTRUCTS: tuple[tuple[str, str, str], ...] = (
+    ("interface_ip", "ipv4-address", "ipv4-address"),
+    ("interface_ip", "ipv6-address", "ipv6-address"),
+    ("interface_ip", "vrf", ":vrf"),
+    ("interface_ip", "kind", ":kind"),
+    ("interface_ip", "parent-binding", "parent-binding"),
+    ("interface_ip", "encap-tag", "encap-tag"),
+    ("interface_attribute", "description", ":description"),
+    ("interface_attribute", "enabled", ":enabled"),
+)
+_IFACE_CMD_CONSTRUCTS: tuple[tuple[str, str, str], ...] = (
+    ("interface_ip", "ip address", "ip address"),
+    ("interface_ip", "ipv6 address", "ipv6 address"),
+    ("interface_ip", "vrf", "vrf"),
+    ("interface_ip", "vrf", "ip vrf"),
+    ("interface_attribute", "description", "description"),
+    ("interface_attribute", "shutdown", "shutdown"),
+    ("interface_attribute", "shutdown", "no shutdown"),
+)
+
+
+def parse_rejected_iface_construct(message: str):
+    """Attribute a rejected merged interface-config module → ``(scope, construct)``.
+
+    The merged module carries BOTH the interface_attribute and interface_ip scopes; coarse
+    recording marked both on one rejection, so a rejected IP falsely warned that attributes
+    are unsupported (H2). When the error names a known construct — by CLI command or by
+    model path — only the offending half is attributed. Returns ``(None, None)`` when
+    nothing matches; the caller falls back to the coarse both-scopes record (losing
+    precision, never losing the record).
+    """
+    msg = message or ""
+    match = re.search(r"command:\s*(.+)", msg)
+    if match:
+        cmd = match.group(1).strip().lower()
+        for scope, name, prefix in _IFACE_CMD_CONSTRUCTS:
+            if cmd.startswith(prefix):
+                return scope, name
+        return None, None
+    low = msg.lower()
+    for scope, name, token in _IFACE_PATH_CONSTRUCTS:
+        if token in low:
+            return scope, name
+    return None, None
 
 
 def parse_rejected_construct(message: str):

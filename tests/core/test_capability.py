@@ -486,3 +486,78 @@ def test_preflight_scopes_flags_read_gap_rows():
     flagged = {(u["scope"], u["status"]) for u in result["unsupported"]}
     # unknown carries no verdict (fail-open) and native is positive — only definite gaps flag
     assert flagged == {("bgp", "unsupported"), ("vlan", "skipped")}
+
+
+# ── H2: attribute a rejected merged interface-config module to its construct ──
+
+
+def test_parse_rejected_iface_construct_from_model_path():
+    from nso_adapter.core.capability import parse_rejected_iface_construct
+
+    # REAL sample (rg03 dry-run 400): NSO service validation names the offending node.
+    msg = (
+        "invalid value for: prefix-length in /ir:interface-config[ir:device='prod-lab03c-rg03']"
+        "[ir:interface-name='GigabitEthernet0/0/7']/ir:ipv4-address[ir:address='10.0.255.5']"
+        '/ir:prefix-length: "99" is out of range.'
+    )
+    assert parse_rejected_iface_construct(msg) == ("interface_ip", "ipv4-address")
+    assert parse_rejected_iface_construct(msg.replace("ipv4-address", "ipv6-address")) == (
+        "interface_ip",
+        "ipv6-address",
+    )
+
+
+def test_parse_rejected_iface_construct_from_attr_model_path():
+    from nso_adapter.core.capability import parse_rejected_iface_construct
+
+    msg = "invalid value for: description in /ir:interface-config[ir:device='x']/ir:description: too long"
+    assert parse_rejected_iface_construct(msg) == ("interface_attribute", "description")
+
+
+def test_parse_rejected_iface_construct_from_cli_command():
+    from nso_adapter.core.capability import parse_rejected_iface_construct
+
+    # CLI-NED device-parser rejections name the offending command (route-policy format).
+    assert parse_rejected_iface_construct(
+        "external error: ... % Invalid input detected ... command: ip address 10.0.255.5 255.255.255.0"
+    ) == ("interface_ip", "ip address")
+    assert parse_rejected_iface_construct("command: ipv6 address 2001:db8::1/64") == (
+        "interface_ip",
+        "ipv6 address",
+    )
+    assert parse_rejected_iface_construct("command: vrf forwarding CUST-1") == ("interface_ip", "vrf")
+    assert parse_rejected_iface_construct("command: description WAY TOO LONG") == (
+        "interface_attribute",
+        "description",
+    )
+    assert parse_rejected_iface_construct("command: shutdown") == ("interface_attribute", "shutdown")
+
+
+def test_parse_rejected_iface_construct_unattributable_is_none():
+    from nso_adapter.core.capability import parse_rejected_iface_construct
+
+    assert parse_rejected_iface_construct("RPC error towards sw01: operation_failed") == (None, None)
+    assert parse_rejected_iface_construct("") == (None, None)
+    assert parse_rejected_iface_construct("command: mtu 99999") == (None, None)  # not an iface-config construct
+
+
+@pytest.mark.asyncio
+async def test_clear_capability_rejections_clears_fine_grained_names_in_scope(adapter_client):  # noqa: F811
+    """H2 records construct-named rows (e.g. (interface_ip, 'ipv4-address')); a clean commit
+    of that scope must clear them like the coarse (scope, scope) rows — else the H1 stale-gap
+    bug returns one granularity finer."""
+    from nso_adapter.core.capability import (
+        clear_capability_rejections,
+        get_device_capability,
+        record_capability_rejection,
+    )
+    from nso_adapter.store.db import get_session
+
+    sw = "17.15.4c"
+    async for db in get_session():
+        await record_capability_rejection(db, _NED, sw, "interface_ip", "ipv4-address", "out of range")
+        cleared = await clear_capability_rejections(db, _NED, sw, ["interface_ip"])
+        assert cleared == 1
+        rows = await get_device_capability(db, _NED, sw)
+        assert not any(r.scope == "interface_ip" for r in rows)
+        break
