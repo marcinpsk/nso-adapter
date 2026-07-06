@@ -28,6 +28,7 @@ class _FakeKvV2:
     def __init__(self, store: dict[str, dict[str, str]]):
         self._store = store
         self.forbid_once: set[str] = set()
+        self.forbid_always: set[str] = set()  # persistent policy denial (survives re-auth)
         self.read_paths: list[str] = []
         self.read_mounts: list[str] = []
         self.write_calls: list[tuple[str, str, dict]] = []
@@ -36,6 +37,8 @@ class _FakeKvV2:
     def read_secret_version(self, *, mount_point, path, raise_on_deleted_version):
         self.read_paths.append(path)
         self.read_mounts.append(mount_point)
+        if path in self.forbid_always:
+            raise _FakeForbidden("permission denied")
         if path in self.forbid_once:
             self.forbid_once.discard(path)  # token "expired" exactly once
             raise _FakeForbidden()

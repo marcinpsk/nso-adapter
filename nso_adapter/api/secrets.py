@@ -84,6 +84,18 @@ def _parse_ref(reference: str) -> VaultRef:
         raise api_error(400, "invalid_vault_ref", str(exc)) from exc
 
 
+def _vault_op(operation, vault_ref: str):
+    """Run a provider read/write, mapping Vault failures to a structured 502.
+
+    hvac error text names the path and reason (e.g. 'permission denied' when the
+    AppRole policy doesn't cover the ref) — never secret values.
+    """
+    try:
+        return operation()
+    except Exception as exc:
+        raise api_error(502, "vault_error", f"Vault operation failed for {vault_ref!r}: {exc}") from exc
+
+
 @router.post("/secrets", response_model=SecretWriteResponse)
 async def set_secret(body: SecretWriteRequest, request: Request) -> SecretWriteResponse:
     """Merge-write secret fields at the ref's Vault path; return version + fingerprints."""
@@ -97,7 +109,7 @@ async def set_secret(body: SecretWriteRequest, request: Request) -> SecretWriteR
         )
 
     plain = {field: value.get_secret_value() for field, value in body.values.items()}
-    version = provider.write_path(ref.mount, ref.path, plain)
+    version = _vault_op(lambda: provider.write_path(ref.mount, ref.path, plain), body.vault_ref)
     hashes = {field: secret_fingerprint(value) for field, value in plain.items()}
     logger.info("secrets.set", vault_ref=body.vault_ref, fields=sorted(plain), version=version)
     return SecretWriteResponse(vault_ref=body.vault_ref, version=version, hashes=hashes)
@@ -109,7 +121,7 @@ async def verify_secret(body: SecretVerifyRequest, request: Request) -> SecretVe
     provider = _vault_provider(request)
     ref = _parse_ref(body.vault_ref)
 
-    data, version = provider.read_path_meta(ref.mount, ref.path)
+    data, version = _vault_op(lambda: provider.read_path_meta(ref.mount, ref.path), body.vault_ref)
     if ref.key is not None:
         data = {ref.key: data[ref.key]} if ref.key in data else {}
     if not data:
@@ -171,7 +183,7 @@ async def harvest_community(
             f"{device.nso_device_name!r} — if the device changed out-of-band, run sync-from and refresh first",
         )
 
-    version = provider.write_path(ref.mount, ref.path, {ref.key: found.secret})
+    version = _vault_op(lambda: provider.write_path(ref.mount, ref.path, {ref.key: found.secret}), body.vault_ref)
     logger.info(
         "secrets.harvest_community",
         device=device.nso_device_name,

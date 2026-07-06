@@ -247,6 +247,24 @@ async def test_verify_keyed_ref_restricts_to_that_field(vault_client):
 
 
 @pytest.mark.anyio
+async def test_vault_permission_denied_returns_structured_502(vault_client):
+    """A Vault policy denial (403 that survives re-auth) must map to a structured
+    error, not an unhandled 500 — live-observed on a path outside the AppRole's
+    policy. The error text carries only the ref/path, never values."""
+    client, store, kv = vault_client
+    store["credentials/other-svc"] = {"password": "x"}
+    kv.forbid_always.add("credentials/other-svc")
+
+    resp = await client.post(
+        "/api/v1/secrets/verify", json={"vault_ref": "network/credentials/other-svc"}, headers=AUTH
+    )
+
+    assert resp.status_code == 502
+    assert resp.json()["error"]["code"] == "vault_error"
+    assert "x" not in resp.json()["error"]["message"]
+
+
+@pytest.mark.anyio
 async def test_verify_missing_path_exists_false(vault_client):
     client, _, _ = vault_client
     resp = await client.post("/api/v1/secrets/verify", json={"vault_ref": "network/nope/ghost"}, headers=AUTH)
