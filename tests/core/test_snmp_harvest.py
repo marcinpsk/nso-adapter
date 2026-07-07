@@ -14,10 +14,28 @@ def test_harvest_subpath_per_ned():
     assert harvest_subpath("cisco-ios-cli-6.77") == "tailf-ned-cisco-ios:snmp-server/community"
     assert harvest_subpath("cisco-iosxr-cli-7.52") == "tailf-ned-cisco-ios-xr:snmp-server/community"
     assert harvest_subpath("juniper-junos-nc-4.19") == "junos:configuration/snmp/community"
-    # timos gated until the live plaintext-vs-hash2 check; arcos has no handler at all
+    assert (
+        harvest_subpath("arcos-v8.1.2X-nc-1.0:arcos-v8.1.2X-nc-1.0")
+        == "openconfig-system:system/arcos-openconfig-system-augments:snmp-server/communities/community"
+    )
+    # timos stays gated: SR OS stores communities hash2-obfuscated (live-confirmed)
     assert harvest_subpath("timos-nc-9.1") is None
-    assert harvest_subpath("arcos-nc-1.0") is None
     assert harvest_subpath("") is None
+
+
+def test_find_community_arcos_name_is_secret():
+    """ArcOS (live-verified ri6): the community NAME is the secret; the platform has
+    no access/view knobs, so access is always RO (mirrors the arcos reader).
+    """
+    payload = {
+        "arcos-openconfig-system-augments:community": [
+            {"name": "arcos-ro", "config": {"name": "arcos-ro"}},
+            {"name": "arcos-other", "config": {"name": "arcos-other"}},
+        ]
+    }
+    found = find_community("arcos-v8.1.2X-nc-1.0:arcos-v8.1.2X-nc-1.0", payload, secret_fingerprint("arcos-ro"))
+    assert found is not None
+    assert (found.secret, found.access, found.acl) == ("arcos-ro", "RO", None)
 
 
 def test_find_community_iosxr_access_list_leaf():

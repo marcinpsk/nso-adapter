@@ -372,6 +372,20 @@ async def test_snmp_apply_body_uses_vault_triples_and_yang_enums():
     assert "contact" not in entry  # None contact omitted
 
 
+async def test_snmp_apply_host_without_binding_omits_community_or_user():
+    """A host with no community/user binding (ArcOS targets carry none — the platform
+    binds via target-parameters, not the target) must OMIT the optional
+    community-or-user leaf, not send a JSON null the RESTCONF layer rejects.
+    """
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+    hosts = [SimpleNamespace(address="192.0.2.99", version="2c", notify_type="trap", community_or_user=None, port=162)]
+    await apply_snmp_config(client, "ri6", [], [], hosts, None, dry_run=True)
+
+    entry = _sent_body(transport)["snmp-reconciler:snmp-config"][0]
+    assert entry["host"] == [{"address": "192.0.2.99", "version": "v2c", "notify-type": "traps", "port": 162}]
+
+
 @pytest.mark.parametrize(
     "bad_ref",
     [

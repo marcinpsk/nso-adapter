@@ -30,6 +30,9 @@ _HARVEST_PATHS: dict[str, str] = {
     "cisco-ios-cli": "tailf-ned-cisco-ios:snmp-server/community",
     "cisco-iosxr-cli": "tailf-ned-cisco-ios-xr:snmp-server/community",
     "juniper-junos-nc": "junos:configuration/snmp/community",
+    # ArcOS (live-verified ri6 2026-07-07): communities ride the openconfig-system
+    # augment; the list-entry NAME is the plaintext secret, same as the cisco shape.
+    "arcos-": "openconfig-system:system/arcos-openconfig-system-augments:snmp-server/communities/community",
 }
 
 
@@ -82,7 +85,12 @@ def _extract_junos(entry: dict) -> HarvestedCommunity | None:
 
 
 def find_community(ned_id: str, payload: dict, community_hash: str) -> HarvestedCommunity | None:
-    """Return the community whose plaintext fingerprint equals *community_hash*."""
+    """Return the community whose plaintext fingerprint equals *community_hash*.
+
+    ArcOS deliberately shares the cisco extractor: its entry NAME is likewise the
+    secret, and the platform has no RW/acl knobs, so the cisco fallbacks (RO, no
+    acl) are exactly the arcos truth (pinned by the arcos test).
+    """
     extract = _extract_junos if ned_id.startswith("juniper-junos-nc") else _extract_cisco
     for entry in _entries(payload):
         found = extract(entry)

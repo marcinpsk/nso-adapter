@@ -826,7 +826,9 @@ async def apply_snmp_config(
                 "address": h.address,
                 "version": _snmp_enum(h.version, _SNMP_VERSION, "version", h.address),
                 "notify-type": _snmp_enum(h.notify_type, _SNMP_NOTIFY, "notify_type", h.address),
-                "community-or-user": h.community_or_user,
+                # optional leaf: a binding-less host (ArcOS targets bind via
+                # target-parameters, not the target) must omit it, not send null
+                **({"community-or-user": h.community_or_user} if h.community_or_user else {}),
                 **({"port": h.port} if h.port is not None else {}),
             }
             for h in host_intents
