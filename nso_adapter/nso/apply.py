@@ -1314,15 +1314,29 @@ def _isis_flex_algo_entry(row) -> dict:
     return entry
 
 
+def _isis_level_entry(row) -> dict:
+    """One YANG ``level`` entry from an IsisLevelIntent row (None fields omitted)."""
+    entry: dict = {"level": int(row.level)}
+    if row.wide_metrics_only is not None:
+        entry["wide-metrics-only"] = bool(row.wide_metrics_only)
+    if row.labeled_preference is not None:
+        entry["labeled-preference"] = int(row.labeled_preference)
+    if row.disabled is not None:
+        entry["disabled"] = bool(row.disabled)
+    return entry
+
+
 def build_isis_process_payload(
     isis_process_rows: list | None,
     redistribution_rows: list | None = None,
     flex_algo_rows: list | None = None,
+    level_rows: list | None = None,
 ) -> list[dict]:
     """Build the isis-reconciler ``process-config`` payload from store rows.
 
-    Includes nested redistribute and flex-algo. Shared by the apply path and the
-    flex-algo removal path (PUT-replace), so both produce identical process-config bodies.
+    Includes nested redistribute, flex-algo and per-level tuning. Shared by the
+    apply path and the flex-algo removal path (PUT-replace), so both produce
+    identical process-config bodies.
     """
     redist_by_proc: dict[str, list[dict]] = {}
     for row in redistribution_rows or []:
@@ -1357,6 +1371,20 @@ def build_isis_process_payload(
             proc_by_tag[tag] = proc
         proc["flex-algo"] = fa_list
 
+    # Per-level tuning attaches identically (orphan tags get a minimal entry so a
+    # level row is never silently dropped).
+    levels_by_proc: dict[str, list[dict]] = {}
+    for row in level_rows or []:
+        levels_by_proc.setdefault(row.process_tag or "", []).append(_isis_level_entry(row))
+
+    for tag, lvl_list in levels_by_proc.items():
+        proc = proc_by_tag.get(tag)
+        if proc is None:
+            proc = {"process-tag": tag}
+            processes.append(proc)
+            proc_by_tag[tag] = proc
+        proc["level"] = lvl_list
+
     return processes
 
 
@@ -1367,6 +1395,7 @@ async def apply_isis_interfaces(
     isis_process_rows: list | None = None,
     redistribution_rows: list | None = None,
     flex_algo_rows: list | None = None,
+    level_rows: list | None = None,
     *,
     dry_run: bool = False,
     stage: dict[str, list] | None = None,
@@ -1385,7 +1414,7 @@ async def apply_isis_interfaces(
 
     Raises NsoApplyError on failure.
     """
-    processes = build_isis_process_payload(isis_process_rows, redistribution_rows, flex_algo_rows)
+    processes = build_isis_process_payload(isis_process_rows, redistribution_rows, flex_algo_rows, level_rows)
 
     interfaces = build_isis_interface_payload(isis_intent_rows)
 

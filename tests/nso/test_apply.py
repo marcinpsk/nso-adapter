@@ -26,6 +26,7 @@ from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import (
     BgpRouterIntent,
     IsisFlexAlgoIntent,
+    IsisLevelIntent,
     IsisProcessIntent,
     OspfInstanceIntent,
     OspfInterfaceIntent,
@@ -745,6 +746,20 @@ def test_build_isis_process_payload_flex_algo_attaches_to_existing_process():
     fa_out = procs[0]["flex-algo"][0]
     assert fa_out == {"algo-id": 128, "admin-group-include-any": "BLUE", "admin-group-include-all": "GREEN"}
     assert "priority" not in fa_out  # None priority omitted
+
+
+def test_build_isis_process_payload_attaches_levels():
+    """Per-level rows attach under their process-tag as the YANG ``level`` list
+    (None fields omitted), creating a minimal process entry when the tag has no
+    process row — the flex-algo orphan parity, so a level row is never dropped."""
+    proc = IsisProcessIntent(process_tag="0", net="49.0001.00")
+    lv2 = IsisLevelIntent(process_tag="0", level=2, wide_metrics_only=True, labeled_preference=7)
+    lv_orphan = IsisLevelIntent(process_tag="EDGE", level=1, disabled=True)
+    procs = build_isis_process_payload([proc], [], [], level_rows=[lv2, lv_orphan])
+    by_tag = {p["process-tag"]: p for p in procs}
+    assert by_tag["0"]["level"] == [{"level": 2, "wide-metrics-only": True, "labeled-preference": 7}]
+    assert by_tag["EDGE"]["level"] == [{"level": 1, "disabled": True}]
+    assert "net" not in by_tag["EDGE"]  # minimal synthesized entry
 
 
 def test_build_isis_process_payload_omits_empty_enums():

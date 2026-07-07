@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import structlog
 from fastapi import APIRouter, Depends
@@ -20,6 +21,7 @@ from nso_adapter.store.models import (
     DeviceIsisProcess,
     IsisFlexAlgoIntent,
     IsisInterfaceIntent,
+    IsisLevelIntent,
     IsisProcessIntent,
     RedistributionIntent,
 )
@@ -185,6 +187,13 @@ class IsisInterfaceEntry(BaseModel):
     accepted_at: datetime | None = None
 
 
+class IsisLevelEntry(BaseModel):
+    level: int
+    wide_metrics_only: bool | None = None
+    labeled_preference: int | None = None
+    disabled: bool | None = None
+
+
 class IsisProcessEntry(BaseModel):
     process_tag: str = ""
     net: str | None = None
@@ -197,6 +206,7 @@ class IsisProcessEntry(BaseModel):
     domain_auth_key: str | None = None
     accepted_at: datetime | None = None
     redistribution: list[RedistributionEntry] = []
+    levels: list[IsisLevelEntry] = []
 
 
 class IsisInterfaceIntentUpdate(BaseModel):
@@ -237,6 +247,13 @@ def _apply_isis_interface_fields(row: IsisInterfaceIntent, e: IsisInterfaceEntry
     row.network_type = e.network_type
     row.metric = e.metric
     row.passive = e.passive
+    row.accepted_at = accepted
+
+
+def _apply_isis_level_fields(row, entry, accepted) -> None:
+    row.wide_metrics_only = entry.wide_metrics_only
+    row.labeled_preference = entry.labeled_preference
+    row.disabled = entry.disabled
     row.accepted_at = accepted
 
 
@@ -349,6 +366,30 @@ async def put_isis_interface_intent(
         now=now,
         apply_fields=_apply_isis_process_fields,
         make_row=lambda e: IsisProcessIntent(device_id=device_id, process_tag=e.process_tag),
+    )
+    # Flatten the per-process level entries into (process_tag, level)-keyed rows;
+    # accepted_at rides the parent process entry (a level is accepted with its process).
+    level_entries = [
+        SimpleNamespace(
+            process_tag=p.process_tag,
+            level=lv.level,
+            wide_metrics_only=lv.wide_metrics_only,
+            labeled_preference=lv.labeled_preference,
+            disabled=lv.disabled,
+            accepted_at=p.accepted_at,
+        )
+        for p in body.processes
+        for lv in p.levels
+    ]
+    await _sync_keyed_intent(
+        db,
+        IsisLevelIntent,
+        device_id,
+        key_of=lambda x: (x.process_tag, x.level),
+        entries=level_entries,
+        now=now,
+        apply_fields=_apply_isis_level_fields,
+        make_row=lambda e: IsisLevelIntent(device_id=device_id, process_tag=e.process_tag, level=e.level),
     )
     await _sync_isis_redistribution(db, device_id, body.processes, now)
     await _maybe_enqueue_isis_apply(db, device_id, iface_count, proc_count)
@@ -494,7 +535,19 @@ async def put_isis_flex_algo_intent(device_id: int, body: IsisFlexAlgoIntentUpda
             .scalars()
             .all()
         )
-        processes = build_isis_process_payload(proc_rows, redist_rows, flex_rows)
+        level_rows = (
+            (
+                await db.execute(
+                    select(IsisLevelIntent).where(
+                        IsisLevelIntent.device_id == device_id,
+                        IsisLevelIntent.accepted_at.is_not(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        processes = build_isis_process_payload(proc_rows, redist_rows, flex_rows, level_rows)
         interfaces = build_isis_interface_payload(iface_rows)
         try:
             nso_client = get_nso_client(device.nso_instance)

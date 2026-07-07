@@ -219,6 +219,9 @@ class Device(Base):
     isis_flex_algo_intents: Mapped[list[IsisFlexAlgoIntent]] = relationship(
         "IsisFlexAlgoIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
+    isis_level_intents: Mapped[list[IsisLevelIntent]] = relationship(
+        "IsisLevelIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
     bgp_routers: Mapped[list[DeviceBgpRouter]] = relationship(
         "DeviceBgpRouter", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
@@ -1347,6 +1350,33 @@ class IsisProcessIntent(Base):
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     device: Mapped[Device] = relationship("Device", back_populates="isis_process_intents")
+
+
+class IsisLevelIntent(Base):
+    """Write-path intent for one per-level (L1/L2) IS-IS process tuning row.
+
+    Keyed by (device, process_tag, level) independently of IsisProcessIntent
+    (the flex-algo pattern) so level tuning survives process-row filtering and
+    the payload builder can synthesize a minimal process entry when needed.
+    """
+
+    __tablename__ = "isis_level_intent"
+    __table_args__ = (UniqueConstraint("device_id", "process_tag", "level", name="uq_isislevelintent_identity"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    process_tag: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    level: Mapped[int] = mapped_column(Integer, nullable=False)
+    wide_metrics_only: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    labeled_preference: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    disabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    device: Mapped[Device] = relationship("Device", back_populates="isis_level_intents")
 
 
 class IsisFlexAlgoIntent(Base):

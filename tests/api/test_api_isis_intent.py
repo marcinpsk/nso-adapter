@@ -121,6 +121,51 @@ async def test_put_isis_intent_full_replace_and_update(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_put_isis_intent_levels_create_and_full_replace(adapter_client):
+    """Per-level process tuning rides the process entries ('levels') and lands in
+    IsisLevelIntent rows keyed (device, process_tag, level) with full-replace
+    semantics — a second PUT without a level deletes its row."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import IsisLevelIntent
+
+    device_id = await seed_device(nso_device_name="isis-levels", netbox_device_id=982)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={
+            "interfaces": [],
+            "processes": [
+                {
+                    "process_tag": "",
+                    "levels": [
+                        {"level": 2, "wide_metrics_only": True, "labeled_preference": 7},
+                        {"level": 1, "disabled": True},
+                    ],
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200
+
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={
+            "interfaces": [],
+            "processes": [{"process_tag": "", "levels": [{"level": 2, "labeled_preference": 9}]}],
+        },
+    )
+    assert resp.status_code == 200
+
+    async for db in get_session():
+        rows = (await db.execute(select(IsisLevelIntent).where(IsisLevelIntent.device_id == device_id))).scalars().all()
+        break
+    assert {(r.process_tag, r.level): (r.wide_metrics_only, r.labeled_preference, r.disabled) for r in rows} == {
+        ("", 2): (None, 9, None)  # level 1 dropped; level 2 updated
+    }
+
+
+@pytest.mark.anyio
 async def test_put_isis_intent_redistribution_create_and_replace(adapter_client):
     from nso_adapter.store.db import get_session
     from nso_adapter.store.models import RedistributionIntent

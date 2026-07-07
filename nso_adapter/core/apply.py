@@ -35,6 +35,7 @@ from nso_adapter.store.models import (
     InterfaceMtuIntent,
     IsisFlexAlgoIntent,
     IsisInterfaceIntent,
+    IsisLevelIntent,
     IsisProcessIntent,
     Job,
     JobStatus,
@@ -249,6 +250,7 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
     isis_iface = await _accepted(IsisInterfaceIntent)
     isis_proc = await _accepted(IsisProcessIntent)
     isis_flex = await _accepted(IsisFlexAlgoIntent)
+    isis_levels = await _accepted(IsisLevelIntent)
     bgp = await _accepted(BgpRouterIntent)
     if bgp:
         from nso_adapter.core.bgp_load import attach_bgp_relationships
@@ -287,7 +289,7 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
         ),
         (
             "isis",
-            [isis_iface, isis_proc, redist_isis, isis_flex],
+            [isis_iface, isis_proc, redist_isis, isis_flex, isis_levels],
             lambda: nso_apply.apply_isis_interfaces(
                 client=client,
                 device_name=device_name,
@@ -295,6 +297,7 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
                 isis_process_rows=isis_proc,
                 redistribution_rows=redist_isis,
                 flex_algo_rows=isis_flex,
+                level_rows=isis_levels,
                 dry_run=True,
             ),
         ),
@@ -891,7 +894,7 @@ async def _stage_atomic_modules(elig, client, device, device_name) -> tuple[dict
         ("l2_sap", elig["l2_sap"], lambda: apply_l2_saps(client, device_name, elig["l2_sap"], stage=modules)),
         (
             "isis",
-            [*elig["isis_iface"], *elig["isis_proc"], *elig["redist_isis"], *elig["isis_flex"]],
+            [*elig["isis_iface"], *elig["isis_proc"], *elig["redist_isis"], *elig["isis_flex"], *elig["isis_levels"]],
             lambda: apply_isis_interfaces(
                 client,
                 device_name,
@@ -899,6 +902,7 @@ async def _stage_atomic_modules(elig, client, device, device_name) -> tuple[dict
                 elig["isis_proc"],
                 elig["redist_isis"],
                 elig["isis_flex"],
+                elig["isis_levels"],
                 stage=modules,
             ),
         ),
@@ -1243,6 +1247,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     isis_eligible = await _collect_eligible(db, IsisInterfaceIntent, device_id, force)
     isis_process_eligible = await _collect_eligible(db, IsisProcessIntent, device_id, force)
     isis_flex_eligible = await _collect_eligible(db, IsisFlexAlgoIntent, device_id, force)
+    isis_level_eligible = await _collect_eligible(db, IsisLevelIntent, device_id, force)
     bgp_eligible = await _collect_eligible(db, BgpRouterIntent, device_id, force)
     if bgp_eligible:
         # Eagerly load BGP relationships for apply (avoids lazy-raise on the worker greenlet).
@@ -1306,6 +1311,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             "isis_iface": isis_eligible,
             "isis_proc": isis_process_eligible,
             "isis_flex": isis_flex_eligible,
+            "isis_levels": isis_level_eligible,
             "bgp": bgp_eligible,
             "rp": rp_eligible,
             "ospf_inst": ospf_instance_eligible,
@@ -1421,7 +1427,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         _Scope(
             "isis",
             "isis",
-            [*isis_eligible, *isis_process_eligible, *redist_isis, *isis_flex_eligible],
+            [*isis_eligible, *isis_process_eligible, *redist_isis, *isis_flex_eligible, *isis_level_eligible],
             lambda: apply_isis_interfaces(
                 client=client,
                 device_name=device_name,
@@ -1429,6 +1435,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
                 isis_process_rows=isis_process_eligible,
                 redistribution_rows=redist_isis,
                 flex_algo_rows=isis_flex_eligible,
+                level_rows=isis_level_eligible,
             ),
         ),
         _Scope(
