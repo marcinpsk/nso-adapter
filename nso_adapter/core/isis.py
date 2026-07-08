@@ -35,6 +35,8 @@ _PROC_SCALAR_KEYS = (
     "overload-on-startup",
     "overload-timeout",
     "te-enabled",
+    "suppress-attached-bit",
+    "ignore-attached-bit",
     "distance",
     "maximum-paths",
     "reference-bandwidth",

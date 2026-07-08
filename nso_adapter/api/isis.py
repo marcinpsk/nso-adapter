@@ -61,6 +61,8 @@ _PROCESS_OPTIONAL_FIELDS = (
     "overload_on_startup",
     "overload_timeout",
     "te_enabled",
+    "suppress_attached_bit",
+    "ignore_attached_bit",
     "distance",
     "maximum_paths",
     "reference_bandwidth",

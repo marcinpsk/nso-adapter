@@ -1175,6 +1175,11 @@ class DeviceIsisProcess(Base):
     overload_on_startup: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     overload_timeout: Mapped[int | None] = mapped_column(Integer, nullable=True)
     te_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # ATT-bit knobs -> netbox_routing ISISInstance.suppress_attached_bit / ignore_attached_bit.
+    # suppress = don't set ATT in our L1 LSP (IOS-XR send never-set / Nokia); ignore = ignore a
+    # received ATT bit (IOS/IOS-XR/Junos/Nokia). Emitted True only when configured.
+    suppress_attached_bit: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    ignore_attached_bit: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     # NB: segment-routing state lives in the `segment_routing` JSON bag (the plugin
     # reconciles it into the ISISSegmentRouting child); the old top-level sr_enabled/
     # sr_node_msd scalars were stale read-surface and were dropped (s3-21).

@@ -308,6 +308,33 @@ async def test_refresh_persists_srv6_locators(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_refresh_persists_attached_bit(adapter_client):
+    """Per-process suppress/ignore-attached-bit boolean leaves are mirrored to columns."""
+    device_id = await seed_device(nso_device_name="isis-att-01", netbox_device_id=972)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_isis_interfaces.return_value = {
+            "process": [
+                {"process-tag": "0", "suppress-attached-bit": True, "ignore-attached-bit": True},
+                {"process-tag": "1"},  # neither knob configured -> both None
+            ],
+            "interface": [],
+        }
+        await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
+
+        procs = {
+            p.process_tag: p
+            for p in (await db.execute(select(DeviceIsisProcess).where(DeviceIsisProcess.device_id == device.id)))
+            .scalars()
+            .all()
+        }
+        assert procs["0"].suppress_attached_bit is True
+        assert procs["0"].ignore_attached_bit is True
+        assert procs["1"].suppress_attached_bit is None
+        assert procs["1"].ignore_attached_bit is None
+
+
+@pytest.mark.anyio
 async def test_refresh_dedups_duplicate_interface(adapter_client):
     """s2-9: a duplicate (interface, af) in the export must not IntegrityError and roll back the
     whole full-replace — deduped (first occurrence wins)."""
