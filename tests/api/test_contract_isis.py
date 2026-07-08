@@ -71,7 +71,10 @@ IFACE_OPTIONAL_SCALARS = {
     "lsp_interval",
     "mesh_group",
 }
-IFACE_CONTAINER_KEYS = {"settings", "levels"}
+IFACE_CONTAINER_KEYS = {"settings", "levels", "prefix_sids"}
+# Per-loopback prefix-SID entry: maximal (SRGB-index) form; sid_label is the
+# mutually-exclusive alternative to sid_index.
+IFACE_PREFIX_SID_KEYS = {"algorithm", "sid_index", "n_flag", "no_php", "explicit_null", "readvertise"}
 
 # Nested JSON-bag sub-dict key sets (snake-cased output the plugin reads).
 INSTANCE_LEVEL_KEYS = {
@@ -211,6 +214,17 @@ async def _seed_isis(device_id: int) -> None:
                 mesh_group="1",
                 settings={"some-knob": "v"},
                 levels=[iface_level],
+                prefix_sids=[
+                    {
+                        "algorithm": 0,
+                        "sid-index": 100006,
+                        "n-flag": True,
+                        "no-php": True,
+                        "explicit-null": False,
+                        "readvertise": False,
+                    },
+                    {"algorithm": 128, "sid-label": 17128},
+                ],
                 last_refreshed_at=ts,
                 refresh_source="poll",
             )
@@ -247,6 +261,9 @@ async def test_isis_payload_matches_contract_exactly(adapter_client):
     assert set(ifaces["GE0/0"].keys()) == IFACE_REQUIRED_KEYS | IFACE_OPTIONAL_SCALARS | IFACE_CONTAINER_KEYS
     assert set(ifaces["GE0/1"].keys()) == IFACE_REQUIRED_KEYS  # optionals + containers omitted
     assert set(ifaces["GE0/0"]["levels"][0].keys()) == IFACE_LEVEL_KEYS
+    # Per-loopback prefix-SID: maximal (index) form, plus the label alternative.
+    assert set(ifaces["GE0/0"]["prefix_sids"][0].keys()) == IFACE_PREFIX_SID_KEYS
+    assert set(ifaces["GE0/0"]["prefix_sids"][1].keys()) == {"algorithm", "sid_label"}
     assert isinstance(ifaces["GE0/0"]["passive"], bool)
 
 

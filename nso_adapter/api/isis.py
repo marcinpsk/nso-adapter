@@ -109,6 +109,8 @@ def _serialize_isis_interface(row: DeviceIsisInterface) -> dict:
         entry["settings"] = row.settings
     if row.levels:
         entry["levels"] = [_snake(lvl) for lvl in row.levels]
+    if row.prefix_sids:
+        entry["prefix_sids"] = [_snake(ps) for ps in row.prefix_sids]
     entry["passive"] = row.passive
     return entry
 

@@ -238,6 +238,12 @@ async def test_refresh_persists_p2_levels_and_sr(adapter_client):
                     "af": "ipv4",
                     "level": [{"level": 2, "metric": 10}],
                 },
+                {
+                    "interface-name": "Loopback0",
+                    "af": "ipv4",
+                    "passive": True,
+                    "prefix-sid": [{"algorithm": 0, "sid-index": 100006, "n-flag": True}],
+                },
             ],
         }
         await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
@@ -252,9 +258,26 @@ async def test_refresh_persists_p2_levels_and_sr(adapter_client):
         assert proc.segment_routing == {"enabled": True, "prefix-sid-range": "global"}
 
         iface = (
-            await db.execute(select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id))
+            await db.execute(
+                select(DeviceIsisInterface).where(
+                    DeviceIsisInterface.device_id == device.id,
+                    DeviceIsisInterface.interface_name == "LAG99:10",
+                )
+            )
         ).scalar_one()
         assert iface.levels == [{"level": 2, "metric": 10}]
+        assert iface.prefix_sids is None
+
+        # Per-loopback prefix-SID list is mirrored onto the interface row.
+        lo = (
+            await db.execute(
+                select(DeviceIsisInterface).where(
+                    DeviceIsisInterface.device_id == device.id,
+                    DeviceIsisInterface.interface_name == "Loopback0",
+                )
+            )
+        ).scalar_one()
+        assert lo.prefix_sids == [{"algorithm": 0, "sid-index": 100006, "n-flag": True}]
 
 
 @pytest.mark.anyio

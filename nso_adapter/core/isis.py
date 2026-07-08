@@ -137,6 +137,7 @@ async def _upsert_isis_data(
                 bfd_enabled=iface.get("bfd-enabled"),
                 settings=_settings_dict(iface),
                 levels=iface.get("level") or None,
+                prefix_sids=iface.get("prefix-sid") or None,
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
                 **_scalar_cols(iface, _IFACE_SCALAR_KEYS),

@@ -1230,6 +1230,9 @@ class DeviceIsisInterface(Base):
     settings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # per-level child rows [{level, metric, hello-interval,...}].
     levels: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # per-loopback SR prefix-SID(s) [{algorithm, sid-index|sid-label, n-flag,...}]
+    # -> netbox_routing ISISPrefixSID (per interface+algorithm).
+    prefix_sids: Mapped[list | None] = mapped_column(JSON, nullable=True)
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
 
