@@ -55,7 +55,7 @@ PROC_OPTIONAL_SCALARS = {
     "maximum_paths",
     "reference_bandwidth",
 }
-PROC_CONTAINER_KEYS = {"settings", "levels", "segment_routing", "flex_algos"}
+PROC_CONTAINER_KEYS = {"settings", "levels", "segment_routing", "flex_algos", "srv6_locators"}
 
 IFACE_REQUIRED_KEYS = {"interface_name", "af", "process_tag", "passive"}
 IFACE_OPTIONAL_SCALARS = {
@@ -107,6 +107,20 @@ FLEX_KEYS = {
     "admin_group_include_any",
     "admin_group_include_all",
 }
+SRV6_LOCATOR_KEYS = {
+    "name",
+    "prefix",
+    "algorithm",
+    "is_anycast",
+    "is_micro_segment",
+    "flavor",
+    "block_length",
+    "node_length",
+    "function_length",
+    "argument_length",
+    "isis_level",
+    "enabled",
+}
 
 
 async def _seed_isis(device_id: int) -> None:
@@ -153,6 +167,20 @@ async def _seed_isis(device_id: int) -> None:
         "priority": 64,
         "passive": False,
     }
+    srv6_loc = {
+        "name": "LOC1",
+        "prefix": "2001:db8:a1::/64",
+        "algorithm": 128,
+        "is-anycast": False,
+        "is-micro-segment": True,
+        "flavor": "psp usd",
+        "block-length": 40,
+        "node-length": 24,
+        "function-length": 16,
+        "argument-length": 0,
+        "isis-level": 2,
+        "enabled": True,
+    }
 
     async for db in get_session():
         # MAXIMAL process: every scalar set + all four containers populated.
@@ -187,6 +215,7 @@ async def _seed_isis(device_id: int) -> None:
                 levels=[instance_level],
                 segment_routing=sr,
                 flex_algos=[flex],
+                srv6_locators=[srv6_loc],
                 last_refreshed_at=ts,
                 refresh_source="poll",
             )
@@ -256,6 +285,7 @@ async def test_isis_payload_matches_contract_exactly(adapter_client):
     assert set(maximal["levels"][0].keys()) == INSTANCE_LEVEL_KEYS
     assert set(maximal["segment_routing"].keys()) == SR_KEYS
     assert set(maximal["flex_algos"][0].keys()) == FLEX_KEYS
+    assert set(maximal["srv6_locators"][0].keys()) == SRV6_LOCATOR_KEYS
 
     ifaces = {i["interface_name"]: i for i in body["interfaces"]}
     assert set(ifaces["GE0/0"].keys()) == IFACE_REQUIRED_KEYS | IFACE_OPTIONAL_SCALARS | IFACE_CONTAINER_KEYS

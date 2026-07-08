@@ -1189,6 +1189,9 @@ class DeviceIsisProcess(Base):
     segment_routing: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # flex-algo child rows [{algo-id, metric-type, priority,...}].
     flex_algos: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # SRv6 locator child rows [{name, prefix, algorithm, enabled,...}]
+    # -> netbox_routing ISISSRv6Locator (per instance+name).
+    srv6_locators: Mapped[list | None] = mapped_column(JSON, nullable=True)
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
 

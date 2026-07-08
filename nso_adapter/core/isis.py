@@ -107,6 +107,7 @@ async def _upsert_isis_data(
                 levels=proc.get("level") or None,
                 segment_routing=proc.get("segment-routing") or None,
                 flex_algos=proc.get("flex-algo") or None,
+                srv6_locators=proc.get("srv6-locator") or None,
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
                 **_scalar_cols(proc, _PROC_SCALAR_KEYS),

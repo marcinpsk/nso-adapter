@@ -95,6 +95,8 @@ def _serialize_isis_process(row: DeviceIsisProcess) -> dict:
         entry["segment_routing"] = _snake(row.segment_routing)
     if row.flex_algos:
         entry["flex_algos"] = [_snake(fa) for fa in row.flex_algos]
+    if row.srv6_locators:
+        entry["srv6_locators"] = [_snake(loc) for loc in row.srv6_locators]
     return entry
 
 

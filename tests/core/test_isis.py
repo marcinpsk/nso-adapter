@@ -281,6 +281,33 @@ async def test_refresh_persists_p2_levels_and_sr(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_refresh_persists_srv6_locators(adapter_client):
+    """The per-process srv6-locator list is mirrored to the srv6_locators column."""
+    device_id = await seed_device(nso_device_name="isis-srv6-01", netbox_device_id=971)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_isis_interfaces.return_value = {
+            "process": [
+                {
+                    "process-tag": "",
+                    "segment-routing": {"srv6-enabled": True},
+                    "srv6-locator": [
+                        {"name": "LOC1", "prefix": "2001:db8:a1::/64", "algorithm": 128, "enabled": True},
+                    ],
+                },
+            ],
+            "interface": [],
+        }
+        await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
+
+        proc = (
+            await db.execute(select(DeviceIsisProcess).where(DeviceIsisProcess.device_id == device.id))
+        ).scalar_one()
+        assert proc.segment_routing == {"srv6-enabled": True}
+        assert proc.srv6_locators == [{"name": "LOC1", "prefix": "2001:db8:a1::/64", "algorithm": 128, "enabled": True}]
+
+
+@pytest.mark.anyio
 async def test_refresh_dedups_duplicate_interface(adapter_client):
     """s2-9: a duplicate (interface, af) in the export must not IntegrityError and roll back the
     whole full-replace — deduped (first occurrence wins)."""
