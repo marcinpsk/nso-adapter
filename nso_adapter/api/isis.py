@@ -190,6 +190,7 @@ class IsisInterfaceEntry(BaseModel):
     network_type: str | None = None
     metric: int | None = None
     passive: bool = False
+    bfd_enabled: bool | None = None
     accepted_at: datetime | None = None
 
 
@@ -266,6 +267,7 @@ def _apply_isis_interface_fields(row: IsisInterfaceIntent, e: IsisInterfaceEntry
     row.network_type = e.network_type
     row.metric = e.metric
     row.passive = e.passive
+    row.bfd_enabled = e.bfd_enabled
     row.accepted_at = accepted
 
 
@@ -391,7 +393,7 @@ async def put_isis_interface_intent(
         now=now,
         apply_fields=_apply_isis_interface_fields,
         make_row=lambda e: IsisInterfaceIntent(device_id=device_id, interface_name=e.interface_name, af=e.af),
-        state_fields=("circuit_type", "network_type", "metric"),
+        state_fields=("circuit_type", "network_type", "metric", "bfd_enabled"),
     )
     proc_count, proc_retracted = await _sync_keyed_intent(
         db,

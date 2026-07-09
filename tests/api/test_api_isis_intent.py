@@ -437,3 +437,45 @@ async def test_put_flex_algo_removal_replace_failure_is_swallowed(adapter_client
     )
     assert resp.status_code == 200
     assert resp.json()["service_replaced"] is False
+
+
+@pytest.mark.anyio
+async def test_put_isis_intent_stores_bfd_enabled(adapter_client):
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import IsisInterfaceIntent
+
+    device_id = await seed_device(nso_device_name="isis-bfd", netbox_device_id=990)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "bfd_enabled": True, "passive": False}]},
+    )
+    assert resp.status_code == 200
+    async for db in get_session():
+        row = (
+            (await db.execute(select(IsisInterfaceIntent).where(IsisInterfaceIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        break
+    assert row.bfd_enabled is True
+
+
+@pytest.mark.anyio
+async def test_clearing_bfd_enabled_enqueues_isis_removal(adapter_client):
+    """Clearing an owned bfd_enabled (True -> omitted/None) must retract BFD from the
+    device — a merge-PATCH can't drop it, so an isis removal (PUT-replace) is queued."""
+    device_id = await seed_device(nso_device_name="isis-bfd-clear", netbox_device_id=991)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "bfd_enabled": True, "passive": False}]},
+    )
+    assert await _isis_removal_jobs(device_id) == []  # the initial enable is not a retraction
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False}]},  # bfd_enabled omitted
+    )
+    assert resp.status_code == 200
+    assert len(await _isis_removal_jobs(device_id)) == 1

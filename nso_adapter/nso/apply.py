@@ -1461,6 +1461,11 @@ def build_isis_interface_payload(isis_intent_rows: list | None) -> list[dict]:
             entry["network-type"] = row.network_type
         if row.metric is not None:
             entry["metric"] = row.metric
+        # bfd-enabled is tri-state: emit only when the intent asserts it (True/False);
+        # None = no opinion → the reconciler leaves any brownfield BFD untouched.
+        bfd_enabled = getattr(row, "bfd_enabled", None)
+        if bfd_enabled is not None:
+            entry["bfd-enabled"] = bool(bfd_enabled)
         interfaces.append(entry)
     return interfaces
 

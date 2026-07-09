@@ -1124,6 +1124,28 @@ def test_build_isis_interface_payload_normalises_circuit_type():
     assert ifaces[0]["circuit-type"] == "level-2-only"
 
 
+def test_build_isis_interface_payload_emits_bfd_enabled_tri_state():
+    """bfd-enabled rides the interface intent: emitted only when asserted (True/False),
+    omitted when None (no opinion → NED default, reconcile leaves brownfield BFD alone)."""
+    from nso_adapter.nso.apply import build_isis_interface_payload
+
+    base = dict(
+        interface_name="Gi0/0",
+        af="ipv4",
+        process_tag="",
+        passive=False,
+        circuit_type=None,
+        network_type=None,
+        metric=None,
+    )
+    on = build_isis_interface_payload([SimpleNamespace(**base, bfd_enabled=True)])
+    off = build_isis_interface_payload([SimpleNamespace(**base, bfd_enabled=False)])
+    absent = build_isis_interface_payload([SimpleNamespace(**base, bfd_enabled=None)])
+    assert on[0]["bfd-enabled"] is True
+    assert off[0]["bfd-enabled"] is False
+    assert "bfd-enabled" not in absent[0]
+
+
 @pytest.mark.asyncio
 async def test_replace_isis_service_puts_keyed_instance():
     """replace_isis_service PUTs the keyed service instance (so empty process-tags

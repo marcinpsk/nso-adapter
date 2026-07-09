@@ -1330,6 +1330,9 @@ class IsisInterfaceIntent(Base):
     network_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     metric: Mapped[int | None] = mapped_column(Integer, nullable=True)
     passive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # tri-state: None = no opinion (NED default, reconcile leaves brownfield BFD alone),
+    # True = enable IS-IS BFD on the interface, False = explicitly disable.
+    bfd_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
