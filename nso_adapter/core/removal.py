@@ -50,9 +50,9 @@ _SCOPE_BY_MODEL: dict[str, str] = {model: scope for scope, (model, _) in _SIMPLE
 # (route-policy communities). Kept as an explicit set so it survives mocking/refactors.
 _NED_DIALECT_SCOPES: frozenset[str] = frozenset({"route_policy"})
 
-# OSPF/BGP have multi-row applies; interface_config is a compound-key (device,interface)
+# OSPF/BGP/IS-IS have multi-row applies; interface_config is a compound-key (device,interface)
 # list whose removal PUT-replaces/deletes per-interface instances — all bespoke below.
-VALID_REMOVAL_SCOPES: set[str] = set(_SIMPLE_TARGETS) | {"ospf", "bgp", "interface_config", "snmp"}
+VALID_REMOVAL_SCOPES: set[str] = set(_SIMPLE_TARGETS) | {"ospf", "bgp", "isis", "interface_config", "snmp"}
 
 
 async def _replace_simple(db: AsyncSession, device, client, scope: str) -> None:
@@ -215,6 +215,38 @@ async def _replace_interface_config(db: AsyncSession, device, client, interface_
         await replace_interface_config(client, device.nso_device_name, name, entry)
 
 
+async def _replace_isis(db: AsyncSession, device, client) -> None:
+    """PUT-replace the isis-reconciler with the device's full remaining accepted intent.
+
+    Bespoke (not a _SIMPLE_TARGET) because apply_isis_interfaces takes several row
+    collections — interfaces, processes, IS-IS redistribution, flex-algos, levels. A
+    PUT-replace re-asserts only the ACCEPTED rows, so a deleted interface OR a cleared
+    owned scalar (metric back to blank, whose leaf a merge-PATCH would never drop) is
+    reverted on the device, while un-owned brownfield IS-IS config stays (reconcile).
+    """
+    from nso_adapter.nso.apply import apply_isis_interfaces
+    from nso_adapter.store.models import (
+        IsisFlexAlgoIntent,
+        IsisInterfaceIntent,
+        IsisLevelIntent,
+        IsisProcessIntent,
+        RedistributionIntent,
+    )
+
+    device_id = device.id
+
+    async def _accepted(model, *extra):
+        stmt = select(model).where(model.device_id == device_id, model.accepted_at.is_not(None), *extra)
+        return (await db.execute(stmt)).scalars().all()
+
+    ifaces = await _accepted(IsisInterfaceIntent)
+    procs = await _accepted(IsisProcessIntent)
+    flex = await _accepted(IsisFlexAlgoIntent)
+    levels = await _accepted(IsisLevelIntent)
+    redist = await _accepted(RedistributionIntent, RedistributionIntent.dest_protocol == "isis")
+    await apply_isis_interfaces(client, device.nso_device_name, ifaces, procs, redist, flex, levels, replace=True)
+
+
 async def _replace_snmp(db: AsyncSession, device, client) -> None:
     """PUT-replace the snmp-reconciler with the device's full remaining intent (all collections).
 
@@ -250,6 +282,8 @@ async def _dispatch_scope(db: AsyncSession, device, client, scope: str, context:
         await _replace_bgp(db, device, client)
     elif scope == "snmp":
         await _replace_snmp(db, device, client)
+    elif scope == "isis":
+        await _replace_isis(db, device, client)
     elif scope == "interface_config":
         await _replace_interface_config(db, device, client, (context or {}).get("interfaces") or [])
     elif scope in _SIMPLE_TARGETS:

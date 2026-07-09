@@ -1397,13 +1397,14 @@ async def apply_isis_interfaces(
     flex_algo_rows: list | None = None,
     level_rows: list | None = None,
     *,
+    replace: bool = False,
     dry_run: bool = False,
     stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write IS-IS interface-enablement and process intent for a single device to NSO.
 
-    Builds a full isis-reconciler PATCH body from the supplied rows and
-    commits with reconcile option so pre-existing IS-IS config is adopted.
+    Builds a full isis-reconciler body from the supplied rows and commits with the
+    reconcile option so pre-existing IS-IS config is adopted (brownfield).
 
     When *isis_process_rows* is provided, a ``process-config`` list is included
     so the reconciler writes process-level config (net, is-type, metric-style,
@@ -1411,6 +1412,13 @@ async def apply_isis_interfaces(
 
     *redistribution_rows* rows must have: dest_ref (process_tag), source_protocol,
     source_ref, route_map (optional), metric (optional), metric_type (optional).
+
+    ``replace=False`` (apply/add/update): merge-PATCH — a merge never drops an omitted
+    leaf, so a cleared scalar (e.g. metric back to blank) is NOT retracted this way.
+    ``replace=True`` (removal): PUT-replace the keyed instance with the FULL owned
+    desired state so any omitted interface/leaf is dropped and FASTMAP reverts it on
+    the device (un-owned brownfield stays, protected by the reconcile option). Used by
+    the ``isis`` removal job to propagate a cleared/deleted owned intent.
 
     Raises NsoApplyError on failure.
     """
@@ -1424,49 +1432,17 @@ async def apply_isis_interfaces(
     if processes:
         service_body["process-config"] = processes
 
-    if stage is not None:
-        stage["isis-reconciler:isis-config"] = [service_body]
-        return None
-
-    payload = json.dumps({"isis-reconciler:isis-config": [service_body]})
-
-    url = f"{client._base}{_ISIS_SERVICE_PATH}"
-
-    if dry_run:
-        return await native_dry_run(client, url, payload, device_name, method="patch")
-
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.patch(
-            _commit_url(url),
-            content=payload,
-            headers={"Content-Type": "application/yang-data+json"},
-        )
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.isis_patch_failed",
-                device=device_name,
-                status=resp.status_code,
-                body=err,
-            )
-            raise NsoApplyError(
-                "nso_patch_failed",
-                f"NSO PATCH for IS-IS intent failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-
-    logger.info(
-        "nso.apply.isis_ok",
-        device=device_name,
-        interface_count=len(interfaces),
-        process_count=len(processes),
+    return await _send_service_config(
+        client,
+        _ISIS_SERVICE_PATH,
+        "isis-reconciler:isis-config",
+        device_name,
+        service_body,
+        scope="isis",
+        replace=replace,
+        dry_run=dry_run,
+        stage=stage,
     )
-
-    await _verify_native_or_raise(client, url, payload, device_name, scope="isis")
-    return None
 
 
 def build_isis_interface_payload(isis_intent_rows: list | None) -> list[dict]:

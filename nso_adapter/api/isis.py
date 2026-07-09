@@ -220,31 +220,44 @@ class IsisInterfaceIntentUpdate(BaseModel):
     processes: list[IsisProcessEntry] = []
 
 
-async def _sync_keyed_intent(db, model, device_id: int, *, key_of, entries, now, apply_fields, make_row) -> int:
-    """Full-replace a keyed IS-IS intent collection. Returns the upserted count.
+async def _sync_keyed_intent(
+    db, model, device_id: int, *, key_of, entries, now, apply_fields, make_row, state_fields=()
+) -> tuple[int, bool]:
+    """Full-replace a keyed IS-IS intent collection. Returns ``(count, retracted)``.
 
     Rows whose key (``key_of``, possibly composite) is absent from *entries* are
     deleted; the rest are upserted — ``make_row`` builds a new identity row,
     ``apply_fields`` writes the mutable fields (incl. accepted_at) on new + existing.
+
+    ``retracted`` is True when this sync drops something the device may still carry —
+    a whole row deleted, OR a retained row whose previously-set *state_fields* scalar
+    is cleared to ``None`` (metric back to blank). A merge-PATCH apply never drops such
+    a leaf, so the caller must enqueue an ``isis`` removal (PUT-replace) to revert it.
+    ``state_fields`` empty ⇒ only deletions count as retractions.
     """
     rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
     existing = {key_of(r): r for r in rows}
     incoming = {key_of(e) for e in entries}
+    retracted = False
     for key, row in existing.items():
         if key not in incoming:
             await db.delete(row)
+            retracted = True
     await db.flush()
 
     count = 0
     for entry in entries:
         accepted = entry.accepted_at.replace(tzinfo=None) if entry.accepted_at else now
         row = existing.get(key_of(entry))
+        before = {f: getattr(row, f) for f in state_fields} if row is not None else None
         if row is None:
             row = make_row(entry)
             db.add(row)
         apply_fields(row, entry, accepted)
+        if before is not None and any(before[f] is not None and getattr(row, f) is None for f in state_fields):
+            retracted = True
         count += 1
-    return count
+    return count, retracted
 
 
 def _apply_isis_interface_fields(row: IsisInterfaceIntent, e: IsisInterfaceEntry, accepted: datetime) -> None:
@@ -283,8 +296,13 @@ def _iter_isis_redistribution(processes: list[IsisProcessEntry]):
             yield dest_ref, entry
 
 
-async def _sync_isis_redistribution(db, device_id: int, processes: list[IsisProcessEntry], now: datetime) -> None:
-    """Full-replace IS-IS (dest_protocol=isis) redistribution intent rows for this device."""
+async def _sync_isis_redistribution(db, device_id: int, processes: list[IsisProcessEntry], now: datetime) -> bool:
+    """Full-replace IS-IS (dest_protocol=isis) redistribution intent rows for this device.
+
+    Returns True if this sync retracts something (a redistribution row deleted, or a
+    retained row's ``route_map``/``metric``/``metric_type`` cleared to ``None``) — a
+    merge-PATCH apply cannot drop it, so the caller enqueues an ``isis`` removal.
+    """
     existing = (
         (
             await db.execute(
@@ -302,9 +320,11 @@ async def _sync_isis_redistribution(db, device_id: int, processes: list[IsisProc
         (dest_ref, e.source_protocol, e.source_ref) for dest_ref, e in _iter_isis_redistribution(processes)
     }
 
+    retracted = False
     for key in list(existing_map):
         if key not in incoming_keys:
             await db.delete(existing_map[key])
+            retracted = True
 
     for dest_ref, entry in _iter_isis_redistribution(processes):
         key = (dest_ref, entry.source_protocol, entry.source_ref)
@@ -319,9 +339,18 @@ async def _sync_isis_redistribution(db, device_id: int, processes: list[IsisProc
                 accepted_at=now,
             )
             db.add(row)
+        else:
+            for old, new in (
+                (row.route_map, entry.route_map),
+                (row.metric, entry.metric),
+                (row.metric_type, entry.metric_type),
+            ):
+                if old is not None and new is None:
+                    retracted = True
         row.route_map = entry.route_map
         row.metric = entry.metric
         row.metric_type = entry.metric_type
+    return retracted
 
 
 async def _maybe_enqueue_isis_apply(db, device_id: int, iface_count: int, proc_count: int) -> None:
@@ -353,7 +382,7 @@ async def put_isis_interface_intent(
 
     now = datetime.now(UTC).replace(tzinfo=None)
 
-    iface_count = await _sync_keyed_intent(
+    iface_count, iface_retracted = await _sync_keyed_intent(
         db,
         IsisInterfaceIntent,
         device_id,
@@ -362,8 +391,9 @@ async def put_isis_interface_intent(
         now=now,
         apply_fields=_apply_isis_interface_fields,
         make_row=lambda e: IsisInterfaceIntent(device_id=device_id, interface_name=e.interface_name, af=e.af),
+        state_fields=("circuit_type", "network_type", "metric"),
     )
-    proc_count = await _sync_keyed_intent(
+    proc_count, proc_retracted = await _sync_keyed_intent(
         db,
         IsisProcessIntent,
         device_id,
@@ -372,6 +402,15 @@ async def put_isis_interface_intent(
         now=now,
         apply_fields=_apply_isis_process_fields,
         make_row=lambda e: IsisProcessIntent(device_id=device_id, process_tag=e.process_tag),
+        state_fields=(
+            "is_type",
+            "metric_style",
+            "overload_bit",
+            "area_auth_type",
+            "area_auth_key",
+            "domain_auth_type",
+            "domain_auth_key",
+        ),
     )
     # Flatten the per-process level entries into (process_tag, level)-keyed rows;
     # accepted_at rides the parent process entry (a level is accepted with its process).
@@ -387,7 +426,7 @@ async def put_isis_interface_intent(
         for p in body.processes
         for lv in p.levels
     ]
-    await _sync_keyed_intent(
+    _, level_retracted = await _sync_keyed_intent(
         db,
         IsisLevelIntent,
         device_id,
@@ -396,9 +435,19 @@ async def put_isis_interface_intent(
         now=now,
         apply_fields=_apply_isis_level_fields,
         make_row=lambda e: IsisLevelIntent(device_id=device_id, process_tag=e.process_tag, level=e.level),
+        state_fields=("wide_metrics_only", "labeled_preference", "disabled"),
     )
-    await _sync_isis_redistribution(db, device_id, body.processes, now)
+    redist_retracted = await _sync_isis_redistribution(db, device_id, body.processes, now)
     await _maybe_enqueue_isis_apply(db, device_id, iface_count, proc_count)
+
+    # A merge-PATCH apply never drops a cleared/deleted leaf, so retracting owned IS-IS
+    # intent (metric back to blank, an interface un-accepted) needs a PUT-replace. Queue
+    # the async ``isis`` removal job — it re-asserts the full remaining accepted snapshot
+    # so FASTMAP reverts what was dropped, while un-owned brownfield stays (reconcile).
+    if iface_retracted or proc_retracted or level_retracted or redist_retracted:
+        from nso_adapter.core.removal import enqueue_removal
+
+        await enqueue_removal(db, device_id, "isis")
 
     await db.commit()
     return {"device_id": device_id, "interface_count": iface_count, "process_count": proc_count}

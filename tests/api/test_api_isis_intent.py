@@ -120,6 +120,94 @@ async def test_put_isis_intent_full_replace_and_update(adapter_client):
     assert {p.process_tag: p.is_type for p in procs} == {"1": "level-2"}  # process 2 dropped, updated
 
 
+async def _isis_removal_jobs(device_id: int):
+    """All queued IS-IS ``removal`` jobs for this device (real Job rows)."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Job, JobType
+
+    async for db in get_session():
+        jobs = (
+            (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal)))
+            .scalars()
+            .all()
+        )
+        return [j for j in jobs if (j.context or {}).get("scope") == "isis"]
+    return []
+
+
+@pytest.mark.anyio
+async def test_clearing_owned_scalar_enqueues_isis_removal(adapter_client):
+    """Clearing a previously-set owned scalar (metric back to blank) queues an ``isis``
+    removal job — a merge-PATCH apply would never drop the metric leaf on-device."""
+    device_id = await seed_device(nso_device_name="isis-clear", netbox_device_id=987)
+    # Own an interface with metric 10 (accepted, applied).
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={"interfaces": [{"interface_name": "system", "af": "ipv4", "metric": 10, "passive": True}]},
+    )
+    assert await _isis_removal_jobs(device_id) == []  # the initial add is not a retraction
+
+    # Clear the metric (omitted → None) while keeping the interface owned.
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={"interfaces": [{"interface_name": "system", "af": "ipv4", "passive": True}]},
+    )
+    assert resp.status_code == 200
+    jobs = await _isis_removal_jobs(device_id)
+    assert len(jobs) == 1, "clearing an owned metric must enqueue an isis removal (PUT-replace)"
+
+
+@pytest.mark.anyio
+async def test_deleting_owned_interface_enqueues_isis_removal(adapter_client):
+    """Dropping a previously-owned interface from the full-replace queues an ``isis`` removal."""
+    device_id = await seed_device(nso_device_name="isis-del", netbox_device_id=988)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={
+            "interfaces": [
+                {"interface_name": "system", "af": "ipv4", "metric": 10, "passive": True},
+                {"interface_name": "lag1", "af": "ipv4", "metric": 5, "passive": False},
+            ]
+        },
+    )
+    # Drop lag1.
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={"interfaces": [{"interface_name": "system", "af": "ipv4", "metric": 10, "passive": True}]},
+    )
+    assert len(await _isis_removal_jobs(device_id)) == 1
+
+
+@pytest.mark.anyio
+async def test_pure_add_or_widen_does_not_enqueue_isis_removal(adapter_client):
+    """A pure add / a set-from-blank (None→value) is NOT a retraction → no removal job.
+
+    Adds/updates ride the normal (merge-PATCH) apply; only a drop/clear needs the
+    PUT-replace, so we must not churn a device commit on every additive edit."""
+    device_id = await seed_device(nso_device_name="isis-add", netbox_device_id=989)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={"interfaces": [{"interface_name": "system", "af": "ipv4", "passive": True}]},
+    )
+    # Set the metric from blank → 20 (widen) and add a new interface — both additive.
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={
+            "interfaces": [
+                {"interface_name": "system", "af": "ipv4", "metric": 20, "passive": True},
+                {"interface_name": "lag1", "af": "ipv4", "metric": 5, "passive": False},
+            ]
+        },
+    )
+    assert await _isis_removal_jobs(device_id) == []
+
+
 @pytest.mark.anyio
 async def test_put_isis_intent_levels_create_and_full_replace(adapter_client):
     """Per-level process tuning rides the process entries ('levels') and lands in

@@ -23,6 +23,10 @@ from nso_adapter.core.removal import enqueue_removal, replace_on_removal
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import (
     Device,
+    IsisFlexAlgoIntent,
+    IsisInterfaceIntent,
+    IsisLevelIntent,
+    IsisProcessIntent,
     Job,
     JobStatus,
     JobType,
@@ -211,6 +215,62 @@ async def test_dispatch_scope_ospf_uses_multi_row_apply(adapter_client):
     assert [i.interface_name for i in args[3]] == ["Gi0/0"]  # un-accepted Gi0/9 filtered out
     # only the accepted ospf redist row survives (bgp + un-accepted ospf filtered)
     assert [(r.dest_protocol, r.source_protocol) for r in args[4]] == [("ospf", "connected")]
+    assert kwargs == {"replace": True}
+
+
+async def test_isis_in_valid_removal_scopes():
+    """IS-IS must be a recognised removal scope (else enqueue_removal rejects it)."""
+    assert "isis" in removal_mod.VALID_REMOVAL_SCOPES
+
+
+async def test_dispatch_scope_isis_uses_multi_row_apply(adapter_client):
+    """IS-IS dispatch fetches ONLY accepted iface/proc/redist(isis)/flex/level, replace=True.
+
+    A PUT-replace re-asserts the full desired state, so it must never include
+    not-yet-accepted rows, and must scope redistribution to dest_protocol=isis.
+    """
+    device_id = await _seed_device(nso_device_name="ra1")
+    async for db in get_session():
+        db.add(
+            IsisInterfaceIntent(
+                device_id=device_id, interface_name="system", af="ipv4", process_tag="0", passive=True, accepted_at=_NOW
+            )
+        )
+        db.add(
+            IsisInterfaceIntent(
+                device_id=device_id, interface_name="lag1", af="ipv4", process_tag="0", passive=False, accepted_at=None
+            )
+        )  # excluded (un-accepted)
+        db.add(IsisProcessIntent(device_id=device_id, process_tag="0", net="49.0001.00", accepted_at=_NOW))
+        db.add(IsisFlexAlgoIntent(device_id=device_id, process_tag="0", algo_id=128, accepted_at=_NOW))
+        db.add(IsisLevelIntent(device_id=device_id, process_tag="0", level=2, accepted_at=_NOW))
+        db.add(
+            RedistributionIntent(
+                device_id=device_id, dest_protocol="isis", source_protocol="connected", accepted_at=_NOW
+            )
+        )
+        db.add(
+            RedistributionIntent(device_id=device_id, dest_protocol="bgp", source_protocol="static", accepted_at=_NOW)
+        )  # excluded (bgp)
+        await db.commit()
+        break
+
+    apply_fn = AsyncMock()
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        with patch("nso_adapter.nso.apply.apply_isis_interfaces", apply_fn):
+            await removal_mod._dispatch_scope(db, device, _CLIENT, "isis")
+        break
+
+    apply_fn.assert_awaited_once()
+    args, kwargs = apply_fn.await_args
+    # apply_isis_interfaces(client, name, ifaces, procs, redist, flex, levels, replace=True)
+    assert args[0] is _CLIENT and args[1] == "ra1"
+    assert [i.interface_name for i in args[2]] == ["system"]  # un-accepted lag1 filtered out
+    assert [p.process_tag for p in args[3]] == ["0"]
+    assert [(r.dest_protocol, r.source_protocol) for r in args[4]] == [("isis", "connected")]  # bgp filtered
+    assert [f.algo_id for f in args[5]] == [128]
+    assert [lv.level for lv in args[6]] == [2]
     assert kwargs == {"replace": True}
 
 
