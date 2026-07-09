@@ -211,3 +211,54 @@ async def test_put_route_policy_intent_no_removal_when_nothing_dropped(adapter_c
         )
         break
     assert jobs == []
+
+
+async def _set_ned(device_id: int, ned_id: str):
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device
+
+    async for db in get_session():
+        dev = await db.get(Device, device_id)
+        dev.ned_id = ned_id
+        await db.commit()
+        return
+
+
+@pytest.mark.anyio
+async def test_put_reports_unrepresentable_community_members_for_nokia(adapter_client):
+    """A community member the device's NED can't hold (wildcard color on Nokia) is
+    reported in the PUT response so the plugin flags it "unsupported on <ned>" instead
+    of showing a phantom "pending apply" that the codec-skipped member can never clear."""
+    device_id = await seed_device(nso_device_name="rp-nokia", netbox_device_id=771)
+    await _set_ned(device_id, "timos-nc-23.10")
+
+    entries = [
+        {"sequence": 1, "action": "permit", "community": "6830:*"},
+        {"sequence": 2, "action": "permit", "community": "color:0:12."},  # unrepresentable
+        {"sequence": 3, "action": "permit", "community": "color:0:128"},  # exact color → representable
+        {"sequence": 4, "action": "permit", "community": "no-export"},
+    ]
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/route-policy-intent",
+        headers=AUTH,
+        json={"objects": [_obj("community_list", "cnad-test", entries=entries, accepted=True)]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["unsupported_members"] == {"cnad-test": ["color:0:12."]}
+
+
+@pytest.mark.anyio
+async def test_put_reports_no_unrepresentable_members_for_identity_ned(adapter_client):
+    """On an identity-dialect NED (IOS-XR) every canonical member is representable —
+    the response carries an empty unsupported map (no false "unsupported" badges)."""
+    device_id = await seed_device(nso_device_name="rp-iosxr", netbox_device_id=772)
+    await _set_ned(device_id, "cisco-iosxr-nc-7.3")
+
+    entries = [{"sequence": 1, "action": "permit", "community": "color:0:12."}]
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/route-policy-intent",
+        headers=AUTH,
+        json={"objects": [_obj("community_list", "cnad-test", entries=entries, accepted=True)]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["unsupported_members"] == {}

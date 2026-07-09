@@ -177,6 +177,24 @@ class CommunityDialect:
         """
         return member
 
+    def unrepresentable_members(self, members) -> list[str]:
+        """Return the subset of *members* this NED cannot hold (dropped on apply).
+
+        Deterministic (pure function of member + dialect), so a caller can flag a
+        community-list member as "unsupported on this NED" WITHOUT a device write —
+        the same verdict the apply path acts on when it skips the member. Preserves
+        input order and de-dupes so the report matches what a reader would surface.
+        """
+        seen: set[str] = set()
+        out: list[str] = []
+        for m in members:
+            if not m or m in seen:
+                continue
+            seen.add(m)
+            if self.from_canonical(m) is UNREPRESENTABLE:
+                out.append(m)
+        return out
+
 
 class _NokiaCommunityDialect(CommunityDialect):
     """Nokia SR OS (timos) community-member dialect."""

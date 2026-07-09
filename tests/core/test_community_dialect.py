@@ -151,6 +151,31 @@ def test_nokia_regex_color_stays_unrepresentable():
     assert _nokia().from_canonical("color:0:12.") is UNREPRESENTABLE
 
 
+def test_nokia_unrepresentable_members_reports_only_the_gaps_deduped_in_order():
+    # cnad-test's member set: only the wildcard color is unrepresentable on Nokia;
+    # the helper reports exactly it (order-preserving, de-duped), so a caller can flag
+    # it "unsupported on Nokia" without a device write.
+    members = [
+        "6830:*",
+        "6830:1234",
+        "6830:1.3.",
+        "color:0:12.",  # the only gap (wildcard color)
+        "color:0:128",  # exact color → ext hex, representable
+        "large:6830:6370:1234",
+        "no-export",
+        "target:6830:1234",
+        "color:0:12.",  # duplicate — must not appear twice
+    ]
+    assert _nokia().unrepresentable_members(members) == ["color:0:12."]
+
+
+def test_identity_dialect_represents_everything():
+    # The default (Cisco/Junos/IOS-XR) dialect holds every canonical member verbatim,
+    # so nothing is ever reported unsupported.
+    d = community_dialect_for("cisco-iosxr-nc-7.3")
+    assert d.unrepresentable_members(["color:0:12.", "bandwidth:100", "large:1:2:3"]) == []
+
+
 # ── Nokia: regex large community = 3 ``&``-separated parts (from live config) ──
 # `&` is SR OS's large-community part separator; exact large uses `:`, regex uses `&`.
 # Source: live `expression expr "NOT (… OR 64500&.*&[0-4])"` ⇄ Junos `large:64500:.*:[0-4]`.

@@ -252,11 +252,31 @@ async def put_route_policy_intent(
         upserted += 1
 
     await db.commit()
+
+    # Which community-list members can this device's NED NOT hold? The apply path
+    # silently skips them (a wildcard color on Nokia has no exact ext-community), which
+    # would otherwise leave the plugin showing a phantom "pending apply" that never
+    # clears — the intent carries a member the device can never mirror. Report them so
+    # the plugin can mark them "unsupported on <ned>" and drop them from its drift/pending
+    # comparison. Deterministic (codec-only, no device write), keyed by object name.
+    from nso_adapter.core.community_dialect import community_dialect_for
+
+    dialect = community_dialect_for(device.ned_id)
+    unsupported_members: dict[str, list[str]] = {}
+    for obj in objects:
+        if obj.get("family") != "community_list":
+            continue
+        members = [e.get("community") for e in (obj.get("entries") or []) if isinstance(e, dict)]
+        bad = dialect.unrepresentable_members(members)
+        if bad:
+            unsupported_members[obj["name"]] = bad
+
     logger.info(
         "route_policy_intent.put",
         device_id=device_id,
         upserted=upserted,
         removed=len(removed),
+        unsupported=sum(len(v) for v in unsupported_members.values()),
     )
 
     if removed:
@@ -265,7 +285,8 @@ async def put_route_policy_intent(
 
         await replace_on_removal(db, device, removed, RoutePolicyObjectIntent, apply_route_policy_config)
 
-    # Return updated intent state for all objects on this device.
+    # Return updated intent state for all objects on this device, plus the per-object
+    # unsupported-member map so the plugin can surface codec-skipped members.
     result = await db.execute(
         select(RoutePolicyObjectIntent)
         .where(RoutePolicyObjectIntent.device_id == device_id)
@@ -286,4 +307,5 @@ async def put_route_policy_intent(
             }
             for r in rows
         ],
+        "unsupported_members": unsupported_members,
     }
