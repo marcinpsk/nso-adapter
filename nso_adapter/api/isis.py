@@ -195,6 +195,8 @@ class IsisInterfaceEntry(BaseModel):
     metric: int | None = None
     passive: bool = False
     bfd_enabled: bool | None = None
+    frr_enabled: bool | None = None
+    frr_protection: str | None = None
     accepted_at: datetime | None = None
 
 
@@ -215,6 +217,8 @@ class IsisProcessEntry(BaseModel):
     area_auth_key: str | None = None
     domain_auth_type: str | None = None
     domain_auth_key: str | None = None
+    fast_reroute: str | None = None
+    microloop_avoidance: bool | None = None
     accepted_at: datetime | None = None
     redistribution: list[RedistributionEntry] = []
     levels: list[IsisLevelEntry] = []
@@ -272,6 +276,8 @@ def _apply_isis_interface_fields(row: IsisInterfaceIntent, e: IsisInterfaceEntry
     row.metric = e.metric
     row.passive = e.passive
     row.bfd_enabled = e.bfd_enabled
+    row.frr_enabled = e.frr_enabled
+    row.frr_protection = e.frr_protection
     row.accepted_at = accepted
 
 
@@ -291,6 +297,8 @@ def _apply_isis_process_fields(row: IsisProcessIntent, e: IsisProcessEntry, acce
     row.area_auth_key = e.area_auth_key
     row.domain_auth_type = e.domain_auth_type
     row.domain_auth_key = e.domain_auth_key
+    row.fast_reroute = e.fast_reroute
+    row.microloop_avoidance = e.microloop_avoidance
     row.accepted_at = accepted
 
 
@@ -411,7 +419,7 @@ async def put_isis_interface_intent(
         now=now,
         apply_fields=_apply_isis_interface_fields,
         make_row=lambda e: IsisInterfaceIntent(device_id=device_id, interface_name=e.interface_name, af=e.af),
-        state_fields=("circuit_type", "network_type", "metric", "bfd_enabled"),
+        state_fields=("circuit_type", "network_type", "metric", "bfd_enabled", "frr_enabled", "frr_protection"),
     )
     proc_count, proc_retracted = await _sync_keyed_intent(
         db,
@@ -430,6 +438,8 @@ async def put_isis_interface_intent(
             "area_auth_key",
             "domain_auth_type",
             "domain_auth_key",
+            "fast_reroute",
+            "microloop_avoidance",
         ),
     )
     # Flatten the per-process level entries into (process_tag, level)-keyed rows;

@@ -1350,6 +1350,9 @@ class IsisInterfaceIntent(Base):
     # tri-state: None = no opinion (NED default, reconcile leaves brownfield BFD alone),
     # True = enable IS-IS BFD on the interface, False = explicitly disable.
     bfd_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # FRR (#83), same tri-state contract; frr_protection: link | node (Junos).
+    frr_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    frr_protection: Mapped[str | None] = mapped_column(String(8), nullable=True)
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -1376,6 +1379,9 @@ class IsisProcessIntent(Base):
     area_auth_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     domain_auth_type: Mapped[str | None] = mapped_column(String(10), nullable=True)
     domain_auth_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # FRR (#83): fast_reroute lfa | remote-lfa | ti-lfa; microloop_avoidance tri-state.
+    fast_reroute: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    microloop_avoidance: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)

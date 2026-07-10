@@ -1334,6 +1334,13 @@ def _isis_process_entry(row, proc_redist: list[dict]) -> dict:
         entry["domain-auth-type"] = row.domain_auth_type
         if row.domain_auth_key is not None:
             entry["domain-auth-key"] = row.domain_auth_key
+    # FRR (#83): fast-reroute is an enum leaf → omit when blank; microloop-avoidance
+    # tri-state (None = leave brownfield alone).
+    if getattr(row, "fast_reroute", None):
+        entry["fast-reroute"] = row.fast_reroute
+    microloop = getattr(row, "microloop_avoidance", None)
+    if microloop is not None:
+        entry["microloop-avoidance"] = bool(microloop)
     if proc_redist:
         entry["redistribute"] = proc_redist
     return entry
@@ -1507,6 +1514,13 @@ def build_isis_interface_payload(isis_intent_rows: list | None) -> list[dict]:
         bfd_enabled = getattr(row, "bfd_enabled", None)
         if bfd_enabled is not None:
             entry["bfd-enabled"] = bool(bfd_enabled)
+        # FRR (#83): same tri-state contract; frr-protection is an enum leaf →
+        # emit only when non-blank.
+        frr_enabled = getattr(row, "frr_enabled", None)
+        if frr_enabled is not None:
+            entry["frr-enabled"] = bool(frr_enabled)
+        if getattr(row, "frr_protection", None):
+            entry["frr-protection"] = row.frr_protection
         interfaces.append(entry)
     return interfaces
 

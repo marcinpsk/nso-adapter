@@ -1146,6 +1146,59 @@ def test_build_isis_interface_payload_emits_bfd_enabled_tri_state():
     assert "bfd-enabled" not in absent[0]
 
 
+def test_build_isis_interface_payload_emits_frr_tri_state():
+    """#83: frr-enabled rides the interface intent like bfd-enabled (tri-state);
+    frr-protection is emitted only when non-blank (enum leaves reject '')."""
+    from nso_adapter.nso.apply import build_isis_interface_payload
+
+    base = dict(
+        interface_name="Bundle-Ether1",
+        af="ipv4",
+        process_tag="CORE",
+        passive=False,
+        circuit_type=None,
+        network_type=None,
+        metric=None,
+        bfd_enabled=None,
+    )
+    on = build_isis_interface_payload([SimpleNamespace(**base, frr_enabled=True, frr_protection="node")])
+    off = build_isis_interface_payload([SimpleNamespace(**base, frr_enabled=False, frr_protection="")])
+    absent = build_isis_interface_payload([SimpleNamespace(**base, frr_enabled=None, frr_protection=None)])
+    assert on[0]["frr-enabled"] is True
+    assert on[0]["frr-protection"] == "node"
+    assert off[0]["frr-enabled"] is False
+    assert "frr-protection" not in off[0]
+    assert "frr-enabled" not in absent[0]
+    assert "frr-protection" not in absent[0]
+
+
+def test_build_isis_process_payload_emits_frr():
+    """#83: fast-reroute (enum — omit when blank) + microloop-avoidance (tri-state)
+    ride the process-config entry."""
+    from nso_adapter.nso.apply import build_isis_process_payload
+
+    base = dict(
+        process_tag="CORE",
+        net=None,
+        is_type=None,
+        metric_style=None,
+        overload_bit=None,
+        area_auth_type=None,
+        area_auth_key=None,
+        domain_auth_type=None,
+        domain_auth_key=None,
+    )
+    on = build_isis_process_payload([SimpleNamespace(**base, fast_reroute="ti-lfa", microloop_avoidance=True)], [], [])
+    off = build_isis_process_payload([SimpleNamespace(**base, fast_reroute="", microloop_avoidance=False)], [], [])
+    absent = build_isis_process_payload([SimpleNamespace(**base, fast_reroute=None, microloop_avoidance=None)], [], [])
+    assert on[0]["fast-reroute"] == "ti-lfa"
+    assert on[0]["microloop-avoidance"] is True
+    assert "fast-reroute" not in off[0]
+    assert off[0]["microloop-avoidance"] is False
+    assert "fast-reroute" not in absent[0]
+    assert "microloop-avoidance" not in absent[0]
+
+
 @pytest.mark.asyncio
 async def test_replace_isis_service_puts_keyed_instance():
     """replace_isis_service PUTs the keyed service instance (so empty process-tags

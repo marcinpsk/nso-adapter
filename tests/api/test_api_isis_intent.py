@@ -504,3 +504,66 @@ async def test_clearing_bfd_enabled_enqueues_isis_removal(adapter_client):
     )
     assert resp.status_code == 200
     assert len(await _isis_removal_jobs(device_id)) == 1
+
+
+@pytest.mark.anyio
+async def test_put_isis_intent_stores_frr(adapter_client):
+    """#83: interface frr_enabled/frr_protection and process fast_reroute/
+    microloop_avoidance persist on the intent rows."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import IsisInterfaceIntent, IsisProcessIntent
+
+    device_id = await seed_device(nso_device_name="isis-frr-int", netbox_device_id=992)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={
+            "interfaces": [
+                {
+                    "interface_name": "Gi0/0",
+                    "af": "ipv4",
+                    "passive": False,
+                    "frr_enabled": True,
+                    "frr_protection": "node",
+                }
+            ],
+            "processes": [{"process_tag": "1", "fast_reroute": "ti-lfa", "microloop_avoidance": True}],
+        },
+    )
+    assert resp.status_code == 200
+    async for db in get_session():
+        irow = (
+            (await db.execute(select(IsisInterfaceIntent).where(IsisInterfaceIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        prow = (
+            (await db.execute(select(IsisProcessIntent).where(IsisProcessIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        break
+    assert irow.frr_enabled is True
+    assert irow.frr_protection == "node"
+    assert prow.fast_reroute == "ti-lfa"
+    assert prow.microloop_avoidance is True
+
+
+@pytest.mark.anyio
+async def test_clearing_frr_enabled_enqueues_isis_removal(adapter_client):
+    """#83: clearing an owned frr_enabled (True -> omitted) must retract FRR from the
+    device — same PUT-replace retraction contract as bfd_enabled."""
+    device_id = await seed_device(nso_device_name="isis-frr-clear", netbox_device_id=993)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False, "frr_enabled": True}]},
+    )
+    assert await _isis_removal_jobs(device_id) == []
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False}]},
+    )
+    assert resp.status_code == 200
+    assert len(await _isis_removal_jobs(device_id)) == 1
