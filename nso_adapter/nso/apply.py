@@ -77,18 +77,20 @@ def atomic_apply_enabled() -> bool:
     return os.environ.get("NSO_ADAPTER_ATOMIC_APPLY", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _commit_url(url: str, *, dry_run: bool = False) -> str:
+def _commit_url(url: str, *, dry_run: bool | str = False) -> str:
     """Append NSO RESTCONF commit query params to a reconciler-service write *url*.
 
     Always adds ``reconcile=<RECONCILE_COMMIT>`` (when configured) so every service
     write adopts pre-existing brownfield device config instead of conflicting with it.
     ``dry_run=True`` also adds ``dry-run=native`` (compute the southbound delta, commit
-    nothing). The two combine — NSO accepts ``?dry-run=native&reconcile=...`` and a
-    dry-run then previews exactly what the reconcile commit would do.
+    nothing); ``dry_run="cli"`` asks for the NED-uniform ``+``/``-`` tree diff instead
+    (the apply-preview "diff -u" panel). The params combine — NSO accepts
+    ``?dry-run=...&reconcile=...`` and a dry-run then previews exactly what the
+    reconcile commit would do.
     """
     params: list[str] = []
     if dry_run:
-        params.append("dry-run=native")
+        params.append("dry-run=cli" if dry_run == "cli" else "dry-run=native")
     if RECONCILE_COMMIT:
         params.append(f"reconcile={RECONCILE_COMMIT}")
     if not params:
@@ -146,10 +148,44 @@ def _device_delta_from_dry_run(body: object, device_name: str) -> str | None:
     return ""
 
 
+def _cli_delta_from_dry_run(body: object) -> str | None:
+    """Return the ``outformat cli`` tree-diff text from a dry-run-result body.
+
+    The cli form is NSO's NED-uniform ``+``/``-`` config-tree diff (one text for the
+    whole transaction, not per-device). Empty/absent ``cli`` means "no change" ("");
+    a body that is not the expected dry-run-result shape returns None (inconclusive).
+    """
+    if not isinstance(body, dict):
+        return None
+    result = body.get("dry-run-result")
+    if not isinstance(result, dict):
+        return None
+    cli = result.get("cli")
+    if cli in (None, {}):
+        return ""
+    if not isinstance(cli, dict):
+        return None
+    node = cli.get("local-node")
+    if not isinstance(node, dict):
+        return ""
+    return node.get("data") or ""
+
+
 async def native_dry_run(
-    client: NsoClient, url: str, payload: str, device_name: str, *, method: str = "patch", strict: bool = False
+    client: NsoClient,
+    url: str,
+    payload: str,
+    device_name: str,
+    *,
+    method: str = "patch",
+    strict: bool = False,
+    outformat: str = "native",
 ) -> str | None:
-    """Issue *payload* to *url* as a native dry-run (``?dry-run=native``) and return the delta.
+    """Issue *payload* to *url* as a dry-run and return the delta (no commit).
+
+    ``outformat="native"`` (default): the device-native southbound delta (CLI lines for
+    cli NEDs, edit-config XML for netconf NEDs). ``outformat="cli"``: NSO's NED-uniform
+    ``+``/``-`` config-tree diff — the apply-preview "diff -u" rendering.
 
     No commit happens — NSO computes the native device config the intent *would* push and
     returns it. The returned string is the device-native delta (``""`` = no change), or
@@ -161,7 +197,7 @@ async def native_dry_run(
     an inconclusive ``None`` — a 4xx means NSO/the device would reject the intent, i.e. the
     apply did NOT land. Transport errors and ``5xx`` stay inconclusive (never block) either way.
     """
-    dry_url = _commit_url(url, dry_run=True)
+    dry_url = _commit_url(url, dry_run="cli" if outformat == "cli" else True)
     try:
         async with client._client(timeout=client._action_timeout) as c:
             resp = await getattr(c, method)(
@@ -189,6 +225,8 @@ async def native_dry_run(
         body = resp.json()
     except Exception:  # unparseable body — inconclusive
         return None
+    if outformat == "cli":
+        return _cli_delta_from_dry_run(body)
     return _device_delta_from_dry_run(body, device_name)
 
 
@@ -265,8 +303,11 @@ async def _send_service_config(
         url = f"{client._base}{service_path}"
         method = "patch"
     if dry_run:
-        # Preview: compute the native device delta without committing anything.
-        return await native_dry_run(client, url, payload, device_name, method=method)
+        # Preview: compute the delta without committing anything (dry_run="cli" asks
+        # for the NED-uniform tree diff; any other truthy value = device-native).
+        return await native_dry_run(
+            client, url, payload, device_name, method=method, outformat="cli" if dry_run == "cli" else "native"
+        )
     async with client._client(timeout=client._action_timeout) as c:
         resp = await getattr(c, method)(
             _commit_url(url), content=payload, headers={"Content-Type": "application/yang-data+json"}

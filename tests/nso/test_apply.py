@@ -1578,3 +1578,43 @@ def test_build_interface_ip_entry_ipv4():
     entry = apply_mod.build_interface_ip_entry("sw01", "ae99.999", rows)
     assert entry["interface-name"] == "ae99.999"
     assert entry["ipv4-address"] == [{"address": "33.1.1.1", "prefix-length": 24, "secondary": False}]
+
+
+# ── cli-outformat dry-run (the diff -u apply preview) ─────────────────────────
+
+
+def test_commit_url_dry_run_cli_format():
+    """dry_run='cli' asks NSO for the NED-uniform +/- tree diff instead of native."""
+    url = apply_mod._commit_url("http://nso/restconf/data/x", dry_run="cli")
+    assert "dry-run=cli" in url
+    assert "dry-run=native" not in url
+
+
+def test_commit_url_dry_run_true_stays_native():
+    url = apply_mod._commit_url("http://nso/restconf/data/x", dry_run=True)
+    assert "dry-run=native" in url
+
+
+def test_cli_delta_from_dry_run_shapes():
+    good = {"dry-run-result": {"cli": {"local-node": {"data": " devices {\n +config\n }"}}}}
+    assert apply_mod._cli_delta_from_dry_run(good) == " devices {\n +config\n }"
+    assert apply_mod._cli_delta_from_dry_run({"dry-run-result": {}}) == ""  # no change
+    assert apply_mod._cli_delta_from_dry_run({"dry-run-result": {"cli": {}}}) == ""
+    assert apply_mod._cli_delta_from_dry_run({"unexpected": 1}) is None
+    assert apply_mod._cli_delta_from_dry_run("nonsense") is None
+
+
+@pytest.mark.asyncio
+async def test_native_dry_run_outformat_cli_requests_and_parses():
+    """outformat='cli' issues ?dry-run=cli and returns the cli tree-diff text."""
+    from nso_adapter.nso.apply import native_dry_run
+
+    client = _make_nso_client()
+    body = {"dry-run-result": {"cli": {"local-node": {"data": "+ isis bfd"}}}}
+    http = AsyncMock()
+    http.patch.return_value = _httpx_response(200, json_data=body)
+    _stub_pool(client, http)
+    delta = await native_dry_run(client, "http://nso/x", "{}", "sw03", outformat="cli")
+    assert delta == "+ isis bfd"
+    url = http.patch.await_args.args[0]
+    assert "dry-run=cli" in url

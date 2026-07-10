@@ -112,6 +112,37 @@ async def test_action_force_removal_rejects_unknown_scope(adapter_client):
         break
 
 
+async def test_action_apply_diff_forwards_outformat(adapter_client):
+    """?outformat=cli reaches collect_apply_diff and is echoed in the response."""
+    from unittest.mock import AsyncMock, patch
+
+    from nso_adapter.api.actions import action_apply_diff
+
+    device_id = await _seed_device("actions-adiff-01", 1350)
+    coll = AsyncMock(return_value={"isis": "+ interface x"})
+    with patch("nso_adapter.core.apply.collect_apply_diff", coll):
+        async for db in get_session():
+            result = await action_apply_diff(device_id=device_id, outformat="cli", db=db)
+            break
+    assert result["diffs"] == {"isis": "+ interface x"}
+    assert result["outformat"] == "cli"
+    assert coll.await_args.kwargs.get("outformat") == "cli"
+
+
+async def test_action_apply_diff_rejects_unknown_outformat(adapter_client):
+    from nso_adapter.api.actions import action_apply_diff
+
+    device_id = await _seed_device("actions-adiff-02", 1351)
+    async for db in get_session():
+        try:
+            await action_apply_diff(device_id=device_id, outformat="nonsense", db=db)
+        except Exception as exc:
+            assert getattr(exc, "status_code", None) == 400
+        else:
+            raise AssertionError("invalid outformat must 400")
+        break
+
+
 async def test_action_detect_drift_enqueues_detect_drift_job(adapter_client):
     """action_detect_drift enqueues a real job of type detect_drift (verifies the TYPE)."""
     device_id = await _seed_device("actions-cc-01", 1330)

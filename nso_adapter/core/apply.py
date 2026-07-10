@@ -106,7 +106,7 @@ async def enqueue_apply(db: AsyncSession, device_id: int, force: bool = True) ->
     return job
 
 
-async def _diff_interface_attributes(db, nso_apply, client, device_name: str, ifaces: dict) -> str:
+async def _diff_interface_attributes(db, nso_apply, client, device_name: str, ifaces: dict, fmt=True) -> str:
     """Accumulated description/enabled native delta across every accepted interface attr.
 
     One isolated dry-run per accepted (description|enabled) slice — a failing slice is
@@ -127,7 +127,7 @@ async def _diff_interface_attributes(db, nso_apply, client, device_name: str, if
                     interface_name=iface.name,
                     attribute=r.attribute,
                     value=r.intent_value,
-                    dry_run=True,
+                    dry_run=fmt,
                 )
             except Exception as exc:  # noqa: BLE001 — preview must never fail hard
                 logger.warning(
@@ -143,7 +143,7 @@ async def _diff_interface_attributes(db, nso_apply, client, device_name: str, if
     return attr_delta
 
 
-async def _diff_interface_ips(db, nso_apply, client, device_name: str, ifaces: dict) -> str:
+async def _diff_interface_ips(db, nso_apply, client, device_name: str, ifaces: dict, fmt=True) -> str:
     """Accumulated native IP delta — one isolated dry-run per interface carrying IP intent."""
     ip_rows = (
         (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id.in_(list(ifaces) or [-1]))))
@@ -169,7 +169,7 @@ async def _diff_interface_ips(db, nso_apply, client, device_name: str, ifaces: d
                 service=iface.service if rk in ("ies", "vprn") else None,
                 parent_binding=iface.parent_binding,
                 encap_tag=iface.encap_tag,
-                dry_run=True,
+                dry_run=fmt,
             )
         except Exception as exc:  # noqa: BLE001 — preview must never fail hard
             logger.warning(
@@ -185,11 +185,13 @@ async def _diff_interface_ips(db, nso_apply, client, device_name: str, ifaces: d
     return ip_delta
 
 
-async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]:
+async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = "native") -> dict[str, str]:
     """Read-only preview: the per-scope native device diff the next Apply would push.
 
-    For each scope, the accepted owned intent is dry-run against NSO (``?dry-run=native``)
-    — NSO computes the device-native config it *would* push without committing anything.
+    For each scope, the accepted owned intent is dry-run against NSO — with
+    ``outformat="native"`` (default) NSO renders the device-native config it *would*
+    push; ``outformat="cli"`` renders the NED-uniform ``+``/``-`` tree diff instead
+    (the apply-preview "diff -u" panel). Nothing is committed either way.
     Returns ``{scope: native_delta}`` for scopes with a non-empty change (a scope already
     in sync yields an empty delta and is omitted). Never writes to NSO or the DB.
 
@@ -207,6 +209,8 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
         return {}
     client = get_nso_client(device.nso_instance)
     device_name = device.nso_device_name
+    # dry_run is bool|str down the apply stack: True = native, "cli" = tree diff.
+    fmt = "cli" if outformat == "cli" else True
     diffs: dict[str, str] = {}
 
     async def _accepted(model) -> list:
@@ -230,10 +234,10 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
     }
 
     # ── Interface attributes + IPs (each accumulates across several dry-runs) ─────
-    attr_delta = await _diff_interface_attributes(db, nso_apply, client, device_name, ifaces)
+    attr_delta = await _diff_interface_attributes(db, nso_apply, client, device_name, ifaces, fmt)
     if attr_delta.strip():
         diffs["interface_attribute"] = attr_delta
-    ip_delta = await _diff_interface_ips(db, nso_apply, client, device_name, ifaces)
+    ip_delta = await _diff_interface_ips(db, nso_apply, client, device_name, ifaces, fmt)
     if ip_delta.strip():
         diffs["interface_ip"] = ip_delta
 
@@ -284,7 +288,7 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
                 process_intent_rows=ospf_inst,
                 interface_intent_rows=ospf_iface,
                 redistribution_rows=redist_ospf,
-                dry_run=True,
+                dry_run=fmt,
             ),
         ),
         (
@@ -298,7 +302,7 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
                 redistribution_rows=redist_isis,
                 flex_algo_rows=isis_flex,
                 level_rows=isis_levels,
-                dry_run=True,
+                dry_run=fmt,
             ),
         ),
         (
@@ -309,7 +313,7 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
                 device_name=device_name,
                 router_intent_rows=bgp,
                 redistribution_rows=redist_bgp,
-                dry_run=True,
+                dry_run=fmt,
             ),
         ),
         (
@@ -320,7 +324,7 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
                 device_name=device_name,
                 intent_rows=rp,
                 ned_id=device.ned_id,
-                dry_run=True,
+                dry_run=fmt,
             ),
         ),
         (
@@ -333,62 +337,62 @@ async def collect_apply_diff(db: AsyncSession, device_id: int) -> dict[str, str]
                 v3_user_intents=snmp_user,
                 host_intents=snmp_host,
                 system_info_intent=snmp_sysinfo,
-                dry_run=True,
+                dry_run=fmt,
             ),
         ),
         (
             "static_route",
             [sr],
             lambda: nso_apply.apply_static_routes(
-                client=client, device_name=device_name, route_intent_rows=sr, dry_run=True
+                client=client, device_name=device_name, route_intent_rows=sr, dry_run=fmt
             ),
         ),
         (
             "logging",
             [lg],
             lambda: nso_apply.apply_logging_config(
-                client=client, device_name=device_name, host_intent_rows=lg, dry_run=True
+                client=client, device_name=device_name, host_intent_rows=lg, dry_run=fmt
             ),
         ),
         (
             "svi",
             [svi],
             lambda: nso_apply.apply_svi_config(
-                client=client, device_name=device_name, svi_intent_rows=svi, dry_run=True
+                client=client, device_name=device_name, svi_intent_rows=svi, dry_run=fmt
             ),
         ),
         (
             "subinterface",
             [subif],
             lambda: nso_apply.apply_subinterface_config(
-                client=client, device_name=device_name, subif_intent_rows=subif, dry_run=True
+                client=client, device_name=device_name, subif_intent_rows=subif, dry_run=fmt
             ),
         ),
         (
             "vlan",
             [vlan],
             lambda: nso_apply.apply_vlan_config(
-                client=client, device_name=device_name, vlan_intent_rows=vlan, dry_run=True
+                client=client, device_name=device_name, vlan_intent_rows=vlan, dry_run=fmt
             ),
         ),
         (
             "bfd",
             [bfd],
             lambda: nso_apply.apply_bfd_config(
-                client=client, device_name=device_name, bfd_intent_rows=bfd, dry_run=True
+                client=client, device_name=device_name, bfd_intent_rows=bfd, dry_run=fmt
             ),
         ),
         (
             "interface_mtu",
             [mtu],
             lambda: nso_apply.apply_mtu_config(
-                client=client, device_name=device_name, mtu_intent_rows=mtu, dry_run=True
+                client=client, device_name=device_name, mtu_intent_rows=mtu, dry_run=fmt
             ),
         ),
         (
             "l2_sap",
             [l2],
-            lambda: nso_apply.apply_l2_saps(client=client, device_name=device_name, sap_intent_rows=l2, dry_run=True),
+            lambda: nso_apply.apply_l2_saps(client=client, device_name=device_name, sap_intent_rows=l2, dry_run=fmt),
         ),
     ]
     for scope, triggers, make_coro in scopes:

@@ -293,6 +293,33 @@ async def test_collect_apply_diff_empty_scope_omitted(adapter_client):
     assert diffs == {}
 
 
+async def test_collect_apply_diff_outformat_cli_threads_format(adapter_client):
+    """outformat='cli' threads dry_run='cli' into every scope apply — NSO then renders the
+    NED-uniform +/- tree diff (the apply-preview 'diff -u' panel) instead of device-native."""
+    from nso_adapter.core.apply import collect_apply_diff
+    from nso_adapter.store.models import OspfInstanceIntent
+
+    device_id = await _seed_device("rtr-diff-cli", 197)
+    async for db in get_session():
+        db.add(
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    ospf = AsyncMock(return_value="+ router ospf 1")
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_ospf_config", ospf),
+    ):
+        async for db in get_session():
+            diffs = await collect_apply_diff(db, device_id, outformat="cli")
+            break
+    assert diffs == {"ospf": "+ router ospf 1"}
+    assert ospf.await_args.kwargs["dry_run"] == "cli"
+
+
 async def test_collect_apply_diff_covers_multiple_scopes(adapter_client):
     """collect_apply_diff dry-runs every scope with accepted intent, keyed by scope name."""
     from nso_adapter.core.apply import collect_apply_diff

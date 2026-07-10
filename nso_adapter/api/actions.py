@@ -111,13 +111,21 @@ async def action_apply(
 @router.get("/{device_id}/actions/apply-diff", dependencies=[Depends(verify_token)])
 async def action_apply_diff(
     device_id: int,
+    outformat: str = "native",
     db: AsyncSession = Depends(get_db),
 ):
-    """Preview the per-scope native device diff the next Apply would push (NSO dry-run, no commit)."""
+    """Preview the per-scope diff the next Apply would push (NSO dry-run, no commit).
+
+    ``outformat=native`` (default): device-native rendering (CLI lines for cli NEDs,
+    edit-config XML for netconf NEDs). ``outformat=cli``: NSO's NED-uniform ``+``/``-``
+    tree diff — the "diff -u" style the preview panel renders.
+    """
     from nso_adapter.core.apply import collect_apply_diff
 
+    if outformat not in ("native", "cli"):
+        raise api_error(400, "bad_request", f"Unknown outformat {outformat!r} (native|cli)")
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
-    diffs = await collect_apply_diff(db, device_id)
-    return {"device_id": device_id, "diffs": diffs}
+    diffs = await collect_apply_diff(db, device_id, outformat=outformat)
+    return {"device_id": device_id, "outformat": outformat, "diffs": diffs}
