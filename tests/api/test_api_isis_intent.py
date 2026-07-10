@@ -183,6 +183,32 @@ async def test_deleting_owned_interface_enqueues_isis_removal(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_deleting_rows_threads_removed_keys_into_removal_context(adapter_client):
+    """The removal job must know WHAT this PUT just deleted so its collateral guard
+    can tell an intended retraction from PATCH-no-op-era orphans (the ra1 lo0
+    incident: orphaned service rows were silently flushed off the live device)."""
+    device_id = await seed_device(nso_device_name="isis-ctx", netbox_device_id=990)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={
+            "interfaces": [
+                {"interface_name": "system", "af": "ipv4", "passive": True},
+                {"interface_name": "lag1", "af": "ipv4", "metric": 5, "passive": False},
+            ]
+        },
+    )
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={"interfaces": [{"interface_name": "system", "af": "ipv4", "passive": True}]},
+    )
+    (job,) = await _isis_removal_jobs(device_id)
+    assert job.context["removed_interfaces"] == [["lag1", "ipv4"]]
+    assert job.context.get("removed_processes", []) == []
+
+
+@pytest.mark.anyio
 async def test_pure_add_or_widen_does_not_enqueue_isis_removal(adapter_client):
     """A pure add / a set-from-blank (None→value) is NOT a retraction → no removal job.
 

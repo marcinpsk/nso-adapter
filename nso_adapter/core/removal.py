@@ -55,6 +55,23 @@ _NED_DIALECT_SCOPES: frozenset[str] = frozenset({"route_policy"})
 VALID_REMOVAL_SCOPES: set[str] = set(_SIMPLE_TARGETS) | {"ospf", "bgp", "isis", "interface_config", "snmp"}
 
 
+class RemovalBlockedError(Exception):
+    """A PUT-replace would retract service rows nobody just removed (collateral).
+
+    Raised by the scope guard BEFORE anything is committed; carries the orphan keys
+    and a native dry-run preview so the failed job's detail gives the operator the
+    full would-be device delta to review (the ra1 lo0 incident guard).
+    """
+
+    def __init__(self, orphan_interfaces: list, orphan_processes: list, preview: str | None):
+        self.orphan_interfaces = orphan_interfaces
+        self.orphan_processes = orphan_processes
+        self.preview = preview
+        super().__init__(
+            f"PUT-replace would retract rows not in intent: interfaces={orphan_interfaces} processes={orphan_processes}"
+        )
+
+
 async def _replace_simple(db: AsyncSession, device, client, scope: str) -> None:
     """PUT-replace a single-model service with its remaining accepted rows."""
     from nso_adapter.nso import apply as nso_apply
@@ -215,7 +232,7 @@ async def _replace_interface_config(db: AsyncSession, device, client, interface_
         await replace_interface_config(client, device.nso_device_name, name, entry)
 
 
-async def _replace_isis(db: AsyncSession, device, client) -> None:
+async def _replace_isis(db: AsyncSession, device, client, context: dict | None = None) -> None:
     """PUT-replace the isis-reconciler with the device's full remaining accepted intent.
 
     Bespoke (not a _SIMPLE_TARGET) because apply_isis_interfaces takes several row
@@ -223,6 +240,14 @@ async def _replace_isis(db: AsyncSession, device, client) -> None:
     PUT-replace re-asserts only the ACCEPTED rows, so a deleted interface OR a cleared
     owned scalar (metric back to blank, whose leaf a merge-PATCH would never drop) is
     reverted on the device, while un-owned brownfield IS-IS config stays (reconcile).
+
+    COLLATERAL GUARD (the ra1 lo0 incident): before committing, compare the rows NSO's
+    service currently carries against the snapshot being asserted plus the keys the
+    trigger just removed (``context["removed_interfaces"]``/``["removed_processes"]``).
+    Anything beyond that is an ORPHAN — a stale service row whose intent deletion never
+    propagated (PATCH-no-op era) — and a PUT-replace would silently retract it from the
+    live device. Block with a native dry-run preview instead; ``context["force"]``
+    (the actions/force-removal override) skips the guard after operator review.
     """
     from nso_adapter.nso.apply import apply_isis_interfaces
     from nso_adapter.store.models import (
@@ -244,6 +269,27 @@ async def _replace_isis(db: AsyncSession, device, client) -> None:
     flex = await _accepted(IsisFlexAlgoIntent)
     levels = await _accepted(IsisLevelIntent)
     redist = await _accepted(RedistributionIntent, RedistributionIntent.dest_protocol == "isis")
+
+    context = context or {}
+    if not context.get("force"):
+        current = await client.get_isis_service_config(device.nso_device_name)
+        if current:
+            snapshot_ifaces = {(r.interface_name, r.af) for r in ifaces}
+            snapshot_procs = {(r.process_tag or "") for r in procs}
+            removed_ifaces = {tuple(k) for k in context.get("removed_interfaces", [])}
+            removed_procs = set(context.get("removed_processes", []))
+            nso_ifaces = {(e.get("interface-name"), e.get("af", "ipv4")) for e in current.get("interface-config", [])}
+            nso_procs = {e.get("process-tag", "") for e in current.get("process-config", [])}
+            orphan_ifaces = sorted(nso_ifaces - snapshot_ifaces - removed_ifaces)
+            orphan_procs = sorted(nso_procs - snapshot_procs - removed_procs)
+            if orphan_ifaces or orphan_procs:
+                preview = await apply_isis_interfaces(
+                    client, device.nso_device_name, ifaces, procs, redist, flex, levels, replace=True, dry_run=True
+                )
+                raise RemovalBlockedError([list(k) for k in orphan_ifaces], list(orphan_procs), preview)
+    else:
+        logger.warning("removal.force", device_id=device.id, scope="isis")
+
     await apply_isis_interfaces(client, device.nso_device_name, ifaces, procs, redist, flex, levels, replace=True)
 
 
@@ -283,7 +329,7 @@ async def _dispatch_scope(db: AsyncSession, device, client, scope: str, context:
     elif scope == "snmp":
         await _replace_snmp(db, device, client)
     elif scope == "isis":
-        await _replace_isis(db, device, client)
+        await _replace_isis(db, device, client, context)
     elif scope == "interface_config":
         await _replace_interface_config(db, device, client, (context or {}).get("interfaces") or [])
     elif scope in _SIMPLE_TARGETS:
@@ -292,12 +338,24 @@ async def _dispatch_scope(db: AsyncSession, device, client, scope: str, context:
         raise ValueError(f"Unknown removal scope {scope!r}")
 
 
-async def enqueue_removal(db: AsyncSession, device_id: int, scope: str, *, interfaces: list[str] | None = None):
+async def enqueue_removal(
+    db: AsyncSession,
+    device_id: int,
+    scope: str,
+    *,
+    interfaces: list[str] | None = None,
+    removed_interfaces: list | None = None,
+    removed_processes: list | None = None,
+    force: bool = False,
+):
     """Queue an async ``removal`` job that PUT-replaces *scope*'s service.
 
     Non-blocking: the intent PUT returns immediately and the worker runs the
     (potentially slow) device commit in the background via :func:`run_removal`.
     *interfaces* scopes an ``interface_config`` removal to the affected interface names.
+    *removed_interfaces*/*removed_processes* record what the trigger JUST deleted so
+    the collateral guard can tell an intended retraction from an orphaned service row;
+    *force* skips the guard (the operator override after reviewing a blocked removal).
     """
     from nso_adapter.store.models import Job, JobStatus, JobType
 
@@ -306,6 +364,12 @@ async def enqueue_removal(db: AsyncSession, device_id: int, scope: str, *, inter
     context: dict = {"scope": scope}
     if interfaces:
         context["interfaces"] = interfaces
+    if removed_interfaces:
+        context["removed_interfaces"] = [list(k) for k in removed_interfaces]
+    if removed_processes:
+        context["removed_processes"] = list(removed_processes)
+    if force:
+        context["force"] = True
     job = Job(
         job_type=JobType.removal,
         device_id=device_id,
@@ -345,6 +409,36 @@ async def run_removal(job_id: int, device_id: int) -> None:
             job.status = JobStatus.succeeded
             job.result = {"scope": scope}
             await db.commit()
+        except RemovalBlockedError as blocked:
+            from nso_adapter.core.jobs import _mark_job_failed
+
+            logger.error(
+                "removal.blocked_collateral",
+                job_id=job_id,
+                device_id=device_id,
+                scope=scope,
+                orphan_interfaces=blocked.orphan_interfaces,
+                orphan_processes=blocked.orphan_processes,
+            )
+            await _mark_job_failed(
+                db,
+                job_id,
+                {
+                    "code": "removal_blocked_collateral",
+                    "message": str(blocked),
+                    "detail": {
+                        "scope": scope,
+                        "orphan_interfaces": blocked.orphan_interfaces,
+                        "orphan_processes": blocked.orphan_processes,
+                        "preview": blocked.preview,
+                        "hint": (
+                            "These service rows are not in the remaining intent and were not part of "
+                            "this retraction. Re-accept them into intent to keep them, or re-run via "
+                            "POST /devices/{id}/actions/force-removal to flush them deliberately."
+                        ),
+                    },
+                },
+            )
         except Exception as exc:  # noqa: BLE001 — record on the job, never crash the worker
             from nso_adapter.core.jobs import _mark_job_failed
 

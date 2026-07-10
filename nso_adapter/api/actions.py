@@ -8,6 +8,7 @@ All actions return 202 with {job_id}.
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
@@ -30,6 +31,34 @@ async def _trigger(
     job, created = await enqueue_job(device_id, job_type, db)
     if not created:
         raise api_error(409, "conflict", "A job is already running for this device", {"job_id": job.id})
+    return {"job_id": job.id}
+
+
+class ForceRemovalBody(BaseModel):
+    scope: str
+
+
+@router.post("/{device_id}/actions/force-removal", status_code=202, dependencies=[Depends(verify_token)])
+async def action_force_removal(
+    device_id: int,
+    body: ForceRemovalBody,
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-run a scope's removal with the collateral guard DISABLED.
+
+    The operator override for a ``removal_blocked_collateral`` failure: after
+    reviewing the blocked job's orphan list + dry-run preview, this deliberately
+    flushes the orphaned service rows (PUT-replace with only the remaining intent).
+    """
+    from nso_adapter.core.removal import VALID_REMOVAL_SCOPES, enqueue_removal
+
+    device = await db.get(Device, device_id)
+    if not device:
+        raise api_error(404, "not_found", "Device not found")
+    if body.scope not in VALID_REMOVAL_SCOPES:
+        raise api_error(400, "bad_request", f"Unknown removal scope {body.scope!r}")
+    job = await enqueue_removal(db, device_id, body.scope, force=True)
+    await db.commit()
     return {"job_id": job.id}
 
 

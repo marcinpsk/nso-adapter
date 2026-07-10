@@ -55,9 +55,14 @@ async def _seed_device(*, nso_device_name: str = "sw3", netbox_device_id: int = 
     raise RuntimeError("no session")
 
 
-async def _seed_removal_job(device_id: int, scope: str = "vlan") -> int:
+async def _seed_removal_job(device_id: int, scope: str = "vlan", context_extra: dict | None = None) -> int:
     async for db in get_session():
-        j = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued, context={"scope": scope})
+        j = Job(
+            job_type=JobType.removal,
+            device_id=device_id,
+            status=JobStatus.queued,
+            context={"scope": scope, **(context_extra or {})},
+        )
         db.add(j)
         await db.commit()
         await db.refresh(j)
@@ -256,16 +261,17 @@ async def test_dispatch_scope_isis_uses_multi_row_apply(adapter_client):
         break
 
     apply_fn = AsyncMock()
+    client = _isis_client(None)  # no service instance in NSO → collateral guard no-ops
     async for db in get_session():
         device = await db.get(Device, device_id)
         with patch("nso_adapter.nso.apply.apply_isis_interfaces", apply_fn):
-            await removal_mod._dispatch_scope(db, device, _CLIENT, "isis")
+            await removal_mod._dispatch_scope(db, device, client, "isis")
         break
 
     apply_fn.assert_awaited_once()
     args, kwargs = apply_fn.await_args
     # apply_isis_interfaces(client, name, ifaces, procs, redist, flex, levels, replace=True)
-    assert args[0] is _CLIENT and args[1] == "ra1"
+    assert args[0] is client and args[1] == "ra1"
     assert [i.interface_name for i in args[2]] == ["system"]  # un-accepted lag1 filtered out
     assert [p.process_tag for p in args[3]] == ["0"]
     assert [(r.dest_protocol, r.source_protocol) for r in args[4]] == [("isis", "connected")]  # bgp filtered
@@ -420,3 +426,161 @@ async def test_run_removal_marks_failed_even_when_session_poisoned(adapter_clien
         assert job.status == JobStatus.failed
         assert job.error["code"] == "removal_failed"
         break
+
+
+# ── isis removal collateral guard (the ra1 lo0 incident, 2026-07-09) ──────────
+#
+# The 714bd93 PUT-replace retract flushed 4 ORPHANED service rows (PATCH-no-op-era
+# debris whose intent deletions never reached NSO) off the live router — lo0 left
+# ra1's IGP for ~42h. The guard compares NSO's current service rows against the
+# remaining snapshot + the trigger's just-removed keys BEFORE committing; anything
+# beyond that is collateral → block with a dry-run preview in the failure detail.
+
+
+def _isis_client(service_config):
+    """A spec'd NSO-client fake for the guard: only the service GET is primed.
+
+    spec=NsoClient so a typo'd method fails instead of being fabricated; the apply
+    boundary stays patched at nso_adapter.nso.apply like the other dispatch tests.
+    """
+    from nso_adapter.nso.client import NsoClient
+
+    client = AsyncMock(spec=NsoClient)
+    client.get_isis_service_config.return_value = service_config
+    return client
+
+
+async def _seed_isis_intent(device_id: int, *ifaces: tuple[str, str]):
+    async for db in get_session():
+        for name, af in ifaces:
+            db.add(
+                IsisInterfaceIntent(
+                    device_id=device_id, interface_name=name, af=af, process_tag="0", passive=True, accepted_at=_NOW
+                )
+            )
+        await db.commit()
+        return
+
+
+async def _run_guarded_removal(device_id: int, job_id: int, client, apply_fn):
+    with (
+        patch("nso_adapter.nso.apply.apply_isis_interfaces", apply_fn),
+        patch("nso_adapter.core.importer.get_nso_client", return_value=client),
+    ):
+        await removal_mod.run_removal(job_id, device_id)
+
+
+async def test_isis_removal_blocked_on_orphaned_service_rows(adapter_client):
+    """An NSO service interface row that is neither in the remaining snapshot nor in
+    the trigger's just-removed set is an orphan; the job must BLOCK, attach the
+    dry-run preview, and commit NOTHING."""
+    device_id = await _seed_device(nso_device_name="ra1-guard")
+    await _seed_isis_intent(device_id, ("system", "ipv4"))
+    client = _isis_client(
+        {
+            "device": "ra1-guard",
+            "interface-config": [
+                {"interface-name": "system", "af": "ipv4"},
+                {"interface-name": "lo0", "af": "ipv4"},  # orphan — nobody just removed it
+            ],
+        }
+    )
+    job_id = await _seed_removal_job(device_id, scope="isis")
+    apply_fn = AsyncMock(return_value="- interface lo0 (native preview)")
+    await _run_guarded_removal(device_id, job_id, client, apply_fn)
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.error["code"] == "removal_blocked_collateral"
+        assert job.error["detail"]["orphan_interfaces"] == [["lo0", "ipv4"]]
+        assert job.error["detail"]["preview"] == "- interface lo0 (native preview)"
+        break
+    # the ONLY apply call was the dry-run preview — nothing was committed
+    apply_fn.assert_awaited_once()
+    assert apply_fn.await_args.kwargs.get("dry_run") is True
+
+
+async def test_isis_removal_orphaned_process_blocks(adapter_client):
+    """A service process-config row beyond the snapshot is collateral too — retracting
+    it would drop the whole `router isis <tag>` process from the device."""
+    device_id = await _seed_device(nso_device_name="ra1-guard-proc")
+    await _seed_isis_intent(device_id, ("system", "ipv4"))
+    client = _isis_client(
+        {
+            "device": "ra1-guard-proc",
+            "interface-config": [{"interface-name": "system", "af": "ipv4"}],
+            "process-config": [{"process-tag": "OLD"}],
+        }
+    )
+    job_id = await _seed_removal_job(device_id, scope="isis")
+    apply_fn = AsyncMock(return_value="preview")
+    await _run_guarded_removal(device_id, job_id, client, apply_fn)
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.error["detail"]["orphan_processes"] == ["OLD"]
+        break
+
+
+async def test_isis_removal_proceeds_when_extra_row_was_just_removed(adapter_client):
+    """The trigger threads the keys it just deleted; those are EXPECTED retractions
+    (the whole point of the removal job), not collateral."""
+    device_id = await _seed_device(nso_device_name="ra1-legit")
+    await _seed_isis_intent(device_id, ("system", "ipv4"))
+    client = _isis_client(
+        {
+            "device": "ra1-legit",
+            "interface-config": [
+                {"interface-name": "system", "af": "ipv4"},
+                {"interface-name": "lag1", "af": "ipv4"},  # just removed by the operator
+            ],
+        }
+    )
+    job_id = await _seed_removal_job(device_id, scope="isis", context_extra={"removed_interfaces": [["lag1", "ipv4"]]})
+    apply_fn = AsyncMock()
+    await _run_guarded_removal(device_id, job_id, client, apply_fn)
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        break
+    apply_fn.assert_awaited_once()
+    assert apply_fn.await_args.kwargs == {"replace": True}
+
+
+async def test_isis_removal_force_skips_guard(adapter_client):
+    """The operator override (actions/force-removal) flushes orphans on purpose."""
+    device_id = await _seed_device(nso_device_name="ra1-force")
+    await _seed_isis_intent(device_id, ("system", "ipv4"))
+    client = _isis_client(
+        {
+            "device": "ra1-force",
+            "interface-config": [
+                {"interface-name": "system", "af": "ipv4"},
+                {"interface-name": "lo0", "af": "ipv4"},
+            ],
+        }
+    )
+    job_id = await _seed_removal_job(device_id, scope="isis", context_extra={"force": True})
+    apply_fn = AsyncMock()
+    await _run_guarded_removal(device_id, job_id, client, apply_fn)
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        break
+    apply_fn.assert_awaited_once()
+    assert apply_fn.await_args.kwargs == {"replace": True}
+
+
+async def test_isis_removal_without_service_instance_proceeds(adapter_client):
+    """No isis-config instance in NSO (404 → None) → nothing to guard, plain replace."""
+    device_id = await _seed_device(nso_device_name="ra1-fresh")
+    await _seed_isis_intent(device_id, ("system", "ipv4"))
+    client = _isis_client(None)
+    job_id = await _seed_removal_job(device_id, scope="isis")
+    apply_fn = AsyncMock()
+    await _run_guarded_removal(device_id, job_id, client, apply_fn)
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        break
+    apply_fn.assert_awaited_once()

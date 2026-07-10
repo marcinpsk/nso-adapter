@@ -84,6 +84,34 @@ async def test_action_sync_enqueues_sync_job(adapter_client):
         break
 
 
+async def test_action_force_removal_enqueues_forced_removal_job(adapter_client):
+    """The operator override for a removal_blocked_collateral failure: enqueues a
+    removal job with force=True so the guard is skipped ON PURPOSE (reviewed flush)."""
+    from nso_adapter.api.actions import ForceRemovalBody, action_force_removal
+
+    device_id = await _seed_device("actions-frm-01", 1340)
+    async for db in get_session():
+        result = await action_force_removal(device_id=device_id, body=ForceRemovalBody(scope="isis"), db=db)
+        job = await db.get(Job, result["job_id"])
+        assert job.job_type == JobType.removal
+        assert job.context == {"scope": "isis", "force": True}
+        break
+
+
+async def test_action_force_removal_rejects_unknown_scope(adapter_client):
+    from nso_adapter.api.actions import ForceRemovalBody, action_force_removal
+
+    device_id = await _seed_device("actions-frm-02", 1341)
+    async for db in get_session():
+        try:
+            await action_force_removal(device_id=device_id, body=ForceRemovalBody(scope="nonsense"), db=db)
+        except Exception as exc:
+            assert getattr(exc, "status_code", None) == 400
+        else:
+            raise AssertionError("unknown scope must be rejected")
+        break
+
+
 async def test_action_detect_drift_enqueues_detect_drift_job(adapter_client):
     """action_detect_drift enqueues a real job of type detect_drift (verifies the TYPE)."""
     device_id = await _seed_device("actions-cc-01", 1330)

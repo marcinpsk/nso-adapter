@@ -384,6 +384,20 @@ async def put_isis_interface_intent(
 
     now = datetime.now(UTC).replace(tzinfo=None)
 
+    # Capture the pre-sync keys so the removal job knows what THIS put deleted —
+    # the collateral guard's discriminator between an intended retraction and an
+    # orphaned service row (the ra1 lo0 incident).
+    pre_iface_keys = {
+        (r.interface_name, r.af)
+        for r in (
+            await db.execute(select(IsisInterfaceIntent).where(IsisInterfaceIntent.device_id == device_id))
+        ).scalars()
+    }
+    pre_proc_tags = {
+        r.process_tag
+        for r in (await db.execute(select(IsisProcessIntent).where(IsisProcessIntent.device_id == device_id))).scalars()
+    }
+
     iface_count, iface_retracted = await _sync_keyed_intent(
         db,
         IsisInterfaceIntent,
@@ -449,7 +463,9 @@ async def put_isis_interface_intent(
     if iface_retracted or proc_retracted or level_retracted or redist_retracted:
         from nso_adapter.core.removal import enqueue_removal
 
-        await enqueue_removal(db, device_id, "isis")
+        removed_ifaces = sorted(pre_iface_keys - {(e.interface_name, e.af) for e in body.interfaces})
+        removed_procs = sorted(pre_proc_tags - {p.process_tag for p in body.processes})
+        await enqueue_removal(db, device_id, "isis", removed_interfaces=removed_ifaces, removed_processes=removed_procs)
 
     await db.commit()
     return {"device_id": device_id, "interface_count": iface_count, "process_count": proc_count}

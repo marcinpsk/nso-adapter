@@ -383,6 +383,23 @@ class NsoClient:
             entries = data.get("network-state-export:device") or data.get("device", [])
             return entries[0] if entries else None
 
+    async def get_isis_service_config(self, device_name: str) -> dict | None:
+        """Return the current ``isis-reconciler:isis-config`` service instance, or None when absent.
+
+        The removal collateral guard compares these rows — what a PUT-replace will
+        RETRACT from the device — against the remaining intent snapshot before
+        committing (the ra1 lo0 incident: orphaned service rows silently flushed).
+        """
+        url = f"{self._base}/restconf/data/isis-reconciler:isis-config={_url_key(device_name)}"
+        async with self._client() as c:
+            resp = await c.get(url)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            entries = data.get("isis-reconciler:isis-config") or data.get("isis-config", [])
+            return entries[0] if entries else None
+
     async def get_bgp_config(self, device_name: str) -> dict | None:
         """Return the bgp-config entry for *device_name* from the NSO package oper-data.
 
