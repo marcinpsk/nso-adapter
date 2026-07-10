@@ -303,7 +303,15 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
     if removed_inst or removed_iface or removed_redist:
         from nso_adapter.core.removal import enqueue_removal
 
-        await enqueue_removal(db, device_id, "ospf")
+        # Thread the just-removed keys so the collateral guard can tell this intended
+        # retraction from an orphaned service row (redistribute rows are nested,
+        # non-guarded content — only the keyed lists matter here).
+        await enqueue_removal(
+            db,
+            device_id,
+            "ospf",
+            removed={"interface-config": removed_iface, "process-config": removed_inst},
+        )
 
     await db.commit()
 

@@ -12,10 +12,12 @@ one test that asserts the on-device revert is attempted.
 from __future__ import annotations
 
 from datetime import datetime
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
 
+from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import (
     SnmpCommunityIntent,
     SnmpHostIntent,
@@ -295,7 +297,11 @@ async def test_put_removal_enqueues_async_removal_job(adapter_client, monkeypatc
     captured = {}
 
     def _fake_get_client(instance):
-        return object()  # opaque client; apply is faked too
+        # The removal worker's collateral guard reads the current service instance;
+        # None (no instance in NSO) short-circuits the guard to a plain replace.
+        client = AsyncMock(spec=NsoClient)
+        client.get_service_config.return_value = None
+        return client
 
     async def _fake_apply(client, device_name, comms, users, hosts, sysinfo, replace):
         captured["device_name"] = device_name
@@ -323,7 +329,8 @@ async def test_put_removal_enqueues_async_removal_job(adapter_client, monkeypatc
             .all()
         )
         assert len(jobs) == 1
-        assert jobs[0].context == {"scope": "snmp"}
+        # community rw1 was just dropped — threaded for the collateral guard
+        assert jobs[0].context == {"scope": "snmp", "removed": {"community": ["rw1"]}}
         job_id = jobs[0].id
         break
 

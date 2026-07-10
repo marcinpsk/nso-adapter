@@ -204,8 +204,7 @@ async def test_deleting_rows_threads_removed_keys_into_removal_context(adapter_c
         json={"interfaces": [{"interface_name": "system", "af": "ipv4", "passive": True}]},
     )
     (job,) = await _isis_removal_jobs(device_id)
-    assert job.context["removed_interfaces"] == [["lag1", "ipv4"]]
-    assert job.context.get("removed_processes", []) == []
+    assert job.context["removed"] == {"interface-config": [["lag1", "ipv4"]]}
 
 
 @pytest.mark.anyio

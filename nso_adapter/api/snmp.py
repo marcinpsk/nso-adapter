@@ -246,7 +246,7 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
 
     now = datetime.now(UTC).replace(tzinfo=None)
 
-    comm_count, removed = await _sync_intent_collection(
+    comm_count, removed_comms = await _sync_intent_collection(
         db,
         SnmpCommunityIntent,
         device_id,
@@ -295,7 +295,7 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
             accepted_at=acc,
         ),
     )
-    removed += removed_users + removed_hosts
+    removed = removed_comms + removed_users + removed_hosts
 
     if await _sync_system_info(db, device_id, body.system_info, now):
         removed.append("system-info")
@@ -317,7 +317,16 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
     if removed:
         from nso_adapter.core.removal import enqueue_removal
 
-        await enqueue_removal(db, device_id, "snmp")
+        # Thread the PER-COLLECTION removed keys (community/v3-user/host) so the
+        # collateral guard can tell this intended retraction from an orphaned service
+        # row — the merged `removed` list is namespace-ambiguous (a community and a
+        # host may share a name) and system-info is a non-guarded scalar.
+        await enqueue_removal(
+            db,
+            device_id,
+            "snmp",
+            removed={"community": removed_comms, "v3-user": removed_users, "host": removed_hosts},
+        )
 
     await db.commit()
 

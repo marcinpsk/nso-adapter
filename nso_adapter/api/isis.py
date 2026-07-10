@@ -465,7 +465,12 @@ async def put_isis_interface_intent(
 
         removed_ifaces = sorted(pre_iface_keys - {(e.interface_name, e.af) for e in body.interfaces})
         removed_procs = sorted(pre_proc_tags - {p.process_tag for p in body.processes})
-        await enqueue_removal(db, device_id, "isis", removed_interfaces=removed_ifaces, removed_processes=removed_procs)
+        await enqueue_removal(
+            db,
+            device_id,
+            "isis",
+            removed={"interface-config": removed_ifaces, "process-config": removed_procs},
+        )
 
     await db.commit()
     return {"device_id": device_id, "interface_count": iface_count, "process_count": proc_count}

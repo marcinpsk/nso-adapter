@@ -100,7 +100,7 @@ async def test_replace_on_removal_enqueues_job_and_commits(adapter_client):
         job = jobs[0]
         assert job.job_type == JobType.removal
         assert job.device_id == device_id
-        assert job.context == {"scope": "vlan"}
+        assert job.context == {"scope": "vlan", "removed": {"vlan": [3366]}}
         assert job.status == JobStatus.queued
         break
 
@@ -163,15 +163,16 @@ async def test_dispatch_scope_simple_calls_apply_replace_true(adapter_client):
         break
 
     apply_fn = AsyncMock()
+    client = _guard_client(None)  # no service instance in NSO → collateral guard no-ops
     async for db in get_session():
         device = await db.get(Device, device_id)
         with patch("nso_adapter.nso.apply.apply_vlan_config", apply_fn):
-            await removal_mod._dispatch_scope(db, device, _CLIENT, "vlan")
+            await removal_mod._dispatch_scope(db, device, client, "vlan")
         break
 
     apply_fn.assert_awaited_once()
     args, kwargs = apply_fn.await_args
-    assert args[0] is _CLIENT
+    assert args[0] is client
     assert args[1] == "sw3"
     assert [r.vlan_id for r in args[2]] == [10]  # the accepted_at filter dropped vlan 20
     assert kwargs == {"replace": True}
@@ -206,16 +207,17 @@ async def test_dispatch_scope_ospf_uses_multi_row_apply(adapter_client):
         break
 
     apply_fn = AsyncMock()
+    client = _guard_client(None)  # no service instance in NSO → collateral guard no-ops
     async for db in get_session():
         device = await db.get(Device, device_id)
         with patch("nso_adapter.nso.apply.apply_ospf_config", apply_fn):
-            await removal_mod._dispatch_scope(db, device, _CLIENT, "ospf")
+            await removal_mod._dispatch_scope(db, device, client, "ospf")
         break
 
     apply_fn.assert_awaited_once()
     args, kwargs = apply_fn.await_args
     # apply_ospf_config(client, name, insts, ifaces, redist, replace=True)
-    assert args[0] is _CLIENT and args[1] == "ra1"
+    assert args[0] is client and args[1] == "ra1"
     assert [i.process_id for i in args[2]] == ["1"]  # un-accepted process 9 filtered out
     assert [i.interface_name for i in args[3]] == ["Gi0/0"]  # un-accepted Gi0/9 filtered out
     # only the accepted ospf redist row survives (bgp + un-accepted ospf filtered)
@@ -261,7 +263,7 @@ async def test_dispatch_scope_isis_uses_multi_row_apply(adapter_client):
         break
 
     apply_fn = AsyncMock()
-    client = _isis_client(None)  # no service instance in NSO → collateral guard no-ops
+    client = _guard_client(None)  # no service instance in NSO → collateral guard no-ops
     async for db in get_session():
         device = await db.get(Device, device_id)
         with patch("nso_adapter.nso.apply.apply_isis_interfaces", apply_fn):
@@ -293,15 +295,16 @@ async def test_dispatch_scope_route_policy_passes_ned_id(adapter_client):
         break
 
     apply_fn = AsyncMock()
+    client = _guard_client(None)  # no service instance in NSO → collateral guard no-ops
     async for db in get_session():
         device = await db.get(Device, device_id)
         with patch("nso_adapter.nso.apply.apply_route_policy_config", apply_fn):
-            await removal_mod._dispatch_scope(db, device, _CLIENT, "route_policy")
+            await removal_mod._dispatch_scope(db, device, client, "route_policy")
         break
 
     apply_fn.assert_awaited_once()
     args, kwargs = apply_fn.await_args
-    assert args[0] is _CLIENT and args[1] == "ra1"
+    assert args[0] is client and args[1] == "ra1"
     assert [r.name for r in args[2]] == ["RP-IN"]
     assert kwargs.get("ned_id") == "cisco-iosxr-nc-7.3"
     assert kwargs.get("replace") is True
@@ -438,16 +441,13 @@ async def test_run_removal_marks_failed_even_when_session_poisoned(adapter_clien
 
 
 def _isis_client(service_config):
-    """A spec'd NSO-client fake for the guard: only the service GET is primed.
+    """A spec'd NSO-client fake for the guard: only the (generic) service GET is primed."""
+    return _guard_client(service_config)
 
-    spec=NsoClient so a typo'd method fails instead of being fabricated; the apply
-    boundary stays patched at nso_adapter.nso.apply like the other dispatch tests.
-    """
-    from nso_adapter.nso.client import NsoClient
 
-    client = AsyncMock(spec=NsoClient)
-    client.get_isis_service_config.return_value = service_config
-    return client
+# The staged body the guard diffs against for the seeded ("system", "ipv4") snapshot —
+# what the REAL apply_isis_interfaces would build from the remaining accepted rows.
+_ISIS_STAGED_SYSTEM = {"interface-config": [{"interface-name": "system", "af": "ipv4"}]}
 
 
 async def _seed_isis_intent(device_id: int, *ifaces: tuple[str, str]):
@@ -486,18 +486,18 @@ async def test_isis_removal_blocked_on_orphaned_service_rows(adapter_client):
         }
     )
     job_id = await _seed_removal_job(device_id, scope="isis")
-    apply_fn = AsyncMock(return_value="- interface lo0 (native preview)")
+    apply_fn = _staging_apply(_ISIS_STAGED_SYSTEM, preview="- interface lo0 (native preview)")
     await _run_guarded_removal(device_id, job_id, client, apply_fn)
     async for db in get_session():
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.error["code"] == "removal_blocked_collateral"
-        assert job.error["detail"]["orphan_interfaces"] == [["lo0", "ipv4"]]
+        assert job.error["detail"]["orphans"] == {"interface-config": [["lo0", "ipv4"]]}
         assert job.error["detail"]["preview"] == "- interface lo0 (native preview)"
         break
-    # the ONLY apply call was the dry-run preview — nothing was committed
-    apply_fn.assert_awaited_once()
-    assert apply_fn.await_args.kwargs.get("dry_run") is True
+    # stage + dry-run preview only — nothing was committed
+    committed = [c for c in apply_fn.await_args_list if c.kwargs.get("stage") is None and not c.kwargs.get("dry_run")]
+    assert committed == []
 
 
 async def test_isis_removal_orphaned_process_blocks(adapter_client):
@@ -513,12 +513,12 @@ async def test_isis_removal_orphaned_process_blocks(adapter_client):
         }
     )
     job_id = await _seed_removal_job(device_id, scope="isis")
-    apply_fn = AsyncMock(return_value="preview")
+    apply_fn = _staging_apply(_ISIS_STAGED_SYSTEM, preview="preview")
     await _run_guarded_removal(device_id, job_id, client, apply_fn)
     async for db in get_session():
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
-        assert job.error["detail"]["orphan_processes"] == ["OLD"]
+        assert job.error["detail"]["orphans"] == {"process-config": [["OLD"]]}
         break
 
 
@@ -536,15 +536,16 @@ async def test_isis_removal_proceeds_when_extra_row_was_just_removed(adapter_cli
             ],
         }
     )
+    # legacy pre-#90 context shape — jobs queued before the generalization must still pass
     job_id = await _seed_removal_job(device_id, scope="isis", context_extra={"removed_interfaces": [["lag1", "ipv4"]]})
-    apply_fn = AsyncMock()
+    apply_fn = _staging_apply(_ISIS_STAGED_SYSTEM)
     await _run_guarded_removal(device_id, job_id, client, apply_fn)
     async for db in get_session():
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         break
-    apply_fn.assert_awaited_once()
-    assert apply_fn.await_args.kwargs == {"replace": True}
+    final = apply_fn.await_args_list[-1]
+    assert final.kwargs == {"replace": True}
 
 
 async def test_isis_removal_force_skips_guard(adapter_client):
@@ -584,3 +585,260 @@ async def test_isis_removal_without_service_instance_proceeds(adapter_client):
         assert job.status == JobStatus.succeeded
         break
     apply_fn.assert_awaited_once()
+
+
+# ── generalized collateral guard (#90) — every PUT-replace scope ──────────────
+#
+# The same orphan-flush risk exists in every scope whose removal PUT-replaces a
+# device-keyed service instance (ospf/bgp/snmp + the _SIMPLE_TARGETS). The guard
+# generalizes: stage the would-be PUT body (no HTTP), diff its keyed YANG lists
+# against the CURRENT service instance, allow only the trigger's just-removed
+# keys (context["removed"] = {yang-list: [keys]}), block anything beyond.
+
+
+def _guard_client(service_config=None):
+    """A spec'd NSO-client fake for the generic guard: only the service GET is primed."""
+    from nso_adapter.nso.client import NsoClient
+
+    client = AsyncMock(spec=NsoClient)
+    client.get_service_config.return_value = service_config
+    return client
+
+
+def _staging_apply(entry: dict, preview: str = "native preview"):
+    """An apply spy honouring the ``stage`` contract of _send_service_config.
+
+    The guard builds the would-be PUT body via ``apply(stage=...)``; a bare
+    AsyncMock would leave the stage empty and make every current row look like
+    an orphan. The spy records calls like an AsyncMock and stages *entry*.
+    """
+
+    async def _impl(*args, **kwargs):
+        if kwargs.get("stage") is not None:
+            kwargs["stage"]["x:config"] = [entry]
+            return None
+        if kwargs.get("dry_run"):
+            return preview
+        return None
+
+    return AsyncMock(side_effect=_impl)
+
+
+async def _run_removal_with(scope: str, apply_target: str, device_id: int, job_id: int, client, apply_fn):
+    with (
+        patch(f"nso_adapter.nso.apply.{apply_target}", apply_fn),
+        patch("nso_adapter.core.importer.get_nso_client", return_value=client),
+    ):
+        await removal_mod.run_removal(job_id, device_id)
+
+
+async def test_snmp_removal_blocked_on_orphaned_community(adapter_client):
+    """An snmp service community that is neither in the staged body nor just-removed
+    is collateral — the job blocks with the generic orphans detail."""
+    device_id = await _seed_device(nso_device_name="sw-snmp-guard")
+    client = _guard_client(
+        {
+            "device": "sw-snmp-guard",
+            "community": [{"name": "ops"}, {"name": "legacy"}],
+            "host": [{"address": "10.0.0.9"}],
+        }
+    )
+    job_id = await _seed_removal_job(device_id, scope="snmp")
+    apply_fn = _staging_apply(
+        {"device": "sw-snmp-guard", "community": [{"name": "ops"}], "host": [{"address": "10.0.0.9"}]}
+    )
+    await _run_removal_with("snmp", "apply_snmp_config", device_id, job_id, client, apply_fn)
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.error["code"] == "removal_blocked_collateral"
+        assert job.error["detail"]["orphans"] == {"community": [["legacy"]]}
+        assert job.error["detail"]["preview"] == "native preview"
+        break
+    # stage + dry-run preview only — nothing committed
+    committed = [c for c in apply_fn.await_args_list if c.kwargs.get("stage") is None and not c.kwargs.get("dry_run")]
+    assert committed == []
+
+
+async def test_snmp_removal_passes_when_removed_threaded(adapter_client):
+    """The trigger's just-removed community is an EXPECTED retraction, not collateral."""
+    device_id = await _seed_device(nso_device_name="sw-snmp-legit")
+    client = _guard_client({"device": "sw-snmp-legit", "community": [{"name": "ops"}, {"name": "legacy"}]})
+    job_id = await _seed_removal_job(device_id, scope="snmp", context_extra={"removed": {"community": ["legacy"]}})
+    apply_fn = _staging_apply({"device": "sw-snmp-legit", "community": [{"name": "ops"}]})
+    await _run_removal_with("snmp", "apply_snmp_config", device_id, job_id, client, apply_fn)
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        break
+    final = apply_fn.await_args_list[-1]
+    assert final.kwargs.get("replace") is True and final.kwargs.get("stage") is None
+
+
+async def test_vlan_removal_blocked_on_orphan_vid_normalizes_ints(adapter_client):
+    """vlan-id ints (NSO JSON) and store ints compare as strings — no false pass/block."""
+    device_id = await _seed_device(nso_device_name="sw-vlan-guard")
+    client = _guard_client({"device": "sw-vlan-guard", "vlan": [{"vlan-id": 10}, {"vlan-id": 99}]})
+    job_id = await _seed_removal_job(device_id, scope="vlan")
+    apply_fn = _staging_apply({"device": "sw-vlan-guard", "vlan": [{"vlan-id": 10}]})
+    await _run_removal_with("vlan", "apply_vlan_config", device_id, job_id, client, apply_fn)
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.error["detail"]["orphans"] == {"vlan": [["99"]]}
+        break
+
+
+async def test_bgp_removal_blocked_on_nested_orphan_peer(adapter_client):
+    """bgp peers live two lists deep (router/scope/peer); an orphan peer still blocks."""
+    device_id = await _seed_device(nso_device_name="sw-bgp-guard")
+    service = {
+        "device": "sw-bgp-guard",
+        "router": [
+            {
+                "asn": "64500",
+                "scope": [{"vrf": "", "peer": [{"peer-address": "192.0.2.1"}, {"peer-address": "192.0.2.9"}]}],
+            }
+        ],
+    }
+    staged = {
+        "device": "sw-bgp-guard",
+        "router": [{"asn": "64500", "scope": [{"vrf": "", "peer": [{"peer-address": "192.0.2.1"}]}]}],
+    }
+    client = _guard_client(service)
+    job_id = await _seed_removal_job(device_id, scope="bgp")
+    apply_fn = _staging_apply(staged)
+    await _run_removal_with("bgp", "apply_bgp_config", device_id, job_id, client, apply_fn)
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.error["detail"]["orphans"] == {"peer": [["192.0.2.9"]]}
+        break
+
+
+async def test_bgp_removal_passes_with_removed_peer_threaded(adapter_client):
+    device_id = await _seed_device(nso_device_name="sw-bgp-legit")
+    service = {
+        "device": "sw-bgp-legit",
+        "router": [{"asn": "64500", "scope": [{"vrf": "", "peer": [{"peer-address": "192.0.2.9"}]}]}],
+    }
+    staged = {"device": "sw-bgp-legit", "router": [{"asn": "64500", "scope": [{"vrf": "", "peer": []}]}]}
+    client = _guard_client(service)
+    job_id = await _seed_removal_job(device_id, scope="bgp", context_extra={"removed": {"peer": ["192.0.2.9"]}})
+    apply_fn = _staging_apply(staged)
+    await _run_removal_with("bgp", "apply_bgp_config", device_id, job_id, client, apply_fn)
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        break
+
+
+async def test_static_route_removal_compound_key(adapter_client):
+    """static routes are keyed (vrf, prefix, next-hop); the compound key must round-trip
+    through the removed context (JSON arrays) and match the YANG entry fields."""
+    device_id = await _seed_device(nso_device_name="sw-sr-guard")
+    service = {
+        "device": "sw-sr-guard",
+        "route": [
+            {"vrf": "", "prefix": "10.0.0.0/24", "next-hop": "192.0.2.1"},
+            {"vrf": "", "prefix": "10.9.0.0/24", "next-hop": "192.0.2.9"},
+        ],
+    }
+    staged = {"device": "sw-sr-guard", "route": [{"vrf": "", "prefix": "10.0.0.0/24", "next-hop": "192.0.2.1"}]}
+    client = _guard_client(service)
+    job_id = await _seed_removal_job(
+        device_id, scope="static_route", context_extra={"removed": {"route": [["", "10.9.0.0/24", "192.0.2.9"]]}}
+    )
+    apply_fn = _staging_apply(staged)
+    await _run_removal_with("static_route", "apply_static_routes", device_id, job_id, client, apply_fn)
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        break
+
+    # same setup WITHOUT the removed context → the dropped route is collateral
+    job2 = await _seed_removal_job(device_id, scope="static_route")
+    apply_fn2 = _staging_apply(staged)
+    await _run_removal_with("static_route", "apply_static_routes", device_id, job2, client, apply_fn2)
+    async for db in get_session():
+        job = await db.get(Job, job2)
+        assert job.status == JobStatus.failed
+        assert job.error["detail"]["orphans"] == {"route": [["", "10.9.0.0/24", "192.0.2.9"]]}
+        break
+
+
+async def test_generic_force_skips_guard_and_service_get(adapter_client):
+    """force=true (operator override) commits without even reading the service."""
+    device_id = await _seed_device(nso_device_name="sw-vlan-force")
+    client = _guard_client({"device": "sw-vlan-force", "vlan": [{"vlan-id": 99}]})
+    job_id = await _seed_removal_job(device_id, scope="vlan", context_extra={"force": True})
+    apply_fn = AsyncMock()
+    await _run_removal_with("vlan", "apply_vlan_config", device_id, job_id, client, apply_fn)
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        break
+    apply_fn.assert_awaited_once()
+    assert apply_fn.await_args.kwargs == {"replace": True}
+    client.get_service_config.assert_not_awaited()
+
+
+async def test_generic_no_service_instance_skips_guard(adapter_client):
+    """No service instance in NSO (404 → None) → nothing to guard, plain replace."""
+    device_id = await _seed_device(nso_device_name="sw-logging-fresh")
+    client = _guard_client(None)
+    job_id = await _seed_removal_job(device_id, scope="logging")
+    apply_fn = AsyncMock()
+    await _run_removal_with("logging", "apply_logging_config", device_id, job_id, client, apply_fn)
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        break
+    apply_fn.assert_awaited_once()
+    assert apply_fn.await_args.kwargs == {"replace": True}
+
+
+async def test_replace_on_removal_threads_removed_keys(adapter_client):
+    """The shim maps each simple scope's removed store keys onto its YANG list."""
+    device_id = await _seed_device(nso_device_name="sw-shim")
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        ok = await replace_on_removal(db, device, [3366, 3377], VlanIntent)
+        assert ok is True
+        break
+    async for db in get_session():
+        job = (await db.execute(select(Job))).scalars().one()
+        assert job.context == {"scope": "vlan", "removed": {"vlan": [3366, 3377]}}
+        break
+
+
+async def test_replace_on_removal_maps_route_policy_families(adapter_client):
+    """route_policy removed keys are (family, name); the shim buckets them into the
+    per-family YANG lists (community_list → community-list etc.)."""
+    device_id = await _seed_device(nso_device_name="sw-shim-rp")
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        ok = await replace_on_removal(
+            db, device, [("community_list", "cnad-test"), ("route_map", "RM-IN")], RoutePolicyObjectIntent
+        )
+        assert ok is True
+        break
+    async for db in get_session():
+        job = (await db.execute(select(Job))).scalars().one()
+        assert job.context == {
+            "scope": "route_policy",
+            "removed": {"community-list": ["cnad-test"], "route-map": ["RM-IN"]},
+        }
+        break
+
+
+async def test_enqueue_removal_serializes_removed_tuples(adapter_client):
+    """Tuple keys (compound) become JSON-safe arrays in the job context."""
+    device_id = await _seed_device(nso_device_name="sw-enq")
+    async for db in get_session():
+        job = await enqueue_removal(
+            db, device_id, "static_route", removed={"route": [("", "10.0.0.0/24", "192.0.2.1")]}
+        )
+        await db.commit()
+        assert job.context == {"scope": "static_route", "removed": {"route": [["", "10.0.0.0/24", "192.0.2.1"]]}}
+        break

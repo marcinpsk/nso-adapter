@@ -19,6 +19,9 @@ safe to requeue after a restart.
 
 from __future__ import annotations
 
+from functools import cache
+from typing import NamedTuple
+
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -59,20 +62,174 @@ class RemovalBlockedError(Exception):
     """A PUT-replace would retract service rows nobody just removed (collateral).
 
     Raised by the scope guard BEFORE anything is committed; carries the orphan keys
-    and a native dry-run preview so the failed job's detail gives the operator the
-    full would-be device delta to review (the ra1 lo0 incident guard).
+    per YANG list and a native dry-run preview so the failed job's detail gives the
+    operator the full would-be device delta to review (the ra1 lo0 incident guard).
     """
 
-    def __init__(self, orphan_interfaces: list, orphan_processes: list, preview: str | None):
-        self.orphan_interfaces = orphan_interfaces
-        self.orphan_processes = orphan_processes
+    def __init__(self, orphans: dict[str, list], preview: str | None):
+        self.orphans = orphans
         self.preview = preview
-        super().__init__(
-            f"PUT-replace would retract rows not in intent: interfaces={orphan_interfaces} processes={orphan_processes}"
-        )
+        super().__init__(f"PUT-replace would retract rows not in intent: {orphans}")
 
 
-async def _replace_simple(db: AsyncSession, device, client, scope: str) -> None:
+# ── collateral guard (#90) — every device-keyed PUT-replace scope ─────────────
+
+
+class _GuardList(NamedTuple):
+    """One keyed YANG list the guard compares.
+
+    ``label`` names the list in ``context["removed"]`` and in the orphan report;
+    ``path`` walks nested lists from the service entry root to the keyed list
+    (bgp peers live at router→scope→peer); ``keys`` are the key leaf names.
+    """
+
+    label: str
+    path: tuple[str, ...]
+    keys: tuple[str, ...]
+
+
+class _GuardSpec(NamedTuple):
+    service_path: str
+    lists: tuple[_GuardList, ...]
+
+
+@cache
+def _guard_specs() -> dict[str, _GuardSpec]:
+    """Scope → service instance path + the keyed YANG lists a PUT-replace can retract.
+
+    Service paths come from the apply module (single source of truth). Nested
+    non-keyed content (route-map entries, redistribute rows, bgp address-families,
+    snmp system-info scalars) is intentionally NOT guarded: the collateral unit is
+    the keyed config object a stale service row would silently flush off the device.
+    interface_config is excluded — its removal is per-instance PUT/DELETE by design.
+    """
+    from nso_adapter.nso import apply as A
+
+    return {
+        "isis": _GuardSpec(
+            A._ISIS_SERVICE_PATH,
+            (
+                _GuardList("interface-config", ("interface-config",), ("interface-name", "af")),
+                _GuardList("process-config", ("process-config",), ("process-tag",)),
+            ),
+        ),
+        "ospf": _GuardSpec(
+            A._OSPF_SERVICE_PATH,
+            (
+                _GuardList("interface-config", ("interface-config",), ("interface-name",)),
+                _GuardList("process-config", ("process-config",), ("process-id",)),
+            ),
+        ),
+        "bgp": _GuardSpec(
+            A._BGP_SERVICE_PATH,
+            (
+                _GuardList("router", ("router",), ("asn",)),
+                # device-wide flatten: the trigger can only produce peer addresses
+                # across all routers/scopes, so the guard compares at the same grain
+                _GuardList("peer", ("router", "scope", "peer"), ("peer-address",)),
+            ),
+        ),
+        "snmp": _GuardSpec(
+            A._SNMP_SERVICE_PATH,
+            (
+                _GuardList("community", ("community",), ("name",)),
+                _GuardList("v3-user", ("v3-user",), ("username",)),
+                _GuardList("host", ("host",), ("address",)),
+            ),
+        ),
+        "route_policy": _GuardSpec(
+            A._ROUTE_POLICY_SERVICE_PATH,
+            (
+                _GuardList("prefix-list", ("prefix-list",), ("name",)),
+                _GuardList("community-list", ("community-list",), ("name",)),
+                _GuardList("as-path", ("as-path",), ("name",)),
+                _GuardList("route-map", ("route-map",), ("name",)),
+            ),
+        ),
+        "bfd": _GuardSpec(A._BFD_SERVICE_PATH, (_GuardList("interface", ("interface",), ("interface-name",)),)),
+        "svi": _GuardSpec(A._SVI_SERVICE_PATH, (_GuardList("interface", ("interface",), ("interface-name",)),)),
+        "subinterface": _GuardSpec(
+            A._SUBIF_SERVICE_PATH, (_GuardList("interface", ("interface",), ("interface-name",)),)
+        ),
+        "static_route": _GuardSpec(
+            A._STATIC_ROUTE_SERVICE_PATH, (_GuardList("route", ("route",), ("vrf", "prefix", "next-hop")),)
+        ),
+        "interface_mtu": _GuardSpec(
+            A._MTU_SERVICE_PATH, (_GuardList("interface", ("interface",), ("interface-name",)),)
+        ),
+        "vlan": _GuardSpec(A._VLAN_SERVICE_PATH, (_GuardList("vlan", ("vlan",), ("vlan-id",)),)),
+        "logging": _GuardSpec(A._LOGGING_SERVICE_PATH, (_GuardList("host", ("host",), ("address",)),)),
+        "l2_sap": _GuardSpec(A._L2_SAP_SERVICE_PATH, (_GuardList("sap", ("sap",), ("service-name", "sap-id")),)),
+    }
+
+
+def _norm_key(key) -> tuple[str, ...]:
+    """Normalize a key (scalar or sequence) to a tuple of strings.
+
+    NSO JSON may carry ints (vlan-id) where the store/trigger has ints or strings,
+    and compound keys round-trip through JSON job context as arrays — string tuples
+    make all three sources comparable.
+    """
+    parts = key if isinstance(key, (list, tuple)) else (key,)
+    return tuple("" if p is None else str(p) for p in parts)
+
+
+def _leaf_keys(entry: dict, guard_list: _GuardList) -> set[tuple[str, ...]]:
+    """Collect the key tuples of *guard_list*'s leaf entries under *entry*."""
+    level = [entry]
+    for name in guard_list.path:
+        level = [child for node in level for child in (node.get(name) or [])]
+    return {tuple(str(e.get(f, "")) for f in guard_list.keys) for e in level}
+
+
+def _removed_context(scope: str, context: dict) -> dict[str, list]:
+    """Return the trigger's just-removed keys per YANG list (with pre-#90 isis compat)."""
+    removed = dict(context.get("removed") or {})
+    if scope == "isis":  # legacy context shape from jobs queued before the generalization
+        removed.setdefault("interface-config", context.get("removed_interfaces", []))
+        removed.setdefault("process-config", context.get("removed_processes", []))
+    return removed
+
+
+async def _guarded_apply(client, device, scope: str, context: dict | None, apply_thunk) -> None:
+    """Run *scope*'s PUT-replace behind the collateral guard (the ra1 lo0 incident).
+
+    ``apply_thunk(**kwargs)`` must call the scope's apply function with its full row
+    collections, forwarding ``replace``/``dry_run``/``stage``. Guard flow: GET the
+    current service instance; stage the would-be PUT body (no HTTP — the apply
+    builder is the single source of key truth, so the diff is YANG-to-YANG); any
+    current key that is neither re-asserted nor in the trigger's just-removed set
+    is an ORPHAN — block with a native dry-run preview instead of committing.
+    ``context["force"]`` (the actions/force-removal override) skips the guard.
+    """
+    context = context or {}
+    if context.get("force"):
+        logger.warning("removal.force", device_id=device.id, scope=scope)
+        await apply_thunk(replace=True)
+        return
+    spec = _guard_specs().get(scope)
+    current = None
+    if spec is not None:
+        current = await client.get_service_config(spec.service_path, device.nso_device_name)
+    if current:
+        stage: dict[str, list] = {}
+        await apply_thunk(replace=True, stage=stage)
+        staged_entries = next(iter(stage.values()), None) or [{}]
+        entry = staged_entries[0]
+        removed = _removed_context(scope, context)
+        orphans: dict[str, list] = {}
+        for gl in spec.lists:
+            allowed = {_norm_key(k) for k in removed.get(gl.label, [])}
+            orphan = sorted(_leaf_keys(current, gl) - _leaf_keys(entry, gl) - allowed)
+            if orphan:
+                orphans[gl.label] = [list(k) for k in orphan]
+        if orphans:
+            preview = await apply_thunk(replace=True, dry_run=True)
+            raise RemovalBlockedError(orphans, preview)
+    await apply_thunk(replace=True)
+
+
+async def _replace_simple(db: AsyncSession, device, client, scope: str, context: dict | None = None) -> None:
     """PUT-replace a single-model service with its remaining accepted rows."""
     from nso_adapter.nso import apply as nso_apply
     from nso_adapter.store import models as store_models
@@ -85,13 +242,17 @@ async def _replace_simple(db: AsyncSession, device, client, scope: str) -> None:
         .scalars()
         .all()
     )
-    kwargs: dict = {"replace": True}
+    extra: dict = {}
     if scope in _NED_DIALECT_SCOPES:
-        kwargs["ned_id"] = device.ned_id
-    await apply_fn(client, device.nso_device_name, rows, **kwargs)
+        extra["ned_id"] = device.ned_id
+
+    async def _apply(**kwargs):
+        return await apply_fn(client, device.nso_device_name, rows, **extra, **kwargs)
+
+    await _guarded_apply(client, device, scope, context, _apply)
 
 
-async def _replace_ospf(db: AsyncSession, device, client) -> None:
+async def _replace_ospf(db: AsyncSession, device, client, context: dict | None = None) -> None:
     from nso_adapter.nso.apply import apply_ospf_config
     from nso_adapter.store.models import OspfInstanceIntent, OspfInterfaceIntent, RedistributionIntent
 
@@ -133,10 +294,14 @@ async def _replace_ospf(db: AsyncSession, device, client) -> None:
         .scalars()
         .all()
     )
-    await apply_ospf_config(client, device.nso_device_name, insts, ifaces, redist, replace=True)
+
+    async def _apply(**kwargs):
+        return await apply_ospf_config(client, device.nso_device_name, insts, ifaces, redist, **kwargs)
+
+    await _guarded_apply(client, device, "ospf", context, _apply)
 
 
-async def _replace_bgp(db: AsyncSession, device, client) -> None:
+async def _replace_bgp(db: AsyncSession, device, client, context: dict | None = None) -> None:
     from nso_adapter.core.bgp_load import attach_bgp_relationships
     from nso_adapter.nso.apply import apply_bgp_config
     from nso_adapter.store.models import BgpRouterIntent, RedistributionIntent
@@ -166,7 +331,11 @@ async def _replace_bgp(db: AsyncSession, device, client) -> None:
         .scalars()
         .all()
     )
-    await apply_bgp_config(client, device.nso_device_name, routers, redist, replace=True)
+
+    async def _apply(**kwargs):
+        return await apply_bgp_config(client, device.nso_device_name, routers, redist, **kwargs)
+
+    await _guarded_apply(client, device, "bgp", context, _apply)
 
 
 async def _replace_interface_config(db: AsyncSession, device, client, interface_names: list[str]) -> None:
@@ -241,13 +410,9 @@ async def _replace_isis(db: AsyncSession, device, client, context: dict | None =
     owned scalar (metric back to blank, whose leaf a merge-PATCH would never drop) is
     reverted on the device, while un-owned brownfield IS-IS config stays (reconcile).
 
-    COLLATERAL GUARD (the ra1 lo0 incident): before committing, compare the rows NSO's
-    service currently carries against the snapshot being asserted plus the keys the
-    trigger just removed (``context["removed_interfaces"]``/``["removed_processes"]``).
-    Anything beyond that is an ORPHAN — a stale service row whose intent deletion never
-    propagated (PATCH-no-op era) — and a PUT-replace would silently retract it from the
-    live device. Block with a native dry-run preview instead; ``context["force"]``
-    (the actions/force-removal override) skips the guard after operator review.
+    COLLATERAL GUARD (the ra1 lo0 incident): handled by :func:`_guarded_apply` like
+    every PUT-replace scope — anything the service carries beyond the snapshot plus
+    the trigger's just-removed keys blocks with a native dry-run preview.
     """
     from nso_adapter.nso.apply import apply_isis_interfaces
     from nso_adapter.store.models import (
@@ -270,30 +435,15 @@ async def _replace_isis(db: AsyncSession, device, client, context: dict | None =
     levels = await _accepted(IsisLevelIntent)
     redist = await _accepted(RedistributionIntent, RedistributionIntent.dest_protocol == "isis")
 
-    context = context or {}
-    if not context.get("force"):
-        current = await client.get_isis_service_config(device.nso_device_name)
-        if current:
-            snapshot_ifaces = {(r.interface_name, r.af) for r in ifaces}
-            snapshot_procs = {(r.process_tag or "") for r in procs}
-            removed_ifaces = {tuple(k) for k in context.get("removed_interfaces", [])}
-            removed_procs = set(context.get("removed_processes", []))
-            nso_ifaces = {(e.get("interface-name"), e.get("af", "ipv4")) for e in current.get("interface-config", [])}
-            nso_procs = {e.get("process-tag", "") for e in current.get("process-config", [])}
-            orphan_ifaces = sorted(nso_ifaces - snapshot_ifaces - removed_ifaces)
-            orphan_procs = sorted(nso_procs - snapshot_procs - removed_procs)
-            if orphan_ifaces or orphan_procs:
-                preview = await apply_isis_interfaces(
-                    client, device.nso_device_name, ifaces, procs, redist, flex, levels, replace=True, dry_run=True
-                )
-                raise RemovalBlockedError([list(k) for k in orphan_ifaces], list(orphan_procs), preview)
-    else:
-        logger.warning("removal.force", device_id=device.id, scope="isis")
+    async def _apply(**kwargs):
+        return await apply_isis_interfaces(
+            client, device.nso_device_name, ifaces, procs, redist, flex, levels, **kwargs
+        )
 
-    await apply_isis_interfaces(client, device.nso_device_name, ifaces, procs, redist, flex, levels, replace=True)
+    await _guarded_apply(client, device, "isis", context, _apply)
 
 
-async def _replace_snmp(db: AsyncSession, device, client) -> None:
+async def _replace_snmp(db: AsyncSession, device, client, context: dict | None = None) -> None:
     """PUT-replace the snmp-reconciler with the device's full remaining intent (all collections).
 
     Bespoke (not a _SIMPLE_TARGET) because apply_snmp_config takes four collections
@@ -318,22 +468,26 @@ async def _replace_snmp(db: AsyncSession, device, client) -> None:
     sysinfo = (
         await db.execute(select(SnmpSystemInfoIntent).where(SnmpSystemInfoIntent.device_id == device_id))
     ).scalar_one_or_none()
-    await apply_snmp_config(client, device.nso_device_name, comms, users, hosts, sysinfo, replace=True)
+
+    async def _apply(**kwargs):
+        return await apply_snmp_config(client, device.nso_device_name, comms, users, hosts, sysinfo, **kwargs)
+
+    await _guarded_apply(client, device, "snmp", context, _apply)
 
 
 async def _dispatch_scope(db: AsyncSession, device, client, scope: str, context: dict | None = None) -> None:
     if scope == "ospf":
-        await _replace_ospf(db, device, client)
+        await _replace_ospf(db, device, client, context)
     elif scope == "bgp":
-        await _replace_bgp(db, device, client)
+        await _replace_bgp(db, device, client, context)
     elif scope == "snmp":
-        await _replace_snmp(db, device, client)
+        await _replace_snmp(db, device, client, context)
     elif scope == "isis":
         await _replace_isis(db, device, client, context)
     elif scope == "interface_config":
         await _replace_interface_config(db, device, client, (context or {}).get("interfaces") or [])
     elif scope in _SIMPLE_TARGETS:
-        await _replace_simple(db, device, client, scope)
+        await _replace_simple(db, device, client, scope, context)
     else:
         raise ValueError(f"Unknown removal scope {scope!r}")
 
@@ -344,8 +498,7 @@ async def enqueue_removal(
     scope: str,
     *,
     interfaces: list[str] | None = None,
-    removed_interfaces: list | None = None,
-    removed_processes: list | None = None,
+    removed: dict[str, list] | None = None,
     force: bool = False,
 ):
     """Queue an async ``removal`` job that PUT-replaces *scope*'s service.
@@ -353,8 +506,8 @@ async def enqueue_removal(
     Non-blocking: the intent PUT returns immediately and the worker runs the
     (potentially slow) device commit in the background via :func:`run_removal`.
     *interfaces* scopes an ``interface_config`` removal to the affected interface names.
-    *removed_interfaces*/*removed_processes* record what the trigger JUST deleted so
-    the collateral guard can tell an intended retraction from an orphaned service row;
+    *removed* maps each YANG list to the keys the trigger JUST deleted so the
+    collateral guard can tell an intended retraction from an orphaned service row;
     *force* skips the guard (the operator override after reviewing a blocked removal).
     """
     from nso_adapter.store.models import Job, JobStatus, JobType
@@ -364,10 +517,13 @@ async def enqueue_removal(
     context: dict = {"scope": scope}
     if interfaces:
         context["interfaces"] = interfaces
-    if removed_interfaces:
-        context["removed_interfaces"] = [list(k) for k in removed_interfaces]
-    if removed_processes:
-        context["removed_processes"] = list(removed_processes)
+    if removed:
+        # compound keys arrive as tuples — make them JSON-safe arrays for the job row
+        context["removed"] = {
+            label: [list(k) if isinstance(k, (list, tuple)) else k for k in keys]
+            for label, keys in removed.items()
+            if keys
+        }
     if force:
         context["force"] = True
     job = Job(
@@ -417,8 +573,7 @@ async def run_removal(job_id: int, device_id: int) -> None:
                 job_id=job_id,
                 device_id=device_id,
                 scope=scope,
-                orphan_interfaces=blocked.orphan_interfaces,
-                orphan_processes=blocked.orphan_processes,
+                orphans=blocked.orphans,
             )
             await _mark_job_failed(
                 db,
@@ -428,8 +583,7 @@ async def run_removal(job_id: int, device_id: int) -> None:
                     "message": str(blocked),
                     "detail": {
                         "scope": scope,
-                        "orphan_interfaces": blocked.orphan_interfaces,
-                        "orphan_processes": blocked.orphan_processes,
+                        "orphans": blocked.orphans,
                         "preview": blocked.preview,
                         "hint": (
                             "These service rows are not in the remaining intent and were not part of "
@@ -448,14 +602,48 @@ async def run_removal(job_id: int, device_id: int) -> None:
             )
 
 
+# store family → the YANG list that carries the object in the route-policy service
+_ROUTE_POLICY_FAMILY_LISTS: dict[str, str] = {
+    "prefix_list": "prefix-list",
+    "community_list": "community-list",
+    "as_path": "as-path",
+    "route_map": "route-map",
+}
+
+
+def _removed_map(scope: str, removed) -> dict[str, list]:
+    """Map a simple scope's just-removed store keys onto its guarded YANG list(s).
+
+    For every _SIMPLE_TARGET the intent PUT already computes the removed keys and
+    they equal the YANG key values verbatim — except route_policy, whose
+    ``(family, name)`` tuples bucket into the per-family lists.
+    """
+    if not isinstance(removed, (list, tuple, set)):
+        return {}
+    if scope == "route_policy":
+        by_list: dict[str, list] = {}
+        for family, name in removed:
+            yang_list = _ROUTE_POLICY_FAMILY_LISTS.get(family)
+            if yang_list:
+                by_list.setdefault(yang_list, []).append(name)
+        return by_list
+    spec = _guard_specs().get(scope)
+    if spec is None or len(spec.lists) != 1:
+        return {}
+    return {spec.lists[0].label: list(removed)}
+
+
 async def replace_on_removal(db: AsyncSession, device, removed, store_model, apply_callable=None) -> bool:
     """Enqueue an async removal job for *store_model*'s scope if *removed* is truthy.
 
     Back-compat shim: the per-service intent PUTs still call this with their
     ``(store_model, apply_callable)``; the scope is derived from ``store_model`` and
     the device commit now runs in a background ``removal`` job rather than inline.
-    *apply_callable* is retained for signature compatibility but superseded by the
-    scope registry. Returns True if a removal job was queued.
+    *removed* — the just-removed store keys every caller already computes — is
+    threaded into the job context so the collateral guard can tell the intended
+    retraction from an orphaned service row. *apply_callable* is retained for
+    signature compatibility but superseded by the scope registry. Returns True if
+    a removal job was queued.
 
     These callers invoke this AFTER committing their row deletes, so the enqueued
     job is committed here. (OSPF/BGP call :func:`enqueue_removal` directly, before
@@ -467,6 +655,6 @@ async def replace_on_removal(db: AsyncSession, device, removed, store_model, app
     if scope is None:
         logger.error("removal.unknown_model", model=store_model.__name__)
         return False
-    await enqueue_removal(db, device.id, scope)
+    await enqueue_removal(db, device.id, scope, removed=_removed_map(scope, removed))
     await db.commit()
     return True

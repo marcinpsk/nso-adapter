@@ -389,12 +389,16 @@ async def _maybe_enqueue_apply(db: AsyncSession, device_id: int, router_count: i
 
 
 def _bgp_removed(
-    existing_asns: set[str], existing_peers: set[str], routers: list[BgpRouterModel], removed_redist: list
-) -> bool:
-    """Report whether any router, peer or redistribution row dropped out of the new payload."""
+    existing_asns: set[str], existing_peers: set[str], routers: list[BgpRouterModel]
+) -> tuple[list[str], list[str]]:
+    """Return the (router ASNs, peer addresses) dropped out of the new payload.
+
+    The peer diff is device-wide (across all routers/scopes) — the same grain the
+    removal collateral guard compares at.
+    """
     incoming_asns = {r.asn for r in routers}
     incoming_peers = {p.peer_address for r in routers for s in r.scopes for p in s.peers}
-    return bool((existing_asns - incoming_asns) or (existing_peers - incoming_peers) or removed_redist)
+    return sorted(existing_asns - incoming_asns), sorted(existing_peers - incoming_peers)
 
 
 @router.put("/{device_id}/bgp-intent", dependencies=[Depends(verify_token)])
@@ -420,10 +424,14 @@ async def put_bgp_intent(device_id: int, body: BgpIntentUpdate, db: AsyncSession
 
     await _maybe_enqueue_apply(db, device_id, router_count)
 
-    if _bgp_removed(existing_asns, existing_peers, body.routers, removed_redist):
+    removed_asns, removed_peers = _bgp_removed(existing_asns, existing_peers, body.routers)
+    if removed_asns or removed_peers or removed_redist:
         from nso_adapter.core.removal import enqueue_removal
 
-        await enqueue_removal(db, device_id, "bgp")
+        # Thread the just-removed keys so the collateral guard can tell this intended
+        # retraction from an orphaned service row (redistribute rows are nested,
+        # non-guarded content — only the keyed router/peer lists matter here).
+        await enqueue_removal(db, device_id, "bgp", removed={"router": removed_asns, "peer": removed_peers})
 
     await db.commit()
 
