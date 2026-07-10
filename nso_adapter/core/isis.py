@@ -37,11 +37,15 @@ _PROC_SCALAR_KEYS = (
     "te-enabled",
     "suppress-attached-bit",
     "ignore-attached-bit",
+    "fast-reroute",
+    "microloop-avoidance",
     "distance",
     "maximum-paths",
     "reference-bandwidth",
 )
 _IFACE_SCALAR_KEYS = (
+    "frr-enabled",
+    "frr-protection",
     "csnp-interval",
     "retransmit-interval",
     "lsp-interval",

@@ -1187,6 +1187,11 @@ class DeviceIsisProcess(Base):
     # received ATT bit (IOS/IOS-XR/Junos/Nokia). Emitted True only when configured.
     suppress_attached_bit: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     ignore_attached_bit: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # FRR (#83) -> netbox_routing ISISInstance.fast_reroute / microloop_avoidance.
+    # fast_reroute: lfa | remote-lfa | ti-lfa (instance-level where the NED models it,
+    # rolled up from interface flavors on XR/ArcOS); microloop_avoidance True-only.
+    fast_reroute: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    microloop_avoidance: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     # NB: segment-routing state lives in the `segment_routing` JSON bag (the plugin
     # reconciles it into the ISISSegmentRouting child); the old top-level sr_enabled/
     # sr_node_msd scalars were stale read-surface and were dropped (s3-21).
@@ -1236,6 +1241,11 @@ class DeviceIsisInterface(Base):
     hello_auth_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     hello_auth_present: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     bfd_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)  # BFD enabled for IS-IS on this iface
+    # FRR (#83) -> netbox_routing ISISInterface.frr_enabled / frr_protection.
+    # frr_enabled tri-state: None unconfigured, False explicit disable/exclude;
+    # frr_protection: link | node (Junos link-/node-link-protection only).
+    frr_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    frr_protection: Mapped[str | None] = mapped_column(String(8), nullable=True)
     # per-interface scalars (read mirror of netbox_routing columns).
     csnp_interval: Mapped[int | None] = mapped_column(Integer, nullable=True)
     retransmit_interval: Mapped[int | None] = mapped_column(Integer, nullable=True)

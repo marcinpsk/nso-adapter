@@ -335,6 +335,51 @@ async def test_refresh_persists_attached_bit(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_refresh_persists_frr(adapter_client):
+    """#83: FRR mirror — process fast-reroute/microloop-avoidance, interface tri-state
+    frr-enabled + frr-protection. Absent keys stay None (unconfigured); an explicit
+    device-side disable/exclude arrives as frr-enabled=False and must persist as False."""
+    device_id = await seed_device(nso_device_name="isis-frr-01", netbox_device_id=973)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_isis_interfaces.return_value = {
+            "process": [
+                {"process-tag": "CORE", "fast-reroute": "ti-lfa", "microloop-avoidance": True},
+                {"process-tag": "EDGE"},  # unconfigured -> both None
+            ],
+            "interface": [
+                {"interface-name": "BE1", "af": "ipv4", "frr-enabled": True, "frr-protection": "node"},
+                {"interface-name": "BE2", "af": "ipv4", "frr-enabled": False},
+                {"interface-name": "BE3", "af": "ipv4"},
+            ],
+        }
+        await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
+
+        procs = {
+            p.process_tag: p
+            for p in (await db.execute(select(DeviceIsisProcess).where(DeviceIsisProcess.device_id == device.id)))
+            .scalars()
+            .all()
+        }
+        assert procs["CORE"].fast_reroute == "ti-lfa"
+        assert procs["CORE"].microloop_avoidance is True
+        assert procs["EDGE"].fast_reroute is None
+        assert procs["EDGE"].microloop_avoidance is None
+
+        ifaces = {
+            i.interface_name: i
+            for i in (await db.execute(select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id)))
+            .scalars()
+            .all()
+        }
+        assert ifaces["BE1"].frr_enabled is True
+        assert ifaces["BE1"].frr_protection == "node"
+        assert ifaces["BE2"].frr_enabled is False
+        assert ifaces["BE2"].frr_protection is None
+        assert ifaces["BE3"].frr_enabled is None
+
+
+@pytest.mark.anyio
 async def test_refresh_dedups_duplicate_interface(adapter_client):
     """s2-9: a duplicate (interface, af) in the export must not IntegrityError and roll back the
     whole full-replace — deduped (first occurrence wins)."""
