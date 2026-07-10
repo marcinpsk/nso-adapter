@@ -43,6 +43,7 @@ async def _upsert_static_routes(
                 prefix=prefix,
                 next_hop=next_hop,
                 interface_next_hop=route.get("interface-next-hop"),
+                next_hop_vrf=route.get("next-hop-vrf"),
                 metric=route.get("metric"),
                 permanent=route.get("permanent"),
                 tag=route.get("tag"),

@@ -911,6 +911,10 @@ class DeviceStaticRoute(Base):
     prefix: Mapped[str] = mapped_column(String(64), nullable=False)
     next_hop: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     interface_next_hop: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Inter-VRF (leaked) next-hop VRF — a NED may emit it together with the IP
+    # next-hop (the arcos leak-route form); dropping it on read would misrepresent
+    # the route (#94).
+    next_hop_vrf: Mapped[str | None] = mapped_column(String(128), nullable=True)
     metric: Mapped[int | None] = mapped_column(Integer, nullable=True)
     permanent: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     tag: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -935,6 +939,9 @@ class StaticRouteIntent(Base):
     prefix: Mapped[str] = mapped_column(String(64), nullable=False)
     next_hop: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     interface_next_hop: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Leak VRF on the accepted intent too — apply.py already emits next-hop-vrf, so
+    # an intent row that cannot carry it would strip the leak on a replace-apply.
+    next_hop_vrf: Mapped[str | None] = mapped_column(String(128), nullable=True)
     metric: Mapped[int | None] = mapped_column(Integer, nullable=True)
     permanent: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     tag: Mapped[int | None] = mapped_column(Integer, nullable=True)

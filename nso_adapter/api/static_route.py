@@ -53,6 +53,8 @@ async def get_static_routes(device_id: int, db: AsyncSession = Depends(get_db)):
         }
         if row.interface_next_hop is not None:
             entry["interface_next_hop"] = row.interface_next_hop
+        if row.next_hop_vrf is not None:
+            entry["next_hop_vrf"] = row.next_hop_vrf
         if row.metric is not None:
             entry["metric"] = row.metric
         if row.permanent is not None:
@@ -81,6 +83,8 @@ class StaticRouteEntry(BaseModel):
     vrf: str = ""
     prefix: str
     next_hop: str
+    interface_next_hop: str | None = None
+    next_hop_vrf: str | None = None
     metric: int | None = None
     permanent: bool | None = None
     tag: int | None = None
@@ -126,6 +130,8 @@ async def put_static_route_intent(device_id: int, body: StaticRouteIntentUpdate,
         if key in existing_rows:
             row = existing_rows[key]
             row.accepted_at = accepted
+            row.interface_next_hop = item.interface_next_hop
+            row.next_hop_vrf = item.next_hop_vrf
             row.metric = item.metric
             row.permanent = item.permanent
             row.tag = item.tag
@@ -136,6 +142,8 @@ async def put_static_route_intent(device_id: int, body: StaticRouteIntentUpdate,
                 vrf=item.vrf,
                 prefix=item.prefix,
                 next_hop=item.next_hop,
+                interface_next_hop=item.interface_next_hop,
+                next_hop_vrf=item.next_hop_vrf,
                 metric=item.metric,
                 permanent=item.permanent,
                 tag=item.tag,
