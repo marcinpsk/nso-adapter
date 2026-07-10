@@ -90,3 +90,30 @@ async def test_get_job_found(adapter_client):
         assert "created_at" in result
         assert "updated_at" in result
         break
+
+
+async def test_job_out_serializes_context(adapter_client):
+    """Jobs carry their queue context (e.g. removal scope) in the API payload.
+
+    The plugin's blocked-removal banner attributes EVERY removal job to a scope —
+    including queued/running ones whose result/error are still null — so the scope
+    must ride on the job itself, not only on the terminal result/error detail.
+    """
+    async for db in get_session():
+        d = Device(nso_instance="nso-dev", nso_device_name="jobs-ctx-01", netbox_device_id=1440)
+        db.add(d)
+        await db.flush()
+        j = Job(
+            device_id=d.id,
+            job_type=JobType.removal,
+            status=JobStatus.queued,
+            context={"scope": "isis", "force": True},
+        )
+        db.add(j)
+        await db.commit()
+        await db.refresh(j)
+        result = await get_job(job_id=j.id, db=db)
+        assert result["context"] == {"scope": "isis", "force": True}
+        listed = await list_jobs(device_id=d.id, db=db)
+        assert listed[0]["context"] == {"scope": "isis", "force": True}
+        break
