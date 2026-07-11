@@ -509,11 +509,20 @@ async def enqueue_removal(
     *removed* maps each YANG list to the keys the trigger JUST deleted so the
     collateral guard can tell an intended retraction from an orphaned service row;
     *force* skips the guard (the operator override after reviewing a blocked removal).
+
+    Returns ``None`` without queueing anything on a store-only request (the plugin's
+    intent re-sync, tracker #103): a store shrink then reconciles the intent mirror
+    only and must never retract FASTMAP-owned config from the device. *force* is
+    exempt — the operator force-removal action is an explicit device flush.
     """
+    from nso_adapter.core.request_flags import STORE_ONLY
     from nso_adapter.store.models import Job, JobStatus, JobType
 
     if scope not in VALID_REMOVAL_SCOPES:
         raise ValueError(f"Unknown removal scope {scope!r}")
+    if STORE_ONLY.get() and not force:
+        logger.info("removal.skipped_store_only", device_id=device_id, scope=scope)
+        return None
     context: dict = {"scope": scope}
     if interfaces:
         context["interfaces"] = interfaces
@@ -655,6 +664,8 @@ async def replace_on_removal(db: AsyncSession, device, removed, store_model, app
     if scope is None:
         logger.error("removal.unknown_model", model=store_model.__name__)
         return False
-    await enqueue_removal(db, device.id, scope, removed=_removed_map(scope, removed))
+    job = await enqueue_removal(db, device.id, scope, removed=_removed_map(scope, removed))
+    if job is None:  # store-only request — the shrink stays store-side
+        return False
     await db.commit()
     return True

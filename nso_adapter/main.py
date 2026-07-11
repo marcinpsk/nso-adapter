@@ -45,6 +45,7 @@ from nso_adapter.core.interface_ip import handle_interface_ip_change
 from nso_adapter.core.interface_mtu import handle_interface_mtu_change
 from nso_adapter.core.l2_service import handle_l2_service_change
 from nso_adapter.core.lag_topology import handle_netconf_config_change
+from nso_adapter.core.request_flags import STORE_ONLY, parse_store_only
 from nso_adapter.core.scheduler import start_scheduler, stop_scheduler
 from nso_adapter.core.snmp import handle_snmp_config_change
 from nso_adapter.core.subinterface import handle_subinterface_change
@@ -258,6 +259,18 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="NSO Adapter", version="0.1.0", lifespan=lifespan)
     app.add_exception_handler(ApiError, api_error_handler)
+
+    @app.middleware("http")
+    async def _store_only_flag(request, call_next):
+        # ?store_only=true → this request must not create device-touching jobs
+        # (removal/apply); guarded at the enqueue choke points in core. See
+        # core/request_flags.py for why this is request-scoped, not per-endpoint.
+        token = STORE_ONLY.set(parse_store_only(request.query_params.get("store_only")))
+        try:
+            return await call_next(request)
+        finally:
+            STORE_ONLY.reset(token)
+
     app.include_router(health_router)
     app.include_router(nso_instances_router)
     app.include_router(devices_router)

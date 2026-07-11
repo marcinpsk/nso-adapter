@@ -93,8 +93,18 @@ def _nokia_routed_kind(iface) -> str | None:
 
 
 async def enqueue_apply(db: AsyncSession, device_id: int, force: bool = True) -> Job | None:
-    """Create an apply job if no active job exists.  Returns Job or None if blocked."""
+    """Create an apply job if no active job exists.  Returns Job or None if blocked.
+
+    Also returns ``None`` on a store-only request (the plugin's intent re-sync,
+    tracker #103): reconciling the intent store must never trigger a device commit,
+    so the auto-apply enqueue is suppressed alongside the shrink-removal one.
+    """
     from nso_adapter.core.jobs import get_active_job
+    from nso_adapter.core.request_flags import STORE_ONLY
+
+    if STORE_ONLY.get():
+        logger.info("apply.skipped_store_only", device_id=device_id)
+        return None
 
     active = await get_active_job(device_id, db)
     if active:
