@@ -379,7 +379,10 @@ async def test_run_removal_dispatches_and_marks_succeeded(adapter_client):
     async for db in get_session():
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
-        assert job.result == {"scope": "vlan"}
+        assert job.result["scope"] == "vlan"
+        # No `removed` keys in this job's context → nothing to residue-check (#104);
+        # the opaque client's reader surface is never touched.
+        assert job.result["residue_check"] == "clean"
         break
 
 
@@ -841,4 +844,179 @@ async def test_enqueue_removal_serializes_removed_tuples(adapter_client):
         )
         await db.commit()
         assert job.context == {"scope": "static_route", "removed": {"route": [["", "10.0.0.0/24", "192.0.2.1"]]}}
+        break
+
+
+# ── #104-A: residue-after-retract detection + immediate follow-up sync ────────
+#
+# FASTMAP's reverse diff keeps service-created entries that picked up foreign leaves
+# (sw03 Vlan987: a sync between apply and removal imported the device-rendered
+# ``no ip address`` into the CDB entry), so a removal can report SUCCESS while its
+# keys survive on the device. run_removal must re-read the scope's device-tree view
+# (network-state-export reader = data-provider, computed at GET time) and surface
+# survivors in the job result, then enqueue a sync so the reappeared rows show as
+# unowned mirrors immediately.
+
+
+class _ReaderClient:
+    """Real-shape fake of the reader surface: canned network-state-export entries."""
+
+    def __init__(self, *, svi=None, l2=None, raise_on_read=False):
+        self._svi = svi
+        self._l2 = l2
+        self._raise = raise_on_read
+        self.reads = 0
+
+    async def get_svi(self, device_name):
+        self.reads += 1
+        if self._raise:
+            raise RuntimeError("reader down")
+        return self._svi
+
+    async def get_l2_service(self, device_name):
+        self.reads += 1
+        if self._raise:
+            raise RuntimeError("reader down")
+        return self._l2
+
+
+async def _run(job_id: int, device_id: int, client) -> None:
+    from nso_adapter.core.removal import run_removal
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=client),
+        patch("nso_adapter.core.removal._dispatch_scope", new=AsyncMock()),
+    ):
+        await run_removal(job_id=job_id, device_id=device_id)
+
+
+async def _job_after(job_id: int) -> Job:
+    async for db in get_session():
+        return await db.get(Job, job_id)
+    raise RuntimeError("no session")
+
+
+async def test_run_removal_reports_residue_when_removed_key_survives(adapter_client):
+    """The sw03 Vlan987 case: removal succeeds but the device tree still has the key."""
+    device_id = await _seed_device(nso_device_name="sw3")
+    job_id = await _seed_removal_job(device_id, "svi", {"removed": {"interface": [["Vlan987"]]}})
+    client = _ReaderClient(svi={"interface": [{"interface-name": "Vlan987", "vlan-id": 987}]})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.status == JobStatus.succeeded
+    assert job.result["residue_check"] == "found"
+    assert job.result["residue"] == {"interface": [["Vlan987"]]}
+
+
+async def test_run_removal_residue_clean_when_key_gone(adapter_client):
+    device_id = await _seed_device(nso_device_name="sw3")
+    job_id = await _seed_removal_job(device_id, "svi", {"removed": {"interface": [["Vlan987"]]}})
+    client = _ReaderClient(svi={"interface": [{"interface-name": "Vlan100", "vlan-id": 100}]})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "clean"
+    assert "residue" not in job.result
+
+
+async def test_run_removal_residue_handles_nested_l2_reader_shape(adapter_client):
+    """The l2 reader nests sap[] under service[] — the compound key must still match."""
+    device_id = await _seed_device(nso_device_name="ra1")
+    job_id = await _seed_removal_job(device_id, "l2_sap", {"removed": {"sap": [["TL", "lag-60:3999"]]}})
+    client = _ReaderClient(l2={"service": [{"service-name": "TL", "sap": [{"sap-id": "lag-60:3999"}]}]})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "found"
+    assert job.result["residue"] == {"sap": [["TL", "lag-60:3999"]]}
+
+
+async def test_run_removal_residue_unsupported_scope_is_transparent(adapter_client):
+    """Scopes without a reader mapping must say so — never silently claim clean."""
+    device_id = await _seed_device(nso_device_name="sw3")
+    job_id = await _seed_removal_job(device_id, "bgp", {"removed": {"router": ["65100"]}})
+
+    await _run(job_id, device_id, _ReaderClient())
+
+    job = await _job_after(job_id)
+    assert job.status == JobStatus.succeeded
+    assert job.result["residue_check"] == "unsupported"
+
+
+async def test_run_removal_residue_reader_error_is_nonfatal(adapter_client):
+    device_id = await _seed_device(nso_device_name="sw3")
+    job_id = await _seed_removal_job(device_id, "svi", {"removed": {"interface": [["Vlan987"]]}})
+
+    await _run(job_id, device_id, _ReaderClient(raise_on_read=True))
+
+    job = await _job_after(job_id)
+    assert job.status == JobStatus.succeeded
+    assert job.result["residue_check"] == "error"
+
+
+async def test_run_removal_without_removed_context_skips_reader(adapter_client):
+    device_id = await _seed_device(nso_device_name="sw3")
+    job_id = await _seed_removal_job(device_id, "svi")
+    client = _ReaderClient(svi={"interface": [{"interface-name": "Vlan987"}]})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "clean"
+    assert client.reads == 0
+
+
+async def test_run_removal_enqueues_followup_sync(adapter_client):
+    """Option A: a successful removal enqueues an immediate sync so reappeared rows
+    surface as unowned mirrors right away, not at the next poll cycle."""
+    device_id = await _seed_device(nso_device_name="sw3")
+    job_id = await _seed_removal_job(device_id, "svi", {"removed": {"interface": [["Vlan987"]]}})
+
+    await _run(job_id, device_id, _ReaderClient(svi={"interface": []}))
+
+    async for db in get_session():
+        sync_jobs = (
+            (
+                await db.execute(
+                    select(Job).where(
+                        Job.device_id == device_id,
+                        Job.job_type == JobType.sync,
+                        Job.status == JobStatus.queued,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(sync_jobs) == 1
+        break
+
+
+async def test_run_removal_failure_skips_residue_and_sync(adapter_client):
+    """A failed removal changed nothing on the device — no residue claim, no sync."""
+    from nso_adapter.core.removal import run_removal
+
+    device_id = await _seed_device(nso_device_name="sw3")
+    job_id = await _seed_removal_job(device_id, "svi", {"removed": {"interface": [["Vlan987"]]}})
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_ReaderClient()),
+        patch("nso_adapter.core.removal._dispatch_scope", new=AsyncMock(side_effect=RuntimeError("boom"))),
+    ):
+        await run_removal(job_id=job_id, device_id=device_id)
+
+    job = await _job_after(job_id)
+    assert job.status == JobStatus.failed
+    assert not (job.result or {}).get("residue_check")
+    async for db in get_session():
+        sync_jobs = (
+            (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.sync)))
+            .scalars()
+            .all()
+        )
+        assert sync_jobs == []
         break

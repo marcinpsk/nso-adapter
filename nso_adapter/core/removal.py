@@ -191,6 +191,68 @@ def _removed_context(scope: str, context: dict) -> dict[str, list]:
     return removed
 
 
+# Scope → the NsoClient reader serving that scope's device-tree view. The
+# network-state-export lists are data-provider callbacks (computed at GET time from
+# the current CDB config), so a read right after the replace commit reflects exactly
+# what FASTMAP left behind. Scopes absent here get residue_check="unsupported" in the
+# job result — transparency over a silent "clean" (intent-integrity principle).
+_RESIDUE_READERS: dict[str, str] = {
+    "svi": "get_svi",
+    "subinterface": "get_subinterface",
+    "static_route": "get_static_routes",
+    "vlan": "get_vlan_database",
+    "logging": "get_logging_config",
+    "interface_mtu": "get_interface_mtu",
+    "bfd": "get_bfd",
+    "l2_sap": "get_l2_service",
+}
+
+
+def _reader_keys(scope: str, entry: dict, guard_list: _GuardList) -> set[tuple[str, ...]]:
+    """Key tuples of *guard_list* present in a network-state-export reader *entry*.
+
+    The reader lists mirror the reconciler-service shapes, so the guard's own
+    ``_leaf_keys`` walk applies as-is — except l2, where the reader nests ``sap``
+    under ``service`` while the service list is flat (service-name, sap-id).
+    """
+    if scope == "l2_sap":
+        return {
+            (str(svc.get("service-name", "")), str(sap.get("sap-id", "")))
+            for svc in entry.get("service") or []
+            for sap in svc.get("sap") or []
+        }
+    return _leaf_keys(entry, guard_list)
+
+
+async def _residue_after_removal(client, device, scope: str, context: dict) -> dict[str, list] | None:
+    """Report the just-removed keys the device STILL has after the replace commit (#104).
+
+    FASTMAP's reverse diff keeps service-created entries that picked up foreign
+    leaves (sw03 Vlan987: a sync between apply and removal imported the
+    device-rendered ``no ip address`` into the CDB entry), so a removal can report
+    SUCCESS while its keys survive in the device tree. Re-read the scope's reader —
+    the NED-agnostic device-tree view — and report survivors per YANG list.
+    Returns ``None`` when the scope has no reader mapping (check unsupported).
+    """
+    reader = _RESIDUE_READERS.get(scope)
+    spec = _guard_specs().get(scope)
+    if reader is None or spec is None:
+        return None
+    removed = _removed_context(scope, context)
+    if not any(removed.values()):
+        return {}
+    entry = await getattr(client, reader)(device.nso_device_name) or {}
+    residue: dict[str, list] = {}
+    for guard_list in spec.lists:
+        keys = {_norm_key(k) for k in removed.get(guard_list.label, [])}
+        if not keys:
+            continue
+        survivors = sorted(keys & _reader_keys(scope, entry, guard_list))
+        if survivors:
+            residue[guard_list.label] = [list(k) for k in survivors]
+    return residue
+
+
 async def _guarded_apply(client, device, scope: str, context: dict | None, apply_thunk) -> None:
     """Run *scope*'s PUT-replace behind the collateral guard (the ra1 lo0 incident).
 
@@ -573,7 +635,45 @@ async def run_removal(job_id: int, device_id: int) -> None:
             await _dispatch_scope(db, device, client, scope, context)
             job.status = JobStatus.succeeded
             job.result = {"scope": scope}
+            # #104-A: a "succeeded" replace can still leave residue on the device
+            # (FASTMAP keeps entries holding foreign leaves) — re-read the scope's
+            # device-tree view and surface survivors in the job result.
+            try:
+                residue = await _residue_after_removal(client, device, scope, context)
+            except Exception as exc:  # noqa: BLE001 — the check must never fail the removal
+                logger.warning(
+                    "removal.residue_check_error", job_id=job_id, device_id=device_id, scope=scope, error=repr(exc)
+                )
+                job.result["residue_check"] = "error"
+            else:
+                if residue is None:
+                    job.result["residue_check"] = "unsupported"
+                elif residue:
+                    job.result["residue_check"] = "found"
+                    job.result["residue"] = residue
+                    logger.warning(
+                        "removal.residue_found",
+                        job_id=job_id,
+                        device_id=device_id,
+                        scope=scope,
+                        residue=residue,
+                    )
+                else:
+                    job.result["residue_check"] = "clean"
             await db.commit()
+            # Option A follow-up: sync now so any residue re-imports as an unowned
+            # mirror immediately instead of at the next poll cycle. After the commit
+            # above this job is no longer active, so the per-device dedup admits the
+            # sync; best-effort — the scheduler covers it if this loses a race.
+            try:
+                from nso_adapter.core.jobs import enqueue_job
+                from nso_adapter.store.models import JobType
+
+                await enqueue_job(device_id, JobType.sync, db)
+            except Exception as exc:  # noqa: BLE001 — never fail a committed removal on this
+                logger.warning(
+                    "removal.followup_sync_enqueue_failed", job_id=job_id, device_id=device_id, error=repr(exc)
+                )
         except RemovalBlockedError as blocked:
             from nso_adapter.core.jobs import _mark_job_failed
 
