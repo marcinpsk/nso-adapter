@@ -123,7 +123,7 @@ async def test_put_ospf_intent_removal_enqueues_job_not_inline(adapter_client):
         assert len(jobs) == 1
         assert jobs[0].status == JobStatus.queued
         # process 2 was just dropped — threaded for the collateral guard
-        assert jobs[0].context == {"scope": "ospf", "removed": {"process-config": ["2"]}}
+        assert jobs[0].context == {"scope": "ospf", "removed": {"process-config": ["2"]}, "detach": True}
         break
 
 

@@ -182,7 +182,7 @@ async def test_put_route_policy_intent_full_replace_removes_and_enqueues(adapter
         break
     assert job is not None
     # as-path AP-1 was just dropped — threaded (per-family list) for the collateral guard
-    assert job.context == {"scope": "route_policy", "removed": {"as-path": ["AP-1"]}}
+    assert job.context == {"scope": "route_policy", "removed": {"as-path": ["AP-1"]}, "detach": True}
 
 
 @pytest.mark.anyio

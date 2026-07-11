@@ -22,9 +22,19 @@ from contextvars import ContextVar
 
 STORE_ONLY: ContextVar[bool] = ContextVar("store_only", default=False)
 
+# ``DELETE_ORIGIN`` carries ``?delete_origin=true``: the plugin stamps it on intent pushes
+# that originate from a NetBox OBJECT DELETION, where the operator's intent is "remove
+# this from the device". Every UNMARKED intent shrink is an un-own ("NetBox stops
+# governing") and its removal job runs as a DETACH — no-networking replace + sync-from,
+# device untouched (tracker #106: a real PUT-replace of an ADOPTED entry plays FASTMAP's
+# reverse diff against the live device and stripped an IOS route-map filter). Guarded at
+# the same enqueue choke point as STORE_ONLY so the safe default holds for every intent
+# endpoint without each one threading a flag.
+DELETE_ORIGIN: ContextVar[bool] = ContextVar("delete_origin", default=False)
+
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
 def parse_store_only(raw: str | None) -> bool:
-    """Parse the raw ``store_only`` query value (mirrors FastAPI's bool query coercion)."""
+    """Parse a raw boolean query value (mirrors FastAPI's bool query coercion)."""
     return raw is not None and raw.strip().lower() in _TRUTHY

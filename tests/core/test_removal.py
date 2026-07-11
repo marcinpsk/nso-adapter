@@ -100,7 +100,7 @@ async def test_replace_on_removal_enqueues_job_and_commits(adapter_client):
         job = jobs[0]
         assert job.job_type == JobType.removal
         assert job.device_id == device_id
-        assert job.context == {"scope": "vlan", "removed": {"vlan": [3366]}}
+        assert job.context == {"scope": "vlan", "removed": {"vlan": [3366]}, "detach": True}
         assert job.status == JobStatus.queued
         break
 
@@ -140,7 +140,7 @@ async def test_enqueue_removal_creates_job_for_each_valid_scope(adapter_client):
             job = await enqueue_removal(db, device_id, scope)
             await db.commit()
             assert job.job_type == JobType.removal
-            assert job.context == {"scope": scope}
+            assert job.context == {"scope": scope, "detach": True}
             break
 
     # Every scope produced a real persisted removal job.
@@ -811,7 +811,7 @@ async def test_replace_on_removal_threads_removed_keys(adapter_client):
         break
     async for db in get_session():
         job = (await db.execute(select(Job))).scalars().one()
-        assert job.context == {"scope": "vlan", "removed": {"vlan": [3366, 3377]}}
+        assert job.context == {"scope": "vlan", "removed": {"vlan": [3366, 3377]}, "detach": True}
         break
 
 
@@ -831,6 +831,7 @@ async def test_replace_on_removal_maps_route_policy_families(adapter_client):
         assert job.context == {
             "scope": "route_policy",
             "removed": {"community-list": ["cnad-test"], "route-map": ["RM-IN"]},
+            "detach": True,
         }
         break
 
@@ -843,7 +844,11 @@ async def test_enqueue_removal_serializes_removed_tuples(adapter_client):
             db, device_id, "static_route", removed={"route": [("", "10.0.0.0/24", "192.0.2.1")]}
         )
         await db.commit()
-        assert job.context == {"scope": "static_route", "removed": {"route": [["", "10.0.0.0/24", "192.0.2.1"]]}}
+        assert job.context == {
+            "scope": "static_route",
+            "removed": {"route": [["", "10.0.0.0/24", "192.0.2.1"]]},
+            "detach": True,
+        }
         break
 
 
@@ -1020,3 +1025,204 @@ async def test_run_removal_failure_skips_residue_and_sync(adapter_client):
         )
         assert sync_jobs == []
         break
+
+
+# ── #106: un-own = detach (drop governance, never touch the device) ───────────
+#
+# A PUT-replace removal of an ADOPTED entry plays FASTMAP's reverse diff against
+# the live device (rg03: the adopted redistribute's route-map filter would have
+# been stripped). Only a NetBox object DELETION may retract for real — the plugin
+# marks those pushes ?delete_origin=true; every unmarked shrink (an un-own) runs
+# the replace with no-networking + sync-from so the device keeps the config as
+# unowned brownfield.
+
+
+async def test_enqueue_removal_unmarked_shrink_defaults_to_detach(adapter_client):
+    device_id = await _seed_device(nso_device_name="sw-detach")
+    async for db in get_session():
+        job = await enqueue_removal(db, device_id, "svi", removed={"interface": [["Vlan9"]]})
+        await db.commit()
+        assert job.context["detach"] is True
+        break
+
+
+async def test_enqueue_removal_delete_origin_is_real_retraction(adapter_client):
+    from nso_adapter.core.request_flags import DELETE_ORIGIN
+
+    device_id = await _seed_device(nso_device_name="sw-detach")
+    token = DELETE_ORIGIN.set(True)
+    try:
+        async for db in get_session():
+            job = await enqueue_removal(db, device_id, "svi", removed={"interface": [["Vlan9"]]})
+            await db.commit()
+            assert "detach" not in (job.context or {})
+            break
+    finally:
+        DELETE_ORIGIN.reset(token)
+
+
+async def test_enqueue_removal_force_is_real_retraction(adapter_client):
+    device_id = await _seed_device(nso_device_name="sw-detach")
+    async for db in get_session():
+        job = await enqueue_removal(db, device_id, "svi", removed={"interface": [["Vlan9"]]}, force=True)
+        await db.commit()
+        assert job.context.get("force") is True
+        assert "detach" not in job.context
+        break
+
+
+async def test_run_removal_detach_syncs_from_and_skips_residue(adapter_client):
+    """Detach: device untouched → the removed keys are EXPECTED on the device (they
+    must not be reported as residue), and CDB must be re-aligned via sync-from."""
+    device_id = await _seed_device(nso_device_name="sw3")
+    job_id = await _seed_removal_job(device_id, "svi", {"removed": {"interface": [["Vlan987"]]}, "detach": True})
+    client = _ReaderClient(svi={"interface": [{"interface-name": "Vlan987"}]})
+    sync_from = AsyncMock(return_value={"result": True})
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=client),
+        patch("nso_adapter.core.removal._dispatch_scope", new=AsyncMock()),
+        patch("nso_adapter.nso.actions.sync_from", new=sync_from),
+    ):
+        from nso_adapter.core.removal import run_removal
+
+        await run_removal(job_id=job_id, device_id=device_id)
+
+    job = await _job_after(job_id)
+    assert job.status == JobStatus.succeeded
+    assert job.result["detach"] is True
+    assert job.result["residue_check"] == "skipped_detach"
+    assert "residue" not in job.result
+    assert client.reads == 0
+    sync_from.assert_awaited_once()
+    async for db in get_session():
+        sync_jobs = (
+            (
+                await db.execute(
+                    select(Job).where(
+                        Job.device_id == device_id,
+                        Job.job_type == JobType.sync,
+                        Job.status == JobStatus.queued,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(sync_jobs) == 1  # the follow-up sync still refreshes the mirrors
+        break
+
+
+async def test_run_removal_real_retraction_does_not_sync_from(adapter_client):
+    device_id = await _seed_device(nso_device_name="sw3")
+    job_id = await _seed_removal_job(device_id, "svi", {"removed": {"interface": [["Vlan987"]]}})
+    sync_from = AsyncMock(return_value={"result": True})
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_ReaderClient(svi={"interface": []})),
+        patch("nso_adapter.core.removal._dispatch_scope", new=AsyncMock()),
+        patch("nso_adapter.nso.actions.sync_from", new=sync_from),
+    ):
+        from nso_adapter.core.removal import run_removal
+
+        await run_removal(job_id=job_id, device_id=device_id)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "clean"
+    sync_from.assert_not_awaited()
+
+
+async def test_guarded_apply_detach_skips_collateral_guard(adapter_client):
+    """Detach drops governance of the whole instance without device writes, so the
+    orphan guard (which protects device config from a real PUT-replace flush) must
+    stand down — otherwise every un-own on an instance with un-adopted siblings
+    blocks forever (the rg03 static sibling condition)."""
+    device_id = await _seed_device(nso_device_name="sw-detach")
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        break
+    client = _guard_client(service_config={"vlan": [{"vlan-id": 100}, {"vlan-id": 200}]})
+    apply_fn = _staging_apply({"vlan": [{"vlan-id": 100}]})  # 200 would be an orphan
+
+    await removal_mod._guarded_apply(client, device, "vlan", {"detach": True}, apply_fn)
+
+    # No RemovalBlockedError raised; the replace ran exactly once, with no dry-run block.
+    replace_calls = [c for c in apply_fn.await_args_list if c.kwargs.get("replace") and not c.kwargs.get("dry_run")]
+    assert len(replace_calls) == 1
+
+
+async def test_send_service_config_detach_replace_adds_no_networking(adapter_client):
+    """The detach replace must commit with no-networking so nothing reaches the device."""
+    import httpx
+
+    from nso_adapter.nso import apply as nso_apply
+    from nso_adapter.nso.client import NsoClient
+
+    recorded: list[str] = []
+
+    class _Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            recorded.append(str(request.url))
+            return httpx.Response(204)
+
+    class _Client(NsoClient):
+        def __init__(self):
+            pass
+
+        _base = "http://nso-test"
+        _action_timeout = 5
+
+        def _client(self, timeout=None):
+            return httpx.AsyncClient(transport=_Transport())
+
+    token = nso_apply.DETACH_REPLACE.set(True)
+    try:
+        await nso_apply._send_service_config(
+            _Client(),
+            "/restconf/data/vlan-reconciler:vlan-config",
+            "vlan-reconciler:vlan-config",
+            "sw-detach",
+            {"device": "sw-detach", "vlan": []},
+            scope="vlan",
+            replace=True,
+        )
+    finally:
+        nso_apply.DETACH_REPLACE.reset(token)
+
+    commit_url = recorded[0]
+    assert "no-networking" in commit_url
+
+
+async def test_delete_interface_config_detach_adds_no_networking(adapter_client):
+    """interface_config removal can DELETE the whole instance — under detach that
+    DELETE must also commit with no-networking (FASTMAP would otherwise revert
+    everything the service created ON THE DEVICE)."""
+    import httpx
+
+    from nso_adapter.nso import apply as nso_apply
+    from nso_adapter.nso.client import NsoClient
+
+    recorded: list[str] = []
+
+    class _Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            recorded.append(str(request.url))
+            return httpx.Response(204)
+
+    class _Client(NsoClient):
+        def __init__(self):
+            pass
+
+        _base = "http://nso-test"
+        _action_timeout = 5
+
+        def _client(self, timeout=None):
+            return httpx.AsyncClient(transport=_Transport())
+
+    token = nso_apply.DETACH_REPLACE.set(True)
+    try:
+        await nso_apply.delete_interface_config(_Client(), "sw-detach", "Gi0/1")
+    finally:
+        nso_apply.DETACH_REPLACE.reset(token)
+
+    assert "no-networking" in recorded[0]

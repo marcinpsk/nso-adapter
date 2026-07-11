@@ -269,6 +269,13 @@ async def _guarded_apply(client, device, scope: str, context: dict | None, apply
         logger.warning("removal.force", device_id=device.id, scope=scope)
         await apply_thunk(replace=True)
         return
+    if context.get("detach"):
+        # Detach (#106): the replace commits with no-networking, so nothing can be
+        # flushed from the device — the orphan guard (which protects device config
+        # from a real PUT-replace) must stand down, or every un-own on an instance
+        # holding un-adopted siblings blocks forever.
+        await apply_thunk(replace=True)
+        return
     spec = _guard_specs().get(scope)
     current = None
     if spec is not None:
@@ -577,7 +584,7 @@ async def enqueue_removal(
     only and must never retract FASTMAP-owned config from the device. *force* is
     exempt — the operator force-removal action is an explicit device flush.
     """
-    from nso_adapter.core.request_flags import STORE_ONLY
+    from nso_adapter.core.request_flags import DELETE_ORIGIN, STORE_ONLY
     from nso_adapter.store.models import Job, JobStatus, JobType
 
     if scope not in VALID_REMOVAL_SCOPES:
@@ -597,6 +604,12 @@ async def enqueue_removal(
         }
     if force:
         context["force"] = True
+    elif not DELETE_ORIGIN.get():
+        # Unmarked shrink = un-own ("NetBox stops governing"), NOT an object deletion:
+        # detach — drop service governance without touching the device (#106). Only a
+        # push the plugin marked ?delete_origin=true (a NetBox object DELETE) or the
+        # operator's force-removal may retract config from the live device.
+        context["detach"] = True
     job = Job(
         job_type=JobType.removal,
         device_id=device_id,
@@ -631,35 +644,72 @@ async def run_removal(job_id: int, device_id: int) -> None:
             device = await db.get(Device, device_id)
             if not device:
                 raise ValueError(f"Device {device_id} not found")
+            from nso_adapter.nso import apply as nso_apply_mod
+
             client = get_nso_client(device.nso_instance)
-            await _dispatch_scope(db, device, client, scope, context)
+            detach = bool(context.get("detach"))
+            detach_token = nso_apply_mod.DETACH_REPLACE.set(detach)
+            try:
+                await _dispatch_scope(db, device, client, scope, context)
+            finally:
+                nso_apply_mod.DETACH_REPLACE.reset(detach_token)
             job.status = JobStatus.succeeded
             job.result = {"scope": scope}
-            # #104-A: a "succeeded" replace can still leave residue on the device
-            # (FASTMAP keeps entries holding foreign leaves) — re-read the scope's
-            # device-tree view and surface survivors in the job result.
-            try:
-                residue = await _residue_after_removal(client, device, scope, context)
-            except Exception as exc:  # noqa: BLE001 — the check must never fail the removal
-                logger.warning(
-                    "removal.residue_check_error", job_id=job_id, device_id=device_id, scope=scope, error=repr(exc)
-                )
-                job.result["residue_check"] = "error"
+            if detach:
+                # Detach (#106): the device was deliberately untouched — the removed
+                # keys are EXPECTED to remain (that is the point), so the residue
+                # check is meaningless here. Re-align CDB with device truth: the
+                # no-networking commit applied FASTMAP's reverse diff to CDB only.
+                job.result["detach"] = True
+                job.result["residue_check"] = "skipped_detach"
+                from nso_adapter.nso import actions
+
+                for attempt in (1, 2):  # one retry — slow-session flake (sw03 read eof)
+                    try:
+                        await actions.sync_from(client, device.nso_device_name)
+                        break
+                    except Exception as exc:  # noqa: BLE001 — surface, never fail the job
+                        logger.warning(
+                            "removal.detach_sync_from_failed",
+                            job_id=job_id,
+                            device_id=device_id,
+                            attempt=attempt,
+                            error=repr(exc),
+                        )
+                        if attempt == 2:
+                            # CDB keeps the locally-applied reverse diff until some
+                            # later sync-from — make that visible on the job.
+                            job.result["sync_from"] = "failed"
             else:
-                if residue is None:
-                    job.result["residue_check"] = "unsupported"
-                elif residue:
-                    job.result["residue_check"] = "found"
-                    job.result["residue"] = residue
+                # #104-A: a "succeeded" replace can still leave residue on the device
+                # (FASTMAP keeps entries holding foreign leaves) — re-read the scope's
+                # device-tree view and surface survivors in the job result.
+                try:
+                    residue = await _residue_after_removal(client, device, scope, context)
+                except Exception as exc:  # noqa: BLE001 — the check must never fail the removal
                     logger.warning(
-                        "removal.residue_found",
+                        "removal.residue_check_error",
                         job_id=job_id,
                         device_id=device_id,
                         scope=scope,
-                        residue=residue,
+                        error=repr(exc),
                     )
+                    job.result["residue_check"] = "error"
                 else:
-                    job.result["residue_check"] = "clean"
+                    if residue is None:
+                        job.result["residue_check"] = "unsupported"
+                    elif residue:
+                        job.result["residue_check"] = "found"
+                        job.result["residue"] = residue
+                        logger.warning(
+                            "removal.residue_found",
+                            job_id=job_id,
+                            device_id=device_id,
+                            scope=scope,
+                            residue=residue,
+                        )
+                    else:
+                        job.result["residue_check"] = "clean"
             await db.commit()
             # Option A follow-up: sync now so any residue re-imports as an unowned
             # mirror immediately instead of at the next poll cycle. After the commit

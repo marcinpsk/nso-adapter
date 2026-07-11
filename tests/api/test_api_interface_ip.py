@@ -272,7 +272,7 @@ async def test_put_ip_intent_removal_enqueues_interface_config_job(adapter_clien
     async for db in get_session():
         removals = [j for j in (await db.execute(select(Job))).scalars().all() if j.job_type == JobType.removal]
         assert len(removals) == 1
-        assert removals[0].context == {"scope": "interface_config", "interfaces": ["Gi0/3"]}
+        assert removals[0].context == {"scope": "interface_config", "interfaces": ["Gi0/3"], "detach": True}
         break
 
 

@@ -330,7 +330,7 @@ async def test_put_removal_enqueues_async_removal_job(adapter_client, monkeypatc
         )
         assert len(jobs) == 1
         # community rw1 was just dropped — threaded for the collateral guard
-        assert jobs[0].context == {"scope": "snmp", "removed": {"community": ["rw1"]}}
+        assert jobs[0].context == {"scope": "snmp", "removed": {"community": ["rw1"]}, "detach": True}
         job_id = jobs[0].id
         break
 

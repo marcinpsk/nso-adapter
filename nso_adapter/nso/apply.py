@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextvars import ContextVar
 
 import structlog
 
@@ -65,6 +66,14 @@ _SERVICE_PATH = "/restconf/data/interface-reconciler:interface-config"
 # live on sw01: a combined subif+IP PATCH renders one ``<edit-config>`` to the device.
 _DATA_PATH = "/restconf/data"
 
+# Set by core/removal.run_removal around a DETACH removal's scope dispatch (#106): every
+# PUT-replace in that dispatch commits with ``no-networking`` so dropping service
+# governance never plays FASTMAP's reverse diff against the live device (an adopted
+# entry's retract stripped an IOS route-map filter). A contextvar — not a parameter —
+# because the dispatch fans out through per-scope apply_* signatures that should not all
+# have to thread a transport concern.
+DETACH_REPLACE: ContextVar[bool] = ContextVar("detach_replace", default=False)
+
 
 def atomic_apply_enabled() -> bool:
     """Whether to stage an apply's scopes into ONE transaction (NSO_ADAPTER_ATOMIC_APPLY).
@@ -77,20 +86,24 @@ def atomic_apply_enabled() -> bool:
     return os.environ.get("NSO_ADAPTER_ATOMIC_APPLY", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _commit_url(url: str, *, dry_run: bool | str = False) -> str:
+def _commit_url(url: str, *, dry_run: bool | str = False, no_networking: bool = False) -> str:
     """Append NSO RESTCONF commit query params to a reconciler-service write *url*.
 
     Always adds ``reconcile=<RECONCILE_COMMIT>`` (when configured) so every service
     write adopts pre-existing brownfield device config instead of conflicting with it.
     ``dry_run=True`` also adds ``dry-run=native`` (compute the southbound delta, commit
     nothing); ``dry_run="cli"`` asks for the NED-uniform ``+``/``-`` tree diff instead
-    (the apply-preview "diff -u" panel). The params combine — NSO accepts
-    ``?dry-run=...&reconcile=...`` and a dry-run then previews exactly what the
-    reconcile commit would do.
+    (the apply-preview "diff -u" panel). ``no_networking=True`` commits to CDB only —
+    the detach path (#106): drop service governance without pushing anything to the
+    device, followed by a sync-from to re-align CDB with device truth. The params
+    combine — NSO accepts ``?dry-run=...&reconcile=...`` and a dry-run then previews
+    exactly what the reconcile commit would do.
     """
     params: list[str] = []
     if dry_run:
         params.append("dry-run=cli" if dry_run == "cli" else "dry-run=native")
+    if no_networking:
+        params.append("no-networking")
     if RECONCILE_COMMIT:
         params.append(f"reconcile={RECONCILE_COMMIT}")
     if not params:
@@ -308,9 +321,14 @@ async def _send_service_config(
         return await native_dry_run(
             client, url, payload, device_name, method=method, outformat="cli" if dry_run == "cli" else "native"
         )
+    # Detach removal (#106): the replace drops service governance in CDB only; the
+    # caller sync-froms right after so CDB returns to device truth.
+    no_networking = replace and DETACH_REPLACE.get()
     async with client._client(timeout=client._action_timeout) as c:
         resp = await getattr(c, method)(
-            _commit_url(url), content=payload, headers={"Content-Type": "application/yang-data+json"}
+            _commit_url(url, no_networking=no_networking),
+            content=payload,
+            headers={"Content-Type": "application/yang-data+json"},
         )
         if resp.status_code not in (200, 201, 204):
             try:
@@ -637,7 +655,9 @@ async def delete_interface_config(client: NsoClient, device_name: str, interface
     instance_key = f"{_url_key(device_name)},{_url_key(interface_name)}"
     url = f"{client._base}{_SERVICE_PATH}={instance_key}"
     async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.delete(_commit_url(url))
+        # Detach (#106): dropping governance of the whole instance must not let
+        # FASTMAP revert the config on the device — commit to CDB only.
+        resp = await c.delete(_commit_url(url, no_networking=DETACH_REPLACE.get()))
         if resp.status_code not in (200, 204, 404):
             try:
                 err = resp.json()
