@@ -179,6 +179,61 @@ async def test_ingestion_helpers_seed_and_upsert_ips(adapter_client):
         break
 
 
+async def test_upsert_new_oob_rearms_probe_schedule(adapter_client):
+    """A NEW/changed OOB IP must be probed promptly. The probe schedule backs off while
+    the OLD OOB is absent/dead, so without a re-arm a freshly configured OOB sits behind
+    hours of accumulated deferral (sw03: next_oob_probe_at ~7h out while the operator
+    added the OOB precisely to restore reachability NOW). The old address's health
+    verdict is stale for the new one → reset. The primary schedule is untouched."""
+    from datetime import datetime
+
+    from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
+
+    async for db in get_session():
+        dev = Device(nso_instance="nso-dev", nso_device_name="rearm1", netbox_device_id=57)
+        db.add(dev)
+        await db.flush()
+        fo = await set_initial_failover_state(db, dev.id, "10.0.0.1", None, ActiveAddress.primary.value)
+        far = datetime(2099, 1, 1)
+        fo.next_oob_probe_at = far
+        fo.next_primary_probe_at = far
+        fo.oob_healthy = True  # stale claim (about no/old OOB)
+        await db.commit()
+
+        assert await upsert_failover_ips(db, dev, "10.0.0.1", "192.0.2.9") is True
+        await db.commit()
+
+        reloaded = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == dev.id))).scalar_one()
+        assert reloaded.next_oob_probe_at < far  # due promptly, not behind old backoff
+        assert reloaded.oob_healthy is False  # verdict about the OLD address must not carry over
+        assert reloaded.next_primary_probe_at == far  # primary unchanged → schedule untouched
+        break
+
+
+async def test_upsert_new_primary_rearms_primary_probe_only(adapter_client):
+    from datetime import datetime
+
+    from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
+
+    async for db in get_session():
+        dev = Device(nso_instance="nso-dev", nso_device_name="rearm2", netbox_device_id=58)
+        db.add(dev)
+        await db.flush()
+        fo = await set_initial_failover_state(db, dev.id, "10.0.0.1", "192.0.2.5", ActiveAddress.primary.value)
+        far = datetime(2099, 1, 1)
+        fo.next_oob_probe_at = far
+        fo.next_primary_probe_at = far
+        await db.commit()
+
+        assert await upsert_failover_ips(db, dev, "10.0.0.2", "192.0.2.5") is True
+        await db.commit()
+
+        reloaded = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == dev.id))).scalar_one()
+        assert reloaded.next_primary_probe_at < far
+        assert reloaded.next_oob_probe_at == far  # OOB unchanged → schedule untouched
+        break
+
+
 async def test_upsert_skips_empty_row_creation(adapter_client):
     """A device reported with no IPs (older plugin) must NOT get an empty failover row."""
     from nso_adapter.core.failover import upsert_failover_ips
