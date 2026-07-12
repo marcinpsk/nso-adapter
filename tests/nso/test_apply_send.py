@@ -566,7 +566,7 @@ async def test_apply_bgp_config_builds_router_scope_peer_tree():
     )
     af = SimpleNamespace(af="ipv4-unicast")
     scope = SimpleNamespace(vrf="", address_families=[af], peers=[peer])
-    router = SimpleNamespace(asn=65000, scopes=[scope])
+    router = SimpleNamespace(asn=65000, router_id=None, scopes=[scope])
     redist = SimpleNamespace(
         dest_ref="65000::ipv4-unicast", source_protocol="connected", source_ref="", route_map=None, metric=None
     )

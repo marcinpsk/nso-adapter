@@ -25,7 +25,8 @@ AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 # ── The contract. Keep in lockstep with the plugin mirror + docs/api-contract.md. ──
 REQUIRED_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "routers"}
-REQUIRED_ROUTER_KEYS = {"asn", "scopes"}
+# router_id is always present (null when unset), like the top-level last_refreshed_at.
+REQUIRED_ROUTER_KEYS = {"asn", "router_id", "scopes"}
 REQUIRED_SCOPE_KEYS = {"vrf", "address_families", "peers", "peer_groups"}
 REQUIRED_PEER_KEYS = {"peer_address", "enabled", "address_families"}
 OPTIONAL_PEER_KEYS = {"peer_group", "remote_as", "local_as", "ttl", "password", "source", "bfd_enabled"}
@@ -44,6 +45,7 @@ async def test_bgp_config_payload_matches_contract_exactly(adapter_client):
     await seed_bgp_config(
         device_id,
         asn="65100",
+        router_id="10.255.0.1",
         scopes=[
             {
                 "vrf": "",
@@ -102,6 +104,7 @@ async def test_bgp_config_payload_matches_contract_exactly(adapter_client):
     assert isinstance(body["routers"], list) and len(body["routers"]) == 1
     bgp_router = body["routers"][0]
     assert set(bgp_router.keys()) == REQUIRED_ROUTER_KEYS
+    assert bgp_router["router_id"] == "10.255.0.1"  # dotted-quad string, always present
 
     scope = bgp_router["scopes"][0]
     assert set(scope.keys()) == REQUIRED_SCOPE_KEYS

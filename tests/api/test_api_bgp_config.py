@@ -99,6 +99,26 @@ async def test_bgp_config_basic_router_and_global_scope(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_bgp_config_router_id_serialized(adapter_client):
+    """The global BGP router-id is surfaced on the router in the GET response."""
+    device_id = await seed_device(nso_device_name="bgp-rid-dev", netbox_device_id=908)
+    await seed_bgp_config(device_id, asn="65100", router_id="10.255.0.1")
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["routers"][0]["router_id"] == "10.255.0.1"
+
+
+@pytest.mark.anyio
+async def test_bgp_config_router_id_null_when_unset(adapter_client):
+    """A router with no router-id serializes router_id: null (key always present)."""
+    device_id = await seed_device(nso_device_name="bgp-norid-dev", netbox_device_id=909)
+    await seed_bgp_config(device_id, asn="65100")
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["routers"][0]["router_id"] is None
+
+
+@pytest.mark.anyio
 async def test_bgp_config_multiple_vrf_scopes(adapter_client):
     """Router with global + two VRF scopes returns all three scopes."""
     device_id = await seed_device(nso_device_name="bgp-vrf-dev", netbox_device_id=903)

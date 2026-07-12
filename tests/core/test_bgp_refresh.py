@@ -617,3 +617,35 @@ async def test_same_neighbor_identical_af_across_groups_is_quiet(adapter_client)
         events = [e.get("event") for e in logs]
         assert "bgp.peer_af_conflict_across_groups" not in events
         break
+
+
+async def test_router_id_imported(adapter_client):
+    """Global BGP router-id (dash-keyed export leaf) is stored on the router row."""
+    from nso_adapter.core.bgp import _upsert_bgp_data
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device, DeviceBgpRouter
+
+    device_id = await seed_device(nso_device_name="bgp-rid", netbox_device_id=885)
+    routers = [{"asn": "65100", "router-id": "10.255.0.1", "scope": []}]
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        await _upsert_bgp_data(db, device, routers, "test")
+        row = (await db.execute(select(DeviceBgpRouter))).scalars().one()
+        assert row.router_id == "10.255.0.1"
+        break
+
+
+async def test_router_id_absent_stored_none(adapter_client):
+    """A router with no router-id leaf stores None, not the empty string."""
+    from nso_adapter.core.bgp import _upsert_bgp_data
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Device, DeviceBgpRouter
+
+    device_id = await seed_device(nso_device_name="bgp-norid", netbox_device_id=886)
+    routers = [{"asn": "65100", "scope": []}]
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        await _upsert_bgp_data(db, device, routers, "test")
+        row = (await db.execute(select(DeviceBgpRouter))).scalars().one()
+        assert row.router_id is None
+        break

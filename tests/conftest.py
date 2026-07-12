@@ -282,6 +282,7 @@ async def seed_bgp_config(
     device_id: int,
     *,
     asn: str = "65100",
+    router_id: str | None = None,
     scopes: list[dict] | None = None,
 ):
     """Insert a minimal BGP read-mirror graph for a device.
@@ -314,7 +315,7 @@ async def seed_bgp_config(
         scopes = [{"vrf": "", "afs": ["ipv4-unicast"], "peers": []}]
 
     async for db in get_session():
-        router = DeviceBgpRouter(device_id=device_id, asn=asn, refresh_source="test")
+        router = DeviceBgpRouter(device_id=device_id, asn=asn, router_id=router_id, refresh_source="test")
         db.add(router)
         await db.flush()
         for scope_def in scopes:

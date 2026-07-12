@@ -220,6 +220,7 @@ async def _upsert_bgp_data(
         router = DeviceBgpRouter(
             device_id=device.id,
             asn=asn,
+            router_id=router_data.get("router-id") or None,  # export leaf is dash-keyed
             last_refreshed_at=now,
             refresh_source=refresh_source,
         )

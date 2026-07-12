@@ -114,6 +114,46 @@ async def test_put_bgp_intent_persists_rows(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_put_bgp_intent_persists_router_id(adapter_client):
+    """An accepted global router-id round-trips into the BgpRouterIntent row."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import BgpRouterIntent
+
+    device_id = await seed_device(nso_device_name="bgp-intent-rid", netbox_device_id=2008)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent",
+        json={"routers": [{**MINIMAL_ROUTER, "router_id": "10.255.0.1"}]},
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+
+    async for db in get_session():
+        router = (await db.execute(select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))).scalar_one()
+        assert router.router_id == "10.255.0.1"
+        break
+
+
+@pytest.mark.anyio
+async def test_put_bgp_intent_router_id_defaults_none(adapter_client):
+    """A router payload with no router_id persists None (field is optional)."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import BgpRouterIntent
+
+    device_id = await seed_device(nso_device_name="bgp-intent-norid", netbox_device_id=2009)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent",
+        json={"routers": [MINIMAL_ROUTER]},
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+
+    async for db in get_session():
+        router = (await db.execute(select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))).scalar_one()
+        assert router.router_id is None
+        break
+
+
+@pytest.mark.anyio
 async def test_put_bgp_intent_full_replace(adapter_client):
     """Second PUT fully replaces the first (full-replace semantics)."""
     from nso_adapter.store.db import get_session

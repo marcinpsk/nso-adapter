@@ -180,6 +180,7 @@ async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_db)):
     routers_out = [
         {
             "asn": bgp_router.asn,
+            "router_id": bgp_router.router_id,
             "scopes": [_serialize_scope(scope, graph) for scope in graph.scopes_by_router.get(bgp_router.id, [])],
         }
         for bgp_router in bgp_routers
@@ -239,6 +240,7 @@ class BgpScopeModel(BaseModel):
 
 class BgpRouterModel(BaseModel):
     asn: str
+    router_id: str | None = None
     scopes: list[BgpScopeModel] = []
     accepted_at: datetime | None = None
 
@@ -314,7 +316,9 @@ async def _rebuild_router_intent(db: AsyncSession, device_id: int, routers: list
     count = 0
     for router_data in routers:
         accepted = router_data.accepted_at.replace(tzinfo=None) if router_data.accepted_at else now
-        router_row = BgpRouterIntent(device_id=device_id, asn=router_data.asn, accepted_at=accepted)
+        router_row = BgpRouterIntent(
+            device_id=device_id, asn=router_data.asn, router_id=router_data.router_id, accepted_at=accepted
+        )
         db.add(router_row)
         await db.flush()
         count += 1

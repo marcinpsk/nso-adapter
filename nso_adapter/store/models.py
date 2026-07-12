@@ -1456,6 +1456,8 @@ class DeviceBgpRouter(Base):
         Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
     )
     asn: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Global BGP router-id (dotted-quad) exported by network-state-export; None when unset.
+    router_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="never")
 
@@ -1619,6 +1621,8 @@ class BgpRouterIntent(Base):
         Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
     )
     asn: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Operator-accepted global BGP router-id (dotted-quad) to push; None = not owned.
+    router_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)

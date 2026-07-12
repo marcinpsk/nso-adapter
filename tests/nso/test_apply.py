@@ -642,7 +642,7 @@ async def test_apply_bgp_config_uses_correct_yang_keys():
         address_families=[SimpleNamespace(af="ipv4-unicast")],
         peers=[peer],
     )
-    router = SimpleNamespace(asn=65100, scopes=[scope])
+    router = SimpleNamespace(asn=65100, router_id=None, scopes=[scope])
 
     await apply_bgp_config(client=client, device_name="rg03", router_intent_rows=[router])
 
@@ -689,7 +689,7 @@ async def test_apply_bgp_config_sends_peer_source():
         peer_address_families=[],
     )
     scope = SimpleNamespace(vrf="", address_families=[], peers=[peer])
-    router = SimpleNamespace(asn=65100, scopes=[scope])
+    router = SimpleNamespace(asn=65100, router_id=None, scopes=[scope])
 
     await apply_bgp_config(client=client, device_name="rg03", router_intent_rows=[router])
 
@@ -933,6 +933,28 @@ async def test_apply_bgp_config_asn_asdot_notation():
     await apply_bgp_config(_make_nso_client(), "d", [router], None, stage=stage)
     routers = stage["bgp-reconciler:bgp-config"][0]["router"]
     assert routers[0]["asn"] == 1 * 65536 + 100
+
+
+async def test_apply_bgp_config_sends_router_id():
+    """An accepted global router-id is emitted as the `router-id` leaf (sibling of asn)."""
+    from nso_adapter.nso.apply import apply_bgp_config
+
+    router = BgpRouterIntent(asn="65100", router_id="10.255.0.1")
+    stage: dict = {}
+    await apply_bgp_config(_make_nso_client(), "d", [router], None, stage=stage)
+    router_out = stage["bgp-reconciler:bgp-config"][0]["router"][0]
+    assert router_out["router-id"] == "10.255.0.1"
+
+
+async def test_apply_bgp_config_omits_router_id_when_unset():
+    """No accepted router-id → the `router-id` leaf is omitted (never an empty string)."""
+    from nso_adapter.nso.apply import apply_bgp_config
+
+    router = BgpRouterIntent(asn="65100")  # router_id column defaults to None
+    stage: dict = {}
+    await apply_bgp_config(_make_nso_client(), "d", [router], None, stage=stage)
+    router_out = stage["bgp-reconciler:bgp-config"][0]["router"][0]
+    assert "router-id" not in router_out
 
 
 async def test_apply_bgp_config_asn_invalid_raises_clean_error():

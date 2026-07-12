@@ -1747,6 +1747,8 @@ async def apply_bgp_config(
             scopes_out.append(scope_dict)
             scope_by_key[(asn_str, scope.vrf)] = scope_dict
         router_dict = {"asn": _parse_asn(r.asn), "scope": scopes_out}
+        if r.router_id:
+            router_dict["router-id"] = r.router_id  # bgp-reconciler leaf, sibling of asn
         routers.append(router_dict)
         router_by_asn[asn_str] = router_dict
 
