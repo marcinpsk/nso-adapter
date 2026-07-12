@@ -983,6 +983,30 @@ def _stamp_ip_atomic(ip_rows_flat, commit_error, iface_failed, err, msg, now) ->
     return 0, 0, []
 
 
+async def _atomic_reader_compare(
+    client, device, scope_rows, scope_outcomes, scope_failures, *, job_id, device_name
+) -> dict[str, str]:
+    """#108 presence check per staged scope after a clean atomic commit.
+
+    Mutates scope_outcomes/scope_failures for scopes with silently-dropped keys and
+    returns the per-scope reader_compare status map for job.result.
+    """
+    reader_compare: dict[str, str] = {}
+    for key, rows in scope_rows.items():
+        s_ok, s_failed = scope_outcomes.get(key, (0, 0))
+        if not rows or s_failed:
+            continue
+        n_ok, n_failed, fails, rc_status = await _reader_compare_scope(
+            client, device, key, rows, ok=s_ok, job_id=job_id, device_name=device_name
+        )
+        if rc_status is not None:
+            reader_compare[key] = rc_status
+        if n_failed:
+            scope_outcomes[key] = (n_ok, n_failed)
+            scope_failures.setdefault(key, []).extend(fails)
+    return reader_compare
+
+
 def _stamp_batch_scopes_atomic(scope_rows, offenders, commit_error, err, msg, now) -> tuple[dict, dict]:
     """Stamp every batch scope from the single atomic outcome → (scope_outcomes, scope_failures).
 
@@ -1081,7 +1105,142 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
     ip_outcome = _stamp_ip_atomic(ip_rows_flat, commit_error, iface_failed, err, msg, now)
     scope_outcomes, scope_failures = _stamp_batch_scopes_atomic(scope_rows, offenders, commit_error, err, msg, now)
 
-    await _finalize_job(db, job, job_id, device.id, True, attr_outcome, ip_outcome, scope_outcomes, scope_failures)
+    # #108: a clean atomic commit rides the same FASTMAP writers — run the post-apply
+    # presence check per staged scope and re-flag any silently-dropped keys.
+    reader_compare: dict[str, str] = {}
+    if commit_error is None:
+        reader_compare = await _atomic_reader_compare(
+            client, device, scope_rows, scope_outcomes, scope_failures, job_id=job_id, device_name=device_name
+        )
+
+    await _finalize_job(
+        db,
+        job,
+        job_id,
+        device.id,
+        True,
+        attr_outcome,
+        ip_outcome,
+        scope_outcomes,
+        scope_failures,
+        reader_compare=reader_compare,
+    )
+
+
+# Scope → (store model name, residue YANG-list label, row → key tuple), guard grain.
+# Key tuples are the store keys verbatim — the same store↔YANG key equivalence the
+# removal path already relies on. bgp and route_policy have bespoke expansion below.
+_READER_COMPARE_SPECS: dict[str, list] = {
+    "static_route": [("StaticRouteIntent", "route", lambda r: (r.vrf, r.prefix, r.next_hop))],
+    "vlan": [("VlanIntent", "vlan", lambda r: (r.vlan_id,))],
+    "svi": [("SviIntent", "interface", lambda r: (r.interface_name,))],
+    "subinterface": [("SubinterfaceIntent", "interface", lambda r: (r.interface_name,))],
+    "bfd": [("BfdIntent", "interface", lambda r: (r.interface_name,))],
+    "interface_mtu": [("InterfaceMtuIntent", "interface", lambda r: (r.interface_name,))],
+    "logging": [("LoggingHostIntent", "host", lambda r: (r.address,))],
+    "l2_sap": [("L2SapIntent", "sap", lambda r: (r.service_name, r.sap_id))],
+    "isis": [
+        ("IsisInterfaceIntent", "interface-config", lambda r: (r.interface_name, r.af)),
+        ("IsisProcessIntent", "process-config", lambda r: (r.process_tag,)),
+    ],
+    "ospf": [
+        ("OspfInstanceIntent", "process-config", lambda r: (r.process_id,)),
+        ("OspfInterfaceIntent", "interface-config", lambda r: (r.interface_name,)),
+    ],
+    "snmp": [
+        ("SnmpCommunityIntent", "community", lambda r: (r.label,)),
+        ("SnmpV3UserIntent", "v3-user", lambda r: (r.username,)),
+        ("SnmpHostIntent", "host", lambda r: (r.address,)),
+    ],
+}
+
+
+def _reader_compare_expected(scope: str, rows) -> list[tuple[object, str, tuple]]:
+    """(intent row, YANG-list label, key tuple) for every checkable intended object (#108).
+
+    Rows without a keyed reader presence are skipped: redistribution / flex-algo /
+    level rows (nested non-keyed content, guard-grain parity) and the snmp
+    system-info scalar.
+    """
+    from nso_adapter.core.removal import _ROUTE_POLICY_FAMILY_LISTS
+    from nso_adapter.store import models as m
+
+    if scope == "route_policy":
+        return [
+            (r, _ROUTE_POLICY_FAMILY_LISTS[r.family], (r.name,))
+            for r in rows
+            if isinstance(r, m.RoutePolicyObjectIntent) and r.family in _ROUTE_POLICY_FAMILY_LISTS
+        ]
+    if scope == "bgp":
+        out: list[tuple[object, str, tuple]] = []
+        for r in rows:
+            if not isinstance(r, m.BgpRouterIntent):
+                continue
+            out.append((r, "router", (r.asn,)))
+            for sc in r.scopes:  # eagerly loaded by attach_bgp_relationships
+                for p in sc.peers:
+                    out.append((r, "peer", (p.peer_address,)))
+        return out
+    out = []
+    for model_name, label, keyfn in _READER_COMPARE_SPECS.get(scope, []):
+        model = getattr(m, model_name)
+        out.extend((r, label, keyfn(r)) for r in rows if isinstance(r, model))
+    return out
+
+
+async def _reader_compare_scope(client, device, scope, rows, *, ok, job_id, device_name):
+    """Post-apply presence check (#108, the #26 silent-drop class) → (ok, failed, fails, status).
+
+    ``_verify_native_or_raise`` re-diffs the committed payload against the CDB SERVICE
+    tree — both sides sit behind the same FASTMAP writer, so a writer that silently
+    drops an object is invisible (proven live on rg03, #26). This check reads the far
+    side of the writer instead: the scope's network-state-export DEVICE-tree view
+    (a data-provider computed from current CDB at GET time, so it reflects the commit
+    just made). Every intended key must be present; a missing key stamps its rows
+    ``reader_compare_missing`` (retryable — last_apply_error keeps them eligible) and
+    fails the scope, so the plugin settles deploying→apply_failed on the immediate
+    post-apply reconcile instead of waiting out stuck_deploying_grace_minutes.
+    Status: "ok" / "missing" / "error" (never fails a good apply on reader trouble) /
+    None (nothing checkable — e.g. only nested non-keyed rows in the batch).
+    NOT covered: NED/device-side divergence (CDB is the near edge of the device —
+    that needs check-sync) and redistribution rows (nested non-keyed, guard parity).
+    """
+    from nso_adapter.core.removal import _RESIDUE_READERS, _guard_specs, _norm_key, _reader_keys
+
+    try:
+        expected = _reader_compare_expected(scope, rows)
+        reader = _RESIDUE_READERS.get(scope)
+        spec = _guard_specs().get(scope)
+        if not expected or reader is None or spec is None:
+            return ok, 0, [], None
+        entry = await getattr(client, reader)(device.nso_device_name) or {}
+        present = {gl.label: _reader_keys(scope, entry, gl) for gl in spec.lists}
+        row_by_id: dict[int, object] = {}
+        missing: dict[int, list[str]] = {}
+        for row, label, key in expected:
+            if _norm_key(key) in present.get(label, set()):
+                continue
+            row_by_id[id(row)] = row
+            missing.setdefault(id(row), []).append(f"{label} {list(key)}")
+    except Exception as exc:  # noqa: BLE001 — the check must never fail a good apply
+        logger.warning("apply.reader_compare_error", job_id=job_id, device=device_name, scope=scope, error=repr(exc))
+        return ok, 0, [], "error"
+    if not missing:
+        return ok, 0, [], "ok"
+    fails = []
+    for rid, keys in missing.items():
+        msg = (
+            f"post-apply device view is missing {', '.join(keys)} — the commit reported "
+            f"success but the key(s) never landed (silent writer drop, #26 class)"
+        )
+        row_by_id[rid].last_apply_error = {
+            "code": "reader_compare_missing",
+            "message": msg,
+            "detail": {"scope": scope},
+        }
+        fails.append({"error": msg})
+    logger.error("apply.reader_compare_missing", job_id=job_id, device=device_name, scope=scope, missing=len(missing))
+    return ok - len(missing), len(missing), fails, "missing"
 
 
 async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_error=None) -> tuple[int, int, list]:
@@ -1124,12 +1283,14 @@ async def _finalize_job(
     ip_outcome: tuple[int, int, list],
     scope_outcomes: dict,
     scope_failures: dict,
+    reader_compare: dict | None = None,
 ) -> None:
     """Assemble job.result/status from the pass outcomes and commit.
 
     With nothing eligible the job succeeds with an all-zero result and returns early.
-    Otherwise the per-scope counts are emitted; any failure flips the job to failed and
-    collects the per-item errors.
+    Otherwise the per-scope counts are emitted (plus the per-scope post-apply
+    reader_compare statuses, #108); any failure flips the job to failed and collects
+    the per-item errors.
     """
     if not any_eligible:
         logger.info("apply.nothing_eligible", job_id=job_id, device_id=device_id)
@@ -1162,6 +1323,8 @@ async def _finalize_job(
     for key in _SCOPE_RESULT_ORDER:
         scope_ok, scope_failed = scope_outcomes[key]
         result[f"{key}_count_by_outcome"] = {"in_sync": scope_ok, "apply_failed": scope_failed}
+    if reader_compare:
+        result["reader_compare"] = reader_compare
     job.result = result
 
     total_failed = attr_failed + ip_failed + sum(failed for _ok, failed in scope_outcomes.values())
@@ -1488,6 +1651,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
 
     scope_outcomes: dict[str, tuple[int, int]] = {}
     scope_failures: dict[str, list] = {}
+    reader_compare: dict[str, str] = {}
     for sc in scopes:
         if not sc.rows:
             scope_outcomes[sc.key] = (0, 0)
@@ -1501,13 +1665,30 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             now=now,
             on_nso_error=sc.on_nso_error,
         )
+        if scope_failed == 0:
+            # #108: the commit reported success — require every intended key to be
+            # present in the scope's device-tree view (the #26 silent-drop class).
+            scope_ok, scope_failed, fails, rc_status = await _reader_compare_scope(
+                client, device, sc.key, sc.rows, ok=scope_ok, job_id=job_id, device_name=device_name
+            )
+            if rc_status is not None:
+                reader_compare[sc.key] = rc_status
         scope_outcomes[sc.key] = (scope_ok, scope_failed)
         if fails:
             scope_failures[sc.key] = fails
 
     # ── Step 7: finalize ── (any_eligible computed up front, before the atomic branch)
     await _finalize_job(
-        db, job, job_id, device_id, any_eligible, attr_outcome, ip_outcome, scope_outcomes, scope_failures
+        db,
+        job,
+        job_id,
+        device_id,
+        any_eligible,
+        attr_outcome,
+        ip_outcome,
+        scope_outcomes,
+        scope_failures,
+        reader_compare=reader_compare,
     )
 
 

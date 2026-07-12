@@ -2198,3 +2198,228 @@ async def test_run_apply_atomic_failure_marks_both_subif_and_ip(adapter_client, 
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         break
+
+
+# ── #108: post-apply reader-compare (the #26 silent-drop class, caught in seconds) ──
+#
+# _verify_native_or_raise re-diffs the committed payload against the CDB SERVICE tree —
+# both sides sit behind the same FASTMAP writer, so a writer that silently drops an
+# object stays invisible (#26, proven live on rg03). The reader-compare closes that
+# hole from the other side: after a scope's batch commit reports success, re-read the
+# scope's network-state-export DEVICE-tree view and require every intended key to be
+# present. A missing key marks those rows apply_failed (retryable) and fails the JOB,
+# so the plugin settles deploying→apply_failed on the immediate post-apply reconcile
+# instead of waiting out stuck_deploying_grace_minutes.
+
+
+async def test_run_apply_reader_compare_flags_silent_drop(adapter_client):
+    """The #26 scenario: the static-route writer 'succeeds' but the device view never
+    gains the route → the job FAILS and the row carries reader_compare_missing."""
+    from nso_adapter.store.models import StaticRouteIntent
+
+    device_id = await _seed_device("rtr-rc-drop", 401)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id,
+                vrf="",
+                prefix="198.18.26.0/24",
+                next_hop="10.0.0.1",
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock(spec=NsoClient)
+    mock_client.get_static_routes.return_value = {"route": []}  # commit "ok", key never landed
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.result["static_route_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
+        assert job.result["reader_compare"]["static_route"] == "missing"
+        row = (
+            (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        assert row.last_apply_error["code"] == "reader_compare_missing"
+        assert "198.18.26.0/24" in row.last_apply_error["message"]
+        break
+
+
+async def test_run_apply_reader_compare_ok_when_key_lands(adapter_client):
+    """A landed key keeps the scope green and records reader_compare=ok."""
+    from nso_adapter.store.models import StaticRouteIntent
+
+    device_id = await _seed_device("rtr-rc-ok", 402)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id,
+                vrf="",
+                prefix="198.18.27.0/24",
+                next_hop="10.0.0.1",
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock(spec=NsoClient)
+    mock_client.get_static_routes.return_value = {
+        "route": [{"vrf": "", "prefix": "198.18.27.0/24", "next-hop": "10.0.0.1"}]
+    }
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        assert job.result["static_route_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
+        assert job.result["reader_compare"]["static_route"] == "ok"
+        row = (
+            (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        assert row.last_apply_error is None
+        assert row.last_apply_at is not None
+        break
+
+
+async def test_run_apply_reader_compare_reader_error_is_nonfatal(adapter_client):
+    """The check must never fail a good apply: a reader exception records 'error' and
+    leaves the scope green (transparency without false alarms)."""
+    from nso_adapter.store.models import StaticRouteIntent
+
+    device_id = await _seed_device("rtr-rc-err", 403)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id,
+                vrf="",
+                prefix="198.18.28.0/24",
+                next_hop="10.0.0.1",
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock(spec=NsoClient)
+    mock_client.get_static_routes.side_effect = RuntimeError("reader down")
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        assert job.result["static_route_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
+        assert job.result["reader_compare"]["static_route"] == "error"
+        break
+
+
+async def test_run_apply_reader_compare_bgp_checks_router_and_peers(adapter_client):
+    """A BgpRouterIntent expands to its router asn AND every scope peer address — the
+    reader nests router→scope→peer like the service. A dropped peer flags the row."""
+    from nso_adapter.store.models import BgpPeerIntent, BgpRouterIntent, BgpScopeIntent
+
+    device_id = await _seed_device("rtr-rc-bgp", 404)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        router = BgpRouterIntent(device_id=device_id, asn="65100", accepted_at=datetime.utcnow())
+        db.add(router)
+        await db.flush()
+        scope = BgpScopeIntent(router_id=router.id, vrf="")
+        db.add(scope)
+        await db.flush()
+        db.add(BgpPeerIntent(scope_id=scope.id, peer_address="10.0.0.7"))
+        db.add(BgpPeerIntent(scope_id=scope.id, peer_address="10.0.0.9"))
+        await db.commit()
+        break
+
+    mock_client = AsyncMock(spec=NsoClient)
+    mock_client.get_bgp_config.return_value = {
+        "router": [{"asn": 65100, "scope": [{"vrf": "", "peer": [{"peer-address": "10.0.0.7"}]}]}]
+    }  # 10.0.0.9 silently dropped
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_bgp_config", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.result["reader_compare"]["bgp"] == "missing"
+        assert job.result["bgp_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
+        router = (
+            (await db.execute(select(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))).scalars().one()
+        )
+        assert router.last_apply_error["code"] == "reader_compare_missing"
+        assert "10.0.0.9" in router.last_apply_error["message"]
+        break
+
+
+async def test_run_apply_reader_compare_isis_flags_only_missing_model(adapter_client):
+    """isis mixes interface and process rows in one scope — only the model whose key
+    is absent (here the process) is flagged; the landed interface row stays green."""
+    from nso_adapter.store.models import IsisInterfaceIntent, IsisProcessIntent
+
+    device_id = await _seed_device("rtr-rc-isis", 405)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            IsisInterfaceIntent(
+                device_id=device_id, interface_name="ge-0/0/0", af="ipv4", accepted_at=datetime.utcnow()
+            )
+        )
+        db.add(IsisProcessIntent(device_id=device_id, process_tag="CORE", accepted_at=datetime.utcnow()))
+        await db.commit()
+        break
+
+    mock_client = AsyncMock(spec=NsoClient)
+    mock_client.get_isis_interfaces.return_value = {
+        "interface": [{"interface-name": "ge-0/0/0", "af": "ipv4"}],
+        "process": [],  # process silently dropped
+    }
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_isis_interfaces", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.result["reader_compare"]["isis"] == "missing"
+        assert job.result["isis_count_by_outcome"] == {"in_sync": 1, "apply_failed": 1}
+        iface_row = (
+            (await db.execute(select(IsisInterfaceIntent).where(IsisInterfaceIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        proc_row = (
+            (await db.execute(select(IsisProcessIntent).where(IsisProcessIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        assert iface_row.last_apply_error is None
+        assert proc_row.last_apply_error["code"] == "reader_compare_missing"
+        break
