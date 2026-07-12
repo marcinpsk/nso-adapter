@@ -196,6 +196,12 @@ def _removed_context(scope: str, context: dict) -> dict[str, list]:
 # the current CDB config), so a read right after the replace commit reflects exactly
 # what FASTMAP left behind. Scopes absent here get residue_check="unsupported" in the
 # job result — transparency over a silent "clean" (intent-integrity principle).
+# interface_config is the one deliberate hold-out: its removal is per-instance at
+# attribute-VALUE grain, and an adopted attribute reverts to the very value the
+# service asserted, so a post-removal re-read cannot tell residue from correct
+# reversion. Names are pinned to the real NsoClient surface by
+# test_residue_readers_resolve_on_the_real_client (#104-A shipped two typos whose
+# test fake matched the misspelling).
 _RESIDUE_READERS: dict[str, str] = {
     "svi": "get_svi",
     "subinterface": "get_subinterface",
@@ -203,17 +209,35 @@ _RESIDUE_READERS: dict[str, str] = {
     "vlan": "get_vlan_database",
     "logging": "get_logging_config",
     "interface_mtu": "get_interface_mtu",
-    "bfd": "get_bfd",
-    "l2_sap": "get_l2_service",
+    "bfd": "get_bfd_config",
+    "l2_sap": "get_l2_services",
+    # #104 phase-2 — the guarded complex scopes; same key grain as the guard lists.
+    "bgp": "get_bgp_config",
+    "isis": "get_isis_interfaces",
+    "ospf": "get_ospf",
+    "route_policy": "get_route_policy",
+    "snmp": "get_snmp_config",
+}
+
+# Guard-list label → the network-state-export list path, for the scopes where the
+# export YANG names its lists differently from the reconciler-service YANG (the
+# key LEAF names agree everywhere, so only the walk path needs translating).
+_READER_LIST_PATHS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("isis", "interface-config"): ("interface",),
+    ("isis", "process-config"): ("process",),
+    ("ospf", "interface-config"): ("interface",),
+    ("ospf", "process-config"): ("instance",),
 }
 
 
 def _reader_keys(scope: str, entry: dict, guard_list: _GuardList) -> set[tuple[str, ...]]:
     """Key tuples of *guard_list* present in a network-state-export reader *entry*.
 
-    The reader lists mirror the reconciler-service shapes, so the guard's own
-    ``_leaf_keys`` walk applies as-is — except l2, where the reader nests ``sap``
-    under ``service`` while the service list is flat (service-name, sap-id).
+    The reader lists mirror the reconciler-service shapes (bgp's router→scope→peer
+    nesting included), so the guard's own ``_leaf_keys`` walk applies as-is — except
+    the isis/ospf list renames in ``_READER_LIST_PATHS`` and l2, where the reader
+    nests ``sap`` under ``service`` while the service list is flat (service-name,
+    sap-id) — a parent-level key leaf the generic walk cannot express.
     """
     if scope == "l2_sap":
         return {
@@ -221,6 +245,9 @@ def _reader_keys(scope: str, entry: dict, guard_list: _GuardList) -> set[tuple[s
             for svc in entry.get("service") or []
             for sap in svc.get("sap") or []
         }
+    path = _READER_LIST_PATHS.get((scope, guard_list.label))
+    if path is not None:
+        guard_list = guard_list._replace(path=path)
     return _leaf_keys(entry, guard_list)
 
 

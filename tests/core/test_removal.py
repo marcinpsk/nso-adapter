@@ -864,25 +864,49 @@ async def test_enqueue_removal_serializes_removed_tuples(adapter_client):
 
 
 class _ReaderClient:
-    """Real-shape fake of the reader surface: canned network-state-export entries."""
+    """Real-shape fake of the reader surface: canned network-state-export entries.
 
-    def __init__(self, *, svi=None, l2=None, raise_on_read=False):
-        self._svi = svi
-        self._l2 = l2
+    Method names MUST be real NsoClient method names —
+    test_residue_readers_resolve_on_the_real_client pins both this fake and the
+    _RESIDUE_READERS mapping to the real surface. (#104-A shipped bfd/l2_sap
+    pointing at nonexistent get_bfd/get_l2_service and the fake matched the typo,
+    so every real bfd/l2 removal silently degraded to residue_check='error'.)
+    """
+
+    def __init__(self, *, raise_on_read=False, **entries):
+        self._entries = entries  # short scope tag → canned reader entry
         self._raise = raise_on_read
         self.reads = 0
 
-    async def get_svi(self, device_name):
+    def _read(self, tag):
         self.reads += 1
         if self._raise:
             raise RuntimeError("reader down")
-        return self._svi
+        return self._entries.get(tag)
 
-    async def get_l2_service(self, device_name):
-        self.reads += 1
-        if self._raise:
-            raise RuntimeError("reader down")
-        return self._l2
+    async def get_svi(self, device_name):
+        return self._read("svi")
+
+    async def get_l2_services(self, device_name):
+        return self._read("l2")
+
+    async def get_bfd_config(self, device_name):
+        return self._read("bfd")
+
+    async def get_bgp_config(self, device_name):
+        return self._read("bgp")
+
+    async def get_isis_interfaces(self, device_name):
+        return self._read("isis")
+
+    async def get_ospf(self, device_name):
+        return self._read("ospf")
+
+    async def get_route_policy(self, device_name):
+        return self._read("route_policy")
+
+    async def get_snmp_config(self, device_name):
+        return self._read("snmp")
 
 
 async def _run(job_id: int, device_id: int, client) -> None:
@@ -941,15 +965,174 @@ async def test_run_removal_residue_handles_nested_l2_reader_shape(adapter_client
 
 
 async def test_run_removal_residue_unsupported_scope_is_transparent(adapter_client):
-    """Scopes without a reader mapping must say so — never silently claim clean."""
+    """Scopes without a reader mapping must say so — never silently claim clean.
+
+    interface_config is the one deliberate hold-out (#104 phase-2): its removal is
+    per-instance at attribute-VALUE grain, and an adopted attribute reverts to the
+    very value the service asserted, so a re-read cannot tell residue from correct
+    reversion.
+    """
     device_id = await _seed_device(nso_device_name="sw3")
-    job_id = await _seed_removal_job(device_id, "bgp", {"removed": {"router": ["65100"]}})
+    job_id = await _seed_removal_job(device_id, "interface_config", {"interfaces": ["GigabitEthernet0/1"]})
 
     await _run(job_id, device_id, _ReaderClient())
 
     job = await _job_after(job_id)
     assert job.status == JobStatus.succeeded
     assert job.result["residue_check"] == "unsupported"
+
+
+def test_residue_readers_resolve_on_the_real_client():
+    """Every _RESIDUE_READERS target must be a real NsoClient coroutine — and so must
+    every get_* method on the test fake. #104-A shipped bfd→get_bfd and
+    l2_sap→get_l2_service (neither exists); the fake carried the same typo, so the
+    suite stayed green while real removals degraded to residue_check='error'."""
+    import inspect
+
+    from nso_adapter.core.removal import _RESIDUE_READERS
+    from nso_adapter.nso.client import NsoClient
+
+    for scope, name in _RESIDUE_READERS.items():
+        fn = getattr(NsoClient, name, None)
+        assert fn is not None and inspect.iscoroutinefunction(fn), f"{scope} → {name} is not a real NsoClient reader"
+    for name in dir(_ReaderClient):
+        if name.startswith("get_"):
+            assert hasattr(NsoClient, name), f"_ReaderClient.{name} drifted off the real NsoClient surface"
+
+
+async def test_run_removal_residue_bgp_router_and_peer(adapter_client):
+    """#104 phase-2: bgp residue matches the guard grain — router by asn, peers
+    flattened across router→scope→peer (the reader nests identically)."""
+    device_id = await _seed_device(nso_device_name="rg3")
+    job_id = await _seed_removal_job(
+        device_id, "bgp", {"removed": {"router": [["65100"]], "peer": [["10.0.0.7"], ["10.0.0.9"]]}}
+    )
+    client = _ReaderClient(
+        bgp={
+            "router": [
+                {
+                    "asn": 65100,  # ints in NSO JSON — must still match the string trigger key
+                    "scope": [{"vrf": "GRT", "peer": [{"peer-address": "10.0.0.7"}]}],
+                }
+            ]
+        }
+    )
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "found"
+    assert job.result["residue"] == {"router": [["65100"]], "peer": [["10.0.0.7"]]}
+
+
+async def test_run_removal_residue_isis_renamed_reader_lists(adapter_client):
+    """#104 phase-2: the isis export lists are named interface/process while the
+    service (and trigger) say interface-config/process-config — the translation
+    must land on the right lists, including the compound (interface-name, af) key."""
+    device_id = await _seed_device(nso_device_name="ra1")
+    job_id = await _seed_removal_job(
+        device_id,
+        "isis",
+        {"removed": {"interface-config": [["ge-0/0/0", "ipv4"], ["ge-0/0/1", "ipv4"]], "process-config": [["CORE"]]}},
+    )
+    client = _ReaderClient(
+        isis={
+            "process": [{"process-tag": "CORE"}],
+            "interface": [{"interface-name": "ge-0/0/0", "af": "ipv4"}],
+        }
+    )
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "found"
+    assert job.result["residue"] == {"interface-config": [["ge-0/0/0", "ipv4"]], "process-config": [["CORE"]]}
+
+
+async def test_run_removal_residue_ospf_instance_rename_and_clean(adapter_client):
+    """#104 phase-2: ospf process-config maps onto the export's `instance` list;
+    a device tree with none of the removed keys reports clean."""
+    device_id = await _seed_device(nso_device_name="rg3")
+    job_id = await _seed_removal_job(
+        device_id, "ospf", {"removed": {"interface-config": [["GigabitEthernet0/1"]], "process-config": [["1"]]}}
+    )
+    clean_client = _ReaderClient(ospf={"instance": [{"process-id": 2}], "interface": []})
+
+    await _run(job_id, device_id, clean_client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "clean"
+    assert "residue" not in job.result
+
+
+async def test_run_removal_residue_ospf_found_via_instance_list(adapter_client):
+    device_id = await _seed_device(nso_device_name="rg3")
+    job_id = await _seed_removal_job(device_id, "ospf", {"removed": {"process-config": [["1"]]}})
+    client = _ReaderClient(ospf={"instance": [{"process-id": 1}]})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "found"
+    assert job.result["residue"] == {"process-config": [["1"]]}
+
+
+async def test_run_removal_residue_snmp_three_lists(adapter_client):
+    """#104 phase-2: snmp residue checks community/v3-user/host independently."""
+    device_id = await _seed_device(nso_device_name="sw3")
+    job_id = await _seed_removal_job(
+        device_id,
+        "snmp",
+        {"removed": {"community": [["public"]], "v3-user": [["nms"]], "host": [["198.18.5.9"]]}},
+    )
+    client = _ReaderClient(
+        snmp={
+            "community": [{"name": "public"}],
+            "v3-user": [],
+            "host": [{"address": "198.18.5.10"}],
+        }
+    )
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "found"
+    assert job.result["residue"] == {"community": [["public"]]}
+
+
+async def test_run_removal_residue_route_policy_per_family_lists(adapter_client):
+    """#104 phase-2: route-policy residue matches per family list (route-map vs
+    prefix-list etc.), same bucketing the trigger's _removed_map produced."""
+    device_id = await _seed_device(nso_device_name="rg3")
+    job_id = await _seed_removal_job(
+        device_id, "route_policy", {"removed": {"route-map": [["RM-X"]], "prefix-list": [["PL-Y"]]}}
+    )
+    client = _ReaderClient(
+        route_policy={
+            "route-map": [{"name": "RM-X", "entry": [{"sequence": 10}]}],
+            "prefix-list": [],
+        }
+    )
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "found"
+    assert job.result["residue"] == {"route-map": [["RM-X"]]}
+
+
+async def test_run_removal_residue_bfd_uses_real_reader_name(adapter_client):
+    """#104-A regression: the bfd mapping pointed at nonexistent get_bfd, so every
+    bfd residue check errored. With the real get_bfd_config it must work."""
+    device_id = await _seed_device(nso_device_name="sw3")
+    job_id = await _seed_removal_job(device_id, "bfd", {"removed": {"interface": [["ge-0/0/2"]]}})
+    client = _ReaderClient(bfd={"interface": [{"interface-name": "ge-0/0/2"}]})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "found"
+    assert job.result["residue"] == {"interface": [["ge-0/0/2"]]}
 
 
 async def test_run_removal_residue_reader_error_is_nonfatal(adapter_client):
