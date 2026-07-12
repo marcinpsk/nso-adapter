@@ -908,6 +908,9 @@ class _ReaderClient:
     async def get_snmp_config(self, device_name):
         return self._read("snmp")
 
+    async def get_interface_ips(self, device_name):
+        return self._read("interface_ips")
+
 
 async def _run(job_id: int, device_id: int, client) -> None:
     from nso_adapter.core.removal import run_removal
@@ -965,12 +968,11 @@ async def test_run_removal_residue_handles_nested_l2_reader_shape(adapter_client
 
 
 async def test_run_removal_residue_unsupported_scope_is_transparent(adapter_client):
-    """Scopes without a reader mapping must say so — never silently claim clean.
+    """Jobs without captured removed values must say so — never silently claim clean.
 
-    interface_config is the one deliberate hold-out (#104 phase-2): its removal is
-    per-instance at attribute-VALUE grain, and an adopted attribute reverts to the
-    very value the service asserted, so a re-read cannot tell residue from correct
-    reversion.
+    An interface_config job whose context has no ``removed`` values (a legacy queue
+    row from before #104 phase-3, or an actions/force-removal with no trigger-computed
+    values) cannot be value-checked, so the check reports unsupported, not clean.
     """
     device_id = await _seed_device(nso_device_name="sw3")
     job_id = await _seed_removal_job(device_id, "interface_config", {"interfaces": ["GigabitEthernet0/1"]})
@@ -1133,6 +1135,103 @@ async def test_run_removal_residue_bfd_uses_real_reader_name(adapter_client):
     job = await _job_after(job_id)
     assert job.result["residue_check"] == "found"
     assert job.result["residue"] == {"interface": [["ge-0/0/2"]]}
+
+
+# ── #104 phase-3: interface_config residue at VALUE grain ─────────────────────
+#
+# interface_config removal is per-instance (PUT-replace/DELETE of one
+# (device, interface) service entry) retracting address/attribute VALUES, not
+# keyed rows — so its residue check intersects the trigger's just-removed
+# (interface, address, vrf) triples with the interface-ip export view.
+
+
+async def test_run_removal_residue_interface_config_value_survives(adapter_client):
+    """A delete-origin IP retraction whose address SURVIVES on the device is reported.
+
+    Whether it survived as a kept-adopted leaf or a husk entry, the operator
+    deleted the IP in NetBox and would otherwise believe it left the device —
+    transparency over a silent 'clean' (intent-integrity principle).
+    """
+    device_id = await _seed_device(nso_device_name="rm-ic-1")
+    job_id = await _seed_removal_job(
+        device_id,
+        "interface_config",
+        {"interfaces": ["Gi0/3"], "removed": {"address": [["Gi0/3", "10.0.0.2/24", ""]]}},
+    )
+    client = _ReaderClient(
+        interface_ips={
+            "interface": [
+                {
+                    "interface-name": "Gi0/3",
+                    "address": [
+                        {"address": "10.0.0.1/24", "vrf": "", "family": "ipv4"},
+                        # explicit null vrf, as the export can emit — must compare as ""
+                        {"address": "10.0.0.2/24", "vrf": None, "family": "ipv4"},
+                    ],
+                }
+            ]
+        }
+    )
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.status == JobStatus.succeeded
+    assert job.result["residue_check"] == "found"
+    assert job.result["residue"] == {"address": [["Gi0/3", "10.0.0.2/24", ""]]}
+
+
+async def test_run_removal_residue_interface_config_value_gone_is_clean(adapter_client):
+    """The removed address absent from ITS interface is clean — a same-address
+    entry on a different interface must not count as residue."""
+    device_id = await _seed_device(nso_device_name="rm-ic-2")
+    job_id = await _seed_removal_job(
+        device_id,
+        "interface_config",
+        {"interfaces": ["Gi0/3"], "removed": {"address": [["Gi0/3", "10.0.0.2/24", ""]]}},
+    )
+    client = _ReaderClient(
+        interface_ips={
+            "interface": [
+                {"interface-name": "Gi0/3", "address": [{"address": "10.0.0.1/24", "vrf": ""}]},
+                {"interface-name": "Gi0/4", "address": [{"address": "10.0.0.2/24", "vrf": ""}]},
+            ]
+        }
+    )
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "clean"
+    assert "residue" not in job.result
+
+
+async def test_run_removal_residue_interface_config_normalizes_ipv6(adapter_client):
+    """Intent form and export form of one address may differ textually (IPv6
+    case/zero-compression) — compare at ip_interface grain, report the trigger's
+    original form."""
+    device_id = await _seed_device(nso_device_name="rm-ic-3")
+    job_id = await _seed_removal_job(
+        device_id,
+        "interface_config",
+        {"interfaces": ["ge-0/0/1"], "removed": {"address": [["ge-0/0/1", "2001:DB8:0:0::1/64", "CUST"]]}},
+    )
+    client = _ReaderClient(
+        interface_ips={
+            "interface": [
+                {
+                    "interface-name": "ge-0/0/1",
+                    "address": [{"address": "2001:db8::1/64", "vrf": "CUST", "family": "ipv6"}],
+                }
+            ]
+        }
+    )
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "found"
+    assert job.result["residue"] == {"address": [["ge-0/0/1", "2001:DB8:0:0::1/64", "CUST"]]}
 
 
 async def test_run_removal_residue_reader_error_is_nonfatal(adapter_client):

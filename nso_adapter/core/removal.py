@@ -19,6 +19,7 @@ safe to requeue after a restart.
 
 from __future__ import annotations
 
+import ipaddress
 from functools import cache
 from typing import NamedTuple
 
@@ -196,10 +197,7 @@ def _removed_context(scope: str, context: dict) -> dict[str, list]:
 # the current CDB config), so a read right after the replace commit reflects exactly
 # what FASTMAP left behind. Scopes absent here get residue_check="unsupported" in the
 # job result — transparency over a silent "clean" (intent-integrity principle).
-# interface_config is the one deliberate hold-out: its removal is per-instance at
-# attribute-VALUE grain, and an adopted attribute reverts to the very value the
-# service asserted, so a post-removal re-read cannot tell residue from correct
-# reversion. Names are pinned to the real NsoClient surface by
+# Names are pinned to the real NsoClient surface by
 # test_residue_readers_resolve_on_the_real_client (#104-A shipped two typos whose
 # test fake matched the misspelling).
 _RESIDUE_READERS: dict[str, str] = {
@@ -217,6 +215,11 @@ _RESIDUE_READERS: dict[str, str] = {
     "ospf": "get_ospf",
     "route_policy": "get_route_policy",
     "snmp": "get_snmp_config",
+    # #104 phase-3 — value grain, bespoke compare in _interface_config_residue: the
+    # per-instance replace/delete retracts address VALUES, not keyed rows, so the
+    # check intersects the trigger's removed (interface, address, vrf) triples with
+    # the interface-ip export instead of walking a guard spec.
+    "interface_config": "get_interface_ips",
 }
 
 # Guard-list label → the network-state-export list path, for the scopes where the
@@ -251,6 +254,50 @@ def _reader_keys(scope: str, entry: dict, guard_list: _GuardList) -> set[tuple[s
     return _leaf_keys(entry, guard_list)
 
 
+def _norm_addr(address) -> str:
+    """Canonicalize an ``ip/prefix-length`` string for comparison.
+
+    The intent form (NetBox) and the export form (device CDB) of one address can
+    differ textually — IPv6 case and zero-compression — while naming the same
+    interface address; ``ip_interface`` collapses both to one canonical string.
+    Unparseable values fall back to the raw string.
+    """
+    try:
+        return str(ipaddress.ip_interface(str(address)))
+    except ValueError:
+        return str(address)
+
+
+def _norm_ip_triple(triple) -> tuple[str, str, str]:
+    """Normalize one removed-value triple to comparable (interface, address, vrf)."""
+    iface, address, vrf = (list(triple) + ["", "", ""])[:3]
+    return (str(iface), _norm_addr(address), str(vrf or ""))
+
+
+async def _interface_config_residue(client, device, context: dict) -> dict[str, list] | None:
+    """Value-grain residue for interface_config removals (#104 phase-3).
+
+    The per-instance PUT-replace/DELETE retracts address VALUES rather than keyed
+    service rows, so the check intersects the trigger's just-removed
+    (interface, address, vrf) triples with the interface-ip export view. A
+    surviving address — whether a kept-adopted leaf or a husk entry — is reported:
+    the operator deleted the IP in NetBox and would otherwise believe it left the
+    device. Jobs without captured values (legacy queue rows, actions/force-removal)
+    return ``None`` → residue_check="unsupported", never a silent "clean".
+    """
+    removed = (context.get("removed") or {}).get("address")
+    if removed is None:
+        return None
+    entry = await getattr(client, _RESIDUE_READERS["interface_config"])(device.nso_device_name) or {}
+    present = {
+        (str(iface.get("interface-name", "")), _norm_addr(addr.get("address", "")), str(addr.get("vrf") or ""))
+        for iface in entry.get("interface") or []
+        for addr in iface.get("address") or []
+    }
+    survivors = sorted([str(p) for p in t] for t in removed if _norm_ip_triple(t) in present)
+    return {"address": survivors} if survivors else {}
+
+
 async def _residue_after_removal(client, device, scope: str, context: dict) -> dict[str, list] | None:
     """Report the just-removed keys the device STILL has after the replace commit (#104).
 
@@ -258,9 +305,13 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> d
     leaves (sw03 Vlan987: a sync between apply and removal imported the
     device-rendered ``no ip address`` into the CDB entry), so a removal can report
     SUCCESS while its keys survive in the device tree. Re-read the scope's reader —
-    the NED-agnostic device-tree view — and report survivors per YANG list.
-    Returns ``None`` when the scope has no reader mapping (check unsupported).
+    the NED-agnostic device-tree view — and report survivors per YANG list
+    (interface_config compares removed VALUES instead — see
+    :func:`_interface_config_residue`). Returns ``None`` when the check cannot run
+    (no reader mapping / no captured values) → residue_check="unsupported".
     """
+    if scope == "interface_config":
+        return await _interface_config_residue(client, device, context)
     reader = _RESIDUE_READERS.get(scope)
     spec = _guard_specs().get(scope)
     if reader is None or spec is None:

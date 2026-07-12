@@ -272,7 +272,49 @@ async def test_put_ip_intent_removal_enqueues_interface_config_job(adapter_clien
     async for db in get_session():
         removals = [j for j in (await db.execute(select(Job))).scalars().all() if j.job_type == JobType.removal]
         assert len(removals) == 1
-        assert removals[0].context == {"scope": "interface_config", "interfaces": ["Gi0/3"], "detach": True}
+        assert removals[0].context == {
+            "scope": "interface_config",
+            "interfaces": ["Gi0/3"],
+            # #104 phase-3: the removed VALUES ride along so run_removal can do the
+            # value-grain residue check after the per-instance replace/delete.
+            "removed": {"address": [["Gi0/3", "10.0.0.2/24", ""]]},
+            "detach": True,
+        }
+        break
+
+
+async def test_put_ip_intent_removal_captures_values_per_interface(adapter_client):
+    """The removal context carries every removed (interface, address, vrf) triple,
+    sorted, across interfaces — the #104 phase-3 value-grain residue input."""
+    from sqlalchemy import select
+
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Job, JobType
+
+    device_id = await seed_device(nso_device_name="ip-rm-vals-dev", netbox_device_id=906)
+    await _seed_interface(device_id, "Gi0/5")
+    await _seed_interface(device_id, "Gi0/6")
+
+    p1 = {
+        "addresses": [
+            {"interface": "Gi0/5", "address": "10.0.2.1/30", "family": "ipv4"},
+            {"interface": "Gi0/5", "address": "10.0.1.1/30", "family": "ipv4", "vrf": "CUST"},
+            {"interface": "Gi0/6", "address": "10.0.3.1/30", "family": "ipv4"},
+        ]
+    }
+    await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=p1)
+
+    p2 = {"addresses": [{"interface": "Gi0/6", "address": "10.0.3.1/30", "family": "ipv4"}]}
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=p2)
+    assert resp.json()["removed_interfaces"] == 1
+
+    async for db in get_session():
+        removals = [j for j in (await db.execute(select(Job))).scalars().all() if j.job_type == JobType.removal]
+        assert len(removals) == 1
+        assert removals[0].context["interfaces"] == ["Gi0/5"]
+        assert removals[0].context["removed"] == {
+            "address": [["Gi0/5", "10.0.1.1/30", "CUST"], ["Gi0/5", "10.0.2.1/30", ""]]
+        }
         break
 
 

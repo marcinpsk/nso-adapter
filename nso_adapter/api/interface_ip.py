@@ -106,6 +106,27 @@ class IpIntentUpdate(BaseModel):
     addresses: list[IpAddressEntry]
 
 
+async def _delete_rows_absent_from_payload(db, existing_rows, new_keys, iface_name_by_id):
+    """Delete intent rows absent from the new payload; return what was removed.
+
+    Returns the affected interface names (the removal job's per-instance scope) and
+    the removed (interface, address, vrf) triples, sorted — the value-grain residue
+    input run_removal checks after the replace commit (#104 phase-3).
+    """
+    removed_interfaces: set[str] = set()
+    removed_addresses: list[list[str]] = []
+    for key, row in existing_rows.items():
+        if key not in new_keys:
+            name = iface_name_by_id.get(row.interface_id, "")
+            removed_interfaces.add(name)
+            if name:
+                removed_addresses.append([name, row.address, row.vrf or ""])
+            await db.delete(row)
+    removed_interfaces.discard("")
+    removed_addresses.sort()
+    return removed_interfaces, removed_addresses
+
+
 @router.put("/{device_id}/ip-intent", dependencies=[Depends(verify_token)])
 async def put_ip_intent(device_id: int, body: IpIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's IP intent mirror for this device atomically.
@@ -171,14 +192,13 @@ async def put_ip_intent(device_id: int, body: IpIntentUpdate, db: AsyncSession =
             new_keys.add((iface.id, item.address, item.vrf))
 
     # Delete rows absent from the new payload, tracking which interfaces lost intent so the
-    # removal can be propagated to the device (a merge-PATCH apply never drops the address).
+    # removal can be propagated to the device (a merge-PATCH apply never drops the address),
+    # and the removed (interface, address, vrf) VALUES so run_removal can do the value-grain
+    # residue check after the per-instance replace/delete (#104 phase-3).
     iface_name_by_id = {i.id: i.name for i in ifaces.values()}
-    removed_interfaces: set[str] = set()
-    for key, row in existing_rows.items():
-        if key not in new_keys:
-            removed_interfaces.add(iface_name_by_id.get(row.interface_id, ""))
-            await db.delete(row)
-    removed_interfaces.discard("")
+    removed_interfaces, removed_addresses = await _delete_rows_absent_from_payload(
+        db, existing_rows, new_keys, iface_name_by_id
+    )
     await db.flush()
 
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -221,7 +241,13 @@ async def put_ip_intent(device_id: int, body: IpIntentUpdate, db: AsyncSession =
     if removed_interfaces:
         from nso_adapter.core.removal import enqueue_removal
 
-        await enqueue_removal(db, device_id, "interface_config", interfaces=sorted(removed_interfaces))
+        await enqueue_removal(
+            db,
+            device_id,
+            "interface_config",
+            interfaces=sorted(removed_interfaces),
+            removed={"address": removed_addresses},
+        )
         replaced = True
 
     await db.commit()
