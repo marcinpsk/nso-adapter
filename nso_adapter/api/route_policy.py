@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import api_error
+from nso_adapter.core.removal import lost_content
 from nso_adapter.store.models import (
     Device,
     DeviceRoutePolicyASPath,
@@ -165,6 +166,59 @@ async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_db)):
 _VALID_FAMILIES = {"prefix_list", "community_list", "as_path", "route_map"}
 
 
+async def _upsert_route_policy_object(db: AsyncSession, device_id: int, obj: dict, before_entries: dict, now) -> bool:
+    """Create-or-update one policy object; return True if its content SHRANK.
+
+    A shrink (a route-map term deleted, a prefix-list line removed, a community member
+    dropped, a match/set leaf blanked) is invisible to the (family, name) diff — the object
+    itself survives — and a merge-PATCH apply cannot express it, so the deleted content stays
+    in the service's CDB input and FASTMAP keeps creating it on the device. It has to trigger
+    the PUT-replace retract (see nso_adapter.core.removal.lost_content).
+    """
+    family = obj.get("family")
+    name = obj.get("name")
+    entries = obj.get("entries")
+    accepted = obj.get("accepted", False)
+    invert_match = bool(obj.get("invert_match", False))
+
+    if family not in _VALID_FAMILIES:
+        raise api_error(422, "invalid_family", f"Unknown family: {family!r}")
+    if not isinstance(name, str) or not name:
+        raise api_error(422, "invalid_name", "Each object must have a non-empty 'name'")
+    if not isinstance(entries, list):
+        raise api_error(422, "invalid_entries", f"'entries' for {name!r} must be a list")
+
+    row = (
+        await db.execute(
+            select(RoutePolicyObjectIntent).where(
+                RoutePolicyObjectIntent.device_id == device_id,
+                RoutePolicyObjectIntent.family == family,
+                RoutePolicyObjectIntent.name == name,
+            )
+        )
+    ).scalar_one_or_none()
+
+    if row is None:
+        db.add(
+            RoutePolicyObjectIntent(
+                device_id=device_id,
+                family=family,
+                name=name,
+                entries=entries,
+                invert_match=invert_match,
+                accepted_at=now if accepted else None,
+            )
+        )
+        return False  # brand new — nothing it could have lost
+
+    shrank = lost_content(before_entries.get((family, name)), entries)
+    row.entries = entries
+    row.invert_match = invert_match
+    if accepted:
+        row.accepted_at = now
+    return shrank
+
+
 @router.put("/{device_id}/route-policy-intent", dependencies=[Depends(verify_token)])
 async def put_route_policy_intent(
     device_id: int,
@@ -205,51 +259,23 @@ async def put_route_policy_intent(
         .all()
     )
     removed = [(r.family, r.name) for r in existing_all if (r.family, r.name) not in incoming_keys]
+    # Pre-image of the surviving objects' CONTENT. The (family, name) diff above only sees an
+    # object that vanished whole — it is blind to the object that merely lost a route-map TERM,
+    # a prefix-list line, or a community member. Those live inside `entries`, which is
+    # overwritten in place below, and a merge-PATCH apply cannot drop any of them: the deleted
+    # term stays in the service's CDB input, so FASTMAP keeps creating it on the device
+    # (tracker #83, the route-policy leg).
+    before_entries = {(r.family, r.name): r.entries for r in existing_all}
     for r in existing_all:
         if (r.family, r.name) not in incoming_keys:
             await db.delete(r)
     await db.flush()
 
+    cleared = False
     for obj in objects:
-        family = obj.get("family")
-        name = obj.get("name")
-        entries = obj.get("entries")
-        accepted = obj.get("accepted", False)
-        invert_match = bool(obj.get("invert_match", False))
-
-        if family not in _VALID_FAMILIES:
-            raise api_error(422, "invalid_family", f"Unknown family: {family!r}")
-        if not isinstance(name, str) or not name:
-            raise api_error(422, "invalid_name", "Each object must have a non-empty 'name'")
-        if not isinstance(entries, list):
-            raise api_error(422, "invalid_entries", f"'entries' for {name!r} must be a list")
-
-        existing_result = await db.execute(
-            select(RoutePolicyObjectIntent).where(
-                RoutePolicyObjectIntent.device_id == device_id,
-                RoutePolicyObjectIntent.family == family,
-                RoutePolicyObjectIntent.name == name,
-            )
-        )
-        row = existing_result.scalar_one_or_none()
-
-        if row is None:
-            row = RoutePolicyObjectIntent(
-                device_id=device_id,
-                family=family,
-                name=name,
-                entries=entries,
-                invert_match=invert_match,
-                accepted_at=now if accepted else None,
-            )
-            db.add(row)
-        else:
-            row.entries = entries
-            row.invert_match = invert_match
-            if accepted:
-                row.accepted_at = now
-
         upserted += 1
+        if await _upsert_route_policy_object(db, device_id, obj, before_entries, now):
+            cleared = True  # a term/line/member disappeared, or a leaf inside one was blanked
 
     await db.commit()
 
@@ -279,11 +305,21 @@ async def put_route_policy_intent(
         unsupported=sum(len(v) for v in unsupported_members.values()),
     )
 
-    if removed:
+    if removed or cleared:
         from nso_adapter.core.removal import replace_on_removal
         from nso_adapter.nso.apply import apply_route_policy_config
 
-        await replace_on_removal(db, device, removed, RoutePolicyObjectIntent, apply_route_policy_config)
+        # retract=cleared: an object that only lost a term is still OWNED and accepted — nothing
+        # is being un-owned, so the PUT-replace must actually reach the device rather than
+        # detach with no-networking (#106's detach-by-default is for shrinking OWNERSHIP).
+        await replace_on_removal(
+            db,
+            device,
+            removed,
+            RoutePolicyObjectIntent,
+            apply_route_policy_config,
+            retract=cleared,
+        )
 
     # Return updated intent state for all objects on this device, plus the per-object
     # unsupported-member map so the plugin can surface codec-skipped members.

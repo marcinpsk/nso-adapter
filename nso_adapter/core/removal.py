@@ -20,6 +20,7 @@ safe to requeue after a restart.
 from __future__ import annotations
 
 import ipaddress
+import json
 from functools import cache
 from typing import NamedTuple
 
@@ -189,6 +190,61 @@ def is_cleared(before, after) -> bool:
         return True
     if isinstance(before, str) and isinstance(after, str):
         return after == ""
+    return False
+
+
+#: List-entry key leaves, in preference order. An entry carrying one of these is a KEYED list
+#: entry (a route-map term): its key is its identity, and a merge-PATCH overwrites the rest of
+#: its leaves in place. An entry carrying none of them is its own key (a community member, a
+#: prefix-list line) — there, changing the value ADDS the new one and leaves the old behind.
+_ENTRY_KEY_LEAVES = ("sequence", "seq", "index", "order")
+
+
+def _entry_identity(item):
+    """Return the identity of one list entry, for telling a DROPPED entry from an EDITED one."""
+    if isinstance(item, dict):
+        for leaf in _ENTRY_KEY_LEAVES:
+            if item.get(leaf) is not None:
+                return (leaf, str(item[leaf]))
+    return json.dumps(item, sort_keys=True, default=str)
+
+
+def lost_content(before, after) -> bool:
+    """Whether *after* drops anything *before* carried — the structural form of :func:`is_cleared`.
+
+    For scopes whose intent is a nested JSON document (route-policy entries) rather than a row
+    of scalars. The question is the same one: is this change something a merge-PATCH can
+    express? A merge only ever ADDS or overwrites, so these it cannot:
+
+    * a cleared scalar leaf — the old value stays (:func:`is_cleared`).
+    * a keyed list ENTRY that disappears — a route-map term the operator deleted is still in
+      the service's CDB input, so FASTMAP keeps creating it on the device.
+    * a leaf-LIST that loses (or swaps) a member — the old members merge straight back in, so
+      ``match-prefix-lists: [A, B] -> [A]`` leaves B applied.
+    * an unkeyed entry whose value CHANGED — a community member or prefix-list line IS its own
+      key, so the edit adds the new one and leaves the old one behind.
+
+    A value change to a KEYED entry's leaves is fine, and so is a rewritten ``set-json`` blob:
+    the merge overwrites the leaf, the service input really changes, and FASTMAP reverts
+    whatever the old value had created. It is the OMITTED leaf that is undroppable.
+    """
+    if is_cleared(before, after):
+        return True
+    if isinstance(before, dict):
+        if not isinstance(after, dict):
+            return bool(before)
+        return any(lost_content(value, after.get(key)) for key, value in before.items())
+    if isinstance(before, (list, tuple)):
+        if not isinstance(after, (list, tuple)):
+            return bool(before)
+        after_by_id = {_entry_identity(item): item for item in after}
+        for item in before:
+            identity = _entry_identity(item)
+            if identity not in after_by_id:
+                return True  # the entry (or the leaf-list member) is gone
+            if lost_content(item, after_by_id[identity]):
+                return True  # the entry survived but something inside it was blanked
+        return False
     return False
 
 

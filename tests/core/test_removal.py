@@ -1621,3 +1621,54 @@ async def test_delete_interface_config_detach_adds_no_networking(adapter_client)
         nso_apply.DETACH_REPLACE.reset(token)
 
     assert "no-networking" in recorded[0]
+
+
+# ── is_cleared / lost_content: the two "a merge-PATCH cannot express this" predicates ──
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "expected"),
+    [
+        ("RM-IN", None, True),  # nullable column blanked
+        ("warning", "", True),  # NOT NULL column with default="" blanked
+        (10, None, True),
+        (None, "RM-IN", False),  # a grow is not a clear
+        ("", "RM-IN", False),
+        ("RM-IN", "RM-OUT", False),  # a value CHANGE merges fine
+        (True, False, False),  # a toggle-off is emitted explicitly — not a clear
+        (False, True, False),
+        (0, None, True),  # 0 is a value, and omitting it would leave the old one
+    ],
+)
+def test_is_cleared(before, after, expected):
+    from nso_adapter.core.removal import is_cleared
+
+    assert is_cleared(before, after) is expected
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "expected"),
+    [
+        # keyed list entries: a dropped term is not deletable by a merge
+        ([{"sequence": 10}, {"sequence": 20}], [{"sequence": 10}], True),
+        ([{"sequence": 10}], [{"sequence": 10}, {"sequence": 20}], False),  # grow
+        ([{"sequence": 10}], [{"sequence": 10}], False),  # republish
+        # a leaf-list MERGES, so losing (or swapping) a member needs a replace
+        ({"match": ["A", "B"]}, {"match": ["A"]}, True),
+        ({"match": ["A"]}, {"match": ["A", "B"]}, False),
+        ({"match": ["A"]}, {"match": ["B"]}, True),
+        # a blanked leaf inside a surviving entry
+        ([{"sequence": 10, "set": {"med": 5}}], [{"sequence": 10}], True),
+        # a rewritten blob is safe: the merge overwrites the leaf, so FASTMAP reverts
+        # whatever the OLD value created
+        ([{"sequence": 10, "set": {"med": 5}}], [{"sequence": 10, "set": {"med": 9}}], False),
+        # ...but a blob that loses a key inside it is a real shrink
+        ([{"sequence": 10, "set": {"med": 5, "lp": 1}}], [{"sequence": 10, "set": {"med": 5}}], True),
+        (None, [{"sequence": 10}], False),  # nothing existed before
+        ([], [{"sequence": 10}], False),
+    ],
+)
+def test_lost_content(before, after, expected):
+    from nso_adapter.core.removal import lost_content
+
+    assert lost_content(before, after) is expected

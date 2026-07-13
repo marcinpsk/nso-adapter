@@ -440,7 +440,7 @@ async def apply_interface_attribute(
     attribute: str,
     value: str | None,
     *,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
 ) -> str | None:
     """Write a single (device, interface, attribute) intent slice to NSO.
 
@@ -477,7 +477,20 @@ async def apply_interface_attribute(
     )
 
     if dry_run:
-        return await native_dry_run(client, url, payload, device_name, method="patch")
+        # Same convention as _send_service_config: dry_run == "cli" asks for NSO's
+        # NED-uniform tree diff, any other truthy value for the device-native delta.
+        # Dropping it here made ?outformat=cli silently return a NATIVE delta for this
+        # scope, so the preview's diff2html renderer was handed device CLI lines it
+        # cannot parse into hunks — the interface rows of a cli-mode preview came out
+        # blank or mangled while every other scope rendered.
+        return await native_dry_run(
+            client,
+            url,
+            payload,
+            device_name,
+            method="patch",
+            outformat="cli" if dry_run == "cli" else "native",
+        )
 
     async with client._client(timeout=client._action_timeout) as c:
         # Use PATCH to create-or-update the service instance (reconcile commit).
@@ -688,7 +701,7 @@ async def apply_interface_ips(
     service: str | None = None,
     parent_binding: str | None = None,
     encap_tag: str | None = None,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
 ) -> str | None:
     """Write IP addresses and VRF for a single interface to NSO.
 
@@ -717,7 +730,15 @@ async def apply_interface_ips(
     payload = json.dumps({"interface-reconciler:interface-config": [entry]})
 
     if dry_run:
-        return await native_dry_run(client, url, payload, device_name, method="patch")
+        # dry_run == "cli" → NSO's NED-uniform tree diff (see apply_interface_attribute).
+        return await native_dry_run(
+            client,
+            url,
+            payload,
+            device_name,
+            method="patch",
+            outformat="cli" if dry_run == "cli" else "native",
+        )
 
     async with client._client(timeout=client._action_timeout) as c:
         resp = await c.patch(

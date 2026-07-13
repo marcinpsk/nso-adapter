@@ -1672,3 +1672,50 @@ async def test_native_dry_run_outformat_cli_requests_and_parses():
     assert delta == "+ isis bfd"
     url = http.patch.await_args.args[0]
     assert "dry-run=cli" in url
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "call"),
+    [
+        (
+            "interface_attribute",
+            lambda client: apply_mod.apply_interface_attribute(
+                client=client,
+                device_name="sw03",
+                interface_name="Gi0/1",
+                attribute="description",
+                value="uplink",
+                dry_run="cli",
+            ),
+        ),
+        (
+            "interface_ips",
+            lambda client: apply_mod.apply_interface_ips(
+                client=client,
+                device_name="sw03",
+                interface_name="Gi0/1",
+                ip_intent_rows=[],
+                dry_run="cli",
+            ),
+        ),
+    ],
+)
+async def test_interface_scopes_honour_the_cli_outformat(scope, call):
+    """collect_apply_diff threads dry_run='cli' into EVERY scope, but these two dropped it and
+    always dry-ran native. The preview then handed diff2html — which parses NSO's NED-uniform
+    tree diff — raw device CLI lines for the interface scopes, so those rows of a cli-mode
+    preview rendered blank/mangled while every other scope rendered fine.
+    """
+    client = _make_nso_client()
+    body = {"dry-run-result": {"cli": {"local-node": {"data": "+ description uplink"}}}}
+    http = AsyncMock()
+    http.patch.return_value = _httpx_response(200, json_data=body)
+    _stub_pool(client, http)
+
+    delta = await call(client)
+
+    url = http.patch.await_args.args[0]
+    assert "dry-run=cli" in url, f"{scope} must ask NSO for the NED-uniform tree diff"
+    assert "dry-run=native" not in url
+    assert delta == "+ description uplink", f"{scope} must return the parsed cli tree diff"

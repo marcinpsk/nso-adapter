@@ -547,12 +547,20 @@ async def set_initial_failover_state(
 async def upsert_failover_ips(db: AsyncSession, device: Device, primary_ip: str | None, oob_ip: str | None) -> bool:
     """Persist the plugin-sourced primary/OOB IPs onto the device's failover row.
 
-    Touches ONLY the IPs and their probe scheduling — never the active address or the
-    switch counters. A CHANGED address re-arms its own probe to fire promptly: the probe
-    schedule backs off while an address is absent/dead, so a freshly configured OOB would
-    otherwise sit behind hours of accumulated deferral — and the operator typically adds
-    an OOB precisely when the device is unreachable and needs the flip now (sw03). A
-    changed OOB also resets ``oob_healthy``: the old verdict described the old address.
+    Touches ONLY the IPs and their probe scheduling — never the active address. A CHANGED
+    address re-arms its own probe to fire promptly: the probe schedule backs off while an
+    address is absent/dead, so a freshly configured OOB would otherwise sit behind hours of
+    accumulated deferral — and the operator typically adds an OOB precisely when the device
+    is unreachable and needs the flip now (sw03).
+
+    A changed address also drops every verdict about the OLD one, because none of it
+    describes the new address: the OOB leg resets ``oob_healthy``, and the PRIMARY leg
+    resets the consecutive-failure/success counters. Re-arming the probe while keeping the
+    old address's failure count meant the operator's fix — repointing a dead device at a
+    working management IP — flipped to OOB on the FIRST probe of the new address if it so
+    much as blipped: the counter was already at (or one below) the threshold, so the
+    hysteresis that threshold exists to provide was spent on the address that is gone.
+
     Does NOT create a row when there is nothing to store (both IPs None and no existing
     row) — so the per-device scope reconcile doesn't litter empty rows for devices an
     older plugin reports without IPs. Returns True if anything changed.
@@ -570,6 +578,12 @@ async def upsert_failover_ips(db: AsyncSession, device: Device, primary_ip: str 
     changed = False
     if fo.primary_ip != primary_ip:
         fo.primary_ip = primary_ip
+        # The counters described the address that just went away — a new address starts with
+        # its full hysteresis budget, exactly as the OOB leg drops oob_healthy below.
+        fo.consecutive_failures = 0
+        fo.consecutive_successes = 0
+        fo.last_probe_at = None
+        fo.last_probe_result = None
         if primary_ip:
             fo.next_primary_probe_at = now
         changed = True

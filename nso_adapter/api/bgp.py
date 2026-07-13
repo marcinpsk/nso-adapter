@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import api_error
+from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import (
     BgpAfIntent,
     BgpPeerAfIntent,
@@ -249,6 +250,15 @@ class BgpIntentUpdate(BaseModel):
     routers: list[BgpRouterModel]
 
 
+#: Owned BGP scalars whose CLEARING must reach the device. A normal apply is a merge-PATCH,
+#: which never drops an omitted leaf, so blanking one of these is invisible on the wire — only
+#: a PUT-replace of the service retracts it (#83). Booleans are deliberately absent: is_cleared
+#: treats False as a value, not an absence, and a merge-PATCH carries it fine.
+_ROUTER_STATE_FIELDS = ("router_id",)
+_PEER_STATE_FIELDS = ("peer_group", "remote_as", "local_as", "ttl", "password", "source")
+_PEER_AF_STATE_FIELDS = ("routemap_in", "routemap_out", "prefixlist_in", "prefixlist_out")
+
+
 async def _capture_bgp_identities(db: AsyncSession, device_id: int) -> tuple[set[str], set[str]]:
     """Snapshot existing router ASNs + peer addresses before the wipe, for removal detection."""
     asns = set(
@@ -267,6 +277,84 @@ async def _capture_bgp_identities(db: AsyncSession, device_id: int) -> tuple[set
         .all()
     )
     return asns, peers
+
+
+async def _capture_bgp_values(db: AsyncSession, device_id: int) -> dict:
+    """Snapshot the owned SCALAR VALUES before the wipe, so a cleared leaf is detectable.
+
+    Every other scope upserts its intent rows in place, so it can read a row's pre-image
+    field-by-field. BGP does not: :func:`_rebuild_router_intent` DELETEs the whole
+    router→scope→peer→af tree and re-inserts it, so by the time the new payload is stored
+    the old values are gone. Only the identity sets were captured — which is enough to see
+    that a peer VANISHED, and blind to the peer that merely lost its route-map. "Remove the
+    route-map from this neighbour" therefore queued no removal at all, the merge-PATCH apply
+    omitted the leaf rather than dropping it, and the device kept applying the policy
+    forever while NetBox and the adapter both showed it gone.
+    """
+    # Flat joins, not relationship walks: the intent relationships are lazy="raise".
+    image: dict = {"router": {}, "peer": {}, "peer_af": {}}
+
+    routers = (
+        await db.execute(
+            select(BgpRouterIntent.asn, BgpRouterIntent.router_id).where(BgpRouterIntent.device_id == device_id)
+        )
+    ).all()
+    for asn, router_id in routers:
+        image["router"][asn] = {"router_id": router_id}
+
+    peers = (
+        (
+            await db.execute(
+                select(BgpPeerIntent)
+                .join(BgpScopeIntent, BgpPeerIntent.scope_id == BgpScopeIntent.id)
+                .join(BgpRouterIntent, BgpScopeIntent.router_id == BgpRouterIntent.id)
+                .where(BgpRouterIntent.device_id == device_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    address_by_peer_id = {}
+    for peer in peers:
+        image["peer"][peer.peer_address] = {f: getattr(peer, f) for f in _PEER_STATE_FIELDS}
+        address_by_peer_id[peer.id] = peer.peer_address
+
+    if address_by_peer_id:
+        peer_afs = (
+            (await db.execute(select(BgpPeerAfIntent).where(BgpPeerAfIntent.peer_id.in_(list(address_by_peer_id)))))
+            .scalars()
+            .all()
+        )
+        for af in peer_afs:
+            key = (address_by_peer_id[af.peer_id], af.af)
+            image["peer_af"][key] = {f: getattr(af, f) for f in _PEER_AF_STATE_FIELDS}
+    return image
+
+
+def _bgp_cleared(before: dict, routers: list[BgpRouterModel]) -> bool:
+    """Whether any owned BGP scalar went SET → UNSET in this payload (the #83 retract trigger).
+
+    A peer address-family that disappears while its peer survives counts too: it is content
+    the merge-PATCH cannot drop, and it is not a peer removal, so nothing else would catch it.
+    """
+    for router in routers:
+        prev_router = before["router"].get(router.asn, {})
+        if any(is_cleared(prev_router.get(f), getattr(router, f, None)) for f in _ROUTER_STATE_FIELDS):
+            return True
+        for scope in router.scopes:
+            for peer in scope.peers:
+                prev_peer = before["peer"].get(peer.peer_address, {})
+                if any(is_cleared(prev_peer.get(f), getattr(peer, f, None)) for f in _PEER_STATE_FIELDS):
+                    return True
+                incoming_afs = {af.af for af in peer.address_families}
+                known_afs = {af for (addr, af) in before["peer_af"] if addr == peer.peer_address}
+                if known_afs - incoming_afs:
+                    return True  # the peer kept its identity but lost an address-family
+                for af in peer.address_families:
+                    prev_af = before["peer_af"].get((peer.peer_address, af.af), {})
+                    if any(is_cleared(prev_af.get(f), getattr(af, f, None)) for f in _PEER_AF_STATE_FIELDS):
+                        return True
+    return False
 
 
 async def _insert_peer(db: AsyncSession, scope_id: int, peer_data: BgpPeerModel) -> None:
@@ -419,8 +507,10 @@ async def put_bgp_intent(device_id: int, body: BgpIntentUpdate, db: AsyncSession
     if not device:
         raise api_error(404, "not_found", "Device not found")
 
-    # Snapshot identities before the wipe so removal can be detected afterwards.
+    # Snapshot identities AND owned scalar values before the wipe: the rebuild drops the whole
+    # tree, so this is the only chance to see what the payload cleared (see _capture_bgp_values).
     existing_asns, existing_peers = await _capture_bgp_identities(db, device_id)
+    before_values = await _capture_bgp_values(db, device_id)
 
     now = datetime.now(UTC).replace(tzinfo=None)
     router_count = await _rebuild_router_intent(db, device_id, body.routers, now)
@@ -429,13 +519,24 @@ async def put_bgp_intent(device_id: int, body: BgpIntentUpdate, db: AsyncSession
     await _maybe_enqueue_apply(db, device_id, router_count)
 
     removed_asns, removed_peers = _bgp_removed(existing_asns, existing_peers, body.routers)
-    if removed_asns or removed_peers or removed_redist:
+    cleared = _bgp_cleared(before_values, body.routers)
+    shrank = bool(removed_asns or removed_peers or removed_redist)
+    if shrank or cleared:
         from nso_adapter.core.removal import enqueue_removal
 
         # Thread the just-removed keys so the collateral guard can tell this intended
         # retraction from an orphaned service row (redistribute rows are nested,
         # non-guarded content — only the keyed router/peer lists matter here).
-        await enqueue_removal(db, device_id, "bgp", removed={"router": removed_asns, "peer": removed_peers})
+        # retract: a cleared owned scalar is not an un-own — the PUT-replace must actually
+        # reach the device, or the merge-PATCH silently leaves the old leaf in place (#83).
+        await enqueue_removal(
+            db,
+            device_id,
+            "bgp",
+            removed={"router": removed_asns, "peer": removed_peers},
+            retract=cleared,
+            shrank=shrank,
+        )
 
     await db.commit()
 

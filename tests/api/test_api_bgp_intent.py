@@ -482,3 +482,169 @@ async def test_put_bgp_intent_redistribution_removal_enqueues_removal_job(adapte
         ).scalar_one_or_none()
         break
     assert job is not None  # redistribution removal alone triggers the bgp removal job
+
+
+# ── cleared owned scalars must retract (#83, the BGP leg) ─────────────────────
+#
+# The BGP PUT DELETEs the whole router→scope→peer→af tree and re-inserts it, so unlike every
+# other scope it has no in-place pre-image to diff against. Only the identity SETS (router
+# ASNs, peer addresses) were captured — enough to notice a peer that VANISHED, blind to the
+# peer that merely lost its route-map. And a plain apply is a merge-PATCH, which never drops
+# an omitted leaf: with no removal job queued, the device kept applying a policy that NetBox
+# and the adapter both showed as gone.
+
+
+def _peer_router(peer: dict) -> dict:
+    return {"asn": "65100", "scopes": [{"vrf": "", "address_families": [{"af": "ipv4-unicast"}], "peers": [peer]}]}
+
+
+async def _removal_job(device_id):
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Job, JobType
+
+    async for db in get_session():
+        return (
+            await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal))
+        ).scalar_one_or_none()
+    return None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("remote_as", "65200"),
+        ("local_as", "64512"),
+        ("ttl", 2),
+        ("password", "s3cr3t"),
+        ("peer_group", "IBGP"),
+        ("source", "Loopback0"),
+    ],
+)
+async def test_clearing_an_owned_peer_scalar_queues_a_retract(adapter_client, field, value):
+    device_id = await seed_device(nso_device_name=f"bgp-clear-{field}", netbox_device_id=2100 + len(field))
+
+    peer = {"peer_address": "192.0.2.1", "address_families": [{"af": "ipv4-unicast"}], field: value}
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(peer)]}, headers=AUTH
+    )
+    assert resp.status_code == 200
+    assert await _removal_job(device_id) is None, "the initial push adds intent — nothing to retract"
+
+    # Same peer, same identity — the operator just blanked the value.
+    cleared_peer = {"peer_address": "192.0.2.1", "address_families": [{"af": "ipv4-unicast"}]}
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(cleared_peer)]}, headers=AUTH
+    )
+    assert resp.status_code == 200
+
+    job = await _removal_job(device_id)
+    assert job is not None, f"clearing {field} must queue a removal — a merge-PATCH cannot drop the leaf"
+    # A cleared scalar is NOT an un-own: the peer is still owned and accepted, so the
+    # PUT-replace must actually reach the device rather than detach with no-networking (#106).
+    assert job.context.get("detach") is not True
+    assert job.context.get("retract_deferred") is not True
+
+
+@pytest.mark.anyio
+async def test_removing_a_route_map_from_a_neighbour_queues_a_retract(adapter_client):
+    """The finding's own example: the peer keeps its identity and its AF, and only the
+    route-map reference is cleared."""
+    device_id = await seed_device(nso_device_name="bgp-clear-rm", netbox_device_id=2130)
+
+    with_rm = {
+        "peer_address": "192.0.2.1",
+        "remote_as": "65200",
+        "address_families": [{"af": "ipv4-unicast", "routemap_in": "RM-IN", "routemap_out": "RM-OUT"}],
+    }
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(with_rm)]}, headers=AUTH
+    )
+    assert await _removal_job(device_id) is None
+
+    without_rm = {
+        "peer_address": "192.0.2.1",
+        "remote_as": "65200",
+        "address_families": [{"af": "ipv4-unicast"}],
+    }
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(without_rm)]}, headers=AUTH
+    )
+    assert resp.status_code == 200
+
+    job = await _removal_job(device_id)
+    assert job is not None, "clearing routemap_in/out must queue a removal"
+    assert job.context.get("detach") is not True
+
+
+@pytest.mark.anyio
+async def test_dropping_an_address_family_from_a_surviving_peer_queues_a_retract(adapter_client):
+    """The peer survives, so it is not a peer removal — but the AF is content the merge-PATCH
+    cannot drop either. Nothing else in the diff would have caught it."""
+    device_id = await seed_device(nso_device_name="bgp-clear-af", netbox_device_id=2131)
+
+    both = {
+        "peer_address": "192.0.2.1",
+        "remote_as": "65200",
+        "address_families": [{"af": "ipv4-unicast"}, {"af": "ipv6-unicast"}],
+    }
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(both)]}, headers=AUTH
+    )
+    assert await _removal_job(device_id) is None
+
+    one = {"peer_address": "192.0.2.1", "remote_as": "65200", "address_families": [{"af": "ipv4-unicast"}]}
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(one)]}, headers=AUTH
+    )
+    assert resp.status_code == 200
+    assert await _removal_job(device_id) is not None, "a dropped address-family must queue a removal"
+
+
+@pytest.mark.anyio
+async def test_clearing_a_router_id_queues_a_retract(adapter_client):
+    device_id = await seed_device(nso_device_name="bgp-clear-rid", netbox_device_id=2132)
+
+    router = _peer_router({"peer_address": "192.0.2.1", "address_families": [{"af": "ipv4-unicast"}]})
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent",
+        json={"routers": [{**router, "router_id": "10.0.0.1"}]},
+        headers=AUTH,
+    )
+    assert await _removal_job(device_id) is None
+
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [router]}, headers=AUTH)
+    assert resp.status_code == 200
+    assert await _removal_job(device_id) is not None, "clearing router_id must queue a removal"
+
+
+@pytest.mark.anyio
+async def test_an_unchanged_republish_queues_nothing(adapter_client):
+    """The guard against the opposite failure: re-pushing the same intent must not manufacture
+    a device-touching removal job out of nothing."""
+    device_id = await seed_device(nso_device_name="bgp-clear-noop", netbox_device_id=2133)
+
+    peer = {"peer_address": "192.0.2.1", "remote_as": "65200", "address_families": [{"af": "ipv4-unicast"}]}
+    for _ in range(2):
+        resp = await adapter_client.put(
+            f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(peer)]}, headers=AUTH
+        )
+        assert resp.status_code == 200
+    assert await _removal_job(device_id) is None
+
+
+@pytest.mark.anyio
+async def test_setting_a_scalar_that_was_unset_queues_nothing(adapter_client):
+    """A GROW is not a clear — nothing to retract."""
+    device_id = await seed_device(nso_device_name="bgp-clear-grow", netbox_device_id=2134)
+
+    bare = {"peer_address": "192.0.2.1", "address_families": [{"af": "ipv4-unicast"}]}
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(bare)]}, headers=AUTH
+    )
+    grown = {**bare, "remote_as": "65200", "ttl": 2}
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(grown)]}, headers=AUTH
+    )
+    assert resp.status_code == 200
+    assert await _removal_job(device_id) is None

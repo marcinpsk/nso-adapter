@@ -152,7 +152,11 @@ async def test_unlinked_device_is_ignored(adapter_client, monkeypatch):
 
 
 async def test_ingestion_helpers_seed_and_upsert_ips(adapter_client):
-    """set_initial_failover_state seeds a row; upsert_failover_ips changes ONLY the IPs."""
+    """set_initial_failover_state seeds a row; upsert_failover_ips changes ONLY the IPs.
+
+    ONLY the IPs — the ACTIVE address in particular is never touched. The per-address probe
+    verdicts (counters, last probe) are a different matter: see the reset test below.
+    """
     from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
 
     async for db in get_session():
@@ -164,7 +168,7 @@ async def test_ingestion_helpers_seed_and_upsert_ips(adapter_client):
         await db.commit()
         assert (fo.primary_ip, fo.oob_ip, fo.active_address) == ("10.0.0.1", "192.0.2.5", "oob")
 
-        # Hand-set live state, then upsert new IPs — state must be preserved.
+        # Hand-set live state, then upsert new IPs.
         fo.consecutive_successes = 4
         await db.commit()
         changed = await upsert_failover_ips(db, dev, "10.0.0.2", "192.0.2.5")
@@ -175,7 +179,41 @@ async def test_ingestion_helpers_seed_and_upsert_ips(adapter_client):
         reloaded = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == dev.id))).scalar_one()
         assert reloaded.primary_ip == "10.0.0.2"
         assert reloaded.active_address == "oob"  # never touched by the IP upsert
-        assert reloaded.consecutive_successes == 4
+        # The 4 successes were 4 successes against 10.0.0.1, which is gone. They say nothing
+        # about 10.0.0.2, and counting them toward the failback to it would fail back on a
+        # verdict never earned. (This assertion used to read `== 4`.)
+        assert reloaded.consecutive_successes == 0
+        break
+
+
+async def test_a_changed_primary_does_not_inherit_the_old_addresss_failure_count(adapter_client):
+    """The failure threshold is hysteresis: N consecutive failures before we flip to OOB.
+
+    A device sitting one probe below the threshold on a DEAD primary is exactly the device
+    an operator repoints at a working management IP. The upsert re-arms the probe to fire
+    promptly — but it used to leave consecutive_failures at the old address's tally, so the
+    first probe of the NEW address flipped the device to OOB the moment it so much as
+    blipped. The hysteresis had already been spent on an address that no longer exists.
+    """
+    from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
+
+    async for db in get_session():
+        dev = Device(nso_instance="nso-dev", nso_device_name="reset1", netbox_device_id=58)
+        db.add(dev)
+        await db.flush()
+        fo = await set_initial_failover_state(db, dev.id, "10.0.0.1", "192.0.2.9", ActiveAddress.primary.value)
+        fo.consecutive_failures = 2  # the old primary is all but declared dead
+        fo.last_probe_result = "fail"
+        await db.commit()
+
+        assert await upsert_failover_ips(db, dev, "10.0.0.77", "192.0.2.9") is True
+        await db.commit()
+
+        reloaded = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == dev.id))).scalar_one()
+        assert reloaded.primary_ip == "10.0.0.77"
+        assert reloaded.consecutive_failures == 0, "the new address starts with its full hysteresis budget"
+        assert reloaded.last_probe_result is None, "and with no verdict about the address it replaced"
+        assert reloaded.active_address == "primary"  # still not the upsert's business
         break
 
 

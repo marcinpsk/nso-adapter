@@ -263,3 +263,104 @@ async def test_put_reports_no_unrepresentable_members_for_identity_ned(adapter_c
     )
     assert resp.status_code == 200
     assert resp.json()["unsupported_members"] == {}
+
+
+# ── entry-level shrink must retract (#83, the route-policy leg) ───────────────
+#
+# The full-replace diff is keyed on (family, name), so it only ever notices an object that
+# vanished WHOLE. Deleting one route-map TERM — or a prefix-list line, or a community member —
+# leaves the key untouched and only shrinks `entries`. A merge-PATCH apply cannot drop any of
+# that: the deleted term stays in the service's CDB input and FASTMAP keeps creating it, so
+# the device went on matching a term the operator had removed in NetBox.
+
+
+async def _removal_job(device_id: int):
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Job, JobType
+
+    async for db in get_session():
+        return (
+            await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal))
+        ).scalar_one_or_none()
+    return None
+
+
+async def _put(adapter_client, device_id: int, objects: list[dict]):
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/route-policy-intent", headers=AUTH, json={"objects": objects}
+    )
+    assert resp.status_code == 200, resp.text
+    return resp
+
+
+@pytest.mark.anyio
+async def test_deleting_a_route_map_term_queues_a_retract(adapter_client):
+    device_id = await seed_device(nso_device_name="rp-term-drop", netbox_device_id=7970)
+    two_terms = [
+        {"sequence": 10, "action": "permit", "match": {"prefix-list": "PL-A"}},
+        {"sequence": 20, "action": "deny", "match": {"prefix-list": "PL-B"}},
+    ]
+    await _put(adapter_client, device_id, [_obj("route_map", "RM-1", entries=two_terms, accepted=True)])
+    assert await _removal_job(device_id) is None, "the initial push only adds intent"
+
+    # The object survives under the same (family, name) — only term 20 is gone.
+    await _put(adapter_client, device_id, [_obj("route_map", "RM-1", entries=two_terms[:1], accepted=True)])
+
+    job = await _removal_job(device_id)
+    assert job is not None, "a deleted route-map term must queue a removal — merge-PATCH cannot drop it"
+    # The policy is still owned and accepted: only a term went away. So this is a retract that
+    # must reach the device, not an un-own that detaches with no-networking (#106).
+    assert job.context.get("detach") is not True
+    assert job.context.get("retract_deferred") is not True
+
+
+@pytest.mark.anyio
+async def test_dropping_a_community_member_queues_a_retract(adapter_client):
+    device_id = await seed_device(nso_device_name="rp-member-drop", netbox_device_id=7971)
+    members = [{"community": "64500:100"}, {"community": "64500:200"}]
+    await _put(adapter_client, device_id, [_obj("community_list", "CL-1", entries=members, accepted=True)])
+    assert await _removal_job(device_id) is None
+
+    await _put(adapter_client, device_id, [_obj("community_list", "CL-1", entries=members[:1], accepted=True)])
+    assert await _removal_job(device_id) is not None
+
+
+@pytest.mark.anyio
+async def test_blanking_a_set_clause_inside_a_surviving_term_queues_a_retract(adapter_client):
+    """The term still exists and keeps its sequence — it just lost its set-clause leaf."""
+    device_id = await seed_device(nso_device_name="rp-set-clear", netbox_device_id=7972)
+    with_set = [{"sequence": 10, "action": "permit", "set": {"local-preference": 200}}]
+    await _put(adapter_client, device_id, [_obj("route_map", "RM-2", entries=with_set, accepted=True)])
+    assert await _removal_job(device_id) is None
+
+    without_set = [{"sequence": 10, "action": "permit"}]
+    await _put(adapter_client, device_id, [_obj("route_map", "RM-2", entries=without_set, accepted=True)])
+    assert await _removal_job(device_id) is not None
+
+
+@pytest.mark.anyio
+async def test_dropping_one_match_prefix_list_from_a_leaf_list_queues_a_retract(adapter_client):
+    """A leaf-list MERGES: [A, B] -> [A] would leave B on the device."""
+    device_id = await seed_device(nso_device_name="rp-leaflist-drop", netbox_device_id=7973)
+    both = [{"sequence": 10, "action": "permit", "match_prefix_lists": ["PL-A", "PL-B"]}]
+    await _put(adapter_client, device_id, [_obj("route_map", "RM-3", entries=both, accepted=True)])
+    assert await _removal_job(device_id) is None
+
+    one = [{"sequence": 10, "action": "permit", "match_prefix_lists": ["PL-A"]}]
+    await _put(adapter_client, device_id, [_obj("route_map", "RM-3", entries=one, accepted=True)])
+    assert await _removal_job(device_id) is not None
+
+
+@pytest.mark.anyio
+async def test_growing_or_republishing_a_policy_queues_nothing(adapter_client):
+    """The guard against the opposite failure: adding a term, or re-pushing the same intent,
+    must not manufacture a device-touching PUT-replace out of nothing."""
+    device_id = await seed_device(nso_device_name="rp-grow", netbox_device_id=7974)
+    one = [{"sequence": 10, "action": "permit"}]
+    await _put(adapter_client, device_id, [_obj("route_map", "RM-4", entries=one, accepted=True)])
+    await _put(adapter_client, device_id, [_obj("route_map", "RM-4", entries=one, accepted=True)])  # republish
+    assert await _removal_job(device_id) is None
+
+    two = [*one, {"sequence": 20, "action": "deny"}]
+    await _put(adapter_client, device_id, [_obj("route_map", "RM-4", entries=two, accepted=True)])
+    assert await _removal_job(device_id) is None, "a grow is not a shrink"
