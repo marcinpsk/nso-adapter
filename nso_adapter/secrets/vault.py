@@ -23,6 +23,12 @@ class VaultSecretsProvider:
     Re-authenticates automatically on 403.
     """
 
+    #: Cap every hvac round-trip. hvac defaults to NO timeout, so an unreachable or wedged
+    #: Vault would hold the calling thread forever — and these calls are made from request
+    #: handlers (via anyio.to_thread), so an unbounded hang leaks the thread-pool slot and
+    #: eventually starves every other blocking offload.
+    REQUEST_TIMEOUT_S = 10
+
     def __init__(
         self,
         addr: str,
@@ -43,7 +49,11 @@ class VaultSecretsProvider:
         self._cache: dict[str, dict[str, str]] = {}
 
     def _authenticate(self) -> None:
-        kwargs: dict[str, Any] = {"url": self._addr, "verify": self._verify_ssl}
+        kwargs: dict[str, Any] = {
+            "url": self._addr,
+            "verify": self._verify_ssl,
+            "timeout": self.REQUEST_TIMEOUT_S,
+        }
         if self._namespace:
             kwargs["namespace"] = self._namespace
         client = hvac.Client(**kwargs)

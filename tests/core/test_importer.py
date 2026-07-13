@@ -16,7 +16,15 @@ from sqlalchemy.orm import sessionmaker
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.core.importer import _attrs_to_interface_list, sync_device
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.store.models import Base, DbInterface, Device, InterfaceAttrState, ManagedScope, MappingStatus
+from nso_adapter.store.models import (
+    Base,
+    DbInterface,
+    Device,
+    InterfaceAttrState,
+    LastSyncStatus,
+    ManagedScope,
+    MappingStatus,
+)
 
 
 @pytest_asyncio.fixture
@@ -1012,6 +1020,74 @@ async def test_sync_device_keeps_ned_when_nso_read_returns_nothing(db_session: A
 
     await db_session.refresh(device)
     assert device.ned_id == "cisco-ios-cli-6.95"  # kept; a transient empty read must not clobber
+
+
+async def test_sync_device_survives_a_raising_ned_id_read(db_session: AsyncSession):
+    """A RAISING ned-id read must not abort the sync of a device whose NED is already known.
+
+    _resolve_ned_id lost its `if device.ned_id: return` short-circuit and now reads NSO on
+    every sync — but only the returns-empty failure was tolerated. get_device_ned_id calls
+    raise_for_status(), and that raise came out of the FIRST NSO call in sync_device, before
+    sync_from: an NSO restart / load spike returning 502 therefore failed the scheduled sync
+    for the ENTIRE fleet, staling every interface/IS-IS/BGP/OSPF/route-policy mirror, where
+    previously only a device with an unset ned_id could fail here.
+
+    The sibling test above stubs return_value="" and so never exercised this path.
+    """
+    import httpx
+
+    from nso_adapter.core import importer as imp
+
+    device = Device(
+        nso_instance="nso-dev", nso_device_name="sw-nedboom", ned_id="cisco-ios-cli-6.95", netbox_device_id=18
+    )
+    db_session.add(device)
+    db_session.add(ManagedScope(device=device, attribute="description"))
+    await db_session.commit()
+
+    client = _make_nso_client({"interface": [{"interface-name": "Gi0/0", "description": "x", "enabled": True}]})
+    client.get_device_ned_id = AsyncMock(
+        side_effect=httpx.HTTPStatusError(
+            "502 Bad Gateway",
+            request=httpx.Request("GET", "http://nso/restconf"),
+            response=httpx.Response(502),
+        )
+    )
+    imp._nso_clients["nso-dev"] = client
+    imp._netbox_client = None
+
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+        await sync_device(device.id, db_session)  # must not raise
+
+    await db_session.refresh(device)
+    assert device.ned_id == "cisco-ios-cli-6.95"  # kept — a transient failure must not clobber
+    assert device.last_sync_status != LastSyncStatus.failed
+
+
+async def test_sync_device_raising_ned_id_read_still_fails_an_unknown_ned(db_session: AsyncSession):
+    """With NO previously-known ned_id there is nothing to fall back on — the device
+    genuinely cannot be synced, so the failure must still surface."""
+    import httpx
+
+    from nso_adapter.core import importer as imp
+
+    device = Device(nso_instance="nso-dev", nso_device_name="sw-nedgone", netbox_device_id=19)
+    db_session.add(device)
+    await db_session.commit()
+
+    client = _make_nso_client({"interface": []})
+    client.get_device_ned_id = AsyncMock(
+        side_effect=httpx.HTTPStatusError(
+            "404 Not Found",
+            request=httpx.Request("GET", "http://nso/restconf"),
+            response=httpx.Response(404),
+        )
+    )
+    imp._nso_clients["nso-dev"] = client
+    imp._netbox_client = None
+
+    with pytest.raises(Exception):  # noqa: B017 — the sync must not silently succeed
+        await sync_device(device.id, db_session)
 
 
 async def test_sync_device_swallows_notify_failure(db_session: AsyncSession):

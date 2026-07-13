@@ -72,10 +72,13 @@ class _FakeApprole:
 
 
 class _FakeClient:
-    def __init__(self, *, url, verify, kv, logins, namespace=None):
+    def __init__(self, *, url, verify, kv, logins, namespace=None, timeout=None):
         self.url = url
         self.verify = verify
         self.namespace = namespace
+        # hvac defaults to NO timeout; the provider must always pass one, or an unreachable
+        # Vault holds the calling thread forever (and these run in the request thread-pool).
+        self.timeout = timeout
         self.token: str | None = None
         self.auth = types.SimpleNamespace(approle=_FakeApprole(logins))
         self.secrets = types.SimpleNamespace(kv=types.SimpleNamespace(v2=kv))
@@ -171,6 +174,18 @@ def test_namespace_forwarded_to_client(fake_hvac):
     store["credentials/svc"] = {"netbox_token": "s3cr3t"}
     _provider(namespace="prod").get("credentials/svc#netbox_token")
     assert state["clients"][0].namespace == "prod"
+
+
+def test_client_always_carries_a_request_timeout(fake_hvac):
+    """hvac defaults to NO timeout. These calls run in the request thread-pool (the API
+    offloads them off the event loop), so an unreachable Vault would pin a pool slot
+    forever and eventually starve every other blocking offload."""
+    from nso_adapter.secrets.vault import VaultSecretsProvider
+
+    state, store, _ = fake_hvac
+    store["credentials/svc"] = {"netbox_token": "s3cr3t"}
+    _provider().get("credentials/svc#netbox_token")
+    assert state["clients"][0].timeout == VaultSecretsProvider.REQUEST_TIMEOUT_S
 
 
 # ── mount-explicit read_path / write_path (SNMP secrets endpoints) ─────────────

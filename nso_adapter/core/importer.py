@@ -270,8 +270,25 @@ async def _resolve_ned_id(db: AsyncSession, device: Device, client: NsoClient) -
     capability matrix, so a stale value silently mis-keys every verdict. A transient read that
     returns nothing does NOT clobber a previously-known ned_id (only an *unset*-and-unresolvable
     ned_id marks the device unmatched); the read is a small ``fields=device-type`` GET.
+
+    "Returns nothing" includes RAISING. ``get_device_ned_id`` calls ``raise_for_status()``, and
+    this is the FIRST NSO call in :func:`sync_device` — before ``sync_from`` — so an NSO restart
+    or load spike answering 502/503 (or a 404 for a device renamed in NSO) would otherwise fail
+    the whole sync for every device whose NED was already known, staling the entire fleet's
+    mirrors. Before the per-sync refresh was added, such a device never made this call at all.
     """
-    learned = await client.get_device_ned_id(device.nso_device_name)
+    try:
+        learned = await client.get_device_ned_id(device.nso_device_name)
+    except Exception as exc:  # noqa: BLE001 — a read failure must not fail an otherwise-fine sync
+        if device.ned_id:
+            logger.warning(
+                "importer.ned_id.read_failed",
+                device=device.nso_device_name,
+                kept=device.ned_id,
+                error=repr(exc),
+            )
+            return  # keep the last-known value and sync on
+        learned = ""  # nothing to fall back on → the unmatched path below
     if learned:
         if device.ned_id != learned:
             logger.info("importer.ned_id.changed", device=device.nso_device_name, old=device.ned_id, new=learned)

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import types
 from unittest.mock import AsyncMock, patch
 
@@ -110,6 +111,67 @@ database_url: sqlite+aiosqlite:///{tmp_path}/test.db
         async with app.router.lifespan_context(app):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
                 yield client, store, kv
+
+
+@pytest.mark.anyio
+async def test_a_slow_vault_write_does_not_stall_the_event_loop(vault_client):
+    """hvac is BLOCKING (requests/sockets). Called straight from an `async def` handler it
+    freezes the single event-loop thread for the whole round-trip — and the hvac client is
+    built with no timeout, while write_path does a read-merge-write plus a possible AppRole
+    re-login on 403. For those tens of seconds EVERY other adapter request hangs: the
+    plugin's NSO tab times out with "Adapter unreachable" for ALL devices, /healthz stops
+    answering (a container liveness probe can kill the adapter mid-write), and the in-process
+    scheduler tick driving failover probes and job dispatch stalls.
+
+    Drive a genuinely blocking write and prove an unrelated request is served WHILE it is
+    still in flight. The assertion has to be about ORDERING, not about how long /healthz
+    itself took: if the blocking call runs on the loop, the /healthz task cannot even start
+    until the write has finished, so it would time its own (now unobstructed) round-trip as
+    fast and a duration-only check would pass against the broken code.
+    """
+    import asyncio
+    import time
+
+    client, _store, kv = vault_client
+
+    real_write = kv.create_or_update_secret
+    gate = threading.Event()
+    timeline: dict[str, float] = {}
+
+    def _blocking_write(*args, **kwargs):
+        # Hold the hvac call open exactly as a slow Vault would. A real thread must release
+        # it, because on the broken (on-loop) path nothing else can run to do so.
+        gate.wait(timeout=3)
+        timeline["write_unblocked"] = time.monotonic()
+        return real_write(*args, **kwargs)
+
+    kv.create_or_update_secret = _blocking_write
+
+    async def _write():
+        return await client.post(
+            "/api/v1/secrets",
+            json={"vault_ref": "network/netbox/snmp/slow", "values": {"community": "s3cr3t"}},
+            headers=AUTH,
+        )
+
+    async def _health_while_writing():
+        await asyncio.sleep(0.05)  # let the write reach the blocking hvac call
+        resp = await client.get("/healthz")
+        timeline["health_served"] = time.monotonic()
+        gate.set()  # only reachable if the loop was never frozen
+        return resp
+
+    started = time.monotonic()
+    write_resp, health_resp = await asyncio.gather(_write(), _health_while_writing())
+    elapsed = time.monotonic() - started
+
+    assert write_resp.status_code == 200
+    assert health_resp.status_code == 200
+    # /healthz must be answered while the Vault write is still parked in the thread-pool.
+    assert timeline["health_served"] < timeline["write_unblocked"], (
+        "/healthz was only served AFTER the Vault write released — the blocking hvac call ran on the event loop"
+    )
+    assert elapsed < 1.0, f"the event loop was frozen for {elapsed:.2f}s by a slow Vault write"
 
 
 # ── POST /api/v1/secrets (set) ────────────────────────────────────────────────
