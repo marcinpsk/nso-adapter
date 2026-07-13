@@ -1190,11 +1190,17 @@ _READER_COMPARE_SPECS: dict[str, list] = {
         ("OspfInterfaceIntent", "interface-config", lambda r: (r.interface_name,)),
     ],
     "snmp": [
-        # SnmpCommunityIntent is intentionally absent: its intent key is the human-readable
-        # label while the export keys a community by sha256(community-string)[:16] — a digest
-        # of a secret the adapter never sees (it pushes a Vault triple; NSO resolves it). The
-        # two namespaces can never intersect, so demanding the label be "present" stamped
-        # reader_compare_missing on EVERY successful SNMP apply. See UNCOMPARABLE_LISTS.
+        # SnmpCommunityIntent's intent key is the human-readable label, while the export keys a
+        # community by sha256(community-string)[:16] — a digest of a secret the adapter never sees
+        # (it pushes a Vault triple; NSO resolves it). Demanding the LABEL be present would stamp
+        # reader_compare_missing on every successful SNMP apply, so the row used to be left out of
+        # the check entirely — leaving the one scope where a silent drop is a missing CREDENTIAL as
+        # the only scope the drop-detector did not cover.
+        #
+        # CR-A17: the adapter holds the vault_ref, so it can resolve the secret and compute that
+        # same digest. The key is emitted as the label here and TRANSLATED in _translate_expected
+        # (which drops the row when Vault cannot answer — unverifiable, never "missing").
+        ("SnmpCommunityIntent", "community", lambda r: (r.label,)),
         ("SnmpV3UserIntent", "v3-user", lambda r: (r.username,)),
         ("SnmpHostIntent", "host", lambda r: (r.address,)),
     ],
@@ -1259,6 +1265,42 @@ def _reader_compare_expected(scope: str, rows, ned_id: str | None = None) -> lis
     return out
 
 
+async def _translate_expected(scope: str, expected: list[tuple[object, str, tuple]]) -> tuple[list, list[str]]:
+    """Re-key the expected rows into the namespace the EXPORT uses (CR-A17).
+
+    Identity for every grain but snmp/community, whose export key is ``sha256(secret)[:16]`` of a
+    Vault-held community string. Returns ``(translatable, unverifiable_labels)``: a row whose key
+    cannot be translated — no Vault provider, a Vault outage, a ref that no longer resolves — is
+    DROPPED from the check rather than stamped ``reader_compare_missing``. Failing open is the only
+    safe direction: a Vault blip must not permanently pin an SNMP scope apply_failed for a
+    community that is sitting on the device exactly as intended.
+    """
+    from nso_adapter.core.removal import UNCOMPARABLE_LISTS
+    from nso_adapter.core.snmp_verify import community_fingerprints
+
+    if not any((scope, label) in UNCOMPARABLE_LISTS for _row, label, _key in expected):
+        return expected, []
+
+    refs = {
+        str(row.label): row.vault_ref
+        for row, label, _key in expected
+        if (scope, label) == ("snmp", "community") and getattr(row, "vault_ref", None)
+    }
+    digests = await community_fingerprints(refs)
+
+    out, unverifiable = [], []
+    for row, label, key in expected:
+        if (scope, label) not in UNCOMPARABLE_LISTS:
+            out.append((row, label, key))
+            continue
+        digest = digests.get(str(getattr(row, "label", "")))
+        if digest is None:
+            unverifiable.append(f"{label} {list(key)}")
+            continue
+        out.append((row, label, (digest,)))
+    return out, sorted(unverifiable)
+
+
 async def _reader_compare_scope(client, device, scope, rows, *, ok, job_id, device_name):
     """Post-apply presence check (#108, the #26 silent-drop class) → (ok, failed, fails, status).
 
@@ -1285,6 +1327,18 @@ async def _reader_compare_scope(client, device, scope, rows, *, ok, job_id, devi
         spec = _guard_specs().get(scope)
         if not expected or reader is None or spec is None:
             return ok, 0, [], None
+        expected, unverifiable = await _translate_expected(scope, expected)
+        if unverifiable:
+            # Named, never folded into "ok" silently: these keys were not checked at all.
+            logger.warning(
+                "apply.reader_compare_unverifiable",
+                job_id=job_id,
+                device=device_name,
+                scope=scope,
+                keys=unverifiable,
+            )
+        if not expected:
+            return ok, 0, [], "unknown"
         entry = await getattr(client, reader)(device.nso_device_name)
         if not entry:
             # The reader answered with NOTHING. Every reader returns None by design when the

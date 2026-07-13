@@ -2442,6 +2442,9 @@ async def test_run_apply_reader_compare_ok_when_key_lands(adapter_client):
         break
 
 
+from tests.core.conftest import SNMP_COMMUNITY, SNMP_VAULT_REF, community_export_name  # noqa: E402
+
+
 def _community_export_name(secret: str) -> str:
     """The export's community key: sha256(community string)[:16] — never the intent label."""
     import hashlib
@@ -2845,4 +2848,154 @@ async def test_run_apply_reader_compare_isis_flags_only_missing_model(adapter_cl
         )
         assert iface_row.last_apply_error is None
         assert proc_row.last_apply_error["code"] == "reader_compare_missing"
+        break
+
+
+# ── CR-A17: a community that never LANDED is a silent drop like any other ─────────────────────
+#
+# The post-apply reader-compare exists to catch the #26 class: the commit reports success and the
+# key never reaches the device. It covered every scope but the SNMP community — whose intent key is
+# a label and whose export key is sha256(community-string)[:16], a digest of a secret the adapter
+# never sees. So the row was simply left out of the check, and the one scope where a silent drop
+# means a MISSING CREDENTIAL (monitoring goes blind, and nobody finds out until it matters) was the
+# one scope the drop-detector did not cover.
+#
+# The adapter holds the vault_ref, so it can compute that digest itself.
+
+
+async def _seed_community(device_id: int, *, label="prod-ro", vault_ref=SNMP_VAULT_REF) -> None:
+    from nso_adapter.store.models import SnmpCommunityIntent
+
+    async for db in get_session():
+        db.add(
+            SnmpCommunityIntent(
+                device_id=device_id,
+                label=label,
+                vault_ref=vault_ref,
+                access="ro",
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+
+
+async def _apply_snmp(device_id: int, job_id: int, snmp_view: dict) -> Job:
+    mock_client = AsyncMock(spec=NsoClient)
+    mock_client.get_snmp_config.return_value = snmp_view
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+    async for db in get_session():
+        return await db.get(Job, job_id)
+    raise RuntimeError("no session")
+
+
+async def test_a_community_the_writer_SILENTLY_DROPPED_is_now_caught(adapter_client, vault):
+    """The commit said success. The device has no such community. Monitoring is blind and NetBox
+    says in_sync. This is exactly the #26 class the check was built for — it just could not see
+    into this grain until it could resolve the secret.
+    """
+    from nso_adapter.store.models import SnmpCommunityIntent
+
+    vault()
+    device_id = await _seed_device("rtr-a17-drop", 431)
+    job_id = await _seed_apply_job(device_id)
+    await _seed_community(device_id)
+
+    job = await _apply_snmp(device_id, job_id, {"community": [], "v3-user": [], "host": []})
+
+    assert job.status == JobStatus.failed
+    assert job.result["reader_compare"]["snmp"] == "missing"
+    async for db in get_session():
+        row = (
+            (await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        assert row.last_apply_error["code"] == "reader_compare_missing"
+        break
+
+
+async def test_a_community_that_DID_land_is_verified_green_not_merely_skipped(adapter_client, vault):
+    """It used to pass this case by not looking. Now it looks, resolves the secret, matches the
+    digest the device reports, and says ok — the difference between "we checked" and "we didn't".
+    """
+    vault()
+    device_id = await _seed_device("rtr-a17-ok", 432)
+    job_id = await _seed_apply_job(device_id)
+    await _seed_community(device_id)
+
+    job = await _apply_snmp(
+        device_id,
+        job_id,
+        {"community": [{"name": community_export_name(SNMP_COMMUNITY), "access": "ro"}], "v3-user": [], "host": []},
+    )
+
+    assert job.status == JobStatus.succeeded
+    assert job.result["reader_compare"]["snmp"] == "ok"
+    assert job.result["snmp_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
+
+
+async def test_VAULT_DOWN_must_not_stamp_a_landed_community_apply_failed(adapter_client, vault):
+    """Fail OPEN, and this is why it matters here more than on the removal side.
+
+    Stamping `reader_compare_missing` because VAULT was unreachable would fail the apply, flip the
+    row to apply_failed and pin the plugin's SNMP scope red — for a community sitting on the device
+    exactly as intended. A check that cannot run must abstain, not accuse.
+    """
+    from nso_adapter.store.models import SnmpCommunityIntent
+
+    vault(fail=True)
+    device_id = await _seed_device("rtr-a17-vaultdown", 433)
+    job_id = await _seed_apply_job(device_id)
+    await _seed_community(device_id)
+
+    job = await _apply_snmp(
+        device_id,
+        job_id,
+        {"community": [{"name": community_export_name(SNMP_COMMUNITY)}], "v3-user": [], "host": []},
+    )
+
+    assert job.status == JobStatus.succeeded
+    async for db in get_session():
+        row = (
+            (await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        assert row.last_apply_error is None, "a Vault outage must never accuse the WRITER of dropping"
+        break
+
+
+async def test_a_dropped_HOST_is_still_caught_when_the_community_grain_goes_dark(adapter_client, vault):
+    """One grain being unverifiable must not blunt the others — the address-keyed host still fails."""
+    from nso_adapter.store.models import SnmpHostIntent
+
+    vault(fail=True)  # community unverifiable
+    device_id = await _seed_device("rtr-a17-mixed", 434)
+    job_id = await _seed_apply_job(device_id)
+    await _seed_community(device_id)
+    async for db in get_session():
+        db.add(
+            SnmpHostIntent(
+                device_id=device_id,
+                address="198.18.5.9",
+                version="2c",
+                notify_type="traps",
+                community_or_user="prod-ro",
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+
+    job = await _apply_snmp(device_id, job_id, {"community": [], "v3-user": [], "host": []})
+
+    assert job.result["reader_compare"]["snmp"] == "missing"
+    async for db in get_session():
+        host = (await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))).scalars().one()
+        assert host.last_apply_error["code"] == "reader_compare_missing"
         break

@@ -36,6 +36,8 @@ from nso_adapter.store.models import (
     RoutePolicyObjectIntent,
     VlanIntent,
 )
+from tests.core.conftest import SNMP_COMMUNITY as _COMMUNITY
+from tests.core.conftest import SNMP_VAULT_REF as _REF
 
 _NOW = datetime.now(UTC).replace(tzinfo=None)
 
@@ -1021,21 +1023,33 @@ async def test_cleared_scalar_retract_residue_is_unsupported(adapter_client):
     assert client.reads == 0
 
 
-def test_uncomparable_grains_are_never_reader_compared():
-    """A grain in UNCOMPARABLE_LISTS must not appear in _READER_COMPARE_SPECS.
+def test_an_uncomparable_grain_is_only_reader_compared_if_it_can_be_TRANSLATED():
+    """CR-A17 relaxed this rule — but only by exactly one notch, and it must not slip further.
 
-    The two registries encode the same key-grain truth, and they had already diverged: the
-    compare demanded a community be "present" under its intent LABEL while the export names
-    it by a SHA-256 of the secret, so every successful SNMP apply was failed. Pin them
-    together so re-adding an un-keyable grain to either side fails here, loudly, rather than
-    on a live device.
+    It used to read "a grain in UNCOMPARABLE_LISTS must NEVER appear in _READER_COMPARE_SPECS",
+    because the two registries encode the same key-grain truth and had already diverged: the
+    compare demanded a community be present under its intent LABEL while the export names it by a
+    SHA-256 of the secret, so every successful SNMP apply was failed.
+
+    The grain is comparable now — but only because `_KEY_TRANSLATORS` knows how to re-key it. The
+    invariant that actually matters is therefore: an un-keyable grain may be reader-compared IF AND
+    ONLY IF something can translate its key. Adding one to _READER_COMPARE_SPECS without a
+    translator resurrects the original bug (every key "missing", the scope permanently
+    apply_failed); registering one whose translator can never resolve resurrects the other (a
+    fabricated verdict). Both fail here, loudly, instead of on a live device.
     """
     from nso_adapter.core.apply import _READER_COMPARE_SPECS
-    from nso_adapter.core.removal import UNCOMPARABLE_LISTS
+    from nso_adapter.core.removal import _KEY_TRANSLATORS, UNCOMPARABLE_LISTS
 
     compared = {(scope, label) for scope, specs in _READER_COMPARE_SPECS.items() for _, label, _ in specs}
-    assert not (compared & UNCOMPARABLE_LISTS), (
-        f"these grains cannot be key-matched against the export: {sorted(compared & UNCOMPARABLE_LISTS)}"
+    untranslatable = (compared & UNCOMPARABLE_LISTS) - set(_KEY_TRANSLATORS)
+    assert not untranslatable, (
+        f"these grains are reader-compared but cannot be key-matched against the export: "
+        f"{sorted(untranslatable)} — every intended key would be reported missing"
+    )
+    assert set(_KEY_TRANSLATORS) <= UNCOMPARABLE_LISTS, (
+        "a translator for a grain that already shares the export's namespace re-keys a key that "
+        "was fine — it can only make the comparison wrong"
     )
 
 
@@ -1672,3 +1686,156 @@ def test_lost_content(before, after, expected):
     from nso_adapter.core.removal import lost_content
 
     assert lost_content(before, after) is expected
+
+
+# ── CR-A17: an SNMP community's retraction is verifiable after all ────────────────────────────
+#
+# The residue check's job is to answer "is the key I just removed actually OFF the device?". For
+# every scope but one it does. snmp/community abstained, because the intent keys a community by its
+# human-readable LABEL while the export keys it by sha256(community-string)[:16] — a digest of a
+# secret the adapter never sees (it pushes a Vault triple and NSO resolves it). Two namespaces, no
+# intersection, so the grain was reported unverifiable: honest, but it left the ONE scope where a
+# survivor is a live credential as the only scope neither integrity check covered. A FASTMAP retract
+# that left a community on the router was caught by nothing.
+#
+# The adapter holds the vault_ref. So: resolve the secret, hash it the same way, compare digests.
+# What it must NEVER do is fabricate a verdict when Vault cannot answer — a clean bill on a
+# credential that is still live is far worse than admitting the check did not run.
+
+
+async def _seed_snmp_removal(device_name: str, *, refs: dict | None = None) -> tuple[int, int]:
+    device_id = await _seed_device(nso_device_name=device_name)
+    context = {"removed": {"community": [["prod-ro"]]}}
+    if refs is not None:
+        context["vault_refs"] = refs
+    job_id = await _seed_removal_job(device_id, "snmp", context)
+    return device_id, job_id
+
+
+async def test_a_removed_community_STILL_on_the_device_is_now_FOUND(adapter_client, vault):
+    """The bug this closes. The community was retracted in NetBox, the replace commit reported
+    success — and the community is still on the router, ready to be used. Previously: "partial",
+    grain unverifiable, nobody the wiser.
+    """
+    provider = vault()
+    device_id, job_id = await _seed_snmp_removal("sw3", refs={"prod-ro": _REF})
+    # the device still carries it, under its hashed export identity
+    client = _ReaderClient(snmp={"community": [{"name": _community_export_name(_COMMUNITY), "access": "ro"}]})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "found"
+    assert job.result["residue"] == {"community": [["prod-ro"]]}
+    assert "residue_unverifiable" not in job.result, "the grain IS verifiable now — say so"
+    assert provider.reads == 1
+
+
+async def test_a_removed_community_that_actually_LEFT_is_CLEAN(adapter_client, vault):
+    """The other half. A clean bill is only allowed once the check has actually run — and now it
+    can, so the operator gets a real "it's gone" instead of a shrug.
+    """
+    vault()
+    device_id, job_id = await _seed_snmp_removal("sw3", refs={"prod-ro": _REF})
+    # some OTHER community remains; ours is gone
+    client = _ReaderClient(snmp={"community": [{"name": _community_export_name("a-different-one"), "access": "rw"}]})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "clean"
+    assert "residue" not in job.result
+    assert "residue_unverifiable" not in job.result
+
+
+async def test_VAULT_DOWN_reports_unverifiable_and_NEVER_clean(adapter_client, vault):
+    """The rule that makes the rest of this safe to trust.
+
+    If Vault cannot answer, the digest cannot be computed, so the comparison cannot run. The
+    intersection of an empty key-set with the device's communities is empty — which, folded into
+    the verdict, would read as "clean": a fabricated all-clear on a credential that may well still
+    be live on the router. Fail OPEN, back to exactly where this grain already was.
+    """
+    vault(fail=True)
+    device_id, job_id = await _seed_snmp_removal("sw3", refs={"prod-ro": _REF})
+    client = _ReaderClient(snmp={"community": [{"name": _community_export_name(_COMMUNITY), "access": "ro"}]})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] != "clean"
+    assert job.result["residue_unverifiable"] == ["community"]
+
+
+async def test_NO_vault_provider_is_unverifiable_too(adapter_client):
+    """The local/env secrets provider has no mount-explicit read. Same verdict as an outage."""
+    device_id, job_id = await _seed_snmp_removal("sw3", refs={"prod-ro": _REF})
+    client = _ReaderClient(snmp={"community": [{"name": _community_export_name(_COMMUNITY)}]})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] != "clean"
+    assert job.result["residue_unverifiable"] == ["community"]
+
+
+async def test_a_job_queued_BEFORE_this_existed_carries_no_refs_and_stays_unverifiable(adapter_client, vault):
+    """Back-compat: a removal job already in the queue has no `vault_refs` in its context. It must
+    degrade to the old verdict, not to a fabricated clean one.
+    """
+    vault()
+    device_id, job_id = await _seed_snmp_removal("sw3", refs=None)  # the OLD context shape
+    client = _ReaderClient(snmp={"community": [{"name": _community_export_name(_COMMUNITY)}]})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] != "clean"
+    assert job.result["residue_unverifiable"] == ["community"]
+
+
+async def test_a_community_whose_ref_no_longer_resolves_does_not_taint_the_OTHER_grains(adapter_client, vault):
+    """Mixed removal: a community (unresolvable) plus a v3-user (plain key). The user's grain is
+    still checked and still reports its survivor — one grain going dark must not blind the others.
+    """
+    vault()
+    device_id = await _seed_device(nso_device_name="sw3")
+    job_id = await _seed_removal_job(
+        device_id,
+        "snmp",
+        {
+            "removed": {"community": [["prod-ro"]], "v3-user": [["netmon"]]},
+            "vault_refs": {"prod-ro": "network/no/such/path#community"},  # resolves to nothing
+        },
+    )
+    client = _ReaderClient(snmp={"community": [], "v3-user": [{"username": "netmon"}]})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "found"
+    assert job.result["residue"] == {"v3-user": [["netmon"]]}
+    assert job.result["residue_unverifiable"] == ["community"]
+
+
+async def test_the_vault_read_never_runs_on_the_EVENT_LOOP_thread(adapter_client, vault):
+    """CR-A13, the constraint CR-A17 had to be built around.
+
+    hvac is blocking `requests`. Resolving a ref straight from an `async def` freezes the single
+    event-loop thread for the whole Vault round-trip: every other adapter request hangs, /health
+    stops answering (a container liveness probe can then kill the adapter mid-write), and the
+    in-process scheduler tick driving failover probes and job dispatch stalls. On a Vault that is
+    slow rather than down — the nastier case — that is a stall, not an error.
+
+    So the read is proven to happen OFF the loop, not merely asserted to in a comment.
+    """
+    import threading
+
+    provider = vault()
+    device_id, job_id = await _seed_snmp_removal("sw3", refs={"prod-ro": _REF})
+
+    await _run(job_id, device_id, _ReaderClient(snmp={"community": []}))
+
+    assert provider.reads == 1
+    assert provider.read_threads == [provider.read_threads[0]]
+    assert provider.read_threads[0] != threading.get_ident(), "the Vault read ran ON the event loop"

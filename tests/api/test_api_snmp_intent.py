@@ -387,8 +387,18 @@ async def test_put_removal_enqueues_async_removal_job(adapter_client, monkeypatc
             .all()
         )
         assert len(jobs) == 1
-        # community rw1 was just dropped — threaded for the collateral guard
-        assert jobs[0].context == {"scope": "snmp", "removed": {"community": ["rw1"]}, "detach": True}
+        # community rw1 was just dropped — threaded for the collateral guard, and (CR-A17) with the
+        # dropped row's vault_ref alongside it. The intent ROW is deleted by this same PUT, so if
+        # the ref is not lifted out here, the worker has no way back to the secret — and no way to
+        # compute the sha256 the device export keys the community by, which is the only thing that
+        # can answer "did it actually leave the router?". A vault_ref is a PATH, not a secret; the
+        # same value already sits in plaintext in snmp_community_intent and in the push payload.
+        assert jobs[0].context == {
+            "scope": "snmp",
+            "removed": {"community": ["rw1"]},
+            "vault_refs": {"rw1": "snmp/rw#community"},
+            "detach": True,
+        }
         job_id = jobs[0].id
         break
 

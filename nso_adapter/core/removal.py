@@ -339,18 +339,56 @@ def _reader_keys(scope: str, entry: dict, guard_list: _GuardList) -> set[tuple[s
 
 
 # (scope, guard-list label) pairs whose intent key and export key live in DIFFERENT
-# NAMESPACES, so they can never be intersected — and a naive intersection is silently
-# empty, which reads as "clean" (removal residue) and "missing" (post-apply
-# reader-compare). Both verdicts are unknowable, so these grains are reported unverifiable
-# instead of guessed.
+# NAMESPACES, so they cannot be intersected as-is — a naive intersection is silently empty,
+# which reads as "clean" (removal residue) and "missing" (post-apply reader-compare). Both
+# verdicts would be fabricated, so these grains are TRANSLATED (below) or reported
+# unverifiable — never guessed.
 #
 # snmp/community: the reconciler keys a community by its human-readable LABEL and pushes a
 # Vault TRIPLE (mount/path/key) — NSO resolves the secret, so the adapter never sees the
 # community string. network-state-export identifies the community on the device by
-# sha256(community-string)[:16] (network-state-export.yang:597). Verifying this grain would
-# need the adapter to read the secret from Vault and hash it — tracked separately; until
-# then, transparency over a fabricated verdict.
+# sha256(community-string)[:16] (network-state-export.yang:597).
+#
+# CR-A17: the adapter holds the vault_ref, so it CAN resolve the secret and compute that same
+# digest — see _export_key_map / core.snmp_verify. The grain is now checked whenever Vault can
+# answer, and falls back to unverifiable (never to "clean") when it cannot.
 UNCOMPARABLE_LISTS: frozenset[tuple[str, str]] = frozenset({("snmp", "community")})
+
+
+async def _snmp_community_keys(keys: set[tuple[str, ...]], context: dict) -> dict[tuple, tuple]:
+    """``(label,) → (sha256(secret)[:16],)`` for the removed communities Vault can answer for.
+
+    The intent ROW is deleted before the removal worker ever runs, so the trigger captures each
+    dropped community's vault_ref alongside its label (``context["vault_refs"]``). A job queued
+    before that existed carries none, and stays unverifiable — exactly as it was.
+    """
+    from nso_adapter.core.snmp_verify import community_fingerprints
+
+    refs = {label: ref for label, ref in (context.get("vault_refs") or {}).items() if (label,) in keys}
+    return {(label,): (digest,) for label, digest in (await community_fingerprints(refs)).items()}
+
+
+# The uncomparable grains the adapter can nonetheless RE-KEY into the export's namespace, and how.
+# A grain in UNCOMPARABLE_LISTS with no translator here can only ever be reported unverifiable — so
+# this registry is also what licenses a grain to appear in apply's _READER_COMPARE_SPECS at all
+# (test_an_uncomparable_grain_is_only_reader_compared_if_it_can_be_TRANSLATED).
+_KEY_TRANSLATORS = {("snmp", "community"): _snmp_community_keys}
+
+
+async def _export_key_map(scope: str, label: str, keys: set[tuple[str, ...]], context: dict) -> dict[tuple, tuple]:
+    """INTENT key → EXPORT key, for the keys whose export key can actually be determined.
+
+    Identity for every grain that shares a namespace with the export. For the ones that do not, a
+    translator re-keys what it can — and a key it CANNOT resolve is simply ABSENT from the map.
+    Callers must treat an absent key as unverifiable, never as "not on the device": a Vault outage
+    must not fabricate a clean bill on a credential that is still live on the router.
+    """
+    if (scope, label) not in UNCOMPARABLE_LISTS:
+        return {k: k for k in keys}
+    translator = _KEY_TRANSLATORS.get((scope, label))
+    if translator is None:
+        return {}
+    return await translator(keys, context)
 
 
 def _norm_addr(address) -> str:
@@ -435,18 +473,32 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> t
         # docstring promises never to emit.
         return None, []
 
-    unverifiable = sorted(
-        gl.label for gl in spec.lists if removed.get(gl.label) and (scope, gl.label) in UNCOMPARABLE_LISTS
-    )
-    checkable = [gl for gl in spec.lists if removed.get(gl.label) and (scope, gl.label) not in UNCOMPARABLE_LISTS]
-    if not checkable:
-        return None, unverifiable  # every removed key was in an unverifiable grain
+    # Translate each grain's removed keys into the namespace the EXPORT keys by (CR-A17: an snmp
+    # community's export key is a digest of a Vault-held secret). A key the translation cannot
+    # resolve makes its grain unverifiable — it is never folded into "clean".
+    keymaps: dict[str, dict[tuple, tuple]] = {}
+    unverifiable: list[str] = []
+    for guard_list in spec.lists:
+        keys = {_norm_key(k) for k in removed.get(guard_list.label, [])}
+        if not keys:
+            continue
+        keymap = await _export_key_map(scope, guard_list.label, keys, context)
+        if keys - set(keymap):
+            unverifiable.append(guard_list.label)
+        if keymap:
+            keymaps[guard_list.label] = keymap
+    unverifiable.sort()
+    if not keymaps:
+        return None, unverifiable  # nothing in any grain could be translated
 
     entry = await getattr(client, reader)(device.nso_device_name) or {}
     residue: dict[str, list] = {}
-    for guard_list in checkable:
-        keys = {_norm_key(k) for k in removed.get(guard_list.label, [])}
-        survivors = sorted(keys & _reader_keys(scope, entry, guard_list))
+    for guard_list in spec.lists:
+        keymap = keymaps.get(guard_list.label)
+        if not keymap:
+            continue
+        present = _reader_keys(scope, entry, guard_list)
+        survivors = sorted(intent for intent, exported in keymap.items() if exported in present)
         if survivors:
             residue[guard_list.label] = [list(k) for k in survivors]
     return residue, unverifiable
@@ -810,6 +862,7 @@ async def enqueue_removal(
     *,
     interfaces: list[str] | None = None,
     removed: dict[str, list] | None = None,
+    vault_refs: dict[str, str] | None = None,
     force: bool = False,
     retract: bool = False,
     shrank: bool = False,
@@ -857,6 +910,13 @@ async def enqueue_removal(
             for label, keys in removed.items()
             if keys
         }
+    if vault_refs:
+        # CR-A17. The removed intent ROW is gone by the time the worker runs, so the residue check
+        # would have no way back to the Vault ref it needs to compute the removed community's
+        # export key (a sha256 of the secret). Captured here, at the trigger, while the row still
+        # exists. A vault_ref is a PATH, not a secret — the same value already sits in plaintext in
+        # snmp_community_intent and in the push payload.
+        context["vault_refs"] = dict(vault_refs)
     # An un-own rode along with the clear in the same push: ONE PUT-replace cannot honour
     # both. Networking it would strip the un-owned row's config off the device (the #106
     # damage); not networking it leaves the cleared leaf. Safety wins — but the deferred

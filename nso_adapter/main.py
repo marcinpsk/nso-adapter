@@ -64,8 +64,15 @@ logger = structlog.get_logger(__name__)
 
 def _init_secrets(app: FastAPI, cfg, env):
     """Build the secrets provider, stashing it and the resolved adapter token on ``app.state``."""
+    from nso_adapter.core.snmp_verify import register_secrets_provider
+
     provider = make_provider(cfg, env)
     app.state.secrets = provider
+    # The apply/removal WORKERS run outside the request scope, so they cannot reach
+    # `request.app.state.secrets`. They need the provider to resolve an SNMP community's
+    # vault_ref into the sha256 the device export keys it by (CR-A17) — same module-level
+    # registry pattern as the NSO / NetBox clients in core.importer.
+    register_secrets_provider(provider)
     app.state.adapter_token = provider.get(cfg.api.adapter_token_ref)
     return provider
 

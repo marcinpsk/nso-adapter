@@ -191,17 +191,24 @@ async def _sync_intent_collection(
     now: datetime,
     apply_fields: Callable,
     make_row: Callable,
-) -> tuple[int, list[str]]:
+    capture: Callable | None = None,
+) -> tuple[int, list[str], dict[str, object]]:
     """Full-replace one keyed SNMP intent collection for a device.
 
     Rows whose key is absent from *entries* are deleted; the rest are upserted
     (``apply_fields`` mutates an existing row, ``make_row`` builds a new one).
-    Returns ``(upserted_count, removed_keys)``.
+    Returns ``(upserted_count, removed_keys, captured)``.
+
+    *capture* snapshots one value off each row that is about to be DELETED, before it is deleted —
+    the removal worker runs long after this row is gone, so anything it needs from the row has to
+    be lifted out here (CR-A17: a community's vault_ref, without which its removal cannot be
+    verified on the device).
     """
     rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
     existing = {getattr(r, key_attr): r for r in rows}
     new_keys = {getattr(e, key_attr) for e in entries}
     removed = [k for k in existing if k not in new_keys]
+    captured = {k: capture(existing[k]) for k in removed} if capture else {}
     for k in removed:
         await db.delete(existing[k])
     await db.flush()
@@ -215,7 +222,7 @@ async def _sync_intent_collection(
         else:
             db.add(make_row(entry, accepted))
         count += 1
-    return count, removed
+    return count, removed, captured
 
 
 def _apply_community_fields(row: SnmpCommunityIntent, e: SnmpCommunityEntry, accepted: datetime) -> None:
@@ -281,7 +288,7 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
 
     now = datetime.now(UTC).replace(tzinfo=None)
 
-    comm_count, removed_comms = await _sync_intent_collection(
+    comm_count, removed_comms, removed_comm_refs = await _sync_intent_collection(
         db,
         SnmpCommunityIntent,
         device_id,
@@ -292,8 +299,12 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
         make_row=lambda e, acc: SnmpCommunityIntent(
             device_id=device_id, label=e.label, vault_ref=e.vault_ref, access=e.access, acl=e.acl, accepted_at=acc
         ),
+        # CR-A17: lift the vault_ref off each row we are about to delete. The removal worker needs
+        # it to compute the community's EXPORT key (sha256 of the secret) and so actually verify
+        # that the community left the device — the row itself is gone by then.
+        capture=lambda row: row.vault_ref,
     )
-    user_count, removed_users = await _sync_intent_collection(
+    user_count, removed_users, _ = await _sync_intent_collection(
         db,
         SnmpV3UserIntent,
         device_id,
@@ -312,7 +323,7 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
             accepted_at=acc,
         ),
     )
-    host_count, removed_hosts = await _sync_intent_collection(
+    host_count, removed_hosts, _ = await _sync_intent_collection(
         db,
         SnmpHostIntent,
         device_id,
@@ -361,6 +372,7 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
             device_id,
             "snmp",
             removed={"community": removed_comms, "v3-user": removed_users, "host": removed_hosts},
+            vault_refs={label: ref for label, ref in removed_comm_refs.items() if ref},
         )
 
     await db.commit()
