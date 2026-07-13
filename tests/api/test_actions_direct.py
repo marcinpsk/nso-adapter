@@ -112,6 +112,49 @@ async def test_action_force_removal_rejects_unknown_scope(adapter_client):
         break
 
 
+async def test_action_force_removal_interface_config_requires_interfaces(adapter_client):
+    """interface_config is per-instance: the job needs the interface names or it flushes
+    NOTHING.
+
+    _replace_interface_config iterates context["interfaces"], and only put_ip_intent ever
+    supplied that key — so a force-removal of this scope pushed no PUT-replace and no
+    DELETE, yet reported a green job. The operator believed the orphaned addresses and
+    descriptions had been flushed while the config was still live on the device. Reject
+    the ambiguous call rather than succeed at nothing.
+    """
+    from nso_adapter.api.actions import ForceRemovalBody, action_force_removal
+
+    device_id = await _seed_device("actions-frm-03", 1342)
+    async for db in get_session():
+        try:
+            await action_force_removal(device_id=device_id, body=ForceRemovalBody(scope="interface_config"), db=db)
+        except Exception as exc:
+            assert getattr(exc, "status_code", None) == 400
+        else:
+            raise AssertionError("interface_config force-removal without interfaces must be rejected")
+        break
+
+
+async def test_action_force_removal_interface_config_carries_the_interfaces(adapter_client):
+    """Given the names, the job carries them so _replace_interface_config actually pushes."""
+    from nso_adapter.api.actions import ForceRemovalBody, action_force_removal
+
+    device_id = await _seed_device("actions-frm-04", 1343)
+    async for db in get_session():
+        result = await action_force_removal(
+            device_id=device_id,
+            body=ForceRemovalBody(scope="interface_config", interfaces=["GigabitEthernet0/1"]),
+            db=db,
+        )
+        job = await db.get(Job, result["job_id"])
+        assert job.context == {
+            "scope": "interface_config",
+            "interfaces": ["GigabitEthernet0/1"],
+            "force": True,
+        }
+        break
+
+
 async def test_action_apply_diff_forwards_outformat(adapter_client):
     """?outformat=cli reaches collect_apply_diff and is echoed in the response."""
     from unittest.mock import AsyncMock, patch

@@ -380,9 +380,10 @@ async def test_run_removal_dispatches_and_marks_succeeded(adapter_client):
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["scope"] == "vlan"
-        # No `removed` keys in this job's context → nothing to residue-check (#104);
-        # the opaque client's reader surface is never touched.
-        assert job.result["residue_check"] == "clean"
+        # No `removed` keys in this job's context → nothing to residue-check (#104); the
+        # opaque client's reader surface is never touched. Report that honestly — a job
+        # that never read the device must not claim the device came back clean.
+        assert job.result["residue_check"] == "unsupported"
         break
 
 
@@ -984,6 +985,42 @@ async def test_run_removal_residue_unsupported_scope_is_transparent(adapter_clie
     assert job.result["residue_check"] == "unsupported"
 
 
+async def test_force_removal_residue_never_silently_clean(adapter_client):
+    """The generic residue path must honour the same "never a silent clean" contract as
+    _interface_config_residue — on the ONE path where a survivor matters most.
+
+    actions/force-removal enqueues with no ``removed`` keys (nothing was trigger-deleted;
+    the operator is deliberately flushing orphans). The generic check short-circuited to
+    {} -> residue_check="clean" WITHOUT ever reading the device: a deliberate flush against
+    a FASTMAP service that already surprised us once, reported verified when nothing was
+    checked. It must report unsupported, and must not pretend to have read the device.
+    """
+    device_id = await _seed_device(nso_device_name="rg03")
+    job_id = await _seed_removal_job(device_id, "bgp", {"force": True})
+    client = _ReaderClient(bgp={"router": [{"asn": 65000}]})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.status == JobStatus.succeeded
+    assert job.result["residue_check"] == "unsupported"  # NOT "clean"
+    assert client.reads == 0  # the device was never read — so nothing was verified
+
+
+async def test_cleared_scalar_retract_residue_is_unsupported(adapter_client):
+    """A cleared-scalar retract removes no KEY, so there is nothing for the key-grain
+    residue check to look for — say so rather than claim the device came back clean."""
+    device_id = await _seed_device(nso_device_name="ra1")
+    job_id = await _seed_removal_job(device_id, "isis", {})
+    client = _ReaderClient(isis={"interface": [{"interface-name": "Gi0/0", "af": "ipv4"}]})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "unsupported"
+    assert client.reads == 0
+
+
 def test_residue_readers_resolve_on_the_real_client():
     """Every _RESIDUE_READERS target must be a real NsoClient coroutine — and so must
     every get_* method on the test fake. #104-A shipped bfd→get_bfd and
@@ -1246,6 +1283,9 @@ async def test_run_removal_residue_reader_error_is_nonfatal(adapter_client):
 
 
 async def test_run_removal_without_removed_context_skips_reader(adapter_client):
+    """With no captured keys the reader is never called — so the result must be
+    "unsupported", not "clean". Asserting reads == 0 alongside "clean" was asserting the
+    bug: a verdict of "the device came back clean" on a device that was never read."""
     device_id = await _seed_device(nso_device_name="sw3")
     job_id = await _seed_removal_job(device_id, "svi")
     client = _ReaderClient(svi={"interface": [{"interface-name": "Vlan987"}]})
@@ -1253,7 +1293,7 @@ async def test_run_removal_without_removed_context_skips_reader(adapter_client):
     await _run(job_id, device_id, client)
 
     job = await _job_after(job_id)
-    assert job.result["residue_check"] == "clean"
+    assert job.result["residue_check"] == "unsupported"
     assert client.reads == 0
 
 

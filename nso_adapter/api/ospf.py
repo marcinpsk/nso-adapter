@@ -152,12 +152,19 @@ async def _sync_keyed_intent(
     now: datetime,
     apply_fields: Callable,
     make_row: Callable,
-) -> list[str]:
-    """Full-replace one keyed OSPF intent collection.
+    state_fields: tuple[str, ...] = (),
+) -> tuple[list[str], bool]:
+    """Full-replace one keyed OSPF intent collection. Returns ``(removed_keys, cleared)``.
 
     Rows whose key is absent from *entries* are deleted; the rest are upserted
     (``make_row`` builds a new row from key+accepted_at, ``apply_fields`` writes
-    the mutable fields on both new and existing rows). Returns the removed keys.
+    the mutable fields on both new and existing rows).
+
+    ``cleared`` is True when a RETAINED row's previously-set *state_fields* scalar went
+    back to ``None`` (a cost blanked). The row stays owned and accepted, so nothing is
+    un-owned — but a merge-PATCH apply never drops the leaf, so the caller must enqueue a
+    PUT-replace removal that actually reaches the device. Kept apart from the removed keys
+    because those are an UN-OWN and must NOT touch the device absent ?delete_origin (#106).
     """
     rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
     existing = {getattr(r, key_attr): r for r in rows}
@@ -165,13 +172,17 @@ async def _sync_keyed_intent(
     removed = [k for k in existing if k not in incoming]
     for k in removed:
         await db.delete(existing[k])
+    cleared = False
     for entry in entries:
         row = existing.get(getattr(entry, key_attr))
+        before = {f: getattr(row, f) for f in state_fields} if row is not None else None
         if row is None:
             row = make_row(entry, now)
             db.add(row)
         apply_fields(row, entry)
-    return removed
+        if before is not None and any(before[f] is not None and getattr(row, f) is None for f in state_fields):
+            cleared = True
+    return removed, cleared
 
 
 def _apply_ospf_instance_fields(row: OspfInstanceIntent, e: OspfInstanceEntry) -> None:
@@ -202,8 +213,12 @@ def _iter_ospf_redistribution(instances: list[OspfInstanceEntry]):
 
 async def _sync_ospf_redistribution(
     db: AsyncSession, device_id: int, instances: list[OspfInstanceEntry], now: datetime
-) -> list[tuple]:
-    """Full-replace OSPF (dest_protocol=ospf) redistribution intent rows. Returns the removed keys."""
+) -> tuple[list[tuple], bool]:
+    """Full-replace OSPF (dest_protocol=ospf) redistribution intent rows.
+
+    Returns ``(removed_keys, cleared)`` — see :func:`_sync_ospf_intent` for why a dropped
+    row and a cleared scalar must be told apart.
+    """
     existing = (
         (
             await db.execute(
@@ -225,6 +240,7 @@ async def _sync_ospf_redistribution(
     for key in removed:
         await db.delete(existing_map[key])
 
+    cleared = False
     for dest_ref, entry in _iter_ospf_redistribution(instances):
         key = (dest_ref, entry.source_protocol, entry.source_ref)
         row = existing_map.get(key)
@@ -238,10 +254,18 @@ async def _sync_ospf_redistribution(
                 accepted_at=now,
             )
             db.add(row)
+        else:
+            for old, new in (
+                (row.route_map, entry.route_map),
+                (row.metric, entry.metric),
+                (row.metric_type, entry.metric_type),
+            ):
+                if old is not None and new is None:
+                    cleared = True
         row.route_map = entry.route_map
         row.metric = entry.metric
         row.metric_type = entry.metric_type
-    return removed
+    return removed, cleared
 
 
 async def _maybe_enqueue_apply(db: AsyncSession, device_id: int, count: int) -> None:
@@ -274,7 +298,7 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
 
     now = datetime.now(UTC).replace(tzinfo=None)
 
-    removed_inst = await _sync_keyed_intent(
+    removed_inst, inst_cleared = await _sync_keyed_intent(
         db,
         OspfInstanceIntent,
         device_id,
@@ -283,8 +307,9 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
         now=now,
         apply_fields=_apply_ospf_instance_fields,
         make_row=lambda e, ts: OspfInstanceIntent(device_id=device_id, process_id=e.process_id, accepted_at=ts),
+        state_fields=("router_id", "areas", "enabled"),
     )
-    removed_iface = await _sync_keyed_intent(
+    removed_iface, iface_cleared = await _sync_keyed_intent(
         db,
         OspfInterfaceIntent,
         device_id,
@@ -295,22 +320,33 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
         make_row=lambda e, ts: OspfInterfaceIntent(
             device_id=device_id, interface_name=e.interface_name, accepted_at=ts
         ),
+        state_fields=("priority", "cost", "network_type", "auth_type", "auth_key"),
     )
-    removed_redist = await _sync_ospf_redistribution(db, device_id, payload.instances, now)
+    removed_redist, redist_cleared = await _sync_ospf_redistribution(db, device_id, payload.instances, now)
 
     await _maybe_enqueue_apply(db, device_id, len(payload.instances) + len(payload.interfaces))
 
-    if removed_inst or removed_iface or removed_redist:
+    # Same two-cause split as IS-IS (see api/isis.py): a DROPPED row is an un-own and must
+    # not strip config off the device absent ?delete_origin (#106 → detach), while a
+    # CLEARED scalar on a retained, still-owned row is an explicit operator retraction that
+    # MUST reach the device (#83). OSPF only ever tracked dropped rows, so clearing a cost
+    # queued nothing at all — and the merge-PATCH apply never drops a leaf, so the device
+    # kept the old value forever and the operator could not clear it.
+    deleted = bool(removed_inst or removed_iface or removed_redist)
+    cleared = inst_cleared or iface_cleared or redist_cleared
+    if deleted or cleared:
         from nso_adapter.core.removal import enqueue_removal
 
         # Thread the just-removed keys so the collateral guard can tell this intended
         # retraction from an orphaned service row (redistribute rows are nested,
-        # non-guarded content — only the keyed lists matter here).
+        # non-guarded content — only the keyed lists matter here, hence `shrank`).
         await enqueue_removal(
             db,
             device_id,
             "ospf",
             removed={"interface-config": removed_iface, "process-config": removed_inst},
+            retract=cleared,
+            shrank=deleted,
         )
 
     await db.commit()

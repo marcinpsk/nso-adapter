@@ -127,6 +127,134 @@ async def test_put_ospf_intent_removal_enqueues_job_not_inline(adapter_client):
         break
 
 
+# ── retracting a cleared owned OSPF scalar (#83's flow, ported from IS-IS) ───
+#
+# OSPF only ever tracked DELETED keys, so a cleared owned scalar (cost back to blank)
+# enqueued no removal job at all — and the next apply is a merge-PATCH, which never drops
+# a leaf. The device kept the old cost forever and the operator could not clear it.
+
+
+async def _ospf_removal_jobs(device_id: int):
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Job, JobType
+
+    async for db in get_session():
+        jobs = (
+            (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal)))
+            .scalars()
+            .all()
+        )
+        return [j for j in jobs if (j.context or {}).get("scope") == "ospf"]
+    return []
+
+
+async def test_clearing_an_owned_ospf_interface_scalar_retracts(adapter_client):
+    """Clearing an owned interface cost must reach the device: the row stays owned and
+    accepted — only the leaf was blanked — so nothing is un-owned and the job must not detach."""
+    device_id = await seed_device(nso_device_name="ospf-clear-iface", netbox_device_id=930)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ospf-intent",
+        headers=AUTH,
+        json={
+            "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
+            "interfaces": [{"interface_name": "Gi0/0", "process_id": "1", "area_id": "0", "cost": 100}],
+        },
+    )
+    assert await _ospf_removal_jobs(device_id) == []  # the initial set is not a retraction
+
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ospf-intent",
+        headers=AUTH,
+        json={
+            "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
+            "interfaces": [{"interface_name": "Gi0/0", "process_id": "1", "area_id": "0"}],  # cost cleared
+        },
+    )
+    assert resp.status_code == 200
+
+    jobs = await _ospf_removal_jobs(device_id)
+    assert len(jobs) == 1
+    assert jobs[0].context.get("detach") is None  # a real, networking replace
+    assert not jobs[0].context.get("removed")  # nothing was un-owned
+
+
+async def test_clearing_an_owned_ospf_instance_scalar_retracts(adapter_client):
+    """Same contract on the instance row (router_id blanked)."""
+    device_id = await seed_device(nso_device_name="ospf-clear-inst", netbox_device_id=931)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ospf-intent",
+        headers=AUTH,
+        json={
+            "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
+            "interfaces": [],
+        },
+    )
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ospf-intent",
+        headers=AUTH,
+        json={"instances": [{"process_id": "1", "vrf": "", "areas": []}], "interfaces": []},  # router_id cleared
+    )
+    assert resp.status_code == 200
+
+    jobs = await _ospf_removal_jobs(device_id)
+    assert len(jobs) == 1
+    assert jobs[0].context.get("detach") is None
+
+
+async def test_ospf_unown_riding_along_with_a_clear_defers_the_retract(adapter_client):
+    """An un-own in the same push cannot be networked (it would strip the dropped process off
+    the device) — safety wins, and the deferred retract is recorded, not silently dropped."""
+    device_id = await seed_device(nso_device_name="ospf-mixed", netbox_device_id=932)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ospf-intent",
+        headers=AUTH,
+        json={
+            "instances": [
+                {"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []},
+                {"process_id": "2", "router_id": "2.2.2.2", "vrf": "", "areas": []},
+            ],
+            "interfaces": [{"interface_name": "Gi0/0", "process_id": "1", "area_id": "0", "cost": 100}],
+        },
+    )
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ospf-intent",
+        headers=AUTH,
+        json={
+            # process 2 un-owned AND Gi0/0's cost cleared, in the same push
+            "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
+            "interfaces": [{"interface_name": "Gi0/0", "process_id": "1", "area_id": "0"}],
+        },
+    )
+    assert resp.status_code == 200
+
+    jobs = await _ospf_removal_jobs(device_id)
+    assert len(jobs) == 1
+    assert jobs[0].context["detach"] is True
+    assert jobs[0].context["retract_deferred"] is True
+
+
+async def test_clearing_an_ospf_scalar_under_store_only_touches_nothing(adapter_client):
+    device_id = await seed_device(nso_device_name="ospf-clear-so", netbox_device_id=933)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ospf-intent",
+        headers=AUTH,
+        json={
+            "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
+            "interfaces": [{"interface_name": "Gi0/0", "process_id": "1", "area_id": "0", "cost": 100}],
+        },
+    )
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ospf-intent?store_only=true",
+        headers=AUTH,
+        json={
+            "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
+            "interfaces": [{"interface_name": "Gi0/0", "process_id": "1", "area_id": "0"}],
+        },
+    )
+    assert resp.status_code == 200
+    assert await _ospf_removal_jobs(device_id) == []
+
+
 async def test_put_ospf_intent_device_not_found(adapter_client):
     """Non-existent device → 404."""
     resp = await adapter_client.put(

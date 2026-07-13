@@ -36,6 +36,7 @@ async def _trigger(
 
 class ForceRemovalBody(BaseModel):
     scope: str
+    interfaces: list[str] | None = None
 
 
 @router.post("/{device_id}/actions/force-removal", status_code=202, dependencies=[Depends(verify_token)])
@@ -49,6 +50,13 @@ async def action_force_removal(
     The operator override for a ``removal_blocked_collateral`` failure: after
     reviewing the blocked job's orphan list + dry-run preview, this deliberately
     flushes the orphaned service rows (PUT-replace with only the remaining intent).
+
+    ``interface_config`` is per-instance (interface-reconciler is keyed by
+    ``(device, interface-name)``), so its removal job flushes exactly the interfaces named
+    in *interfaces* — with none, ``_replace_interface_config`` iterates an empty list and
+    the job succeeds having pushed NOTHING, telling the operator their orphaned addresses
+    were flushed while the config is still live on the device. Reject that rather than
+    succeed at nothing.
     """
     from nso_adapter.core.removal import VALID_REMOVAL_SCOPES, enqueue_removal
 
@@ -57,7 +65,14 @@ async def action_force_removal(
         raise api_error(404, "not_found", "Device not found")
     if body.scope not in VALID_REMOVAL_SCOPES:
         raise api_error(400, "bad_request", f"Unknown removal scope {body.scope!r}")
-    job = await enqueue_removal(db, device_id, body.scope, force=True)
+    if body.scope == "interface_config" and not body.interfaces:
+        raise api_error(
+            400,
+            "bad_request",
+            "force-removal of interface_config requires 'interfaces': the interface-reconciler "
+            "is keyed per interface, so with none named the job would flush nothing.",
+        )
+    job = await enqueue_removal(db, device_id, body.scope, interfaces=body.interfaces, force=True)
     await db.commit()
     return {"job_id": job.id}
 

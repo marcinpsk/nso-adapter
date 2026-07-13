@@ -318,7 +318,13 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> d
         return None
     removed = _removed_context(scope, context)
     if not any(removed.values()):
-        return {}
+        # No captured keys to look for — a force-removal (nothing was trigger-deleted; the
+        # operator is deliberately flushing orphans), a cleared-scalar retract (no KEY was
+        # removed at all), or a legacy queue row. The check cannot run, so say so. Returning
+        # {} here reported "clean" WITHOUT EVER READING THE DEVICE, on exactly the paths
+        # where a survivor matters most — the same silent-clean _interface_config_residue's
+        # docstring promises never to emit.
+        return None
     entry = await getattr(client, reader)(device.nso_device_name) or {}
     residue: dict[str, list] = {}
     for guard_list in spec.lists:
