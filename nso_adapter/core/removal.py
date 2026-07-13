@@ -254,6 +254,21 @@ def _reader_keys(scope: str, entry: dict, guard_list: _GuardList) -> set[tuple[s
     return _leaf_keys(entry, guard_list)
 
 
+# (scope, guard-list label) pairs whose intent key and export key live in DIFFERENT
+# NAMESPACES, so they can never be intersected — and a naive intersection is silently
+# empty, which reads as "clean" (removal residue) and "missing" (post-apply
+# reader-compare). Both verdicts are unknowable, so these grains are reported unverifiable
+# instead of guessed.
+#
+# snmp/community: the reconciler keys a community by its human-readable LABEL and pushes a
+# Vault TRIPLE (mount/path/key) — NSO resolves the secret, so the adapter never sees the
+# community string. network-state-export identifies the community on the device by
+# sha256(community-string)[:16] (network-state-export.yang:597). Verifying this grain would
+# need the adapter to read the secret from Vault and hash it — tracked separately; until
+# then, transparency over a fabricated verdict.
+UNCOMPARABLE_LISTS: frozenset[tuple[str, str]] = frozenset({("snmp", "community")})
+
+
 def _norm_addr(address) -> str:
     """Canonicalize an ``ip/prefix-length`` string for comparison.
 
@@ -298,7 +313,7 @@ async def _interface_config_residue(client, device, context: dict) -> dict[str, 
     return {"address": survivors} if survivors else {}
 
 
-async def _residue_after_removal(client, device, scope: str, context: dict) -> dict[str, list] | None:
+async def _residue_after_removal(client, device, scope: str, context: dict) -> tuple[dict[str, list] | None, list[str]]:
     """Report the just-removed keys the device STILL has after the replace commit (#104).
 
     FASTMAP's reverse diff keeps service-created entries that picked up foreign
@@ -307,15 +322,25 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> d
     SUCCESS while its keys survive in the device tree. Re-read the scope's reader —
     the NED-agnostic device-tree view — and report survivors per YANG list
     (interface_config compares removed VALUES instead — see
-    :func:`_interface_config_residue`). Returns ``None`` when the check cannot run
-    (no reader mapping / no captured values) → residue_check="unsupported".
+    :func:`_interface_config_residue`).
+
+    Returns ``(residue, unverifiable)``:
+
+    ``residue``      survivors per YANG list; ``{}`` means every list that COULD be
+                     checked came back clean; ``None`` means nothing could be checked at
+                     all (no reader mapping / no captured keys) → residue_check
+                     "unsupported".
+    ``unverifiable`` labels whose grain cannot be key-matched against the export
+                     (:data:`UNCOMPARABLE_LISTS`). Their keys are neither silently
+                     intersected (an empty intersection would read as "clean" for a
+                     credential still live on the router) nor guessed at.
     """
     if scope == "interface_config":
-        return await _interface_config_residue(client, device, context)
+        return await _interface_config_residue(client, device, context), []
     reader = _RESIDUE_READERS.get(scope)
     spec = _guard_specs().get(scope)
     if reader is None or spec is None:
-        return None
+        return None, []
     removed = _removed_context(scope, context)
     if not any(removed.values()):
         # No captured keys to look for — a force-removal (nothing was trigger-deleted; the
@@ -324,17 +349,66 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> d
         # {} here reported "clean" WITHOUT EVER READING THE DEVICE, on exactly the paths
         # where a survivor matters most — the same silent-clean _interface_config_residue's
         # docstring promises never to emit.
-        return None
+        return None, []
+
+    unverifiable = sorted(
+        gl.label for gl in spec.lists if removed.get(gl.label) and (scope, gl.label) in UNCOMPARABLE_LISTS
+    )
+    checkable = [gl for gl in spec.lists if removed.get(gl.label) and (scope, gl.label) not in UNCOMPARABLE_LISTS]
+    if not checkable:
+        return None, unverifiable  # every removed key was in an unverifiable grain
+
     entry = await getattr(client, reader)(device.nso_device_name) or {}
     residue: dict[str, list] = {}
-    for guard_list in spec.lists:
+    for guard_list in checkable:
         keys = {_norm_key(k) for k in removed.get(guard_list.label, [])}
-        if not keys:
-            continue
         survivors = sorted(keys & _reader_keys(scope, entry, guard_list))
         if survivors:
             residue[guard_list.label] = [list(k) for k in survivors]
-    return residue
+    return residue, unverifiable
+
+
+async def _record_residue(job, client, device, scope: str, context: dict, *, job_id: int, device_id: int) -> None:
+    """Run the post-replace residue check (#104) and record its verdict on *job*.
+
+    A "succeeded" replace can still leave residue on the device (FASTMAP keeps entries
+    holding foreign leaves), so re-read the scope's device-tree view and surface survivors.
+    Verdicts:
+
+    ``found``        a removed key is still on the device.
+    ``clean``        every removed key was checked and none survived.
+    ``partial``      what could be checked came back clean, but some grain could not be
+                     checked at all (:data:`UNCOMPARABLE_LISTS`) — NOT a clean bill.
+    ``unsupported``  nothing could be checked (no reader, no captured keys, or every
+                     removed key was in an unverifiable grain).
+    ``error``        the reader blew up — never fails the removal.
+    """
+    try:
+        residue, unverifiable = await _residue_after_removal(client, device, scope, context)
+    except Exception as exc:  # noqa: BLE001 — the check must never fail the removal
+        logger.warning("removal.residue_check_error", job_id=job_id, device_id=device_id, scope=scope, error=repr(exc))
+        job.result["residue_check"] = "error"
+        return
+
+    if unverifiable:
+        # Grains whose intent key and export key live in different namespaces (snmp
+        # community: a label vs a sha256 of a secret the adapter never sees). Never fold
+        # these into a "clean" — a survivor there is a credential still live on the router.
+        job.result["residue_unverifiable"] = unverifiable
+        logger.warning(
+            "removal.residue_unverifiable", job_id=job_id, device_id=device_id, scope=scope, lists=unverifiable
+        )
+
+    if residue is None:
+        job.result["residue_check"] = "unsupported"
+    elif residue:
+        job.result["residue_check"] = "found"
+        job.result["residue"] = residue
+        logger.warning("removal.residue_found", job_id=job_id, device_id=device_id, scope=scope, residue=residue)
+    elif unverifiable:
+        job.result["residue_check"] = "partial"
+    else:
+        job.result["residue_check"] = "clean"
 
 
 async def _guarded_apply(client, device, scope: str, context: dict | None, apply_thunk) -> None:
@@ -788,35 +862,7 @@ async def run_removal(job_id: int, device_id: int) -> None:
                             # later sync-from — make that visible on the job.
                             job.result["sync_from"] = "failed"
             else:
-                # #104-A: a "succeeded" replace can still leave residue on the device
-                # (FASTMAP keeps entries holding foreign leaves) — re-read the scope's
-                # device-tree view and surface survivors in the job result.
-                try:
-                    residue = await _residue_after_removal(client, device, scope, context)
-                except Exception as exc:  # noqa: BLE001 — the check must never fail the removal
-                    logger.warning(
-                        "removal.residue_check_error",
-                        job_id=job_id,
-                        device_id=device_id,
-                        scope=scope,
-                        error=repr(exc),
-                    )
-                    job.result["residue_check"] = "error"
-                else:
-                    if residue is None:
-                        job.result["residue_check"] = "unsupported"
-                    elif residue:
-                        job.result["residue_check"] = "found"
-                        job.result["residue"] = residue
-                        logger.warning(
-                            "removal.residue_found",
-                            job_id=job_id,
-                            device_id=device_id,
-                            scope=scope,
-                            residue=residue,
-                        )
-                    else:
-                        job.result["residue_check"] = "clean"
+                await _record_residue(job, client, device, scope, context, job_id=job_id, device_id=device_id)
             await db.commit()
             # Option A follow-up: sync now so any residue re-imports as an unowned
             # mirror immediately instead of at the next poll cycle. After the commit

@@ -1021,6 +1021,24 @@ async def test_cleared_scalar_retract_residue_is_unsupported(adapter_client):
     assert client.reads == 0
 
 
+def test_uncomparable_grains_are_never_reader_compared():
+    """A grain in UNCOMPARABLE_LISTS must not appear in _READER_COMPARE_SPECS.
+
+    The two registries encode the same key-grain truth, and they had already diverged: the
+    compare demanded a community be "present" under its intent LABEL while the export names
+    it by a SHA-256 of the secret, so every successful SNMP apply was failed. Pin them
+    together so re-adding an un-keyable grain to either side fails here, loudly, rather than
+    on a live device.
+    """
+    from nso_adapter.core.apply import _READER_COMPARE_SPECS
+    from nso_adapter.core.removal import UNCOMPARABLE_LISTS
+
+    compared = {(scope, label) for scope, specs in _READER_COMPARE_SPECS.items() for _, label, _ in specs}
+    assert not (compared & UNCOMPARABLE_LISTS), (
+        f"these grains cannot be key-matched against the export: {sorted(compared & UNCOMPARABLE_LISTS)}"
+    )
+
+
 def test_residue_readers_resolve_on_the_real_client():
     """Every _RESIDUE_READERS target must be a real NsoClient coroutine — and so must
     every get_* method on the test fake. #104-A shipped bfd→get_bfd and
@@ -1116,18 +1134,36 @@ async def test_run_removal_residue_ospf_found_via_instance_list(adapter_client):
     assert job.result["residue"] == {"process-config": [["1"]]}
 
 
+def _community_export_name(secret: str) -> str:
+    """The export's community key: sha256 of the community STRING, first 16 hex chars.
+
+    network-state-export.yang:597 — "Stable opaque identifier (first 16 hex chars of
+    SHA-256 of the community string)". The intent's key is the human-readable LABEL, and
+    the adapter never sees the secret (it pushes a Vault triple; NSO resolves it), so the
+    two namespaces can never be intersected.
+    """
+    import hashlib
+
+    return hashlib.sha256(secret.encode()).hexdigest()[:16]
+
+
 async def test_run_removal_residue_snmp_three_lists(adapter_client):
-    """#104 phase-2: snmp residue checks community/v3-user/host independently."""
+    """#104 phase-2: snmp residue checks v3-user/host by key; community CANNOT be keyed.
+
+    The old fake keyed the exported community by the intent LABEL ("public"), which the
+    real export never emits — so the suite stayed green while the check was structurally
+    incapable of matching. Address-keyed hosts and username-keyed v3-users are correct.
+    """
     device_id = await _seed_device(nso_device_name="sw3")
     job_id = await _seed_removal_job(
         device_id,
         "snmp",
-        {"removed": {"community": [["public"]], "v3-user": [["nms"]], "host": [["198.18.5.9"]]}},
+        {"removed": {"v3-user": [["nms"]], "host": [["198.18.5.9"]]}},
     )
     client = _ReaderClient(
         snmp={
-            "community": [{"name": "public"}],
-            "v3-user": [],
+            "community": [{"name": _community_export_name("public")}],
+            "v3-user": [{"username": "nms"}],
             "host": [{"address": "198.18.5.10"}],
         }
     )
@@ -1136,7 +1172,44 @@ async def test_run_removal_residue_snmp_three_lists(adapter_client):
 
     job = await _job_after(job_id)
     assert job.result["residue_check"] == "found"
-    assert job.result["residue"] == {"community": [["public"]]}
+    assert job.result["residue"] == {"v3-user": [["nms"]]}  # host 198.18.5.9 really is gone
+
+
+async def test_run_removal_residue_snmp_community_is_never_falsely_clean(adapter_client):
+    """A community that SURVIVES the retract must never be reported clean.
+
+    The check intersected the removed LABELS with the export's SHA-256 fingerprints — empty
+    by construction — so it reported "clean" while the credential was still live on the
+    router: a silent false-clean on a security-relevant removal, on the very check built to
+    surface it. The grain is unverifiable, so say so.
+    """
+    device_id = await _seed_device(nso_device_name="sw3")
+    job_id = await _seed_removal_job(device_id, "snmp", {"removed": {"community": [["ro-community"]]}})
+    # The community is STILL on the device — the export shows its hashed identity.
+    client = _ReaderClient(snmp={"community": [{"name": _community_export_name("s3cr3t")}], "v3-user": [], "host": []})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] != "clean"
+    assert job.result["residue_check"] == "unsupported"  # nothing checkable was checked
+    assert job.result["residue_unverifiable"] == ["community"]
+
+
+async def test_run_removal_residue_snmp_mixed_reports_partial(adapter_client):
+    """A checkable list came back clean but the community could not be checked at all —
+    that is not a clean bill of health for the removal."""
+    device_id = await _seed_device(nso_device_name="sw3")
+    job_id = await _seed_removal_job(
+        device_id, "snmp", {"removed": {"community": [["ro-community"]], "host": [["198.18.5.9"]]}}
+    )
+    client = _ReaderClient(snmp={"community": [], "v3-user": [], "host": [{"address": "198.18.5.10"}]})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] == "partial"
+    assert job.result["residue_unverifiable"] == ["community"]
 
 
 async def test_run_removal_residue_route_policy_per_family_lists(adapter_client):

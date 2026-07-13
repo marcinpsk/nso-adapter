@@ -1148,7 +1148,11 @@ _READER_COMPARE_SPECS: dict[str, list] = {
         ("OspfInterfaceIntent", "interface-config", lambda r: (r.interface_name,)),
     ],
     "snmp": [
-        ("SnmpCommunityIntent", "community", lambda r: (r.label,)),
+        # SnmpCommunityIntent is intentionally absent: its intent key is the human-readable
+        # label while the export keys a community by sha256(community-string)[:16] — a digest
+        # of a secret the adapter never sees (it pushes a Vault triple; NSO resolves it). The
+        # two namespaces can never intersect, so demanding the label be "present" stamped
+        # reader_compare_missing on EVERY successful SNMP apply. See UNCOMPARABLE_LISTS.
         ("SnmpV3UserIntent", "v3-user", lambda r: (r.username,)),
         ("SnmpHostIntent", "host", lambda r: (r.address,)),
     ],

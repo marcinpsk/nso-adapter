@@ -2375,6 +2375,102 @@ async def test_run_apply_reader_compare_ok_when_key_lands(adapter_client):
         break
 
 
+def _community_export_name(secret: str) -> str:
+    """The export's community key: sha256(community string)[:16] — never the intent label."""
+    import hashlib
+
+    return hashlib.sha256(secret.encode()).hexdigest()[:16]
+
+
+async def test_run_apply_reader_compare_does_not_fail_a_landed_community(adapter_client):
+    """A community that DID land must not be re-flagged as a silent writer drop.
+
+    The check keyed SnmpCommunityIntent by `label`, but network-state-export keys a
+    community by sha256(community-string)[:16] — and the adapter never sees that string
+    (it pushes a Vault triple; NSO resolves the secret). The sets could never intersect, so
+    EVERY successful SNMP apply was stamped reader_compare_missing and failed, forever.
+    """
+    from nso_adapter.store.models import SnmpCommunityIntent
+
+    device_id = await _seed_device("rtr-rc-snmp", 404)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            SnmpCommunityIntent(
+                device_id=device_id,
+                label="prod-ro",
+                vault_ref="network/netbox/snmp/community/prod-ro#community",
+                access="ro",
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock(spec=NsoClient)
+    # The community IS on the device — under its hashed export identity.
+    mock_client.get_snmp_config.return_value = {
+        "community": [{"name": _community_export_name("s3cr3t"), "access": "ro"}],
+        "v3-user": [],
+        "host": [],
+    }
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        assert job.result["snmp_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
+        row = (
+            (await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        assert row.last_apply_error is None
+        break
+
+
+async def test_run_apply_reader_compare_still_catches_a_dropped_snmp_host(adapter_client):
+    """Dropping the un-keyable community grain must not blunt the check: the
+    address-keyed host and username-keyed v3-user are still verified."""
+    from nso_adapter.store.models import SnmpHostIntent
+
+    device_id = await _seed_device("rtr-rc-snmp-host", 405)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            SnmpHostIntent(
+                device_id=device_id,
+                address="198.18.5.9",
+                version="2c",
+                notify_type="traps",
+                community_or_user="prod-ro",
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock(spec=NsoClient)
+    mock_client.get_snmp_config.return_value = {"community": [], "v3-user": [], "host": []}  # never landed
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.result["reader_compare"]["snmp"] == "missing"
+        row = (await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))).scalars().one()
+        assert row.last_apply_error["code"] == "reader_compare_missing"
+        break
+
+
 async def test_run_apply_reader_compare_reader_error_is_nonfatal(adapter_client):
     """The check must never fail a good apply: a reader exception records 'error' and
     leaves the scope green (transparency without false alarms)."""
