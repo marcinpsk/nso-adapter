@@ -732,8 +732,16 @@ class SnmpV3User(Base):
 class SnmpHost(Base):
     """Read mirror of SNMP trap/inform receiver entries from NSO oper-data.
 
-    Only non-secret fields: address, version, notify_type, port.
-    Community strings and usernames are never stored.
+    Only non-secret fields: address, version, notify_type, port, and — on a v3 host — the
+    security ``username``.
+
+    A v3 host's user name is NOT a secret: it is the same identity the v3-user list already
+    mirrors, and both host writers KEY the receiver on it (IOS: the community-string leaf;
+    IOS-XR: the third key component). Without it a brownfield v3 trap host can be imported but
+    never pushed back — there is nothing to put in the field (CR-P16).
+
+    A v1/v2c host's corresponding NED field holds the COMMUNITY STRING, which IS a secret; the
+    export never returns it, so it is never stored here either.
     """
 
     __tablename__ = "snmp_host"
@@ -747,6 +755,7 @@ class SnmpHost(Base):
     version: Mapped[str | None] = mapped_column(String(8), nullable=True)  # "1" | "2c" | "3"
     notify_type: Mapped[str | None] = mapped_column(String(16), nullable=True)  # "trap" | "inform"
     port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    username: Mapped[str | None] = mapped_column(String(128), nullable=True)  # v3 hosts only; never a community
     last_refreshed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     refresh_source: Mapped[str] = mapped_column(String(64), nullable=False)
 

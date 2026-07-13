@@ -88,6 +88,7 @@ async def get_snmp_config(device_id: int, db: AsyncSession = Depends(get_db)):
                 "version": h.version,
                 "notify_type": h.notify_type,
                 "port": h.port,
+                "username": h.username,
             }
             for h in hosts
         ],

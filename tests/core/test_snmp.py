@@ -102,6 +102,36 @@ async def test_refresh_inserts_hosts(adapter_client):
         assert h.version == "2c"
         assert h.notify_type == "trap"
         assert h.port == 162
+        assert h.username is None, "a v1/v2c host has no user — its NED field holds the COMMUNITY"
+
+
+@pytest.mark.anyio
+async def test_refresh_stores_a_v3_hosts_SECURITY_USER_NAME(adapter_client):
+    """CR-P16. Without this the v3 host is a dead end: it imports, it displays, and it can never be
+    pushed back — both NSO host writers KEY the receiver on the user name (IOS: the
+    community-string leaf; IOS-XR: the third key component), so the push has nothing to send. The
+    plugin refused it outright rather than pretend, which is right, but the capability was absent.
+
+    The user name is NOT a secret (it is the same identity the v3-user mirror already holds). The
+    COMMUNITY on a v1/v2c host is — and it lives in the very same NED field, which is why the
+    export gates the leaf on version and why the test above asserts the v2c host has none.
+    """
+    device_id = await seed_device(nso_device_name="snmp-v3host-sw01", netbox_device_id=968)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_snmp_config.return_value = {
+            "name": "snmp-v3host-sw01",
+            "host": [
+                {"address": "10.0.1.101", "version": "3", "notify-type": "inform", "user": "netmon-v3"},
+            ],
+        }
+
+        await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
+
+        h = (await db.execute(select(SnmpHost).where(SnmpHost.device_id == device.id))).scalars().one()
+        assert h.username == "netmon-v3"
+        assert h.version == "3"
+        assert h.notify_type == "inform"
 
 
 @pytest.mark.anyio

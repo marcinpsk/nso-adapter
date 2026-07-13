@@ -23,7 +23,9 @@ AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 SNMP_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "communities", "v3_users", "hosts", "system_info"}
 SNMP_COMMUNITY_KEYS = {"community_hash", "access", "acl"}
 SNMP_V3USER_KEYS = {"username", "has_auth_secret", "has_priv_secret"}
-SNMP_HOST_KEYS = {"address", "version", "notify_type", "port"}
+# `username` = the SNMPv3 security user name (v3 hosts only). NOT a secret, and the field both
+# NSO host writers KEY the receiver on — without it a v3 trap host cannot be pushed (CR-P16).
+SNMP_HOST_KEYS = {"address", "version", "notify_type", "port", "username"}
 SNMP_SYSINFO_KEYS = {"location", "contact"}
 LOGGING_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "hosts"}
 LOGGING_HOST_REQUIRED_KEYS = {"address"}

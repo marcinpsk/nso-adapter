@@ -61,6 +61,7 @@ async def _seed_snmp(
                     version=host.get("version"),
                     notify_type=host.get("notify_type"),
                     port=host.get("port"),
+                    username=host.get("username"),
                     last_refreshed_at=ts,
                     refresh_source=refresh_source,
                 )
@@ -159,6 +160,23 @@ async def test_snmp_config_hosts_returned(adapter_client):
     assert host["version"] == "2c"
     assert host["notify_type"] == "trap"
     assert host["port"] == 162
+    assert host["username"] is None  # v1/v2c: the corresponding NED field is the COMMUNITY (secret)
+
+
+@pytest.mark.anyio
+async def test_snmp_config_v3_host_returns_its_SECURITY_USER_NAME(adapter_client):
+    """CR-P16: the plugin cannot push a v3 trap host it cannot see the user name of — both NSO host
+    writers key the receiver on exactly that field.
+    """
+    device_id = await seed_device(nso_device_name="snmp-v3host-dev", netbox_device_id=958)
+    await _seed_snmp(
+        device_id,
+        hosts=[{"address": "10.0.1.101", "version": "3", "notify_type": "inform", "username": "netmon-v3"}],
+    )
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/snmp-config", headers=AUTH)
+    host = resp.json()["hosts"][0]
+    assert host["username"] == "netmon-v3"
+    assert host["version"] == "3"
 
 
 @pytest.mark.anyio

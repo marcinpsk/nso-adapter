@@ -68,6 +68,9 @@ async def _upsert_snmp_config(
                 version=host.get("version") or None,
                 notify_type=host.get("notify-type") or None,
                 port=host.get("port") or None,
+                # v3 hosts only — the export gates it on version, precisely so a v1/v2c host's
+                # community string (the same NED field) can never arrive here (CR-P16).
+                username=host.get("user") or None,
                 last_refreshed_at=now,
                 refresh_source=refresh_source,
             )
