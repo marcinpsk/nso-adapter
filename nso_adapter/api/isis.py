@@ -231,30 +231,40 @@ class IsisInterfaceIntentUpdate(BaseModel):
 
 async def _sync_keyed_intent(
     db, model, device_id: int, *, key_of, entries, now, apply_fields, make_row, state_fields=()
-) -> tuple[int, bool]:
-    """Full-replace a keyed IS-IS intent collection. Returns ``(count, retracted)``.
+) -> tuple[int, bool, bool]:
+    """Full-replace a keyed IS-IS intent collection. Returns ``(count, deleted, cleared)``.
 
     Rows whose key (``key_of``, possibly composite) is absent from *entries* are
     deleted; the rest are upserted — ``make_row`` builds a new identity row,
     ``apply_fields`` writes the mutable fields (incl. accepted_at) on new + existing.
 
-    ``retracted`` is True when this sync drops something the device may still carry —
-    a whole row deleted, OR a retained row whose previously-set *state_fields* scalar
-    is cleared to ``None`` (metric back to blank). A merge-PATCH apply never drops such
-    a leaf, so the caller must enqueue an ``isis`` removal (PUT-replace) to revert it.
-    ``state_fields`` empty ⇒ only deletions count as retractions.
+    Both outcomes drop something the device may still carry, and both need the caller to
+    enqueue an ``isis`` removal (a merge-PATCH apply never drops a leaf) — but they are
+    DIFFERENT operations and the removal must treat them differently:
+
+    ``deleted``  a whole row went away. Absent ?delete_origin this is an UN-OWN — NetBox
+                 stops governing the row — and must not strip its config off the device
+                 (#106: detach, no-networking).
+    ``cleared``  a retained row's previously-set *state_fields* scalar went back to
+                 ``None`` (metric blanked). The row is still owned and accepted, so
+                 nothing is un-owned: this is an explicit operator retraction and MUST
+                 reach the device (#83), even though no NetBox object was deleted and the
+                 push therefore cannot carry ?delete_origin.
+
+    ``state_fields`` empty ⇒ ``cleared`` is always False.
     """
     rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
     existing = {key_of(r): r for r in rows}
     incoming = {key_of(e) for e in entries}
-    retracted = False
+    deleted = False
     for key, row in existing.items():
         if key not in incoming:
             await db.delete(row)
-            retracted = True
+            deleted = True
     await db.flush()
 
     count = 0
+    cleared = False
     for entry in entries:
         accepted = entry.accepted_at.replace(tzinfo=None) if entry.accepted_at else now
         row = existing.get(key_of(entry))
@@ -264,9 +274,9 @@ async def _sync_keyed_intent(
             db.add(row)
         apply_fields(row, entry, accepted)
         if before is not None and any(before[f] is not None and getattr(row, f) is None for f in state_fields):
-            retracted = True
+            cleared = True
         count += 1
-    return count, retracted
+    return count, deleted, cleared
 
 
 def _apply_isis_interface_fields(row: IsisInterfaceIntent, e: IsisInterfaceEntry, accepted: datetime) -> None:
@@ -310,12 +320,18 @@ def _iter_isis_redistribution(processes: list[IsisProcessEntry]):
             yield dest_ref, entry
 
 
-async def _sync_isis_redistribution(db, device_id: int, processes: list[IsisProcessEntry], now: datetime) -> bool:
+async def _sync_isis_redistribution(
+    db, device_id: int, processes: list[IsisProcessEntry], now: datetime
+) -> tuple[bool, bool]:
     """Full-replace IS-IS (dest_protocol=isis) redistribution intent rows for this device.
 
-    Returns True if this sync retracts something (a redistribution row deleted, or a
-    retained row's ``route_map``/``metric``/``metric_type`` cleared to ``None``) — a
-    merge-PATCH apply cannot drop it, so the caller enqueues an ``isis`` removal.
+    Returns ``(deleted, cleared)`` — a redistribution row dropped, and a retained row's
+    ``route_map``/``metric``/``metric_type`` cleared to ``None``. A merge-PATCH apply can
+    drop neither, so either makes the caller enqueue an ``isis`` removal; they are kept
+    apart because only the second may reach the device without ?delete_origin (see
+    :func:`_sync_keyed_intent`). Redistribute rows are nested, non-guarded content, so a
+    dropped one never shows up in the removal's ``removed`` keys — the caller must thread
+    ``deleted`` through explicitly.
     """
     existing = (
         (
@@ -334,12 +350,13 @@ async def _sync_isis_redistribution(db, device_id: int, processes: list[IsisProc
         (dest_ref, e.source_protocol, e.source_ref) for dest_ref, e in _iter_isis_redistribution(processes)
     }
 
-    retracted = False
+    deleted = False
     for key in list(existing_map):
         if key not in incoming_keys:
             await db.delete(existing_map[key])
-            retracted = True
+            deleted = True
 
+    cleared = False
     for dest_ref, entry in _iter_isis_redistribution(processes):
         key = (dest_ref, entry.source_protocol, entry.source_ref)
         row = existing_map.get(key)
@@ -360,11 +377,11 @@ async def _sync_isis_redistribution(db, device_id: int, processes: list[IsisProc
                 (row.metric_type, entry.metric_type),
             ):
                 if old is not None and new is None:
-                    retracted = True
+                    cleared = True
         row.route_map = entry.route_map
         row.metric = entry.metric
         row.metric_type = entry.metric_type
-    return retracted
+    return deleted, cleared
 
 
 async def _maybe_enqueue_isis_apply(db, device_id: int, iface_count: int, proc_count: int) -> None:
@@ -410,7 +427,7 @@ async def put_isis_interface_intent(
         for r in (await db.execute(select(IsisProcessIntent).where(IsisProcessIntent.device_id == device_id))).scalars()
     }
 
-    iface_count, iface_retracted = await _sync_keyed_intent(
+    iface_count, iface_deleted, iface_cleared = await _sync_keyed_intent(
         db,
         IsisInterfaceIntent,
         device_id,
@@ -421,7 +438,7 @@ async def put_isis_interface_intent(
         make_row=lambda e: IsisInterfaceIntent(device_id=device_id, interface_name=e.interface_name, af=e.af),
         state_fields=("circuit_type", "network_type", "metric", "bfd_enabled", "frr_enabled", "frr_protection"),
     )
-    proc_count, proc_retracted = await _sync_keyed_intent(
+    proc_count, proc_deleted, proc_cleared = await _sync_keyed_intent(
         db,
         IsisProcessIntent,
         device_id,
@@ -456,7 +473,7 @@ async def put_isis_interface_intent(
         for p in body.processes
         for lv in p.levels
     ]
-    _, level_retracted = await _sync_keyed_intent(
+    _, level_deleted, level_cleared = await _sync_keyed_intent(
         db,
         IsisLevelIntent,
         device_id,
@@ -467,14 +484,24 @@ async def put_isis_interface_intent(
         make_row=lambda e: IsisLevelIntent(device_id=device_id, process_tag=e.process_tag, level=e.level),
         state_fields=("wide_metrics_only", "labeled_preference", "disabled"),
     )
-    redist_retracted = await _sync_isis_redistribution(db, device_id, body.processes, now)
+    redist_deleted, redist_cleared = await _sync_isis_redistribution(db, device_id, body.processes, now)
     await _maybe_enqueue_isis_apply(db, device_id, iface_count, proc_count)
 
     # A merge-PATCH apply never drops a cleared/deleted leaf, so retracting owned IS-IS
-    # intent (metric back to blank, an interface un-accepted) needs a PUT-replace. Queue
-    # the async ``isis`` removal job — it re-asserts the full remaining accepted snapshot
-    # so FASTMAP reverts what was dropped, while un-owned brownfield stays (reconcile).
-    if iface_retracted or proc_retracted or level_retracted or redist_retracted:
+    # intent needs a PUT-replace. Queue the async ``isis`` removal job — it re-asserts the
+    # full remaining accepted snapshot so FASTMAP reverts what was dropped.
+    #
+    # The two causes are NOT the same operation and the job must tell them apart:
+    #   deleted — a row went away. Absent ?delete_origin that is an UN-OWN and must not
+    #             strip the row's config off the device (#106 → detach).
+    #   cleared — a retained, still-owned row's scalar was blanked (metric back to none).
+    #             Nothing is un-owned, so this MUST reach the device (#83) even though no
+    #             NetBox object was deleted and the push cannot carry ?delete_origin.
+    # Conflating them is what let detach-by-default silently kill the cleared-scalar
+    # retract: the device kept the old value forever while the operator saw it as removed.
+    deleted = iface_deleted or proc_deleted or level_deleted or redist_deleted
+    cleared = iface_cleared or proc_cleared or level_cleared or redist_cleared
+    if deleted or cleared:
         from nso_adapter.core.removal import enqueue_removal
 
         removed_ifaces = sorted(pre_iface_keys - {(e.interface_name, e.af) for e in body.interfaces})
@@ -484,6 +511,8 @@ async def put_isis_interface_intent(
             device_id,
             "isis",
             removed={"interface-config": removed_ifaces, "process-config": removed_procs},
+            retract=cleared,
+            shrank=deleted,
         )
 
     await db.commit()

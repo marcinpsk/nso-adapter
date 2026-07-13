@@ -647,6 +647,8 @@ async def enqueue_removal(
     interfaces: list[str] | None = None,
     removed: dict[str, list] | None = None,
     force: bool = False,
+    retract: bool = False,
+    shrank: bool = False,
 ):
     """Queue an async ``removal`` job that PUT-replaces *scope*'s service.
 
@@ -656,6 +658,17 @@ async def enqueue_removal(
     *removed* maps each YANG list to the keys the trigger JUST deleted so the
     collateral guard can tell an intended retraction from an orphaned service row;
     *force* skips the guard (the operator override after reviewing a blocked removal).
+
+    *retract* marks a removal whose cause is a CLEARED OWNED SCALAR (a metric blanked
+    back to none, #83) rather than a shrink. The row stays owned and accepted — only a
+    leaf was blanked — so nothing is being un-owned and the replace must actually reach
+    the device, even though no NetBox object was deleted and the push therefore cannot
+    carry ?delete_origin. Without this, #106's detach-by-default committed it
+    ``no-networking`` and the device kept the old value forever.
+
+    *shrank* says whole rows were dropped by the same push. It is distinct from *removed*
+    because a scope's dropped rows may be non-guarded nested content (IS-IS/OSPF
+    redistribute) that never appears there — and an un-own must still detach.
 
     Returns ``None`` without queueing anything on a store-only request (the plugin's
     intent re-sync, tracker #103): a store shrink then reconciles the intent mirror
@@ -680,13 +693,23 @@ async def enqueue_removal(
             for label, keys in removed.items()
             if keys
         }
+    # An un-own rode along with the clear in the same push: ONE PUT-replace cannot honour
+    # both. Networking it would strip the un-owned row's config off the device (the #106
+    # damage); not networking it leaves the cleared leaf. Safety wins — but the deferred
+    # retract is recorded, never silently dropped (intent-integrity). The next push that
+    # carries no un-own retracts it.
+    un_own = (shrank or bool(context.get("removed"))) and not DELETE_ORIGIN.get()
+    if retract and un_own:
+        context["retract_deferred"] = True
+        logger.warning("removal.retract_deferred", device_id=device_id, scope=scope)
     if force:
         context["force"] = True
-    elif not DELETE_ORIGIN.get():
+    elif not DELETE_ORIGIN.get() and not (retract and not un_own):
         # Unmarked shrink = un-own ("NetBox stops governing"), NOT an object deletion:
         # detach — drop service governance without touching the device (#106). Only a
-        # push the plugin marked ?delete_origin=true (a NetBox object DELETE) or the
-        # operator's force-removal may retract config from the live device.
+        # push the plugin marked ?delete_origin=true (a NetBox object DELETE), a cleared
+        # owned scalar (#83, above) or the operator's force-removal may retract config
+        # from the live device.
         context["detach"] = True
     job = Job(
         job_type=JobType.removal,

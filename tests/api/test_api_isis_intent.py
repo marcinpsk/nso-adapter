@@ -562,6 +562,116 @@ async def test_clearing_bfd_enabled_enqueues_isis_removal(adapter_client):
     assert len(await _isis_removal_jobs(device_id)) == 1
 
 
+# ── #83 (retract cleared owned scalars) vs #106 (un-own detaches) ────────────
+#
+# Both produce an "isis" removal job, but they are DIFFERENT operations and the
+# detach-by-default of #106 silently killed the first: a cleared scalar is not a NetBox
+# object deletion, so the plugin cannot legitimately stamp ?delete_origin=true, the job
+# detached, the replace committed with no-networking — and the device kept the old metric
+# forever. Asserting only "a job was enqueued" (as the two tests above did) stays green
+# while the feature is dead; these assert what the job actually DOES.
+
+
+@pytest.mark.anyio
+async def test_clearing_an_owned_scalar_retracts_for_real(adapter_client):
+    """A cleared owned scalar must REACH the device: the row is still owned and accepted —
+    only the leaf was blanked — so nothing is being un-owned and the job must not detach."""
+    device_id = await seed_device(nso_device_name="isis-clear-retract", netbox_device_id=994)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False, "metric": 10}]},
+    )
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False}]},  # metric cleared
+    )
+    assert resp.status_code == 200
+
+    jobs = await _isis_removal_jobs(device_id)
+    assert len(jobs) == 1
+    assert jobs[0].context.get("detach") is None  # a real, networking replace
+    assert not jobs[0].context.get("removed")  # nothing was un-owned
+
+
+@pytest.mark.anyio
+async def test_unmarked_row_removal_still_detaches(adapter_client):
+    """The #106 contract stands: dropping a whole row without ?delete_origin is an un-own —
+    NetBox stops governing it — and must NOT strip its config off the live device."""
+    device_id = await seed_device(nso_device_name="isis-unown-detach", netbox_device_id=995)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={
+            "interfaces": [
+                {"interface_name": "Gi0/0", "af": "ipv4", "passive": False, "metric": 10},
+                {"interface_name": "Gi0/1", "af": "ipv4", "passive": False, "metric": 20},
+            ]
+        },
+    )
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False, "metric": 10}]},
+    )
+    assert resp.status_code == 200
+
+    jobs = await _isis_removal_jobs(device_id)
+    assert len(jobs) == 1
+    assert jobs[0].context["detach"] is True
+    assert jobs[0].context["removed"]["interface-config"] == [["Gi0/1", "ipv4"]]
+
+
+@pytest.mark.anyio
+async def test_unown_riding_along_with_a_clear_defers_the_retract(adapter_client):
+    """An un-own and a cleared scalar in ONE push cannot both be honoured: the same
+    PUT-replace either networks (retracting the un-owned row's config off the device — the
+    #106 damage) or does not (leaving the cleared leaf). Safety wins — detach — but the
+    deferral is recorded rather than silently dropped."""
+    device_id = await seed_device(nso_device_name="isis-mixed", netbox_device_id=996)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={
+            "interfaces": [
+                {"interface_name": "Gi0/0", "af": "ipv4", "passive": False, "metric": 10},
+                {"interface_name": "Gi0/1", "af": "ipv4", "passive": False, "metric": 20},
+            ]
+        },
+    )
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        # Gi0/1 un-owned AND Gi0/0's metric cleared, in the same push
+        json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False}]},
+    )
+    assert resp.status_code == 200
+
+    jobs = await _isis_removal_jobs(device_id)
+    assert len(jobs) == 1
+    assert jobs[0].context["detach"] is True  # the un-own's safety wins …
+    assert jobs[0].context["retract_deferred"] is True  # … and the clear is NOT silently dropped
+
+
+@pytest.mark.anyio
+async def test_clearing_a_scalar_under_store_only_touches_nothing(adapter_client):
+    """A cleared scalar re-pushed by the store-only re-sync must still not queue a job."""
+    device_id = await seed_device(nso_device_name="isis-clear-so", netbox_device_id=997)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        headers=AUTH,
+        json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False, "metric": 10}]},
+    )
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent?store_only=true",
+        headers=AUTH,
+        json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False}]},
+    )
+    assert resp.status_code == 200
+    assert await _isis_removal_jobs(device_id) == []
+
+
 @pytest.mark.anyio
 async def test_put_isis_intent_stores_frr(adapter_client):
     """#83: interface frr_enabled/frr_protection and process fast_reroute/
