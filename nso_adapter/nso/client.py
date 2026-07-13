@@ -15,6 +15,16 @@ from nso_adapter.nso.neds import extract_ned_component as _extract_ned_component
 logger = structlog.get_logger(__name__)
 
 
+class NsoExportUnavailableError(RuntimeError):
+    """The network-state-export oper-data is not reachable — a READ FAILURE, not an empty device.
+
+    Raised instead of returning None where the caller would otherwise treat the absence of data as
+    "the operator removed this config" and DELETE the mirrored rows. The two are different facts,
+    and conflating them is how a transient NSO blip wipes accepted state (see the route-policy
+    reader's RoutePolicyReadError for the other half of this contract).
+    """
+
+
 def _url_key(value: str) -> str:
     """Percent-encode a value for use as a RESTCONF list-key URL path segment (RFC 8040).
 
@@ -422,13 +432,32 @@ class NsoClient:
     async def get_route_policy(self, device_name: str) -> dict | None:
         """Return the route-policy entry for *device_name* from the NSO package oper-data.
 
-        Returns None if the device has no route-policy config (404 or empty).
+        Returns None ONLY when the export is healthy and this device genuinely carries no
+        route-policy — the caller (`refresh_route_policy_for_device`) DELETES every mirrored row
+        on that None, so it must never stand in for "we could not read".
+
+        A bare 404 cannot carry that meaning on its own: it is equally what NSO returns when the
+        `network-state-export` package is not loaded, is mid-`packages reload`, or its callpoint is
+        erroring — in which case EVERY device 404s at once and the caller would wipe the mirrored
+        route-policy for the entire fleet. So a 404 is confirmed against the parent container
+        before it is believed: container reachable → this device really is absent → None (delete is
+        correct); container unreachable → raise, and the caller's degraded path leaves the rows
+        alone. The extra GET only ever runs on the 404 path.
+
         Raises httpx.HTTPStatusError on other errors.
         """
-        url = f"{self._base}/restconf/data/network-state-export:route-policy/device={_url_key(device_name)}"
+        base = f"{self._base}/restconf/data/network-state-export:route-policy"
         async with self._client() as c:
-            resp = await c.get(url)
+            resp = await c.get(f"{base}/device={_url_key(device_name)}")
             if resp.status_code == 404:
+                probe = await c.get(base)
+                if probe.status_code == 404:
+                    raise NsoExportUnavailableError(
+                        "network-state-export:route-policy is not exported by NSO — refusing to "
+                        f"read {device_name!r}'s 404 as 'this device has no route-policy'. Treating "
+                        "it that way would DELETE the mirrored rows for every device at once."
+                    )
+                probe.raise_for_status()
                 return None
             resp.raise_for_status()
             data = resp.json()

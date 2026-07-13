@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from nso_adapter.config import NsoInstanceConfig
-from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
 
 
 def _make_cfg(base_url: str = "http://nso:8080", ca_cert=None, host_header=None):
@@ -419,11 +419,84 @@ async def test_device_oper_getter_returns_entry_and_targets_resource(method, res
     assert f"network-state-export:{resource}/device=sw01" in transport.url
 
 
-@pytest.mark.parametrize(("method", "resource"), _DEVICE_OPER_METHODS)
+@pytest.mark.parametrize(
+    ("method", "resource"),
+    [(m, r) for m, r in _DEVICE_OPER_METHODS if m != "get_route_policy"],
+)
 async def test_device_oper_getter_returns_none_on_404(method, resource):
     client = _make_client()
     _capture(client, 404, {"error": "not found"})
     assert await getattr(client, method)("sw01") is None
+
+
+# ── get_route_policy: a 404 is confirmed before it is believed ────────────────────────────────
+#
+# `refresh_route_policy_for_device` DELETES every mirrored route-policy row for a device when this
+# returns None — it is the only refresher in the adapter that deletes on a None read. So None has to
+# mean "the export is healthy and this device genuinely has no route-policy", and nothing else.
+#
+# A bare 404 cannot carry that meaning: it is equally what NSO returns when network-state-export is
+# not loaded, is mid-`packages reload`, or its callpoint is erroring — in which case EVERY device
+# 404s at once and the fleet's mirrored policy is wiped in one pass, reported as a successful
+# refresh. This is the adapter half of RP-F8; the NSO half is RoutePolicyReadError.
+
+
+class _PathAwareTransport(httpx.AsyncBaseTransport):
+    """Answers the device GET and the parent-container probe with independent statuses."""
+
+    def __init__(self, device_status: int, container_status: int):
+        self._device_status = device_status
+        self._container_status = container_status
+        self.urls: list[str] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.urls.append(str(request.url))
+        is_probe = "/device=" not in str(request.url)
+        status = self._container_status if is_probe else self._device_status
+        return httpx.Response(
+            status,
+            content=json.dumps({"network-state-export:device": []}).encode(),
+            headers={"content-type": "application/yang-data+json"},
+            request=request,
+        )
+
+
+def _path_aware(client: NsoClient, device_status: int, container_status: int):
+    transport = _PathAwareTransport(device_status, container_status)
+    client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url="http://nso:8080")
+    return transport
+
+
+async def test_route_policy_404_with_a_healthy_container_is_a_genuinely_empty_device():
+    """The export is up and this device simply isn't in it — clearing the rows is CORRECT."""
+    client = _make_client()
+    transport = _path_aware(client, device_status=404, container_status=200)
+    assert await client.get_route_policy("sw01") is None
+    assert len(transport.urls) == 2, "the 404 must be confirmed against the parent container"
+
+
+async def test_route_policy_404_from_a_MISSING_EXPORT_raises_instead_of_returning_none():
+    """network-state-export is not exported at all → every device 404s → this would wipe the fleet."""
+    client = _make_client()
+    _path_aware(client, device_status=404, container_status=404)
+    with pytest.raises(NsoExportUnavailableError, match="not exported"):
+        await client.get_route_policy("sw01")
+
+
+async def test_route_policy_404_with_a_broken_container_raises_the_http_error():
+    """A 500 on the probe is a failure too — never silently a delete."""
+    client = _make_client()
+    _path_aware(client, device_status=404, container_status=500)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.get_route_policy("sw01")
+
+
+async def test_route_policy_happy_path_does_not_probe():
+    """The extra GET only ever runs on the 404 path."""
+    client = _make_client()
+    transport = _capture(client, 200, {"network-state-export:device": [{"device-name": "sw01"}]})
+    assert await client.get_route_policy("sw01") == {"device-name": "sw01"}
+    assert "/device=sw01" in transport.url
 
 
 @pytest.mark.parametrize(("method", "resource"), _DEVICE_OPER_METHODS)
