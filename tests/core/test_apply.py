@@ -1173,6 +1173,82 @@ async def test_run_apply_scope_unexpected_exception(adapter_client):
         break
 
 
+# The IS-IS sub-collections (process/level/flex) are eligible on their OWN — a per-level
+# knob can be the only accepted row on a device whose interfaces are already in sync. They
+# were missing from run_apply's `any_eligible`, so the isis scope still PUSHED (its _Scope
+# rows list includes them) while _finalize_job took the "nothing eligible" early-return:
+# an all-zero SUCCESS for a commit the device had rejected, which the plugin then settled
+# deploying -> in_sync. These lock each sub-collection as independently apply-worthy.
+_ISIS_SUBSCOPE_CASES = [
+    ("IsisProcessIntent", dict(process_tag="1", net="49.0001.0000.0000.0001.00")),
+    ("IsisLevelIntent", dict(process_tag="1", level=2, wide_metrics_only=True)),
+    ("IsisFlexAlgoIntent", dict(process_tag="1", algo_id=128)),
+]
+
+
+@pytest.mark.parametrize("model_name, kwargs", _ISIS_SUBSCOPE_CASES)
+async def test_run_apply_isis_subscope_failure_fails_the_job(adapter_client, model_name, kwargs):
+    """An IS-IS process/level/flex row is the ONLY eligible intent and the device rejects it.
+
+    The job must FAIL. Before the fix it reported succeeded with all-zero counts.
+    """
+    from nso_adapter.nso.apply import NsoApplyError
+    from nso_adapter.store import models as m
+
+    device_id = await _seed_device(f"rtr-isis-sub-{model_name.lower()}", 330)
+    job_id = await _seed_apply_job(device_id)
+    model = getattr(m, model_name)
+    async for db in get_session():
+        db.add(model(device_id=device_id, accepted_at=datetime.utcnow(), **kwargs))
+        await db.commit()
+        break
+
+    nso_err = NsoApplyError(code="nso_error", message="level rejected", detail={})
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=AsyncMock()),
+        patch("nso_adapter.nso.apply.apply_isis_interfaces", new_callable=AsyncMock, side_effect=nso_err),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.result["isis_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
+        assert job.error["code"] == "nso_commit_failed"
+        rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
+        assert rows[0].last_apply_error["message"] == "level rejected"
+        break
+
+
+@pytest.mark.parametrize("model_name, kwargs", _ISIS_SUBSCOPE_CASES)
+async def test_run_apply_isis_subscope_success_is_counted(adapter_client, model_name, kwargs):
+    """The same row applying cleanly must be COUNTED in_sync, not reported as nothing-eligible."""
+    from nso_adapter.store import models as m
+
+    device_id = await _seed_device(f"rtr-isis-sub-ok-{model_name.lower()}", 331)
+    job_id = await _seed_apply_job(device_id)
+    model = getattr(m, model_name)
+    async for db in get_session():
+        db.add(model(device_id=device_id, accepted_at=datetime.utcnow(), **kwargs))
+        await db.commit()
+        break
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=AsyncMock()),
+        patch("nso_adapter.nso.apply.apply_isis_interfaces", new_callable=AsyncMock) as mock_apply,
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    mock_apply.assert_awaited_once()
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        assert job.result["isis_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
+        rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
+        assert rows[0].last_apply_at is not None
+        break
+
+
 async def test_run_apply_isis_applies_process_redist_and_flexalgo(adapter_client):
     """The IS-IS pass stamps interface + process + redistribute + flex-algo rows together."""
     from nso_adapter.store.models import (

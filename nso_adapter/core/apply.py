@@ -1442,6 +1442,12 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     job.context = {"force": force, "intent_snapshot": intent_snapshot, "ip_snapshot": ip_snapshot}
     now = datetime.now(UTC).replace(tzinfo=None)
 
+    # EVERY collection the scope table below can push must be listed here. The IS-IS
+    # sub-collections are eligible on their own (a per-level knob accepted on a device
+    # whose interfaces are already in sync): when they were missing, the isis scope still
+    # pushed — its _Scope rows list includes them — while _finalize_job took the "nothing
+    # eligible" early-return and reported an all-zero SUCCESS for a commit the device had
+    # rejected, which the plugin then settled deploying -> in_sync.
     any_eligible = any(
         [
             attr_eligible,
@@ -1456,6 +1462,9 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             mtu_eligible,
             l2_eligible,
             isis_eligible,
+            isis_process_eligible,
+            isis_flex_eligible,
+            isis_level_eligible,
             bgp_eligible,
             rp_eligible,
             ospf_instance_eligible,
