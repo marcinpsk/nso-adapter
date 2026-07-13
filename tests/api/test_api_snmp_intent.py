@@ -66,6 +66,64 @@ async def _read_intent(device_id: int):
     raise RuntimeError("no session")
 
 
+# ── boundary validation: a ref/enum the writer can never render is rejected HERE ──
+#
+# apply_snmp_config hard-fails any vault_ref that is not mount/path#key and any enum
+# spelling it cannot map. Both fields were unvalidated `str`, so the PUT returned 200 and
+# the bad value sat in the store failing EVERY apply forever — and with atomic apply on,
+# taking the whole job (interfaces, IPs, BGP, IS-IS) down with it. The apply-diff preview
+# swallowed the error too, so the operator got no warning before hitting Apply. Reject at
+# the boundary: the store must never hold intent the writer cannot render.
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "bad_ref",
+    [
+        "snmp/ro",  # no '#key' — the mandatory vault triple cannot be built
+        "no-mount#community",  # no '/' — mount cannot be determined
+        "snmp/ro#a#b",  # more than one '#'
+        "snmp/ro#",  # empty key after '#'
+        "snmp/ ro#community",  # whitespace
+    ],
+)
+async def test_put_rejects_a_community_vault_ref_the_writer_cannot_render(adapter_client, bad_ref):
+    device_id = await seed_device(nso_device_name=f"snmp-badref-{abs(hash(bad_ref)) % 9999}", netbox_device_id=970)
+    body = _full_body()
+    body["communities"] = [{"label": "ro1", "vault_ref": bad_ref, "access": "RO"}]
+
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH)
+
+    assert resp.status_code == 422
+    comms, _, _, _ = await _read_intent(device_id)
+    assert comms == []  # nothing was stored
+
+
+@pytest.mark.anyio
+async def test_put_rejects_an_unmappable_host_version(adapter_client):
+    device_id = await seed_device(nso_device_name="snmp-badver", netbox_device_id=971)
+    body = _full_body()
+    body["hosts"] = [{"address": "10.0.1.100", "version": "9", "notify_type": "trap", "community_or_user": "ro1"}]
+
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH)
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_put_accepts_the_bare_2_version_spelling(adapter_client):
+    """ "2" is a legitimate v2c spelling — the writer maps it, so the API must take it."""
+    device_id = await seed_device(nso_device_name="snmp-ver2", netbox_device_id=972)
+    body = _full_body()
+    body["hosts"] = [{"address": "10.0.1.100", "version": "2", "notify_type": "trap", "community_or_user": "ro1"}]
+
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH)
+
+    assert resp.status_code == 200
+    _, _, hosts, _ = await _read_intent(device_id)
+    assert hosts[0].version == "2"
+
+
 # ── happy path ──────────────────────────────────────────────────────────────
 
 

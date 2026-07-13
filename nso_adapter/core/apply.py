@@ -229,11 +229,19 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
         return [r for r in rows if getattr(r, "accepted_at", None) is not None]
 
     async def _record(scope: str, coro) -> None:
-        """Run one scope's dry-run; store a non-empty delta. Never raise."""
+        """Run one scope's dry-run; store a non-empty delta. Never raise.
+
+        A scope that blows up is reported IN the preview rather than silently omitted: the
+        operator approves the apply from this panel, and an empty entry reads as "nothing to
+        do". A body-builder error (a vault_ref the writer cannot render, an unmappable enum)
+        is exactly what will fail the real apply, so it must be visible here first.
+        """
         try:
             delta = await coro
         except Exception as exc:  # noqa: BLE001 — preview must never fail hard
             logger.warning("apply_diff.scope_failed", scope=scope, device=device_name, error=repr(exc))
+            reason = getattr(exc, "message", None) or repr(exc)
+            diffs[scope] = f"!! preview unavailable for this scope: {reason}"
             return
         if delta and delta.strip():
             diffs[scope] = delta
@@ -848,12 +856,16 @@ async def _clear_atomic_capability(db, device, modules) -> None:
     await clear_capability_rejections(db, ned_id, sw, scopes)
 
 
-async def _stage_atomic_modules(elig, client, device, device_name) -> tuple[dict, list, dict]:
+async def _stage_atomic_modules(elig, client, device, device_name) -> tuple[dict, list, dict, dict]:
     """Build the combined ``/restconf/data`` body across every scope.
 
-    Returns ``(modules, iface_entries, scope_rows)``. Each scope stages its body via
-    ``stage=modules`` (reusing its own body-builder, no HTTP); the interface-config module
-    merges attribute + IP intent per interface.
+    Returns ``(modules, iface_entries, scope_rows, stage_errors)``. Each scope stages its
+    body via ``stage=modules`` (reusing its own body-builder, no HTTP); the interface-config
+    module merges attribute + IP intent per interface.
+
+    A scope whose body cannot be BUILT (a malformed vault_ref, an unmappable enum) is
+    isolated into *stage_errors* rather than raising: the fault is deterministic and local
+    to that scope, so the rest of the apply still commits.
     """
     from nso_adapter.nso.apply import (
         apply_bfd_config,
@@ -939,10 +951,22 @@ async def _stage_atomic_modules(elig, client, device, device_name) -> tuple[dict
         ),
     ]
     scope_rows = {key: rows for key, rows, _fn in stagers}
-    for _key, rows, stage_fn in stagers:
-        if rows:
+    stage_errors: dict[str, NsoApplyError] = {}
+    for key, rows, stage_fn in stagers:
+        if not rows:
+            continue
+        try:
             await stage_fn()
-    return modules, iface_entries, scope_rows
+        except NsoApplyError as exc:
+            # This scope's BODY could not be built — a vault_ref that predates the
+            # mount/path#key contract, an enum spelling the writer cannot map. Deterministic
+            # and local to the scope: nothing was staged into `modules` (each builder
+            # assembles its entry locally and only stages it at the very end), so drop the
+            # offender and let the healthy scopes commit. Letting the raise escape failed the
+            # ENTIRE job — interfaces, IPs, BGP, IS-IS — for one bad SNMP row.
+            logger.error("apply.atomic_stage_failed", device=device_name, scope=key, error=exc.message)
+            stage_errors[key] = exc
+    return modules, iface_entries, scope_rows, stage_errors
 
 
 def _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot) -> tuple[int, int, list]:
@@ -1051,15 +1075,22 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
     await db.commit()
 
     try:
-        modules, iface_entries, scope_rows = await _stage_atomic_modules(elig, client, device, device_name)
+        modules, iface_entries, scope_rows, stage_errors = await _stage_atomic_modules(
+            elig, client, device, device_name
+        )
     except Exception:
-        # A body-builder raised while building the combined body (before any commit). Revert
-        # the attrs we just marked 'deploying' so they aren't stuck forever, then re-raise so
+        # An UNEXPECTED error while building the combined body (before any commit) — a real
+        # bug, not a scope's own bad intent, which _stage_atomic_modules isolates. Revert the
+        # attrs we just marked 'deploying' so they aren't stuck forever, then re-raise so
         # run_apply fails the job with the real error.
         for attr_state, _ir, _if in attr_eligible:
             attr_state.sync_state = snapshot[attr_state]
         await db.commit()
         raise
+
+    # Scopes whose body could not be built never entered the transaction; the rest still
+    # commit. Keep them out of every stage that assumes a scope was pushed.
+    staged_rows = {k: v for k, v in scope_rows.items() if k not in stage_errors}
 
     commit_error: NsoApplyError | None = None
     try:
@@ -1103,14 +1134,25 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
     iface_failed = (_IFACE_CONFIG_ROOT in offenders) if iface_entries else False
     attr_outcome = _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot)
     ip_outcome = _stamp_ip_atomic(ip_rows_flat, commit_error, iface_failed, err, msg, now)
-    scope_outcomes, scope_failures = _stamp_batch_scopes_atomic(scope_rows, offenders, commit_error, err, msg, now)
+    scope_outcomes, scope_failures = _stamp_batch_scopes_atomic(staged_rows, offenders, commit_error, err, msg, now)
+
+    # A scope whose body could not be built failed on its own terms — it never reached the
+    # device, so the commit outcome says nothing about it. Fail exactly its rows.
+    for scope_key, stage_exc in stage_errors.items():
+        rows = scope_rows.get(scope_key) or []
+        stage_err = {"code": stage_exc.code, "message": stage_exc.message, "detail": stage_exc.detail}
+        for row in rows:
+            row.last_apply_error = stage_err
+        scope_outcomes[scope_key] = (0, len(rows))
+        scope_failures[scope_key] = [{"error": stage_exc.message}]
 
     # #108: a clean atomic commit rides the same FASTMAP writers — run the post-apply
-    # presence check per staged scope and re-flag any silently-dropped keys.
+    # presence check per staged scope and re-flag any silently-dropped keys. Unstaged
+    # scopes are excluded: they were never pushed, so "not on the device" is not a drop.
     reader_compare: dict[str, str] = {}
     if commit_error is None:
         reader_compare = await _atomic_reader_compare(
-            client, device, scope_rows, scope_outcomes, scope_failures, job_id=job_id, device_name=device_name
+            client, device, staged_rows, scope_outcomes, scope_failures, job_id=job_id, device_name=device_name
         )
 
     await _finalize_job(

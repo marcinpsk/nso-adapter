@@ -486,7 +486,12 @@ async def test_collect_apply_diff_covers_every_scope(adapter_client):
 
 
 async def test_collect_apply_diff_scope_failure_is_isolated(adapter_client):
-    """A scope whose dry-run raises is logged and skipped; other scopes still report."""
+    """A scope whose dry-run raises must not block the others — but must not vanish either.
+
+    The operator approves the apply FROM this panel, and an omitted scope reads as "nothing
+    to do". A body-builder error (a vault_ref the writer cannot render, an unmappable enum)
+    is precisely what will fail the real apply, so it has to be visible here first.
+    """
     from nso_adapter.core.apply import collect_apply_diff
     from nso_adapter.store.models import OspfInstanceIntent, StaticRouteIntent
 
@@ -514,8 +519,10 @@ async def test_collect_apply_diff_scope_failure_is_isolated(adapter_client):
         async for db in get_session():
             diffs = await collect_apply_diff(db, device_id)
             break
-    # ospf raised → omitted; static_route still present
-    assert diffs == {"static_route": "STATIC DELTA"}
+    # static_route still previews normally; ospf's failure is REPORTED, not swallowed
+    assert diffs["static_route"] == "STATIC DELTA"
+    assert "dry-run boom" in diffs["ospf"]
+    assert diffs["ospf"].startswith("!! preview unavailable")
 
 
 async def test_collect_apply_diff_interface_scope_failures_and_skips(adapter_client):
@@ -1697,6 +1704,66 @@ async def test_run_apply_atomic_stages_all_scopes_in_one_commit(adapter_client, 
     } <= set(modules)
     async for db in get_session():
         assert (await db.get(Job, job_id)).status == JobStatus.succeeded
+        break
+
+
+@pytest.mark.asyncio
+async def test_run_apply_atomic_unrenderable_scope_does_not_take_down_the_job(adapter_client, monkeypatch):
+    """A scope whose BODY cannot be built must fail alone — not the entire apply.
+
+    A legacy SnmpCommunityIntent whose vault_ref predates the mount/path#key contract makes
+    apply_snmp_config raise while _stage_atomic_modules is assembling the combined body.
+    That raise propagated out of _run_atomic_apply and failed the WHOLE job: interfaces,
+    IPs, BGP, IS-IS — every scope, none of which had anything wrong with it. Isolate the
+    offender: stamp its rows, drop it from the transaction, and commit the rest.
+    """
+    from nso_adapter.store.models import SnmpCommunityIntent, StaticRouteIntent
+
+    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+    device_id = await _seed_device(name="sw01-legacy")
+    await _seed_snmp_and_static_route(device_id)
+    async for db in get_session():
+        row = (
+            (await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        row.vault_ref = "network/netbox/snmp/legacy"  # pre-#121: no '#key'
+        await db.commit()
+        break
+    job_id = await _seed_apply_job(device_id)
+
+    mock_client = AsyncMock()
+    combined = AsyncMock(return_value=None)
+    with ExitStack() as stack:
+        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
+        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", combined))
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    # The healthy scopes still committed, without the offender's module.
+    combined.assert_awaited_once()
+    modules = combined.await_args.args[2]
+    assert "static-route-reconciler:static-route-config" in modules
+    assert "snmp-reconciler:snmp-config" not in modules
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed  # the snmp scope really did fail
+        assert job.result["snmp_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
+        assert job.result["static_route_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
+        comm = (
+            (await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        assert comm.last_apply_error["code"] == "invalid_vault_ref"
+        sr = (
+            (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        assert sr.last_apply_error is None  # an innocent scope was not punished
+        assert sr.last_apply_at is not None
         break
 
 

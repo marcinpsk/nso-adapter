@@ -164,6 +164,34 @@ def _guard_specs() -> dict[str, _GuardSpec]:
     }
 
 
+def is_cleared(before, after) -> bool:
+    """Whether an owned scalar went from SET to UNSET — the #83 retract trigger.
+
+    A merge-PATCH apply never drops a leaf the writer omits, so a value that goes back to
+    unset can only be reverted on the device by a PUT-replace of the whole service. This is
+    the single predicate that decides when an intent PUT must enqueue that retract.
+
+    Two spellings of "unset", because the store uses both:
+
+    * ``None`` — a nullable column (isis metric, ospf cost).
+    * ``""``   — a NOT NULL column with ``default=""`` (ospf vrf, logging severity). The
+      writers emit these only when truthy (``if row.vrf:``), so an empty string is just as
+      undroppable as a None.
+
+    A boolean flipping ``True -> False`` is NOT a clear: the writers emit ``False``
+    explicitly (isis ``microloop-avoidance: false``), so the merge-PATCH does carry it and
+    no retract is needed. Treating it as one would fire a real device PUT-replace on every
+    toggle-off.
+    """
+    if before is None or before is False or before == "":
+        return False  # was already unset — nothing to retract
+    if after is None:
+        return True
+    if isinstance(before, str) and isinstance(after, str):
+        return after == ""
+    return False
+
+
 def _norm_key(key) -> tuple[str, ...]:
     """Normalize a key (scalar or sequence) to a tuple of strings.
 
@@ -945,8 +973,10 @@ def _removed_map(scope: str, removed) -> dict[str, list]:
     return {spec.lists[0].label: list(removed)}
 
 
-async def replace_on_removal(db: AsyncSession, device, removed, store_model, apply_callable=None) -> bool:
-    """Enqueue an async removal job for *store_model*'s scope if *removed* is truthy.
+async def replace_on_removal(
+    db: AsyncSession, device, removed, store_model, apply_callable=None, *, retract: bool = False
+) -> bool:
+    """Enqueue an async removal job for *store_model*'s scope.
 
     Back-compat shim: the per-service intent PUTs still call this with their
     ``(store_model, apply_callable)``; the scope is derived from ``store_model`` and
@@ -957,17 +987,30 @@ async def replace_on_removal(db: AsyncSession, device, removed, store_model, app
     signature compatibility but superseded by the scope registry. Returns True if
     a removal job was queued.
 
+    *retract* says a CLEARED OWNED SCALAR caused (part of) this call — see
+    :func:`is_cleared`. A clear is not a shrink: it removes no key, so a caller with
+    nothing in *removed* must still get a job, and that job must actually reach the device
+    rather than detaching (#106's default). Without this the nine simple scopes would
+    detect a clear and still commit it ``no-networking`` — a no-op.
+
     These callers invoke this AFTER committing their row deletes, so the enqueued
     job is committed here. (OSPF/BGP call :func:`enqueue_removal` directly, before
     their own commit, to persist the deletes and the job atomically.)
     """
-    if not removed:
+    if not removed and not retract:
         return False
     scope = _SCOPE_BY_MODEL.get(store_model.__name__)
     if scope is None:
         logger.error("removal.unknown_model", model=store_model.__name__)
         return False
-    job = await enqueue_removal(db, device.id, scope, removed=_removed_map(scope, removed))
+    job = await enqueue_removal(
+        db,
+        device.id,
+        scope,
+        removed=_removed_map(scope, removed) if removed else None,
+        retract=retract,
+        shrank=bool(removed),
+    )
     if job is None:  # store-only request — the shrink stays store-side
         return False
     await db.commit()

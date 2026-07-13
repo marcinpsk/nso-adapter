@@ -372,6 +372,22 @@ async def test_snmp_apply_body_uses_vault_triples_and_yang_enums():
     assert "contact" not in entry  # None contact omitted
 
 
+async def test_snmp_apply_accepts_the_bare_2_version_spelling():
+    """A bare "2" is a legitimate SNMPv2c spelling the API accepts (version is a plain str),
+    and pre-#121 host rows may already hold it — but _SNMP_VERSION had no entry for it, so
+    _snmp_enum raised WHILE the body was being built. That aborted the whole SNMP scope:
+    the device's communities and v3 users, which had applied fine for months, were never
+    pushed either, on every apply."""
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+    hosts = [SimpleNamespace(address="192.0.2.98", version="2", notify_type="trap", community_or_user="ro", port=None)]
+
+    await apply_snmp_config(client, "ri6", [], [], hosts, None, dry_run=True)
+
+    entry = _sent_body(transport)["snmp-reconciler:snmp-config"][0]
+    assert entry["host"][0]["version"] == "v2c"
+
+
 async def test_snmp_apply_host_without_binding_omits_community_or_user():
     """A host with no community/user binding (ArcOS targets carry none — the platform
     binds via target-parameters, not the target) must OMIT the optional

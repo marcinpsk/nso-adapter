@@ -10,7 +10,7 @@ from typing import Literal
 
 import structlog
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -100,12 +100,44 @@ async def get_snmp_config(device_id: int, db: AsyncSession = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 
+def _validated_vault_ref(value: str | None) -> str | None:
+    """Reject a vault_ref the SNMP writer could never render into the mandatory triple.
+
+    apply_snmp_config splits every ref into vault-mount/path/key and raises
+    ``invalid_vault_ref`` on anything malformed — a mandatory leaf, so a bad ref cannot be
+    skipped (dropping the element would delete it from the device on a replace apply). The
+    field was an unvalidated ``str``, so the PUT returned 200 and the bad ref sat in the
+    store failing EVERY apply forever, with the apply-diff preview swallowing the error so
+    the operator saw no warning before hitting Apply. Fail at the boundary instead: the
+    store must never hold intent the writer cannot render.
+    """
+    if value is None or value == "":
+        return value
+    from nso_adapter.secrets.refs import VaultRefError, parse_vault_ref
+
+    try:
+        parse_vault_ref(value, require_key=True)
+    except VaultRefError as exc:
+        raise ValueError(str(exc)) from exc
+    return value
+
+
+# The exact spellings _SNMP_VERSION / _SNMP_NOTIFY / _SNMP_ACCESS can map (nso/apply.py).
+# Anything else raises mid-body-build and aborts the whole SNMP scope, so it must never
+# reach the store.
+SnmpVersion = Literal["1", "v1", "2", "2c", "v2c", "3", "v3"]
+SnmpNotifyType = Literal["trap", "traps", "inform", "informs"]
+SnmpAccess = Literal["ro", "RO", "rw", "RW"]
+
+
 class SnmpCommunityEntry(BaseModel):
     label: str
     vault_ref: str  # "mount/path#key"
-    access: str  # "RO" | "RW"
+    access: SnmpAccess
     acl: str | None = None
     accepted_at: datetime | None = None
+
+    _check_vault_ref = field_validator("vault_ref")(_validated_vault_ref)
 
 
 class SnmpV3UserEntry(BaseModel):
@@ -118,11 +150,14 @@ class SnmpV3UserEntry(BaseModel):
     priv_vault_ref: str | None = None
     accepted_at: datetime | None = None
 
+    _check_auth_ref = field_validator("auth_vault_ref")(_validated_vault_ref)
+    _check_priv_ref = field_validator("priv_vault_ref")(_validated_vault_ref)
+
 
 class SnmpHostEntry(BaseModel):
     address: str
-    version: str  # "1" | "2c" | "3"
-    notify_type: str  # "trap" | "inform"
+    version: SnmpVersion
+    notify_type: SnmpNotifyType
     community_or_user: str
     port: int | None = Field(default=None, ge=1, le=65535)  # absent = NED default 162
     accepted_at: datetime | None = None

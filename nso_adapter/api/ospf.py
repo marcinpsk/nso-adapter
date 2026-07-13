@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import api_error
+from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import (
     Device,
     DeviceOspfInstance,
@@ -180,7 +181,7 @@ async def _sync_keyed_intent(
             row = make_row(entry, now)
             db.add(row)
         apply_fields(row, entry)
-        if before is not None and any(before[f] is not None and getattr(row, f) is None for f in state_fields):
+        if before is not None and any(is_cleared(before[f], getattr(row, f)) for f in state_fields):
             cleared = True
     return removed, cleared
 
@@ -307,7 +308,9 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
         now=now,
         apply_fields=_apply_ospf_instance_fields,
         make_row=lambda e, ts: OspfInstanceIntent(device_id=device_id, process_id=e.process_id, accepted_at=ts),
-        state_fields=("router_id", "areas", "enabled"),
+        # `vrf` is emitted only when truthy (`if row.vrf` in the writer), so a merge-PATCH
+        # cannot drop it either — a cleared vrf needs the same PUT-replace retract.
+        state_fields=("router_id", "areas", "enabled", "vrf"),
     )
     removed_iface, iface_cleared = await _sync_keyed_intent(
         db,

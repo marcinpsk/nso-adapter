@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import api_error
+from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import (
     Device,
     DeviceIsisInterface,
@@ -273,7 +274,7 @@ async def _sync_keyed_intent(
             row = make_row(entry)
             db.add(row)
         apply_fields(row, entry, accepted)
-        if before is not None and any(before[f] is not None and getattr(row, f) is None for f in state_fields):
+        if before is not None and any(is_cleared(before[f], getattr(row, f)) for f in state_fields):
             cleared = True
         count += 1
     return count, deleted, cleared
@@ -448,6 +449,7 @@ async def put_isis_interface_intent(
         apply_fields=_apply_isis_process_fields,
         make_row=lambda e: IsisProcessIntent(device_id=device_id, process_tag=e.process_tag),
         state_fields=(
+            "net",  # `if row.net is not None` in the writer → a merge-PATCH cannot drop it
             "is_type",
             "metric_style",
             "overload_bit",
@@ -561,11 +563,24 @@ async def put_isis_flex_algo_intent(device_id: int, body: IsisFlexAlgoIntentUpda
             await db.delete(row)
     await db.flush()
 
+    _FLEX_STATE_FIELDS = (
+        "metric_type",
+        "priority",
+        "admin_group_exclude",
+        "admin_group_include_any",
+        "admin_group_include_all",
+    )
+
     count = 0
+    cleared = False
     for item in body.flex_algos:
         key = (item.process_tag, item.algo_id)
         accepted = item.accepted_at.replace(tzinfo=None) if item.accepted_at else now
         row = existing_rows.get(key)
+        # Every flex-algo scalar is emitted only when set (`if row.priority is not None`),
+        # so a merge-PATCH apply can never drop one that goes back to unset — a cleared
+        # scalar needs the same PUT-replace retract as a dropped flex-algo.
+        before = {f: getattr(row, f) for f in _FLEX_STATE_FIELDS} if row is not None else None
         if row is None:
             row = IsisFlexAlgoIntent(
                 device_id=device_id,
@@ -579,6 +594,8 @@ async def put_isis_flex_algo_intent(device_id: int, body: IsisFlexAlgoIntentUpda
         row.admin_group_exclude = item.admin_group_exclude
         row.admin_group_include_any = item.admin_group_include_any
         row.admin_group_include_all = item.admin_group_include_all
+        if before is not None and any(is_cleared(before[f], getattr(row, f)) for f in _FLEX_STATE_FIELDS):
+            cleared = True
         row.accepted_at = accepted
         count += 1
 
@@ -607,10 +624,10 @@ async def put_isis_flex_algo_intent(device_id: int, body: IsisFlexAlgoIntentUpda
     # INSIDE process-config, so the shrink removes no key at the guard's grain and needs
     # no orphan allowance.
     removal_queued = False
-    if removed_keys:
+    if removed_keys or cleared:
         from nso_adapter.core.removal import enqueue_removal
 
-        job = await enqueue_removal(db, device_id, "isis")
+        job = await enqueue_removal(db, device_id, "isis", retract=cleared, shrank=bool(removed_keys))
         removal_queued = job is not None
 
     await db.commit()

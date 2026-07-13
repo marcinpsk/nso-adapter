@@ -757,9 +757,13 @@ async def apply_interface_ips(
 
 _SNMP_SERVICE_PATH = "/restconf/data/snmp-reconciler:snmp-config"
 
-# Plugin/adapter spellings → snmp-reconciler YANG enum values.
+# Plugin/adapter spellings → snmp-reconciler YANG enum values. The API constrains these
+# fields to exactly these keys (api/snmp.py), so the store can never hold a spelling the
+# writer cannot render — a raise here aborts the whole SNMP body, taking unrelated
+# communities and v3 users down with it. A bare "2" is a legitimate v2c spelling and was
+# missing, so a single such host row failed every SNMP apply on the device.
 _SNMP_ACCESS = {"ro": "ro", "rw": "rw"}
-_SNMP_VERSION = {"1": "v1", "v1": "v1", "2c": "v2c", "v2c": "v2c", "3": "v3", "v3": "v3"}
+_SNMP_VERSION = {"1": "v1", "v1": "v1", "2": "v2c", "2c": "v2c", "v2c": "v2c", "3": "v3", "v3": "v3"}
 _SNMP_NOTIFY = {"trap": "traps", "traps": "traps", "inform": "informs", "informs": "informs"}
 
 
