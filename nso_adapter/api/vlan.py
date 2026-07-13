@@ -15,6 +15,7 @@ from sqlalchemy.orm import selectinload
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import api_error
 from nso_adapter.core.importer import get_nso_client
+from nso_adapter.core.removal import is_cleared
 from nso_adapter.core.switchport_intent import apply_switchport_config as apply_switchport_core
 from nso_adapter.store.models import Device, DeviceSettings, DeviceSwitchport, DeviceVlan, VlanIntent
 
@@ -105,6 +106,12 @@ class VlanEntry(BaseModel):
     accepted_at: datetime | None = None
 
 
+# Scalars the writer emits only when set — `if row.name:` (nso/apply.py)
+# A merge-PATCH apply can never drop one that goes back to unset, so clearing any of
+# them must enqueue a PUT-replace retract. See core.removal.is_cleared.
+_STATE_FIELDS = ("name",)
+
+
 class VlanIntentUpdate(BaseModel):
     vlans: list[VlanEntry]
 
@@ -132,14 +139,18 @@ async def put_vlan_intent(device_id: int, body: VlanIntentUpdate, db: AsyncSessi
 
     now = datetime.now(UTC).replace(tzinfo=None)
     count = 0
+    cleared = False
     for item in body.vlans:
         accepted = item.accepted_at.replace(tzinfo=None) if item.accepted_at else now
         row = existing_rows.get(item.vlan_id)
+        before = {f: getattr(row, f) for f in _STATE_FIELDS} if row is not None else None
         if row is None:
             row = VlanIntent(device_id=device_id, vlan_id=item.vlan_id)
             db.add(row)
         row.name = item.name or None
         row.accepted_at = accepted
+        if before is not None and any(is_cleared(before[f], getattr(row, f)) for f in _STATE_FIELDS):
+            cleared = True
         count += 1
 
     await db.flush()
@@ -156,10 +167,10 @@ async def put_vlan_intent(device_id: int, body: VlanIntentUpdate, db: AsyncSessi
     # Removal propagation: a dropped vid won't be removed by the next merge-PATCH
     # apply, so PUT-replace the vlan-reconciler instance with the remaining list.
     replaced = False
-    if removed_vids:
+    if removed_vids or cleared:
         from nso_adapter.core.removal import replace_on_removal
         from nso_adapter.nso.apply import apply_vlan_config
 
-        replaced = await replace_on_removal(db, device, removed_vids, VlanIntent, apply_vlan_config)
+        replaced = await replace_on_removal(db, device, removed_vids, VlanIntent, apply_vlan_config, retract=cleared)
 
     return {"device_id": device_id, "count": count, "removed": len(removed_vids), "replaced": replaced}

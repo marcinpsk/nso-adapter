@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import api_error
+from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import Device, DeviceSettings, DeviceStaticRoute, StaticRouteIntent
 
 logger = structlog.get_logger(__name__)
@@ -92,6 +93,12 @@ class StaticRouteEntry(BaseModel):
     accepted_at: datetime | None = None
 
 
+# Scalars the writer emits only when set — `if row.metric is not None:` / `if getattr(row, 'interface_next_hop', None):` (nso/apply.py)
+# A merge-PATCH apply can never drop one that goes back to unset, so clearing any of
+# them must enqueue a PUT-replace retract. See core.removal.is_cleared.
+_STATE_FIELDS = ("interface_next_hop", "next_hop_vrf", "metric", "permanent", "tag", "name")
+
+
 class StaticRouteIntentUpdate(BaseModel):
     routes: list[StaticRouteEntry]
 
@@ -124,11 +131,13 @@ async def put_static_route_intent(device_id: int, body: StaticRouteIntentUpdate,
 
     now = datetime.now(UTC).replace(tzinfo=None)
     count = 0
+    cleared = False
     for item in body.routes:
         key = (item.vrf, item.prefix, item.next_hop)
         accepted = item.accepted_at.replace(tzinfo=None) if item.accepted_at else now
         if key in existing_rows:
             row = existing_rows[key]
+            before = {f: getattr(row, f) for f in _STATE_FIELDS}
             row.accepted_at = accepted
             row.interface_next_hop = item.interface_next_hop
             row.next_hop_vrf = item.next_hop_vrf
@@ -136,6 +145,8 @@ async def put_static_route_intent(device_id: int, body: StaticRouteIntentUpdate,
             row.permanent = item.permanent
             row.tag = item.tag
             row.name = item.name
+            if any(is_cleared(before[f], getattr(row, f)) for f in _STATE_FIELDS):
+                cleared = True
         else:
             row = StaticRouteIntent(
                 device_id=device_id,
@@ -165,10 +176,12 @@ async def put_static_route_intent(device_id: int, body: StaticRouteIntentUpdate,
     await db.commit()
 
     replaced = False
-    if removed:
+    if removed or cleared:
         from nso_adapter.core.removal import replace_on_removal
         from nso_adapter.nso.apply import apply_static_routes
 
-        replaced = await replace_on_removal(db, device, removed, StaticRouteIntent, apply_static_routes)
+        replaced = await replace_on_removal(
+            db, device, removed, StaticRouteIntent, apply_static_routes, retract=cleared
+        )
 
     return {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}

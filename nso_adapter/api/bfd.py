@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import api_error
+from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import BfdIntent, Device, DeviceBfdInterface, DeviceSettings
 
 logger = structlog.get_logger(__name__)
@@ -80,6 +81,12 @@ class BfdEntry(BaseModel):
     accepted_at: datetime | None = None
 
 
+# Scalars the writer emits only when set — `if row.min_tx is not None:` (nso/apply.py)
+# A merge-PATCH apply can never drop one that goes back to unset, so clearing any of
+# them must enqueue a PUT-replace retract. See core.removal.is_cleared.
+_STATE_FIELDS = ("min_tx", "min_rx", "multiplier")
+
+
 class BfdIntentUpdate(BaseModel):
     interfaces: list[BfdEntry]
 
@@ -107,9 +114,11 @@ async def put_bfd_intent(device_id: int, body: BfdIntentUpdate, db: AsyncSession
 
     now = datetime.now(UTC).replace(tzinfo=None)
     count = 0
+    cleared = False
     for item in body.interfaces:
         accepted = item.accepted_at.replace(tzinfo=None) if item.accepted_at else now
         row = existing_rows.get(item.interface_name)
+        before = {f: getattr(row, f) for f in _STATE_FIELDS} if row is not None else None
         if row is None:
             row = BfdIntent(device_id=device_id, interface_name=item.interface_name)
             db.add(row)
@@ -118,6 +127,8 @@ async def put_bfd_intent(device_id: int, body: BfdIntentUpdate, db: AsyncSession
         row.multiplier = item.multiplier
         row.micro_bfd = item.micro_bfd
         row.accepted_at = accepted
+        if before is not None and any(is_cleared(before[f], getattr(row, f)) for f in _STATE_FIELDS):
+            cleared = True
         count += 1
 
     await db.flush()
@@ -132,10 +143,10 @@ async def put_bfd_intent(device_id: int, body: BfdIntentUpdate, db: AsyncSession
     await db.commit()
 
     replaced = False
-    if removed:
+    if removed or cleared:
         from nso_adapter.core.removal import replace_on_removal
         from nso_adapter.nso.apply import apply_bfd_config
 
-        replaced = await replace_on_removal(db, device, removed, BfdIntent, apply_bfd_config)
+        replaced = await replace_on_removal(db, device, removed, BfdIntent, apply_bfd_config, retract=cleared)
 
     return {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}

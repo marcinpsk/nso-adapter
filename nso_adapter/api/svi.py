@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import api_error
+from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import Device, DeviceSettings, DeviceSvi, SviIntent
 
 router = APIRouter(prefix="/api/v1/devices", tags=["svi"])
@@ -56,6 +57,12 @@ class SviEntry(BaseModel):
     accepted_at: datetime | None = None
 
 
+# Scalars the writer emits only when set — `if row.vrf:` (nso/apply.py). vrf is NOT NULL default='' so the clear is ''.
+# A merge-PATCH apply can never drop one that goes back to unset, so clearing any of
+# them must enqueue a PUT-replace retract. See core.removal.is_cleared.
+_STATE_FIELDS = ("vrf",)
+
+
 class SviIntentUpdate(BaseModel):
     interfaces: list[SviEntry]
 
@@ -82,9 +89,11 @@ async def put_svi_intent(device_id: int, body: SviIntentUpdate, db: AsyncSession
 
     now = datetime.now(UTC).replace(tzinfo=None)
     count = 0
+    cleared = False
     for item in body.interfaces:
         accepted = item.accepted_at.replace(tzinfo=None) if item.accepted_at else now
         row = existing_rows.get(item.interface_name)
+        before = {f: getattr(row, f) for f in _STATE_FIELDS} if row is not None else None
         if row is None:
             row = SviIntent(device_id=device_id, interface_name=item.interface_name)
             db.add(row)
@@ -92,6 +101,8 @@ async def put_svi_intent(device_id: int, body: SviIntentUpdate, db: AsyncSession
         row.svi_type = item.type
         row.vrf = item.vrf or None
         row.accepted_at = accepted
+        if before is not None and any(is_cleared(before[f], getattr(row, f)) for f in _STATE_FIELDS):
+            cleared = True
         count += 1
 
     await db.flush()
@@ -106,10 +117,10 @@ async def put_svi_intent(device_id: int, body: SviIntentUpdate, db: AsyncSession
     await db.commit()
 
     replaced = False
-    if removed:
+    if removed or cleared:
         from nso_adapter.core.removal import replace_on_removal
         from nso_adapter.nso.apply import apply_svi_config
 
-        replaced = await replace_on_removal(db, device, removed, SviIntent, apply_svi_config)
+        replaced = await replace_on_removal(db, device, removed, SviIntent, apply_svi_config, retract=cleared)
 
     return {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}

@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import api_error
+from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import Device, DeviceInterfaceMtu, DeviceSettings, InterfaceMtuIntent
 
 router = APIRouter(prefix="/api/v1/devices", tags=["interface-mtu"])
@@ -65,6 +66,12 @@ class InterfaceMtuEntry(BaseModel):
     accepted_at: datetime | None = None
 
 
+# Scalars the writer emits only when set (`if row.mtu is not None:`, nso/apply.py) — a
+# merge-PATCH apply can never drop one that goes back to unset, so clearing any of them
+# must enqueue a PUT-replace retract. See core.removal.is_cleared.
+_STATE_FIELDS = ("mtu", "ip_mtu", "mpls_mtu")
+
+
 class InterfaceMtuIntentUpdate(BaseModel):
     interfaces: list[InterfaceMtuEntry]
 
@@ -92,9 +99,11 @@ async def put_interface_mtu_intent(device_id: int, body: InterfaceMtuIntentUpdat
 
     now = datetime.now(UTC).replace(tzinfo=None)
     count = 0
+    cleared = False
     for item in body.interfaces:
         accepted = item.accepted_at.replace(tzinfo=None) if item.accepted_at else now
         row = existing_rows.get(item.interface_name)
+        before = {f: getattr(row, f) for f in _STATE_FIELDS} if row is not None else None
         if row is None:
             row = InterfaceMtuIntent(device_id=device_id, interface_name=item.interface_name)
             db.add(row)
@@ -102,6 +111,8 @@ async def put_interface_mtu_intent(device_id: int, body: InterfaceMtuIntentUpdat
         row.ip_mtu = item.ip_mtu
         row.mpls_mtu = item.mpls_mtu
         row.accepted_at = accepted
+        if before is not None and any(is_cleared(before[f], getattr(row, f)) for f in _STATE_FIELDS):
+            cleared = True
         count += 1
 
     await db.flush()
@@ -116,10 +127,10 @@ async def put_interface_mtu_intent(device_id: int, body: InterfaceMtuIntentUpdat
     await db.commit()
 
     replaced = False
-    if removed:
+    if removed or cleared:
         from nso_adapter.core.removal import replace_on_removal
         from nso_adapter.nso.apply import apply_mtu_config
 
-        replaced = await replace_on_removal(db, device, removed, InterfaceMtuIntent, apply_mtu_config)
+        replaced = await replace_on_removal(db, device, removed, InterfaceMtuIntent, apply_mtu_config, retract=cleared)
 
     return {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}

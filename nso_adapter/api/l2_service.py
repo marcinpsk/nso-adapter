@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import api_error
+from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import Device, DeviceL2Sap, DeviceSettings, L2SapIntent
 
 logger = structlog.get_logger(__name__)
@@ -69,6 +70,12 @@ class L2SapEntry(BaseModel):
     accepted_at: datetime | None = None
 
 
+# Scalars the writer emits only when set — `if row.port:` / `if row.outer_tag is not None:` (nso/apply.py)
+# A merge-PATCH apply can never drop one that goes back to unset, so clearing any of
+# them must enqueue a PUT-replace retract. See core.removal.is_cleared.
+_STATE_FIELDS = ("port", "outer_tag", "inner_tag")
+
+
 class L2SapIntentUpdate(BaseModel):
     saps: list[L2SapEntry]
 
@@ -97,16 +104,20 @@ async def put_l2_sap_intent(device_id: int, body: L2SapIntentUpdate, db: AsyncSe
 
     now = datetime.now(UTC).replace(tzinfo=None)
     count = 0
+    cleared = False
     for item in body.saps:
         key = (item.service_name, item.sap_id)
         accepted = item.accepted_at.replace(tzinfo=None) if item.accepted_at else now
         if key in existing_rows:
             row = existing_rows[key]
+            before = {f: getattr(row, f) for f in _STATE_FIELDS}
             row.service_type = item.service_type
             row.port = item.port
             row.outer_tag = item.outer_tag
             row.inner_tag = item.inner_tag
             row.accepted_at = accepted
+            if any(is_cleared(before[f], getattr(row, f)) for f in _STATE_FIELDS):
+                cleared = True
         else:
             row = L2SapIntent(
                 device_id=device_id,
@@ -133,10 +144,10 @@ async def put_l2_sap_intent(device_id: int, body: L2SapIntentUpdate, db: AsyncSe
     await db.commit()
 
     replaced = False
-    if removed:
+    if removed or cleared:
         from nso_adapter.core.removal import replace_on_removal
         from nso_adapter.nso.apply import apply_l2_saps
 
-        replaced = await replace_on_removal(db, device, removed, L2SapIntent, apply_l2_saps)
+        replaced = await replace_on_removal(db, device, removed, L2SapIntent, apply_l2_saps, retract=cleared)
 
     return {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}
