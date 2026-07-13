@@ -51,6 +51,20 @@ async def _logging_rows(device_id: int) -> list[str]:
     return []
 
 
+async def _flex_algo_keys(device_id: int) -> list[tuple[str, int]]:
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import IsisFlexAlgoIntent
+
+    async for db in get_session():
+        rows = (
+            (await db.execute(select(IsisFlexAlgoIntent).where(IsisFlexAlgoIntent.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        return sorted((r.process_tag, r.algo_id) for r in rows)
+    return []
+
+
 async def _seed_settings(device_id: int, *, auto_apply: bool) -> None:
     from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceSettings
@@ -169,6 +183,48 @@ async def test_snmp_shrink_store_only_skips_direct_removal(adapter_client):
         break
     assert labels == ["ro1"]  # store shrank
     assert await _jobs(device_id) == []  # no removal job
+
+
+# ── store_only suppresses the flex-algo INLINE service replace ──────────────
+
+
+@pytest.mark.anyio
+async def test_flex_algo_shrink_store_only_does_not_touch_the_device(adapter_client, monkeypatch):
+    """The flex-algo PUT must honour store_only like every other intent endpoint.
+
+    It used to PUT-replace the isis-reconciler INLINE (bypassing the enqueue choke point
+    where STORE_ONLY is guarded), so the plugin's "does not touch the device" re-sync —
+    which re-pushes every scope, isis_flex_algo included, under ?store_only=true — played
+    FASTMAP's reverse diff against the live router and retracted real IS-IS config.
+
+    The inline path swallows every exception, so a raising sentinel would be masked:
+    RECORD the NSO boundary crossings instead and assert there were none.
+    """
+    touched: list = []
+
+    monkeypatch.setattr(
+        "nso_adapter.core.importer.get_nso_client",
+        lambda instance: touched.append(instance) or object(),
+    )
+
+    device_id = await seed_device(nso_device_name="so-flex-dev", netbox_device_id=987)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-flex-algo-intent",
+        json={"flex_algos": [{"process_tag": "1", "algo_id": 128}, {"process_tag": "1", "algo_id": 129}]},
+        headers=AUTH,
+    )
+
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-flex-algo-intent?store_only=true",
+        json={"flex_algos": [{"process_tag": "1", "algo_id": 129}]},
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["flex_algo_count"] == 1
+
+    assert await _flex_algo_keys(device_id) == [("1", 129)]  # the store shrink DID happen …
+    assert touched == []  # … but the device was never reached …
+    assert await _jobs(device_id) == []  # … and no device-touching job was queued
 
 
 # ── store_only suppresses the auto-apply enqueue ────────────────────────────

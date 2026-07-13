@@ -564,92 +564,26 @@ async def put_isis_flex_algo_intent(device_id: int, body: IsisFlexAlgoIntentUpda
 
         await enqueue_apply(db, device_id, force=True)
 
+    # A merge-PATCH apply never drops an omitted flex-algo (and a node-level DELETE can't
+    # address an empty-string process-tag key), so retracting one needs a PUT-replace of
+    # the whole service. Queue the async ``isis`` removal job — :func:`_replace_isis`
+    # re-asserts the full remaining accepted snapshot (flex-algos included) so FASTMAP
+    # reverts what was dropped.
+    #
+    # This MUST go through enqueue_removal rather than replacing the service inline: that
+    # is the single choke point where STORE_ONLY (#103 — the plugin's re-sync promises it
+    # "does not touch the device"), the un-own detach (#106) and the collateral orphan
+    # guard (#90) are enforced. An inline write here bypassed all three and could retract
+    # live IS-IS config on a re-sync push. No ``removed=`` is passed: a flex-algo lives
+    # INSIDE process-config, so the shrink removes no key at the guard's grain and needs
+    # no orphan allowance.
+    removal_queued = False
+    if removed_keys:
+        from nso_adapter.core.removal import enqueue_removal
+
+        job = await enqueue_removal(db, device_id, "isis")
+        removal_queued = job is not None
+
     await db.commit()
 
-    # Removal must be pushed to NSO explicitly: a merge-PATCH on the next apply
-    # would not drop the omitted entry, and a node-level DELETE can't address an
-    # empty-string process-tag key.  PUT-replace the whole process-config list
-    # (built from the full desired state) so FASTMAP reverts removed flex-algos.
-    replaced = False
-    if removed_keys:
-        from nso_adapter.core.importer import get_nso_client
-        from nso_adapter.nso.apply import (
-            build_isis_interface_payload,
-            build_isis_process_payload,
-            replace_isis_service,
-        )
-
-        proc_rows = (
-            (
-                await db.execute(
-                    select(IsisProcessIntent).where(
-                        IsisProcessIntent.device_id == device_id,
-                        IsisProcessIntent.accepted_at.is_not(None),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        flex_rows = (
-            (
-                await db.execute(
-                    select(IsisFlexAlgoIntent).where(
-                        IsisFlexAlgoIntent.device_id == device_id,
-                        IsisFlexAlgoIntent.accepted_at.is_not(None),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        redist_rows = (
-            (
-                await db.execute(
-                    select(RedistributionIntent).where(
-                        RedistributionIntent.device_id == device_id,
-                        RedistributionIntent.dest_protocol == "isis",
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        iface_rows = (
-            (
-                await db.execute(
-                    select(IsisInterfaceIntent).where(
-                        IsisInterfaceIntent.device_id == device_id,
-                        IsisInterfaceIntent.accepted_at.is_not(None),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        level_rows = (
-            (
-                await db.execute(
-                    select(IsisLevelIntent).where(
-                        IsisLevelIntent.device_id == device_id,
-                        IsisLevelIntent.accepted_at.is_not(None),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        processes = build_isis_process_payload(proc_rows, redist_rows, flex_rows, level_rows)
-        interfaces = build_isis_interface_payload(iface_rows)
-        try:
-            nso_client = get_nso_client(device.nso_instance)
-            await replace_isis_service(nso_client, device.nso_device_name, interfaces, processes)
-            replaced = True
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "isis_flex_algo.service_replace_failed",
-                device_id=device_id,
-                error=repr(exc),
-            )
-
-    return {"device_id": device_id, "flex_algo_count": count, "service_replaced": replaced}
+    return {"device_id": device_id, "flex_algo_count": count, "removal_queued": removal_queued}

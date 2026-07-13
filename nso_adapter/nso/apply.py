@@ -1589,26 +1589,6 @@ async def replace_service_instance(
     logger.info("nso.apply.service_replaced", service=root_key, device=device_name)
 
 
-async def replace_isis_service(
-    client: NsoClient,
-    device_name: str,
-    interfaces: list[dict],
-    processes: list[dict],
-) -> None:
-    """PUT-replace the isis-reconciler service instance (full desired state).
-
-    Thin wrapper over :func:`replace_service_instance` used to propagate IS-IS
-    removals (e.g. a deleted flex-algo). *interfaces* and *processes* are the FULL
-    desired state for the device.
-    """
-    body: dict = {"device": device_name}
-    if interfaces:
-        body["interface-config"] = interfaces
-    if processes:
-        body["process-config"] = processes
-    await replace_service_instance(client, _ISIS_SERVICE_PATH, "isis-reconciler:isis-config", device_name, body)
-
-
 def _parse_asn(asn) -> int:
     """Return the uint32 AS number for *asn*, accepting plain decimal or asdot ``X.Y``.
 

@@ -1222,27 +1222,6 @@ def test_build_isis_process_payload_emits_frr():
 
 
 @pytest.mark.asyncio
-async def test_replace_isis_service_puts_keyed_instance():
-    """replace_isis_service PUTs the keyed service instance (so empty process-tags
-    removal works — PUT key is the device name, not the empty list key)."""
-    import json
-
-    from nso_adapter.nso.apply import replace_isis_service
-
-    client = _make_nso_client()
-    mock_http = AsyncMock()
-    mock_http.put.return_value = _httpx_response(204)
-    _stub_pool(client, mock_http)
-    await replace_isis_service(client=client, device_name="rc1", interfaces=[{"interface-name": "ae2.0"}], processes=[])
-
-    (url,) = mock_http.put.call_args[0]
-    assert url.split("?")[0].endswith("isis-reconciler:isis-config=rc1")
-    assert "reconcile=keep-non-service-config" in url
-    body = json.loads(mock_http.put.call_args[1]["content"])
-    assert body["isis-reconciler:isis-config"][0]["device"] == "rc1"
-
-
-@pytest.mark.asyncio
 async def test_replace_service_instance_puts_keyed_instance():
     """Generic removal primitive: PUT on the keyed service instance with the full body."""
     import json

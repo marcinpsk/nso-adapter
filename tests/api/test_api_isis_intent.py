@@ -372,7 +372,7 @@ async def test_put_flex_algo_creates_and_updates_in_place(adapter_client):
         json={"flex_algos": [{"process_tag": "1", "algo_id": 128, "priority": 100, "metric_type": "delay"}]},
     )
     assert resp.status_code == 200
-    assert resp.json() == {"device_id": device_id, "flex_algo_count": 1, "service_replaced": False}
+    assert resp.json() == {"device_id": device_id, "flex_algo_count": 1, "removal_queued": False}
 
     # Re-PUT same (process_tag, algo_id) with a changed priority → updated in place.
     resp = await adapter_client.put(
@@ -417,8 +417,22 @@ async def test_put_flex_algo_auto_apply_enqueues_job(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_put_flex_algo_removal_triggers_service_replace(adapter_client, monkeypatch):
-    """Dropping a flex-algo PUT-replaces the IS-IS service in NSO (service_replaced=True)."""
+async def test_put_flex_algo_removal_queues_the_guarded_removal_job(adapter_client, monkeypatch):
+    """Dropping a flex-algo queues the async ``isis`` removal job — it never writes inline.
+
+    The endpoint used to PUT-replace the isis-reconciler inline, which bypassed the enqueue
+    choke point that enforces STORE_ONLY (#103), the un-own detach (#106) and the collateral
+    orphan guard (#90). The device must not be touched from the request path at all.
+    """
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Job, JobType
+
+    touched: list = []
+    monkeypatch.setattr(
+        "nso_adapter.core.importer.get_nso_client",
+        lambda instance: touched.append(instance) or object(),
+    )
+
     device_id = await seed_device(nso_device_name="isis-flex-removal", netbox_device_id=986)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-flex-algo-intent",
@@ -426,42 +440,84 @@ async def test_put_flex_algo_removal_triggers_service_replace(adapter_client, mo
         json={"flex_algos": [{"process_tag": "1", "algo_id": 128}]},
     )
 
-    captured = {}
-
-    async def _fake_replace(client, device_name, interfaces, processes):
-        captured["device_name"] = device_name
-
-    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda instance: object())
-    monkeypatch.setattr("nso_adapter.nso.apply.replace_isis_service", _fake_replace)
-
-    # PUT an empty set → the seeded flex-algo is removed → service replace fires.
+    # PUT an empty set → the seeded flex-algo is removed → the removal job is queued.
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-flex-algo-intent",
         headers=AUTH,
         json={"flex_algos": []},
     )
     assert resp.status_code == 200
-    assert resp.json() == {"device_id": device_id, "flex_algo_count": 0, "service_replaced": True}
-    assert captured["device_name"] == "isis-flex-removal"
+    assert resp.json() == {"device_id": device_id, "flex_algo_count": 0, "removal_queued": True}
+    assert touched == []  # the request path never reached NSO
+
+    async for db in get_session():
+        jobs = (
+            (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal)))
+            .scalars()
+            .all()
+        )
+        break
+    assert len(jobs) == 1
+    assert jobs[0].context["scope"] == "isis"
 
 
 @pytest.mark.anyio
-async def test_put_flex_algo_removal_replace_failure_is_swallowed(adapter_client):
-    """If the NSO service replace fails (instance unregistered), service_replaced=False, no raise."""
-    device_id = await seed_device(nso_device_name="isis-flex-fail", netbox_device_id=987)
+async def test_put_flex_algo_unmarked_shrink_detaches(adapter_client):
+    """An UNMARKED flex-algo shrink is an un-own, not a deletion: the job detaches (#106).
+
+    Only a push the plugin stamps ?delete_origin=true (a real NetBox object DELETE) may
+    retract config from the live device. Routing through enqueue_removal is what gives the
+    flex-algo scope these semantics — the old inline replace always hard-retracted.
+    """
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Job, JobType
+
+    device_id = await seed_device(nso_device_name="isis-flex-detach", netbox_device_id=987)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-flex-algo-intent",
         headers=AUTH,
         json={"flex_algos": [{"process_tag": "1", "algo_id": 128}]},
     )
-    # No NSO client registered for 'nso-dev' → get_nso_client raises → caught.
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-flex-algo-intent",
         headers=AUTH,
         json={"flex_algos": []},
     )
     assert resp.status_code == 200
-    assert resp.json()["service_replaced"] is False
+
+    async for db in get_session():
+        job = (
+            await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal))
+        ).scalar_one()
+        break
+    assert job.context.get("detach") is True
+
+
+@pytest.mark.anyio
+async def test_put_flex_algo_delete_origin_shrink_retracts(adapter_client):
+    """A ?delete_origin=true flex-algo shrink is a real deletion → a retracting job (no detach)."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import Job, JobType
+
+    device_id = await seed_device(nso_device_name="isis-flex-del", netbox_device_id=988)
+    await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-flex-algo-intent",
+        headers=AUTH,
+        json={"flex_algos": [{"process_tag": "1", "algo_id": 128}]},
+    )
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-flex-algo-intent?delete_origin=true",
+        headers=AUTH,
+        json={"flex_algos": []},
+    )
+    assert resp.status_code == 200
+
+    async for db in get_session():
+        job = (
+            await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal))
+        ).scalar_one()
+        break
+    assert job.context.get("detach") is None  # a deletion retracts for real
 
 
 @pytest.mark.anyio
