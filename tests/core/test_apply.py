@@ -2471,6 +2471,190 @@ async def test_run_apply_reader_compare_still_catches_a_dropped_snmp_host(adapte
         break
 
 
+async def test_run_apply_reader_compare_absent_reader_surface_is_not_a_drop(adapter_client):
+    """A reader that returns NOTHING means "unknown", not "the writer dropped everything".
+
+    Every reader in _RESIDUE_READERS returns None by design when the device has no such
+    config / the NED has no export surface for the scope (client.get_isis_interfaces:
+    "Returns None if the device has no IS-IS config"). Coercing that to {} made `present`
+    the empty set for every list, so every intended key was classified a silent writer
+    drop: the scope went permanently apply_failed on a device where NSO had committed the
+    intent and the config was on the box — and no retry could ever clear it.
+    """
+    from nso_adapter.store.models import StaticRouteIntent
+
+    device_id = await _seed_device("rtr-rc-none", 406)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id,
+                vrf="",
+                prefix="198.18.29.0/24",
+                next_hop="10.0.0.1",
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock(spec=NsoClient)
+    mock_client.get_static_routes.return_value = None  # no export surface on this NED
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        assert job.result["static_route_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
+        assert job.result["reader_compare"]["static_route"] == "unknown"
+        row = (
+            (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        assert row.last_apply_error is None
+        break
+
+
+async def test_run_apply_reader_compare_empty_list_payload_is_still_a_drop(adapter_client):
+    """A reader that DOES answer, with the scope's list empty, is a real silent drop —
+    the export surface exists and reports nothing there. Must still fail."""
+    from nso_adapter.store.models import StaticRouteIntent
+
+    device_id = await _seed_device("rtr-rc-empty", 407)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id,
+                vrf="",
+                prefix="198.18.30.0/24",
+                next_hop="10.0.0.1",
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock(spec=NsoClient)
+    mock_client.get_static_routes.return_value = {"route": []}  # answered — and the route is NOT there
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.result["reader_compare"]["static_route"] == "missing"
+        break
+
+
+async def _seed_nokia_device(name: str, netbox_id: int) -> int:
+    """A device whose NED cannot hold every canonical community member (SR OS)."""
+    async for db in get_session():
+        d = Device(
+            nso_instance="nso-dev",
+            nso_device_name=name,
+            netbox_device_id=netbox_id,
+            ned_id="timos-nc-23.10",
+        )
+        db.add(d)
+        await db.commit()
+        await db.refresh(d)
+        return d.id
+    raise RuntimeError("no session")
+
+
+async def test_run_apply_reader_compare_skips_a_fully_unrepresentable_community_list(adapter_client):
+    """An object the writer DELIBERATELY could not render must not be called a silent drop.
+
+    apply_route_policy_config skips community members the NED cannot hold (`bandwidth:` has
+    no SR OS policy keyword), so a community-list whose members are ALL unrepresentable
+    emits {"name": …, "entry": []} — which has no renderable CLI form, never lands, and so
+    never appears in the export. The PUT already reports these to the plugin via
+    `unsupported_members` so it can mark them "unsupported on <ned>". Demanding the object
+    be present anyway turned a known, deliberately-tolerated codec skip into a hard,
+    permanently-recurring apply failure for the whole route_policy scope.
+    """
+    from nso_adapter.store.models import RoutePolicyObjectIntent
+
+    device_id = await _seed_nokia_device("rtr-rp-unsup", 408)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            RoutePolicyObjectIntent(
+                device_id=device_id,
+                family="community_list",
+                name="CL-COLOR-ONLY",
+                entries=[{"community": "bandwidth:64500:100"}],  # unrepresentable on SR OS
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock(spec=NsoClient)
+    # The export answers — the object legitimately is not there, because nothing was rendered.
+    mock_client.get_route_policy.return_value = {"community-list": [], "prefix-list": [], "route-map": []}
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_route_policy_config", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        assert job.result["route_policy_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
+        row = (
+            (await db.execute(select(RoutePolicyObjectIntent).where(RoutePolicyObjectIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        assert row.last_apply_error is None
+        break
+
+
+async def test_run_apply_reader_compare_still_fails_a_representable_community_list(adapter_client):
+    """A community-list the NED CAN hold, that did not land, is still a real silent drop."""
+    from nso_adapter.store.models import RoutePolicyObjectIntent
+
+    device_id = await _seed_nokia_device("rtr-rp-real", 409)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            RoutePolicyObjectIntent(
+                device_id=device_id,
+                family="community_list",
+                name="CL-STD",
+                entries=[{"community": "64500:100"}],  # plain asn:val — SR OS takes it verbatim
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock(spec=NsoClient)
+    mock_client.get_route_policy.return_value = {"community-list": [], "prefix-list": [], "route-map": []}
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_route_policy_config", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.result["reader_compare"]["route_policy"] == "missing"
+        break
+
+
 async def test_run_apply_reader_compare_reader_error_is_nonfatal(adapter_client):
     """The check must never fail a good apply: a reader exception records 'error' and
     leaves the scope green (transparency without false alarms)."""

@@ -1159,12 +1159,35 @@ _READER_COMPARE_SPECS: dict[str, list] = {
 }
 
 
-def _reader_compare_expected(scope: str, rows) -> list[tuple[object, str, tuple]]:
+def _unrenderable_community_list(row, ned_id: str | None) -> bool:
+    """Report whether EVERY member of this community-list is unrepresentable on the NED.
+
+    apply_route_policy_config skips members the NED cannot hold, so such an object is
+    emitted as ``{"name": …, "entry": []}`` — an empty community-list has no renderable CLI
+    form, never lands on the device, and therefore can never appear in the export. It is a
+    deliberate, already-reported codec skip (the PUT hands the plugin `unsupported_members`
+    so it can badge them "unsupported on <ned>"), NOT a silent writer drop.
+
+    Deterministic — a pure function of member + dialect, the same verdict the apply path
+    acts on — so no device read is needed to decide it.
+    """
+    from nso_adapter.core.community_dialect import community_dialect_for
+
+    if row.family != "community_list":
+        return False
+    members = {e.get("community") for e in (row.entries or []) if isinstance(e, dict) and e.get("community")}
+    if not members:
+        return False
+    return len(community_dialect_for(ned_id).unrepresentable_members(sorted(members))) == len(members)
+
+
+def _reader_compare_expected(scope: str, rows, ned_id: str | None = None) -> list[tuple[object, str, tuple]]:
     """(intent row, YANG-list label, key tuple) for every checkable intended object (#108).
 
     Rows without a keyed reader presence are skipped: redistribution / flex-algo /
-    level rows (nested non-keyed content, guard-grain parity) and the snmp
-    system-info scalar.
+    level rows (nested non-keyed content, guard-grain parity), the snmp system-info
+    scalar, and community-lists the NED cannot render at all
+    (:func:`_unrenderable_community_list`).
     """
     from nso_adapter.core.removal import _ROUTE_POLICY_FAMILY_LISTS
     from nso_adapter.store import models as m
@@ -1173,7 +1196,9 @@ def _reader_compare_expected(scope: str, rows) -> list[tuple[object, str, tuple]
         return [
             (r, _ROUTE_POLICY_FAMILY_LISTS[r.family], (r.name,))
             for r in rows
-            if isinstance(r, m.RoutePolicyObjectIntent) and r.family in _ROUTE_POLICY_FAMILY_LISTS
+            if isinstance(r, m.RoutePolicyObjectIntent)
+            and r.family in _ROUTE_POLICY_FAMILY_LISTS
+            and not _unrenderable_community_list(r, ned_id)
         ]
     if scope == "bgp":
         out: list[tuple[object, str, tuple]] = []
@@ -1204,20 +1229,31 @@ async def _reader_compare_scope(client, device, scope, rows, *, ok, job_id, devi
     ``reader_compare_missing`` (retryable — last_apply_error keeps them eligible) and
     fails the scope, so the plugin settles deploying→apply_failed on the immediate
     post-apply reconcile instead of waiting out stuck_deploying_grace_minutes.
-    Status: "ok" / "missing" / "error" (never fails a good apply on reader trouble) /
-    None (nothing checkable — e.g. only nested non-keyed rows in the batch).
+    Status: "ok" / "missing" / "unknown" (the reader has no view of this scope on this
+    device — absence proves nothing) / "error" (never fails a good apply on reader
+    trouble) / None (nothing checkable — e.g. only nested non-keyed rows in the batch).
     NOT covered: NED/device-side divergence (CDB is the near edge of the device —
     that needs check-sync) and redistribution rows (nested non-keyed, guard parity).
     """
     from nso_adapter.core.removal import _RESIDUE_READERS, _guard_specs, _norm_key, _reader_keys
 
     try:
-        expected = _reader_compare_expected(scope, rows)
+        expected = _reader_compare_expected(scope, rows, getattr(device, "ned_id", None))
         reader = _RESIDUE_READERS.get(scope)
         spec = _guard_specs().get(scope)
         if not expected or reader is None or spec is None:
             return ok, 0, [], None
-        entry = await getattr(client, reader)(device.nso_device_name) or {}
+        entry = await getattr(client, reader)(device.nso_device_name)
+        if not entry:
+            # The reader answered with NOTHING. Every reader returns None by design when the
+            # device has no such config or the NED has no export surface for the scope
+            # (get_isis_interfaces: "Returns None if the device has no IS-IS config"). That
+            # is UNKNOWN, not "the writer silently dropped every key" — coercing it to {}
+            # classified every intended key as missing and pinned the scope permanently
+            # apply_failed on a device where NSO had committed the intent. An empty LIST
+            # inside a real payload ({"route": []}) is a different thing and still a drop.
+            logger.info("apply.reader_compare_unknown", job_id=job_id, device=device_name, scope=scope, reader=reader)
+            return ok, 0, [], "unknown"
         present = {gl.label: _reader_keys(scope, entry, gl) for gl in spec.lists}
         row_by_id: dict[int, object] = {}
         missing: dict[int, list[str]] = {}
