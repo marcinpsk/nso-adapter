@@ -53,6 +53,151 @@ def test_nokia_routed_kind_ies_when_service_global_table_or_mismatched_vrf():
     assert _nokia_routed_kind(_iface("logical", service="SVC", vrf="other")) == "ies"
 
 
+# ── _nokia_attr_kind (attribute-write context: routed kinds + lag) ────────────────
+
+
+def test_nokia_attr_kind_lag_for_a_lag_interface():
+    """A Nokia LAG's description/admin-state belong on `configure lag`, so the attribute-write
+    context is 'lag' — routed-kind returns None for a lag (it never carries an IP)."""
+    from nso_adapter.core.apply import _nokia_attr_kind
+
+    assert _nokia_attr_kind(_iface("lag")) == "lag"
+
+
+def test_nokia_attr_kind_matches_routed_for_l3_and_ports():
+    """For everything except a lag, the attribute context is the routed context: base/ies/vprn
+    for L3 routed interfaces, None for a physical port (→ the legacy port path)."""
+    from nso_adapter.core.apply import _nokia_attr_kind
+
+    assert _nokia_attr_kind(_iface("loopback")) == "base"
+    assert _nokia_attr_kind(_iface("logical", service="VPRN-A", vrf="VPRN-A")) == "vprn"
+    assert _nokia_attr_kind(_iface("logical", service="IES-1", vrf="")) == "ies"
+    assert _nokia_attr_kind(_iface("physical")) is None
+
+
+# ── _apply_attributes threads the Nokia routed context (Finding C-drift) ──────────
+
+
+def _capturing_nso_client() -> tuple[NsoClient, list]:
+    """A spec'd NsoClient whose HTTP pool records every PATCH content. Only the RESTCONF
+    boundary is faked; the real ``_apply_attributes`` → ``apply_interface_attribute`` body
+    building runs unchanged. Returns (client, list-of-decoded-PATCH-bodies)."""
+    import json
+    from unittest.mock import MagicMock
+
+    import httpx
+
+    from nso_adapter.nso.client import NsoClient as _Client
+
+    bodies: list = []
+
+    async def _patch(url, content=None, headers=None):
+        bodies.append(json.loads(content))
+        return httpx.Response(204, request=httpx.Request("PATCH", url), text="")
+
+    http = AsyncMock()
+    http.patch.side_effect = _patch
+    client = MagicMock(spec=_Client)
+    client._base = "http://nso"
+    client._action_timeout = 120.0
+    cm = client._client.return_value
+    cm.__aenter__.return_value = http
+    cm.__aexit__.return_value = False
+    return client, bodies
+
+
+async def test_apply_attributes_threads_nokia_routed_context():
+    """The real per-scope apply path derives base|ies|vprn for a Nokia routed interface and
+    threads it into the attribute PATCH, so description/enabled land on the router/service
+    interface — not a phantom ``configure port <logical-name>`` (Finding C-drift root cause)."""
+    from nso_adapter.core.apply import _apply_attributes
+    from nso_adapter.nso.apply import apply_interface_attribute
+
+    iface = DbInterface(
+        device_id=1,
+        netbox_interface_id=7001,
+        name="CRPD-VPN:LO7",
+        kind="loopback",
+        service="CRPD-VPN",
+        vrf="CRPD-VPN",  # vrf == service ⇒ vprn
+        parent_binding="lag-99",
+        encap_tag="10",
+    )
+    attr_state = InterfaceAttrState(interface_id=1, attribute="description", sync_state=SyncState.accepted)
+    intent = InterfaceIntent(interface_id=1, attribute="description", intent_value="loopback for CRPD-VPN")
+
+    client, bodies = _capturing_nso_client()
+    ok, failed, failures = await _apply_attributes(
+        [(attr_state, intent, iface)],
+        apply_interface_attribute,
+        client=client,
+        device_name="ra1",
+        job_id=1,
+        now=datetime.now(UTC),
+    )
+
+    assert (ok, failed) == (1, 0)
+    assert attr_state.sync_state == SyncState.in_sync
+    entry = bodies[0]["interface-reconciler:interface-config"][0]
+    assert entry["kind"] == "vprn"
+    assert entry["service"] == "CRPD-VPN"
+    assert entry["parent-binding"] == "lag-99"
+    assert entry["encap-tag"] == "10"
+    assert entry["description"] == "loopback for CRPD-VPN"
+
+
+async def test_apply_attributes_threads_lag_kind_for_a_nokia_lag():
+    """A Nokia LAG's attribute PATCH carries kind='lag' (no service/binding), so the reconciler
+    writes description/admin-state to `configure lag`, not a phantom `configure port lag-N`."""
+    from nso_adapter.core.apply import _apply_attributes
+    from nso_adapter.nso.apply import apply_interface_attribute
+
+    iface = DbInterface(device_id=1, netbox_interface_id=7003, name="lag-30", kind="lag")
+    attr_state = InterfaceAttrState(interface_id=1, attribute="description", sync_state=SyncState.accepted)
+    intent = InterfaceIntent(interface_id=1, attribute="description", intent_value="uplink bundle")
+
+    client, bodies = _capturing_nso_client()
+    await _apply_attributes(
+        [(attr_state, intent, iface)],
+        apply_interface_attribute,
+        client=client,
+        device_name="ra1",
+        job_id=1,
+        now=datetime.now(UTC),
+    )
+
+    entry = bodies[0]["interface-reconciler:interface-config"][0]
+    assert entry["kind"] == "lag"
+    assert entry["description"] == "uplink bundle"
+    assert "service" not in entry  # a LAG is not an IES/VPRN service
+
+
+async def test_apply_attributes_ios_interface_omits_routed_context():
+    """A non-Nokia interface (kind unset) carries no routed context — the per-scope path is
+    unchanged for IOS/Junos, guarding against a false kind leaking into every PATCH."""
+    from nso_adapter.core.apply import _apply_attributes
+    from nso_adapter.nso.apply import apply_interface_attribute
+
+    iface = DbInterface(device_id=1, netbox_interface_id=7002, name="GigabitEthernet0/0")
+    attr_state = InterfaceAttrState(interface_id=1, attribute="enabled", sync_state=SyncState.accepted)
+    intent = InterfaceIntent(interface_id=1, attribute="enabled", intent_value="true")
+
+    client, bodies = _capturing_nso_client()
+    await _apply_attributes(
+        [(attr_state, intent, iface)],
+        apply_interface_attribute,
+        client=client,
+        device_name="core-rtr-01",
+        job_id=1,
+        now=datetime.now(UTC),
+    )
+
+    entry = bodies[0]["interface-reconciler:interface-config"][0]
+    assert entry["enabled"] is True
+    assert "kind" not in entry and "service" not in entry
+    assert "parent-binding" not in entry and "encap-tag" not in entry
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 

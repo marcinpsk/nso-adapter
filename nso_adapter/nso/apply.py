@@ -433,6 +433,31 @@ def _coerce_enabled_intent(value) -> bool:
     )
 
 
+def _add_nokia_routed_context(
+    entry: dict,
+    *,
+    kind: str | None,
+    service: str | None,
+    parent_binding: str | None,
+    encap_tag: str | None,
+) -> None:
+    """Stamp the Nokia routed-interface context onto *entry* in place (no-op when kind is None).
+
+    Shared by the IP path (:func:`build_interface_ip_entry`) and the per-scope attribute path
+    (:func:`apply_interface_attribute`) so both route a Nokia logical/loopback interface's config
+    to the ``router``/``service`` interface instead of the physical port. Ignored by IOS/Junos.
+    """
+    if not kind:
+        return
+    entry["kind"] = kind
+    if service:
+        entry["service"] = service
+    if parent_binding:
+        entry["parent-binding"] = parent_binding
+    if encap_tag:
+        entry["encap-tag"] = encap_tag
+
+
 async def apply_interface_attribute(
     client: NsoClient,
     device_name: str,
@@ -440,12 +465,21 @@ async def apply_interface_attribute(
     attribute: str,
     value: str | None,
     *,
+    kind: str | None = None,
+    service: str | None = None,
+    parent_binding: str | None = None,
+    encap_tag: str | None = None,
     dry_run: bool | str = False,
 ) -> str | None:
     """Write a single (device, interface, attribute) intent slice to NSO.
 
     Creates or updates the service instance keyed by (device_name, interface_name)
     using NSO RESTCONF PATCH with the reconcile commit option.
+
+    ``kind``/``service``/``parent_binding``/``encap_tag`` carry the Nokia routed-interface
+    context (base|ies|vprn) so a logical/loopback interface's description/enabled lands on the
+    ``router``/``service`` interface, not a phantom ``configure port <logical-name>`` — the
+    per-scope twin of what :func:`apply_interface_ips` already threads. Ignored by IOS/Junos.
 
     Raises NsoApplyError on failure.
     """
@@ -460,6 +494,7 @@ async def apply_interface_attribute(
     }
 
     entry = service_body["interface-reconciler:interface-config"][0]
+    _add_nokia_routed_context(entry, kind=kind, service=service, parent_binding=parent_binding, encap_tag=encap_tag)
 
     if attribute == "description":
         entry["description"] = value if value is not None else ""
@@ -554,14 +589,7 @@ def build_interface_ip_entry(
 
     # Nokia routed-interface context (apply): route the IP to the router/service
     # interface, not the port. Only emitted when kind is set (Nokia L3 interfaces).
-    if kind:
-        entry["kind"] = kind
-        if service:
-            entry["service"] = service
-        if parent_binding:
-            entry["parent-binding"] = parent_binding
-        if encap_tag:
-            entry["encap-tag"] = encap_tag
+    _add_nokia_routed_context(entry, kind=kind, service=service, parent_binding=parent_binding, encap_tag=encap_tag)
 
     ipv4_entries = []
     ipv6_entries = []

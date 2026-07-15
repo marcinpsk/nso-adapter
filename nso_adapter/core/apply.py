@@ -92,6 +92,20 @@ def _nokia_routed_kind(iface) -> str | None:
     return "base"
 
 
+def _nokia_attr_kind(iface) -> str | None:
+    """SR OS context for a Nokia interface's description/admin-state write.
+
+    Extends :func:`_nokia_routed_kind` (base|ies|vprn for an L3 routed interface) with ``lag``:
+    a Nokia LAG's description/admin-state live under ``configure lag <lag-N>``, not a port and
+    not a router interface. Physical ports (and non-Nokia interfaces) return ``None`` → the
+    legacy ``configure port`` path. Distinct from ``_nokia_routed_kind`` because a LAG never
+    carries an IP, so the IP path must keep returning ``None`` for it.
+    """
+    if iface.kind == "lag":
+        return "lag"
+    return _nokia_routed_kind(iface)
+
+
 async def enqueue_apply(db: AsyncSession, device_id: int, force: bool = True) -> Job | None:
     """Create an apply job if no active job exists.  Returns Job or None if blocked.
 
@@ -127,6 +141,7 @@ async def _diff_interface_attributes(db, nso_apply, client, device_name: str, if
         rows = (
             (await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface.id))).scalars().all()
         )
+        rk = _nokia_attr_kind(iface)
         for r in rows:
             if r.accepted_at is None or r.attribute not in ("description", "enabled"):
                 continue
@@ -137,6 +152,10 @@ async def _diff_interface_attributes(db, nso_apply, client, device_name: str, if
                     interface_name=iface.name,
                     attribute=r.attribute,
                     value=r.intent_value,
+                    kind=rk,
+                    service=iface.service if rk in ("ies", "vprn") else None,
+                    parent_binding=iface.parent_binding,
+                    encap_tag=iface.encap_tag,
                     dry_run=fmt,
                 )
             except Exception as exc:  # noqa: BLE001 — preview must never fail hard
@@ -573,6 +592,7 @@ async def _apply_attributes(eligible, apply_fn, *, client, device_name, job_id, 
     failed = 0
     failures: list[dict] = []
     for attr_state, intent_row, iface in eligible:
+        routed_kind = _nokia_attr_kind(iface)
         try:
             await apply_fn(
                 client=client,
@@ -580,6 +600,10 @@ async def _apply_attributes(eligible, apply_fn, *, client, device_name, job_id, 
                 interface_name=iface.name,
                 attribute=intent_row.attribute,
                 value=intent_row.intent_value,
+                kind=routed_kind,
+                service=iface.service if routed_kind in ("ies", "vprn") else None,
+                parent_binding=iface.parent_binding,
+                encap_tag=iface.encap_tag,
             )
         except NsoApplyError as exc:
             logger.error(

@@ -162,6 +162,58 @@ async def test_apply_description_none_uses_empty_string():
 
 
 @pytest.mark.asyncio
+async def test_apply_interface_attribute_nokia_routed_context():
+    """A Nokia logical/loopback interface's description carries the base|ies|vprn routed
+    context so the reconciler writes it onto the router/service interface, not the phantom
+    ``configure port <logical-name>``. Without this the per-scope attribute apply drifts a
+    Nokia interface_attribute roundtrip (Finding C-drift)."""
+    client = _make_nso_client()
+    _mock_http_ctx(client, _httpx_response(204))
+
+    await apply_interface_attribute(
+        client,
+        "ra1",
+        "CRPD-VPN:LO7",
+        "description",
+        "loopback for CRPD-VPN",
+        kind="vprn",
+        service="CRPD-VPN",
+        parent_binding="lag-99",
+        encap_tag="10",
+    )
+
+    import json
+
+    entry = json.loads(client._client.return_value.__aenter__.return_value.patch.call_args_list[0].kwargs["content"])[
+        "interface-reconciler:interface-config"
+    ][0]
+    assert entry["kind"] == "vprn"
+    assert entry["service"] == "CRPD-VPN"
+    assert entry["parent-binding"] == "lag-99"
+    assert entry["encap-tag"] == "10"
+    assert entry["description"] == "loopback for CRPD-VPN"
+
+
+@pytest.mark.asyncio
+async def test_apply_interface_attribute_no_kind_omits_routed_fields():
+    """IOS/Junos (no kind) attribute PATCH carries no Nokia routed-interface fields — the
+    existing per-scope behaviour is unchanged when the interface is not a Nokia L3 one."""
+    client = _make_nso_client()
+    _mock_http_ctx(client, _httpx_response(204))
+
+    await apply_interface_attribute(client, "rtr", "GigabitEthernet0/0", "enabled", "True")
+
+    import json
+
+    entry = json.loads(client._client.return_value.__aenter__.return_value.patch.call_args_list[0].kwargs["content"])[
+        "interface-reconciler:interface-config"
+    ][0]
+    assert entry["enabled"] is True
+    assert "kind" not in entry and "service" not in entry
+    assert "parent-binding" not in entry and "encap-tag" not in entry
+
+
+@pytest.mark.asyncio
 async def test_apply_unsupported_attribute_raises():
     """Unsupported attribute raises NsoApplyError immediately (no HTTP call)."""
     client = _make_nso_client()
