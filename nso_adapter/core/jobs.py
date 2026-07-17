@@ -230,6 +230,24 @@ async def _run_removal(job_id: int, device_id: int) -> None:
     await run_removal(job_id, device_id)
 
 
+async def _notify_provision_complete(job_id: int) -> None:
+    """Best-effort: tell the plugin a provision job finished so it advances the onboarding row.
+
+    Fire-and-forget — a callback failure must not fail the job; the plugin's device-tab self-heal
+    and hourly sweep still catch a missed notification. No-op when the NetBox client is unset
+    (e.g. tests, or a deployment without the plugin callback wired).
+    """
+    from nso_adapter.core.importer import get_netbox_client
+
+    nb = get_netbox_client()
+    if nb is None:
+        return
+    try:
+        await nb.notify_provision_complete(job_id)
+    except Exception as exc:  # noqa: BLE001 - best-effort callback; never fail the job on it
+        logger.warning("netbox.provision_complete_notify_failed", job_id=job_id, error=str(exc) or type(exc).__name__)
+
+
 async def _run_provision(job_id: int, device_id: int | None) -> None:
     """Run a queued device-onboarding job from its stored ``context`` parameters.
 
@@ -272,6 +290,11 @@ async def _run_provision(job_id: int, device_id: int | None) -> None:
         except Exception as exc:
             logger.exception("job.provision.failed", job_id=job_id, error=repr(exc))
             await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}})
+
+    # Tell the plugin the provision job reached a terminal state (any branch above) so it advances
+    # the gated onboarding row off the dashboard-poll path. Best-effort — the plugin's device-tab
+    # self-heal and hourly sweep still catch a missed callback.
+    await _notify_provision_complete(job_id)
 
 
 _JOB_RUNNERS = {

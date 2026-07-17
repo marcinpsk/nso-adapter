@@ -521,3 +521,70 @@ async def test_run_provision_marks_failed_even_when_session_poisoned(adapter_cli
     async for db in get_session():
         assert (await db.get(Job, job_id)).status == JobStatus.failed
         break
+
+
+class _FakeNb:
+    """Real-shape async fake of the NetBox client — records provision-complete callbacks."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def notify_provision_complete(self, job_id):
+        self.calls.append(job_id)
+
+
+async def _queue_provision_job(device_name: str) -> int:
+    job_id = 0
+    async for db in get_session():
+        j = Job(
+            job_type=JobType.provision,
+            device_id=None,
+            status=JobStatus.queued,
+            context={"nso_instance": "nso-dev", "device_name": device_name},
+        )
+        db.add(j)
+        await db.commit()
+        await db.refresh(j)
+        job_id = j.id
+        break
+    return job_id
+
+
+async def test_run_provision_notifies_plugin_on_success(adapter_client):
+    """A successful provision fires the plugin provision-complete callback with the job id."""
+    job_id = await _queue_provision_job("prov-notify-ok")
+    fake = _FakeNb()
+
+    async def ok_provision(db, **params):
+        return {"ok": True, "steps": [{"step": "create", "status": "ok"}], "device_id": None}
+
+    with (
+        patch("nso_adapter.core.onboarding.provision_nso_device", ok_provision),
+        patch("nso_adapter.core.importer.get_netbox_client", lambda: fake),
+    ):
+        await _run_provision(job_id, None)
+
+    async for db in get_session():
+        assert (await db.get(Job, job_id)).status == JobStatus.succeeded
+        break
+    assert fake.calls == [job_id]
+
+
+async def test_run_provision_notifies_plugin_on_failure(adapter_client):
+    """Even when provisioning fails, the runner still fires the callback so the plugin marks it failed."""
+    job_id = await _queue_provision_job("prov-notify-fail")
+    fake = _FakeNb()
+
+    async def boom_provision(db, **params):
+        raise RuntimeError("nso unreachable")
+
+    with (
+        patch("nso_adapter.core.onboarding.provision_nso_device", boom_provision),
+        patch("nso_adapter.core.importer.get_netbox_client", lambda: fake),
+    ):
+        await _run_provision(job_id, None)
+
+    async for db in get_session():
+        assert (await db.get(Job, job_id)).status == JobStatus.failed
+        break
+    assert fake.calls == [job_id]
