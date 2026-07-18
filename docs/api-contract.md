@@ -21,12 +21,26 @@
   ```json
   { "error": { "code": "string", "message": "human readable", "detail": {} } }
   ```
-  Codes (closed set — `/openapi.json` enum must match):
+  Codes (closed set — `/openapi.json` enum must match; mechanically enforced
+  by `nso_adapter/api/errors.py::ERROR_CODES` + `tests/api/test_error_codes.py`,
+  which pin call sites ⊆ ERROR_CODES ⊆ this document):
   - Phase 1: `unauthorized`, `not_found`, `validation_error`,
     `nso_unreachable`, `netbox_unreachable`, `conflict`, `internal`.
   - Phase 2: `not_implemented` (apply endpoint pre-M4),
     `nso_commit_failed` (M5+, reconcile-commit refused or partially
     failed; `error.detail.attributes` lists the failed ones).
+  - Per-endpoint: `ambiguous_device` (device lookup matches >1),
+    `bad_request` (malformed action parameter), `community_not_found`
+    (SNMP harvest), `harvest_unsupported_ned`, `invalid_vault_ref`
+    (secrets/SNMP refs), `no_ned_id` (capability probe before NED learned),
+    `no_nso_client` (device's NSO instance not configured),
+    `nso_unavailable` (secrets probe), `secrets_write_unsupported`,
+    `vault_error`, and route-policy intent validation:
+    `invalid_payload`, `invalid_family`, `invalid_name`, `invalid_entries`.
+  - Request-body validation failures (Pydantic) return the SAME envelope with
+    `code=validation_error` and the field errors under
+    `error.detail.errors` — FastAPI's default `{"detail": [...]}` shape is
+    never emitted.
 
 ### Call directions
 

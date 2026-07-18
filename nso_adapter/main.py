@@ -9,14 +9,16 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 
+from nso_adapter import __version__
 from nso_adapter.api.actions import router as actions_router
 from nso_adapter.api.bfd import router as bfd_router
 from nso_adapter.api.bgp import router as bgp_router
 from nso_adapter.api.capability import router as capability_router
 from nso_adapter.api.config import router as config_router
 from nso_adapter.api.devices import router as devices_router
-from nso_adapter.api.errors import ApiError, api_error_handler
+from nso_adapter.api.errors import ApiError, api_error_handler, validation_error_handler
 from nso_adapter.api.health import router as health_router
 from nso_adapter.api.intent import router as intent_router
 from nso_adapter.api.interface_ip import router as interface_ip_router
@@ -264,8 +266,9 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="NSO Adapter", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="NSO Adapter", version=__version__, lifespan=lifespan)
     app.add_exception_handler(ApiError, api_error_handler)
+    app.add_exception_handler(RequestValidationError, validation_error_handler)
 
     @app.middleware("http")
     async def _store_only_flag(request, call_next):

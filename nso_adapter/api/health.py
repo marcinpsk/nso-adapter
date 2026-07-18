@@ -5,12 +5,13 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 
+from nso_adapter import __version__
 from nso_adapter.config import get_config
 from nso_adapter.core.importer import get_nso_client
 
 router = APIRouter(tags=["health"])
 
-_VERSION = "0.1.0"
+_VERSION = __version__
 
 
 @router.get("/healthz")
