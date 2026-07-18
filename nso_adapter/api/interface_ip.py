@@ -158,7 +158,20 @@ async def _delete_rows_absent_from_payload(db, existing_rows, new_keys, iface_na
     return removed_interfaces, removed_addresses
 
 
-@router.put("/{device_id}/ip-intent", dependencies=[Depends(verify_token)])
+class IpIntentResult(BaseModel):
+    device_id: int
+    address_count: int
+    removed_interfaces: int
+    replaced: bool
+    updated_at: str  # "<iso>Z" stamped at write time
+
+
+@router.put(
+    "/{device_id}/ip-intent",
+    dependencies=[Depends(verify_token)],
+    response_model=IpIntentResult,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def put_ip_intent(device_id: int, body: IpIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's IP intent mirror for this device atomically.
 

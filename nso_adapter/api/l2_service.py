@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, IntentApplyResult, api_error
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import Device, DeviceL2Sap, DeviceSettings, L2SapIntent
 
@@ -109,7 +109,12 @@ class L2SapIntentUpdate(BaseModel):
     saps: list[L2SapEntry]
 
 
-@router.put("/{device_id}/l2-sap-intent", dependencies=[Depends(verify_token)])
+@router.put(
+    "/{device_id}/l2-sap-intent",
+    dependencies=[Depends(verify_token)],
+    response_model=IntentApplyResult,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def put_l2_sap_intent(device_id: int, body: L2SapIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's L2 SAP intent mirror for this device atomically.
 

@@ -479,7 +479,18 @@ async def _maybe_enqueue_isis_apply(db, device_id: int, iface_count: int, proc_c
         await enqueue_apply(db, device_id, force=True)
 
 
-@router.put("/{device_id}/isis-interface-intent", dependencies=[Depends(verify_token)])
+class IsisInterfaceIntentResult(BaseModel):
+    device_id: int
+    interface_count: int
+    process_count: int
+
+
+@router.put(
+    "/{device_id}/isis-interface-intent",
+    dependencies=[Depends(verify_token)],
+    response_model=IsisInterfaceIntentResult,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def put_isis_interface_intent(
     device_id: int, body: IsisInterfaceIntentUpdate, db: AsyncSession = Depends(get_db)
 ):
@@ -617,7 +628,18 @@ class IsisFlexAlgoIntentUpdate(BaseModel):
     flex_algos: list[IsisFlexAlgoEntry]
 
 
-@router.put("/{device_id}/isis-flex-algo-intent", dependencies=[Depends(verify_token)])
+class IsisFlexAlgoIntentResult(BaseModel):
+    device_id: int
+    flex_algo_count: int
+    removal_queued: bool
+
+
+@router.put(
+    "/{device_id}/isis-flex-algo-intent",
+    dependencies=[Depends(verify_token)],
+    response_model=IsisFlexAlgoIntentResult,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def put_isis_flex_algo_intent(device_id: int, body: IsisFlexAlgoIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's IS-IS Flex-Algorithm intent mirror for this device atomically.
 

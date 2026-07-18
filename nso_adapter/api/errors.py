@@ -95,6 +95,22 @@ class ErrorEnvelope(BaseModel):
     error: ErrorBody
 
 
+class IntentApplyResult(BaseModel):
+    """Shared 2xx body for the full-replace intent PUTs.
+
+    Eight intent endpoints (static-route/vlan/svi/subinterface/l2-sap/logging/
+    bfd/interface-mtu) return exactly this shape: how many rows the payload wrote
+    (``count``), how many it dropped (``removed``), and whether a PUT-replace was
+    enqueued to revert a removal/clear on the device (``replaced``). Endpoints
+    with a different summary (bgp/ospf/isis/snmp/ip) keep their own inline model.
+    """
+
+    device_id: int
+    count: int
+    removed: int
+    replaced: bool
+
+
 class ApiError(HTTPException):
     """HTTPException whose detail IS the full response body (no FastAPI wrapping)."""
 

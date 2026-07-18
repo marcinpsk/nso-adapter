@@ -323,7 +323,18 @@ async def _maybe_enqueue_apply(db: AsyncSession, device_id: int, count: int) -> 
         await enqueue_apply(db, device_id, force=True)
 
 
-@router.put("/{device_id}/ospf-intent", dependencies=[Depends(verify_token)])
+class OspfIntentResult(BaseModel):
+    device_id: int
+    instance_count: int
+    interface_count: int
+
+
+@router.put(
+    "/{device_id}/ospf-intent",
+    dependencies=[Depends(verify_token)],
+    response_model=OspfIntentResult,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's OSPF intent mirror for this device atomically.
 

@@ -15,7 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, IntentApplyResult, api_error
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import Device, DeviceInterfaceMtu, DeviceSettings, InterfaceMtuIntent
 
@@ -99,7 +99,12 @@ class InterfaceMtuIntentUpdate(BaseModel):
     interfaces: list[InterfaceMtuEntry]
 
 
-@router.put("/{device_id}/interface-mtu-intent", dependencies=[Depends(verify_token)])
+@router.put(
+    "/{device_id}/interface-mtu-intent",
+    dependencies=[Depends(verify_token)],
+    response_model=IntentApplyResult,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def put_interface_mtu_intent(device_id: int, body: InterfaceMtuIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's per-interface MTU intent mirror for this device atomically.
 

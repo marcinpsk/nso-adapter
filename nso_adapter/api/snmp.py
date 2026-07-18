@@ -320,7 +320,21 @@ async def _sync_system_info(db: AsyncSession, device_id: int, entry: SnmpSystemI
     return False
 
 
-@router.put("/{device_id}/snmp-intent", dependencies=[Depends(verify_token)])
+class SnmpIntentResult(BaseModel):
+    device_id: int
+    community_count: int
+    v3_user_count: int
+    host_count: int
+    has_system_info: bool
+    updated_at: str  # "<iso>Z" stamped at write time
+
+
+@router.put(
+    "/{device_id}/snmp-intent",
+    dependencies=[Depends(verify_token)],
+    response_model=SnmpIntentResult,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's SNMP intent mirror for this device atomically.
 

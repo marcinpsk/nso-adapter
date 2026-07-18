@@ -563,7 +563,17 @@ def _bgp_removed(
     return sorted(existing_asns - incoming_asns), sorted(existing_peers - incoming_peers)
 
 
-@router.put("/{device_id}/bgp-intent", dependencies=[Depends(verify_token)])
+class BgpIntentResult(BaseModel):
+    device_id: int
+    router_count: int
+
+
+@router.put(
+    "/{device_id}/bgp-intent",
+    dependencies=[Depends(verify_token)],
+    response_model=BgpIntentResult,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def put_bgp_intent(device_id: int, body: BgpIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's BGP intent mirror for this device atomically.
 

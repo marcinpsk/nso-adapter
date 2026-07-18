@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, IntentApplyResult, api_error
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import BfdIntent, Device, DeviceBfdInterface, DeviceSettings
 
@@ -119,7 +119,12 @@ class BfdIntentUpdate(BaseModel):
     interfaces: list[BfdEntry]
 
 
-@router.put("/{device_id}/bfd-intent", dependencies=[Depends(verify_token)])
+@router.put(
+    "/{device_id}/bfd-intent",
+    dependencies=[Depends(verify_token)],
+    response_model=IntentApplyResult,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def put_bfd_intent(device_id: int, body: BfdIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's per-interface BFD intent mirror for this device atomically.
 

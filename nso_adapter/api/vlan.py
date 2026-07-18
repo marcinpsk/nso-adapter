@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, IntentApplyResult, api_error
 from nso_adapter.core.importer import get_nso_client
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.core.switchport_intent import apply_switchport_config as apply_switchport_core
@@ -155,7 +155,12 @@ class VlanIntentUpdate(BaseModel):
     vlans: list[VlanEntry]
 
 
-@router.put("/{device_id}/vlan-intent", dependencies=[Depends(verify_token)])
+@router.put(
+    "/{device_id}/vlan-intent",
+    dependencies=[Depends(verify_token)],
+    response_model=IntentApplyResult,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def put_vlan_intent(device_id: int, body: VlanIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's VLAN-database intent mirror for this device atomically.
 
