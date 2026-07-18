@@ -11,10 +11,20 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.store.models import Device, DeviceSettings, ManagedScope
 
 router = APIRouter(prefix="/api/v1/devices", tags=["scope"])
+
+
+class ScopeOut(BaseModel):
+    """EMIT-NULL fixed-key scope shape (updated_at = max attr time, or a read-time mint if empty)."""
+
+    device_id: int
+    attributes: list[str]
+    auto_apply: bool
+    sync_before_apply: bool
+    updated_at: str
 
 
 def _scope_out(device_id: int, attrs: list[ManagedScope], settings: DeviceSettings | None) -> dict:
@@ -28,7 +38,12 @@ def _scope_out(device_id: int, attrs: list[ManagedScope], settings: DeviceSettin
     }
 
 
-@router.get("/{device_id}/scope", dependencies=[Depends(verify_token)])
+@router.get(
+    "/{device_id}/scope",
+    dependencies=[Depends(verify_token)],
+    response_model=ScopeOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_scope(device_id: int, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, device_id)
     if not device:
@@ -50,7 +65,12 @@ class ScopeUpdate(BaseModel):
     oob_ip: str | None = None
 
 
-@router.put("/{device_id}/scope", dependencies=[Depends(verify_token)])
+@router.put(
+    "/{device_id}/scope",
+    dependencies=[Depends(verify_token)],
+    response_model=ScopeOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def update_scope(device_id: int, body: ScopeUpdate, db: AsyncSession = Depends(get_db)):
     from nso_adapter.core.onboarding import set_scope
 

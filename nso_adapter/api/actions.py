@@ -12,11 +12,37 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import (
+    RESP_400,
+    RESP_401,
+    RESP_404_DEVICE,
+    RESP_409_ACTIVE_JOB,
+    RESP_422_VALIDATION,
+    api_error,
+)
 from nso_adapter.core.jobs import enqueue_job
 from nso_adapter.store.models import Device, JobType
 
 router = APIRouter(prefix="/api/v1/devices", tags=["actions"])
+
+# All action endpoints emit 401 (token) + 422 (device_id path); the responses fragments
+# below add the ones each endpoint actually raises. The trigger POSTs go through
+# _trigger (404 + 409-active-job); force-removal / apply-diff raise 400 bad_request.
+_TRIGGER_ERRORS = {**RESP_401, **RESP_404_DEVICE, **RESP_409_ACTIVE_JOB, **RESP_422_VALIDATION}
+
+
+class JobTriggerOut(BaseModel):
+    """The async-action envelope: the id of the enqueued job (202)."""
+
+    job_id: int
+
+
+class ApplyDiffOut(BaseModel):
+    """apply-diff preview — {scope: native_delta} for scopes with a non-empty change."""
+
+    device_id: int
+    outformat: str
+    diffs: dict[str, str]
 
 
 async def _trigger(
@@ -39,7 +65,13 @@ class ForceRemovalBody(BaseModel):
     interfaces: list[str] | None = None
 
 
-@router.post("/{device_id}/actions/force-removal", status_code=202, dependencies=[Depends(verify_token)])
+@router.post(
+    "/{device_id}/actions/force-removal",
+    status_code=202,
+    dependencies=[Depends(verify_token)],
+    response_model=JobTriggerOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_400, **RESP_422_VALIDATION},
+)
 async def action_force_removal(
     device_id: int,
     body: ForceRemovalBody,
@@ -77,7 +109,13 @@ async def action_force_removal(
     return {"job_id": job.id}
 
 
-@router.post("/{device_id}/actions/sync", status_code=202, dependencies=[Depends(verify_token)])
+@router.post(
+    "/{device_id}/actions/sync",
+    status_code=202,
+    dependencies=[Depends(verify_token)],
+    response_model=JobTriggerOut,
+    responses=_TRIGGER_ERRORS,
+)
 async def action_sync(
     device_id: int,
     db: AsyncSession = Depends(get_db),
@@ -85,7 +123,13 @@ async def action_sync(
     return await _trigger(device_id, JobType.sync, db)
 
 
-@router.post("/{device_id}/actions/detect-drift", status_code=202, dependencies=[Depends(verify_token)])
+@router.post(
+    "/{device_id}/actions/detect-drift",
+    status_code=202,
+    dependencies=[Depends(verify_token)],
+    response_model=JobTriggerOut,
+    responses=_TRIGGER_ERRORS,
+)
 async def action_detect_drift(
     device_id: int,
     db: AsyncSession = Depends(get_db),
@@ -93,7 +137,13 @@ async def action_detect_drift(
     return await _trigger(device_id, JobType.detect_drift, db)
 
 
-@router.post("/{device_id}/actions/connect", status_code=202, dependencies=[Depends(verify_token)])
+@router.post(
+    "/{device_id}/actions/connect",
+    status_code=202,
+    dependencies=[Depends(verify_token)],
+    response_model=JobTriggerOut,
+    responses=_TRIGGER_ERRORS,
+)
 async def action_connect(
     device_id: int,
     db: AsyncSession = Depends(get_db),
@@ -101,7 +151,13 @@ async def action_connect(
     return await _trigger(device_id, JobType.connect, db)
 
 
-@router.post("/{device_id}/sync-notify", status_code=202, dependencies=[Depends(verify_token)])
+@router.post(
+    "/{device_id}/sync-notify",
+    status_code=202,
+    dependencies=[Depends(verify_token)],
+    response_model=JobTriggerOut,
+    responses=_TRIGGER_ERRORS,
+)
 async def sync_notify(
     device_id: int,
     db: AsyncSession = Depends(get_db),
@@ -114,7 +170,13 @@ async def sync_notify(
     return await _trigger(device_id, JobType.sync, db)
 
 
-@router.post("/{device_id}/actions/apply", status_code=202, dependencies=[Depends(verify_token)])
+@router.post(
+    "/{device_id}/actions/apply",
+    status_code=202,
+    dependencies=[Depends(verify_token)],
+    response_model=JobTriggerOut,
+    responses=_TRIGGER_ERRORS,
+)
 async def action_apply(
     device_id: int,
     db: AsyncSession = Depends(get_db),
@@ -123,7 +185,12 @@ async def action_apply(
     return await _trigger(device_id, JobType.apply, db)
 
 
-@router.get("/{device_id}/actions/apply-diff", dependencies=[Depends(verify_token)])
+@router.get(
+    "/{device_id}/actions/apply-diff",
+    dependencies=[Depends(verify_token)],
+    response_model=ApplyDiffOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_400, **RESP_422_VALIDATION},
+)
 async def action_apply_diff(
     device_id: int,
     outformat: str = "native",

@@ -17,7 +17,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.store.models import (
     DbInterface,
     Device,
@@ -44,6 +44,48 @@ class IntentUpdate(BaseModel):
     attributes: list[IntentAttribute]
 
 
+class IntentRowOut(BaseModel):
+    """One mirror row — EMIT-NULL (all six keys always present)."""
+
+    interface: str
+    attribute: str
+    intent_value: str | None
+    accepted_at: str | None
+    last_apply_at: str | None
+    last_apply_error: dict | None
+
+
+class IntentReadOut(BaseModel):
+    """GET /intent — attributes plus a read-time (frozen-in-test) updated_at mint."""
+
+    device_id: int
+    attributes: list[IntentRowOut]
+    updated_at: str
+
+
+class IntentPutResultOut(BaseModel):
+    """PUT /intent — count of landed rows plus a write-time updated_at mint."""
+
+    device_id: int
+    attribute_count: int
+    updated_at: str
+
+
+class IntentScopeCount(BaseModel):
+    """Per-scope apply-state breakdown in the intent-summary map."""
+
+    count: int
+    applied: int
+    failed: int
+
+
+class IntentSummaryOut(BaseModel):
+    """GET /intent-summary — a {scope_name: {count, applied, failed}} map, non-empty scopes only."""
+
+    device_id: int
+    scopes: dict[str, IntentScopeCount]
+
+
 def _intent_row_out(row: InterfaceIntent, if_name: str) -> dict:
     return {
         "interface": if_name,
@@ -55,7 +97,12 @@ def _intent_row_out(row: InterfaceIntent, if_name: str) -> dict:
     }
 
 
-@router.put("/{device_id}/intent", dependencies=[Depends(verify_token)])
+@router.put(
+    "/{device_id}/intent",
+    dependencies=[Depends(verify_token)],
+    response_model=IntentPutResultOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def put_intent(device_id: int, body: IntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's intent mirror for this device atomically.
 
@@ -152,7 +199,12 @@ async def put_intent(device_id: int, body: IntentUpdate, db: AsyncSession = Depe
     }
 
 
-@router.get("/{device_id}/intent", dependencies=[Depends(verify_token)])
+@router.get(
+    "/{device_id}/intent",
+    dependencies=[Depends(verify_token)],
+    response_model=IntentReadOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_intent(device_id: int, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, device_id)
     if not device:
@@ -218,7 +270,12 @@ async def _device_intent_counts(db: AsyncSession, device_id: int) -> dict[str, d
     return out
 
 
-@router.get("/{device_id}/intent-summary", dependencies=[Depends(verify_token)])
+@router.get(
+    "/{device_id}/intent-summary",
+    dependencies=[Depends(verify_token)],
+    response_model=IntentSummaryOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_intent_summary(device_id: int, db: AsyncSession = Depends(get_db)):
     """Per-scope summary of the adapter's intent mirror for a device.
 

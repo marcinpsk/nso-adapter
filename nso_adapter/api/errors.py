@@ -157,6 +157,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 # dependencies' + framework paths) — never a blanket router-level set.
 _ENVELOPE_SCHEMA = {"model": ErrorEnvelope}
 
+RESP_400 = {400: {**_ENVELOPE_SCHEMA, "description": "Bad request"}}
 RESP_401 = {401: {**_ENVELOPE_SCHEMA, "description": "Missing or invalid bearer token"}}
 RESP_404_DEVICE = {404: {**_ENVELOPE_SCHEMA, "description": "Device not found"}}
 RESP_404 = {404: {**_ENVELOPE_SCHEMA, "description": "Not found"}}
