@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
+from nso_adapter.api.errors import RESP_401, RESP_422_VALIDATION
 from nso_adapter.config import get_config
 from nso_adapter.core.failover import (
     EffectiveFailoverConfig,
@@ -20,6 +21,22 @@ from nso_adapter.core.failover import (
 )
 
 router = APIRouter(prefix="/api/v1/config", tags=["config"])
+
+
+class FailoverConfigOut(BaseModel):
+    """Effective failover tuning (canonical un-prefixed field names) — every key present."""
+
+    enabled: bool
+    deployment_enabled: bool
+    primary_probe_interval: int
+    oob_probe_interval: int
+    failure_threshold: int
+    success_threshold: int
+    probe_timeout: float
+    active_probe_timeout: float
+    probe_concurrency: int
+    max_flips_per_tick: int
+    sync_from_after_switch: bool
 
 
 def _config_out(eff: EffectiveFailoverConfig, deployment_enabled: bool) -> dict:
@@ -67,7 +84,12 @@ class FailoverConfigUpdate(BaseModel):
     sync_from_after_switch: bool | None = None
 
 
-@router.get("/failover", dependencies=[Depends(verify_token)])
+@router.get(
+    "/failover",
+    dependencies=[Depends(verify_token)],
+    response_model=FailoverConfigOut,
+    responses={**RESP_401},
+)
 async def get_failover_config(db: AsyncSession = Depends(get_db)):
     """Return the live failover config (the stored singleton, or the static fallback)."""
     sched = get_config().scheduler
@@ -75,7 +97,12 @@ async def get_failover_config(db: AsyncSession = Depends(get_db)):
     return _config_out(eff, sched.enable_failover)
 
 
-@router.put("/failover", dependencies=[Depends(verify_token)])
+@router.put(
+    "/failover",
+    dependencies=[Depends(verify_token)],
+    response_model=FailoverConfigOut,
+    responses={**RESP_401, **RESP_422_VALIDATION},
+)
 async def put_failover_config(body: FailoverConfigUpdate, db: AsyncSession = Depends(get_db)):
     """Upsert the failover tuning singleton; the next base-tick reads the new values."""
     await upsert_failover_config(db, **body.model_dump(exclude_unset=True))

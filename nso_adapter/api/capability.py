@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404, RESP_404_DEVICE, RESP_409, RESP_422_VALIDATION, api_error
 from nso_adapter.core import capability
 from nso_adapter.core.importer import get_nso_client
 from nso_adapter.store.models import Device
@@ -51,6 +51,69 @@ class ReadCapabilityReport(BaseModel):
     elements: list[ReadCapabilityElement] = []
 
 
+# ── Response models ───────────────────────────────────────────────────────────
+# The GET + both preflights are two-branch: the "known" branch adds a (ned_id,
+# sw_version) key and coverage_unknown; the "unknown" branch omits them. Those keys
+# are unset-by-default optionals + response_model_exclude_unset=True, so an omitted
+# key stays absent (never null). The golden tests pin every branch's exact bytes.
+
+
+class CapabilityElementOut(BaseModel):
+    scope: str
+    name: str
+    status: str
+    detail: str
+    source: str
+
+
+class CapabilityOut(BaseModel):
+    known: bool
+    ned_id: str
+    sw_version: str
+    coverage_unknown: bool | None = None  # present only in the known branch
+    elements: list[CapabilityElementOut]
+
+
+class CapabilityKeyCountOut(BaseModel):
+    """{ned_id, sw_version, count} — shared by refresh + read-capability report."""
+
+    ned_id: str
+    sw_version: str
+    count: int
+
+
+class RoutePolicyPreflightUnsupported(BaseModel):
+    scope: str
+    element: str
+    status: str
+    detail: str
+
+
+class RoutePolicyPreflightOut(BaseModel):
+    known: bool
+    ned_id: str | None = None  # present only in the known branch
+    sw_version: str | None = None  # present only in the known branch
+    fully_supported: bool
+    unsupported: list[RoutePolicyPreflightUnsupported]
+    coverage_unknown: bool
+
+
+class ApplyPreflightUnsupported(BaseModel):
+    scope: str
+    name: str
+    status: str
+    detail: str
+
+
+class ApplyPreflightOut(BaseModel):
+    known: bool
+    ned_id: str | None = None  # present only in the known branch
+    sw_version: str | None = None  # present only in the known branch
+    coverage_unknown: bool
+    fully_supported: bool
+    unsupported: list[ApplyPreflightUnsupported]
+
+
 async def _device_and_client(device_id: int, db: AsyncSession):
     device = await db.get(Device, device_id)
     if not device:
@@ -62,7 +125,12 @@ async def _device_and_client(device_id: int, db: AsyncSession):
     return device, client
 
 
-@router.post("/{device_id}/capability/refresh", dependencies=[Depends(verify_token)])
+@router.post(
+    "/{device_id}/capability/refresh",
+    dependencies=[Depends(verify_token)],
+    response_model=CapabilityKeyCountOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409, **RESP_422_VALIDATION},
+)
 async def refresh_capability(device_id: int, db: AsyncSession = Depends(get_db)):
     """Force a capability probe for this device now ('check now') and persist the result."""
     device, client = await _device_and_client(device_id, db)
@@ -70,7 +138,13 @@ async def refresh_capability(device_id: int, db: AsyncSession = Depends(get_db))
     return info or {"ned_id": "", "sw_version": "", "count": 0}
 
 
-@router.get("/{device_id}/capability", dependencies=[Depends(verify_token)])
+@router.get(
+    "/{device_id}/capability",
+    dependencies=[Depends(verify_token)],
+    response_model=CapabilityOut,
+    response_model_exclude_unset=True,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409, **RESP_422_VALIDATION},
+)
 async def get_capability(device_id: int, refresh: bool = False, db: AsyncSession = Depends(get_db)):
     """Return the cached capability verdict for this device's (ned_id, sw_version).
 
@@ -94,7 +168,12 @@ async def get_capability(device_id: int, refresh: bool = False, db: AsyncSession
     }
 
 
-@router.post("/read-capability/report", dependencies=[Depends(verify_token)])
+@router.post(
+    "/read-capability/report",
+    dependencies=[Depends(verify_token)],
+    response_model=CapabilityKeyCountOut,
+    responses={**RESP_401, **RESP_404, **RESP_409, **RESP_422_VALIDATION},
+)
 async def report_read_capability(body: ReadCapabilityReport, db: AsyncSession = Depends(get_db)):
     """Ingest the READ half of the capability matrix from an external read probe.
 
@@ -124,7 +203,13 @@ async def report_read_capability(body: ReadCapabilityReport, db: AsyncSession = 
     return {"ned_id": ned_id, "sw_version": sw_version, "count": count}
 
 
-@router.post("/{device_id}/route-policy/preflight", dependencies=[Depends(verify_token)])
+@router.post(
+    "/{device_id}/route-policy/preflight",
+    dependencies=[Depends(verify_token)],
+    response_model=RoutePolicyPreflightOut,
+    response_model_exclude_unset=True,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409, **RESP_422_VALIDATION},
+)
 async def preflight_route_policy(
     device_id: int, body: PreflightRequest, refresh: bool = True, db: AsyncSession = Depends(get_db)
 ):
@@ -143,7 +228,13 @@ async def preflight_route_policy(
     return {"known": True, "ned_id": info["ned_id"], "sw_version": info["sw_version"], **result}
 
 
-@router.post("/{device_id}/apply/preflight", dependencies=[Depends(verify_token)])
+@router.post(
+    "/{device_id}/apply/preflight",
+    dependencies=[Depends(verify_token)],
+    response_model=ApplyPreflightOut,
+    response_model_exclude_unset=True,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409, **RESP_422_VALIDATION},
+)
 async def preflight_apply(
     device_id: int, body: ApplyPreflightRequest, refresh: bool = False, db: AsyncSession = Depends(get_db)
 ):

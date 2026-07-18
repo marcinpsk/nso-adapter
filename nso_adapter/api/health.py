@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Request
+from pydantic import BaseModel
 
 from nso_adapter import __version__
 from nso_adapter.config import get_config
@@ -14,7 +15,18 @@ router = APIRouter(tags=["health"])
 _VERSION = __version__
 
 
-@router.get("/healthz")
+class HealthInstanceOut(BaseModel):
+    name: str
+    reachable: bool
+
+
+class HealthzOut(BaseModel):
+    status: str
+    version: str
+    nso_instances: list[HealthInstanceOut]
+
+
+@router.get("/healthz", response_model=HealthzOut)
 async def healthz(request: Request):
     cfg = get_config()
     instances = []
