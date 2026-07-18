@@ -15,7 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.store.models import (
     Device,
     DeviceSettings,
@@ -34,7 +34,53 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/api/v1/devices", tags=["snmp-config"])
 
 
-@router.get("/{device_id}/snmp-config", dependencies=[Depends(verify_token)])
+# ── Read-mirror response models (GET /snmp-config) ────────────────────────────
+# EMIT-NULL shape: every key is always present and nullable values serialise as
+# null (NOT omitted), so this endpoint deliberately does NOT use
+# response_model_exclude_unset — the fixed shape is the contract.
+
+
+class SnmpCommunityOut(BaseModel):
+    community_hash: str
+    access: str
+    acl: str | None
+
+
+class SnmpV3UserOut(BaseModel):
+    username: str
+    has_auth_secret: bool
+    has_priv_secret: bool
+
+
+class SnmpHostOut(BaseModel):
+    address: str
+    version: str | None
+    notify_type: str | None
+    port: int | None
+    username: str | None
+
+
+class SnmpSystemInfoOut(BaseModel):
+    location: str | None
+    contact: str | None
+
+
+class SnmpConfigOut(BaseModel):
+    device_id: int
+    last_refreshed_at: str | None = None  # reader formats "<iso>Z"; None when never refreshed
+    refresh_source: str
+    communities: list[SnmpCommunityOut]
+    v3_users: list[SnmpV3UserOut]
+    hosts: list[SnmpHostOut]
+    system_info: SnmpSystemInfoOut | None
+
+
+@router.get(
+    "/{device_id}/snmp-config",
+    dependencies=[Depends(verify_token)],
+    response_model=SnmpConfigOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_snmp_config(device_id: int, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, device_id)
     if not device:

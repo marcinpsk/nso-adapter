@@ -12,14 +12,39 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import Device, DeviceLoggingHost, DeviceSettings, LoggingHostIntent
 
 router = APIRouter(prefix="/api/v1/devices", tags=["logging-config"])
 
 
-@router.get("/{device_id}/logging-config", dependencies=[Depends(verify_token)])
+class LoggingHostOut(BaseModel):
+    """One remote syslog server; every key but ``address`` omitted when unset."""
+
+    address: str
+    port: int | None = None
+    severity: str | None = None
+    facility: str | None = None
+    transport: str | None = None
+    vrf: str | None = None
+    source: str | None = None
+
+
+class LoggingConfigOut(BaseModel):
+    device_id: int
+    last_refreshed_at: str | None = None  # reader formats "<iso>Z"; None when never refreshed
+    refresh_source: str
+    hosts: list[LoggingHostOut]
+
+
+@router.get(
+    "/{device_id}/logging-config",
+    dependencies=[Depends(verify_token)],
+    response_model=LoggingConfigOut,
+    response_model_exclude_unset=True,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_logging_config(device_id: int, db: AsyncSession = Depends(get_db)):
     """Return the device's remote syslog servers."""
     device = await db.get(Device, device_id)

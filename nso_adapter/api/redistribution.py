@@ -4,13 +4,16 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import structlog
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.store.models import Device, DeviceRedistribution
 
 logger = structlog.get_logger(__name__)
@@ -18,7 +21,32 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/api/v1/devices", tags=["redistribution"])
 
 
-@router.get("/{device_id}/redistribution", dependencies=[Depends(verify_token)])
+class RedistributionOut(BaseModel):
+    """One redistribution statement; route_map/metric/metric_type omitted when unset."""
+
+    dest_protocol: str
+    dest_ref: str
+    source_protocol: str
+    source_ref: str
+    route_map: str | None = None
+    metric: int | None = None
+    metric_type: str | None = None
+
+
+class RedistributionConfigOut(BaseModel):
+    device_id: int
+    last_refreshed_at: datetime | None = None  # reader passes the raw datetime (no "Z")
+    refresh_source: str
+    entries: list[RedistributionOut]
+
+
+@router.get(
+    "/{device_id}/redistribution",
+    dependencies=[Depends(verify_token)],
+    response_model=RedistributionConfigOut,
+    response_model_exclude_unset=True,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_redistribution(device_id: int, db: AsyncSession = Depends(get_db)):
     """Return all redistribution statements cached from NSO for *device_id*.
 
