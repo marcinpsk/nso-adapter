@@ -15,14 +15,37 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import Device, DeviceInterfaceMtu, DeviceSettings, InterfaceMtuIntent
 
 router = APIRouter(prefix="/api/v1/devices", tags=["interface-mtu"])
 
 
-@router.get("/{device_id}/interface-mtu", dependencies=[Depends(verify_token)])
+# ── Read-mirror response models (GET /interface-mtu) ──────────────────────────
+# Fixed/EMIT-NULL shape, NO top-level timestamp: mtu/ip_mtu/mpls_mtu always
+# present (null when unset), bound_port coerced to "". No exclude_unset.
+
+
+class InterfaceMtuEntryOut(BaseModel):
+    interface_name: str
+    mtu: int | None
+    ip_mtu: int | None
+    mpls_mtu: int | None
+    bound_port: str
+
+
+class InterfaceMtuOut(BaseModel):
+    device_id: int
+    interfaces: list[InterfaceMtuEntryOut]
+
+
+@router.get(
+    "/{device_id}/interface-mtu",
+    dependencies=[Depends(verify_token)],
+    response_model=InterfaceMtuOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_interface_mtu(device_id: int, db: AsyncSession = Depends(get_db)):
     """Return the device's per-interface MTU (mtu / ip-mtu / mpls-mtu + bound-port)."""
     if await db.get(Device, device_id) is None:

@@ -5,18 +5,46 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.store.models import Device, LagInterface
 
 router = APIRouter(prefix="/api/v1/devices", tags=["lag-topology"])
 
 
-@router.get("/{device_id}/lag-topology", dependencies=[Depends(verify_token)])
+# ── Read-mirror response models (GET /lag-topology) ───────────────────────────
+# Fixed shape; member ``mode`` is a non-null str. "<iso>Z" timestamp.
+
+
+class LagTopologyMemberOut(BaseModel):
+    interface: str
+    mode: str
+
+
+class LagTopologyLagOut(BaseModel):
+    name: str
+    id: int
+    members: list[LagTopologyMemberOut]
+
+
+class LagTopologyOut(BaseModel):
+    device_id: int
+    last_refreshed_at: str | None = None  # reader formats "<iso>Z"; None when never refreshed
+    refresh_source: str
+    lags: list[LagTopologyLagOut]
+
+
+@router.get(
+    "/{device_id}/lag-topology",
+    dependencies=[Depends(verify_token)],
+    response_model=LagTopologyOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_lag_topology(device_id: int, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, device_id)
     if not device:

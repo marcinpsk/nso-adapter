@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import BfdIntent, Device, DeviceBfdInterface, DeviceSettings
 
@@ -22,7 +22,35 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/api/v1/devices", tags=["bfd"])
 
 
-@router.get("/{device_id}/bfd", dependencies=[Depends(verify_token)])
+# ── Read-mirror response models (GET /bfd) ────────────────────────────────────
+# OMIT shape: bound_port/min_tx/min_rx/multiplier omitted when unset ->
+# exclude_unset; micro_bfd/enabled are always-present bools.
+
+
+class BfdInterfaceOut(BaseModel):
+    interface_name: str
+    micro_bfd: bool
+    enabled: bool
+    bound_port: str | None = None
+    min_tx: int | None = None
+    min_rx: int | None = None
+    multiplier: int | None = None
+
+
+class BfdConfigOut(BaseModel):
+    device_id: int
+    last_refreshed_at: str | None = None  # reader formats "<iso>Z"; None when never refreshed
+    refresh_source: str
+    interfaces: list[BfdInterfaceOut]
+
+
+@router.get(
+    "/{device_id}/bfd",
+    dependencies=[Depends(verify_token)],
+    response_model=BfdConfigOut,
+    response_model_exclude_unset=True,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_bfd(device_id: int, db: AsyncSession = Depends(get_db)):
     """Return the per-interface BFD read-mirror for this device."""
     device = await db.get(Device, device_id)
