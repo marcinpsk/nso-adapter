@@ -12,14 +12,32 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import Device, DeviceSettings, DeviceSvi, SviIntent
 
 router = APIRouter(prefix="/api/v1/devices", tags=["svi"])
 
 
-@router.get("/{device_id}/svi", dependencies=[Depends(verify_token)])
+class SviIfaceOut(BaseModel):
+    interface_name: str
+    vlan_id: int
+    type: str
+    vrf: str  # coerced to "" when unset
+    source: str
+
+
+class SviOut(BaseModel):
+    device_id: int
+    interfaces: list[SviIfaceOut]
+
+
+@router.get(
+    "/{device_id}/svi",
+    dependencies=[Depends(verify_token)],
+    response_model=SviOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_svi(device_id: int, db: AsyncSession = Depends(get_db)):
     """Return the device's SVIs/IRBs (no IPs — those ride interface-ip)."""
     if await db.get(Device, device_id) is None:

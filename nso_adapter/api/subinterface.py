@@ -15,14 +15,33 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import Device, DeviceSettings, DeviceSubinterface, SubinterfaceIntent
 
 router = APIRouter(prefix="/api/v1/devices", tags=["subinterface"])
 
 
-@router.get("/{device_id}/subinterface", dependencies=[Depends(verify_token)])
+class SubinterfaceIfaceOut(BaseModel):
+    interface_name: str
+    parent_interface: str | None  # null when unset
+    dot1q_vlan: int | None  # null when unset
+    type: str
+    vrf: str  # coerced to "" when unset
+    source: str
+
+
+class SubinterfaceOut(BaseModel):
+    device_id: int
+    interfaces: list[SubinterfaceIfaceOut]
+
+
+@router.get(
+    "/{device_id}/subinterface",
+    dependencies=[Depends(verify_token)],
+    response_model=SubinterfaceOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_subinterface(device_id: int, db: AsyncSession = Depends(get_db)):
     """Return the device's dot1q subinterfaces (no IPs — those ride interface-ip)."""
     if await db.get(Device, device_id) is None:

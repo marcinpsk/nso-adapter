@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.core.importer import get_nso_client
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.core.switchport_intent import apply_switchport_config as apply_switchport_core
@@ -33,7 +33,41 @@ class SwitchportApplyRequest(BaseModel):
     interfaces: list[SwitchportApply] = []
 
 
-@router.get("/{device_id}/vlan-database", dependencies=[Depends(verify_token)])
+# ── Read-mirror response models ───────────────────────────────────────────────
+# Fixed shapes with no top-level timestamp; every key always present (untagged_vlan
+# null / tagged_vlans [] when empty, name/mode coerced to ""), so no exclude_unset.
+
+
+class VlanOut(BaseModel):
+    vlan_id: int
+    name: str
+    source: str
+
+
+class VlanDatabaseOut(BaseModel):
+    device_id: int
+    vlans: list[VlanOut]
+
+
+class SwitchportIfaceOut(BaseModel):
+    interface_name: str
+    mode: str
+    untagged_vlan: int | None
+    tagged_vlans: list[int]
+    source: str
+
+
+class SwitchportOut(BaseModel):
+    device_id: int
+    interfaces: list[SwitchportIfaceOut]
+
+
+@router.get(
+    "/{device_id}/vlan-database",
+    dependencies=[Depends(verify_token)],
+    response_model=VlanDatabaseOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_vlan_database(device_id: int, db: AsyncSession = Depends(get_db)):
     if await db.get(Device, device_id) is None:
         raise api_error(404, "not_found", "Device not found")
@@ -48,7 +82,12 @@ async def get_vlan_database(device_id: int, db: AsyncSession = Depends(get_db)):
     }
 
 
-@router.get("/{device_id}/switchport", dependencies=[Depends(verify_token)])
+@router.get(
+    "/{device_id}/switchport",
+    dependencies=[Depends(verify_token)],
+    response_model=SwitchportOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_switchport(device_id: int, db: AsyncSession = Depends(get_db)):
     if await db.get(Device, device_id) is None:
         raise api_error(404, "not_found", "Device not found")
