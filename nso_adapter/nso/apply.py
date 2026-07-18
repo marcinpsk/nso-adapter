@@ -27,6 +27,7 @@ import structlog
 
 from nso_adapter.core.isis_canon import isis_level
 from nso_adapter.nso.client import NsoClient, _url_key
+from nso_adapter.nso.nso_json import boundary_safe_dumps
 from nso_adapter.secrets.refs import VaultRefError, parse_vault_ref
 
 logger = structlog.get_logger(__name__)
@@ -306,7 +307,7 @@ async def _send_service_config(
     if stage is not None:
         stage[root_key] = [body]
         return None
-    payload = json.dumps({root_key: [body]})
+    payload = boundary_safe_dumps({root_key: [body]})
     if replace:
         # instance_key overrides the single-key default for a compound-key list (e.g.
         # interface-config is keyed by "device interface-name" → "<device>,<iface>").
@@ -376,7 +377,7 @@ async def apply_combined(
     localisation to tell a real NED rejection apart from a transient/inconclusive blip.
     """
     body = {root: bodies for root, bodies in modules.items() if bodies}
-    payload = json.dumps(body)
+    payload = boundary_safe_dumps(body)
     url = f"{client._base}{_DATA_PATH}"
 
     if dry_run:
@@ -507,7 +508,7 @@ async def apply_interface_attribute(
         )
 
     url = f"{client._base}{_SERVICE_PATH}"
-    payload = json.dumps(
+    payload = boundary_safe_dumps(
         {"interface-reconciler:interface-config": service_body["interface-reconciler:interface-config"]}
     )
 
@@ -755,7 +756,7 @@ async def apply_interface_ips(
     )
 
     url = f"{client._base}{_SERVICE_PATH}"
-    payload = json.dumps({"interface-reconciler:interface-config": [entry]})
+    payload = boundary_safe_dumps({"interface-reconciler:interface-config": [entry]})
 
     if dry_run:
         # dry_run == "cli" → NSO's NED-uniform tree diff (see apply_interface_attribute).
@@ -1619,7 +1620,7 @@ async def replace_service_instance(
     still adopts brownfield config rather than conflicting with it.
     """
     url = f"{client._base}{service_path}={_url_key(device_name)}"
-    payload = json.dumps({root_key: [body]})
+    payload = boundary_safe_dumps({root_key: [body]})
     async with client._client(timeout=client._action_timeout) as c:
         resp = await c.put(_commit_url(url), content=payload, headers={"Content-Type": "application/yang-data+json"})
         if resp.status_code not in (200, 201, 204):

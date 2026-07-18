@@ -22,15 +22,20 @@ from nso_adapter.nso.apply import (
     _verify_native_or_raise,
     apply_bfd_config,
     apply_bgp_config,
+    apply_combined,
+    apply_interface_ips,
     apply_isis_interfaces,
     apply_logging_config,
     apply_mtu_config,
     apply_ospf_config,
     apply_snmp_config,
     apply_static_routes,
+    build_interface_ip_entry,
     native_dry_run,
+    replace_service_instance,
 )
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.nso_json import NSO_LEX_CHUNK, straddling_bare_tokens
 from nso_adapter.store.models import OspfInstanceIntent, OspfInterfaceIntent, RedistributionIntent
 
 _EMPTY_DRYRUN = {"dry-run-result": {"native": {}}}
@@ -596,3 +601,91 @@ async def test_apply_bgp_config_builds_router_scope_peer_tree():
     assert p["peer-address"] == "192.0.2.1"
     assert p["remote-as"] == 65001 and p["peer-group"] == "UPSTREAM" and p["password"] == "s3c"
     assert p["peer-address-family"][0] == {"afi": "ipv4-unicast", "enabled": True, "routemap-in": "RM-IN"}
+
+
+# ── 64KiB boundary safety (check-item 134) ─────────────────────────────────────
+# NSO 6.7's RESTCONF JSON lexer loses token state at its 64KiB read-buffer
+# refill — a bare literal straddling byte k*65536 400s the whole request
+# ("1: Bad JSON character: f"). Every apply-path body must therefore leave the
+# adapter with no bare token on a boundary. These tests drive the REAL apply
+# functions over the recording transport and assert on the actual bytes handed
+# to httpx; each fixture asserts its own premise (default serialization DOES
+# straddle), so a sizing drift fails loudly instead of passing vacuously.
+
+
+def _straddling_service_body(wrap) -> dict:
+    """A service body whose default-serialized WRAPPED request straddles a boundary.
+
+    *wrap* replicates exactly how the function under test wraps the body into the
+    request payload; the pad places the first ``false`` 2 bytes across byte 65536.
+    """
+    probe = {"device": "sw03", "pad": "", "rows": [{"secondary": False, "n": 1234} for _ in range(40)]}
+    first_false = json.dumps(wrap(probe)).index("false")
+    body = {**probe, "pad": "x" * (NSO_LEX_CHUNK - first_false - 2)}
+    assert straddling_bare_tokens(json.dumps(wrap(body))), "fixture premise: default dumps DOES straddle"
+    return body
+
+
+def _assert_wire_boundary_safe(transport: _RecordingTransport) -> None:
+    """No request body that actually went over the wire straddles a 64KiB multiple."""
+    bodies = [r.content.decode() for r in transport.requests if r.content]
+    assert any(len(b) > NSO_LEX_CHUNK for b in bodies), "fixture premise: an oversized body was sent"
+    for b in bodies:
+        assert straddling_bare_tokens(b) == []
+
+
+async def test_send_service_config_oversized_body_is_boundary_safe():
+    transport = _RecordingTransport(send_status=204)
+    client = _client_with(transport)
+    body = _straddling_service_body(lambda b: {"svc:cfg": [b]})
+
+    await _send_service_config(client, "/restconf/data/svc:cfg", "svc:cfg", "sw03", body, scope="snmp")
+
+    _assert_wire_boundary_safe(transport)
+    # whitespace-only protection: the parsed intent is unchanged
+    assert json.loads(transport.requests[0].content) == {"svc:cfg": [body]}
+
+
+async def test_apply_combined_oversized_body_is_boundary_safe():
+    transport = _RecordingTransport(send_status=204)
+    client = _client_with(transport)
+    body = _straddling_service_body(lambda b: {"svc:cfg": [b]})
+
+    await apply_combined(client, "sw03", {"svc:cfg": [body]})
+
+    _assert_wire_boundary_safe(transport)
+    assert json.loads(transport.requests[0].content) == {"svc:cfg": [body]}
+
+
+async def test_replace_service_instance_oversized_body_is_boundary_safe():
+    transport = _RecordingTransport(send_status=204)
+    client = _client_with(transport)
+    body = _straddling_service_body(lambda b: {"svc:cfg": [b]})
+
+    await replace_service_instance(client, "/restconf/data/svc:cfg", "svc:cfg", "sw03", body)
+
+    assert transport.requests[0].method == "PUT"
+    _assert_wire_boundary_safe(transport)
+    assert json.loads(transport.requests[0].content) == {"svc:cfg": [body]}
+
+
+async def test_apply_interface_ips_production_scale_body_is_boundary_safe():
+    """The exact shape that hit production scale: thousands of ``"secondary": false`` rows."""
+    transport = _RecordingTransport(send_status=204)
+    client = _client_with(transport)
+    rows = [SimpleNamespace(address="10.0.0.1/24", family="ipv4", secondary=False, vrf="") for _ in range(120)]
+    # The interface name precedes every row in the entry, so sizing it shifts each
+    # row token by the same amount — place the first `false` across byte 65536.
+    base_entry = build_interface_ip_entry("sw03", "ae0", rows)
+    first_false = json.dumps({"interface-reconciler:interface-config": [base_entry]}).index("false")
+    name = "ae0" + "x" * (NSO_LEX_CHUNK - first_false - 2)
+    entry = build_interface_ip_entry("sw03", name, rows)
+    payload = json.dumps({"interface-reconciler:interface-config": [entry]})
+    assert straddling_bare_tokens(payload), "fixture premise: default dumps DOES straddle"
+
+    await apply_interface_ips(client, "sw03", name, rows)
+
+    _assert_wire_boundary_safe(transport)
+    sent = json.loads(transport.requests[0].content)["interface-reconciler:interface-config"][0]
+    assert sent["interface-name"] == name
+    assert len(sent["ipv4-address"]) == 120
