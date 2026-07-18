@@ -8,11 +8,12 @@ from datetime import UTC, datetime
 
 import structlog
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.core.removal import lost_content
 from nso_adapter.store.models import (
     Device,
@@ -98,7 +99,81 @@ async def _load_named(db: AsyncSession, model, device_id: int) -> list:
     return (await db.execute(select(model).where(model.device_id == device_id).order_by(model.name))).scalars().all()
 
 
-@router.get("/{device_id}/route-policy", dependencies=[Depends(verify_token)])
+# ── Read-mirror response models (GET /route-policy) ───────────────────────────
+# Mostly fixed shapes; only a prefix-list entry omits ge/le when unset, so the
+# endpoint uses exclude_unset. NB: NO top-level refresh_source. ``family`` is an
+# int; a route-map entry's ``match``/``set`` are JSON *strings* (the reader emits
+# match_json/set_json verbatim) while match_* are lists.
+
+
+class RoutePolicyPrefixEntryOut(BaseModel):
+    sequence: int
+    action: str
+    prefix: str
+    ge: int | None = None
+    le: int | None = None
+
+
+class RoutePolicyPrefixListOut(BaseModel):
+    name: str
+    family: int
+    entries: list[RoutePolicyPrefixEntryOut]
+
+
+class RoutePolicyCommunityEntryOut(BaseModel):
+    sequence: int
+    action: str
+    community: str
+
+
+class RoutePolicyCommunityListOut(BaseModel):
+    name: str
+    invert_match: bool
+    entries: list[RoutePolicyCommunityEntryOut]
+
+
+class RoutePolicyASPathEntryOut(BaseModel):
+    sequence: int
+    action: str
+    pattern: str
+
+
+class RoutePolicyASPathOut(BaseModel):
+    name: str
+    entries: list[RoutePolicyASPathEntryOut]
+
+
+class RoutePolicyRouteMapEntryOut(BaseModel):
+    sequence: int
+    action: str
+    match_prefix_lists: list
+    match_community_lists: list
+    match_as_paths: list
+    match: str  # JSON string (match_json or "{}")
+    set: str  # JSON string (set_json or "{}")
+
+
+class RoutePolicyRouteMapOut(BaseModel):
+    name: str
+    entries: list[RoutePolicyRouteMapEntryOut]
+
+
+class RoutePolicyConfigOut(BaseModel):
+    device_id: int
+    last_refreshed_at: str | None = None  # reader formats "<iso>Z"; None when never refreshed (no refresh_source here)
+    prefix_lists: list[RoutePolicyPrefixListOut]
+    community_lists: list[RoutePolicyCommunityListOut]
+    as_paths: list[RoutePolicyASPathOut]
+    route_maps: list[RoutePolicyRouteMapOut]
+
+
+@router.get(
+    "/{device_id}/route-policy",
+    dependencies=[Depends(verify_token)],
+    response_model=RoutePolicyConfigOut,
+    response_model_exclude_unset=True,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_db)):
     """Return the route-policy config read-mirror for this device.
 

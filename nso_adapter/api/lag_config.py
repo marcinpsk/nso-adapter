@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.core.importer import get_nso_client
 from nso_adapter.core.lag_intent import apply_lag_config as apply_lag_config_core
 from nso_adapter.store.models import Device, LagBundleConfig
@@ -40,7 +40,41 @@ class LagConfigApplyRequest(BaseModel):
     bundles: list[LagBundleApply] = []
 
 
-@router.get("/{device_id}/lag-config", dependencies=[Depends(verify_token)])
+# ── Read-mirror response models (GET /lag-config) ─────────────────────────────
+# OMIT shape: bundle/member optionals are omitted when unset -> exclude_unset.
+
+
+class LagMemberOut(BaseModel):
+    interface_name: str
+    mode: str | None = None
+    port_priority: int | None = None
+
+
+class LagBundleOut(BaseModel):
+    name: str
+    lag_id: int
+    min_links: int | None = None
+    system_priority: int | None = None
+    system_id: str | None = None
+    timer: str | None = None
+    admin_key: int | None = None
+    members: list[LagMemberOut]
+
+
+class LagConfigOut(BaseModel):
+    device_id: int
+    last_refreshed_at: str | None = None  # reader formats "<iso>Z"; None when never refreshed
+    refresh_source: str
+    bundles: list[LagBundleOut]
+
+
+@router.get(
+    "/{device_id}/lag-config",
+    dependencies=[Depends(verify_token)],
+    response_model=LagConfigOut,
+    response_model_exclude_unset=True,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_lag_config(device_id: int, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, device_id)
     if not device:
