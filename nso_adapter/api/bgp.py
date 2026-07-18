@@ -14,7 +14,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import (
     BgpAfIntent,
@@ -150,7 +150,77 @@ def _serialize_scope(scope: DeviceBgpScope, graph: _BgpGraph) -> dict:
     }
 
 
-@router.get("/{device_id}/bgp-config", dependencies=[Depends(verify_token)])
+# ── Read-mirror response models (GET /bgp-config) ─────────────────────────────
+# Distinct from the PUT intent models below: the read mirror carries fields the
+# intent never does (bfd_enabled) and omits accepted_at. Optional keys are
+# emitted only when present (response_model_exclude_unset), matching the
+# hand-built dicts in the _serialize_* helpers above.
+
+
+class BgpPeerAfOut(BaseModel):
+    af: str
+    enabled: bool
+    routemap_in: str | None = None
+    routemap_out: str | None = None
+    prefixlist_in: str | None = None
+    prefixlist_out: str | None = None
+
+
+class BgpPeerOut(BaseModel):
+    peer_address: str
+    enabled: bool
+    address_families: list[BgpPeerAfOut] = []
+    peer_group: str | None = None
+    remote_as: str | None = None
+    local_as: str | None = None
+    ttl: int | None = None
+    password: str | None = None
+    source: str | None = None
+    bfd_enabled: bool | None = None
+
+
+class BgpPeerGroupAfOut(BaseModel):
+    af: str
+    routemap_in: str | None = None
+    routemap_out: str | None = None
+    prefixlist_in: str | None = None
+    prefixlist_out: str | None = None
+
+
+class BgpPeerGroupOut(BaseModel):
+    name: str
+    address_families: list[BgpPeerGroupAfOut] = []
+    remote_as: str | None = None
+    source: str | None = None
+
+
+class BgpScopeOut(BaseModel):
+    vrf: str
+    address_families: list[str] = []
+    peers: list[BgpPeerOut] = []
+    peer_groups: list[BgpPeerGroupOut] = []
+
+
+class BgpRouterOut(BaseModel):
+    asn: str
+    router_id: str | None = None  # always present (null when unset)
+    scopes: list[BgpScopeOut] = []
+
+
+class BgpConfigOut(BaseModel):
+    device_id: int
+    last_refreshed_at: str | None = None  # reader formats "<iso>Z"; None when never refreshed
+    refresh_source: str
+    routers: list[BgpRouterOut]
+
+
+@router.get(
+    "/{device_id}/bgp-config",
+    dependencies=[Depends(verify_token)],
+    response_model=BgpConfigOut,
+    response_model_exclude_unset=True,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_db)):
     """Return the BGP config read-mirror for this device."""
     device = await db.get(Device, device_id)

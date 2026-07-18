@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import Device, DeviceSettings, DeviceStaticRoute, StaticRouteIntent
 
@@ -22,7 +22,39 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/api/v1/devices", tags=["static-routes"])
 
 
-@router.get("/{device_id}/static-routes", dependencies=[Depends(verify_token)])
+class StaticRouteOut(BaseModel):
+    """One static route in the read mirror.
+
+    The identity keys (``vrf``/``prefix``/``next_hop``) are always present; the
+    rest are emitted only when set (``response_model_exclude_unset``), matching
+    the hand-built dict the reader has always produced.
+    """
+
+    vrf: str
+    prefix: str
+    next_hop: str
+    interface_next_hop: str | None = None
+    next_hop_vrf: str | None = None
+    metric: int | None = None
+    permanent: bool | None = None
+    tag: int | None = None
+    name: str | None = None
+
+
+class StaticRoutesOut(BaseModel):
+    device_id: int
+    last_refreshed_at: str | None = None  # reader formats "<iso>Z"; None when never refreshed
+    refresh_source: str
+    routes: list[StaticRouteOut]
+
+
+@router.get(
+    "/{device_id}/static-routes",
+    dependencies=[Depends(verify_token)],
+    response_model=StaticRoutesOut,
+    response_model_exclude_unset=True,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_static_routes(device_id: int, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, device_id)
     if not device:

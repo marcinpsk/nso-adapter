@@ -14,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import (
     Device,
@@ -31,7 +31,48 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/api/v1/devices", tags=["ospf"])
 
 
-@router.get("/{device_id}/ospf", dependencies=[Depends(verify_token)])
+# ── Read-mirror response models (GET /ospf) ───────────────────────────────────
+# NB: last_refreshed_at is a `datetime` (the reader passes the raw naive datetime,
+# not an "<iso>Z" string like the other routers) — jsonable_encoder emits it with
+# no trailing Z. `areas` is an opaque JSON list, always present. router_id/enabled
+# and the interface optionals are emitted only when set (response_model_exclude_unset).
+
+
+class OspfInstanceOut(BaseModel):
+    process_id: str
+    vrf: str
+    areas: list = []
+    router_id: str | None = None
+    enabled: bool | None = None
+
+
+class OspfInterfaceOut(BaseModel):
+    interface_name: str
+    passive: bool
+    auth_present: bool
+    process_id: str | None = None
+    area_id: str | None = None
+    priority: int | None = None
+    cost: int | None = None
+    network_type: str | None = None
+    auth_type: str | None = None
+
+
+class OspfConfigOut(BaseModel):
+    device_id: int
+    last_refreshed_at: datetime | None = None  # raw datetime (no "Z"), None when never refreshed
+    refresh_source: str
+    instances: list[OspfInstanceOut]
+    interfaces: list[OspfInterfaceOut]
+
+
+@router.get(
+    "/{device_id}/ospf",
+    dependencies=[Depends(verify_token)],
+    response_model=OspfConfigOut,
+    response_model_exclude_unset=True,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_ospf(device_id: int, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, device_id)
     if not device:

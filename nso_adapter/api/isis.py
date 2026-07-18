@@ -14,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import (
     Device,
@@ -124,7 +124,88 @@ def _serialize_isis_interface(row: DeviceIsisInterface) -> dict:
     return entry
 
 
-@router.get("/{device_id}/isis-interfaces", dependencies=[Depends(verify_token)])
+# ── Read-mirror response models (GET /isis-interfaces) ────────────────────────
+# The nested bags (settings/levels/segment_routing/flex_algos/srv6_locators/
+# prefix_sids) are opaque JSON pass-throughs — typed dict/list so their contents
+# are preserved verbatim (the reader _snake()s the container keys; the plugin
+# reads fixed sub-keys the adapter does not itself constrain). Optional scalars
+# and containers are emitted only when set (response_model_exclude_unset).
+
+
+class IsisProcessOut(BaseModel):
+    process_tag: str
+    net: str | None = None
+    is_type: str | None = None
+    metric_style: str | None = None
+    overload_bit: bool | None = None
+    area_auth_type: str | None = None
+    area_auth_present: bool | None = None
+    area_auth_key: str | None = None
+    domain_auth_type: str | None = None
+    domain_auth_present: bool | None = None
+    domain_auth_key: str | None = None
+    spf_initial_wait: int | None = None
+    spf_max_wait: int | None = None
+    lsp_initial_wait: int | None = None
+    lsp_max_wait: int | None = None
+    lsp_lifetime: int | None = None
+    lsp_refresh_interval: int | None = None
+    lsp_mtu: int | None = None
+    overload_on_startup: bool | None = None
+    overload_timeout: int | None = None
+    te_enabled: bool | None = None
+    suppress_attached_bit: bool | None = None
+    ignore_attached_bit: bool | None = None
+    fast_reroute: str | None = None
+    microloop_avoidance: bool | None = None
+    distance: int | None = None
+    maximum_paths: int | None = None
+    reference_bandwidth: int | None = None
+    settings: dict | None = None
+    levels: list | None = None
+    segment_routing: dict | None = None
+    flex_algos: list | None = None
+    srv6_locators: list | None = None
+
+
+class IsisInterfaceOut(BaseModel):
+    interface_name: str
+    af: str
+    process_tag: str
+    circuit_type: str | None = None
+    network_type: str | None = None
+    metric: int | None = None
+    bound_port: str | None = None
+    hello_auth_type: str | None = None
+    hello_auth_present: bool | None = None
+    bfd_enabled: bool | None = None
+    frr_enabled: bool | None = None
+    frr_protection: str | None = None
+    csnp_interval: int | None = None
+    retransmit_interval: int | None = None
+    lsp_interval: int | None = None
+    mesh_group: str | None = None
+    settings: dict | None = None
+    levels: list | None = None
+    prefix_sids: list | None = None
+    passive: bool
+
+
+class IsisInterfacesOut(BaseModel):
+    device_id: int
+    last_refreshed_at: str | None = None  # reader formats "<iso>Z"; None when never refreshed
+    refresh_source: str
+    processes: list[IsisProcessOut]
+    interfaces: list[IsisInterfaceOut]
+
+
+@router.get(
+    "/{device_id}/isis-interfaces",
+    dependencies=[Depends(verify_token)],
+    response_model=IsisInterfacesOut,
+    response_model_exclude_unset=True,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, device_id)
     if not device:
