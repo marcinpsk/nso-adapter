@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
@@ -121,7 +122,38 @@ async def get_switchport(device_id: int, db: AsyncSession = Depends(get_db)):
     }
 
 
-@router.post("/{device_id}/switchport/apply", dependencies=[Depends(verify_token)])
+# The apply result is a union envelope. It is documented via responses={200: {...}} with
+# response_model=None so the handler dict passes through untouched (zero wire risk) — a
+# Pydantic response_model would coerce/validate it. See core.switchport_intent for the branches.
+
+
+class SwitchportApplyDeployed(BaseModel):
+    status: Literal["deployed"]
+    device: str
+    interface_count: int
+
+
+class SwitchportApplyError(BaseModel):
+    status: Literal["error"]
+    error: str
+    message: str
+    detail: dict | None = None  # present only on an NSO commit failure (absent on no_nso_device_name)
+
+
+SwitchportApplyResult = SwitchportApplyDeployed | SwitchportApplyError
+
+
+@router.post(
+    "/{device_id}/switchport/apply",
+    dependencies=[Depends(verify_token)],
+    response_model=None,
+    responses={
+        200: {"model": SwitchportApplyResult, "description": "Apply result envelope (deployed | error)"},
+        **RESP_401,
+        **RESP_404_DEVICE,
+        **RESP_422_VALIDATION,
+    },
+)
 async def apply_switchport(
     device_id: int,
     payload: SwitchportApplyRequest,

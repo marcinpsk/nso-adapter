@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -124,7 +126,37 @@ async def get_lag_config(device_id: int, db: AsyncSession = Depends(get_db)):
     }
 
 
-@router.post("/{device_id}/lag-config/apply", dependencies=[Depends(verify_token)])
+# Union result envelope, documented via responses={200: {...}} + response_model=None so the
+# handler dict passes through untouched (zero wire risk). See core.lag_intent for the branches.
+
+
+class LagConfigApplyDeployed(BaseModel):
+    status: Literal["deployed"]
+    device: str
+    bundle_count: int
+
+
+class LagConfigApplyError(BaseModel):
+    status: Literal["error"]
+    error: str
+    message: str
+    detail: dict | None = None  # present only on an NSO commit failure (absent on no_nso_device_name)
+
+
+LagConfigApplyResult = LagConfigApplyDeployed | LagConfigApplyError
+
+
+@router.post(
+    "/{device_id}/lag-config/apply",
+    dependencies=[Depends(verify_token)],
+    response_model=None,
+    responses={
+        200: {"model": LagConfigApplyResult, "description": "Apply result envelope (deployed | error)"},
+        **RESP_401,
+        **RESP_404_DEVICE,
+        **RESP_422_VALIDATION,
+    },
+)
 async def apply_lag_config(
     device_id: int,
     payload: LagConfigApplyRequest,

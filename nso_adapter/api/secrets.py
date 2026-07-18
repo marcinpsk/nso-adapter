@@ -19,7 +19,16 @@ from pydantic import BaseModel, Field, SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import (
+    RESP_400,
+    RESP_401,
+    RESP_404,
+    RESP_409,
+    RESP_422_VALIDATION,
+    RESP_501,
+    RESP_502,
+    api_error,
+)
 from nso_adapter.core import snmp_harvest
 from nso_adapter.core.importer import get_nso_client
 from nso_adapter.secrets.refs import VaultRef, VaultRefError, parse_vault_ref, secret_fingerprint
@@ -35,7 +44,7 @@ class SecretWriteRequest(BaseModel):
     values: dict[str, SecretStr] = Field(min_length=1)
 
 
-class SecretWriteResponse(BaseModel):
+class SecretWriteOut(BaseModel):
     vault_ref: str
     version: int
     hashes: dict[str, str]  # field → sha256[:16] fingerprint
@@ -45,7 +54,7 @@ class SecretVerifyRequest(BaseModel):
     vault_ref: str
 
 
-class SecretVerifyResponse(BaseModel):
+class SecretVerifyOut(BaseModel):
     vault_ref: str
     exists: bool
     fields: list[str]
@@ -58,7 +67,7 @@ class HarvestCommunityRequest(BaseModel):
     vault_ref: str  # "mount/path#key" target to write the plaintext to
 
 
-class HarvestCommunityResponse(BaseModel):
+class HarvestCommunityOut(BaseModel):
     vault_ref: str
     secret_hash: str
     version: int
@@ -104,8 +113,12 @@ async def _vault_op(operation, vault_ref: str):
         raise api_error(502, "vault_error", f"Vault operation failed for {vault_ref!r}: {exc}") from exc
 
 
-@router.post("/secrets", response_model=SecretWriteResponse)
-async def set_secret(body: SecretWriteRequest, request: Request) -> SecretWriteResponse:
+@router.post(
+    "/secrets",
+    response_model=SecretWriteOut,
+    responses={**RESP_401, **RESP_400, **RESP_422_VALIDATION, **RESP_501, **RESP_502},
+)
+async def set_secret(body: SecretWriteRequest, request: Request) -> SecretWriteOut:
     """Merge-write secret fields at the ref's Vault path; return version + fingerprints."""
     provider = _vault_provider(request)
     ref = _parse_ref(body.vault_ref)
@@ -120,11 +133,15 @@ async def set_secret(body: SecretWriteRequest, request: Request) -> SecretWriteR
     version = await _vault_op(lambda: provider.write_path(ref.mount, ref.path, plain), body.vault_ref)
     hashes = {field: secret_fingerprint(value) for field, value in plain.items()}
     logger.info("secrets.set", vault_ref=body.vault_ref, fields=sorted(plain), version=version)
-    return SecretWriteResponse(vault_ref=body.vault_ref, version=version, hashes=hashes)
+    return SecretWriteOut(vault_ref=body.vault_ref, version=version, hashes=hashes)
 
 
-@router.post("/secrets/verify", response_model=SecretVerifyResponse)
-async def verify_secret(body: SecretVerifyRequest, request: Request) -> SecretVerifyResponse:
+@router.post(
+    "/secrets/verify",
+    response_model=SecretVerifyOut,
+    responses={**RESP_401, **RESP_400, **RESP_422_VALIDATION, **RESP_501, **RESP_502},
+)
+async def verify_secret(body: SecretVerifyRequest, request: Request) -> SecretVerifyOut:
     """Resolve a ref and return field names + fingerprints — never the values."""
     provider = _vault_provider(request)
     ref = _parse_ref(body.vault_ref)
@@ -134,7 +151,7 @@ async def verify_secret(body: SecretVerifyRequest, request: Request) -> SecretVe
         data = {ref.key: data[ref.key]} if ref.key in data else {}
     if not data:
         version = None
-    return SecretVerifyResponse(
+    return SecretVerifyOut(
         vault_ref=body.vault_ref,
         exists=bool(data),
         fields=sorted(data),
@@ -143,13 +160,25 @@ async def verify_secret(body: SecretVerifyRequest, request: Request) -> SecretVe
     )
 
 
-@router.post("/devices/{device_id}/secrets/harvest-community", response_model=HarvestCommunityResponse)
+@router.post(
+    "/devices/{device_id}/secrets/harvest-community",
+    response_model=HarvestCommunityOut,
+    responses={
+        **RESP_401,
+        **RESP_400,
+        **RESP_404,
+        **RESP_409,
+        **RESP_422_VALIDATION,
+        **RESP_501,
+        **RESP_502,
+    },
+)
 async def harvest_community(
     device_id: int,
     body: HarvestCommunityRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
-) -> HarvestCommunityResponse:
+) -> HarvestCommunityOut:
     """Adopt a device-held community string into Vault by its read-mirror fingerprint.
 
     Reads ONLY the targeted per-NED community subtree of NSO's config mirror,
@@ -199,7 +228,7 @@ async def harvest_community(
         vault_ref=body.vault_ref,
         version=version,
     )
-    return HarvestCommunityResponse(
+    return HarvestCommunityOut(
         vault_ref=body.vault_ref,
         secret_hash=secret_fingerprint(found.secret),
         version=version,

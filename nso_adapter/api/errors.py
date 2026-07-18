@@ -164,4 +164,6 @@ RESP_404 = {404: {**_ENVELOPE_SCHEMA, "description": "Not found"}}
 RESP_409_ACTIVE_JOB = {409: {**_ENVELOPE_SCHEMA, "description": "A job is already running for this device"}}
 RESP_409 = {409: {**_ENVELOPE_SCHEMA, "description": "Conflict"}}
 RESP_422_VALIDATION = {422: {**_ENVELOPE_SCHEMA, "description": "Request validation failed (envelope shape)"}}
+RESP_501 = {501: {**_ENVELOPE_SCHEMA, "description": "Not supported by the configured provider"}}
 RESP_502_NSO = {502: {**_ENVELOPE_SCHEMA, "description": "NSO unreachable"}}
+RESP_502 = {502: {**_ENVELOPE_SCHEMA, "description": "Upstream (NSO/Vault) operation failed"}}
