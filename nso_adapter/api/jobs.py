@@ -4,14 +4,31 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404, RESP_422_VALIDATION, api_error
 from nso_adapter.store.models import Job, JobStatus
 
 router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
+
+
+class JobOut(BaseModel):
+    """EMIT-NULL job shape — every key always present, nullables emitted as null."""
+
+    id: int
+    type: str
+    device_id: int | None
+    status: str
+    result: dict | None
+    error: dict | None
+    context: dict | None
+    created_at: str
+    updated_at: str
+    started_at: str | None
+    heartbeat_at: str | None
 
 
 def _job_out(j: Job) -> dict:
@@ -30,7 +47,12 @@ def _job_out(j: Job) -> dict:
     }
 
 
-@router.get("", dependencies=[Depends(verify_token)])
+@router.get(
+    "",
+    dependencies=[Depends(verify_token)],
+    response_model=list[JobOut],
+    responses={**RESP_401, **RESP_422_VALIDATION},
+)
 async def list_jobs(
     device_id: int | None = None,
     status: str | None = None,
@@ -49,7 +71,12 @@ async def list_jobs(
     return [_job_out(j) for j in result.scalars().all()]
 
 
-@router.get("/{job_id}", dependencies=[Depends(verify_token)])
+@router.get(
+    "/{job_id}",
+    dependencies=[Depends(verify_token)],
+    response_model=JobOut,
+    responses={**RESP_401, **RESP_404, **RESP_422_VALIDATION},
+)
 async def get_job(job_id: int, db: AsyncSession = Depends(get_db)):
     job = await db.get(Job, job_id)
     if not job:
