@@ -403,9 +403,13 @@ class DeviceFailover(Base):
     manual_override: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     # Proactive fallback-health: is the OOB path known-good while we're on primary? (None=unknown)
     oob_healthy: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    oob_health_result: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    oob_health_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     oob_health_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_probe_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    last_probe_result: Mapped[str | None] = mapped_column(String(16), nullable=True)  # "ok" | "fail"
+    last_probe_result: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    last_probe_target: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    last_probe_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_switch_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # Staggering bookkeeping — per-address due times so the fleet isn't probed in lockstep.
     next_primary_probe_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -437,6 +441,7 @@ class FailoverConfig(Base):
     failure_threshold: Mapped[int] = mapped_column(Integer, default=3, server_default=text("3"))
     success_threshold: Mapped[int] = mapped_column(Integer, default=5, server_default=text("5"))
     probe_timeout: Mapped[float] = mapped_column(Float, default=10.0, server_default=text("10.0"))  # seconds
+    active_probe_timeout: Mapped[float] = mapped_column(Float, default=45.0, server_default=text("45.0"))
     # Spike-derived: probe due devices concurrently under this cap so simultaneously-down
     # devices cost ceil(n/concurrency)·timeout, not n·timeout.
     probe_concurrency: Mapped[int] = mapped_column(Integer, default=8, server_default=text("8"))

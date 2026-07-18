@@ -38,6 +38,8 @@ def test_failover_defaults(db):
     assert row.consecutive_successes == 0
     assert row.manual_override is False
     assert row.oob_healthy is None  # tri-state: not yet checked
+    assert row.oob_health_result is None
+    assert row.oob_health_detail is None
     assert row.last_probe_at is None and row.last_switch_at is None
 
 
@@ -96,6 +98,7 @@ def test_failover_config_defaults(db):
     assert row.failure_threshold == 3
     assert row.success_threshold == 5
     assert row.probe_timeout == 10.0
+    assert row.active_probe_timeout == 45.0
     assert row.probe_concurrency == 8
     assert row.max_flips_per_tick == 8
     assert row.sync_from_after_switch is True

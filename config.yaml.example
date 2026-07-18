@@ -28,7 +28,7 @@ netbox:
 api:
   adapter_token_ref: "credentials/example-svc#adapter_token"
 
-database_url: sqlite+aiosqlite:///./nso_adapter.db
+database_url: postgresql+asyncpg://nso_adapter:replace-me@postgres:5432/nso_adapter
 log_level: INFO
 log_format: json
 

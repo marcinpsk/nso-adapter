@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 import structlog
 from sqlalchemy import select
 
-from nso_adapter.nso.actions import probe_reachable
+from nso_adapter.nso.actions import ProbeStatus, ReachabilityProbe, probe_reachable
 from nso_adapter.store.models import ActiveAddress, DeviceFailover, FailoverConfig
 
 if TYPE_CHECKING:
@@ -65,6 +65,7 @@ class EffectiveFailoverConfig:
     failover_failure_threshold: int
     failover_success_threshold: int
     failover_probe_timeout: float
+    failover_active_probe_timeout: float
     failover_sync_from_after_switch: bool
     probe_concurrency: int
     max_flips_per_tick: int
@@ -86,6 +87,7 @@ async def get_effective_failover_config(db: AsyncSession, scheduler_cfg: Schedul
             failover_failure_threshold=scheduler_cfg.failover_failure_threshold,
             failover_success_threshold=scheduler_cfg.failover_success_threshold,
             failover_probe_timeout=scheduler_cfg.failover_probe_timeout,
+            failover_active_probe_timeout=scheduler_cfg.failover_active_probe_timeout,
             failover_sync_from_after_switch=scheduler_cfg.failover_sync_from_after_switch,
             probe_concurrency=scheduler_cfg.failover_probe_concurrency,
             max_flips_per_tick=scheduler_cfg.failover_max_flips_per_tick,
@@ -97,6 +99,7 @@ async def get_effective_failover_config(db: AsyncSession, scheduler_cfg: Schedul
         failover_failure_threshold=row.failure_threshold,
         failover_success_threshold=row.success_threshold,
         failover_probe_timeout=row.probe_timeout,
+        failover_active_probe_timeout=row.active_probe_timeout,
         failover_sync_from_after_switch=row.sync_from_after_switch,
         probe_concurrency=row.probe_concurrency,
         max_flips_per_tick=row.max_flips_per_tick,
@@ -277,9 +280,29 @@ async def _maybe_clear_manual_override(client: NsoClient, fo: DeviceFailover, na
         logger.info("failover.manual_override_cleared", device=name, address=current)
 
 
-def _record_probe(fo: DeviceFailover, now: datetime, reachable: bool) -> None:
+def _coerce_probe(outcome) -> ReachabilityProbe:
+    """Accept the structured result plus legacy tuple-shaped test/external fakes."""
+    if isinstance(outcome, ReachabilityProbe):
+        return outcome
+    reachable, detail, elapsed = outcome
+    status = ProbeStatus.ok if reachable else ProbeStatus.unreachable
+    return ReachabilityProbe(status, detail, elapsed)
+
+
+def _record_probe(fo: DeviceFailover, now: datetime, outcome: ReachabilityProbe, target: str) -> None:
     fo.last_probe_at = now
-    fo.last_probe_result = "ok" if reachable else "fail"
+    fo.last_probe_result = outcome.status.value
+    fo.last_probe_target = target
+    fo.last_probe_detail = outcome.detail or None
+
+
+def _legacy_health(outcome: ReachabilityProbe) -> bool | None:
+    """Map only conclusive outcomes onto the compatibility boolean."""
+    if outcome.status == ProbeStatus.ok:
+        return True
+    if outcome.status == ProbeStatus.unreachable:
+        return False
+    return None
 
 
 # ── State transitions (the switch + failback commit) ──────────────────────────
@@ -339,10 +362,17 @@ async def _active_primary_probe(
     Returns True (probe ran → advance due-time) unless a needed switch is flip-budget-capped,
     in which case it returns False so the device stays due and retries the switch next tick.
     """
-    reachable, _detail, elapsed = await probe_reachable(client, name, cfg.failover_probe_timeout)
-    logger.debug("failover.probe", device=name, target=_PRIMARY, active=True, reachable=reachable, elapsed=elapsed)
-    _record_probe(fo, now, reachable)
-    step = step_failover(reachable, fo.consecutive_failures, has_oob, cfg.failover_failure_threshold)
+    outcome = _coerce_probe(await probe_reachable(client, name, cfg.failover_active_probe_timeout))
+    logger.debug(
+        "failover.probe",
+        device=name,
+        target=_PRIMARY,
+        active=True,
+        status=outcome.status.value,
+        elapsed=outcome.elapsed,
+    )
+    _record_probe(fo, now, outcome, _PRIMARY)
+    step = step_failover(outcome.reachable, fo.consecutive_failures, has_oob, cfg.failover_failure_threshold)
     fo.consecutive_failures, fo.consecutive_successes = step.failures, step.successes
     if not step.act:
         return True
@@ -385,10 +415,16 @@ async def _failback_flip_probe(
     await _set_address(client, name, fo.primary_ip)  # flip to primary for the probe
     committed = False
     try:
-        reachable, _detail, elapsed = await probe_reachable(client, name, cfg.failover_probe_timeout)
-        logger.debug("failover.flip_probe", device=name, target=_PRIMARY, reachable=reachable, elapsed=elapsed)
-        _record_probe(fo, now, reachable)
-        step = step_failback(reachable, fo.consecutive_successes, cfg.failover_success_threshold)
+        outcome = _coerce_probe(await probe_reachable(client, name, cfg.failover_probe_timeout))
+        logger.debug(
+            "failover.flip_probe",
+            device=name,
+            target=_PRIMARY,
+            status=outcome.status.value,
+            elapsed=outcome.elapsed,
+        )
+        _record_probe(fo, now, outcome, _PRIMARY)
+        step = step_failback(outcome.reachable, fo.consecutive_successes, cfg.failover_success_threshold)
         fo.consecutive_failures, fo.consecutive_successes = step.failures, step.successes
         if step.act:
             await _commit_failback(client, fo, name, cfg, now)
@@ -429,10 +465,19 @@ async def _probe_oob(
     """Probe the OOB IP — liveness when on OOB, proactive fallback-health flip when on primary."""
     if fo.active_address == _OOB:
         # Cheap liveness of the active OOB (surfaces the both-down case; no state change).
-        reachable, _detail, elapsed = await probe_reachable(client, name, cfg.failover_probe_timeout)
-        logger.debug("failover.probe", device=name, target=_OOB, active=True, reachable=reachable, elapsed=elapsed)
-        _record_probe(fo, now, reachable)
-        fo.oob_healthy = reachable
+        outcome = _coerce_probe(await probe_reachable(client, name, cfg.failover_active_probe_timeout))
+        logger.debug(
+            "failover.probe",
+            device=name,
+            target=_OOB,
+            active=True,
+            status=outcome.status.value,
+            elapsed=outcome.elapsed,
+        )
+        _record_probe(fo, now, outcome, _OOB)
+        fo.oob_healthy = _legacy_health(outcome)
+        fo.oob_health_result = outcome.status.value
+        fo.oob_health_detail = outcome.detail or None
         fo.oob_health_checked_at = now
         return True
 
@@ -447,9 +492,17 @@ async def _probe_oob(
     fo.manual_override = False
     await _set_address(client, name, fo.oob_ip)  # flip to OOB for the health probe
     try:
-        reachable, _detail, elapsed = await probe_reachable(client, name, cfg.failover_probe_timeout)
-        logger.debug("failover.flip_probe", device=name, target=_OOB, reachable=reachable, elapsed=elapsed)
-        fo.oob_healthy = reachable
+        outcome = _coerce_probe(await probe_reachable(client, name, cfg.failover_probe_timeout))
+        logger.debug(
+            "failover.flip_probe",
+            device=name,
+            target=_OOB,
+            status=outcome.status.value,
+            elapsed=outcome.elapsed,
+        )
+        fo.oob_healthy = _legacy_health(outcome)
+        fo.oob_health_result = outcome.status.value
+        fo.oob_health_detail = outcome.detail or None
         fo.oob_health_checked_at = now
     finally:
         # Always flip back to primary (even if the probe raised) — this was only a health check.
@@ -584,12 +637,16 @@ async def upsert_failover_ips(db: AsyncSession, device: Device, primary_ip: str 
         fo.consecutive_successes = 0
         fo.last_probe_at = None
         fo.last_probe_result = None
+        fo.last_probe_target = None
+        fo.last_probe_detail = None
         if primary_ip:
             fo.next_primary_probe_at = now
         changed = True
     if fo.oob_ip != oob_ip:
         fo.oob_ip = oob_ip
-        fo.oob_healthy = False
+        fo.oob_healthy = None
+        fo.oob_health_result = None
+        fo.oob_health_detail = None
         fo.oob_health_checked_at = None
         if oob_ip:
             fo.next_oob_probe_at = now

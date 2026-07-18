@@ -27,6 +27,7 @@ async def test_get_failover_config_defaults_when_unset(adapter_client):
     assert body["failure_threshold"] == 3
     assert body["success_threshold"] == 5
     assert body["probe_timeout"] == 10.0
+    assert body["active_probe_timeout"] == 45.0
     assert body["probe_concurrency"] == 8
     assert body["max_flips_per_tick"] == 8
 
@@ -40,6 +41,7 @@ async def test_put_failover_config_persists_and_get_reflects(adapter_client):
         "failure_threshold": 4,
         "success_threshold": 6,
         "probe_timeout": 7.5,
+        "active_probe_timeout": 50.0,
         "probe_concurrency": 12,
         "max_flips_per_tick": 10,
         "sync_from_after_switch": False,

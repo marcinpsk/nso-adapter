@@ -8,6 +8,8 @@ docs/nso-adapter.md §3.
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
+from enum import StrEnum
 
 import httpx
 import structlog
@@ -17,6 +19,33 @@ from nso_adapter.nso.client import NsoClient, _url_key
 logger = structlog.get_logger(__name__)
 
 _DEVICE_BASE = "/restconf/data/tailf-ncs:devices/device={name}"
+
+
+class ProbeStatus(StrEnum):
+    """Why a reachability probe passed or failed."""
+
+    ok = "ok"
+    unreachable = "unreachable"
+    timeout = "timeout"
+    error = "error"
+
+
+@dataclass(frozen=True)
+class ReachabilityProbe:
+    """Structured probe outcome with tuple-unpacking compatibility for older callers."""
+
+    status: ProbeStatus
+    detail: str
+    elapsed: float
+
+    @property
+    def reachable(self) -> bool:
+        return self.status == ProbeStatus.ok
+
+    def __iter__(self):
+        yield self.reachable
+        yield self.detail
+        yield self.elapsed
 
 
 def _device_base(client: NsoClient, device_name: str) -> str:
@@ -76,28 +105,30 @@ async def connect(client: NsoClient, device_name: str, timeout: float | None = N
         return resp.json().get("tailf-ncs:output", {})
 
 
-async def probe_reachable(client: NsoClient, device_name: str, timeout: float | None = None) -> tuple[bool, str, float]:
+async def probe_reachable(client: NsoClient, device_name: str, timeout: float | None = None) -> ReachabilityProbe:
     """Test device manageability via NSO ``connect`` — reachability as NSO sees it.
 
-    Returns ``(reachable, detail, elapsed_seconds)``. The device is reachable only when the
-    connect action returns a truthy ``result`` (``"connected"``). NSO reports an unreachable
-    device EITHER by raising an RPC/HTTP error OR by returning HTTP 200 with
-    ``{"result": false, "info": ...}`` (the same shape ``fetch-host-keys`` uses for a failed
-    SSH negotiation), so BOTH must be treated as unreachable — never raise-only. *detail*
-    carries NSO's ``info`` / the error repr for logging.
+    Returns a structured outcome which can still be unpacked as
+    ``(reachable, detail, elapsed_seconds)``. The device is reachable only when the
+    connect action returns a truthy ``result`` (``"connected"``). An HTTP 200 with
+    ``{"result": false, "info": ...}`` is a genuine unreachable verdict from NSO. Timeouts
+    and NSO/API errors remain separate outcomes because neither proves the device address is
+    down. *detail* carries NSO's ``info`` or the exception representation for logging and UI.
     """
     start = time.perf_counter()
     try:
         out = await connect(client, device_name, timeout=timeout)
+    except httpx.TimeoutException as exc:
+        return ReachabilityProbe(ProbeStatus.timeout, repr(exc), time.perf_counter() - start)
     except (httpx.HTTPError, ValueError) as exc:
-        # ValueError covers a JSONDecodeError from a malformed/empty reply — treat any of
-        # these as unreachable rather than letting the probe crash its caller.
-        return False, repr(exc), time.perf_counter() - start
+        # An NSO/API/decoding failure does not prove that the device address is unreachable.
+        return ReachabilityProbe(ProbeStatus.error, repr(exc), time.perf_counter() - start)
     elapsed = time.perf_counter() - start
     result = out.get("result")
     reachable = result in ("connected", True, "true")
     detail = "" if reachable else str(out.get("info") or result or "")
-    return reachable, detail, elapsed
+    status = ProbeStatus.ok if reachable else ProbeStatus.unreachable
+    return ReachabilityProbe(status, detail, elapsed)
 
 
 async def capability_probe(client: NsoClient, device_name: str) -> dict:

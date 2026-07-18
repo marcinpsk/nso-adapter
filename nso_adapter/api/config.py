@@ -39,6 +39,7 @@ def _config_out(eff: EffectiveFailoverConfig, deployment_enabled: bool) -> dict:
         "failure_threshold": eff.failover_failure_threshold,
         "success_threshold": eff.failover_success_threshold,
         "probe_timeout": eff.failover_probe_timeout,
+        "active_probe_timeout": eff.failover_active_probe_timeout,
         "probe_concurrency": eff.probe_concurrency,
         "max_flips_per_tick": eff.max_flips_per_tick,
         "sync_from_after_switch": eff.failover_sync_from_after_switch,
@@ -57,6 +58,7 @@ class FailoverConfigUpdate(BaseModel):
     failure_threshold: int | None = Field(None, ge=1)
     success_threshold: int | None = Field(None, ge=1)
     probe_timeout: float | None = Field(None, gt=0, le=120)  # seconds
+    active_probe_timeout: float | None = Field(None, gt=0, le=120)  # seconds
     # Ceiling kept ≤ the DB pool headroom (store/db.py sizes the pool at 30): each concurrent
     # probe holds a session for the full unreachable-probe timeout, so a higher value would
     # starve the pool that API/sync traffic shares.

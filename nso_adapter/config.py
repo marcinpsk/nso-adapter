@@ -129,6 +129,7 @@ class SchedulerConfig(BaseModel):
     failover_failure_threshold: int = 3  # consecutive failures before primary→OOB
     failover_success_threshold: int = 5  # consecutive successes before OOB→primary
     failover_probe_timeout: float = 10.0  # seconds — short, so an unreachable connect can't hang
+    failover_active_probe_timeout: float = 45.0  # seconds — allow a cold active-address session to establish
     failover_sync_from_after_switch: bool = True
     # Spike-derived staggering knobs (static fallback when no FailoverConfig row exists).
     failover_probe_concurrency: int = 8  # probe due devices concurrently — the load lever (keep ≤ DB pool; store/db.py)
@@ -143,7 +144,7 @@ class AppConfig(BaseModel):
     netbox: NetboxConfig
     api: ApiConfig
     scheduler: SchedulerConfig = SchedulerConfig()
-    database_url: str = "sqlite+aiosqlite:///./nso_adapter.db"
+    database_url: str
     log_level: str = "INFO"
     log_format: str = "json"
 

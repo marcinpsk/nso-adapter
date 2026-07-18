@@ -23,8 +23,12 @@ async def test_get_device_includes_failover_block(adapter_client):
                 primary_ip="10.0.0.1",
                 oob_ip="192.0.2.5",
                 active_address=ActiveAddress.oob.value,
-                last_probe_result="fail",
-                oob_healthy=True,
+                last_probe_result="timeout",
+                last_probe_target="oob",
+                last_probe_detail="cold connect exceeded probe window",
+                oob_healthy=None,
+                oob_health_result="timeout",
+                oob_health_detail="cold connect exceeded probe window",
                 last_switch_at=datetime.now(UTC).replace(tzinfo=None),
             )
         )
@@ -37,8 +41,12 @@ async def test_get_device_includes_failover_block(adapter_client):
     assert fo["active_address"] == "oob"
     assert fo["primary_ip"] == "10.0.0.1"
     assert fo["oob_ip"] == "192.0.2.5"
-    assert fo["last_probe_result"] == "fail"
-    assert fo["oob_healthy"] is True
+    assert fo["last_probe_result"] == "timeout"
+    assert fo["last_probe_target"] == "oob"
+    assert fo["last_probe_detail"] == "cold connect exceeded probe window"
+    assert fo["oob_healthy"] is None
+    assert fo["oob_health_result"] == "timeout"
+    assert fo["oob_health_detail"] == "cold connect exceeded probe window"
     assert fo["last_switch_at"] is not None
     assert fo["manual_override"] is False
 

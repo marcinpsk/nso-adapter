@@ -255,6 +255,36 @@ async def test_oob_liveness_probe_records_health_on_oob(monkeypatch):
     assert client.calls == []  # cheap liveness, no address change
 
 
+async def test_active_oob_timeout_is_recorded_with_detail_and_uses_longer_timeout(monkeypatch):
+    """A cold active-OOB connect gets the active-address window and retains a timeout
+    verdict/detail; it must not collapse into the misleading binary 'unreachable'."""
+    cfg = SchedulerConfig()
+    object.__setattr__(cfg, "failover_active_probe_timeout", 45.0)
+    seen = {}
+
+    async def _probe(client, name, timeout=None):
+        seen["timeout"] = timeout
+        return failover.ReachabilityProbe(
+            failover.ProbeStatus.timeout,
+            "cold connect exceeded 10 seconds",
+            10.0,
+        )
+
+    monkeypatch.setattr(failover, "probe_reachable", _probe)
+    dev = _device()
+    fo = _failover_row(active=ActiveAddress.oob.value)
+
+    await _tick(dev, fo, FakeNso(address="192.0.2.5"), cfg, now=_BASE, primary_due=False, oob_due=True)
+
+    assert seen["timeout"] == 45.0
+    assert fo.last_probe_result == "timeout"
+    assert fo.last_probe_target == "oob"
+    assert fo.last_probe_detail == "cold connect exceeded 10 seconds"
+    assert fo.oob_health_result == "timeout"
+    assert fo.oob_health_detail == "cold connect exceeded 10 seconds"
+    assert fo.oob_healthy is None  # legacy boolean must not turn a timeout into "unreachable"
+
+
 async def test_oob_active_refreshes_at_primary_cadence(monkeypatch):
     """On OOB, the active address's liveness refreshes at the primary (active) cadence —
     NOT the slow proactive-fallback cadence, which left a device-on-OOB showing health

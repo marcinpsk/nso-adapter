@@ -18,6 +18,7 @@ def _app_config(provider: str, vault: VaultConfig | None = None) -> AppConfig:
         nso_instances=[],
         netbox=NetboxConfig(base_url="http://netbox.local", api_token_ref="NB_TOKEN"),
         api=ApiConfig(adapter_token_ref="ADAPTER_TOKEN"),
+        database_url="postgresql+asyncpg://adapter:adapter@db/adapter_test",
     )
 
 

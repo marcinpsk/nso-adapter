@@ -1,9 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for config loading."""
 
+from pathlib import Path
+
 import pytest
+import yaml
 
 from nso_adapter.config import get_config, get_env_settings, reset_config
+
+
+def test_example_config_uses_postgresql():
+    """The operator-facing example must not revive the retired SQLite dev setup."""
+    example = yaml.safe_load((Path(__file__).parents[1] / "config.yaml.example").read_text())
+
+    assert example["database_url"].startswith("postgresql+asyncpg://")
 
 
 def test_get_config_loads_yaml(tmp_path, monkeypatch):
@@ -22,7 +32,7 @@ netbox:
   api_token_ref: "NETBOX_TOKEN"
 api:
   adapter_token_ref: "ADAPTER_TOKEN"
-database_url: sqlite+aiosqlite:///./test.db
+database_url: postgresql+asyncpg://adapter:adapter@db/adapter_test
 """)
     monkeypatch.setenv("CONFIG_FILE", str(cfg_file))
     reset_config()
@@ -53,6 +63,7 @@ netbox:
   api_token_ref: "NETBOX_TOKEN"
 api:
   adapter_token_ref: "ADAPTER_TOKEN"
+database_url: postgresql+asyncpg://adapter:adapter@db/adapter_test
 """)
     monkeypatch.setenv("CONFIG_FILE", str(cfg_file))
     reset_config()
@@ -60,6 +71,27 @@ api:
     reset_config()
     cfg2 = get_config()
     assert cfg1 is not cfg2
+
+
+def test_database_url_has_no_implicit_sqlite_fallback(tmp_path, monkeypatch):
+    """Runtime config must name PostgreSQL explicitly; omitting it must not silently create
+    the obsolete local SQLite database that was removed from the dev architecture."""
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("""
+secrets:
+  provider: local
+nso_instances: []
+netbox:
+  base_url: http://netbox.local
+  api_token_ref: "NETBOX_TOKEN"
+api:
+  adapter_token_ref: "ADAPTER_TOKEN"
+""")
+    monkeypatch.setenv("CONFIG_FILE", str(cfg_file))
+    reset_config()
+
+    with pytest.raises(ValueError, match="database_url"):
+        get_config()
 
 
 def test_env_settings_reads_role_id(monkeypatch):

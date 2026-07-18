@@ -231,23 +231,43 @@ async def test_probe_reachable_result_false_is_unreachable():
     client = _make_nso_client()
     _mock_http_ctx(client, _resp(200, {"tailf-ncs:output": {"result": False, "info": "connection refused"}}))
 
-    reachable, detail, _ = await probe_reachable(client, "rtr")
+    outcome = await probe_reachable(client, "rtr")
+    reachable, detail, _ = outcome
 
     assert reachable is False
+    assert outcome.status == "unreachable"
     assert "connection refused" in detail
 
 
 @pytest.mark.asyncio
-async def test_probe_reachable_http_error_is_unreachable():
-    """An RPC/HTTP error (here a 502) is also unreachable — connect's raise_for_status
-    raises httpx.HTTPStatusError, which probe_reachable swallows into (False, detail)."""
+async def test_probe_reachable_http_error_is_probe_error():
+    """An NSO/API error is not evidence that the device itself is unreachable."""
     client = _make_nso_client()
     _mock_http_ctx(client, _resp(502, {"tailf-ncs:output": {"result": "connected"}}))
 
-    reachable, detail, _ = await probe_reachable(client, "rtr")
+    outcome = await probe_reachable(client, "rtr")
+    reachable, detail, _ = outcome
 
     assert reachable is False
+    assert outcome.status == "error"
     assert detail  # carries the error repr
+
+
+@pytest.mark.asyncio
+async def test_probe_reachable_timeout_is_distinct_and_retains_detail():
+    """A cold NSO connection exceeding the short probe window must be reported as a
+    timeout, not as proof that the address is unreachable (the live OOB false negative)."""
+    client = _make_nso_client()
+    http = AsyncMock()
+    request = httpx.Request("POST", "http://nso/connect")
+    http.post.side_effect = httpx.ReadTimeout("connect exceeded probe window", request=request)
+    _stub_pool(client, http)
+
+    outcome = await probe_reachable(client, "rtr", timeout=10)
+
+    assert outcome.reachable is False
+    assert outcome.status == "timeout"
+    assert "connect exceeded probe window" in outcome.detail
 
 
 @pytest.mark.asyncio

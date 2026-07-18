@@ -243,7 +243,9 @@ async def test_upsert_new_oob_rearms_probe_schedule(adapter_client):
 
         reloaded = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == dev.id))).scalar_one()
         assert reloaded.next_oob_probe_at < far  # due promptly, not behind old backoff
-        assert reloaded.oob_healthy is False  # verdict about the OLD address must not carry over
+        assert reloaded.oob_healthy is None  # no verdict about the new address yet
+        assert reloaded.oob_health_result is None
+        assert reloaded.oob_health_detail is None
         assert reloaded.next_primary_probe_at == far  # primary unchanged → schedule untouched
         break
 
