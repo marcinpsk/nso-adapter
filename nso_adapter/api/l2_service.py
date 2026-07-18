@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store.models import Device, DeviceL2Sap, DeviceSettings, L2SapIntent
 
@@ -22,7 +22,36 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/api/v1/devices", tags=["l2-service"])
 
 
-@router.get("/{device_id}/l2-services", dependencies=[Depends(verify_token)])
+# ── Read-mirror response models (GET /l2-services) ────────────────────────────
+# EMIT-NULL fixed shape (service_id/outer_tag/inner_tag null when unset), and the
+# response has NO top-level timestamp — so this endpoint does NOT use exclude_unset.
+
+
+class L2SapOut(BaseModel):
+    sap_id: str
+    port: str
+    outer_tag: int | None
+    inner_tag: int | None
+
+
+class L2ServiceOut(BaseModel):
+    service_name: str
+    service_type: str
+    service_id: int | None
+    saps: list[L2SapOut]
+
+
+class L2ServicesOut(BaseModel):
+    device_id: int
+    services: list[L2ServiceOut]
+
+
+@router.get(
+    "/{device_id}/l2-services",
+    dependencies=[Depends(verify_token)],
+    response_model=L2ServicesOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_l2_services(device_id: int, db: AsyncSession = Depends(get_db)):
     if await db.get(Device, device_id) is None:
         raise api_error(404, "not_found", "Device not found")

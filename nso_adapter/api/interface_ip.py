@@ -14,12 +14,38 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.store.models import DbInterface, Device, DeviceSettings, InterfaceIpAddress, InterfaceIpIntent
 
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/devices", tags=["interface-ips"])
+
+
+# ── Read-mirror response models (GET /interface-ips) ──────────────────────────
+# Fixed/EMIT-NULL shape: bound_port and each address's prefix_length are always
+# present (null when absent), so this endpoint does NOT use exclude_unset.
+
+
+class InterfaceIpAddressOut(BaseModel):
+    address: str
+    prefix_length: int | None
+    family: str
+    secondary: bool
+    vrf: str
+
+
+class InterfaceIpEntryOut(BaseModel):
+    interface: str
+    bound_port: str | None
+    addresses: list[InterfaceIpAddressOut]
+
+
+class InterfaceIpsOut(BaseModel):
+    device_id: int
+    last_refreshed_at: str | None = None  # reader formats "<iso>Z"; None when never refreshed
+    refresh_source: str
+    interfaces: list[InterfaceIpEntryOut]
 
 
 def _extract_prefix_length(address: str) -> int | None:
@@ -32,7 +58,12 @@ def _extract_prefix_length(address: str) -> int | None:
     return None
 
 
-@router.get("/{device_id}/interface-ips", dependencies=[Depends(verify_token)])
+@router.get(
+    "/{device_id}/interface-ips",
+    dependencies=[Depends(verify_token)],
+    response_model=InterfaceIpsOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_interface_ips(device_id: int, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, device_id)
     if not device:

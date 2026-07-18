@@ -4,14 +4,48 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.store.models import DbInterface, Device, InterfaceAttrState, InterfaceIntent
 
 router = APIRouter(prefix="/api/v1/devices", tags=["interfaces"])
+
+
+# ── Response models ───────────────────────────────────────────────────────────
+# Both endpoints are EMIT-NULL fixed shapes (every key always present, nullable
+# values serialised as null), so neither uses response_model_exclude_unset.
+# ``attrs`` is a dynamic map keyed by attribute name.
+
+
+class InterfaceAttrOut(BaseModel):
+    nso_value: str | None
+    netbox_value: str | None
+    intent_value: str | None
+    status: str
+    last_apply_at: str | None  # "<iso>Z" when applied, else null
+    last_apply_error: dict | None
+
+
+class InterfaceOut(BaseModel):
+    name: str
+    netbox_interface_id: int | None
+    attrs: dict[str, InterfaceAttrOut]
+    parent_binding: str | None
+    kind: str | None
+    encap_tag: str | None
+    vrf: str | None
+    service: str | None
+
+
+class InterfaceStateOut(BaseModel):
+    device_id: int
+    managed_interfaces: int
+    by_status: dict[str, int]  # SyncState value -> count
+    last_checked_at: str | None  # "<iso>Z" or null
 
 
 def _attr_out(attr_state: InterfaceAttrState, intent_row: InterfaceIntent | None) -> dict:
@@ -27,7 +61,12 @@ def _attr_out(attr_state: InterfaceAttrState, intent_row: InterfaceIntent | None
     }
 
 
-@router.get("/{device_id}/interfaces", dependencies=[Depends(verify_token)])
+@router.get(
+    "/{device_id}/interfaces",
+    dependencies=[Depends(verify_token)],
+    response_model=list[InterfaceOut],
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def list_interfaces(device_id: int, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, device_id)
     if not device:
@@ -68,7 +107,12 @@ async def list_interfaces(device_id: int, db: AsyncSession = Depends(get_db)):
     return out
 
 
-@router.get("/{device_id}/state", dependencies=[Depends(verify_token)])
+@router.get(
+    "/{device_id}/state",
+    dependencies=[Depends(verify_token)],
+    response_model=InterfaceStateOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
 async def get_state(device_id: int, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, device_id)
     if not device:
