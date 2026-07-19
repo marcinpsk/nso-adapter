@@ -5,6 +5,19 @@
 - **This file is canonical.** Both teams build against it. The plugin team
   mocks these endpoints; the adapter team also serves an auto-generated
   OpenAPI document from FastAPI at `/openapi.json` that must match this file.
+  Keeping this prose in step with the served schema is a manual discipline, but
+  three test suites keep the *served* schema itself honest and change-controlled
+  so it cannot drift silently between reviews:
+  - **`tests/api/test_openapi_snapshot.py`** — a schema-change review gate:
+    `create_app().openapi()` must equal the committed `tests/api/openapi_snapshot.json`
+    (regenerate deliberately via `uv run --native-tls -- python -m tests.api.gen_openapi --write`).
+    It also asserts no disambiguation-qualified component names and no dangling internal `$ref`s.
+    Framing: the snapshot flags any *schema* change but cannot catch a handler that emits a
+    key its `response_model` lacks (the rendered schema is unchanged) — that is the golden tests' job.
+  - **`tests/api/test_golden_*.py`** — per-endpoint response-body byte-identity (maximal / empty /
+    nullable variants), the drop guard the snapshot structurally cannot provide.
+  - **`tests/api/test_error_codes.py`** — pins the closed error-code set: every `api_error(` call
+    site ⊆ `ERROR_CODES` ⊆ the enum below.
 
 ---
 
