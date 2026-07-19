@@ -115,6 +115,7 @@ def test_start_scheduler_registers_lag_refresh_job(monkeypatch: pytest.MonkeyPat
         "switchport_refresh",
         "svi_refresh",
         "subinterface_refresh",
+        "startup_sync_kick",  # A4: one-shot restart repopulation
     }
     scheduler_module.stop_scheduler()
     assert fake_scheduler.stopped is True
@@ -183,6 +184,7 @@ def test_start_scheduler_skips_lag_refresh_when_disabled(monkeypatch: pytest.Mon
         "scope_reconcile",
         "intent_reconcile",
         "orphan_reap",
+        "startup_sync_kick",  # A4: one-shot restart repopulation (always registered)
     }
     scheduler_module.stop_scheduler()
 
@@ -245,7 +247,8 @@ def test_start_scheduler_registers_every_job_with_correct_interval(monkeypatch: 
     scheduler_module.start_scheduler()
 
     assert fake_scheduler.started is True
-    assert {job["id"]: job["minutes"] for job in fake_scheduler.jobs} == {
+    # Interval jobs only: the A4 startup_sync_kick is a one-shot "date" job with no `minutes`.
+    assert {job["id"]: job["minutes"] for job in fake_scheduler.jobs if job["trigger"] == "interval"} == {
         "sync_all_devices": 1,
         "scope_reconcile": 2,
         "intent_reconcile": 2,
@@ -429,3 +432,21 @@ async def test_l2l3_family_refresh_refreshes_all_devices(adapter_client, monkeyp
     # reach refresh as the 3rd positional arg (db, device, nso_client, ...).
     assert all(call.args[2] is nso_client for call in refresh.await_args_list)
     assert {call.args[1].nso_device_name for call in refresh.await_args_list} == {"d1", "d2"}
+
+
+def test_start_scheduler_kicks_startup_sync(monkeypatch: pytest.MonkeyPatch):
+    """A4: start_scheduler schedules ONE immediate sync sweep (routing + interface_ip) so a
+    restart repopulates the visible mirror promptly — not all 17 per-family polls at once."""
+    fake_scheduler = _FakeScheduler()
+    monkeypatch.setattr(scheduler_module, "AsyncIOScheduler", lambda **_kw: fake_scheduler)
+    monkeypatch.setattr(scheduler_module, "get_config", lambda: SimpleNamespace(scheduler=SchedulerConfig()))
+
+    scheduler_module.start_scheduler()
+
+    kick = [j for j in fake_scheduler.jobs if j.get("id") == "startup_sync_kick"]
+    assert len(kick) == 1
+    assert kick[0]["func"] is scheduler_module._scheduled_sync_all
+    assert kick[0]["trigger"] == "date"
+    # It must NOT schedule the per-family poll wrappers as startup one-shots (no 17-read burst):
+    family_oneshots = [j for j in fake_scheduler.jobs if j["trigger"] == "date" and j.get("id") != "startup_sync_kick"]
+    assert family_oneshots == []

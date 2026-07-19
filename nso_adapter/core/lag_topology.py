@@ -85,17 +85,21 @@ async def refresh_lag_topology_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "poll",
-) -> None:
-    """Read oper-data for *device* from NSO and upsert DB rows."""
+) -> bool:
+    """Read oper-data for *device* from NSO and upsert DB rows.
+
+    Returns True on a successful read (or an intentional skip); False when the NSO read
+    failed and the last-known rows were left untouched (a degraded surface).
+    """
     if not device.nso_device_name:
         logger.debug("lag.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
-        return
+        return True
 
     try:
         entry = await nso_client.get_lag_topology(device.nso_device_name)
     except Exception as exc:
         logger.warning("lag.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return
+        return False
 
     lags_data = as_list(entry.get("lag")) if entry else []
     await _upsert_lags(db, device, lags_data, refresh_source)
@@ -106,6 +110,7 @@ async def refresh_lag_topology_for_device(
         lag_count=len(lags_data),
         source=refresh_source,
     )
+    return True
 
 
 async def handle_netconf_config_change(

@@ -29,15 +29,19 @@ async def refresh_subinterface_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "poll",
-) -> None:
-    """Read subinterface oper-data for *device* and full-replace its rows."""
+) -> bool:
+    """Read subinterface oper-data for *device* and full-replace its rows.
+
+    Returns True on a successful read (or an intentional skip); False when the NSO read
+    failed and the last-known rows were left untouched (a degraded surface).
+    """
     if not device.nso_device_name:
-        return
+        return True
     try:
         entry = await nso_client.get_subinterface(device.nso_device_name)
     except Exception as exc:
         logger.warning("subinterface.refresh.error", device_id=device.id, error=repr(exc))
-        return
+        return False
 
     interfaces = as_list((entry or {}).get("interface")) if entry else []
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -68,6 +72,7 @@ async def refresh_subinterface_for_device(
         count=len(interfaces),
         refresh_source=refresh_source,
     )
+    return True
 
 
 async def handle_subinterface_change(

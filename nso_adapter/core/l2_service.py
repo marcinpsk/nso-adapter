@@ -68,17 +68,21 @@ async def refresh_l2_services_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "poll",
-) -> None:
-    """Read L2-service oper-data for *device* from NSO and upsert DB rows."""
+) -> bool:
+    """Read L2-service oper-data for *device* from NSO and upsert DB rows.
+
+    Returns True on a successful read (or an intentional skip); False when the NSO read
+    failed and the last-known rows were left untouched (a degraded surface).
+    """
     if not device.nso_device_name:
         logger.debug("l2_service.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
-        return
+        return True
 
     try:
         entry = await nso_client.get_l2_services(device.nso_device_name)
     except Exception as exc:
         logger.warning("l2_service.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return
+        return False
 
     services_data = as_list(entry.get("service")) if entry else []
     await _upsert_l2_saps(db, device, services_data, refresh_source)
@@ -89,6 +93,7 @@ async def refresh_l2_services_for_device(
         service_count=len(services_data),
         refresh_source=refresh_source,
     )
+    return True
 
 
 async def handle_l2_service_change(

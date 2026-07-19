@@ -551,6 +551,8 @@ async def test_refresh_routing_surfaces_returns_failed_surfaces(db_session: Asyn
         "nso_adapter.core.snmp.refresh_snmp_config_for_device": AsyncMock(return_value=True),
         "nso_adapter.core.logging_config.refresh_logging_config_for_device": AsyncMock(return_value=True),
         "nso_adapter.core.bfd.refresh_bfd_interfaces_for_device": AsyncMock(return_value=True),
+        # interface_ip rides the routing fan-out too (A3) — a clean read here.
+        "nso_adapter.core.interface_ip.refresh_interface_ips_for_device": AsyncMock(return_value=True),
     }
     with contextlib.ExitStack() as stack:
         for path, m in targets.items():
@@ -650,6 +652,7 @@ async def test_refresh_routing_surfaces_skips_all_when_disabled(db_session: Asyn
             enable_snmp_sync=False,
             enable_logging_sync=False,
             enable_bfd_sync=False,
+            enable_interface_ip_sync=False,
         )
     )
     monkeypatch.setattr("nso_adapter.core.importer.get_config", lambda: cfg)
@@ -1235,3 +1238,56 @@ async def test_detect_drift_swallows_notify_failure(db_session: AsyncSession):
 
     assert summary == {"changes_detected": 0}
     nb.notify_sync_complete.assert_awaited_once()
+
+
+# ── A3b: sync_device validates the sync-from result ──────────────────────────
+
+
+async def test_sync_device_reports_partial_on_failed_sync_from(db_session: AsyncSession):
+    """A3b: a sync-from that returned result:false means the mirror was read from stale CDB —
+    the device must report ``partial`` with ``sync_from`` degraded, not a misleading ``succeeded``."""
+    device = Device(
+        nso_instance="nso-dev", nso_device_name="sw-a3b-fail", ned_id="cisco-ios-cli-6.95", netbox_device_id=88
+    )
+    db_session.add(device)
+    await db_session.commit()
+
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = _make_nso_client({"interface": []})
+    imp._netbox_client = None
+
+    with (
+        patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": False})),
+        patch("nso_adapter.core.importer.refresh_routing_surfaces_for_device", new=AsyncMock(return_value=[])),
+    ):
+        await sync_device(device.id, db_session)
+
+    await db_session.refresh(device)
+    assert device.last_sync_status == LastSyncStatus.partial
+    assert "sync_from" in (device.degraded_surfaces or [])
+
+
+async def test_sync_device_succeeds_on_ok_sync_from(db_session: AsyncSession):
+    """A clean sync-from (result:true) with no degraded surfaces reports ``succeeded`` and does
+    not spuriously mark ``sync_from`` degraded."""
+    device = Device(
+        nso_instance="nso-dev", nso_device_name="sw-a3b-ok", ned_id="cisco-ios-cli-6.95", netbox_device_id=89
+    )
+    db_session.add(device)
+    await db_session.commit()
+
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = _make_nso_client({"interface": []})
+    imp._netbox_client = None
+
+    with (
+        patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})),
+        patch("nso_adapter.core.importer.refresh_routing_surfaces_for_device", new=AsyncMock(return_value=[])),
+    ):
+        await sync_device(device.id, db_session)
+
+    await db_session.refresh(device)
+    assert device.last_sync_status == LastSyncStatus.succeeded
+    assert device.degraded_surfaces is None

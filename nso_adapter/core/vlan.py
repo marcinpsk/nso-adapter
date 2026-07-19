@@ -68,15 +68,19 @@ async def refresh_vlan_database_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "poll",
-) -> None:
-    """Read the VLAN database for *device* and upsert+prune DeviceVlan rows."""
+) -> bool:
+    """Read the VLAN database for *device* and upsert+prune DeviceVlan rows.
+
+    Returns True on a successful read (or an intentional skip); False when the NSO read
+    failed and the last-known rows were left untouched (a degraded surface).
+    """
     if not device.nso_device_name:
-        return
+        return True
     try:
         entry = await nso_client.get_vlan_database(device.nso_device_name)
     except Exception as exc:
         logger.warning("vlan.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return
+        return False
 
     vlans = as_list((entry or {}).get("vlan") or (entry or {}).get("vlans"))
     existing = {
@@ -101,6 +105,7 @@ async def refresh_vlan_database_for_device(
             await db.delete(row)
     await db.commit()
     logger.info("vlan.refresh.done", device_id=device.id, vlans=len(seen), source=refresh_source)
+    return True
 
 
 async def refresh_switchport_for_device(
@@ -109,19 +114,22 @@ async def refresh_switchport_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "poll",
-) -> None:
+) -> bool:
     """Read switchport state for *device* and upsert+prune DeviceSwitchport rows.
 
     Resolves untagged/tagged VLAN ids to the device's DeviceVlan rows (by vlan-id);
     unknown vlan-ids are simply left unlinked (untagged) / skipped (tagged).
+
+    Returns True on a successful read (or an intentional skip); False when the NSO read
+    failed and the last-known rows were left untouched (a degraded surface).
     """
     if not device.nso_device_name:
-        return
+        return True
     try:
         entry = await nso_client.get_switchport(device.nso_device_name)
     except Exception as exc:
         logger.warning("switchport.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return
+        return False
 
     interfaces = as_list((entry or {}).get("interface") or (entry or {}).get("interfaces"))
     vlan_by_vid = {
@@ -167,6 +175,7 @@ async def refresh_switchport_for_device(
             await db.delete(row)
     await db.commit()
     logger.info("switchport.refresh.done", device_id=device.id, interfaces=len(seen), source=refresh_source)
+    return True
 
 
 async def _handle_change(event_data, db, nso_clients, refresh_fn) -> None:

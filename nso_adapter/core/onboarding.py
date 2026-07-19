@@ -247,10 +247,11 @@ async def provision_nso_device(
 
     # 4. sync-from — non-fatal (the adapter's normal sync will retry), but give
     #    it one backed-off retry too so onboarding usually lands fully synced.
+    sync_ok = False
     if do_sync:
         try:
-            ok = await _once_with_retry(lambda: client.sync_from(device_name), ok=bool)
-            _step("sync_from", "ok" if ok else "failed")
+            sync_ok = bool(await _once_with_retry(lambda: client.sync_from(device_name), ok=bool))
+            _step("sync_from", "ok" if sync_ok else "failed")
         except Exception as exc:
             _step("sync_from", "failed", repr(exc))
 
@@ -260,8 +261,35 @@ async def provision_nso_device(
         db, nso_instance, device_name, netbox_device_id, address, oob_ip, active_address, steps
     )
 
+    # 7. A2: fill the read-mirror immediately so a freshly-onboarded device's IP/LAG/L2/... show up
+    #    on the tab NOW, not on the next per-family poll (0–60 min for IP, up to 300 min for most).
+    #    Gated on a SUCCESSFUL sync-from: reading the export before the CDB is populated returns an
+    #    empty/404 body that would commit an empty mirror (the onboarding empty-wipe race). Best-effort
+    #    — a surface read failure must never fail provisioning; the normal poll/sync heals it later.
+    if sync_ok and device_id is not None:
+        await _initial_mirror_refresh(db, device_id, client)
+
     logger.info("device.provisioned", nso_device=device_name, instance=nso_instance, steps=steps)
     return _result(True, device_id)
+
+
+async def _initial_mirror_refresh(db: AsyncSession, device_id: int, client) -> None:
+    """Best-effort comprehensive read-mirror fill for a freshly-provisioned device (A2)."""
+    from nso_adapter.core.importer import refresh_all_surfaces_for_device
+
+    try:
+        device = await db.get(Device, device_id)
+        if device is None:
+            return
+        degraded = await refresh_all_surfaces_for_device(db, device, client, refresh_source="onboard")
+        await db.commit()
+        if degraded:
+            logger.warning("device.onboard_mirror.partial", device_id=device_id, degraded_surfaces=sorted(degraded))
+        else:
+            logger.info("device.onboard_mirror.done", device_id=device_id)
+    except Exception as exc:  # noqa: BLE001 — never fail provisioning on a mirror-read hiccup
+        await db.rollback()
+        logger.warning("device.onboard_mirror.failed", device_id=device_id, error=repr(exc))
 
 
 async def _map_and_seed_failover(

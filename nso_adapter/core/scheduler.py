@@ -940,6 +940,12 @@ def start_scheduler() -> None:
         if enabled and (not spec.gate_on_interval or interval > 0):
             _scheduler.add_job(spec.fn, "interval", minutes=interval, id=spec.job_id)
     _scheduler.start()
+    # A4: one immediate sync sweep so a process restart repopulates the operator-visible mirror
+    # (routing + interface_ip, via sync_device) within seconds instead of waiting a full poll
+    # interval (60 min for IP) — and WITHOUT firing all the per-family polls at once (a 17-read
+    # per-device startup burst). _scheduled_sync_all enqueues one deduped sync job per scoped
+    # device; the durable worker pool drains them. "date" with no run_date fires once, now.
+    _scheduler.add_job(_scheduled_sync_all, "date", id="startup_sync_kick", replace_existing=True)
     logger.info("scheduler.started")
 
 

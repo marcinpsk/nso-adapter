@@ -29,15 +29,19 @@ async def refresh_svi_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "poll",
-) -> None:
-    """Read svi oper-data for *device* and full-replace its device_svi rows."""
+) -> bool:
+    """Read svi oper-data for *device* and full-replace its device_svi rows.
+
+    Returns True on a successful read (or an intentional skip); False when the NSO read
+    failed and the last-known rows were left untouched (a degraded surface).
+    """
     if not device.nso_device_name:
-        return
+        return True
     try:
         entry = await nso_client.get_svi(device.nso_device_name)
     except Exception as exc:
         logger.warning("svi.refresh.error", device_id=device.id, error=repr(exc))
-        return
+        return False
 
     interfaces = as_list((entry or {}).get("interface")) if entry else []
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -66,6 +70,7 @@ async def refresh_svi_for_device(
         count=len(interfaces),
         refresh_source=refresh_source,
     )
+    return True
 
 
 async def handle_svi_change(

@@ -37,15 +37,19 @@ async def refresh_interface_mtu_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "poll",
-) -> None:
-    """Read interface-mtu oper-data for *device* and full-replace its rows."""
+) -> bool:
+    """Read interface-mtu oper-data for *device* and full-replace its rows.
+
+    Returns True on a successful read (or an intentional skip); False when the NSO read
+    failed and the last-known rows were left untouched (a degraded surface).
+    """
     if not device.nso_device_name:
-        return
+        return True
     try:
         entry = await nso_client.get_interface_mtu(device.nso_device_name)
     except Exception as exc:
         logger.warning("interface_mtu.refresh.error", device_id=device.id, error=repr(exc))
-        return
+        return False
 
     interfaces = (entry or {}).get("interface", []) if entry else []
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -75,6 +79,7 @@ async def refresh_interface_mtu_for_device(
         count=len(interfaces),
         refresh_source=refresh_source,
     )
+    return True
 
 
 async def handle_interface_mtu_change(

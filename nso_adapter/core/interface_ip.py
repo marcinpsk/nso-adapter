@@ -67,17 +67,21 @@ async def refresh_interface_ips_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "poll",
-) -> None:
-    """Read oper-data for *device* from NSO and upsert DB rows."""
+) -> bool:
+    """Read oper-data for *device* from NSO and upsert DB rows.
+
+    Returns True on a successful read (or an intentional skip); False when the NSO read
+    failed and the last-known rows were left untouched (a degraded surface).
+    """
     if not device.nso_device_name:
         logger.debug("interface_ip.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
-        return
+        return True
 
     try:
         entry = await nso_client.get_interface_ips(device.nso_device_name)
     except Exception as exc:
         logger.warning("interface_ip.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return
+        return False
 
     interfaces_data = as_list(entry.get("interface")) if entry else []
     await _upsert_ip_addresses(db, device, interfaces_data, refresh_source)
@@ -90,6 +94,7 @@ async def refresh_interface_ips_for_device(
         address_count=total_addrs,
         source=refresh_source,
     )
+    return True
 
 
 async def handle_interface_ip_change(

@@ -121,29 +121,46 @@ def get_netbox_client():
     return _netbox_client
 
 
-async def refresh_routing_surfaces_for_device(
+async def _run_surfaces(
     db: AsyncSession,
     device: Device,
     nso_client: NsoClient,
-    *,
-    refresh_source: str = "sync",
+    surfaces: list[tuple[str, object]],
+    refresh_source: str,
 ) -> list[str]:
-    """Best-effort fan-out: refresh every enabled routing/extra surface for one device.
+    """Run a list of ``(name, refresh_fn)`` for one device, isolating per-surface failures.
 
-    A device "sync" historically only refreshed interface attributes; the routing
-    surfaces (IS-IS / BGP / OSPF / route-policy / redistribution / static / SNMP) were
-    updated solely by their independent poll jobs, so "Sync Now" never moved them. This
-    runs each enabled surface's existing per-device refresh on demand, gated by the same
-    scheduler enable flags. Every surface is isolated — one failing (or a NED that does
-    not serve it) must not abort the others or the sync. The caller commits.
-
-    Returns the names of surfaces that FAILED to refresh — either the refresher raised,
-    or it signalled a swallowed NSO read failure with ``return False`` (its last-known
-    rows are now stale). The caller records these so the device reports ``partial``
-    rather than a misleading ``succeeded``.
+    Returns the names of surfaces that FAILED — either the refresher raised, or it signalled
+    a swallowed NSO read failure with ``return False`` (its last-known rows are now stale).
+    Callers record these so the device reports ``partial`` rather than a misleading
+    ``succeeded``. One failing surface (or a NED that does not serve it) must not abort the
+    others. The caller commits.
     """
-    cfg = get_config().scheduler
+    failed: list[str] = []
+    for name, fn in surfaces:
+        try:
+            ok = await fn(db, device, nso_client, refresh_source=refresh_source)
+            if ok is False:
+                failed.append(name)
+        except Exception as exc:
+            logger.warning(
+                "sync.surface_refresh_failed",
+                device_id=device.id,
+                surface=name,
+                error=repr(exc),
+            )
+            failed.append(name)
+    return failed
 
+
+def _routing_surfaces(cfg) -> list[tuple[str, object]]:
+    """Build the routing/extra surface list refreshed by ``sync_device`` (Sync Now + 15-min poll).
+
+    Includes ``interface_ip`` (A3): folding it into the sync fan-out is a cheap +1 read that
+    keeps the operator-visible IP mirror fresh on every sync, instead of only on its 60-min
+    poll or an SSE event. The heavier L2/lag families stay off this hot path — they refresh
+    on their own poll jobs and via the comprehensive on-demand ``refresh_all_surfaces``.
+    """
     surfaces: list[tuple[str, object]] = []
     if cfg.enable_static_routing_sync:
         from nso_adapter.core.static_route import refresh_static_routes_for_device
@@ -181,43 +198,15 @@ async def refresh_routing_surfaces_for_device(
         from nso_adapter.core.bfd import refresh_bfd_interfaces_for_device
 
         surfaces.append(("bfd", refresh_bfd_interfaces_for_device))
+    if cfg.enable_interface_ip_sync:
+        from nso_adapter.core.interface_ip import refresh_interface_ips_for_device
 
-    failed: list[str] = []
-    for name, fn in surfaces:
-        try:
-            ok = await fn(db, device, nso_client, refresh_source=refresh_source)
-            if ok is False:
-                failed.append(name)
-        except Exception as exc:
-            logger.warning(
-                "sync.surface_refresh_failed",
-                device_id=device.id,
-                surface=name,
-                error=repr(exc),
-            )
-            failed.append(name)
-    return failed
+        surfaces.append(("interface_ip", refresh_interface_ips_for_device))
+    return surfaces
 
 
-async def refresh_config_surfaces_for_device(
-    db: AsyncSession,
-    device: Device,
-    nso_client: NsoClient,
-    *,
-    refresh_source: str = "apply",
-) -> None:
-    """Best-effort refresh of the L2 / interface config surfaces (VLAN / SVI / subinterface / MTU).
-
-    These back the plugin's ``accepted → deploying`` overlay rows that settle to ``in_sync`` only
-    once the applied object is *present* in the adapter read-mirror. Unlike the routing surfaces
-    they are NOT part of ``sync_device``'s fan-out (each refreshes on its own poll job), so after a
-    device Apply the plugin's post-apply reconcile would otherwise read a stale mirror and leave the
-    row ``deploying`` until that surface's next poll. Re-reading them here lets the row settle right
-    after Apply. Each surface is isolated + gated by the same scheduler enable flag; one failure
-    must not abort the others (the caller commits).
-    """
-    cfg = get_config().scheduler
-
+def _config_surfaces(cfg) -> list[tuple[str, object]]:
+    """Build the L2 / interface config surface list (VLAN / SVI / subinterface / MTU)."""
     surfaces: list[tuple[str, object]] = []
     if cfg.enable_vlan_sync:
         from nso_adapter.core.vlan import refresh_vlan_database_for_device
@@ -235,17 +224,86 @@ async def refresh_config_surfaces_for_device(
         from nso_adapter.core.interface_mtu import refresh_interface_mtu_for_device
 
         surfaces.append(("interface_mtu", refresh_interface_mtu_for_device))
+    return surfaces
 
-    for name, fn in surfaces:
-        try:
-            await fn(db, device, nso_client, refresh_source=refresh_source)
-        except Exception as exc:
-            logger.warning(
-                "apply.config_surface_refresh_failed",
-                device_id=device.id,
-                surface=name,
-                error=repr(exc),
-            )
+
+def _extra_mirror_surfaces(cfg) -> list[tuple[str, object]]:
+    """Build the device-mirror surface list neither in the routing fan-out nor the config set.
+
+    ``lag_topology`` / ``lag_config`` carry no dedicated enable flag (their poll job is
+    gated on interval only), so they are always included in the comprehensive refresh.
+    """
+    surfaces: list[tuple[str, object]] = []
+    from nso_adapter.core.lag_topology import refresh_lag_topology_for_device
+
+    surfaces.append(("lag_topology", refresh_lag_topology_for_device))
+    from nso_adapter.core.lag_config import refresh_lag_config_for_device
+
+    surfaces.append(("lag_config", refresh_lag_config_for_device))
+    if cfg.enable_l2_service_sync:
+        from nso_adapter.core.l2_service import refresh_l2_services_for_device
+
+        surfaces.append(("l2_service", refresh_l2_services_for_device))
+    if cfg.enable_switchport_sync:
+        from nso_adapter.core.vlan import refresh_switchport_for_device
+
+        surfaces.append(("switchport", refresh_switchport_for_device))
+    return surfaces
+
+
+async def refresh_routing_surfaces_for_device(
+    db: AsyncSession,
+    device: Device,
+    nso_client: NsoClient,
+    *,
+    refresh_source: str = "sync",
+) -> list[str]:
+    """Fan-out for ``sync_device``: refresh the routing/extra surfaces (incl. interface_ip).
+
+    A device "sync" historically only refreshed interface attributes; the routing surfaces
+    were updated solely by their independent poll jobs, so "Sync Now" never moved them (and
+    interface_ip was omitted entirely). Runs each enabled surface's per-device refresh on
+    demand, gated by the scheduler enable flags. Returns the FAILED surface names (see
+    :func:`_run_surfaces`); the caller records them so the device reports ``partial``.
+    """
+    return await _run_surfaces(db, device, nso_client, _routing_surfaces(get_config().scheduler), refresh_source)
+
+
+async def refresh_config_surfaces_for_device(
+    db: AsyncSession,
+    device: Device,
+    nso_client: NsoClient,
+    *,
+    refresh_source: str = "apply",
+) -> list[str]:
+    """Best-effort refresh of the L2 / interface config surfaces (VLAN / SVI / subinterface / MTU).
+
+    These back the plugin's ``accepted → deploying`` overlay rows that settle to ``in_sync`` only
+    once the applied object is *present* in the adapter read-mirror. Re-reading them right after a
+    device Apply lets the row settle instead of waiting for that surface's next poll. Returns the
+    FAILED surface names (callers may ignore the list — apply just wants the best-effort refresh).
+    """
+    return await _run_surfaces(db, device, nso_client, _config_surfaces(get_config().scheduler), refresh_source)
+
+
+async def refresh_all_surfaces_for_device(
+    db: AsyncSession,
+    device: Device,
+    nso_client: NsoClient,
+    *,
+    refresh_source: str = "refresh",
+) -> list[str]:
+    """Comprehensive on-demand refresh of EVERY enabled read-mirror family for one device.
+
+    The single "refresh this device's whole mirror now" primitive, used at the moments that
+    matter (onboarding, an explicit refresh) where reading all 18 families is worth it — as
+    opposed to the lean per-15-min ``sync_device`` path (routing + interface_ip only). Each
+    surface is enable-gated and isolated; returns the FAILED surface names so the caller can
+    report ``partial``. The caller commits.
+    """
+    cfg = get_config().scheduler
+    surfaces = _routing_surfaces(cfg) + _config_surfaces(cfg) + _extra_mirror_surfaces(cfg)
+    return await _run_surfaces(db, device, nso_client, surfaces, refresh_source)
 
 
 class _WriteCtx(NamedTuple):
@@ -423,6 +481,19 @@ async def _flush_netbox_patches(nb_client, attr_patches, pending_by_id) -> int:
     return count
 
 
+def _sync_from_succeeded(output) -> bool:
+    """Whether a sync-from action output signals it actually pulled the running config.
+
+    NSO returns ``{"result": true}`` on a real pull. Mirrors ``NsoClient.sync_from``'s check
+    (absent/falsy result → not pulled), tolerating a string rendering. Used so ``sync_device``
+    does not report a live reread when the CDB was never refreshed (device unreachable).
+    """
+    result = (output or {}).get("result")
+    if isinstance(result, str):
+        return result.strip().lower() == "true"
+    return bool(result)
+
+
 async def sync_device(device_id: int, db: AsyncSession) -> dict:
     """Full sync: NSO → DB → NetBox. Returns job result summary dict."""
     device = await db.get(Device, device_id)
@@ -432,8 +503,10 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
     client = get_nso_client(device.nso_instance)
     await _resolve_ned_id(db, device, client)
 
-    # Step 1: sync-from — refresh CDB from live device
-    await nso_actions.sync_from(client, device.nso_device_name)
+    # Step 1: sync-from — refresh CDB from live device. Capture the action result: a 200 does
+    # NOT mean it pulled (a device-unreachable sync-from returns result:false), and every mirror
+    # read below is only as fresh as this made the CDB (A3b).
+    sync_from_ok = _sync_from_succeeded(await nso_actions.sync_from(client, device.nso_device_name))
 
     # Step 2: read canonical interface attributes from NSO package oper-data
     attrs = await client.get_interface_attributes(device.nso_device_name)
@@ -472,6 +545,12 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
     # exposes (IS-IS/BGP/OSPF/route-policy/...), not just interface attributes. Done
     # before the plugin notify so its reconcile sees the fresh surface state in one pass.
     degraded = await refresh_routing_surfaces_for_device(db, device, client, refresh_source="sync")
+
+    # A3b: a sync-from that did not actually pull (result:false / unreachable) means every surface
+    # was just re-read from STALE CDB — this sync is not a live device reread, so report it degraded
+    # rather than claim 'succeeded' with fresh data it does not have.
+    if not sync_from_ok:
+        degraded = [*degraded, "sync_from"]
 
     # Record the outcome only AFTER the fan-out. A surface whose NSO read failed leaves a
     # stale mirror, so the device reports 'partial' (naming the offending surfaces) rather
