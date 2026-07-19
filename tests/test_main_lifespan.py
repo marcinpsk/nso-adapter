@@ -407,3 +407,44 @@ async def test_init_database_skips_create_all_on_postgres(monkeypatch):
 
     await _init_database(SimpleNamespace(database_url="postgresql+asyncpg://u:p@db/adapter"))
     # no AttributeError on fake_pg_engine.begin → the create_all block was skipped
+
+
+# --------------------------------------------------------------------------- #
+# B3 — SSE emits notify_sync_complete per changed device (real overlay backstop)
+# --------------------------------------------------------------------------- #
+
+
+async def test_notify_changed_devices_notifies_plugin(adapter_client):
+    """B3: an SSE config-change for a NetBox-linked device fires exactly one notify_sync_complete
+    so the change reaches the plugin overlays — the SSE path was mirror-only (no notify) before."""
+    from unittest.mock import AsyncMock
+
+    from nso_adapter.core.importer import set_netbox_client
+    from nso_adapter.main import _notify_changed_devices
+    from nso_adapter.store.db import get_session
+    from tests.conftest import seed_device
+
+    await seed_device(nso_device_name="sse-dev", netbox_device_id=555)
+    nb = AsyncMock()
+    set_netbox_client(nb)
+    try:
+        event = {"netconf-config-change": {"edit": [{"target": "/ncs:devices/device[name='sse-dev']/config/x"}]}}
+        async for db in get_session():
+            await _notify_changed_devices(event, db)
+            break
+        nb.notify_sync_complete.assert_awaited_once_with(555)
+    finally:
+        set_netbox_client(None)
+
+
+async def test_notify_changed_devices_noop_without_netbox_client(adapter_client):
+    """No NetBox client registered → the notify path is a clean no-op (never raises)."""
+    from nso_adapter.core.importer import set_netbox_client
+    from nso_adapter.main import _notify_changed_devices
+    from nso_adapter.store.db import get_session
+
+    set_netbox_client(None)
+    event = {"netconf-config-change": {"edit": [{"target": "/ncs:devices/device[name='ghost']/config/x"}]}}
+    async for db in get_session():
+        await _notify_changed_devices(event, db)  # must not raise
+        break

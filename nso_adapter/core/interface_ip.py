@@ -83,7 +83,22 @@ async def refresh_interface_ips_for_device(
         logger.warning("interface_ip.refresh.nso_error", device_id=device.id, error=repr(exc))
         return False
 
-    interfaces_data = as_list(entry.get("interface")) if entry else []
+    if entry is None:
+        # B2 (F5): the client returns None on a 404, which is NOT an authoritative "this device has
+        # no IPs" — it means the export isn't serving this device (unsupported NED / not-ready /
+        # absent). A genuinely IP-less but *synced* device returns a PRESENT entry with an empty
+        # `interface` list (200 — see network-state-export ips.py `_refresh_device`), so a real
+        # total-clear still wipes below. Keep the last-known rows rather than committing an empty
+        # mirror over a transient/absent read (the onboarding empty-wipe class).
+        logger.info(
+            "interface_ip.refresh.empty_suspect",
+            device_id=device.id,
+            nso_device_name=device.nso_device_name,
+            reason="nso_returned_none",
+        )
+        return True
+
+    interfaces_data = as_list(entry.get("interface"))
     await _upsert_ip_addresses(db, device, interfaces_data, refresh_source)
     total_addrs = sum(len(as_list(iface.get("address"))) for iface in interfaces_data)
     logger.info(

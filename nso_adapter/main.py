@@ -134,6 +134,46 @@ async def _dispatch_netconf_change(cfg, parsed: dict, db, clients: dict[str, Nso
     await handle_subinterface_change(parsed, db, clients)
     if cfg.scheduler.enable_interface_mtu_sync:
         await handle_interface_mtu_change(parsed, db, clients)
+    # B3: the handlers above refreshed the adapter mirror, but the SSE path historically never
+    # notified the plugin — so a config change did not reach the NSO*State overlays until the next
+    # 15-min sync. Emit ONE notify_sync_complete per changed device so the change reconciles promptly,
+    # making SSE a real overlay backstop (not just a mirror-only refresh).
+    await _notify_changed_devices(parsed, db)
+
+
+async def _notify_changed_devices(parsed: dict, db) -> None:
+    """Emit one deduped notify_sync_complete per NetBox-linked device named in the change (B3).
+
+    Best-effort: a notify failure is logged and swallowed — the mirror is already refreshed, and
+    the periodic sync/reconcile still reconciles the overlays later.
+    """
+    from sqlalchemy import select
+
+    from nso_adapter.core.importer import get_netbox_client
+    from nso_adapter.core.lag_topology import parse_changed_nso_devices
+    from nso_adapter.store.models import Device
+
+    nb_client = get_netbox_client()
+    if nb_client is None:
+        return
+    changed = parse_changed_nso_devices(parsed)
+    if not changed:
+        return
+    devices = (
+        (
+            await db.execute(
+                select(Device).where(Device.nso_device_name.in_(changed), Device.netbox_device_id.is_not(None))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # dedup by NetBox id so one event → at most one reconcile-notify per device
+    for netbox_id in {d.netbox_device_id for d in devices}:
+        try:
+            await nb_client.notify_sync_complete(netbox_id)
+        except Exception as exc:
+            logger.warning("sse.notify_failed", netbox_device_id=netbox_id, error=str(exc) or type(exc).__name__)
 
 
 def _make_sse_event_handler(cfg, clients: dict[str, NsoClient], dispatch_tasks: set[asyncio.Task]):

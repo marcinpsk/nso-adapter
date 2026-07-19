@@ -129,8 +129,10 @@ async def test_refresh_full_replaces_existing_rows(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_refresh_clears_on_404(adapter_client):
-    """If NSO returns None (device gone) existing rows are cleared."""
+async def test_refresh_keeps_rows_on_none_404(adapter_client):
+    """B2 (F5): a client None (HTTP 404) is NOT authoritative — the export isn't serving this
+    device (unsupported NED / not-ready / absent), so existing rows are KEPT, not wiped. A real
+    total-clear returns a PRESENT entry with an empty interface list (see next test)."""
     device_id = await seed_device(nso_device_name="ip-sw03", netbox_device_id=912)
     async with _device_session(device_id) as (db, device):
         from datetime import UTC, datetime
@@ -152,10 +154,51 @@ async def test_refresh_clears_on_404(adapter_client):
         nso_client = AsyncMock()
         nso_client.get_interface_ips.return_value = None
 
-        await refresh_interface_ips_for_device(db, device, nso_client)
+        result = await refresh_interface_ips_for_device(db, device, nso_client)
 
-        result = await db.execute(select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id))
-        assert result.scalars().all() == []
+        assert result is True  # a clean 404 answer, not a read failure
+        rows = (
+            (await db.execute(select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id)))
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1  # kept — NOT wiped by the ambiguous None
+
+
+@pytest.mark.anyio
+async def test_refresh_wipes_on_present_empty(adapter_client):
+    """A genuinely IP-less but synced device returns a PRESENT entry with an empty interface list
+    (200) — that IS authoritative, so the mirror is full-replaced to empty (a real total-clear)."""
+    device_id = await seed_device(nso_device_name="ip-empty", netbox_device_id=916)
+    async with _device_session(device_id) as (db, device):
+        from datetime import UTC, datetime
+
+        db.add(
+            InterfaceIpAddress(
+                device_id=device.id,
+                interface_name="GE0/1",
+                address="10.0.0.1/24",
+                vrf="",
+                family="ipv4",
+                secondary=False,
+                last_refreshed_at=datetime.now(UTC).replace(tzinfo=None),
+                refresh_source="poll",
+            )
+        )
+        await db.commit()
+
+        nso_client = AsyncMock()
+        nso_client.get_interface_ips.return_value = {"device-name": "ip-empty", "interface": []}
+
+        result = await refresh_interface_ips_for_device(db, device, nso_client)
+
+        assert result is True
+        rows = (
+            (await db.execute(select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id)))
+            .scalars()
+            .all()
+        )
+        assert rows == []  # authoritative empty → wiped
 
 
 @pytest.mark.anyio

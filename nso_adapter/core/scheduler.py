@@ -278,236 +278,65 @@ async def _scheduled_orphan_reap() -> None:
 
 async def _scheduled_lag_topology_refresh() -> None:
     """Periodic fallback: refresh LAG topology for all managed devices."""
-    from sqlalchemy import select
-
-    from nso_adapter.core.importer import get_nso_client
     from nso_adapter.core.lag_topology import refresh_lag_topology_for_device
-    from nso_adapter.store.db import get_session
-    from nso_adapter.store.models import Device
 
-    async for db in get_session():
-        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
-        devices = result.scalars().all()
-        for device in devices:
-            try:
-                nso_client = get_nso_client(device.nso_instance)
-            except RuntimeError:
-                logger.debug(
-                    "scheduler.lag_topology.skipped",
-                    device_id=device.id,
-                    reason="no_nso_client",
-                    instance=device.nso_instance,
-                )
-                continue
-            await refresh_lag_topology_for_device(db, device, nso_client, refresh_source="poll")
+    await _refresh_all_devices(refresh_lag_topology_for_device, "lag_topology")
 
 
 async def _scheduled_lag_config_refresh() -> None:
     """Periodic fallback: refresh LAG config for all managed devices."""
-    from sqlalchemy import select
-
-    from nso_adapter.core.importer import get_nso_client
     from nso_adapter.core.lag_config import refresh_lag_config_for_device
-    from nso_adapter.store.db import get_session
-    from nso_adapter.store.models import Device
 
-    async for db in get_session():
-        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
-        devices = result.scalars().all()
-        for device in devices:
-            try:
-                nso_client = get_nso_client(device.nso_instance)
-            except RuntimeError:
-                logger.debug(
-                    "scheduler.lag_config.skipped",
-                    device_id=device.id,
-                    reason="no_nso_client",
-                    instance=device.nso_instance,
-                )
-                continue
-            await refresh_lag_config_for_device(db, device, nso_client, refresh_source="poll")
+    await _refresh_all_devices(refresh_lag_config_for_device, "lag_config")
 
 
 async def _scheduled_l2_service_refresh() -> None:
     """Periodic fallback: refresh Nokia L2 services (epipe/vpls + SAPs) for all managed devices."""
-    from sqlalchemy import select
-
-    from nso_adapter.core.importer import get_nso_client
     from nso_adapter.core.l2_service import refresh_l2_services_for_device
-    from nso_adapter.store.db import get_session
-    from nso_adapter.store.models import Device
 
-    async for db in get_session():
-        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
-        devices = result.scalars().all()
-        for device in devices:
-            try:
-                nso_client = get_nso_client(device.nso_instance)
-            except RuntimeError:
-                logger.debug(
-                    "scheduler.l2_service.skipped",
-                    device_id=device.id,
-                    reason="no_nso_client",
-                    instance=device.nso_instance,
-                )
-                continue
-            await refresh_l2_services_for_device(db, device, nso_client, refresh_source="poll")
+    await _refresh_all_devices(refresh_l2_services_for_device, "l2_service")
 
 
 async def _scheduled_interface_ip_refresh() -> None:
     """Periodic fallback: refresh interface IP addresses for all managed devices."""
-    from sqlalchemy import select
-
-    from nso_adapter.core.importer import get_nso_client
     from nso_adapter.core.interface_ip import refresh_interface_ips_for_device
-    from nso_adapter.store.db import get_session
-    from nso_adapter.store.models import Device
 
-    async for db in get_session():
-        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
-        devices = result.scalars().all()
-        for device in devices:
-            try:
-                nso_client = get_nso_client(device.nso_instance)
-            except RuntimeError:
-                logger.debug(
-                    "scheduler.interface_ip.skipped",
-                    device_id=device.id,
-                    reason="no_nso_client",
-                    instance=device.nso_instance,
-                )
-                continue
-            await refresh_interface_ips_for_device(db, device, nso_client, refresh_source="poll")
+    await _refresh_all_devices(refresh_interface_ips_for_device, "interface_ip")
 
 
 async def _scheduled_static_route_refresh() -> None:
     """Periodic fallback: refresh static routes for all managed devices."""
-    from sqlalchemy import select
-
-    from nso_adapter.core.importer import get_nso_client
     from nso_adapter.core.static_route import refresh_static_routes_for_device
-    from nso_adapter.store.db import get_session
-    from nso_adapter.store.models import Device
 
-    async for db in get_session():
-        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
-        devices = result.scalars().all()
-        for device in devices:
-            try:
-                nso_client = get_nso_client(device.nso_instance)
-            except RuntimeError:
-                logger.debug(
-                    "scheduler.static_route.skipped",
-                    device_id=device.id,
-                    reason="no_nso_client",
-                    instance=device.nso_instance,
-                )
-                continue
-            await refresh_static_routes_for_device(db, device, nso_client, refresh_source="poll")
+    await _refresh_all_devices(refresh_static_routes_for_device, "static_route")
 
 
 async def _scheduled_isis_refresh() -> None:
     """Periodic fallback: refresh IS-IS interfaces for all managed devices."""
-    from sqlalchemy import select
-
-    from nso_adapter.core.importer import get_nso_client
     from nso_adapter.core.isis import refresh_isis_interfaces_for_device
-    from nso_adapter.store.db import get_session
-    from nso_adapter.store.models import Device
 
-    async for db in get_session():
-        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
-        devices = result.scalars().all()
-        for device in devices:
-            try:
-                nso_client = get_nso_client(device.nso_instance)
-            except RuntimeError:
-                logger.debug(
-                    "scheduler.isis.skipped",
-                    device_id=device.id,
-                    reason="no_nso_client",
-                    instance=device.nso_instance,
-                )
-                continue
-            await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
+    await _refresh_all_devices(refresh_isis_interfaces_for_device, "isis")
 
 
 async def _scheduled_bgp_refresh() -> None:
     """Periodic fallback: refresh BGP config for all managed devices."""
-    from sqlalchemy import select
-
     from nso_adapter.core.bgp import refresh_bgp_config_for_device
-    from nso_adapter.core.importer import get_nso_client
-    from nso_adapter.store.db import get_session
-    from nso_adapter.store.models import Device
 
-    async for db in get_session():
-        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
-        devices = result.scalars().all()
-        for device in devices:
-            try:
-                nso_client = get_nso_client(device.nso_instance)
-            except RuntimeError:
-                logger.debug(
-                    "scheduler.bgp.skipped",
-                    device_id=device.id,
-                    reason="no_nso_client",
-                    instance=device.nso_instance,
-                )
-                continue
-            await refresh_bgp_config_for_device(db, device, nso_client, refresh_source="poll")
+    await _refresh_all_devices(refresh_bgp_config_for_device, "bgp")
 
 
 async def _scheduled_ospf_refresh() -> None:
     """Periodic fallback: refresh OSPF config for all managed devices."""
-    from sqlalchemy import select
-
-    from nso_adapter.core.importer import get_nso_client
     from nso_adapter.core.ospf import refresh_ospf_for_device
-    from nso_adapter.store.db import get_session
-    from nso_adapter.store.models import Device
 
-    async for db in get_session():
-        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
-        devices = result.scalars().all()
-        for device in devices:
-            try:
-                nso_client = get_nso_client(device.nso_instance)
-            except RuntimeError:
-                logger.debug(
-                    "scheduler.ospf.skipped",
-                    device_id=device.id,
-                    reason="no_nso_client",
-                    instance=device.nso_instance,
-                )
-                continue
-            await refresh_ospf_for_device(db, device, nso_client, refresh_source="poll")
+    await _refresh_all_devices(refresh_ospf_for_device, "ospf")
 
 
 async def _scheduled_redistribution_refresh() -> None:
     """Periodic fallback: refresh redistribution config for all managed devices."""
-    from sqlalchemy import select
-
-    from nso_adapter.core.importer import get_nso_client
     from nso_adapter.core.redistribution import refresh_redistribution_for_device
-    from nso_adapter.store.db import get_session
-    from nso_adapter.store.models import Device
 
-    async for db in get_session():
-        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
-        devices = result.scalars().all()
-        for device in devices:
-            try:
-                nso_client = get_nso_client(device.nso_instance)
-            except RuntimeError:
-                logger.debug(
-                    "scheduler.redistribution.skipped",
-                    device_id=device.id,
-                    reason="no_nso_client",
-                    instance=device.nso_instance,
-                )
-                continue
-            await refresh_redistribution_for_device(db, device, nso_client, refresh_source="poll")
+    await _refresh_all_devices(refresh_redistribution_for_device, "redistribution")
 
 
 async def _scheduled_snmp_refresh() -> None:
@@ -516,73 +345,23 @@ async def _scheduled_snmp_refresh() -> None:
     SNMP otherwise only refreshes on an SSE config-change event, so without this
     the mirror never populates/self-heals on a device that hasn't changed.
     """
-    from sqlalchemy import select
-
-    from nso_adapter.core.importer import get_nso_client
     from nso_adapter.core.snmp import refresh_snmp_config_for_device
-    from nso_adapter.store.db import get_session
-    from nso_adapter.store.models import Device
 
-    async for db in get_session():
-        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
-        devices = result.scalars().all()
-        for device in devices:
-            try:
-                nso_client = get_nso_client(device.nso_instance)
-            except RuntimeError:
-                logger.debug(
-                    "scheduler.snmp.skipped",
-                    device_id=device.id,
-                    reason="no_nso_client",
-                    instance=device.nso_instance,
-                )
-                continue
-            await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
+    await _refresh_all_devices(refresh_snmp_config_for_device, "snmp")
 
 
 async def _scheduled_logging_refresh() -> None:
     """Periodic fallback: refresh logging/syslog config for all managed devices."""
-    from sqlalchemy import select
-
-    from nso_adapter.core.importer import get_nso_client
     from nso_adapter.core.logging_config import refresh_logging_config_for_device
-    from nso_adapter.store.db import get_session
-    from nso_adapter.store.models import Device
 
-    async for db in get_session():
-        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
-        for device in result.scalars().all():
-            try:
-                nso_client = get_nso_client(device.nso_instance)
-            except RuntimeError:
-                continue
-            await refresh_logging_config_for_device(db, device, nso_client, refresh_source="poll")
+    await _refresh_all_devices(refresh_logging_config_for_device, "logging")
 
 
 async def _scheduled_route_policy_refresh() -> None:
     """Periodic fallback: refresh route-policy objects for all managed devices."""
-    from sqlalchemy import select
-
-    from nso_adapter.core.importer import get_nso_client
     from nso_adapter.core.route_policy import refresh_route_policy_for_device
-    from nso_adapter.store.db import get_session
-    from nso_adapter.store.models import Device
 
-    async for db in get_session():
-        result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
-        devices = result.scalars().all()
-        for device in devices:
-            try:
-                nso_client = get_nso_client(device.nso_instance)
-            except RuntimeError:
-                logger.debug(
-                    "scheduler.route_policy.skipped",
-                    device_id=device.id,
-                    reason="no_nso_client",
-                    instance=device.nso_instance,
-                )
-                continue
-            await refresh_route_policy_for_device(db, device, nso_client, refresh_source="poll")
+    await _refresh_all_devices(refresh_route_policy_for_device, "route_policy")
 
 
 async def _scheduled_capability_refresh() -> None:
