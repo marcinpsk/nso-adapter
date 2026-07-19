@@ -418,6 +418,10 @@ async def put_route_policy_intent(
     objects = body.get("objects")
     if not isinstance(objects, list):
         raise api_error(422, "invalid_payload", "Body must contain an 'objects' list")
+    if not all(isinstance(o, dict) for o in objects):
+        # Reject non-object items before building the full-replace key set below — otherwise
+        # ``o.get("family")`` on a primitive raises an unhandled AttributeError (500).
+        raise api_error(422, "invalid_payload", "Each item in 'objects' must be a JSON object")
 
     now = datetime.now(UTC).replace(tzinfo=None)
     upserted = 0

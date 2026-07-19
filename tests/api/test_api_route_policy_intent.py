@@ -169,22 +169,29 @@ async def test_invalid_name_beats_invalid_entries_within_object(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_primitive_list_items_are_a_known_unhandled_gap(adapter_client):
-    """DOCUMENTED GAP (deferred per the S3 plan — "primitive list items → current behavior").
-
-    ``{"objects": [1, 2]}`` passes the is-list check, then ``o.get("family")`` is called on an
-    int while building the full-replace key set — an unhandled ``AttributeError`` (a 500 in
-    production; the ASGI test transport re-raises it). S3 documents the request schema without
-    touching ``body: dict``, so this runtime behavior is intentionally left unchanged. This
-    test pins it: any future guard that turns primitive items into a clean 4xx will (correctly)
-    turn this test red, forcing a deliberate review of the behavior change."""
+async def test_primitive_list_items_rejected_as_invalid_payload(adapter_client):
+    """A non-object item in ``objects`` (e.g. ``{"objects": [1, 2]}``) is rejected with a clean
+    422 ``invalid_payload`` before any DB mutation — previously ``o.get("family")`` was called on
+    an int while building the full-replace key set, an unhandled AttributeError (500)."""
     device_id = await seed_device(nso_device_name="rp-primitive-items", netbox_device_id=7962)
-    with pytest.raises(AttributeError):
-        await adapter_client.put(
-            f"/api/v1/devices/{device_id}/route-policy-intent",
-            headers=AUTH,
-            json={"objects": [1, 2]},
-        )
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/route-policy-intent",
+        headers=AUTH,
+        json={"objects": [1, 2]},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_payload"
+
+
+@pytest.mark.anyio
+async def test_missing_device_beats_primitive_list_items(adapter_client):
+    """404 (device) still wins over the non-object-item 422: the device lookup precedes the
+    per-item shape check, exactly as it does for the non-list-objects case."""
+    resp = await adapter_client.put(
+        "/api/v1/devices/999999/route-policy-intent", headers=AUTH, json={"objects": [1, 2]}
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "not_found"
 
 
 # ── upsert + response ─────────────────────────────────────────────────────────
