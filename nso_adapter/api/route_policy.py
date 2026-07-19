@@ -241,6 +241,97 @@ async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_db)):
 _VALID_FAMILIES = {"prefix_list", "community_list", "as_path", "route_map"}
 
 
+# ── Intent PUT response model (PUT /route-policy-intent) ───────────────────────
+# EMIT-NULL shape: every key is always present (no exclude_unset). ``entries`` is
+# the opaque per-family JSON stored verbatim (prefix-list lines / community members
+# / as-path patterns / route-map terms) — typed ``list`` so it passes through
+# unaltered. ``accepted_at``/``last_apply_at`` are "<iso>Z" strings or None.
+
+
+class RoutePolicyIntentObjectOut(BaseModel):
+    id: int
+    family: str
+    name: str
+    entries: list  # opaque per-family shape, pass-through
+    accepted_at: str | None  # "<iso>Z" when accepted, else None
+    last_apply_at: str | None  # "<iso>Z" once applied, else None
+    last_apply_error: dict | None  # structured {code, message, detail} from core/apply.py, or None
+
+
+class RoutePolicyIntentPutOut(BaseModel):
+    device_id: int
+    objects: list[RoutePolicyIntentObjectOut]
+    # object name -> community members the device's NED codec cannot represent
+    unsupported_members: dict[str, list[str]]
+
+
+# Request schema is documented via ``openapi_extra`` rather than a Pydantic body model:
+# any body model (even ``objects: list[Any]``) validates BEFORE the endpoint runs, which
+# would pre-empt the handler's device-lookup-first precedence (a missing device must 404,
+# not 422 on the body). Keeping ``body: dict`` preserves that order; this block only
+# documents the request shape in OpenAPI. FastAPI deep-merges it onto the auto-generated
+# ``requestBody`` for ``body: dict`` (see test_api_route_policy_intent.py behavior matrix).
+_ROUTE_POLICY_INTENT_OPENAPI = {
+    "requestBody": {
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "title": "RoutePolicyIntentRequest",
+                    "type": "object",
+                    "required": ["objects"],
+                    "properties": {
+                        "objects": {
+                            "type": "array",
+                            "description": (
+                                "The full owned set of route-policy objects for this device. "
+                                "Full-replace per object: objects absent from the list are removed "
+                                "from the mirror."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "required": ["family", "name", "entries"],
+                                "properties": {
+                                    "family": {
+                                        "type": "string",
+                                        "enum": sorted(_VALID_FAMILIES),
+                                        "description": "Route-policy object family.",
+                                    },
+                                    "name": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "description": "Object name (non-empty).",
+                                    },
+                                    "entries": {
+                                        "type": "array",
+                                        "items": {"type": "object", "additionalProperties": True},
+                                        "description": (
+                                            "Per-family entry list (prefix-list lines, community members, "
+                                            "as-path patterns, or route-map terms). The shape is "
+                                            "family-specific and stored verbatim."
+                                        ),
+                                    },
+                                    "accepted": {
+                                        "type": "boolean",
+                                        "default": False,
+                                        "description": "When true, stamps accepted_at on the object.",
+                                    },
+                                    "invert_match": {
+                                        "type": "boolean",
+                                        "default": False,
+                                        "description": "Community-list invert-match flag.",
+                                    },
+                                },
+                            },
+                        }
+                    },
+                }
+            }
+        },
+    }
+}
+
+
 async def _upsert_route_policy_object(db: AsyncSession, device_id: int, obj: dict, before_entries: dict, now) -> bool:
     """Create-or-update one policy object; return True if its content SHRANK.
 
@@ -294,7 +385,13 @@ async def _upsert_route_policy_object(db: AsyncSession, device_id: int, obj: dic
     return shrank
 
 
-@router.put("/{device_id}/route-policy-intent", dependencies=[Depends(verify_token)])
+@router.put(
+    "/{device_id}/route-policy-intent",
+    dependencies=[Depends(verify_token)],
+    response_model=RoutePolicyIntentPutOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    openapi_extra=_ROUTE_POLICY_INTENT_OPENAPI,
+)
 async def put_route_policy_intent(
     device_id: int,
     body: dict,

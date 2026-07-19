@@ -96,6 +96,97 @@ async def test_put_route_policy_intent_rejects_non_list_entries(adapter_client):
     assert resp.json()["error"]["code"] == "invalid_entries"
 
 
+# ── behavior matrix: validation PRECEDENCE ──────────────────────────────────────
+#
+# The endpoint keeps ``body: dict`` (never a Pydantic body model) on purpose: the request
+# schema is documented via ``openapi_extra`` so the runtime precedence below is preserved.
+# A Pydantic body model would validate the body BEFORE the handler runs, turning every
+# "missing device + malformed body" case into a 422 (body validation) instead of the 404 the
+# handler produces by checking the device FIRST. These tests pin that order so the OpenAPI
+# schema documentation stays decoupled from — and honest about — runtime behavior.
+
+
+@pytest.mark.anyio
+async def test_missing_device_beats_non_list_objects(adapter_client):
+    """404 (device) wins over 422 (non-list ``objects``): the device lookup precedes the
+    body-shape check. A Pydantic ``objects: list`` body model would 422 here instead."""
+    resp = await adapter_client.put(
+        "/api/v1/devices/999999/route-policy-intent", headers=AUTH, json={"objects": "not-a-list"}
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "not_found"
+
+
+@pytest.mark.anyio
+async def test_missing_device_beats_bad_per_object(adapter_client):
+    """404 (device) wins over per-object 422s (invalid_family/name/entries): the device
+    lookup precedes the per-object validation loop."""
+    resp = await adapter_client.put(
+        "/api/v1/devices/999999/route-policy-intent",
+        headers=AUTH,
+        json={"objects": [{"family": "bogus", "name": ""}]},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "not_found"
+
+
+@pytest.mark.anyio
+async def test_non_dict_body_is_framework_validation_error(adapter_client):
+    """``body: dict`` still enforces a JSON object at the framework layer: a non-object body
+    (here a JSON array) is rejected as the S0 ``validation_error`` envelope, matching the
+    ``type: object`` requestBody the openapi_extra schema documents."""
+    resp = await adapter_client.put("/api/v1/devices/999999/route-policy-intent", headers=AUTH, json=[1, 2, 3])
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
+
+
+@pytest.mark.anyio
+async def test_invalid_family_beats_invalid_name_within_object(adapter_client):
+    """Within one object, family is validated before name: a bad family AND an empty name
+    reports ``invalid_family`` (not ``invalid_name``)."""
+    device_id = await seed_device(nso_device_name="rp-fam-then-name", netbox_device_id=7960)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/route-policy-intent",
+        headers=AUTH,
+        json={"objects": [{"family": "bogus", "name": ""}]},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_family"
+
+
+@pytest.mark.anyio
+async def test_invalid_name_beats_invalid_entries_within_object(adapter_client):
+    """Within one object, name is validated before entries: an empty name AND non-list
+    entries reports ``invalid_name`` (not ``invalid_entries``)."""
+    device_id = await seed_device(nso_device_name="rp-name-then-entries", netbox_device_id=7961)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/route-policy-intent",
+        headers=AUTH,
+        json={"objects": [{"family": "prefix_list", "name": "", "entries": "nope"}]},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_name"
+
+
+@pytest.mark.anyio
+async def test_primitive_list_items_are_a_known_unhandled_gap(adapter_client):
+    """DOCUMENTED GAP (deferred per the S3 plan — "primitive list items → current behavior").
+
+    ``{"objects": [1, 2]}`` passes the is-list check, then ``o.get("family")`` is called on an
+    int while building the full-replace key set — an unhandled ``AttributeError`` (a 500 in
+    production; the ASGI test transport re-raises it). S3 documents the request schema without
+    touching ``body: dict``, so this runtime behavior is intentionally left unchanged. This
+    test pins it: any future guard that turns primitive items into a clean 4xx will (correctly)
+    turn this test red, forcing a deliberate review of the behavior change."""
+    device_id = await seed_device(nso_device_name="rp-primitive-items", netbox_device_id=7962)
+    with pytest.raises(AttributeError):
+        await adapter_client.put(
+            f"/api/v1/devices/{device_id}/route-policy-intent",
+            headers=AUTH,
+            json={"objects": [1, 2]},
+        )
+
+
 # ── upsert + response ─────────────────────────────────────────────────────────
 
 
