@@ -69,6 +69,31 @@ async def test_refresh_lag_config_happy(adapter_client):
         }
 
 
+async def test_refresh_lag_config_carries_vpc_sensitive(adapter_client):
+    """NX-P2: the reader emits `vpc-sensitive` only for a vPC-protected bundle (absent =
+    ordinary). The refresh must store it so the plugin can gate/badge it — a vPC bundle is
+    refused zero-write by the lag-reconciler and must never be offered for accept."""
+    device_id = await seed_device(nso_device_name="nx-tor", netbox_device_id=913)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_lag_config.return_value = {
+            "device-name": "nx-tor",
+            "lag": [
+                {"name": "port-channel1", "lag-id": 1, "vpc-sensitive": True, "member": []},  # peer-link
+                {"name": "port-channel25", "lag-id": 25, "member": []},  # ordinary (flag absent)
+            ],
+        }
+
+        await refresh_lag_config_for_device(db, device, nso_client, refresh_source="poll")
+
+        bundles = (
+            (await db.execute(select(LagBundleConfig).where(LagBundleConfig.device_id == device.id))).scalars().all()
+        )
+        by_name = {b.name: b for b in bundles}
+        assert by_name["port-channel1"].vpc_sensitive is True
+        assert by_name["port-channel25"].vpc_sensitive is False  # absent flag → ordinary
+
+
 async def test_refresh_lag_config_skips_malformed_bundles_and_members(adapter_client):
     """A bundle missing name/lag-id, or a member missing interface-name, must be skipped —
     not KeyError-abort the upsert (which sits OUTSIDE the fetch try/except) and freeze the

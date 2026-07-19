@@ -520,6 +520,11 @@ class LagBundleConfig(Base):
     system_id: Mapped[str | None] = mapped_column(String(17), nullable=True)
     timer: Mapped[str | None] = mapped_column(String(8), nullable=True)
     admin_key: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # NX-P2 vPC preserve/REFUSE: True when the NX port-channel carries a per-bundle vPC
+    # discriminator (vpc <id>/peer-link/orphan-port). The lag-reconciler refuses such a bundle
+    # zero-write, so the plugin must NOT offer it for accept — this flag carries the reader's
+    # signal to the plugin so it can gate/badge it (a vPC bundle never enters a writable intent).
+    vpc_sensitive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(64), nullable=False, default="never")
 

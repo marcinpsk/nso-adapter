@@ -51,6 +51,10 @@ async def _upsert_lag_configs(
             system_id=bundle.get("system-id"),
             timer=bundle.get("timer"),
             admin_key=bundle.get("admin-key"),
+            # NX-P2: the reader emits `vpc-sensitive` only for a vPC-protected bundle (absent =
+            # ordinary). Carry it so the plugin can gate/badge it — a vPC bundle is refused
+            # zero-write by the lag-reconciler, so it must never be offered for accept.
+            vpc_sensitive=bool(bundle.get("vpc-sensitive")),
             last_refreshed_at=now,
             refresh_source=refresh_source,
         )

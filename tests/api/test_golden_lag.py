@@ -92,3 +92,41 @@ async def test_lag_config_golden_empty(adapter_client):
         "refresh_source": "never",
         "bundles": [],
     }
+
+
+@pytest.mark.anyio
+async def test_lag_config_surfaces_vpc_sensitive(adapter_client):
+    """NX-P2: a vPC-protected bundle carries vpc_sensitive=True to the plugin (OMIT shape —
+    ordinary bundles omit it, reading False via the model default). The plugin gates Accept on
+    this so a vPC bundle never enters a writable intent."""
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import LagBundleConfig
+
+    device_id = await seed_device(nso_device_name="lag-vpc", netbox_device_id=7994)
+    async for db in get_session():
+        db.add(
+            LagBundleConfig(
+                device_id=device_id,
+                name="port-channel1",
+                lag_id=1,
+                vpc_sensitive=True,
+                last_refreshed_at=TS,
+                refresh_source="poll",
+            )
+        )
+        db.add(
+            LagBundleConfig(
+                device_id=device_id,
+                name="port-channel25",
+                lag_id=25,
+                last_refreshed_at=TS,
+                refresh_source="poll",
+            )
+        )
+        await db.commit()
+        break
+
+    body = (await adapter_client.get(f"/api/v1/devices/{device_id}/lag-config", headers=AUTH)).json()
+    by_name = {b["name"]: b for b in body["bundles"]}
+    assert by_name["port-channel1"]["vpc_sensitive"] is True
+    assert "vpc_sensitive" not in by_name["port-channel25"]  # ordinary → omitted (OMIT shape)

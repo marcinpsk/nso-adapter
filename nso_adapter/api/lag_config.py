@@ -60,6 +60,9 @@ class LagBundleOut(BaseModel):
     system_id: str | None = None
     timer: str | None = None
     admin_key: int | None = None
+    # NX-P2: True for a vPC-protected bundle (omitted/False = ordinary, onboardable). The plugin
+    # gates Accept on this so a vPC bundle never enters a writable intent (the writer refuses it).
+    vpc_sensitive: bool = False
     members: list[LagMemberOut]
 
 
@@ -112,6 +115,8 @@ async def get_lag_config(device_id: int, db: AsyncSession = Depends(get_db)):
                 **({"system_id": b.system_id} if b.system_id is not None else {}),
                 **({"timer": b.timer} if b.timer is not None else {}),
                 **({"admin_key": b.admin_key} if b.admin_key is not None else {}),
+                # OMIT shape: emit only when True (ordinary bundles read False via the model default)
+                **({"vpc_sensitive": True} if b.vpc_sensitive else {}),
                 "members": [
                     {
                         "interface_name": m.interface_name,
