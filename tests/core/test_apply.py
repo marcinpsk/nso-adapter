@@ -810,6 +810,13 @@ async def test_run_apply_refreshes_mirror_and_notifies_plugin(adapter_client):
     )
 
     mock_client = AsyncMock()
+    # READSEM grain b: post-apply consumes the projected doc. Serve BOTH families' sections
+    # with a row each so their materializers demonstrably run.
+    mock_client.get_device_state_doc.return_value = {
+        "device-name": "rtr-settle",
+        "route-policy": {"status": "ok", "prefix-list": [{"name": "PL-SETTLE", "entry": []}]},
+        "svi": {"status": "ok", "interface": [{"interface-name": "Vlan77"}]},
+    }
     nb = AsyncMock(spec=NetboxClient)
     nb.notify_sync_complete = AsyncMock()
     imp._netbox_client = nb
@@ -822,13 +829,26 @@ async def test_run_apply_refreshes_mirror_and_notifies_plugin(adapter_client):
     finally:
         imp._netbox_client = None
 
-    # The read-mirror was re-read from NSO for both a routing surface (route-policy) and a config
-    # surface (SVI) — the two families that back a 'deploying' overlay row ...
-    # Both families are envelope-flipped: their re-reads arrive as device-state section
-    # GETs. Assert BOTH wire families explicitly (a generic assert would stay green if the
-    # routing fan-out were dropped while the config fan-out still reads svi) - codex S3-R2 F5.
-    read_families = {c.args[1] for c in mock_client.get_device_state_section.await_args_list}
-    assert {"route-policy", "svi"} <= read_families, read_families
+    # Both post-apply fan-outs (routing AND config) consumed the projected doc — one doc GET
+    # each (codex S3-R2 F5's two-fan-out proof under grain b) ...
+    assert mock_client.get_device_state_doc.await_count == 2, mock_client.get_device_state_doc.await_count
+    # ... their sections actually materialized (the families that back a 'deploying' row) ...
+    async for db in get_session():
+        from nso_adapter.store.models import DeviceRoutePolicyPrefixList, DeviceSvi
+
+        pls = (
+            (
+                await db.execute(
+                    select(DeviceRoutePolicyPrefixList).where(DeviceRoutePolicyPrefixList.device_id == device_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        svis = (await db.execute(select(DeviceSvi).where(DeviceSvi.device_id == device_id))).scalars().all()
+        assert [x.name for x in pls] == ["PL-SETTLE"]
+        assert [x.interface_name for x in svis] == ["Vlan77"]
+        break
     # ... and the plugin was notified so its post-apply reconcile settles the deploying row.
     nb.notify_sync_complete.assert_awaited_once_with(321)
 

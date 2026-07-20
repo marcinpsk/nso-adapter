@@ -56,6 +56,10 @@ class NsoClient:
         # build; the fleet whale (rc1: all-18 in 75.6s) needs ~2x headroom over the live
         # worst case, which the 120s action timeout does not give.
         self._device_state_read_timeout = 180.0
+        # The record-served whole-device doc GET (grain b): serialization-only, but the
+        # fleet whale is real - rc1 measured 14.4s/1.7MB live (2026-07-21). The blanket
+        # 30s leaves no growth margin; 120s does.
+        self._device_state_doc_timeout = 120.0
 
     def _client(self, timeout: float | None = None) -> httpx.AsyncClient:
         headers = dict(RESTCONF_HEADERS)
@@ -441,7 +445,7 @@ class NsoClient:
         declared design. Same 404 disambiguation as :meth:`get_device_state_section`.
         """
         base = f"{self._base}/restconf/data/network-state-export:device-state"
-        async with self._client() as c:
+        async with self._client(self._device_state_doc_timeout) as c:
             resp = await c.get(f"{base}/device={_url_key(device_name)}")
             if resp.status_code == 404:
                 probe = await c.get(f"{base}?depth=1")  # liveness only — see get_device_state_section

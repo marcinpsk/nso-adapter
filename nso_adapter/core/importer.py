@@ -19,12 +19,22 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.config import get_config
-from nso_adapter.core.refresh_engine import classify_envelope_family_read
+from nso_adapter.core.refresh_engine import (
+    classify_envelope_family_read,
+    run_family_refresh_from_outcome,
+    run_family_refresh_from_section,
+)
 from nso_adapter.core.sync_state import compute_sync_state
 from nso_adapter.domain.models import Interface, InterfaceAttr
 from nso_adapter.nso import actions as nso_actions
-from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.read_outcome import EmptyPolicy, Present
+from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
+from nso_adapter.nso.read_outcome import (  # noqa: F401 — Present used below
+    EmptyPolicy,
+    Present,
+    Unavailable,
+    UnavailableReason,
+    classify_envelope_section,
+)
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
     DbInterface,
@@ -155,6 +165,124 @@ async def _run_surfaces(
     return failed
 
 
+def _projectable_spec(name: str):
+    """Resolve a surface name to its FamilySpec (None for non-spec composites like redistribution).
+
+    Lazy imports mirror the surface-list builders below (import cost only when used).
+    """
+    from nso_adapter.core.bfd import BFD_SPEC
+    from nso_adapter.core.bgp import BGP_SPEC
+    from nso_adapter.core.interface_ip import INTERFACE_IP_SPEC
+    from nso_adapter.core.interface_mtu import INTERFACE_MTU_SPEC
+    from nso_adapter.core.isis import ISIS_SPEC
+    from nso_adapter.core.l2_service import L2_SERVICE_SPEC
+    from nso_adapter.core.lag_config import LAG_CONFIG_SPEC
+    from nso_adapter.core.lag_topology import LAG_TOPOLOGY_SPEC
+    from nso_adapter.core.logging_config import LOGGING_CONFIG_SPEC
+    from nso_adapter.core.ospf import OSPF_SPEC
+    from nso_adapter.core.route_policy import ROUTE_POLICY_SPEC
+    from nso_adapter.core.snmp import SNMP_SPEC
+    from nso_adapter.core.static_route import STATIC_ROUTE_SPEC
+    from nso_adapter.core.subinterface import SUBINTERFACE_SPEC
+    from nso_adapter.core.svi import SVI_SPEC
+    from nso_adapter.core.vlan import SWITCHPORT_SPEC, VLAN_DATABASE_SPEC
+
+    return {
+        "static_route": STATIC_ROUTE_SPEC,
+        "isis": ISIS_SPEC,
+        "bgp": BGP_SPEC,
+        "ospf": OSPF_SPEC,
+        "route_policy": ROUTE_POLICY_SPEC,
+        "snmp": SNMP_SPEC,
+        "logging": LOGGING_CONFIG_SPEC,
+        "bfd": BFD_SPEC,
+        "interface_ip": INTERFACE_IP_SPEC,
+        "vlan": VLAN_DATABASE_SPEC,
+        "svi": SVI_SPEC,
+        "subinterface": SUBINTERFACE_SPEC,
+        "interface_mtu": INTERFACE_MTU_SPEC,
+        "lag_topology": LAG_TOPOLOGY_SPEC,
+        "lag_config": LAG_CONFIG_SPEC,
+        "l2_service": L2_SERVICE_SPEC,
+        "switchport": SWITCHPORT_SPEC,
+    }.get(name)
+
+
+async def _fetch_projection(nso_client, device, wire_names: list[str]):
+    """Grain-b supplier: ONE record-served doc GET + ONE heal action for the not-ready set.
+
+    Returns ``(sections, supplier_outcome)``: on supplier failure sections is empty and
+    the outcome (export_down / read_error) fans out to every family via
+    ``run_family_refresh_from_outcome`` — NEVER a fabricated section (codex S3-R1 F8).
+    A confirmed device absence yields ``{wire: None}`` (per-family EmptyPolicy applies).
+    """
+    try:
+        doc = await nso_client.get_device_state_doc(device.nso_device_name)
+    except NsoExportUnavailableError as exc:
+        return {}, Unavailable(UnavailableReason.export_down, detail=repr(exc))
+    except Exception as exc:  # noqa: BLE001 — any supplier failure keeps every family
+        return {}, Unavailable(UnavailableReason.read_error, detail=repr(exc))
+    if doc is None:
+        return {w: None for w in wire_names}, None
+    sections = {w: doc.get(w, {"status": "error", "error-reason": "doc missing the section"}) for w in wire_names}
+    not_ready = [w for w, sec in sections.items() if isinstance(sec, dict) and sec.get("status") == "not-ready"]
+    if not_ready:
+        try:
+            output = await nso_client.run_device_state_read(device.nso_device_name, not_ready)
+            for w in not_ready:
+                sections[w] = output.get(w, {"status": "error", "error-reason": "action output missing the section"})
+        except Exception as exc:  # noqa: BLE001 — heal failure degrades only the not-ready set
+            for w in not_ready:
+                sections[w] = {"status": "error", "error-reason": f"heal action failed: {exc!r}"}
+    return sections, None
+
+
+async def _run_surfaces_projected(
+    db: AsyncSession,
+    device: Device,
+    nso_client: NsoClient,
+    surfaces: list[tuple[str, object]],
+    refresh_source: str,
+) -> list[str]:
+    """READSEM grain b: feed every spec-backed surface from ONE projected doc.
+
+    Same contract as :func:`_run_surfaces` (failed-name list, per-surface isolation);
+    non-spec surfaces (redistribution) still run their own warm section reads.
+    """
+    spec_by_name = {name: _projectable_spec(name) for name, _ in surfaces}
+    wire_names = [spec.wire_name for spec in spec_by_name.values() if spec is not None]
+    sections, supplier_outcome = await _fetch_projection(nso_client, device, wire_names)
+
+    failed: list[str] = []
+    for name, fn in surfaces:
+        spec = spec_by_name[name]
+        try:
+            if spec is None:
+                ok = await fn(db, device, nso_client, refresh_source=refresh_source)
+            elif supplier_outcome is not None:
+                ok = await run_family_refresh_from_outcome(
+                    db, device, spec, supplier_outcome, refresh_source=refresh_source
+                )
+            else:
+                section = sections[spec.wire_name]
+                if section is None:
+                    ok = await run_family_refresh_from_outcome(
+                        db,
+                        device,
+                        spec,
+                        classify_envelope_section(None, spec.empty_policy),
+                        refresh_source=refresh_source,
+                    )
+                else:
+                    ok = await run_family_refresh_from_section(db, device, spec, section, refresh_source=refresh_source)
+            if not ok:
+                failed.append(name)
+        except Exception as exc:  # noqa: BLE001 — one surface must not take down the rest
+            logger.warning("sync.surface_refresh_failed", device_id=device.id, surface=name, error=repr(exc))
+            failed.append(name)
+    return failed
+
+
 def _routing_surfaces(cfg) -> list[tuple[str, object]]:
     """Build the routing/extra surface list refreshed by ``sync_device`` (Sync Now + 15-min poll).
 
@@ -268,7 +396,9 @@ async def refresh_routing_surfaces_for_device(
     demand, gated by the scheduler enable flags. Returns the FAILED surface names (see
     :func:`_run_surfaces`); the caller records them so the device reports ``partial``.
     """
-    return await _run_surfaces(db, device, nso_client, _routing_surfaces(get_config().scheduler), refresh_source)
+    return await _run_surfaces_projected(
+        db, device, nso_client, _routing_surfaces(get_config().scheduler), refresh_source
+    )
 
 
 async def refresh_config_surfaces_for_device(
@@ -285,7 +415,9 @@ async def refresh_config_surfaces_for_device(
     device Apply lets the row settle instead of waiting for that surface's next poll. Returns the
     FAILED surface names (callers may ignore the list — apply just wants the best-effort refresh).
     """
-    return await _run_surfaces(db, device, nso_client, _config_surfaces(get_config().scheduler), refresh_source)
+    return await _run_surfaces_projected(
+        db, device, nso_client, _config_surfaces(get_config().scheduler), refresh_source
+    )
 
 
 async def refresh_all_surfaces_for_device(
