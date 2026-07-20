@@ -26,7 +26,7 @@ from dataclasses import dataclass
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
     EmptyPolicy,
@@ -34,6 +34,7 @@ from nso_adapter.nso.read_outcome import (
     ReadOutcome,
     Unavailable,
     UnavailableReason,
+    classify_envelope_section,
     classify_read,
 )
 from nso_adapter.store import outcome_store
@@ -78,6 +79,10 @@ class FamilySpec:
       can return the whole entry ``dict`` (or any structure) for its materializer to destructure.
     * ``materialize`` — ``(db, device, payload, refresh_source) -> Awaitable[None]``; the
       family-owned full-replace/upsert that also commits.
+    * ``wire_name`` — the device-state envelope section name (e.g. ``"static-route"``).
+      **This is the READSEM S3 fetch-source flip**: ``None`` keeps the legacy per-family
+      getter path byte-for-byte; set, the engine reads the family's envelope section
+      (status-declared) and ``getter`` goes unused. Flips per family, one line each.
 
     An authoritative clear (``AbsentAuthoritative``) is expressed by feeding the extractor an
     empty entry ``{}`` — so ``extract({})`` yields the family's "nothing" payload (``[]`` for a
@@ -90,6 +95,55 @@ class FamilySpec:
     getter: Callable[[NsoClient, str], Awaitable[dict | None]]
     extract: Callable[[dict], object]
     materialize: Callable[[AsyncSession, Device, object, str], Awaitable[None]]
+    wire_name: str | None = None
+
+
+async def _escalate_not_ready(device: Device, nso_client: NsoClient, spec: FamilySpec) -> ReadOutcome:
+    """``not-ready`` → ONE ``device-state-read run`` for this family (READSEM S3).
+
+    The envelope never extracts and its records are in-process — after a `packages reload`
+    (or a NED remount) every section is ``not-ready`` until an extraction runs. The action
+    extracts on demand and CAS-updates the records, so this single escalation both answers
+    THIS read and re-warms the envelope for the next poll. Action output sections are
+    terminal (``ok|unsupported|error``) — a ``not-ready`` here is a contract violation and
+    is refused rather than looped on.
+    """
+    assert spec.wire_name is not None
+    try:
+        output = await nso_client.run_device_state_read(device.nso_device_name, [spec.wire_name])
+    except Exception as exc:  # noqa: BLE001 — action error (bracket exhaustion, unknown device) → keep rows
+        return Unavailable(UnavailableReason.read_error, detail=repr(exc))
+    section = output.get(spec.wire_name)
+    if section is None:
+        return Unavailable(UnavailableReason.read_error, detail="action output missing the requested section")
+    outcome = classify_envelope_section(section, spec.empty_policy)
+    if isinstance(outcome, Unavailable) and outcome.reason is UnavailableReason.not_ready:
+        return Unavailable(UnavailableReason.read_error, detail="action returned not-ready (contract violation)")
+    return outcome
+
+
+async def _classify_family_read(device: Device, nso_client: NsoClient, spec: FamilySpec) -> ReadOutcome:
+    """Read + classify one family for one device, honoring the spec's fetch source."""
+    if spec.wire_name is None:
+        return await classify_read(
+            lambda: spec.getter(nso_client, device.nso_device_name),
+            spec.empty_policy,
+        )
+    try:
+        section = await nso_client.get_device_state_section(device.nso_device_name, spec.wire_name)
+    except NsoExportUnavailableError as exc:
+        return Unavailable(UnavailableReason.export_down, detail=repr(exc))
+    except Exception as exc:  # noqa: BLE001 — any read failure is Unavailable; the mirror is kept
+        return Unavailable(UnavailableReason.read_error, detail=repr(exc))
+    outcome = classify_envelope_section(section, spec.empty_policy)
+    if isinstance(outcome, Unavailable) and outcome.reason is UnavailableReason.not_ready:
+        logger.info(
+            f"{spec.name}.refresh.not_ready_escalating",
+            device_id=device.id,
+            device_name=device.nso_device_name,
+        )
+        outcome = await _escalate_not_ready(device, nso_client, spec)
+    return outcome
 
 
 async def run_family_refresh(
@@ -110,10 +164,41 @@ async def run_family_refresh(
         logger.debug(f"{spec.name}.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
         return True
 
-    outcome = await classify_read(
-        lambda: spec.getter(nso_client, device.nso_device_name),
-        spec.empty_policy,
-    )
+    outcome = await _classify_family_read(device, nso_client, spec)
+    return await _apply_outcome(db, device, spec, outcome, refresh_source)
+
+
+async def run_family_refresh_from_section(
+    db: AsyncSession,
+    device: Device,
+    spec: FamilySpec,
+    section: dict | None,
+    *,
+    refresh_source: str = "sync",
+) -> bool:
+    """Refresh one family from a PRE-FETCHED envelope section (READSEM fetch grains b/c).
+
+    The multi-family call classes — the periodic ``sync_device`` projection (one whole-device
+    GET) and the atomic Sync-Now/onboarding action — fetch once and feed each family's section
+    here. No escalation: the doc supplier is responsible for healing ``not-ready`` sections
+    (a still-not-ready section records honestly and keeps rows, a degraded surface).
+    """
+    if not device.nso_device_name:
+        logger.debug(f"{spec.name}.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
+        return True
+
+    outcome = classify_envelope_section(section, spec.empty_policy)
+    return await _apply_outcome(db, device, spec, outcome, refresh_source)
+
+
+async def _apply_outcome(
+    db: AsyncSession,
+    device: Device,
+    spec: FamilySpec,
+    outcome: ReadOutcome,
+    refresh_source: str,
+) -> bool:
+    """Drive the mirror action + two-phase outcome record for a classified read."""
     # Phase 1: record the read outcome before the materializer runs (independent session).
     attempt_id = await _record_read(db, device, spec, outcome, refresh_source)
 
@@ -146,15 +231,16 @@ async def run_family_refresh(
 
     # Unavailable — keep the last-known rows in every case.
     assert isinstance(outcome, Unavailable)
-    if outcome.reason is UnavailableReason.not_authoritative:
-        # A keep-on-None inventory family (present policy) got a 404: the export isn't serving
-        # this device for this family (unsupported NED / unknown / not-ready). That's an EXPECTED
-        # absence, not a read failure — keep the rows and report success (NOT a degraded surface),
-        # so it never flips the device to `partial` on every poll.
+    if outcome.reason in (UnavailableReason.not_authoritative, UnavailableReason.unsupported):
+        # Declared/expected absence of authority: a keep-on-None inventory family's 404
+        # (legacy path) or the envelope's declared `unsupported` (this NED has no reader for
+        # the family). Not a read failure — keep the rows and report success (NOT a degraded
+        # surface), so it never flips the device to `partial` on every poll.
         logger.info(
             f"{spec.name}.refresh.not_authoritative",
             device_id=device.id,
             device_name=device.nso_device_name,
+            reason=outcome.reason.value,
             refresh_source=refresh_source,
         )
         await _record_result(db, spec, attempt_id, result="kept", succeeded=True, row_count=None)
