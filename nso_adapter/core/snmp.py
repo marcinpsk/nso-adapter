@@ -16,7 +16,10 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.lag_topology import parse_changed_nso_devices
+from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.read_outcome import EmptyPolicy
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, SnmpCommunity, SnmpHost, SnmpSystemInfo, SnmpV3User
 
 logger = structlog.get_logger(__name__)
@@ -44,7 +47,8 @@ async def _upsert_snmp_config(
 
     await _delete_snmp_rows(db, device)
 
-    for comm in entry.get("community", []):
+    # as_list guards the RESTCONF singleton-rendered-as-bare-dict case for each child list.
+    for comm in as_list(entry.get("community")):
         db.add(
             SnmpCommunity(
                 device_id=device.id,
@@ -56,7 +60,7 @@ async def _upsert_snmp_config(
             )
         )
 
-    for user in entry.get("v3-user", []):
+    for user in as_list(entry.get("v3-user")):
         db.add(
             SnmpV3User(
                 device_id=device.id,
@@ -68,7 +72,7 @@ async def _upsert_snmp_config(
             )
         )
 
-    for host in entry.get("host", []):
+    for host in as_list(entry.get("host")):
         db.add(
             SnmpHost(
                 device_id=device.id,
@@ -100,6 +104,22 @@ async def _upsert_snmp_config(
     await db.commit()
 
 
+SNMP_SPEC = FamilySpec(
+    name="snmp",
+    # snmp-config is a POP-ON-EMPTY export family: a genuinely SNMP-less but synced device 404s,
+    # and get_snmp_config confirms that bare 404 against the parent container before returning
+    # None (a fleet-wide outage raises NsoExportUnavailableError → Unavailable → keep). So a None
+    # here is a container-confirmed per-device absence → AbsentAuthoritative → clear. This is the
+    # opposite of interface_ip, a present-empty inventory family whose 404 means only
+    # unsupported-NED, so it KEEPS.
+    empty_policy=EmptyPolicy.pop,
+    getter=lambda client, name: client.get_snmp_config(name),
+    # The materializer takes the whole entry dict; extract({}) → the clear (delete all + add none).
+    extract=lambda data: data,
+    materialize=_upsert_snmp_config,
+)
+
+
 async def refresh_snmp_config_for_device(
     db: AsyncSession,
     device: Device,
@@ -107,56 +127,12 @@ async def refresh_snmp_config_for_device(
     *,
     refresh_source: str = "poll",
 ) -> bool:
-    """Read SNMP oper-data for *device* from NSO and upsert DB rows.
+    """Read SNMP oper-data for *device* from NSO and upsert DB rows (via the shared refresh engine).
 
     Returns True on a successful read (or nothing to read); False when the NSO read
     failed and the last-known rows were left untouched (a degraded surface).
     """
-    if not device.nso_device_name:
-        logger.debug("snmp.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
-        return True
-
-    try:
-        entry = await nso_client.get_snmp_config(device.nso_device_name)
-    except Exception as exc:
-        logger.warning("snmp.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return False
-
-    if entry is None:
-        # Read-mirror empty-semantics contract (see interface_ip.refresh's B2 note for the
-        # other side). snmp-config is a POP-ON-EMPTY export family: a genuinely SNMP-less but
-        # synced device 404s. Per the export's deliberate design (network_state_export/snmp.py
-        # `_refresh_device`: "the operator really did remove it"), that None is AUTHORITATIVE —
-        # the mirror must CLEAR to match. This is the opposite of interface_ip, a present-empty
-        # "inventory" family whose 404 means only unsupported-NED, so it KEEPS.
-        #
-        # Crucially, get_snmp_config confirms a bare 404 against the parent container before
-        # returning None (mirroring get_route_policy): a fleet-wide export outage — package not
-        # loaded / mid-`packages reload` / callpoint erroring — 404s EVERY device at once, and is
-        # raised as NsoExportUnavailableError → caught by the `except` above → return False, rows
-        # untouched. So None here is only ever a confirmed per-device absence, never a wipe over a
-        # degraded read.
-        await _delete_snmp_rows(db, device)
-        await db.commit()
-        logger.info(
-            "snmp.refresh.cleared",
-            device_id=device.id,
-            nso_device_name=device.nso_device_name,
-            reason="nso_returned_none",
-        )
-        return True
-
-    await _upsert_snmp_config(db, device, entry, refresh_source)
-    logger.info(
-        "snmp.refresh.done",
-        device_id=device.id,
-        nso_device_name=device.nso_device_name,
-        communities=len(entry.get("community", [])),
-        v3_users=len(entry.get("v3-user", [])),
-        hosts=len(entry.get("host", [])),
-        source=refresh_source,
-    )
-    return True
+    return await run_family_refresh(db, device, nso_client, SNMP_SPEC, refresh_source=refresh_source)
 
 
 async def handle_snmp_config_change(

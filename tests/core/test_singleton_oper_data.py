@@ -22,10 +22,14 @@ from nso_adapter.core.bgp import refresh_bgp_config_for_device
 from nso_adapter.core.importer import _attrs_to_interface_list
 from nso_adapter.core.interface_ip import refresh_interface_ips_for_device
 from nso_adapter.core.interface_mtu import refresh_interface_mtu_for_device
+from nso_adapter.core.isis import refresh_isis_interfaces_for_device
 from nso_adapter.core.l2_service import refresh_l2_services_for_device
+from nso_adapter.core.lag_config import refresh_lag_config_for_device
 from nso_adapter.core.lag_topology import refresh_lag_topology_for_device
 from nso_adapter.core.logging_config import refresh_logging_config_for_device
 from nso_adapter.core.ospf import refresh_ospf_for_device
+from nso_adapter.core.route_policy import refresh_route_policy_for_device
+from nso_adapter.core.snmp import refresh_snmp_config_for_device
 from nso_adapter.core.subinterface import refresh_subinterface_for_device
 from nso_adapter.core.svi import refresh_svi_for_device
 from nso_adapter.core.vlan import refresh_switchport_for_device, refresh_vlan_database_for_device
@@ -41,17 +45,28 @@ from nso_adapter.store.models import (
     DeviceBgpRouter,
     DeviceBgpScope,
     DeviceInterfaceMtu,
+    DeviceIsisInterface,
+    DeviceIsisProcess,
     DeviceL2Sap,
     DeviceLoggingHost,
     DeviceOspfInstance,
     DeviceOspfInterface,
+    DeviceRoutePolicyCommunityList,
+    DeviceRoutePolicyCommunityListEntry,
+    DeviceRoutePolicyPrefixList,
+    DeviceRoutePolicyPrefixListEntry,
     DeviceSubinterface,
     DeviceSvi,
     DeviceSwitchport,
     DeviceVlan,
     InterfaceIpAddress,
+    LagBundleConfig,
     LagInterface,
     LagMember,
+    LagMemberConfig,
+    SnmpCommunity,
+    SnmpHost,
+    SnmpV3User,
 )
 from tests.conftest import seed_device
 
@@ -385,3 +400,147 @@ async def test_ospf_singleton_bare_objects(adapter_client):
         )
         assert len(interfaces) == 1
         assert interfaces[0].interface_name == "GigabitEthernet0/0"
+
+
+@pytest.mark.anyio
+async def test_isis_singleton_bare_objects(adapter_client):
+    """IS-IS process + interface rendered as bare objects → one row each.
+
+    Without as_list the top-level ``for proc in entry.get("process")`` iterates the singleton
+    dict's keys (strings) and crashes on ``proc.get("process-tag")``.
+    """
+    device_id = await seed_device(nso_device_name="single-isis", netbox_device_id=2612)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_isis_interfaces.return_value = {
+            "process": {"process-tag": "1", "net": "49.0001.0000.0000.0001.00", "is-type": "level-2"},
+            "interface": {"interface-name": "GigabitEthernet0/0", "af": "ipv4", "process-tag": "1"},
+        }
+
+        ok = await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
+        assert ok is True
+
+        procs = (
+            (await db.execute(select(DeviceIsisProcess).where(DeviceIsisProcess.device_id == device.id)))
+            .scalars()
+            .all()
+        )
+        assert len(procs) == 1
+        assert procs[0].process_tag == "1"
+        assert procs[0].is_type == "level-2-only"  # alias folded
+
+        ifaces = (
+            (await db.execute(select(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id)))
+            .scalars()
+            .all()
+        )
+        assert len(ifaces) == 1
+        assert ifaces[0].interface_name == "GigabitEthernet0/0"
+
+
+@pytest.mark.anyio
+async def test_lag_config_singleton_bare_objects(adapter_client):
+    """A single lag-config bundle (and its single member), both bare objects → one row each.
+
+    Without as_list the top-level ``for bundle in entry.get("lag")`` and the nested
+    ``for member in bundle.get("member")`` iterate the singleton dict's keys and crash.
+    """
+    device_id = await seed_device(nso_device_name="single-lagcfg", netbox_device_id=2613)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_lag_config.return_value = {
+            "lag": {
+                "name": "Port-channel1",
+                "lag-id": 1,
+                "member": {"interface-name": "GigabitEthernet0/1", "mode": "active"},
+            }
+        }
+
+        ok = await refresh_lag_config_for_device(db, device, nso_client, refresh_source="poll")
+        assert ok is True
+
+        bundles = (
+            (await db.execute(select(LagBundleConfig).where(LagBundleConfig.device_id == device.id))).scalars().all()
+        )
+        assert len(bundles) == 1
+        assert bundles[0].name == "Port-channel1"
+        members = (await db.execute(select(LagMemberConfig))).scalars().all()
+        assert [(m.interface_name, m.mode) for m in members] == [("GigabitEthernet0/1", "active")]
+
+
+@pytest.mark.anyio
+async def test_snmp_singleton_bare_objects(adapter_client):
+    """A single community / v3-user / host, each a bare object → one row each.
+
+    Without as_list ``for comm in entry.get("community")`` iterates the singleton dict's keys
+    and crashes on ``comm.get("name")``.
+    """
+    device_id = await seed_device(nso_device_name="single-snmp", netbox_device_id=2614)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_snmp_config.return_value = {
+            "community": {"name": "abcdef012345", "access": "RO"},
+            "v3-user": {"username": "obs", "has-auth-secret": True, "has-priv-secret": False},
+            "host": {"address": "10.0.0.53", "version": "3", "user": "obs"},
+        }
+
+        ok = await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
+        assert ok is True
+
+        comms = (await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device.id))).scalars().all()
+        assert [c.community_hash for c in comms] == ["abcdef012345"]
+        users = (await db.execute(select(SnmpV3User).where(SnmpV3User.device_id == device.id))).scalars().all()
+        assert [u.username for u in users] == ["obs"]
+        hosts = (await db.execute(select(SnmpHost).where(SnmpHost.device_id == device.id))).scalars().all()
+        assert [h.address for h in hosts] == ["10.0.0.53"]
+
+
+@pytest.mark.anyio
+async def test_route_policy_singleton_bare_objects(adapter_client):
+    """A single prefix-list / community-list (and their single entries), each a bare object.
+
+    Without as_list ``for pl_data in data.get("prefix-list")`` iterates the singleton dict's
+    keys and crashes on ``pl_data.get("name")``; likewise ``pl_data.get("entry")``.
+    """
+    device_id = await seed_device(nso_device_name="single-rp", netbox_device_id=2615)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_route_policy.return_value = {
+            "prefix-list": {
+                "name": "PL-1",
+                "family": 4,
+                "entry": {"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8"},
+            },
+            "community-list": {
+                "name": "CL-1",
+                "entry": {"sequence": 10, "action": "permit", "community": "64500:1"},
+            },
+        }
+
+        ok = await refresh_route_policy_for_device(db, device, nso_client, refresh_source="poll")
+        assert ok is True
+
+        pls = (
+            (
+                await db.execute(
+                    select(DeviceRoutePolicyPrefixList).where(DeviceRoutePolicyPrefixList.device_id == device.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [p.name for p in pls] == ["PL-1"]
+        pl_entries = (await db.execute(select(DeviceRoutePolicyPrefixListEntry))).scalars().all()
+        assert [(e.sequence, e.prefix) for e in pl_entries] == [(10, "10.0.0.0/8")]
+        cls = (
+            (
+                await db.execute(
+                    select(DeviceRoutePolicyCommunityList).where(DeviceRoutePolicyCommunityList.device_id == device.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [c.name for c in cls] == ["CL-1"]
+        cl_entries = (await db.execute(select(DeviceRoutePolicyCommunityListEntry))).scalars().all()
+        assert [e.community for e in cl_entries] == ["64500:1"]

@@ -15,7 +15,9 @@ import structlog
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceOspfInstance, DeviceOspfInterface
 
@@ -76,6 +78,31 @@ async def _upsert_ospf_data(
     await db.commit()
 
 
+async def _materialize_ospf(db: AsyncSession, device: Device, entry: dict, refresh_source: str) -> None:
+    """Engine materializer: destructure the OSPF entry into its two lists and full-replace.
+
+    ``as_list`` normalizes the RESTCONF singleton-as-bare-object case for the ``instance`` and
+    ``interface`` YANG lists. An empty entry ``{}`` (the AbsentAuthoritative clear) yields two
+    empty lists → clear.
+    """
+    await _upsert_ospf_data(
+        db,
+        device,
+        as_list(entry.get("instance")),
+        as_list(entry.get("interface")),
+        refresh_source,
+    )
+
+
+OSPF_SPEC = FamilySpec(
+    name="ospf",
+    empty_policy=EmptyPolicy.pop,  # config family: a container-confirmed 404 is an authoritative clear
+    getter=lambda client, name: client.get_ospf(name),
+    extract=lambda data: data,
+    materialize=_materialize_ospf,
+)
+
+
 async def refresh_ospf_for_device(
     db: AsyncSession,
     device: Device,
@@ -83,33 +110,12 @@ async def refresh_ospf_for_device(
     *,
     refresh_source: str = "poll",
 ) -> bool:
-    """Read OSPF oper-data for *device* from NSO and upsert DB rows.
+    """Read OSPF oper-data for *device* from NSO and upsert DB rows (via the shared refresh engine).
 
     Returns True on a successful read (or nothing to read); False when the NSO read
     failed and the last-known rows were left untouched (a degraded surface).
     """
-    if not device.nso_device_name:
-        logger.debug("ospf.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
-        return True
-
-    try:
-        entry = await nso_client.get_ospf(device.nso_device_name)
-    except Exception as exc:
-        logger.warning("ospf.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return False
-
-    instances = as_list(entry.get("instance")) if entry else []
-    interfaces = as_list(entry.get("interface")) if entry else []
-    await _upsert_ospf_data(db, device, instances, interfaces, refresh_source)
-    logger.info(
-        "ospf.refresh.done",
-        device_id=device.id,
-        device_name=device.nso_device_name,
-        instance_count=len(instances),
-        interface_count=len(interfaces),
-        refresh_source=refresh_source,
-    )
-    return True
+    return await run_family_refresh(db, device, nso_client, OSPF_SPEC, refresh_source=refresh_source)
 
 
 async def handle_ospf_change(

@@ -18,7 +18,10 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.community_dialect import community_dialect_for
+from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.read_outcome import EmptyPolicy
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
     Device,
     DeviceRoutePolicyASPath,
@@ -83,7 +86,7 @@ async def _upsert_prefix_lists(db, device, items, now, refresh_source) -> None:
         )
         db.add(pl)
         await db.flush()
-        for e in pl_data.get("entry", []):
+        for e in as_list(pl_data.get("entry")):
             if not _required(e, "sequence", "action", "prefix"):
                 continue
             db.add(
@@ -112,7 +115,7 @@ async def _upsert_community_lists(db, device, items, now, refresh_source, dialec
         )
         db.add(cl)
         await db.flush()
-        for e in cl_data.get("entry", []):
+        for e in as_list(cl_data.get("entry")):
             # null/absent community would also crash dialect.to_canonical (None.strip()).
             if not _required(e, "sequence", "action", "community"):
                 continue
@@ -139,7 +142,7 @@ async def _upsert_as_paths(db, device, items, now, refresh_source) -> None:
         )
         db.add(ap)
         await db.flush()
-        for e in ap_data.get("entry", []):
+        for e in as_list(ap_data.get("entry")):
             if not _required(e, "sequence", "action", "pattern"):
                 continue
             db.add(
@@ -165,7 +168,7 @@ async def _upsert_route_maps(db, device, items, now, refresh_source) -> None:
         )
         db.add(rm)
         await db.flush()
-        for e in rm_data.get("entry", []):
+        for e in as_list(rm_data.get("entry")):
             if not _required(e, "sequence", "action"):
                 continue
             db.add(
@@ -201,12 +204,25 @@ async def _upsert_route_policy_data(
 
     now = datetime.now(UTC).replace(tzinfo=None)
 
-    await _upsert_prefix_lists(db, device, data.get("prefix-list", []), now, refresh_source)
-    await _upsert_community_lists(db, device, data.get("community-list", []), now, refresh_source, dialect)
-    await _upsert_as_paths(db, device, data.get("as-path", []), now, refresh_source)
-    await _upsert_route_maps(db, device, data.get("route-map", []), now, refresh_source)
+    # as_list guards the RESTCONF singleton-rendered-as-bare-dict case for each top-level list;
+    # an empty ``data`` dict (the AbsentAuthoritative clear) yields four empty lists → clear.
+    await _upsert_prefix_lists(db, device, as_list(data.get("prefix-list")), now, refresh_source)
+    await _upsert_community_lists(db, device, as_list(data.get("community-list")), now, refresh_source, dialect)
+    await _upsert_as_paths(db, device, as_list(data.get("as-path")), now, refresh_source)
+    await _upsert_route_maps(db, device, as_list(data.get("route-map")), now, refresh_source)
 
     await db.commit()
+
+
+ROUTE_POLICY_SPEC = FamilySpec(
+    name="route_policy",
+    empty_policy=EmptyPolicy.pop,  # config family: a container-confirmed 404 is an authoritative clear
+    getter=lambda client, name: client.get_route_policy(name),
+    # The materializer takes the whole entry dict; extract({}) → the four-family clear. The engine
+    # logs the clear (route_policy.refresh.cleared) — fixing the old silent clear-on-None path.
+    extract=lambda data: data,
+    materialize=_upsert_route_policy_data,
+)
 
 
 async def refresh_route_policy_for_device(
@@ -216,54 +232,12 @@ async def refresh_route_policy_for_device(
     *,
     refresh_source: str = "poll",
 ) -> bool:
-    """Read route-policy oper-data for *device* from NSO and upsert DB rows.
+    """Read route-policy oper-data for *device* from NSO and upsert DB rows (via the shared refresh engine).
 
     Returns True on a successful read (or nothing to read); False when the NSO read
     failed and the last-known rows were left untouched (a degraded surface).
     """
-    if not device.nso_device_name:
-        logger.debug("route_policy.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
-        return True
-
-    try:
-        nso_data = await nso_client.get_route_policy(device.nso_device_name)
-    except Exception as exc:
-        logger.warning(
-            "route_policy.refresh.nso_error",
-            device_id=device.id,
-            device_name=device.nso_device_name,
-            error=str(exc),
-        )
-        return False
-
-    if nso_data is None:
-        # Device has no route-policy objects — clear any stale rows.
-        await db.execute(delete(DeviceRoutePolicyPrefixList).where(DeviceRoutePolicyPrefixList.device_id == device.id))
-        await db.execute(
-            delete(DeviceRoutePolicyCommunityList).where(DeviceRoutePolicyCommunityList.device_id == device.id)
-        )
-        await db.execute(delete(DeviceRoutePolicyASPath).where(DeviceRoutePolicyASPath.device_id == device.id))
-        await db.execute(delete(DeviceRoutePolicyRouteMap).where(DeviceRoutePolicyRouteMap.device_id == device.id))
-        await db.commit()
-        return True
-
-    await _upsert_route_policy_data(db, device, nso_data, refresh_source)
-
-    pl_count = len(nso_data.get("prefix-list", []))
-    cl_count = len(nso_data.get("community-list", []))
-    ap_count = len(nso_data.get("as-path", []))
-    rm_count = len(nso_data.get("route-map", []))
-    logger.info(
-        "route_policy.refresh.done",
-        device_id=device.id,
-        device_name=device.nso_device_name,
-        prefix_lists=pl_count,
-        community_lists=cl_count,
-        as_paths=ap_count,
-        route_maps=rm_count,
-        source=refresh_source,
-    )
-    return True
+    return await run_family_refresh(db, device, nso_client, ROUTE_POLICY_SPEC, refresh_source=refresh_source)
 
 
 async def handle_route_policy_change(device_name: str, db: AsyncSession, nso_client: NsoClient) -> None:

@@ -10,7 +10,10 @@ import structlog
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.read_outcome import EmptyPolicy
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, LagBundleConfig, LagMemberConfig
 
 logger = structlog.get_logger(__name__)
@@ -60,7 +63,8 @@ async def _upsert_lag_configs(
         )
         db.add(b)
         await db.flush()
-        for member in bundle.get("member", []):
+        # as_list guards the singleton-rendered-as-bare-dict case for the nested member list.
+        for member in as_list(bundle.get("member")):
             member_name = member.get("interface-name")
             if not member_name:
                 continue  # NOT-NULL member key missing → skip this member
@@ -75,6 +79,16 @@ async def _upsert_lag_configs(
     await db.commit()
 
 
+LAG_CONFIG_SPEC = FamilySpec(
+    name="lag_config",
+    empty_policy=EmptyPolicy.pop,  # config family: a container-confirmed 404 is an authoritative clear
+    getter=lambda client, name: client.get_lag_config(name),
+    # as_list guards the singleton-rendered-as-bare-dict case; extract({}) → [] → clear.
+    extract=lambda data: as_list(data.get("lag")),
+    materialize=_upsert_lag_configs,
+)
+
+
 async def refresh_lag_config_for_device(
     db: AsyncSession,
     device: Device,
@@ -82,27 +96,9 @@ async def refresh_lag_config_for_device(
     *,
     refresh_source: str = "poll",
 ) -> bool:
-    """Read lag-config oper-data for *device* from NSO and upsert DB rows.
+    """Read lag-config oper-data for *device* from NSO and upsert DB rows (via the shared refresh engine).
 
     Returns True on a successful read (or an intentional skip); False when the NSO read
     failed and the last-known rows were left untouched (a degraded surface).
     """
-    if not device.nso_device_name:
-        logger.debug("lag_config.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
-        return True
-
-    try:
-        entry = await nso_client.get_lag_config(device.nso_device_name)
-    except Exception as exc:
-        logger.warning("lag_config.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return False
-
-    bundles_data = entry.get("lag", []) if entry else []
-    await _upsert_lag_configs(db, device, bundles_data, refresh_source)
-    logger.info(
-        "lag_config.refresh.done",
-        device_id=device.id,
-        bundle_count=len(bundles_data),
-        source=refresh_source,
-    )
-    return True
+    return await run_family_refresh(db, device, nso_client, LAG_CONFIG_SPEC, refresh_source=refresh_source)

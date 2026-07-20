@@ -16,7 +16,10 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.isis_canon import isis_level
+from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.read_outcome import EmptyPolicy
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceIsisInterface, DeviceIsisProcess
 
 logger = structlog.get_logger(__name__)
@@ -154,6 +157,31 @@ async def _upsert_isis_data(
     await db.commit()
 
 
+async def _materialize_isis(db: AsyncSession, device: Device, entry: dict, refresh_source: str) -> None:
+    """Engine materializer: destructure the IS-IS entry into its two lists and full-replace.
+
+    ``as_list`` guards the RESTCONF singleton-as-bare-object case for both the ``process`` and
+    ``interface`` YANG lists (a raw ``entry.get(...)`` would iterate a singleton dict's keys and
+    crash). An empty entry ``{}`` (the AbsentAuthoritative clear) yields two empty lists → clear.
+    """
+    await _upsert_isis_data(
+        db,
+        device,
+        as_list(entry.get("process")),
+        as_list(entry.get("interface")),
+        refresh_source,
+    )
+
+
+ISIS_SPEC = FamilySpec(
+    name="isis",
+    empty_policy=EmptyPolicy.pop,  # config family: a container-confirmed 404 is an authoritative clear
+    getter=lambda client, name: client.get_isis_interfaces(name),
+    extract=lambda data: data,
+    materialize=_materialize_isis,
+)
+
+
 async def refresh_isis_interfaces_for_device(
     db: AsyncSession,
     device: Device,
@@ -161,33 +189,12 @@ async def refresh_isis_interfaces_for_device(
     *,
     refresh_source: str = "poll",
 ) -> bool:
-    """Read IS-IS oper-data for *device* from NSO and upsert DB rows.
+    """Read IS-IS oper-data for *device* from NSO and upsert DB rows (via the shared refresh engine).
 
     Returns True when the read succeeded (or there was nothing to read); False when the
     NSO read failed and the last-known rows were left untouched (a degraded surface).
     """
-    if not device.nso_device_name:
-        logger.debug("isis.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
-        return True
-
-    try:
-        entry = await nso_client.get_isis_interfaces(device.nso_device_name)
-    except Exception as exc:
-        logger.warning("isis.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return False
-
-    processes = entry.get("process", []) if entry else []
-    interfaces = entry.get("interface", []) if entry else []
-    await _upsert_isis_data(db, device, processes, interfaces, refresh_source)
-    logger.info(
-        "isis.refresh.done",
-        device_id=device.id,
-        device_name=device.nso_device_name,
-        process_count=len(processes),
-        interface_count=len(interfaces),
-        refresh_source=refresh_source,
-    )
-    return True
+    return await run_family_refresh(db, device, nso_client, ISIS_SPEC, refresh_source=refresh_source)
 
 
 async def handle_isis_interface_change(

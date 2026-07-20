@@ -15,7 +15,9 @@ import structlog
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
     Device,
@@ -233,6 +235,16 @@ async def _upsert_bgp_data(
     await db.commit()
 
 
+BGP_SPEC = FamilySpec(
+    name="bgp",
+    empty_policy=EmptyPolicy.pop,  # config family: a container-confirmed 404 is an authoritative clear
+    getter=lambda client, name: client.get_bgp_config(name),
+    # as_list guards the singleton-rendered-as-bare-dict case; extract({}) → [] → clear.
+    extract=lambda data: as_list(data.get("router")),
+    materialize=_upsert_bgp_data,
+)
+
+
 async def refresh_bgp_config_for_device(
     db: AsyncSession,
     device: Device,
@@ -240,34 +252,12 @@ async def refresh_bgp_config_for_device(
     *,
     refresh_source: str = "poll",
 ) -> bool:
-    """Read BGP oper-data for *device* from NSO and upsert DB rows.
+    """Read BGP oper-data for *device* from NSO and upsert DB rows (via the shared refresh engine).
 
     Returns True on a successful read (or nothing to read); False when the NSO read
     failed and the last-known rows were left untouched (a degraded surface).
     """
-    if not device.nso_device_name:
-        logger.debug("bgp.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
-        return True
-
-    try:
-        entry = await nso_client.get_bgp_config(device.nso_device_name)
-    except Exception as exc:
-        logger.warning("bgp.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return False
-
-    routers = as_list(entry.get("router")) if entry else []
-    await _upsert_bgp_data(db, device, routers, refresh_source)
-
-    peer_count = sum(len(as_list(scope_data.get("peer"))) for r in routers for scope_data in as_list(r.get("scope")))
-    logger.info(
-        "bgp.refresh.done",
-        device_id=device.id,
-        device_name=device.nso_device_name,
-        router_count=len(routers),
-        peer_count=peer_count,
-        refresh_source=refresh_source,
-    )
-    return True
+    return await run_family_refresh(db, device, nso_client, BGP_SPEC, refresh_source=refresh_source)
 
 
 async def handle_bgp_config_change(
