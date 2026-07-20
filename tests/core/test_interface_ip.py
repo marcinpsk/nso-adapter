@@ -261,3 +261,48 @@ async def test_handle_interface_ip_change_unknown_device_no_dispatch(adapter_cli
 
         nso_client.get_interface_ips.assert_not_awaited()
         break
+
+
+@pytest.mark.anyio
+async def test_handle_interface_ip_change_no_changed_devices_is_noop(adapter_client):
+    """An event carrying no device edits parses to nothing → early return, no NSO call."""
+    async for db in get_session():
+        nso_client = AsyncMock()
+        await handle_interface_ip_change({}, db, {"nso-dev": nso_client})
+        nso_client.get_interface_ips.assert_not_awaited()
+        break
+
+
+@pytest.mark.anyio
+async def test_handle_interface_ip_change_no_client_for_instance_skips(adapter_client):
+    """A matched device whose NSO instance has no client → skipped, not an error."""
+    await seed_device(nso_device_name="ip-noclient", netbox_device_id=915)
+    async for db in get_session():
+        event = {
+            "netconf-config-change": {
+                "edit": [{"target": "/ncs:devices/device[name='ip-noclient']/config/ios:interface/GE0/1"}]
+            }
+        }
+        # nso_clients dict lacks the device's instance ("nso-dev") → nso_clients.get(...) is None.
+        await handle_interface_ip_change(event, db, {"other-instance": AsyncMock()})
+        break  # no exception = the no_client branch was taken
+
+
+@pytest.mark.anyio
+async def test_refresh_skips_addressless_entry(adapter_client):
+    """An interface whose address entry carries no `address` value is skipped, not inserted."""
+    device_id = await seed_device(nso_device_name="ip-addrless", netbox_device_id=917)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_interface_ips.return_value = {
+            "interface": [{"interface-name": "GE0/1", "address": [{"address": "", "vrf": "", "family": "ipv4"}]}]
+        }
+
+        await refresh_interface_ips_for_device(db, device, nso_client)
+
+        rows = (
+            (await db.execute(select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id)))
+            .scalars()
+            .all()
+        )
+        assert rows == []

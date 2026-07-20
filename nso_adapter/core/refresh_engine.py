@@ -32,6 +32,7 @@ from nso_adapter.nso.read_outcome import (
     EmptyPolicy,
     Present,
     Unavailable,
+    UnavailableReason,
     classify_read,
 )
 from nso_adapter.store.models import Device
@@ -105,8 +106,21 @@ async def run_family_refresh(
         )
         return True
 
-    # Unavailable — keep the last-known rows; the surface is degraded.
+    # Unavailable — keep the last-known rows in every case.
     assert isinstance(outcome, Unavailable)
+    if outcome.reason is UnavailableReason.not_authoritative:
+        # A keep-on-None inventory family (present policy) got a 404: the export isn't serving
+        # this device for this family (unsupported NED / unknown / not-ready). That's an EXPECTED
+        # absence, not a read failure — keep the rows and report success (NOT a degraded surface),
+        # so it never flips the device to `partial` on every poll.
+        logger.info(
+            f"{spec.name}.refresh.not_authoritative",
+            device_id=device.id,
+            device_name=device.nso_device_name,
+            refresh_source=refresh_source,
+        )
+        return True
+
     logger.warning(
         f"{spec.name}.refresh.unavailable",
         device_id=device.id,

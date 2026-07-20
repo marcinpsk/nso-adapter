@@ -13,6 +13,7 @@ Two layers:
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import pytest
@@ -231,3 +232,83 @@ async def test_engine_skips_device_without_nso_name(adapter_client):
 
         assert ok is True
         client.get_static_routes.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_engine_present_policy_not_authoritative_keeps_rows_and_reports_success(adapter_client):
+    """A present-policy family's None (404) is an EXPECTED absence, not degradation:
+
+    rows are KEPT and the surface reports success (True), so it never flips the device to
+    ``partial`` on every poll. Contrast with export_down/read_error, which return False.
+    """
+    from nso_adapter.core.interface_ip import refresh_interface_ips_for_device
+    from nso_adapter.store.models import InterfaceIpAddress
+
+    device_id = await seed_device(nso_device_name="eng-present-none-sw01", netbox_device_id=9607)
+    async for db in get_session():
+        db.add(
+            InterfaceIpAddress(
+                device_id=device_id,
+                interface_name="GE0/1",
+                address="10.0.0.1/24",
+                vrf="",
+                family="ipv4",
+                secondary=False,
+                last_refreshed_at=datetime.now(UTC).replace(tzinfo=None),
+                refresh_source="poll",
+            )
+        )
+        await db.commit()
+        break
+
+    async with _device_session(device_id) as (db, device):
+        client = AsyncMock()
+        client.get_interface_ips.return_value = None  # 404 → not-authoritative for a present family
+
+        ok = await refresh_interface_ips_for_device(db, device, client)
+
+        assert ok is True  # NOT degraded
+        rows = (
+            (await db.execute(select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id)))
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1  # kept
+
+
+@pytest.mark.anyio
+async def test_engine_present_policy_read_error_reports_degraded(adapter_client):
+    """A genuine read failure on a present-policy family DOES report degraded (False), rows kept."""
+    from nso_adapter.core.interface_ip import refresh_interface_ips_for_device
+    from nso_adapter.store.models import InterfaceIpAddress
+
+    device_id = await seed_device(nso_device_name="eng-present-err-sw01", netbox_device_id=9608)
+    async for db in get_session():
+        db.add(
+            InterfaceIpAddress(
+                device_id=device_id,
+                interface_name="GE0/1",
+                address="10.0.0.1/24",
+                vrf="",
+                family="ipv4",
+                secondary=False,
+                last_refreshed_at=datetime.now(UTC).replace(tzinfo=None),
+                refresh_source="poll",
+            )
+        )
+        await db.commit()
+        break
+
+    async with _device_session(device_id) as (db, device):
+        client = AsyncMock()
+        client.get_interface_ips.side_effect = RuntimeError("timeout")
+
+        ok = await refresh_interface_ips_for_device(db, device, client)
+
+        assert ok is False  # degraded
+        rows = (
+            (await db.execute(select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id)))
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1  # kept
