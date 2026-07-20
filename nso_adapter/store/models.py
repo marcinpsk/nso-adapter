@@ -2146,3 +2146,67 @@ class DeviceCapability(Base):
     detail: Mapped[str] = mapped_column(String(256), default="")
     source: Mapped[str] = mapped_column(String(16))  # probe | apply | read
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
+
+
+class RefreshOutcome(Base):
+    """One read-mirror refresh attempt's outcome, recorded in two phases (READSEM §2.4).
+
+    Phase 1 (read): the classified read outcome, written BEFORE the family materializer runs.
+    Phase 2 (result): the materialization result + returned success flag, written AFTER — this
+    terminalizes the attempt.
+
+    The row's ``id`` is the immutable **attempt id** AND the start-order key (rows are inserted
+    at phase 1, so id order == the order attempts entered the store). The two phases UPDATE the
+    same row; they never insert a second. The per-(device, family) current pointer
+    (:class:`RefreshOutcomePointer`) advances to the newest TERMINAL attempt by start order, so a
+    newest failure stays visible and an older attempt finishing late never overwrites a newer
+    terminal result.
+
+    Recorded on the caller's session (see :mod:`nso_adapter.store.outcome_store` for why a second
+    connection can't be used): phase 1 flushes to ride the family's transaction, phase 2 commits.
+    """
+
+    __tablename__ = "refresh_outcome"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    family: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="poll")
+    # Phase 1 — the classified read outcome.
+    read_outcome: Mapped[str] = mapped_column(
+        String(32), nullable=False
+    )  # present | absent_authoritative | unavailable
+    read_reason: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )  # export_down|read_error|not_authoritative
+    freshness: Mapped[str | None] = mapped_column(String(16), nullable=True)  # fresh | aged
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
+    # Phase 2 — the terminal materialization result. NULL until phase 2 is recorded.
+    result: Mapped[str | None] = mapped_column(String(16), nullable=True)  # replaced | cleared | kept
+    succeeded: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RefreshOutcomePointer(Base):
+    """Per-(device, family) pointer to the current refresh outcome (READSEM §2.4).
+
+    Points at the newest TERMINAL :class:`RefreshOutcome` by start order (its ``attempt_id``).
+    Advanced only when a terminalizing attempt's id is greater than the pointed-to one, so an
+    older attempt that finishes late cannot regress the pointer onto a stale result.
+    """
+
+    __tablename__ = "refresh_outcome_pointer"
+    __table_args__ = (UniqueConstraint("device_id", "family", name="uq_refresh_outcome_pointer"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    family: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempt_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("refresh_outcome.id", ondelete="CASCADE"), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())

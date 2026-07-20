@@ -31,13 +31,38 @@ from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
     EmptyPolicy,
     Present,
+    ReadOutcome,
     Unavailable,
     UnavailableReason,
     classify_read,
 )
+from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device
 
 logger = structlog.get_logger(__name__)
+
+
+async def _record_read(
+    db: AsyncSession, device: Device, spec: FamilySpec, outcome: ReadOutcome, refresh_source: str
+) -> int | None:
+    """Best-effort phase-1 outcome record; a store failure must never break the mirror refresh."""
+    try:
+        return await outcome_store.record_read_outcome(db, device.id, spec.name, outcome, refresh_source=refresh_source)
+    except Exception as exc:  # noqa: BLE001 — telemetry write; the mirror is the source of truth
+        logger.warning(f"{spec.name}.outcome.read_record_failed", device_id=device.id, error=repr(exc))
+        return None
+
+
+async def _record_result(
+    db: AsyncSession, spec: FamilySpec, attempt_id: int | None, *, result: str, succeeded: bool, row_count: int | None
+) -> None:
+    """Best-effort phase-2 outcome record + pointer advance."""
+    if attempt_id is None:
+        return
+    try:
+        await outcome_store.record_result(db, attempt_id, result=result, succeeded=succeeded, row_count=row_count)
+    except Exception as exc:  # noqa: BLE001 — telemetry write; never fail the refresh over it
+        logger.warning(f"{spec.name}.outcome.result_record_failed", attempt_id=attempt_id, error=repr(exc))
 
 
 @dataclass(frozen=True)
@@ -89,18 +114,22 @@ async def run_family_refresh(
         lambda: spec.getter(nso_client, device.nso_device_name),
         spec.empty_policy,
     )
+    # Phase 1: record the read outcome before the materializer runs (independent session).
+    attempt_id = await _record_read(db, device, spec, outcome, refresh_source)
 
     if isinstance(outcome, Present):
         payload = spec.extract(outcome.data)
         await spec.materialize(db, device, payload, refresh_source)
+        row_count = len(payload) if isinstance(payload, (list, tuple)) else None
         logger.info(
             f"{spec.name}.refresh.done",
             device_id=device.id,
             device_name=device.nso_device_name,
-            row_count=len(payload) if isinstance(payload, (list, tuple)) else None,
+            row_count=row_count,
             freshness=outcome.freshness.value,
             refresh_source=refresh_source,
         )
+        await _record_result(db, spec, attempt_id, result="replaced", succeeded=True, row_count=row_count)
         return True
 
     if isinstance(outcome, AbsentAuthoritative):
@@ -112,6 +141,7 @@ async def run_family_refresh(
             device_name=device.nso_device_name,
             refresh_source=refresh_source,
         )
+        await _record_result(db, spec, attempt_id, result="cleared", succeeded=True, row_count=0)
         return True
 
     # Unavailable — keep the last-known rows in every case.
@@ -127,6 +157,7 @@ async def run_family_refresh(
             device_name=device.nso_device_name,
             refresh_source=refresh_source,
         )
+        await _record_result(db, spec, attempt_id, result="kept", succeeded=True, row_count=None)
         return True
 
     logger.warning(
@@ -136,4 +167,5 @@ async def run_family_refresh(
         reason=outcome.reason.value,
         detail=outcome.detail,
     )
+    await _record_result(db, spec, attempt_id, result="kept", succeeded=False, row_count=None)
     return False
