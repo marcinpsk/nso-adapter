@@ -35,7 +35,7 @@ def _make_client() -> NsoClient:
 class EnvelopeTransport(httpx.AsyncBaseTransport):
     """Routes the three URL shapes independently and records every request.
 
-    * action POST (``/restconf/operations/``) → ``action_status``/``action_body``
+    * action POST (``device-state-read/run``) → ``action_status``/``action_body``
     * keyed device GET (``/device=`` in the path) → ``device_status``/``device_body``
     * the bare ``device-state`` container probe → ``container_status``
     """
@@ -59,7 +59,7 @@ class EnvelopeTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         url = str(request.url)
-        if "/restconf/operations/" in url:
+        if "device-state-read/run" in url:  # follows a COLON (module-qualified), not a slash
             status, body = self.action_status, self.action_body
         elif "/device=" in url:
             status, body = self.device_status, self.device_body
@@ -117,9 +117,12 @@ async def test_section_404_with_healthy_container_is_device_absent(patch_client)
     transport = EnvelopeTransport(device_status=404, container_status=200)
     with patch_client(client, transport):
         assert await client.get_device_state_section("ghost", "ospf-config") is None
-    # The probe must actually have run (second request, container URL, no /device=).
+    # The probe must actually have run (second request, container URL, no /device=) and be
+    # BOUNDED: without ?depth=1 the bare container GET serializes the whole fleet x 18 sections.
     assert len(transport.requests) == 2
-    assert "/device=" not in str(transport.requests[1].url)
+    probe_url = str(transport.requests[1].url)
+    assert "/device=" not in probe_url
+    assert "depth=1" in probe_url
 
 
 async def test_section_404_with_dead_container_raises_export_unavailable(patch_client):
@@ -189,7 +192,8 @@ async def test_action_posts_module_qualified_input_and_returns_output(patch_clie
     assert output["logging-config"]["status"] == "unsupported"
     sent = json.loads(transport.requests[0].content)
     assert sent == {"network-state-export:input": {"device": "sw01", "family": ["ospf-config", "logging-config"]}}
-    assert "/restconf/operations/network-state-export:device-state-read/run" in str(transport.requests[0].url)
+    # The CANONICAL nested-action form (S2b contract): the action lives under /restconf/data.
+    assert "/restconf/data/network-state-export:device-state-read/run" in str(transport.requests[0].url)
 
 
 async def test_action_error_raises_http_status_error(patch_client):

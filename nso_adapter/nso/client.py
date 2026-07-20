@@ -416,7 +416,10 @@ class NsoClient:
         async with self._client() as c:
             resp = await c.get(f"{base}/device={_url_key(device_name)}/{wire_family}")
             if resp.status_code == 404:
-                probe = await c.get(base)
+                # Liveness-only probe: ?depth=1 keeps NSO from serializing EVERY device x 18
+                # sections just to answer "is the export alive" (only the status code is read,
+                # so the depth-truncation trap does not apply).
+                probe = await c.get(f"{base}?depth=1")
                 if probe.status_code == 404:
                     raise NsoExportUnavailableError(
                         f"network-state-export:device-state is not exported by NSO — refusing to "
@@ -441,7 +444,7 @@ class NsoClient:
         async with self._client() as c:
             resp = await c.get(f"{base}/device={_url_key(device_name)}")
             if resp.status_code == 404:
-                probe = await c.get(base)
+                probe = await c.get(f"{base}?depth=1")  # liveness only — see get_device_state_section
                 if probe.status_code == 404:
                     raise NsoExportUnavailableError(
                         f"network-state-export:device-state is not exported by NSO — refusing to "
@@ -454,7 +457,9 @@ class NsoClient:
             entries = data.get("network-state-export:device") or data.get("device", [])
             return entries[0] if entries else None
 
-    async def run_device_state_read(self, device_name: str, wire_families: list[str]) -> dict:
+    async def run_device_state_read(
+        self, device_name: str, wire_families: list[str], *, timeout: float | None = None
+    ) -> dict:
         """POST the ``device-state-read run`` action — the on-demand ATOMIC multi-family read.
 
         Extracts every requested family inside ONE txid-bracketed CDB build and CAS-updates
@@ -468,9 +473,9 @@ class NsoClient:
         Raises ``httpx.HTTPStatusError`` on an action error (bracket exhaustion, unknown
         device) — callers keep rows for every requested family.
         """
-        url = f"{self._base}/restconf/operations/network-state-export:device-state-read/run"
+        url = f"{self._base}/restconf/data/network-state-export:device-state-read/run"
         body = {"network-state-export:input": {"device": device_name, "family": list(wire_families)}}
-        async with self._client(self._device_state_read_timeout) as c:
+        async with self._client(timeout if timeout is not None else self._device_state_read_timeout) as c:
             resp = await c.post(url, json=body)
             resp.raise_for_status()
             data = resp.json()
