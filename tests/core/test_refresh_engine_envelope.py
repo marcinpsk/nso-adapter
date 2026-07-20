@@ -436,3 +436,67 @@ async def test_poisoned_session_store_failure_stays_best_effort(adapter_client, 
 
         assert ok is True, "a telemetry-write failure must never fail the refresh"
         assert await _routes(db, device_id) == ["172.16.0.0/12"], "the mirror must still refresh"
+
+
+# ── codex R2: commit-time materializer failure (F1) + phase-2 store poisoning (F2) ──
+
+
+@pytest.mark.anyio
+async def test_commit_time_materializer_failure_recovers_and_terminalizes(adapter_client):
+    """Codex S3-R2 F1: materializers COMMIT internally, releasing the savepoint — a DB
+    error surfacing at flush/commit dooms the whole transaction. The engine must recover
+    the session and record a FRESH terminal failure row (the flushed phase-1 row died
+    with the transaction), and the session must be usable afterwards."""
+    from sqlalchemy.exc import IntegrityError
+
+    from nso_adapter.store.models import RefreshOutcome
+
+    device_id = await seed_device(nso_device_name="eng-env-commitfail", netbox_device_id=9721)
+    await _seed_one_route(device_id)
+    async with _device_session(device_id) as (db, device):
+
+        async def _bad_materialize(db_, device_, payload, refresh_source):
+            # A NOT NULL violation that only surfaces at flush-inside-commit.
+            db_.add(RefreshOutcome(device_id=None, family=None, read_outcome=None))
+            await db_.commit()
+
+        spec = dataclasses.replace(ENV_SPEC, materialize=_bad_materialize)
+        with pytest.raises(IntegrityError):
+            await run_family_refresh(db, device, _client(section=OK_SECTION), spec)
+
+        outcome_row = await _latest_outcome(db, device_id)
+        assert (outcome_row.result, outcome_row.succeeded) == ("error", False)
+        # The session is usable and a follow-up refresh with a healthy client works.
+        ok = await run_family_refresh(db, device, _client(section=OK_SECTION), ENV_SPEC)
+        assert ok is True
+        assert await _routes(db, device_id) == ["172.16.0.0/12"]
+
+
+@pytest.mark.anyio
+async def test_phase2_store_poisoning_recovers_the_session(adapter_client, monkeypatch):
+    """Codex S3-R2 F2: a phase-2 store failure that dooms the transaction must not leave
+    the session poisoned for the NEXT family in the caller's fan-out."""
+    from nso_adapter.store import outcome_store as outcome_store_mod
+
+    device_id = await seed_device(nso_device_name="eng-env-p2poison", netbox_device_id=9722)
+    await _seed_one_route(device_id)
+    async with _device_session(device_id) as (db, device):
+
+        async def _poisoning_result(db_, attempt_id, *, result, succeeded, row_count=None):
+            from nso_adapter.store.models import RefreshOutcome as _RO
+
+            # An authentic doomed transaction: a failing FLUSH puts the session in
+            # pending-rollback (a fake that merely raises leaves it healthy).
+            db_.add(_RO(device_id=None, family=None, read_outcome=None))
+            await db_.flush()
+
+        monkeypatch.setattr(outcome_store_mod, "record_result", _poisoning_result)
+
+        ok = await run_family_refresh(db, device, _client(section=OK_SECTION), ENV_SPEC)
+
+        assert ok is True, "phase-2 telemetry failure must never fail the refresh"
+        # The next family's refresh on the SAME session must work (sync_device fan-out shape).
+        monkeypatch.undo()
+        ok2 = await run_family_refresh(db, device, _client(section=OK_SECTION), ENV_SPEC)
+        assert ok2 is True
+        assert await _routes(db, device_id) == ["172.16.0.0/12"]

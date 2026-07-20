@@ -21,7 +21,6 @@ succeeded or nothing-to-read; ``False`` = read failed, rows untouched) so existi
 from __future__ import annotations
 
 import asyncio
-import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -53,15 +52,17 @@ logger = structlog.get_logger(__name__)
 # asyncio primitives bind to the loop that first awaits them, and the test suite runs
 # one loop per test.
 _ACTION_CONCURRENCY = 4
-_coordination_by_loop: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 def _loop_coordination() -> tuple[dict[tuple[int, str], asyncio.Lock], asyncio.Semaphore]:
+    # Stored ON the loop object, not in a module registry: a WeakKeyDictionary keyed by
+    # the loop cannot collect (its values are loop-bound primitives referencing the key —
+    # codex S3-R2 F4), while a loop attribute dies exactly with the loop.
     loop = asyncio.get_running_loop()
-    entry = _coordination_by_loop.get(loop)
+    entry = getattr(loop, "_nso_adapter_refresh_coordination", None)
     if entry is None:
         entry = ({}, asyncio.Semaphore(_ACTION_CONCURRENCY))
-        _coordination_by_loop[loop] = entry
+        loop._nso_adapter_refresh_coordination = entry
     return entry
 
 
@@ -91,27 +92,45 @@ async def _record_read(
         return await outcome_store.record_read_outcome(db, device_id, spec.name, outcome, refresh_source=refresh_source)
     except Exception as exc:  # noqa: BLE001 — telemetry write; the mirror is the source of truth
         logger.warning(f"{spec.name}.outcome.read_record_failed", device_id=device_id, error=repr(exc))
-        try:
-            if not db.sync_session.is_active:
-                await db.rollback()  # the transaction was doomed at the DB level
-            await db.refresh(device)  # un-expire; one SELECT, failure path only
-        except Exception as recovery_exc:  # noqa: BLE001 — nothing more we can do; let the refresh try
-            logger.warning(
-                f"{spec.name}.outcome.session_recovery_failed", device_id=device_id, error=repr(recovery_exc)
-            )
+        await _recover_session(db, device, spec.name, device_id)
         return None
 
 
+async def _recover_session(db: AsyncSession, device: Device, label: str, device_id: int) -> None:
+    """Make the session usable again after a store write died at the DB level.
+
+    A failed flush/commit dooms the transaction (pending-rollback) and expires every ORM
+    instance — without recovery the NEXT database touch (the materializer, the next
+    surface in ``sync_device``'s fan-out, the caller's final commit) raises
+    ``PendingRollbackError`` (found live; codex S3-R2 F2 extends it to phase 2).
+    """
+    try:
+        if not db.sync_session.is_active:
+            await db.rollback()  # the transaction was doomed at the DB level
+        await db.refresh(device)  # un-expire; one SELECT, failure path only
+    except Exception as recovery_exc:  # noqa: BLE001 — nothing more we can do; let the caller try
+        logger.warning(f"{label}.outcome.session_recovery_failed", device_id=device_id, error=repr(recovery_exc))
+
+
 async def _record_result(
-    db: AsyncSession, spec: FamilySpec, attempt_id: int | None, *, result: str, succeeded: bool, row_count: int | None
+    db: AsyncSession,
+    device: Device,
+    spec: FamilySpec,
+    attempt_id: int | None,
+    *,
+    result: str,
+    succeeded: bool,
+    row_count: int | None,
 ) -> None:
-    """Best-effort phase-2 outcome record + pointer advance."""
+    """Best-effort phase-2 outcome record + pointer advance (with session recovery)."""
     if attempt_id is None:
         return
+    device_id = device.id  # snapshot before the store call can poison the session
     try:
         await outcome_store.record_result(db, attempt_id, result=result, succeeded=succeeded, row_count=row_count)
     except Exception as exc:  # noqa: BLE001 — telemetry write; never fail the refresh over it
         logger.warning(f"{spec.name}.outcome.result_record_failed", attempt_id=attempt_id, error=repr(exc))
+        await _recover_session(db, device, spec.name, device_id)
 
 
 @dataclass(frozen=True)
@@ -303,6 +322,7 @@ async def _materialize_guarded(
     attempt_id: int | None,
     payload_fn,
     refresh_source: str,
+    outcome: ReadOutcome,
 ):
     """Run extract+materialize under a SAVEPOINT; terminalize the attempt on failure.
 
@@ -316,16 +336,29 @@ async def _materialize_guarded(
     A materializer that already committed (its normal last step) deactivates the
     savepoint — nothing to roll back. The exception always re-raises (legacy contract).
     """
+    device_id = device.id  # snapshot: a commit-time failure expires the instance
     savepoint = await db.begin_nested()
     try:
         payload = payload_fn()
         await spec.materialize(db, device, payload, refresh_source)
         return payload
     except Exception:
+        # Two failure modes (codex S3-R2 F1): a Python-level materializer error leaves the
+        # savepoint alive — roll IT back (sibling caller work survives) and terminalize the
+        # SAME attempt. A flush/commit-time DB error dooms the WHOLE transaction (the
+        # materializers commit internally, releasing the savepoint) — sibling work was lost
+        # to the DB failure itself; recover the session and record a FRESH terminal row
+        # (the flushed phase-1 row died with the transaction).
         try:
             if savepoint.is_active:
                 await savepoint.rollback()
-            await _record_result(db, spec, attempt_id, result="error", succeeded=False, row_count=None)
+                await _record_result(db, device, spec, attempt_id, result="error", succeeded=False, row_count=None)
+            else:
+                await _recover_session(db, device, spec.name, device_id)
+                failed_id = await outcome_store.record_read_outcome(
+                    db, device_id, spec.name, outcome, refresh_source=refresh_source
+                )
+                await outcome_store.record_result(db, failed_id, result="error", succeeded=False, row_count=None)
         except Exception as store_exc:  # noqa: BLE001 — telemetry; the materializer error is the story
             logger.warning(f"{spec.name}.outcome.terminalize_failed", attempt_id=attempt_id, error=repr(store_exc))
         raise
@@ -344,7 +377,7 @@ async def _apply_outcome(
 
     if isinstance(outcome, Present):
         payload = await _materialize_guarded(
-            db, device, spec, attempt_id, lambda: spec.extract(outcome.data), refresh_source
+            db, device, spec, attempt_id, lambda: spec.extract(outcome.data), refresh_source, outcome
         )
         row_count = len(payload) if isinstance(payload, (list, tuple)) else None
         logger.info(
@@ -355,19 +388,19 @@ async def _apply_outcome(
             freshness=outcome.freshness.value,
             refresh_source=refresh_source,
         )
-        await _record_result(db, spec, attempt_id, result="replaced", succeeded=True, row_count=row_count)
+        await _record_result(db, device, spec, attempt_id, result="replaced", succeeded=True, row_count=row_count)
         return True
 
     if isinstance(outcome, AbsentAuthoritative):
         # Clear by materializing the "nothing" payload for this family (extract of an empty entry).
-        await _materialize_guarded(db, device, spec, attempt_id, lambda: spec.extract({}), refresh_source)
+        await _materialize_guarded(db, device, spec, attempt_id, lambda: spec.extract({}), refresh_source, outcome)
         logger.info(
             f"{spec.name}.refresh.cleared",
             device_id=device.id,
             device_name=device.nso_device_name,
             refresh_source=refresh_source,
         )
-        await _record_result(db, spec, attempt_id, result="cleared", succeeded=True, row_count=0)
+        await _record_result(db, device, spec, attempt_id, result="cleared", succeeded=True, row_count=0)
         return True
 
     # Unavailable — keep the last-known rows in every case.
@@ -384,7 +417,7 @@ async def _apply_outcome(
             reason=outcome.reason.value,
             refresh_source=refresh_source,
         )
-        await _record_result(db, spec, attempt_id, result="kept", succeeded=True, row_count=None)
+        await _record_result(db, device, spec, attempt_id, result="kept", succeeded=True, row_count=None)
         return True
 
     logger.warning(
@@ -394,5 +427,5 @@ async def _apply_outcome(
         reason=outcome.reason.value,
         detail=outcome.detail,
     )
-    await _record_result(db, spec, attempt_id, result="kept", succeeded=False, row_count=None)
+    await _record_result(db, device, spec, attempt_id, result="kept", succeeded=False, row_count=None)
     return False

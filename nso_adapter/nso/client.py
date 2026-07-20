@@ -455,7 +455,20 @@ class NsoClient:
             resp.raise_for_status()
             data = resp.json()
             entries = data.get("network-state-export:device") or data.get("device", [])
-            return entries[0] if entries else None
+            # A 200 whose body lacks exactly this device is a MALFORMED response (truncated
+            # doc, wrong namespace, proxy garbage) - never device absence. None is reserved
+            # for the confirmed-404 branch above; classifying a bad 200 as absence would
+            # clear every pop-policy family downstream (codex S3-R2 F3).
+            if (
+                not isinstance(entries, list)
+                or len(entries) != 1
+                or not isinstance(entries[0], dict)
+                or entries[0].get("device-name") != device_name
+            ):
+                raise NsoExportUnavailableError(
+                    f"device-state GET for {device_name!r} returned 200 with a malformed body"
+                )
+            return entries[0]
 
     async def run_device_state_read(
         self, device_name: str, wire_families: list[str], *, timeout: float | None = None

@@ -824,10 +824,11 @@ async def test_run_apply_refreshes_mirror_and_notifies_plugin(adapter_client):
 
     # The read-mirror was re-read from NSO for both a routing surface (route-policy) and a config
     # surface (SVI) — the two families that back a 'deploying' overlay row ...
-    mock_client.get_device_state_section.assert_awaited()
-    # svi is envelope-flipped (READSEM S3 B2): its re-read arrives as a device-state section GET.
-    svi_reads = [c for c in mock_client.get_device_state_section.await_args_list if c.args[1] == "svi"]
-    assert svi_reads, "post-apply refresh must re-read the svi section"
+    # Both families are envelope-flipped: their re-reads arrive as device-state section
+    # GETs. Assert BOTH wire families explicitly (a generic assert would stay green if the
+    # routing fan-out were dropped while the config fan-out still reads svi) - codex S3-R2 F5.
+    read_families = {c.args[1] for c in mock_client.get_device_state_section.await_args_list}
+    assert {"route-policy", "svi"} <= read_families, read_families
     # ... and the plugin was notified so its post-apply reconcile settles the deploying row.
     nb.notify_sync_complete.assert_awaited_once_with(321)
 

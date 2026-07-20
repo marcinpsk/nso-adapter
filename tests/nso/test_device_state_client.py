@@ -221,3 +221,26 @@ async def test_section_and_doc_run_on_the_blanket_timeout(patch_client):
     with patch_client(client, EnvelopeTransport(device_body=body)) as seen_timeouts:
         await client.get_device_state_section("sw01", "ospf-config")
     assert seen_timeouts == [None]
+
+
+# ── codex R2 F3: a malformed 200 must never read as device absence ──────────────────
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},  # empty document
+        {"network-state-export:device": []},  # empty device list
+        {"wrong-namespace:device": [{"device-name": "sw01"}]},  # wrong namespace
+        {"network-state-export:device": [{"device-name": "OTHER"}]},  # mismatched device
+        {"network-state-export:device": [{"device-name": "sw01"}, {"device-name": "sw02"}]},  # multiple
+    ],
+    ids=["empty-doc", "empty-list", "wrong-ns", "mismatch", "multiple"],
+)
+async def test_doc_malformed_200_raises_never_absence(patch_client, body):
+    """None is RESERVED for the confirmed-404 branch: a truncated/mangled 200 classified
+    as device absence would clear every pop-policy family downstream."""
+    client = _make_client()
+    with patch_client(client, EnvelopeTransport(device_body=body)):
+        with pytest.raises(NsoExportUnavailableError):
+            await client.get_device_state_doc("sw01")

@@ -61,6 +61,17 @@ async def _upsert_lags(
 
     now = datetime.now(UTC).replace(tzinfo=None)
     for lag in lags_data:
+        if "lag-id" not in lag:
+            # Live ra1: a Nokia lag named without digits ("lag-aa") serves no lag-id, and
+            # the column is NOT NULL — skip the entry (bgp's asn-less-router convention)
+            # instead of KeyError'ing the whole refresh and losing every lag.
+            logger.warning(
+                "lag_topology.entry_skipped",
+                device_id=device.id,
+                lag_name=lag.get("name"),
+                reason="no lag-id",
+            )
+            continue
         li = LagInterface(
             device_id=device.id,
             name=lag["name"],

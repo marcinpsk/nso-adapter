@@ -168,7 +168,7 @@ async def refresh_redistribution_for_device(
         logger.warning("redistribution.refresh.degraded", device_id=device.id, device_name=name)
         await _record_composite(
             db,
-            device.id,
+            device,
             Unavailable(UnavailableReason.export_down),
             refresh_source,
             result="kept",
@@ -241,7 +241,7 @@ async def refresh_redistribution_for_device(
     if all_authoritative:
         merged: ReadOutcome = Present({}, Freshness.stale if any_stale else Freshness.fresh)
         await _record_composite(
-            db, device.id, merged, refresh_source, result="replaced", succeeded=True, row_count=len(rebuilt)
+            db, device, merged, refresh_source, result="replaced", succeeded=True, row_count=len(rebuilt)
         )
     else:
         kept = [
@@ -251,14 +251,14 @@ async def refresh_redistribution_for_device(
         ]
         merged = Unavailable(UnavailableReason.read_error, detail=f"components kept: {kept}")
         await _record_composite(
-            db, device.id, merged, refresh_source, result="kept", succeeded=False, row_count=len(rebuilt)
+            db, device, merged, refresh_source, result="kept", succeeded=False, row_count=len(rebuilt)
         )
     return all_authoritative
 
 
 async def _record_composite(
     db: AsyncSession,
-    device_id: int,
+    device: Device,
     outcome: ReadOutcome,
     refresh_source: str,
     *,
@@ -266,7 +266,15 @@ async def _record_composite(
     succeeded: bool,
     row_count: int | None,
 ) -> None:
-    """Best-effort two-phase outcome record for the composite family (never breaks the refresh)."""
+    """Best-effort two-phase outcome record for the composite family (never breaks the refresh).
+
+    Same session-recovery contract as the engine's phase helpers (codex S3-R2 F2 class): a
+    store write that dies at the DB level dooms the caller's transaction and expires the
+    ORM instances — recover so the caller's next work stays usable.
+    """
+    from nso_adapter.core.refresh_engine import _recover_session
+
+    device_id = device.id
     try:
         attempt_id = await outcome_store.record_read_outcome(
             db, device_id, "redistribution", outcome, refresh_source=refresh_source
@@ -274,3 +282,4 @@ async def _record_composite(
         await outcome_store.record_result(db, attempt_id, result=result, succeeded=succeeded, row_count=row_count)
     except Exception as exc:  # noqa: BLE001 — telemetry write; the mirror is the source of truth
         logger.warning("redistribution.outcome.record_failed", device_id=device_id, error=repr(exc))
+        await _recover_session(db, device, "redistribution", device_id)

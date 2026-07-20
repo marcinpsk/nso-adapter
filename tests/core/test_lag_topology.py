@@ -160,3 +160,27 @@ async def test_handle_netconf_config_change_unknown_device(adapter_client):
 
         nso_client.get_device_state_section.assert_not_awaited()
         break
+
+
+@pytest.mark.anyio
+async def test_lag_without_lag_id_is_skipped_not_fatal(adapter_client):
+    """Live ra1 shape: a Nokia lag named without digits ('lag-aa') serves NO lag-id.
+    The old direct indexing KeyError'd the whole refresh (every lag lost, surface
+    degraded); a malformed entry must be SKIPPED with a warning, like bgp's asn-less
+    router."""
+    device_id = await seed_device(nso_device_name="lag-noid", netbox_device_id=9820)
+    async with _device_session(device_id) as (db, device):
+        client = AsyncMock()
+        client.get_device_state_section.return_value = {
+            "status": "ok",
+            "lag": [
+                {"name": "lag-1", "lag-id": 1, "member": [{"interface-name": "1/1/c1/1", "mode": "active"}]},
+                {"name": "lag-aa", "member": [{"interface-name": "1/1/c2/1", "mode": "active"}]},  # no lag-id
+            ],
+        }
+
+        ok = await refresh_lag_topology_for_device(db, device, client)
+
+        assert ok is True
+        rows = (await db.execute(select(LagInterface).where(LagInterface.device_id == device.id))).scalars().all()
+        assert [(r.name, r.lag_id) for r in rows] == [("lag-1", 1)]
