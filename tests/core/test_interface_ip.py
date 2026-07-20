@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.core.interface_ip import (
+    INTERFACE_IP_SPEC,
     handle_interface_ip_change,
     refresh_interface_ips_for_device,
 )
@@ -36,7 +37,8 @@ async def test_refresh_inserts_addresses(adapter_client):
     device_id = await seed_device(nso_device_name="ip-sw01", netbox_device_id=910)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_interface_ips.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "name": "ip-sw01",
             "interface": [
                 {
@@ -55,7 +57,7 @@ async def test_refresh_inserts_addresses(adapter_client):
 
         await refresh_interface_ips_for_device(db, device, nso_client, refresh_source="poll")
 
-        nso_client.get_interface_ips.assert_awaited_once_with("ip-sw01")
+        nso_client.get_device_state_section.assert_awaited_once_with("ip-sw01", "interface-ip")
         result = await db.execute(select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id))
         rows = result.scalars().all()
         assert len(rows) == 3
@@ -73,7 +75,8 @@ async def test_refresh_coerces_explicit_null_vrf_and_family(adapter_client):
     device_id = await seed_device(nso_device_name="ip-nullvrf", netbox_device_id=915)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_interface_ips.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "name": "ip-nullvrf",
             "interface": [
                 {
@@ -99,7 +102,8 @@ async def test_refresh_full_replaces_existing_rows(adapter_client):
     device_id = await seed_device(nso_device_name="ip-sw02", netbox_device_id=911)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_interface_ips.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "name": "ip-sw02",
             "interface": [
                 {
@@ -111,7 +115,8 @@ async def test_refresh_full_replaces_existing_rows(adapter_client):
 
         await refresh_interface_ips_for_device(db, device, nso_client)
         # Update — different address
-        nso_client.get_interface_ips.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "name": "ip-sw02",
             "interface": [
                 {
@@ -152,7 +157,7 @@ async def test_refresh_keeps_rows_on_none_404(adapter_client):
         await db.commit()
 
         nso_client = AsyncMock()
-        nso_client.get_interface_ips.return_value = None
+        nso_client.get_device_state_section.return_value = None
 
         result = await refresh_interface_ips_for_device(db, device, nso_client)
 
@@ -188,7 +193,7 @@ async def test_refresh_wipes_on_present_empty(adapter_client):
         await db.commit()
 
         nso_client = AsyncMock()
-        nso_client.get_interface_ips.return_value = {"device-name": "ip-empty", "interface": []}
+        nso_client.get_device_state_section.return_value = {"status": "ok", "device-name": "ip-empty", "interface": []}
 
         result = await refresh_interface_ips_for_device(db, device, nso_client)
 
@@ -223,7 +228,7 @@ async def test_refresh_transport_error_leaves_existing_rows(adapter_client):
         await db.commit()
 
         nso_client = AsyncMock()
-        nso_client.get_interface_ips.side_effect = httpx.ConnectError("timeout")
+        nso_client.get_device_state_section.side_effect = httpx.ConnectError("timeout")
 
         await refresh_interface_ips_for_device(db, device, nso_client)
 
@@ -238,7 +243,7 @@ async def test_handle_interface_ip_change_dispatches(adapter_client):
     device_id = await seed_device(nso_device_name="ip-sw05", netbox_device_id=914)
     async with _device_session(device_id) as (db, _device):
         nso_client = AsyncMock()
-        nso_client.get_interface_ips.return_value = {"name": "ip-sw05", "interface": []}
+        nso_client.get_device_state_section.return_value = {"status": "ok", "name": "ip-sw05", "interface": []}
         event = {
             "netconf-config-change": {
                 "edit": [{"target": "/ncs:devices/device[name='ip-sw05']/config/ios:interface/GigabitEthernet0/1"}]
@@ -247,7 +252,7 @@ async def test_handle_interface_ip_change_dispatches(adapter_client):
 
         await handle_interface_ip_change(event, db, {"nso-dev": nso_client})
 
-        nso_client.get_interface_ips.assert_awaited_once_with("ip-sw05")
+        nso_client.get_device_state_section.assert_awaited_once_with("ip-sw05", "interface-ip")
 
 
 @pytest.mark.anyio
@@ -259,7 +264,7 @@ async def test_handle_interface_ip_change_unknown_device_no_dispatch(adapter_cli
 
         await handle_interface_ip_change(event, db, {"nso-dev": nso_client})
 
-        nso_client.get_interface_ips.assert_not_awaited()
+        nso_client.get_device_state_section.assert_not_awaited()
         break
 
 
@@ -269,7 +274,7 @@ async def test_handle_interface_ip_change_no_changed_devices_is_noop(adapter_cli
     async for db in get_session():
         nso_client = AsyncMock()
         await handle_interface_ip_change({}, db, {"nso-dev": nso_client})
-        nso_client.get_interface_ips.assert_not_awaited()
+        nso_client.get_device_state_section.assert_not_awaited()
         break
 
 
@@ -294,8 +299,9 @@ async def test_refresh_skips_addressless_entry(adapter_client):
     device_id = await seed_device(nso_device_name="ip-addrless", netbox_device_id=917)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_interface_ips.return_value = {
-            "interface": [{"interface-name": "GE0/1", "address": [{"address": "", "vrf": "", "family": "ipv4"}]}]
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": [{"interface-name": "GE0/1", "address": [{"address": "", "vrf": "", "family": "ipv4"}]}],
         }
 
         await refresh_interface_ips_for_device(db, device, nso_client)
@@ -306,3 +312,11 @@ async def test_refresh_skips_addressless_entry(adapter_client):
             .all()
         )
         assert rows == []
+
+
+# ── READSEM S3: the B1 envelope flip ────────────────────────────────────────────────
+
+
+def test_spec_is_flipped_to_the_envelope():
+    """The S3 fetch-source flip pin — reverting wire_name reverts the family to legacy."""
+    assert INTERFACE_IP_SPEC.wire_name == "interface-ip"

@@ -179,7 +179,10 @@ async def test_engine_records_two_phase_outcome_and_pointer(adapter_client):
     async for db in get_session():
         device = await db.get(Device, device_id)
         client = AsyncMock()
-        client.get_static_routes.return_value = {"route": [{"prefix": "10.0.0.0/8", "next-hop": "1.1.1.1"}]}
+        client.get_device_state_section.return_value = {
+            "status": "ok",
+            "route": [{"prefix": "10.0.0.0/8", "next-hop": "1.1.1.1"}],
+        }
         await refresh_static_routes_for_device(db, device, client, refresh_source="poll")
         break
 
@@ -209,7 +212,7 @@ async def test_engine_records_unavailable_outcome(adapter_client):
     async for db in get_session():
         device = await db.get(Device, device_id)
         client = AsyncMock()
-        client.get_static_routes.side_effect = NsoExportUnavailableError("export down")
+        client.get_device_state_section.side_effect = NsoExportUnavailableError("export down")
         ok = await refresh_static_routes_for_device(db, device, client)
         assert ok is False
         break

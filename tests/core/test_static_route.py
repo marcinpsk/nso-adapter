@@ -10,7 +10,11 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import select
 
-from nso_adapter.core.static_route import handle_static_route_change, refresh_static_routes_for_device
+from nso_adapter.core.static_route import (
+    STATIC_ROUTE_SPEC,
+    handle_static_route_change,
+    refresh_static_routes_for_device,
+)
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, DeviceStaticRoute
 from tests.conftest import seed_device
@@ -32,7 +36,8 @@ async def test_refresh_inserts_routes(adapter_client):
     device_id = await seed_device(nso_device_name="sr-insert-sw01", netbox_device_id=980)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_static_routes.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "name": "sr-insert-sw01",
             "route": [
                 {"vrf": "", "prefix": "10.0.0.0/8", "next-hop": "192.168.1.1"},
@@ -42,7 +47,7 @@ async def test_refresh_inserts_routes(adapter_client):
 
         await refresh_static_routes_for_device(db, device, nso_client, refresh_source="poll")
 
-        nso_client.get_static_routes.assert_awaited_once_with("sr-insert-sw01")
+        nso_client.get_device_state_section.assert_awaited_once_with("sr-insert-sw01", "static-route")
         result = await db.execute(select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id))
         rows = result.scalars().all()
         assert len(rows) == 2
@@ -59,14 +64,16 @@ async def test_refresh_replaces_existing_rows(adapter_client):
     device_id = await seed_device(nso_device_name="sr-replace-sw01", netbox_device_id=981)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_static_routes.return_value = {
-            "route": [{"vrf": "", "prefix": "10.0.0.0/8", "next-hop": "192.168.1.1"}]
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "route": [{"vrf": "", "prefix": "10.0.0.0/8", "next-hop": "192.168.1.1"}],
         }
         await refresh_static_routes_for_device(db, device, nso_client)
 
         # Second call with different data
-        nso_client.get_static_routes.return_value = {
-            "route": [{"vrf": "", "prefix": "172.16.0.0/12", "next-hop": "10.0.0.1"}]
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "route": [{"vrf": "", "prefix": "172.16.0.0/12", "next-hop": "10.0.0.1"}],
         }
         await refresh_static_routes_for_device(db, device, nso_client)
 
@@ -97,7 +104,7 @@ async def test_refresh_nso_returns_none_clears_rows(adapter_client):
 
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_static_routes.return_value = None
+        nso_client.get_device_state_section.return_value = None
         await refresh_static_routes_for_device(db, device, nso_client)
 
         result = await db.execute(select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id))
@@ -125,7 +132,7 @@ async def test_refresh_nso_error_skips_update(adapter_client):
 
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_static_routes.side_effect = RuntimeError("NSO unreachable")
+        nso_client.get_device_state_section.side_effect = RuntimeError("NSO unreachable")
         await refresh_static_routes_for_device(db, device, nso_client)
 
         result = await db.execute(select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id))
@@ -142,7 +149,7 @@ async def test_refresh_skips_device_without_nso_name(adapter_client):
         device.nso_device_name = None  # simulate unmapped device
         nso_client = AsyncMock()
         await refresh_static_routes_for_device(db, device, nso_client)
-        nso_client.get_static_routes.assert_not_awaited()
+        nso_client.get_device_state_section.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -151,8 +158,9 @@ async def test_handle_sse_event_refreshes_device(adapter_client):
     device_id = await seed_device(nso_device_name="sr-sse-sw01", netbox_device_id=985)
     async for db in get_session():
         nso_client = AsyncMock()
-        nso_client.get_static_routes.return_value = {
-            "route": [{"vrf": "", "prefix": "10.100.0.0/24", "next-hop": "192.168.0.1"}]
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "route": [{"vrf": "", "prefix": "10.100.0.0/24", "next-hop": "192.168.0.1"}],
         }
         await handle_static_route_change(db, "sr-sse-sw01", nso_client)
 
@@ -170,5 +178,37 @@ async def test_handle_sse_event_unknown_device_is_noop(adapter_client):
     async for db in get_session():
         nso_client = AsyncMock()
         await handle_static_route_change(db, "nonexistent-device", nso_client)
-        nso_client.get_static_routes.assert_not_awaited()
+        nso_client.get_device_state_section.assert_not_awaited()
         break
+
+
+# ── READSEM S3: the B1 envelope flip ────────────────────────────────────────────────
+
+
+def test_spec_is_flipped_to_the_envelope():
+    """The S3 fetch-source flip pin — reverting wire_name reverts the family to legacy."""
+    assert STATIC_ROUTE_SPEC.wire_name == "static-route"
+
+
+@pytest.mark.anyio
+async def test_unsupported_keeps_rows_and_reports_success(adapter_client):
+    """RED-FIRST S3 delta: the legacy probe-confirmed 404 CLEARED an unsupported-NED
+    device's routes; the envelope's declared `unsupported` keeps them."""
+    device_id = await seed_device(nso_device_name="sr-unsup-sw01", netbox_device_id=9821)
+    async for db in get_session():
+        db.add(DeviceStaticRoute(device_id=device_id, vrf="", prefix="10.9.0.0/16", next_hop="1.1.1.1"))
+        await db.commit()
+        break
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_device_state_section.return_value = {"status": "unsupported"}
+
+        ok = await refresh_static_routes_for_device(db, device, nso_client)
+
+        assert ok is True
+        rows = (
+            (await db.execute(select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id)))
+            .scalars()
+            .all()
+        )
+        assert [r.prefix for r in rows] == ["10.9.0.0/16"], "unsupported must KEEP rows"

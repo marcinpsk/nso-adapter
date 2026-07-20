@@ -111,11 +111,12 @@ async def test_interface_ip_singleton_bare_object(adapter_client):
     device_id = await seed_device(nso_device_name="single-ip", netbox_device_id=2601)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_interface_ips.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "interface": {
                 "interface-name": "GigabitEthernet0/0",
                 "address": {"address": "192.0.2.1/24", "vrf": "", "family": "ipv4", "secondary": False},
-            }
+            },
         }
 
         await refresh_interface_ips_for_device(db, device, nso_client, refresh_source="poll")

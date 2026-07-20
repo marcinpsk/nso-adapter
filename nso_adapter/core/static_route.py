@@ -63,6 +63,7 @@ STATIC_ROUTE_SPEC = FamilySpec(
     getter=lambda client, name: client.get_static_routes(name),
     extract=lambda data: data.get("route", []),
     materialize=_upsert_static_routes,
+    wire_name="static-route",  # READSEM S3: fetch from the device-state envelope
 )
 
 

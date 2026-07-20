@@ -197,7 +197,8 @@ async def test_read_path_carries_next_hop_vrf(adapter_client):
 
     device_id = await seed_device(nso_device_name="sr-leak-dev", netbox_device_id=974)
     client = AsyncMock(spec=NsoClient)
-    client.get_static_routes.return_value = {
+    client.get_device_state_section.return_value = {
+        "status": "ok",
         "device": "sr-leak-dev",
         "route": [
             {"vrf": "CUST-A", "prefix": "10.9.0.0/24", "next-hop": "192.0.2.9", "next-hop-vrf": "default"},

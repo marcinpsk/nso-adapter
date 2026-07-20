@@ -12,6 +12,7 @@ Two layers:
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
@@ -19,7 +20,9 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import select
 
-from nso_adapter.core.static_route import STATIC_ROUTE_SPEC, refresh_static_routes_for_device
+from nso_adapter.core.interface_ip import INTERFACE_IP_SPEC
+from nso_adapter.core.refresh_engine import run_family_refresh
+from nso_adapter.core.static_route import STATIC_ROUTE_SPEC
 from nso_adapter.nso.client import NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
@@ -32,6 +35,13 @@ from nso_adapter.nso.read_outcome import (
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, DeviceStaticRoute
 from tests.conftest import seed_device
+
+# The engine's LEGACY fetch path (classify_read over the per-family getter) still serves
+# every unmigrated family until the S3 flips complete (and the code path itself lives to S5).
+# static_route/interface_ip flipped to the envelope in B1, so their specs are un-flipped HERE
+# to keep the legacy outcome->action matrix covered.
+LEGACY_STATIC_ROUTE_SPEC = dataclasses.replace(STATIC_ROUTE_SPEC, wire_name=None)
+LEGACY_INTERFACE_IP_SPEC = dataclasses.replace(INTERFACE_IP_SPEC, wire_name=None)
 
 
 @asynccontextmanager
@@ -131,7 +141,7 @@ async def test_engine_present_replaces_rows(adapter_client):
             "route": [{"vrf": "", "prefix": "172.16.0.0/12", "next-hop": "10.0.0.1"}]
         }
 
-        ok = await refresh_static_routes_for_device(db, device, client)
+        ok = await run_family_refresh(db, device, client, LEGACY_STATIC_ROUTE_SPEC)
 
         assert ok is True
         rows = (
@@ -151,7 +161,7 @@ async def test_engine_present_empty_clears_rows(adapter_client):
         client = AsyncMock()
         client.get_static_routes.return_value = {"name": "eng-empty-sw01", "route": []}
 
-        ok = await refresh_static_routes_for_device(db, device, client)
+        ok = await run_family_refresh(db, device, client, LEGACY_STATIC_ROUTE_SPEC)
 
         assert ok is True
         rows = (
@@ -171,7 +181,7 @@ async def test_engine_absent_authoritative_clears_rows(adapter_client):
         client = AsyncMock()
         client.get_static_routes.return_value = None
 
-        ok = await refresh_static_routes_for_device(db, device, client)
+        ok = await run_family_refresh(db, device, client, LEGACY_STATIC_ROUTE_SPEC)
 
         assert ok is True
         rows = (
@@ -191,7 +201,7 @@ async def test_engine_export_down_keeps_rows(adapter_client):
         client = AsyncMock()
         client.get_static_routes.side_effect = NsoExportUnavailableError("export down")
 
-        ok = await refresh_static_routes_for_device(db, device, client)
+        ok = await run_family_refresh(db, device, client, LEGACY_STATIC_ROUTE_SPEC)
 
         assert ok is False
         rows = (
@@ -210,7 +220,7 @@ async def test_engine_read_error_keeps_rows(adapter_client):
         client = AsyncMock()
         client.get_static_routes.side_effect = RuntimeError("NSO unreachable")
 
-        ok = await refresh_static_routes_for_device(db, device, client)
+        ok = await run_family_refresh(db, device, client, LEGACY_STATIC_ROUTE_SPEC)
 
         assert ok is False
         rows = (
@@ -228,7 +238,7 @@ async def test_engine_skips_device_without_nso_name(adapter_client):
         device.nso_device_name = None
         client = AsyncMock()
 
-        ok = await refresh_static_routes_for_device(db, device, client)
+        ok = await run_family_refresh(db, device, client, LEGACY_STATIC_ROUTE_SPEC)
 
         assert ok is True
         client.get_static_routes.assert_not_awaited()
@@ -241,7 +251,6 @@ async def test_engine_present_policy_not_authoritative_keeps_rows_and_reports_su
     rows are KEPT and the surface reports success (True), so it never flips the device to
     ``partial`` on every poll. Contrast with export_down/read_error, which return False.
     """
-    from nso_adapter.core.interface_ip import refresh_interface_ips_for_device
     from nso_adapter.store.models import InterfaceIpAddress
 
     device_id = await seed_device(nso_device_name="eng-present-none-sw01", netbox_device_id=9607)
@@ -265,7 +274,7 @@ async def test_engine_present_policy_not_authoritative_keeps_rows_and_reports_su
         client = AsyncMock()
         client.get_interface_ips.return_value = None  # 404 → not-authoritative for a present family
 
-        ok = await refresh_interface_ips_for_device(db, device, client)
+        ok = await run_family_refresh(db, device, client, LEGACY_INTERFACE_IP_SPEC)
 
         assert ok is True  # NOT degraded
         rows = (
@@ -279,7 +288,6 @@ async def test_engine_present_policy_not_authoritative_keeps_rows_and_reports_su
 @pytest.mark.anyio
 async def test_engine_present_policy_read_error_reports_degraded(adapter_client):
     """A genuine read failure on a present-policy family DOES report degraded (False), rows kept."""
-    from nso_adapter.core.interface_ip import refresh_interface_ips_for_device
     from nso_adapter.store.models import InterfaceIpAddress
 
     device_id = await seed_device(nso_device_name="eng-present-err-sw01", netbox_device_id=9608)
@@ -303,7 +311,7 @@ async def test_engine_present_policy_read_error_reports_degraded(adapter_client)
         client = AsyncMock()
         client.get_interface_ips.side_effect = RuntimeError("timeout")
 
-        ok = await refresh_interface_ips_for_device(db, device, client)
+        ok = await run_family_refresh(db, device, client, LEGACY_INTERFACE_IP_SPEC)
 
         assert ok is False  # degraded
         rows = (

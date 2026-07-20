@@ -75,6 +75,7 @@ INTERFACE_IP_SPEC = FamilySpec(
     getter=lambda client, name: client.get_interface_ips(name),
     extract=lambda data: as_list(data.get("interface")),
     materialize=_upsert_ip_addresses,
+    wire_name="interface-ip",  # READSEM S3: fetch from the device-state envelope
 )
 
 
