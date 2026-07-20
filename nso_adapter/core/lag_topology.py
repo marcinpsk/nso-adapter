@@ -88,6 +88,7 @@ LAG_TOPOLOGY_SPEC = FamilySpec(
     # as_list guards the singleton-rendered-as-bare-dict case; extract({}) → [] → clear.
     extract=lambda data: as_list(data.get("lag")),
     materialize=_upsert_lags,
+    wire_name="lag-topology",  # READSEM S3: fetch from the device-state envelope
 )
 
 

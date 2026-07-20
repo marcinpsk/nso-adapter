@@ -32,7 +32,8 @@ async def test_refresh_inserts_communities(adapter_client):
     device_id = await seed_device(nso_device_name="snmp-insert-sw01", netbox_device_id=960)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_snmp_config.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "name": "snmp-insert-sw01",
             "community": [
                 {"name": "abc123def456abcd", "access": "RO", "acl": "20", "has-secret": True},
@@ -42,7 +43,7 @@ async def test_refresh_inserts_communities(adapter_client):
 
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
 
-        nso_client.get_snmp_config.assert_awaited_once_with("snmp-insert-sw01")
+        nso_client.get_device_state_section.assert_awaited_once_with("snmp-insert-sw01", "snmp-config")
         result = await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device.id))
         rows = result.scalars().all()
         assert len(rows) == 2
@@ -60,7 +61,8 @@ async def test_refresh_inserts_v3_users(adapter_client):
     device_id = await seed_device(nso_device_name="snmp-v3-sw01", netbox_device_id=961)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_snmp_config.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "name": "snmp-v3-sw01",
             "v3-user": [
                 {"username": "monitor", "has-auth-secret": True, "has-priv-secret": False},
@@ -85,7 +87,8 @@ async def test_refresh_inserts_hosts(adapter_client):
     device_id = await seed_device(nso_device_name="snmp-hosts-sw01", netbox_device_id=962)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_snmp_config.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "name": "snmp-hosts-sw01",
             "host": [
                 {"address": "10.0.1.100", "version": "2c", "notify-type": "trap", "port": 162},
@@ -119,7 +122,8 @@ async def test_refresh_stores_a_v3_hosts_SECURITY_USER_NAME(adapter_client):
     device_id = await seed_device(nso_device_name="snmp-v3host-sw01", netbox_device_id=968)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_snmp_config.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "name": "snmp-v3host-sw01",
             "host": [
                 {"address": "10.0.1.101", "version": "3", "notify-type": "inform", "user": "netmon-v3"},
@@ -140,7 +144,8 @@ async def test_refresh_inserts_system_info(adapter_client):
     device_id = await seed_device(nso_device_name="snmp-sysinfo-sw01", netbox_device_id=963)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_snmp_config.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "name": "snmp-sysinfo-sw01",
             "location": "ITC-Lab",
             "contact": "noc@example.com",
@@ -162,7 +167,8 @@ async def test_refresh_full_replaces_existing_rows(adapter_client):
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
         # First refresh — two communities
-        nso_client.get_snmp_config.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "name": "snmp-replace-sw01",
             "community": [
                 {"name": "hash_old1_abcd1234", "access": "RO"},
@@ -172,7 +178,8 @@ async def test_refresh_full_replaces_existing_rows(adapter_client):
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
 
         # Second refresh — only one (different) community
-        nso_client.get_snmp_config.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "name": "snmp-replace-sw01",
             "community": [
                 {"name": "hash_new1_mnop9012", "access": "RO"},
@@ -193,7 +200,7 @@ async def test_refresh_skips_device_without_nso_name(adapter_client):
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
-        nso_client.get_snmp_config.assert_not_called()
+        nso_client.get_device_state_section.assert_not_called()
 
 
 @pytest.mark.anyio
@@ -202,7 +209,7 @@ async def test_refresh_handles_nso_error_gracefully(adapter_client):
     device_id = await seed_device(nso_device_name="snmp-err-sw01", netbox_device_id=966)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_snmp_config.side_effect = Exception("RESTCONF error")
+        nso_client.get_device_state_section.side_effect = Exception("RESTCONF error")
 
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
 
@@ -216,7 +223,7 @@ async def test_refresh_handles_nso_none_gracefully(adapter_client):
     device_id = await seed_device(nso_device_name="snmp-none-sw01", netbox_device_id=967)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_snmp_config.return_value = None
+        nso_client.get_device_state_section.return_value = None
 
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
 
@@ -240,7 +247,8 @@ async def test_refresh_clears_stale_rows_when_device_reports_none(adapter_client
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
         # First refresh — a device with a full spread of SNMP config across all four tables.
-        nso_client.get_snmp_config.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "name": "snmp-clear-sw01",
             "community": [{"name": "clear_me_abcd1234", "access": "RO"}],
             "v3-user": [{"username": "monitor", "has-auth-secret": True, "has-priv-secret": False}],
@@ -256,7 +264,7 @@ async def test_refresh_clears_stale_rows_when_device_reports_none(adapter_client
             assert rows, f"{model.__name__} should be seeded before the clear"
 
         # Second refresh — the export now 404s (operator removed all SNMP config).
-        nso_client.get_snmp_config.return_value = None
+        nso_client.get_device_state_section.return_value = None
         result = await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
 
         # A clean 404 is a successful (authoritative-empty) read, not a degraded one.
@@ -277,14 +285,15 @@ async def test_refresh_keeps_rows_on_read_error(adapter_client):
     device_id = await seed_device(nso_device_name="snmp-degraded-sw01", netbox_device_id=970)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_snmp_config.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "name": "snmp-degraded-sw01",
             "community": [{"name": "keep_me_efgh5678", "access": "RW"}],
         }
         await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
 
         # A subsequent read blows up (transport error, NSO mid-reload, ...).
-        nso_client.get_snmp_config.side_effect = Exception("RESTCONF transport error")
+        nso_client.get_device_state_section.side_effect = Exception("RESTCONF transport error")
         result = await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
 
         assert result is False  # degraded surface
@@ -298,7 +307,8 @@ async def test_handle_snmp_config_change_dispatches_to_affected_devices(adapter_
     """SSE event → refresh is triggered for each affected managed device."""
     device_id = await seed_device(nso_device_name="snmp-sse-sw01", netbox_device_id=968)
     nso_client = AsyncMock()
-    nso_client.get_snmp_config.return_value = {
+    nso_client.get_device_state_section.return_value = {
+        "status": "ok",
         "name": "snmp-sse-sw01",
         "community": [{"name": "aaabbbccc1112233", "access": "RO"}],
     }
@@ -323,7 +333,7 @@ async def test_handle_snmp_config_change_dispatches_to_affected_devices(adapter_
         await handle_snmp_config_change(event_data, db, {"nso-dev": nso_client})
         break
 
-    nso_client.get_snmp_config.assert_awaited_once_with("snmp-sse-sw01")
+    nso_client.get_device_state_section.assert_awaited_once_with("snmp-sse-sw01", "snmp-config")
 
     async for db in get_session():
         result = await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device_id))

@@ -35,11 +35,11 @@ from tests.conftest import seed_device
 # set = the family reads its device-state envelope section. Each S3 flip updates its row here.
 _NORMALIZED = [
     (refresh_interface_ips_for_device, "get_interface_ips", {"interface": []}, "interface-ip"),
-    (refresh_lag_topology_for_device, "get_lag_topology", {"lag": []}, None),
-    (refresh_lag_config_for_device, "get_lag_config", {"lag": []}, None),
+    (refresh_lag_topology_for_device, "get_lag_topology", {"lag": []}, "lag-topology"),
+    (refresh_lag_config_for_device, "get_lag_config", {"lag": []}, "lag-config"),
     (refresh_l2_services_for_device, "get_l2_services", {"service": []}, "l2-service"),
-    (refresh_vlan_database_for_device, "get_vlan_database", {"vlan": []}, None),
-    (refresh_switchport_for_device, "get_switchport", {"interface": []}, None),
+    (refresh_vlan_database_for_device, "get_vlan_database", {"vlan": []}, "vlan-database"),
+    (refresh_switchport_for_device, "get_switchport", {"interface": []}, "switchport"),
     (refresh_svi_for_device, "get_svi", {"interface": []}, "svi"),
     (refresh_subinterface_for_device, "get_subinterface", {"interface": []}, "subinterface"),
     (refresh_interface_mtu_for_device, "get_interface_mtu", {"interface": []}, "interface-mtu"),
@@ -117,13 +117,21 @@ def test_s3_flipped_families_read_the_envelope():
     reverts the family to the legacy container byte-for-byte.
     """
     from nso_adapter.core.bfd import BFD_SPEC
+    from nso_adapter.core.bgp import BGP_SPEC
     from nso_adapter.core.interface_ip import INTERFACE_IP_SPEC
     from nso_adapter.core.interface_mtu import INTERFACE_MTU_SPEC
+    from nso_adapter.core.isis import ISIS_SPEC
     from nso_adapter.core.l2_service import L2_SERVICE_SPEC
+    from nso_adapter.core.lag_config import LAG_CONFIG_SPEC
+    from nso_adapter.core.lag_topology import LAG_TOPOLOGY_SPEC
     from nso_adapter.core.logging_config import LOGGING_CONFIG_SPEC
+    from nso_adapter.core.ospf import OSPF_SPEC
+    from nso_adapter.core.route_policy import ROUTE_POLICY_SPEC
+    from nso_adapter.core.snmp import SNMP_SPEC
     from nso_adapter.core.static_route import STATIC_ROUTE_SPEC
     from nso_adapter.core.subinterface import SUBINTERFACE_SPEC
     from nso_adapter.core.svi import SVI_SPEC
+    from nso_adapter.core.vlan import SWITCHPORT_SPEC, VLAN_DATABASE_SPEC
 
     flipped = {
         spec.name: spec.wire_name
@@ -136,6 +144,15 @@ def test_s3_flipped_families_read_the_envelope():
             LOGGING_CONFIG_SPEC,
             L2_SERVICE_SPEC,
             BFD_SPEC,
+            ISIS_SPEC,
+            OSPF_SPEC,
+            LAG_TOPOLOGY_SPEC,
+            LAG_CONFIG_SPEC,
+            SNMP_SPEC,
+            ROUTE_POLICY_SPEC,
+            BGP_SPEC,
+            VLAN_DATABASE_SPEC,
+            SWITCHPORT_SPEC,
         )
     }
     assert flipped == {
@@ -147,4 +164,13 @@ def test_s3_flipped_families_read_the_envelope():
         "logging": "logging-config",
         "l2_service": "l2-service",
         "bfd": "bfd-config",
+        "isis": "isis-interface",
+        "ospf": "ospf-config",
+        "lag": "lag-topology",
+        "lag_config": "lag-config",
+        "snmp": "snmp-config",
+        "route_policy": "route-policy",
+        "bgp": "bgp-config",
+        "vlan": "vlan-database",
+        "switchport": "switchport",
     }

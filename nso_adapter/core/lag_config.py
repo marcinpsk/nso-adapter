@@ -86,6 +86,7 @@ LAG_CONFIG_SPEC = FamilySpec(
     # as_list guards the singleton-rendered-as-bare-dict case; extract({}) → [] → clear.
     extract=lambda data: as_list(data.get("lag")),
     materialize=_upsert_lag_configs,
+    wire_name="lag-config",  # READSEM S3: fetch from the device-state envelope
 )
 
 

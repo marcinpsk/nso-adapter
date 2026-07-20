@@ -33,7 +33,8 @@ async def test_refresh_lag_config_happy(adapter_client):
     device_id = await seed_device(nso_device_name="sw03", netbox_device_id=910)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_lag_config.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "device-name": "sw03",
             "lag": [
                 {
@@ -53,7 +54,7 @@ async def test_refresh_lag_config_happy(adapter_client):
 
         await refresh_lag_config_for_device(db, device, nso_client, refresh_source="poll")
 
-        nso_client.get_lag_config.assert_awaited_once_with("sw03")
+        nso_client.get_device_state_section.assert_awaited_once_with("sw03", "lag-config")
         bundles = (
             (await db.execute(select(LagBundleConfig).where(LagBundleConfig.device_id == device.id))).scalars().all()
         )
@@ -76,7 +77,8 @@ async def test_refresh_lag_config_carries_vpc_sensitive(adapter_client):
     device_id = await seed_device(nso_device_name="nx-tor", netbox_device_id=913)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_lag_config.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "device-name": "nx-tor",
             "lag": [
                 {"name": "port-channel1", "lag-id": 1, "vpc-sensitive": True, "member": []},  # peer-link
@@ -101,7 +103,8 @@ async def test_refresh_lag_config_skips_malformed_bundles_and_members(adapter_cl
     device_id = await seed_device(nso_device_name="sw-malformed", netbox_device_id=912)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_lag_config.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "device-name": "sw-malformed",
             "lag": [
                 {"lag-id": 9, "member": []},  # missing name → skip
@@ -143,7 +146,7 @@ async def test_refresh_lag_config_clears_on_404(adapter_client):
         await db.commit()
 
         nso_client = AsyncMock()
-        nso_client.get_lag_config.return_value = None
+        nso_client.get_device_state_section.return_value = None
 
         await refresh_lag_config_for_device(db, device, nso_client, refresh_source="poll")
 
@@ -167,7 +170,7 @@ async def test_refresh_lag_config_transport_error_no_change(adapter_client):
         await db.commit()
 
         nso_client = AsyncMock()
-        nso_client.get_lag_config.side_effect = httpx.ConnectError("timeout")
+        nso_client.get_device_state_section.side_effect = httpx.ConnectError("timeout")
 
         await refresh_lag_config_for_device(db, device, nso_client, refresh_source="poll")
 
@@ -185,4 +188,4 @@ async def test_refresh_lag_config_skips_without_nso_name(adapter_client):
 
         await refresh_lag_config_for_device(db, device, nso_client, refresh_source="poll")
 
-        nso_client.get_lag_config.assert_not_awaited()
+        nso_client.get_device_state_section.assert_not_awaited()

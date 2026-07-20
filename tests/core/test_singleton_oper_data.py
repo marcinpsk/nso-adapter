@@ -87,7 +87,8 @@ async def test_lag_topology_singleton_bare_object(adapter_client):
     device_id = await seed_device(nso_device_name="single-lag", netbox_device_id=2600)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_lag_topology.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "device-name": "single-lag",
             "lag": {
                 "name": "Port-channel1",
@@ -278,7 +279,7 @@ async def test_vlan_database_singleton_bare_object(adapter_client):
     device_id = await seed_device(nso_device_name="single-vlan", netbox_device_id=2605)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_vlan_database.return_value = {"vlan": {"vlan-id": 10, "name": "MGMT"}}
+        nso_client.get_device_state_section.return_value = {"status": "ok", "vlan": {"vlan-id": 10, "name": "MGMT"}}
 
         await refresh_vlan_database_for_device(db, device, nso_client, refresh_source="poll")
 
@@ -294,8 +295,9 @@ async def test_switchport_singleton_bare_object(adapter_client):
     device_id = await seed_device(nso_device_name="single-swp", netbox_device_id=2606)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_switchport.return_value = {
-            "interface": {"interface-name": "GigabitEthernet0/1", "mode": "access"}
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": {"interface-name": "GigabitEthernet0/1", "mode": "access"},
         }
 
         await refresh_switchport_for_device(db, device, nso_client, refresh_source="poll")
@@ -329,7 +331,8 @@ async def test_bgp_singleton_bare_objects(adapter_client):
     device_id = await seed_device(nso_device_name="single-bgp", netbox_device_id=2610)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_bgp_config.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "router": {
                 "asn": 65001,
                 "scope": {
@@ -379,7 +382,8 @@ async def test_ospf_singleton_bare_objects(adapter_client):
     device_id = await seed_device(nso_device_name="single-ospf", netbox_device_id=2611)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_ospf.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "instance": {
                 "process-id": 1,
                 "router-id": "1.1.1.1",
@@ -421,7 +425,8 @@ async def test_isis_singleton_bare_objects(adapter_client):
     device_id = await seed_device(nso_device_name="single-isis", netbox_device_id=2612)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_isis_interfaces.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "process": {"process-tag": "1", "net": "49.0001.0000.0000.0001.00", "is-type": "level-2"},
             "interface": {"interface-name": "GigabitEthernet0/0", "af": "ipv4", "process-tag": "1"},
         }
@@ -457,12 +462,13 @@ async def test_lag_config_singleton_bare_objects(adapter_client):
     device_id = await seed_device(nso_device_name="single-lagcfg", netbox_device_id=2613)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_lag_config.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "lag": {
                 "name": "Port-channel1",
                 "lag-id": 1,
                 "member": {"interface-name": "GigabitEthernet0/1", "mode": "active"},
-            }
+            },
         }
 
         ok = await refresh_lag_config_for_device(db, device, nso_client, refresh_source="poll")
@@ -487,7 +493,8 @@ async def test_snmp_singleton_bare_objects(adapter_client):
     device_id = await seed_device(nso_device_name="single-snmp", netbox_device_id=2614)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_snmp_config.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "community": {"name": "abcdef012345", "access": "RO"},
             "v3-user": {"username": "obs", "has-auth-secret": True, "has-priv-secret": False},
             "host": {"address": "10.0.0.53", "version": "3", "user": "obs"},
@@ -514,7 +521,8 @@ async def test_route_policy_singleton_bare_objects(adapter_client):
     device_id = await seed_device(nso_device_name="single-rp", netbox_device_id=2615)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_route_policy.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "prefix-list": {
                 "name": "PL-1",
                 "family": 4,

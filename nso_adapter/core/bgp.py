@@ -242,6 +242,7 @@ BGP_SPEC = FamilySpec(
     # as_list guards the singleton-rendered-as-bare-dict case; extract({}) → [] → clear.
     extract=lambda data: as_list(data.get("router")),
     materialize=_upsert_bgp_data,
+    wire_name="bgp-config",  # READSEM S3: fetch from the device-state envelope
 )
 
 

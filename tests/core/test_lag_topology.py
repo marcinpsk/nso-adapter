@@ -69,7 +69,8 @@ async def test_refresh_lag_topology_happy(adapter_client):
     device_id = await seed_device(nso_device_name="sw03", netbox_device_id=900)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_lag_topology.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "device-name": "sw03",
             "lag": [
                 {
@@ -83,7 +84,7 @@ async def test_refresh_lag_topology_happy(adapter_client):
 
         await refresh_lag_topology_for_device(db, device, nso_client, refresh_source="poll")
 
-        nso_client.get_lag_topology.assert_awaited_once_with("sw03")
+        nso_client.get_device_state_section.assert_awaited_once_with("sw03", "lag-topology")
         lag_result = await db.execute(select(LagInterface).where(LagInterface.device_id == device.id))
         member_result = await db.execute(select(LagMember))
         lags = lag_result.scalars().all()
@@ -109,7 +110,7 @@ async def test_refresh_lag_topology_clears_on_404(adapter_client):
         await db.commit()
 
         nso_client = AsyncMock()
-        nso_client.get_lag_topology.return_value = None
+        nso_client.get_device_state_section.return_value = None
 
         await refresh_lag_topology_for_device(db, device, nso_client, refresh_source="poll")
 
@@ -122,7 +123,7 @@ async def test_refresh_lag_topology_transport_error(adapter_client):
     device_id = await seed_device(nso_device_name="sw03", netbox_device_id=902)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_lag_topology.side_effect = httpx.ConnectError("timeout")
+        nso_client.get_device_state_section.side_effect = httpx.ConnectError("timeout")
 
         await refresh_lag_topology_for_device(db, device, nso_client, refresh_source="poll")
 
@@ -135,7 +136,7 @@ async def test_handle_netconf_config_change_dispatches(adapter_client):
     device_id = await seed_device(nso_device_name="sw03", netbox_device_id=903)
     async with _device_session(device_id) as (db, _device):
         nso_client = AsyncMock()
-        nso_client.get_lag_topology.return_value = {"device-name": "sw03", "lag": []}
+        nso_client.get_device_state_section.return_value = {"status": "ok", "device-name": "sw03", "lag": []}
         event = {
             "netconf-config-change": {
                 "edit": [{"target": "/ncs:devices/device[name='sw03']/config/ios:interface/GigabitEthernet1"}]
@@ -144,7 +145,7 @@ async def test_handle_netconf_config_change_dispatches(adapter_client):
 
         await handle_netconf_config_change(event, db, {"nso-dev": nso_client})
 
-        nso_client.get_lag_topology.assert_awaited_once_with("sw03")
+        nso_client.get_device_state_section.assert_awaited_once_with("sw03", "lag-topology")
 
 
 @pytest.mark.anyio
@@ -157,5 +158,5 @@ async def test_handle_netconf_config_change_unknown_device(adapter_client):
 
         await handle_netconf_config_change(event, db, {"nso-dev": nso_client})
 
-        nso_client.get_lag_topology.assert_not_awaited()
+        nso_client.get_device_state_section.assert_not_awaited()
         break

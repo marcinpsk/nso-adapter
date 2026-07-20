@@ -179,6 +179,7 @@ ISIS_SPEC = FamilySpec(
     getter=lambda client, name: client.get_isis_interfaces(name),
     extract=lambda data: data,
     materialize=_materialize_isis,
+    wire_name="isis-interface",  # READSEM S3: fetch from the device-state envelope
 )
 
 

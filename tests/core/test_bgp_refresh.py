@@ -311,11 +311,15 @@ class _FakeNso:
         self._exc = exc
         self.calls: list[str] = []
 
-    async def get_bgp_config(self, nso_device_name):
+    async def get_device_state_section(self, nso_device_name, wire_family):
+        # bgp is envelope-flipped (READSEM S3 B3): the engine reads its section.
+        assert wire_family == "bgp-config"
         self.calls.append(nso_device_name)
         if self._exc is not None:
             raise self._exc
-        return self._entry
+        if self._entry is None:
+            return None
+        return {"status": "ok", **self._entry}
 
 
 async def test_router_without_asn_is_skipped(adapter_client):

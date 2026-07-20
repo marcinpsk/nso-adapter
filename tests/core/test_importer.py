@@ -552,7 +552,7 @@ async def test_surface_refresher_returns_false_on_read_error(db_session: AsyncSe
     await db_session.commit()
 
     client = AsyncMock(spec=NsoClient)
-    client.get_bgp_config = AsyncMock(side_effect=RuntimeError("nso down"))
+    client.get_device_state_section = AsyncMock(side_effect=RuntimeError("nso down"))
     ok = await refresh_bgp_config_for_device(db_session, device, client, refresh_source="sync")
     assert ok is False
 
@@ -566,7 +566,7 @@ async def test_surface_refresher_returns_true_on_success(db_session: AsyncSessio
     await db_session.commit()
 
     client = AsyncMock(spec=NsoClient)
-    client.get_bgp_config = AsyncMock(return_value={"router": []})
+    client.get_device_state_section = AsyncMock(return_value={"status": "ok", "router": []})
     ok = await refresh_bgp_config_for_device(db_session, device, client, refresh_source="sync")
     assert ok is True
 

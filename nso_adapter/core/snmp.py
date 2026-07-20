@@ -117,6 +117,7 @@ SNMP_SPEC = FamilySpec(
     # The materializer takes the whole entry dict; extract({}) → the clear (delete all + add none).
     extract=lambda data: data,
     materialize=_upsert_snmp_config,
+    wire_name="snmp-config",  # READSEM S3: fetch from the device-state envelope
 )
 
 

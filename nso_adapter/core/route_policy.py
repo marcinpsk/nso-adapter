@@ -222,6 +222,7 @@ ROUTE_POLICY_SPEC = FamilySpec(
     # logs the clear (route_policy.refresh.cleared) — fixing the old silent clear-on-None path.
     extract=lambda data: data,
     materialize=_upsert_route_policy_data,
+    wire_name="route-policy",  # READSEM S3: fetch from the device-state envelope
 )
 
 

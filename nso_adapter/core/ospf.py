@@ -100,6 +100,7 @@ OSPF_SPEC = FamilySpec(
     getter=lambda client, name: client.get_ospf(name),
     extract=lambda data: data,
     materialize=_materialize_ospf,
+    wire_name="ospf-config",  # READSEM S3: fetch from the device-state envelope
 )
 
 

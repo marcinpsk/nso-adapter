@@ -824,7 +824,7 @@ async def test_run_apply_refreshes_mirror_and_notifies_plugin(adapter_client):
 
     # The read-mirror was re-read from NSO for both a routing surface (route-policy) and a config
     # surface (SVI) — the two families that back a 'deploying' overlay row ...
-    mock_client.get_route_policy.assert_awaited()
+    mock_client.get_device_state_section.assert_awaited()
     # svi is envelope-flipped (READSEM S3 B2): its re-read arrives as a device-state section GET.
     svi_reads = [c for c in mock_client.get_device_state_section.await_args_list if c.args[1] == "svi"]
     assert svi_reads, "post-apply refresh must re-read the svi section"
@@ -2626,11 +2626,14 @@ async def test_run_apply_reader_compare_does_not_fail_a_landed_community(adapter
 
     mock_client = AsyncMock(spec=NsoClient)
     # The community IS on the device — under its hashed export identity.
-    mock_client.get_snmp_config.return_value = {
+    mock_client.get_device_state_section.return_value = {
+        "status": "ok",
         "community": [{"name": _community_export_name("s3cr3t"), "access": "ro"}],
         "v3-user": [],
         "host": [],
     }
+    # reader-compare still reads the LEGACY getter (its migration is scoped separately)
+    mock_client.get_snmp_config.return_value = mock_client.get_device_state_section.return_value
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock),
@@ -2672,7 +2675,14 @@ async def test_run_apply_reader_compare_still_catches_a_dropped_snmp_host(adapte
         break
 
     mock_client = AsyncMock(spec=NsoClient)
-    mock_client.get_snmp_config.return_value = {"community": [], "v3-user": [], "host": []}  # never landed
+    mock_client.get_device_state_section.return_value = {
+        "status": "ok",
+        "community": [],
+        "v3-user": [],
+        "host": [],
+    }  # never landed
+    # reader-compare still reads the LEGACY getter (its migration is scoped separately)
+    mock_client.get_snmp_config.return_value = mock_client.get_device_state_section.return_value
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock),
@@ -2692,7 +2702,7 @@ async def test_run_apply_reader_compare_absent_reader_surface_is_not_a_drop(adap
     """A reader that returns NOTHING means "unknown", not "the writer dropped everything".
 
     Every reader in _RESIDUE_READERS returns None by design when the device has no such
-    config / the NED has no export surface for the scope (client.get_isis_interfaces:
+    config / the NED has no export surface for the scope (the isis-interface section read:
     "Returns None if the device has no IS-IS config"). Coercing that to {} made `present`
     the empty set for every list, so every intended key was classified a silent writer
     drop: the scope went permanently apply_failed on a device where NSO had committed the
@@ -2818,7 +2828,14 @@ async def test_run_apply_reader_compare_skips_a_fully_unrepresentable_community_
 
     mock_client = AsyncMock(spec=NsoClient)
     # The export answers — the object legitimately is not there, because nothing was rendered.
-    mock_client.get_route_policy.return_value = {"community-list": [], "prefix-list": [], "route-map": []}
+    mock_client.get_device_state_section.return_value = {
+        "status": "ok",
+        "community-list": [],
+        "prefix-list": [],
+        "route-map": [],
+    }
+    # reader-compare still reads the LEGACY getter (its migration is scoped separately)
+    mock_client.get_route_policy.return_value = mock_client.get_device_state_section.return_value
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_route_policy_config", new_callable=AsyncMock),
@@ -2858,7 +2875,14 @@ async def test_run_apply_reader_compare_still_fails_a_representable_community_li
         break
 
     mock_client = AsyncMock(spec=NsoClient)
-    mock_client.get_route_policy.return_value = {"community-list": [], "prefix-list": [], "route-map": []}
+    mock_client.get_device_state_section.return_value = {
+        "status": "ok",
+        "community-list": [],
+        "prefix-list": [],
+        "route-map": [],
+    }
+    # reader-compare still reads the LEGACY getter (its migration is scoped separately)
+    mock_client.get_route_policy.return_value = mock_client.get_device_state_section.return_value
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_route_policy_config", new_callable=AsyncMock),
@@ -2928,9 +2952,12 @@ async def test_run_apply_reader_compare_bgp_checks_router_and_peers(adapter_clie
         break
 
     mock_client = AsyncMock(spec=NsoClient)
-    mock_client.get_bgp_config.return_value = {
-        "router": [{"asn": 65100, "scope": [{"vrf": "", "peer": [{"peer-address": "10.0.0.7"}]}]}]
+    mock_client.get_device_state_section.return_value = {
+        "status": "ok",
+        "router": [{"asn": 65100, "scope": [{"vrf": "", "peer": [{"peer-address": "10.0.0.7"}]}]}],
     }  # 10.0.0.9 silently dropped
+    # reader-compare still reads the LEGACY getter (its migration is scoped separately)
+    mock_client.get_bgp_config.return_value = mock_client.get_device_state_section.return_value
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_bgp_config", new_callable=AsyncMock),
@@ -2968,10 +2995,13 @@ async def test_run_apply_reader_compare_isis_flags_only_missing_model(adapter_cl
         break
 
     mock_client = AsyncMock(spec=NsoClient)
-    mock_client.get_isis_interfaces.return_value = {
+    mock_client.get_device_state_section.return_value = {
+        "status": "ok",
         "interface": [{"interface-name": "ge-0/0/0", "af": "ipv4"}],
         "process": [],  # process silently dropped
     }
+    # reader-compare still reads the LEGACY getter (its migration is scoped separately)
+    mock_client.get_isis_interfaces.return_value = mock_client.get_device_state_section.return_value
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_isis_interfaces", new_callable=AsyncMock),
@@ -3029,7 +3059,9 @@ async def _seed_community(device_id: int, *, label="prod-ro", vault_ref=SNMP_VAU
 
 async def _apply_snmp(device_id: int, job_id: int, snmp_view: dict) -> Job:
     mock_client = AsyncMock(spec=NsoClient)
-    mock_client.get_snmp_config.return_value = snmp_view
+    mock_client.get_device_state_section.return_value = {"status": "ok", **snmp_view}
+    # reader-compare still reads the LEGACY getter (its migration is scoped separately)
+    mock_client.get_snmp_config.return_value = mock_client.get_device_state_section.return_value
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock),

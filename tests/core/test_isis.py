@@ -33,7 +33,8 @@ async def test_refresh_normalizes_level_2_alias(adapter_client):
     device_id = await seed_device(nso_device_name="isis-lvl2", netbox_device_id=968)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_isis_interfaces.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "process": [{"process-tag": "0", "is-type": "level-2"}],
             "interface": [{"interface-name": "Gi0/1", "af": "ipv4", "circuit-type": "level-2"}],
         }
@@ -61,7 +62,8 @@ async def test_refresh_persists_bound_port_for_nokia(adapter_client):
     device_id = await seed_device(nso_device_name="isis-nokia01", netbox_device_id=960)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_isis_interfaces.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "process": [],
             "interface": [
                 {"interface-name": "LAG99:10", "af": "ipv4", "bound-port": "lag-99:10"},
@@ -83,7 +85,8 @@ async def test_refresh_empty_bound_port_string_stored_as_none(adapter_client):
     device_id = await seed_device(nso_device_name="isis-nokia02", netbox_device_id=961)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_isis_interfaces.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "process": [],
             "interface": [{"interface-name": "LAG99:20", "af": "ipv4", "bound-port": ""}],
         }
@@ -101,7 +104,8 @@ async def test_refresh_cisco_interface_has_no_bound_port(adapter_client):
     device_id = await seed_device(nso_device_name="isis-cisco01", netbox_device_id=962)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_isis_interfaces.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "process": [],
             "interface": [{"interface-name": "GigabitEthernet0/1", "af": "ipv4"}],
         }
@@ -119,7 +123,8 @@ async def test_refresh_persists_hello_auth(adapter_client):
     device_id = await seed_device(nso_device_name="isis-hauth01", netbox_device_id=961)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_isis_interfaces.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "process": [],
             "interface": [
                 {"interface-name": "ae10.0", "af": "ipv4", "hello-auth-type": "md5", "hello-auth-present": True},
@@ -142,7 +147,8 @@ async def test_refresh_persists_isis_bfd_enabled(adapter_client):
     device_id = await seed_device(nso_device_name="isis-bfd01", netbox_device_id=963)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_isis_interfaces.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "process": [],
             "interface": [
                 {"interface-name": "ae10.0", "af": "ipv4", "bfd-enabled": True},
@@ -166,7 +172,8 @@ async def test_refresh_persists_p1_scalars_and_settings(adapter_client):
     device_id = await seed_device(nso_device_name="isis-p1-01", netbox_device_id=965)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_isis_interfaces.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "process": [
                 {
                     "process-tag": "0",
@@ -221,7 +228,8 @@ async def test_refresh_persists_p2_levels_and_sr(adapter_client):
     device_id = await seed_device(nso_device_name="isis-p2-01", netbox_device_id=967)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_isis_interfaces.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "process": [
                 {
                     "process-tag": "0",
@@ -286,7 +294,8 @@ async def test_refresh_persists_srv6_locators(adapter_client):
     device_id = await seed_device(nso_device_name="isis-srv6-01", netbox_device_id=971)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_isis_interfaces.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "process": [
                 {
                     "process-tag": "",
@@ -313,7 +322,8 @@ async def test_refresh_persists_attached_bit(adapter_client):
     device_id = await seed_device(nso_device_name="isis-att-01", netbox_device_id=972)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_isis_interfaces.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "process": [
                 {"process-tag": "0", "suppress-attached-bit": True, "ignore-attached-bit": True},
                 {"process-tag": "1"},  # neither knob configured -> both None
@@ -342,7 +352,8 @@ async def test_refresh_persists_frr(adapter_client):
     device_id = await seed_device(nso_device_name="isis-frr-01", netbox_device_id=973)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_isis_interfaces.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "process": [
                 {"process-tag": "CORE", "fast-reroute": "ti-lfa", "microloop-avoidance": True},
                 {"process-tag": "EDGE"},  # unconfigured -> both None
@@ -386,7 +397,8 @@ async def test_refresh_dedups_duplicate_interface(adapter_client):
     device_id = await seed_device(nso_device_name="isis-dup01", netbox_device_id=969)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_isis_interfaces.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "process": [],
             "interface": [
                 {"interface-name": "Gi0/1", "af": "ipv4", "metric": 10},

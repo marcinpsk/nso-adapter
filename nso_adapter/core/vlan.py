@@ -106,6 +106,7 @@ VLAN_DATABASE_SPEC = FamilySpec(
     # as_list guards the singleton-rendered-as-bare-dict case; extract({}) → [] → prune all (clear).
     extract=lambda data: as_list(data.get("vlan") or data.get("vlans")),
     materialize=_upsert_vlans,
+    wire_name="vlan-database",  # READSEM S3: fetch from the device-state envelope
 )
 
 
@@ -188,6 +189,7 @@ SWITCHPORT_SPEC = FamilySpec(
     # as_list guards the singleton-rendered-as-bare-dict case; extract({}) → [] → prune all (clear).
     extract=lambda data: as_list(data.get("interface") or data.get("interfaces")),
     materialize=_upsert_switchports,
+    wire_name="switchport",  # READSEM S3: fetch from the device-state envelope
 )
 
 
