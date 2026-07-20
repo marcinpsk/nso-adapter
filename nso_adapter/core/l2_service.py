@@ -70,6 +70,7 @@ L2_SERVICE_SPEC = FamilySpec(
     getter=lambda client, name: client.get_l2_services(name),
     extract=lambda data: as_list(data.get("service")),
     materialize=_upsert_l2_saps,
+    wire_name="l2-service",  # READSEM S3: fetch from the device-state envelope
 )
 
 

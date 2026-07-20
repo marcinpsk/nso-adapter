@@ -51,6 +51,7 @@ LOGGING_CONFIG_SPEC = FamilySpec(
     # as_list guards the singleton-rendered-as-bare-dict case (was a raw .get → crash).
     extract=lambda data: as_list(data.get("host")),
     materialize=_upsert_logging_config,
+    wire_name="logging-config",  # READSEM S3: fetch from the device-state envelope
 )
 
 

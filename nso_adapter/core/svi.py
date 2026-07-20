@@ -53,6 +53,7 @@ SVI_SPEC = FamilySpec(
     getter=lambda client, name: client.get_svi(name),
     extract=lambda data: as_list(data.get("interface")),
     materialize=_upsert_svi,
+    wire_name="svi",  # READSEM S3: fetch from the device-state envelope
 )
 
 

@@ -64,6 +64,7 @@ INTERFACE_MTU_SPEC = FamilySpec(
     # as_list guards the singleton-rendered-as-bare-dict case (was a raw .get → crash).
     extract=lambda data: as_list(data.get("interface")),
     materialize=_upsert_interface_mtu,
+    wire_name="interface-mtu",  # READSEM S3: fetch from the device-state envelope
 )
 
 

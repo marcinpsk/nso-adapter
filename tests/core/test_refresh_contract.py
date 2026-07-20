@@ -37,12 +37,12 @@ _NORMALIZED = [
     (refresh_interface_ips_for_device, "get_interface_ips", {"interface": []}, "interface-ip"),
     (refresh_lag_topology_for_device, "get_lag_topology", {"lag": []}, None),
     (refresh_lag_config_for_device, "get_lag_config", {"lag": []}, None),
-    (refresh_l2_services_for_device, "get_l2_services", {"service": []}, None),
+    (refresh_l2_services_for_device, "get_l2_services", {"service": []}, "l2-service"),
     (refresh_vlan_database_for_device, "get_vlan_database", {"vlan": []}, None),
     (refresh_switchport_for_device, "get_switchport", {"interface": []}, None),
-    (refresh_svi_for_device, "get_svi", {"interface": []}, None),
-    (refresh_subinterface_for_device, "get_subinterface", {"interface": []}, None),
-    (refresh_interface_mtu_for_device, "get_interface_mtu", {"interface": []}, None),
+    (refresh_svi_for_device, "get_svi", {"interface": []}, "svi"),
+    (refresh_subinterface_for_device, "get_subinterface", {"interface": []}, "subinterface"),
+    (refresh_interface_mtu_for_device, "get_interface_mtu", {"interface": []}, "interface-mtu"),
 ]
 
 _IDS = [fn.__name__ for fn, _, _, _ in _NORMALIZED]
@@ -107,3 +107,44 @@ async def test_refresher_returns_true_on_no_nso_name_skip(adapter_client, refres
 
         assert result is True
         _fetch_target(nso_client, getter, wire_name).assert_not_awaited()
+
+
+def test_s3_flipped_families_read_the_envelope():
+    """The READSEM S3 flip manifest — one line per family, extended per batch.
+
+    A wire_name here means the family fetches its device-state envelope section
+    (status-declared, not-ready self-healing); reverting the spec's wire_name
+    reverts the family to the legacy container byte-for-byte.
+    """
+    from nso_adapter.core.bfd import BFD_SPEC
+    from nso_adapter.core.interface_ip import INTERFACE_IP_SPEC
+    from nso_adapter.core.interface_mtu import INTERFACE_MTU_SPEC
+    from nso_adapter.core.l2_service import L2_SERVICE_SPEC
+    from nso_adapter.core.logging_config import LOGGING_CONFIG_SPEC
+    from nso_adapter.core.static_route import STATIC_ROUTE_SPEC
+    from nso_adapter.core.subinterface import SUBINTERFACE_SPEC
+    from nso_adapter.core.svi import SVI_SPEC
+
+    flipped = {
+        spec.name: spec.wire_name
+        for spec in (
+            STATIC_ROUTE_SPEC,
+            INTERFACE_IP_SPEC,
+            SVI_SPEC,
+            SUBINTERFACE_SPEC,
+            INTERFACE_MTU_SPEC,
+            LOGGING_CONFIG_SPEC,
+            L2_SERVICE_SPEC,
+            BFD_SPEC,
+        )
+    }
+    assert flipped == {
+        "static_route": "static-route",
+        "interface_ip": "interface-ip",
+        "svi": "svi",
+        "subinterface": "subinterface",
+        "interface_mtu": "interface-mtu",
+        "logging": "logging-config",
+        "l2_service": "l2-service",
+        "bfd": "bfd-config",
+    }

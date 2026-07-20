@@ -38,7 +38,8 @@ async def test_refresh_inserts_subinterfaces(adapter_client):
     device_id = await seed_device(nso_device_name="subif-rtr01", netbox_device_id=970)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_subinterface.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "device-name": "subif-rtr01",
             "interface": [
                 {
@@ -69,12 +70,14 @@ async def test_refresh_full_replace(adapter_client):
     device_id = await seed_device(nso_device_name="subif-rtr02", netbox_device_id=971)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_subinterface.return_value = {
-            "interface": [{"interface-name": "ge-0/0/0.10", "parent-interface": "ge-0/0/0", "dot1q-vlan": 10}]
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": [{"interface-name": "ge-0/0/0.10", "parent-interface": "ge-0/0/0", "dot1q-vlan": 10}],
         }
         await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")
-        nso_client.get_subinterface.return_value = {
-            "interface": [{"interface-name": "ge-0/0/0.20", "parent-interface": "ge-0/0/0", "dot1q-vlan": 20}]
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": [{"interface-name": "ge-0/0/0.20", "parent-interface": "ge-0/0/0", "dot1q-vlan": 20}],
         }
         await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")
         assert set(await _rows(db, device_id)) == {"ge-0/0/0.20"}
@@ -85,10 +88,11 @@ async def test_refresh_none_clears(adapter_client):
     device_id = await seed_device(nso_device_name="subif-rtr03", netbox_device_id=972)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_subinterface.return_value = {
-            "interface": [{"interface-name": "ge-0/0/0.10", "parent-interface": "ge-0/0/0", "dot1q-vlan": 10}]
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": [{"interface-name": "ge-0/0/0.10", "parent-interface": "ge-0/0/0", "dot1q-vlan": 10}],
         }
         await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")
-        nso_client.get_subinterface.return_value = None
+        nso_client.get_device_state_section.return_value = None
         await refresh_subinterface_for_device(db, device, nso_client, refresh_source="test")
         assert await _rows(db, device_id) == {}

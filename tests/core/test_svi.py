@@ -36,7 +36,8 @@ async def test_refresh_inserts_svis(adapter_client):
     device_id = await seed_device(nso_device_name="svi-sw01", netbox_device_id=980)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_svi.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "device-name": "svi-sw01",
             "interface": [
                 {"interface-name": "Vlan100", "vlan-id": 100, "type": "svi", "vrf": "MGMT"},
@@ -54,10 +55,16 @@ async def test_refresh_full_replace(adapter_client):
     device_id = await seed_device(nso_device_name="svi-sw02", netbox_device_id=981)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_svi.return_value = {"interface": [{"interface-name": "Vlan10", "vlan-id": 10, "type": "svi"}]}
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": [{"interface-name": "Vlan10", "vlan-id": 10, "type": "svi"}],
+        }
         await refresh_svi_for_device(db, device, nso_client, refresh_source="test")
         # Second refresh with a different set → old row gone.
-        nso_client.get_svi.return_value = {"interface": [{"interface-name": "Vlan20", "vlan-id": 20, "type": "svi"}]}
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": [{"interface-name": "Vlan20", "vlan-id": 20, "type": "svi"}],
+        }
         await refresh_svi_for_device(db, device, nso_client, refresh_source="test")
         assert set(await _svis(db, device_id)) == {"Vlan20"}
 
@@ -67,8 +74,11 @@ async def test_refresh_none_clears(adapter_client):
     device_id = await seed_device(nso_device_name="svi-sw03", netbox_device_id=982)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_svi.return_value = {"interface": [{"interface-name": "Vlan10", "vlan-id": 10, "type": "svi"}]}
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": [{"interface-name": "Vlan10", "vlan-id": 10, "type": "svi"}],
+        }
         await refresh_svi_for_device(db, device, nso_client, refresh_source="test")
-        nso_client.get_svi.return_value = None
+        nso_client.get_device_state_section.return_value = None
         await refresh_svi_for_device(db, device, nso_client, refresh_source="test")
         assert await _svis(db, device_id) == {}

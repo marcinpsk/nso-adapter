@@ -55,6 +55,7 @@ SUBINTERFACE_SPEC = FamilySpec(
     getter=lambda client, name: client.get_subinterface(name),
     extract=lambda data: as_list(data.get("interface")),
     materialize=_upsert_subinterface,
+    wire_name="subinterface",  # READSEM S3: fetch from the device-state envelope
 )
 
 

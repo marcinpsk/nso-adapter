@@ -38,7 +38,8 @@ async def test_refresh_inserts_mtu(adapter_client):
     device_id = await seed_device(nso_device_name="mtu-rtr01", netbox_device_id=980)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_interface_mtu.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "device-name": "mtu-rtr01",
             "interface": [
                 {"interface-name": "Port-channel1", "mtu": 9216},
@@ -61,9 +62,15 @@ async def test_refresh_full_replace(adapter_client):
     device_id = await seed_device(nso_device_name="mtu-rtr02", netbox_device_id=981)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_interface_mtu.return_value = {"interface": [{"interface-name": "ae10", "mtu": 9192}]}
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": [{"interface-name": "ae10", "mtu": 9192}],
+        }
         await refresh_interface_mtu_for_device(db, device, nso_client, refresh_source="test")
-        nso_client.get_interface_mtu.return_value = {"interface": [{"interface-name": "ae11", "mtu": 1500}]}
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": [{"interface-name": "ae11", "mtu": 1500}],
+        }
         await refresh_interface_mtu_for_device(db, device, nso_client, refresh_source="test")
         assert set(await _rows(db, device_id)) == {"ae11"}
 
@@ -73,8 +80,11 @@ async def test_refresh_none_clears(adapter_client):
     device_id = await seed_device(nso_device_name="mtu-rtr03", netbox_device_id=982)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_interface_mtu.return_value = {"interface": [{"interface-name": "ae10", "mtu": 9192}]}
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": [{"interface-name": "ae10", "mtu": 9192}],
+        }
         await refresh_interface_mtu_for_device(db, device, nso_client, refresh_source="test")
-        nso_client.get_interface_mtu.return_value = None
+        nso_client.get_device_state_section.return_value = None
         await refresh_interface_mtu_for_device(db, device, nso_client, refresh_source="test")
         assert await _rows(db, device_id) == {}

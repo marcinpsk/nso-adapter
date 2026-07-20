@@ -825,7 +825,9 @@ async def test_run_apply_refreshes_mirror_and_notifies_plugin(adapter_client):
     # The read-mirror was re-read from NSO for both a routing surface (route-policy) and a config
     # surface (SVI) — the two families that back a 'deploying' overlay row ...
     mock_client.get_route_policy.assert_awaited()
-    mock_client.get_svi.assert_awaited()
+    # svi is envelope-flipped (READSEM S3 B2): its re-read arrives as a device-state section GET.
+    svi_reads = [c for c in mock_client.get_device_state_section.await_args_list if c.args[1] == "svi"]
+    assert svi_reads, "post-apply refresh must re-read the svi section"
     # ... and the plugin was notified so its post-apply reconcile settles the deploying row.
     nb.notify_sync_complete.assert_awaited_once_with(321)
 

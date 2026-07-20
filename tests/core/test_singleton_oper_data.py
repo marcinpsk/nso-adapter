@@ -137,13 +137,14 @@ async def test_l2_service_singleton_bare_object(adapter_client):
     device_id = await seed_device(nso_device_name="single-l2", netbox_device_id=2602)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_l2_services.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "service": {
                 "service-name": "EPIPE-1",
                 "service-type": "epipe",
                 "service-id": 100,
                 "sap": {"sap-id": "1/1/1:10", "port": "1/1/1", "outer-tag": 10},
-            }
+            },
         }
 
         await refresh_l2_services_for_device(db, device, nso_client, refresh_source="poll")
@@ -160,7 +161,10 @@ async def test_svi_singleton_bare_object(adapter_client):
     device_id = await seed_device(nso_device_name="single-svi", netbox_device_id=2603)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_svi.return_value = {"interface": {"interface-name": "Vlan10", "vlan-id": 10, "type": "svi"}}
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": {"interface-name": "Vlan10", "vlan-id": 10, "type": "svi"},
+        }
 
         await refresh_svi_for_device(db, device, nso_client, refresh_source="poll")
 
@@ -176,13 +180,14 @@ async def test_subinterface_singleton_bare_object(adapter_client):
     device_id = await seed_device(nso_device_name="single-subif", netbox_device_id=2604)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_subinterface.return_value = {
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
             "interface": {
                 "interface-name": "GigabitEthernet0/0.10",
                 "parent-interface": "GigabitEthernet0/0",
                 "dot1q-vlan": 10,
                 "type": "subinterface",
-            }
+            },
         }
 
         await refresh_subinterface_for_device(db, device, nso_client, refresh_source="poll")
@@ -203,8 +208,9 @@ async def test_bfd_singleton_bare_object(adapter_client):
     device_id = await seed_device(nso_device_name="single-bfd", netbox_device_id=2652)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_bfd_config.return_value = {
-            "interface": {"interface-name": "GigabitEthernet0/1", "min-tx": 300, "min-rx": 300, "multiplier": 3}
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": {"interface-name": "GigabitEthernet0/1", "min-tx": 300, "min-rx": 300, "multiplier": 3},
         }
 
         await refresh_bfd_interfaces_for_device(db, device, nso_client, refresh_source="poll")
@@ -225,8 +231,9 @@ async def test_interface_mtu_singleton_bare_object(adapter_client):
     device_id = await seed_device(nso_device_name="single-mtu", netbox_device_id=2650)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_interface_mtu.return_value = {
-            "interface": {"interface-name": "GigabitEthernet0/1", "mtu": 9000, "ip-mtu": 1500}
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "interface": {"interface-name": "GigabitEthernet0/1", "mtu": 9000, "ip-mtu": 1500},
         }
 
         await refresh_interface_mtu_for_device(db, device, nso_client, refresh_source="poll")
@@ -248,8 +255,9 @@ async def test_logging_host_singleton_bare_object(adapter_client):
     device_id = await seed_device(nso_device_name="single-log", netbox_device_id=2651)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_logging_config.return_value = {
-            "host": {"address": "10.0.0.53", "port": 514, "severity": "informational"}
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "host": {"address": "10.0.0.53", "port": 514, "severity": "informational"},
         }
 
         await refresh_logging_config_for_device(db, device, nso_client, refresh_source="poll")

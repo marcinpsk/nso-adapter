@@ -102,7 +102,7 @@ async def test_refresh_all_surfaces_reports_failed_family(adapter_client):
     the returned failed list; interface_ip is exercised as the operator-visible pain family."""
     device_id = await seed_device(nso_device_name="all-surfaces")
     async with _device_session(device_id) as (db, device):
-        client = _RecordingClient(fail={"get_interface_ips"})
+        client = _RecordingClient(fail={"interface-ip"})  # interface_ip is envelope-flipped (S3)
         failed = await refresh_all_surfaces_for_device(db, device, client, refresh_source="test")
         assert "interface_ip" in failed
         # every family was attempted (each family reads at least one getter)
@@ -110,8 +110,11 @@ async def test_refresh_all_surfaces_reports_failed_family(adapter_client):
 
 
 class _RecordingClient:
-    """Fake NsoClient: every ``get_*`` returns an empty-but-valid oper-data dict and is recorded;
-    getters named in *fail* raise to exercise the degraded path."""
+    """Fake NsoClient: every ``get_*`` returns an empty-but-valid oper-data dict and is
+    recorded; names (legacy getters) or wire families (envelope sections) in *fail* raise
+    to exercise the degraded path. S3-flipped families arrive as
+    ``get_device_state_section(device, wire_family)`` — the fake answers ok-empty
+    sections and records the WIRE family, keeping the one-call-per-family count."""
 
     def __init__(self, fail: frozenset[str] = frozenset()):
         self.called: list[str] = []
@@ -120,10 +123,13 @@ class _RecordingClient:
     def __getattr__(self, name):
         import httpx
 
-        async def _getter(device_name):
-            self.called.append(name)
-            if name in self._fail:
+        async def _getter(device_name, *args):
+            called_as = args[0] if name == "get_device_state_section" else name
+            self.called.append(called_as)
+            if called_as in self._fail:
                 raise httpx.ConnectError("boom")
+            if name == "get_device_state_section":
+                return {"status": "ok"}
             return {}
 
         return _getter
