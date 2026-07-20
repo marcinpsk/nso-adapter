@@ -23,6 +23,7 @@ from nso_adapter.core.sync_state import compute_sync_state
 from nso_adapter.domain.models import Interface, InterfaceAttr
 from nso_adapter.nso import actions as nso_actions
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.read_outcome import EmptyPolicy, Present, classify_read
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
     DbInterface,
@@ -508,36 +509,58 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
     # read below is only as fresh as this made the CDB (A3b).
     sync_from_ok = _sync_from_succeeded(await nso_actions.sync_from(client, device.nso_device_name))
 
-    # Step 2: read canonical interface attributes from NSO package oper-data
-    attrs = await client.get_interface_attributes(device.nso_device_name)
-    interfaces = _attrs_to_interface_list(attrs)
+    # Step 2: read canonical interface attributes from NSO package oper-data, through the
+    # read-outcome vocabulary. interface-attributes is a present-policy inventory family
+    # (get_interface_attributes → confirm_404=False), so a 404/None means the export is down /
+    # the NED is unsupported / the device is not-ready — NOT "this device has zero interfaces".
+    # Only an authoritative Present read may drive the interface reconcile and flip
+    # mapping_status; an Unavailable read leaves the prior mapping intact and reports the surface
+    # degraded, so a transient export blip never demotes a mapped device to unmatched_interfaces.
+    attrs_outcome = await classify_read(
+        lambda: client.get_interface_attributes(device.nso_device_name),
+        EmptyPolicy.present,
+    )
+    attrs_available = isinstance(attrs_outcome, Present)
 
-    scope_result = await db.execute(select(ManagedScope).where(ManagedScope.device_id == device_id))
-    scope_attrs = [s.attribute for s in scope_result.scalars().all()]
-
-    result_rows = await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))
-    existing_ifaces: dict[str, DbInterface] = {row.name: row for row in result_rows.scalars().all()}
-
-    # Phase 1: bulk interface inventory reconcile (plan Layer A).
     nb_client = get_netbox_client()
-    nb_id_by_name = await _ensure_netbox_interfaces(nb_client, device, device_id, interfaces)
-
     interfaces_created = 0
     changes_detected = 0
-    ctx = _WriteCtx(nb_client, device, nb_id_by_name, {}, {})
-    for iface in interfaces:
-        created, changes = await _reconcile_interface(db, device_id, iface, scope_attrs, existing_ifaces, ctx)
-        interfaces_created += int(created)
-        changes_detected += changes
+    interfaces_written = 0
+    if attrs_available:
+        interfaces = _attrs_to_interface_list(attrs_outcome.data)
 
-    # Phase 2 flush: push queued attribute updates, batched + isolated.
-    interfaces_written = await _flush_netbox_patches(nb_client, ctx.attr_patches, ctx.pending_by_id)
+        scope_result = await db.execute(select(ManagedScope).where(ManagedScope.device_id == device_id))
+        scope_attrs = [s.attribute for s in scope_result.scalars().all()]
 
-    # The interface sync itself is done; its mapping + timestamp are accurate regardless
-    # of what the routing surfaces do next. Commit that work now, but defer the final
-    # last_sync_status until after the fan-out so a silently-failed surface read cannot
-    # hide under a premature 'succeeded'.
-    device.mapping_status = MappingStatus.mapped if interfaces else MappingStatus.unmatched_interfaces
+        result_rows = await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))
+        existing_ifaces: dict[str, DbInterface] = {row.name: row for row in result_rows.scalars().all()}
+
+        # Phase 1: bulk interface inventory reconcile (plan Layer A).
+        nb_id_by_name = await _ensure_netbox_interfaces(nb_client, device, device_id, interfaces)
+
+        ctx = _WriteCtx(nb_client, device, nb_id_by_name, {}, {})
+        for iface in interfaces:
+            created, changes = await _reconcile_interface(db, device_id, iface, scope_attrs, existing_ifaces, ctx)
+            interfaces_created += int(created)
+            changes_detected += changes
+
+        # Phase 2 flush: push queued attribute updates, batched + isolated.
+        interfaces_written = await _flush_netbox_patches(nb_client, ctx.attr_patches, ctx.pending_by_id)
+
+        # The interface sync itself is done; its mapping is accurate regardless of what the
+        # routing surfaces do next. An authoritative present-empty read (zero interfaces) is a
+        # genuine unmatched_interfaces.
+        device.mapping_status = MappingStatus.mapped if interfaces else MappingStatus.unmatched_interfaces
+    else:
+        # Unavailable read: keep the prior mapping_status untouched; the surface is degraded and
+        # is added to the fan-out's degraded list below.
+        logger.warning(
+            "sync.interface_attributes_unavailable",
+            device_id=device_id,
+            reason=attrs_outcome.reason.value,
+        )
+    # Commit the interface work + timestamp now, but defer the final last_sync_status until after
+    # the fan-out so a silently-failed surface read cannot hide under a premature 'succeeded'.
     device.last_sync_at = _utcnow()
     await db.commit()
 
@@ -545,6 +568,8 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
     # exposes (IS-IS/BGP/OSPF/route-policy/...), not just interface attributes. Done
     # before the plugin notify so its reconcile sees the fresh surface state in one pass.
     degraded = await refresh_routing_surfaces_for_device(db, device, client, refresh_source="sync")
+    if not attrs_available:
+        degraded = [*degraded, "interface_attributes"]
 
     # A3b: a sync-from that did not actually pull (result:false / unreachable) means every surface
     # was just re-read from STALE CDB — this sync is not a live device reread, so report it degraded
@@ -593,8 +618,22 @@ async def detect_drift(device_id: int, db: AsyncSession) -> dict:
     # compare-config re-reads from NSO CDB vs live device
     await nso_actions.compare_config(client, device.nso_device_name)
 
-    attrs = await client.get_interface_attributes(device.nso_device_name)
-    interfaces = _attrs_to_interface_list(attrs)
+    # Route the attrs read through the vocabulary (present-policy family): a 404/None or read
+    # error is Unavailable, not "zero interfaces", so drift is computed only from an authoritative
+    # Present read. An Unavailable read leaves the stored sync_state untouched (drift is read-only).
+    attrs_outcome = await classify_read(
+        lambda: client.get_interface_attributes(device.nso_device_name),
+        EmptyPolicy.present,
+    )
+    if isinstance(attrs_outcome, Present):
+        interfaces = _attrs_to_interface_list(attrs_outcome.data)
+    else:
+        logger.warning(
+            "drift.interface_attributes_unavailable",
+            device_id=device_id,
+            reason=attrs_outcome.reason.value,
+        )
+        interfaces = []
 
     scope_result2 = await db.execute(select(ManagedScope).where(ManagedScope.device_id == device_id))
     scope_attrs = [s.attribute for s in scope_result2.scalars().all()]

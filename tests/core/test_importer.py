@@ -191,6 +191,11 @@ async def test_sync_device_calls_get_interface_attributes(db_session: AsyncSessi
 
 
 async def test_sync_device_marks_unmatched_interfaces_when_empty(db_session: AsyncSession):
+    """An AUTHORITATIVE present-empty attrs read (200 with zero interfaces) → unmatched_interfaces.
+
+    A present-empty read is the export saying "this device really has no interfaces we manage";
+    that is distinct from a 404/None (unavailable), covered by the keeps-mapping test below.
+    """
     device = Device(
         nso_instance="nso-dev",
         nso_device_name="sw02",
@@ -200,7 +205,7 @@ async def test_sync_device_marks_unmatched_interfaces_when_empty(db_session: Asy
     db_session.add(device)
     await db_session.commit()
 
-    nso_client = _make_nso_client(None)
+    nso_client = _make_nso_client({"device-name": "sw02", "interface": []})
 
     from nso_adapter.core import importer as imp
 
@@ -212,6 +217,40 @@ async def test_sync_device_marks_unmatched_interfaces_when_empty(db_session: Asy
 
     await db_session.refresh(device)
     assert device.mapping_status == MappingStatus.unmatched_interfaces
+
+
+async def test_sync_device_keeps_mapping_when_attrs_unavailable(db_session: AsyncSession):
+    """A 404/None attrs read (export down / unsupported NED / not-ready) must NOT demote a
+    mapped device to unmatched_interfaces — it keeps the prior mapping and reports the
+    interface_attributes surface degraded.
+
+    RED against the old code, which read None as an empty interface list and flipped
+    mapping_status to unmatched_interfaces on every transient export blip.
+    """
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="sw05",
+        ned_id="cisco-ios-cli-6.95",
+        netbox_device_id=5,
+        mapping_status=MappingStatus.mapped,  # a prior healthy sync mapped it
+    )
+    db_session.add(device)
+    await db_session.commit()
+
+    nso_client = _make_nso_client(None)  # 404 → present-policy not-authoritative
+
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = nso_client
+    imp._netbox_client = None
+
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+        await sync_device(device.id, db_session)
+
+    await db_session.refresh(device)
+    assert device.mapping_status == MappingStatus.mapped  # kept, NOT demoted
+    assert device.last_sync_status == LastSyncStatus.partial
+    assert "interface_attributes" in (device.degraded_surfaces or [])
 
 
 # ── detect_drift integration test ────────────────────────────────────────
