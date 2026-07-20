@@ -20,6 +20,8 @@ succeeded or nothing-to-read; ``False`` = read failed, rows untouched) so existi
 
 from __future__ import annotations
 
+import asyncio
+import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -41,6 +43,36 @@ from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device
 
 logger = structlog.get_logger(__name__)
+
+# ── in-process refresh coordination (codex S3-R1 F2) ─────────────────────────────────
+# The adapter is a SINGLE process; these primitives serialize same-(device, family)
+# refreshes (so concurrent pollers/SSE/sync can't double-fire the not-ready escalation
+# or interleave materializations out of order) and bound total concurrent action calls
+# (post-reload the whole fleet goes not-ready at once — without a bound, aligned
+# scheduler jobs would stampede NSO with extraction actions). Keyed per event loop:
+# asyncio primitives bind to the loop that first awaits them, and the test suite runs
+# one loop per test.
+_ACTION_CONCURRENCY = 4
+_coordination_by_loop: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _loop_coordination() -> tuple[dict[tuple[int, str], asyncio.Lock], asyncio.Semaphore]:
+    loop = asyncio.get_running_loop()
+    entry = _coordination_by_loop.get(loop)
+    if entry is None:
+        entry = ({}, asyncio.Semaphore(_ACTION_CONCURRENCY))
+        _coordination_by_loop[loop] = entry
+    return entry
+
+
+def _family_lock(device_id: int, family: str) -> asyncio.Lock:
+    locks, _ = _loop_coordination()
+    return locks.setdefault((device_id, family), asyncio.Lock())
+
+
+def _action_semaphore() -> asyncio.Semaphore:
+    _, semaphore = _loop_coordination()
+    return semaphore
 
 
 async def _record_read(
@@ -110,7 +142,8 @@ async def _escalate_not_ready(device: Device, nso_client: NsoClient, spec: Famil
     """
     assert spec.wire_name is not None
     try:
-        output = await nso_client.run_device_state_read(device.nso_device_name, [spec.wire_name])
+        async with _action_semaphore():
+            output = await nso_client.run_device_state_read(device.nso_device_name, [spec.wire_name])
     except Exception as exc:  # noqa: BLE001 — action error (bracket exhaustion, unknown device) → keep rows
         return Unavailable(UnavailableReason.read_error, detail=repr(exc))
     section = output.get(spec.wire_name)
@@ -164,15 +197,19 @@ async def run_family_refresh(
         logger.debug(f"{spec.name}.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
         return True
 
-    outcome = await _classify_family_read(device, nso_client, spec)
-    return await _apply_outcome(db, device, spec, outcome, refresh_source)
+    # Singleflight per (device, family): a concurrent second caller waits, then does its
+    # OWN fresh read — after the first caller's escalation warmed the records, that read
+    # is a cheap envelope GET, never a duplicate action.
+    async with _family_lock(device.id, spec.name):
+        outcome = await _classify_family_read(device, nso_client, spec)
+        return await _apply_outcome(db, device, spec, outcome, refresh_source)
 
 
 async def run_family_refresh_from_section(
     db: AsyncSession,
     device: Device,
     spec: FamilySpec,
-    section: dict | None,
+    section: dict,
     *,
     refresh_source: str = "sync",
 ) -> bool:
@@ -182,13 +219,79 @@ async def run_family_refresh_from_section(
     GET) and the atomic Sync-Now/onboarding action — fetch once and feed each family's section
     here. No escalation: the doc supplier is responsible for healing ``not-ready`` sections
     (a still-not-ready section records honestly and keeps rows, a degraded surface).
+
+    ``section`` must be a real section dict. Supplier-level failures (action error, doc GET
+    failure) and confirmed DEVICE absence are NOT sections — represent them explicitly via
+    :func:`run_family_refresh_from_outcome`; normalizing them to ``None`` here would classify
+    as device-absence and WIPE every pop family (codex S3-R1 F8).
+    """
+    if section is None:
+        raise ValueError(
+            "run_family_refresh_from_section requires a section dict; represent supplier "
+            "failures / device absence via run_family_refresh_from_outcome"
+        )
+    return await run_family_refresh_from_outcome(
+        db, device, spec, classify_envelope_section(section, spec.empty_policy), refresh_source=refresh_source
+    )
+
+
+async def run_family_refresh_from_outcome(
+    db: AsyncSession,
+    device: Device,
+    spec: FamilySpec,
+    outcome: ReadOutcome,
+    *,
+    refresh_source: str = "sync",
+) -> bool:
+    """Refresh one family from an ALREADY-CLASSIFIED outcome (READSEM fetch grains b/c).
+
+    The escape hatch :func:`run_family_refresh_from_section` cannot express: a grain-b/c
+    supplier that failed wholesale (action error → ``Unavailable(read_error)`` for every
+    requested family; doc GET outage → ``Unavailable(export_down)``) or a confirmed
+    device-level 404 (``classify_envelope_section(None, policy)``). Keeps per-family
+    outcome rows flowing even when nothing was fetched.
     """
     if not device.nso_device_name:
         logger.debug(f"{spec.name}.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
         return True
 
-    outcome = classify_envelope_section(section, spec.empty_policy)
-    return await _apply_outcome(db, device, spec, outcome, refresh_source)
+    async with _family_lock(device.id, spec.name):
+        return await _apply_outcome(db, device, spec, outcome, refresh_source)
+
+
+async def _materialize_guarded(
+    db: AsyncSession,
+    device: Device,
+    spec: FamilySpec,
+    attempt_id: int | None,
+    payload_fn,
+    refresh_source: str,
+):
+    """Run extract+materialize under a SAVEPOINT; terminalize the attempt on failure.
+
+    Codex S3-R1 F6, scoped: a materializer exception must (a) not leave its PARTIAL
+    mirror writes to be committed later, and (b) still terminalize phase 2 so the newest
+    failure stays visible via the pointer. A full-session rollback would achieve (a) but
+    destroys the CALLER's sibling uncommitted work (`sync_device` batches interface rows
+    + every surface in ONE session — `_run_surfaces` isolates a raising surface and
+    carries on). The savepoint scopes the discard to the materializer's own writes; the
+    phase-1 row was flushed BEFORE it and survives, so the SAME attempt is terminalized.
+    A materializer that already committed (its normal last step) deactivates the
+    savepoint — nothing to roll back. The exception always re-raises (legacy contract).
+    """
+    savepoint = await db.begin_nested()
+    try:
+        payload = payload_fn()
+        await spec.materialize(db, device, payload, refresh_source)
+        return payload
+    except Exception:
+        try:
+            if savepoint.is_active:
+                await savepoint.rollback()
+            await _record_result(db, spec, attempt_id, result="error", succeeded=False, row_count=None)
+        except Exception as store_exc:  # noqa: BLE001 — telemetry; the materializer error is the story
+            logger.warning(f"{spec.name}.outcome.terminalize_failed", attempt_id=attempt_id, error=repr(store_exc))
+        raise
 
 
 async def _apply_outcome(
@@ -203,8 +306,9 @@ async def _apply_outcome(
     attempt_id = await _record_read(db, device, spec, outcome, refresh_source)
 
     if isinstance(outcome, Present):
-        payload = spec.extract(outcome.data)
-        await spec.materialize(db, device, payload, refresh_source)
+        payload = await _materialize_guarded(
+            db, device, spec, attempt_id, lambda: spec.extract(outcome.data), refresh_source
+        )
         row_count = len(payload) if isinstance(payload, (list, tuple)) else None
         logger.info(
             f"{spec.name}.refresh.done",
@@ -219,7 +323,7 @@ async def _apply_outcome(
 
     if isinstance(outcome, AbsentAuthoritative):
         # Clear by materializing the "nothing" payload for this family (extract of an empty entry).
-        await spec.materialize(db, device, spec.extract({}), refresh_source)
+        await _materialize_guarded(db, device, spec, attempt_id, lambda: spec.extract({}), refresh_source)
         logger.info(
             f"{spec.name}.refresh.cleared",
             device_id=device.id,

@@ -278,7 +278,8 @@ async def test_wire_name_none_never_touches_the_envelope(adapter_client):
         client = AsyncMock(spec=NsoClient)
         client.get_static_routes.return_value = {"route": [{"vrf": "", "prefix": "192.0.2.0/24", "next-hop": "x"}]}
 
-        ok = await run_family_refresh(db, device, client, STATIC_ROUTE_SPEC)
+        legacy_spec = dataclasses.replace(STATIC_ROUTE_SPEC, wire_name=None)
+        ok = await run_family_refresh(db, device, client, legacy_spec)
 
         assert ok is True
         assert await _routes(db, device_id) == ["192.0.2.0/24"]
@@ -312,3 +313,95 @@ async def test_from_section_not_ready_keeps_and_reports_degraded(adapter_client)
 
         assert ok is False
         assert await _routes(db, device_id) == ["10.0.0.0/8"]
+
+
+# ── codex R1: materializer-failure terminalization (F6) + escalation coordination (F2) ──
+
+
+@pytest.mark.anyio
+async def test_materializer_failure_terminalizes_the_outcome_attempt(adapter_client):
+    """A materializer exception must still terminalize phase 2 (result=error) so the
+    newest FAILURE is visible via the pointer — a nonterminal row hides it from S4."""
+    device_id = await seed_device(nso_device_name="eng-env-matfail", netbox_device_id=9716)
+    await _seed_one_route(device_id)
+
+    async def _boom_materialize(db, device, payload, refresh_source):
+        raise RuntimeError("materializer exploded")
+
+    spec = dataclasses.replace(ENV_SPEC, materialize=_boom_materialize)
+    async with _device_session(device_id) as (db, device):
+        with pytest.raises(RuntimeError, match="materializer exploded"):
+            await run_family_refresh(db, device, _client(section=OK_SECTION), spec)
+
+        outcome_row = await _latest_outcome(db, device_id)
+        assert (outcome_row.result, outcome_row.succeeded) == ("error", False)
+        assert outcome_row.completed_at is not None
+
+
+@pytest.mark.anyio
+async def test_concurrent_same_family_refreshes_escalate_once(adapter_client):
+    """Post-reload alignment: two concurrent refreshes of ONE (device, family) must be
+    singleflighted. The action mock YIELDS mid-flight (as the real HTTP call does), so
+    without the per-(device,family) lock both callers classify not-ready before either
+    action lands and the action fires TWICE."""
+    import asyncio
+
+    device_id = await seed_device(nso_device_name="eng-env-race", netbox_device_id=9717)
+    await _seed_one_route(device_id)
+    async with _device_session(device_id) as (db, device):
+        acted = False
+
+        async def _section(name, wire_family):
+            # Records are warm only after the first action completed.
+            return OK_SECTION if acted else {"status": "not-ready"}
+
+        async def _action(name, wire_families):
+            nonlocal acted
+            await asyncio.sleep(0)  # a real yield point — the live HTTP call suspends here
+            acted = True
+            return {"atomic": True, "static-route": OK_SECTION}
+
+        client = AsyncMock(spec=NsoClient)
+        client.get_device_state_section.side_effect = _section
+        client.run_device_state_read.side_effect = _action
+
+        async for db2 in get_session():
+            device2 = await db2.get(Device, device_id)
+            ok1, ok2 = await asyncio.gather(
+                run_family_refresh(db, device, client, ENV_SPEC),
+                run_family_refresh(db2, device2, client, ENV_SPEC),
+            )
+            break
+
+        assert (ok1, ok2) == (True, True)
+        assert client.run_device_state_read.await_count == 1, "the second refresh must not re-fire the action"
+        assert await _routes(db, device_id) == ["172.16.0.0/12"]
+
+
+# ── codex R1 F11: real-client → engine → DB integration (no AsyncMock boundary) ─────
+
+
+@pytest.mark.anyio
+async def test_real_client_envelope_refresh_end_to_end(adapter_client):
+    """The full S3 grain-a path with NO mocked client: real NsoClient request construction
+    against a routing transport, real classification, real materializer, real outcome rows.
+    An AsyncMock client cannot catch URL/shape drift between client and engine — this does."""
+    import httpx
+
+    from tests.nso.test_device_state_client import EnvelopeTransport, _make_client
+
+    device_id = await seed_device(nso_device_name="eng-env-realclient", netbox_device_id=9718)
+    await _seed_one_route(device_id)
+    async with _device_session(device_id) as (db, device):
+        real_client = _make_client()
+        transport = EnvelopeTransport(device_body={"network-state-export:static-route": OK_SECTION})
+        real_client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url="http://nso:8080")
+
+        ok = await run_family_refresh(db, device, real_client, ENV_SPEC)
+
+        assert ok is True
+        assert await _routes(db, device_id) == ["172.16.0.0/12"]
+        url = str(transport.requests[0].url)
+        assert url.endswith("/restconf/data/network-state-export:device-state/device=eng-env-realclient/static-route")
+        outcome_row = await _latest_outcome(db, device_id)
+        assert (outcome_row.read_outcome, outcome_row.result) == ("present", "replaced")
