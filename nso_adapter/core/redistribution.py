@@ -18,16 +18,19 @@ import structlog
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.core.refresh_engine import classify_envelope_family_read
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
     EmptyPolicy,
+    Freshness,
     Present,
+    ReadOutcome,
     Unavailable,
     UnavailableReason,
-    classify_read,
 )
 from nso_adapter.nso.shape import as_list
+from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, DeviceRedistribution
 
 logger = structlog.get_logger(__name__)
@@ -110,11 +113,13 @@ def _bgp_redistribution_rows(device_id: int, entry: dict, now: datetime, refresh
     return rows
 
 
-# Each source protocol: its getter + the row builder that partitions on this dest_protocol.
+# Each source protocol: its envelope section (READSEM S3 B5) + the row builder that
+# partitions on this dest_protocol. The redistribute lists ride inside the protocol
+# families' own sections — redistribution reads the same wire the family specs read.
 _REDIST_COMPONENTS = (
-    ("ospf", lambda c, n: c.get_ospf(n), _ospf_redistribution_rows),
-    ("isis", lambda c, n: c.get_isis_interfaces(n), _isis_redistribution_rows),
-    ("bgp", lambda c, n: c.get_bgp_config(n), _bgp_redistribution_rows),
+    ("ospf", "ospf-config", _ospf_redistribution_rows),
+    ("isis", "isis-interface", _isis_redistribution_rows),
+    ("bgp", "bgp-config", _bgp_redistribution_rows),
 )
 
 
@@ -146,24 +151,46 @@ async def refresh_redistribution_for_device(
     name = device.nso_device_name
     now = datetime.now(UTC).replace(tzinfo=None)
 
-    # Classify each component read independently. Each getter is a pop-policy config family: a
-    # container-confirmed 404 → AbsentAuthoritative (that protocol has no redistribution).
-    outcomes: dict[str, object] = {}
-    for proto, getter, _builder in _REDIST_COMPONENTS:
-        outcomes[proto] = await classify_read(lambda g=getter: g(nso_client, name), EmptyPolicy.pop)
+    # Classify each component's envelope section independently (pop policy: a confirmed
+    # DEVICE absence is an authoritative clear for every partition).
+    outcomes: dict[str, ReadOutcome] = {}
+    for proto, wire_name, _builder in _REDIST_COMPONENTS:
+        outcomes[proto] = await classify_envelope_family_read(
+            device,
+            nso_client,
+            wire_name=wire_name,
+            empty_policy=EmptyPolicy.pop,
+            family_name=f"redistribution.{proto}",
+        )
 
     # Tier 1 — any confirmed export outage aborts the whole refresh, rows untouched.
     if any(isinstance(o, Unavailable) and o.reason is UnavailableReason.export_down for o in outcomes.values()):
         logger.warning("redistribution.refresh.degraded", device_id=device.id, device_name=name)
+        await _record_composite(
+            db,
+            device.id,
+            Unavailable(UnavailableReason.export_down),
+            refresh_source,
+            result="kept",
+            succeeded=False,
+            row_count=None,
+        )
         return False
 
-    # Tier 2 — per-component retention. Build the fresh rows for the authoritative protocols and
-    # full-replace only those partitions; a read_error protocol keeps its rows (never deleted).
+    # Tier 2 — per-component aggregation (codex S3-R1 F7, explicit):
+    # * Present (fresh OR stale=degraded-success) / AbsentAuthoritative → full-replace the
+    #   partition (stale carries the degraded marker into the composite outcome record);
+    # * declared `unsupported` → keep the partition AND count as success — an ArcOS device
+    #   (OSPF unsupported, ISIS/BGP supported) must not sit permanently `partial`;
+    # * anything else (read_error, failed escalation) → keep the partition + failure.
     all_authoritative = True
+    any_stale = False
     rebuilt: list[DeviceRedistribution] = []
-    for proto, _getter, builder in _REDIST_COMPONENTS:
+    for proto, _wire_name, builder in _REDIST_COMPONENTS:
         outcome = outcomes[proto]
         if isinstance(outcome, (Present, AbsentAuthoritative)):
+            if isinstance(outcome, Present) and outcome.freshness is Freshness.stale:
+                any_stale = True
             entry = outcome.data if isinstance(outcome, Present) else {}
             await db.execute(
                 delete(DeviceRedistribution).where(
@@ -172,6 +199,13 @@ async def refresh_redistribution_for_device(
                 )
             )
             rebuilt.extend(builder(device.id, entry, now, refresh_source))
+        elif isinstance(outcome, Unavailable) and outcome.reason is UnavailableReason.unsupported:
+            logger.info(
+                "redistribution.refresh.component_unsupported",
+                device_id=device.id,
+                device_name=name,
+                protocol=proto,
+            )
         else:
             all_authoritative = False
             logger.warning(
@@ -201,4 +235,42 @@ async def refresh_redistribution_for_device(
         row_count=len(rebuilt),
         refresh_source=refresh_source,
     )
+    # Composite outcome record (codex S3-R1 F7 — redistribution never recorded): the merged
+    # worst-of view. Success (incl. unsupported-skips) → Present, stale if ANY component was;
+    # a kept component → Unavailable(read_error) with succeeded=False.
+    if all_authoritative:
+        merged: ReadOutcome = Present({}, Freshness.stale if any_stale else Freshness.fresh)
+        await _record_composite(
+            db, device.id, merged, refresh_source, result="replaced", succeeded=True, row_count=len(rebuilt)
+        )
+    else:
+        kept = [
+            p
+            for p, o in outcomes.items()
+            if isinstance(o, Unavailable) and o.reason is not UnavailableReason.unsupported
+        ]
+        merged = Unavailable(UnavailableReason.read_error, detail=f"components kept: {kept}")
+        await _record_composite(
+            db, device.id, merged, refresh_source, result="kept", succeeded=False, row_count=len(rebuilt)
+        )
     return all_authoritative
+
+
+async def _record_composite(
+    db: AsyncSession,
+    device_id: int,
+    outcome: ReadOutcome,
+    refresh_source: str,
+    *,
+    result: str,
+    succeeded: bool,
+    row_count: int | None,
+) -> None:
+    """Best-effort two-phase outcome record for the composite family (never breaks the refresh)."""
+    try:
+        attempt_id = await outcome_store.record_read_outcome(
+            db, device_id, "redistribution", outcome, refresh_source=refresh_source
+        )
+        await outcome_store.record_result(db, attempt_id, result=result, succeeded=succeeded, row_count=row_count)
+    except Exception as exc:  # noqa: BLE001 — telemetry write; the mirror is the source of truth
+        logger.warning("redistribution.outcome.record_failed", device_id=device_id, error=repr(exc))

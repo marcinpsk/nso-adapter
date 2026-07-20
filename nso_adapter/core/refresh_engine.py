@@ -146,7 +146,9 @@ class FamilySpec:
     wire_name: str | None = None
 
 
-async def _escalate_not_ready(device: Device, nso_client: NsoClient, spec: FamilySpec) -> ReadOutcome:
+async def _escalate_not_ready(
+    device: Device, nso_client: NsoClient, wire_name: str, empty_policy: EmptyPolicy
+) -> ReadOutcome:
     """``not-ready`` → ONE ``device-state-read run`` for this family (READSEM S3).
 
     The envelope never extracts and its records are in-process — after a `packages reload`
@@ -156,18 +158,49 @@ async def _escalate_not_ready(device: Device, nso_client: NsoClient, spec: Famil
     terminal (``ok|unsupported|error``) — a ``not-ready`` here is a contract violation and
     is refused rather than looped on.
     """
-    assert spec.wire_name is not None
     try:
         async with _action_semaphore():
-            output = await nso_client.run_device_state_read(device.nso_device_name, [spec.wire_name])
+            output = await nso_client.run_device_state_read(device.nso_device_name, [wire_name])
     except Exception as exc:  # noqa: BLE001 — action error (bracket exhaustion, unknown device) → keep rows
         return Unavailable(UnavailableReason.read_error, detail=repr(exc))
-    section = output.get(spec.wire_name)
+    section = output.get(wire_name)
     if section is None:
         return Unavailable(UnavailableReason.read_error, detail="action output missing the requested section")
-    outcome = classify_envelope_section(section, spec.empty_policy)
+    outcome = classify_envelope_section(section, empty_policy)
     if isinstance(outcome, Unavailable) and outcome.reason is UnavailableReason.not_ready:
         return Unavailable(UnavailableReason.read_error, detail="action returned not-ready (contract violation)")
+    return outcome
+
+
+async def classify_envelope_family_read(
+    device: Device,
+    nso_client: NsoClient,
+    *,
+    wire_name: str,
+    empty_policy: EmptyPolicy,
+    family_name: str,
+) -> ReadOutcome:
+    """Envelope section GET + classification + single-shot not-ready escalation.
+
+    The one classification point for EVERY envelope consumer: the engine's per-family
+    refresh AND the composite readers that never became FamilySpecs (redistribution's
+    three components, the importer's interface_attributes read). Escalation runs under
+    the shared action semaphore.
+    """
+    try:
+        section = await nso_client.get_device_state_section(device.nso_device_name, wire_name)
+    except NsoExportUnavailableError as exc:
+        return Unavailable(UnavailableReason.export_down, detail=repr(exc))
+    except Exception as exc:  # noqa: BLE001 — any read failure is Unavailable; the mirror is kept
+        return Unavailable(UnavailableReason.read_error, detail=repr(exc))
+    outcome = classify_envelope_section(section, empty_policy)
+    if isinstance(outcome, Unavailable) and outcome.reason is UnavailableReason.not_ready:
+        logger.info(
+            f"{family_name}.refresh.not_ready_escalating",
+            device_id=device.id,
+            device_name=device.nso_device_name,
+        )
+        outcome = await _escalate_not_ready(device, nso_client, wire_name, empty_policy)
     return outcome
 
 
@@ -178,21 +211,9 @@ async def _classify_family_read(device: Device, nso_client: NsoClient, spec: Fam
             lambda: spec.getter(nso_client, device.nso_device_name),
             spec.empty_policy,
         )
-    try:
-        section = await nso_client.get_device_state_section(device.nso_device_name, spec.wire_name)
-    except NsoExportUnavailableError as exc:
-        return Unavailable(UnavailableReason.export_down, detail=repr(exc))
-    except Exception as exc:  # noqa: BLE001 — any read failure is Unavailable; the mirror is kept
-        return Unavailable(UnavailableReason.read_error, detail=repr(exc))
-    outcome = classify_envelope_section(section, spec.empty_policy)
-    if isinstance(outcome, Unavailable) and outcome.reason is UnavailableReason.not_ready:
-        logger.info(
-            f"{spec.name}.refresh.not_ready_escalating",
-            device_id=device.id,
-            device_name=device.nso_device_name,
-        )
-        outcome = await _escalate_not_ready(device, nso_client, spec)
-    return outcome
+    return await classify_envelope_family_read(
+        device, nso_client, wire_name=spec.wire_name, empty_policy=spec.empty_policy, family_name=spec.name
+    )
 
 
 async def run_family_refresh(

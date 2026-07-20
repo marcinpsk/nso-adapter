@@ -38,13 +38,25 @@ async def db_session():
     await engine.dispose()
 
 
-def _make_nso_client(iface_entry=None):
-    """Build a fake NsoClient (spec-bound to the real interface — get_device_ned_id /
-    get_interface_attributes are real async methods). iface_entry is the dict | None
-    returned by get_interface_attributes."""
+def _make_nso_client(iface_entry=None, sections=None):
+    """Build a fake NsoClient (spec-bound to the real interface).
+
+    interface_attributes is envelope-flipped (READSEM S3 B5): *iface_entry* becomes the
+    ``interface-attributes`` section (ok-wrapped; ``None`` = confirmed device absence →
+    present-policy keep, the old 404 shape). Other families' sections default to an
+    ERROR section (keep + degraded surface) unless supplied via *sections* — matching
+    the pre-port behavior where un-stubbed surface reads were degraded.
+    """
     client = AsyncMock(spec=NsoClient)
     client.get_device_ned_id = AsyncMock(return_value="cisco-ios-cli-6.95")
-    client.get_interface_attributes = AsyncMock(return_value=iface_entry)
+    routed = {"interface-attributes": None if iface_entry is None else {"status": "ok", **iface_entry}}
+    routed.update(sections or {})
+    client._sections = routed
+
+    async def _get_section(device_name, wire_family):
+        return routed.get(wire_family, {"status": "error", "error-reason": "not stubbed in this test"})
+
+    client.get_device_state_section = AsyncMock(side_effect=_get_section)
     return client
 
 
@@ -185,7 +197,7 @@ async def test_sync_device_calls_get_interface_attributes(db_session: AsyncSessi
     with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
         await sync_device(device.id, db_session)
 
-    nso_client.get_interface_attributes.assert_called_once_with("sw04")
+    nso_client.get_device_state_section.assert_any_await("sw04", "interface-attributes")
     # get_device_config must NOT be called
     nso_client.get_device_config.assert_not_called()
 
@@ -299,7 +311,7 @@ async def test_detect_drift_uses_interface_attributes(db_session: AsyncSession):
     with patch("nso_adapter.core.importer.nso_actions.compare_config", new_callable=AsyncMock):
         summary = await detect_drift(device.id, db_session)
 
-    nso_client.get_interface_attributes.assert_called_once_with("sw03")
+    nso_client.get_device_state_section.assert_any_await("sw03", "interface-attributes")
     assert summary["changes_detected"] == 1
 
 
@@ -1330,3 +1342,44 @@ async def test_sync_device_succeeds_on_ok_sync_from(db_session: AsyncSession):
     await db_session.refresh(device)
     assert device.last_sync_status == LastSyncStatus.succeeded
     assert device.degraded_surfaces is None
+
+
+@pytest.mark.anyio
+async def test_sync_device_records_attrs_outcome_rows(db_session: AsyncSession):
+    """READSEM S3 B5 (codex R1-F7): the importer-owned attrs read records two-phase
+    outcomes (it never did) — family=interface_attributes, replaced on success."""
+    from nso_adapter.store.models import RefreshOutcome
+
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="sw-attrs-rec",
+        ned_id="cisco-ios-cli-6.95",
+        netbox_device_id=99,
+    )
+    db_session.add(device)
+    await db_session.commit()
+
+    nso_client = _make_nso_client({"device-name": "sw-attrs-rec", "interface": []})
+
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = nso_client
+    imp._netbox_client = None
+
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+        await sync_device(device.id, db_session)
+
+    rows = (
+        (
+            await db_session.execute(
+                select(RefreshOutcome).where(
+                    RefreshOutcome.device_id == device.id,
+                    RefreshOutcome.family == "interface_attributes",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert rows, "attrs must record outcomes now"
+    assert (rows[-1].read_outcome, rows[-1].succeeded, rows[-1].result) == ("present", True, "replaced")

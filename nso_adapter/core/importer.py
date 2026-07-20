@@ -19,11 +19,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.config import get_config
+from nso_adapter.core.refresh_engine import classify_envelope_family_read
 from nso_adapter.core.sync_state import compute_sync_state
 from nso_adapter.domain.models import Interface, InterfaceAttr
 from nso_adapter.nso import actions as nso_actions
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.read_outcome import EmptyPolicy, Present, classify_read
+from nso_adapter.nso.read_outcome import EmptyPolicy, Present
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
     DbInterface,
@@ -495,6 +496,37 @@ def _sync_from_succeeded(output) -> bool:
     return bool(result)
 
 
+async def _record_attrs_read(db, device, outcome, refresh_source: str):
+    """Best-effort phase-1 outcome record for the importer-owned attrs read (R1-F7)."""
+    from nso_adapter.store import outcome_store
+
+    try:
+        return await outcome_store.record_read_outcome(
+            db, device.id, "interface_attributes", outcome, refresh_source=refresh_source
+        )
+    except Exception as exc:  # noqa: BLE001 — telemetry write; the sync is the story
+        logger.warning("interface_attributes.outcome.read_record_failed", device_id=device.id, error=repr(exc))
+        return None
+
+
+async def _record_attrs_result(db, attempt_id, *, available: bool, row_count: int | None) -> None:
+    """Best-effort phase-2 terminalization for the attrs read."""
+    from nso_adapter.store import outcome_store
+
+    if attempt_id is None:
+        return
+    try:
+        await outcome_store.record_result(
+            db,
+            attempt_id,
+            result="replaced" if available else "kept",
+            succeeded=available,
+            row_count=row_count if available else None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("interface_attributes.outcome.result_record_failed", attempt_id=attempt_id, error=repr(exc))
+
+
 async def sync_device(device_id: int, db: AsyncSession) -> dict:
     """Full sync: NSO → DB → NetBox. Returns job result summary dict."""
     device = await db.get(Device, device_id)
@@ -516,11 +548,17 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
     # Only an authoritative Present read may drive the interface reconcile and flip
     # mapping_status; an Unavailable read leaves the prior mapping intact and reports the surface
     # degraded, so a transient export blip never demotes a mapped device to unmatched_interfaces.
-    attrs_outcome = await classify_read(
-        lambda: client.get_interface_attributes(device.nso_device_name),
-        EmptyPolicy.present,
+    attrs_outcome = await classify_envelope_family_read(
+        device,
+        client,
+        wire_name="interface-attributes",
+        empty_policy=EmptyPolicy.present,
+        family_name="interface_attributes",
     )
     attrs_available = isinstance(attrs_outcome, Present)
+    # READSEM S3 B5 (codex R1-F7): attrs starts recording outcomes. Phase 1 here; phase 2
+    # after the interface reconcile below (best-effort — never breaks the sync).
+    attrs_attempt_id = await _record_attrs_read(db, device, attrs_outcome, "sync")
 
     nb_client = get_netbox_client()
     interfaces_created = 0
@@ -563,6 +601,7 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
     # the fan-out so a silently-failed surface read cannot hide under a premature 'succeeded'.
     device.last_sync_at = _utcnow()
     await db.commit()
+    await _record_attrs_result(db, attrs_attempt_id, available=attrs_available, row_count=interfaces_written)
 
     # Fan out to the routing/extra surfaces so one sync refreshes everything the device
     # exposes (IS-IS/BGP/OSPF/route-policy/...), not just interface attributes. Done
@@ -621,9 +660,12 @@ async def detect_drift(device_id: int, db: AsyncSession) -> dict:
     # Route the attrs read through the vocabulary (present-policy family): a 404/None or read
     # error is Unavailable, not "zero interfaces", so drift is computed only from an authoritative
     # Present read. An Unavailable read leaves the stored sync_state untouched (drift is read-only).
-    attrs_outcome = await classify_read(
-        lambda: client.get_interface_attributes(device.nso_device_name),
-        EmptyPolicy.present,
+    attrs_outcome = await classify_envelope_family_read(
+        device,
+        client,
+        wire_name="interface-attributes",
+        empty_policy=EmptyPolicy.present,
+        family_name="interface_attributes",
     )
     if isinstance(attrs_outcome, Present):
         interfaces = _attrs_to_interface_list(attrs_outcome.data)

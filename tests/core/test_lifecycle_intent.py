@@ -63,8 +63,10 @@ async def _run_detect_drift(device_id, device_name, device_reports):
     """Run detect_drift with NSO reporting `device_reports`; NetBox client forced None so
     the cached netbox_value is the Phase-1 baseline (proving Phase 2 ignores it)."""
     nso = AsyncMock()
-    nso.get_interface_attributes = AsyncMock(
+    # attrs is envelope-flipped (READSEM S3 B5): drift reads the interface-attributes section.
+    nso.get_device_state_section = AsyncMock(
         return_value={
+            "status": "ok",
             "device-name": device_name,
             "interface": [{"interface-name": "GE0/0", "description": device_reports}],
         }

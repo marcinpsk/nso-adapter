@@ -28,10 +28,26 @@ async def _device_session(device_id: int):
 
 
 def _nso_client_with_data(ospf=None, isis=None, bgp=None) -> AsyncMock:
+    """Envelope-flipped (READSEM S3 B5): serve the three component sections.
+
+    ``client._sections`` is mutable per test: a section dict is served as-is, an
+    Exception instance is raised (export-down / read-error shapes).
+    """
     client = AsyncMock()
-    client.get_ospf.return_value = ospf or {}
-    client.get_isis_interfaces.return_value = isis or {}
-    client.get_bgp_config.return_value = bgp or {}
+    sections = {
+        "ospf-config": {"status": "ok", **(ospf or {})},
+        "isis-interface": {"status": "ok", **(isis or {})},
+        "bgp-config": {"status": "ok", **(bgp or {})},
+    }
+    client._sections = sections
+
+    async def _get(device_name, wire_family):
+        value = sections[wire_family]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    client.get_device_state_section.side_effect = _get
     return client
 
 
@@ -203,10 +219,10 @@ async def test_refresh_keeps_rows_when_a_read_is_degraded(adapter_client):
         )
         assert len(seeded) == 1
 
-        # A subsequent refresh hits a fleet-wide export outage: the ospf getter raises.
+        # A subsequent refresh hits a fleet-wide export outage: the ospf section read raises.
         degraded = _nso_client_with_data(bgp={"router": []}, isis={"process": []})
-        degraded.get_ospf.side_effect = NsoExportUnavailableError(
-            "network-state-export:ospf-config is not exported by NSO"
+        degraded._sections["ospf-config"] = NsoExportUnavailableError(
+            "network-state-export:device-state is not exported by NSO"
         )
         result = await refresh_redistribution_for_device(db, device, degraded, refresh_source="test")
 
@@ -254,7 +270,7 @@ async def test_refresh_keeps_failed_protocol_rows_per_component(adapter_client):
             },
             bgp={},
         )
-        degraded.get_ospf.side_effect = RuntimeError("ospf read timeout")  # read_error, NOT an outage
+        degraded._sections["ospf-config"] = RuntimeError("ospf read timeout")  # read_error, NOT an outage
 
         ok = await refresh_redistribution_for_device(db, device, degraded, refresh_source="test")
 
@@ -291,10 +307,10 @@ async def test_refresh_ospf_failure_falls_back_to_other_protocols(adapter_client
     """If OSPF call raises, ISIS/BGP rows are still upserted (graceful partial failure)."""
     device_id = await seed_device(nso_device_name="rd-partial-sw01", netbox_device_id=7705)
     async with _device_session(device_id) as (db, device):
-        nso_client = AsyncMock()
-        nso_client.get_ospf.side_effect = Exception("OSPF NSO error")
-        nso_client.get_isis_interfaces.return_value = {}
-        nso_client.get_bgp_config.return_value = {
+        nso_client = _nso_client_with_data(isis={})
+        nso_client._sections["ospf-config"] = Exception("OSPF NSO error")
+        nso_client._sections["bgp-config"] = {
+            "status": "ok",
             "router": [
                 {
                     "asn": "65001",
@@ -310,7 +326,7 @@ async def test_refresh_ospf_failure_falls_back_to_other_protocols(adapter_client
                         }
                     ],
                 }
-            ]
+            ],
         }
 
         await refresh_redistribution_for_device(db, device, nso_client, refresh_source="test")
@@ -331,7 +347,7 @@ async def test_refresh_skipped_when_no_nso_device_name(adapter_client):
 
         await refresh_redistribution_for_device(db, device, nso_client, refresh_source="test")
 
-        nso_client.get_ospf.assert_not_awaited()
+        nso_client.get_device_state_section.assert_not_awaited()
         result = await db.execute(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id))
         assert len(result.scalars().all()) == 0
 
@@ -366,3 +382,124 @@ async def test_refresh_dedups_duplicate_identity(adapter_client):
         assert len(rows) == 1
         assert rows[0].source_protocol == "connected"
         assert rows[0].metric == 10  # first wins
+
+
+# ── READSEM S3 B5: explicit component aggregation (codex R1-F7) ─────────────────────
+
+
+@pytest.mark.anyio
+async def test_arcos_asymmetry_unsupported_component_is_not_a_failure(adapter_client):
+    """The ArcOS shape: OSPF has no reader (unsupported), ISIS/BGP serve fine. The old
+    aggregation filed `unsupported` under kept-stale and returned False — the device sat
+    permanently `partial`. Declared unsupported must keep the partition AND succeed."""
+    device_id = await seed_device(nso_device_name="rd-arcos", netbox_device_id=7707)
+    async with _device_session(device_id) as (db, device):
+        client = _nso_client_with_data(
+            isis={
+                "process": [{"process-tag": "CORE", "redistribute": [{"source-protocol": "static", "source-ref": ""}]}]
+            },
+            bgp={},
+        )
+        client._sections["ospf-config"] = {"status": "unsupported"}
+
+        ok = await refresh_redistribution_for_device(db, device, client, refresh_source="test")
+
+        assert ok is True, "an unsupported component must not degrade the composite"
+        rows = (
+            (await db.execute(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        assert {(r.dest_protocol, r.source_protocol) for r in rows} == {("isis", "static")}
+
+
+@pytest.mark.anyio
+async def test_stale_component_replaces_and_records_degraded(adapter_client):
+    """stale = degraded-success: the partition replaces (export's best-known) and the
+    composite outcome row carries freshness=stale."""
+    from nso_adapter.store.models import RefreshOutcome
+
+    device_id = await seed_device(nso_device_name="rd-stale", netbox_device_id=7708)
+    async with _device_session(device_id) as (db, device):
+        client = _nso_client_with_data(isis={}, bgp={})
+        client._sections["ospf-config"] = {
+            "status": "stale",
+            "instance": [{"process-id": "1", "redistribute": [{"source-protocol": "connected", "source-ref": ""}]}],
+        }
+
+        ok = await refresh_redistribution_for_device(db, device, client, refresh_source="test")
+
+        assert ok is True
+        rows = (
+            (await db.execute(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        assert {(r.dest_protocol, r.source_protocol) for r in rows} == {("ospf", "connected")}
+        outcome_rows = (
+            (
+                await db.execute(
+                    select(RefreshOutcome)
+                    .where(RefreshOutcome.device_id == device_id, RefreshOutcome.family == "redistribution")
+                    .order_by(RefreshOutcome.id.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert outcome_rows, "the composite must record outcomes now"
+        assert (outcome_rows[0].freshness, outcome_rows[0].succeeded) == ("stale", True)
+
+
+@pytest.mark.anyio
+async def test_not_ready_component_escalates_a_single_family_action(adapter_client):
+    """A not-ready component self-heals via ONE device-state-read for THAT family."""
+    device_id = await seed_device(nso_device_name="rd-notready", netbox_device_id=7709)
+    async with _device_session(device_id) as (db, device):
+        client = _nso_client_with_data(isis={}, bgp={})
+        client._sections["ospf-config"] = {"status": "not-ready"}
+        client.run_device_state_read.return_value = {
+            "atomic": True,
+            "ospf-config": {
+                "status": "ok",
+                "instance": [{"process-id": "1", "redistribute": [{"source-protocol": "static", "source-ref": ""}]}],
+            },
+        }
+
+        ok = await refresh_redistribution_for_device(db, device, client, refresh_source="test")
+
+        assert ok is True
+        client.run_device_state_read.assert_awaited_once_with(device.nso_device_name, ["ospf-config"])
+        rows = (
+            (await db.execute(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        assert {(r.dest_protocol, r.source_protocol) for r in rows} == {("ospf", "static")}
+
+
+@pytest.mark.anyio
+async def test_kept_component_records_a_failed_composite_outcome(adapter_client):
+    from nso_adapter.store.models import RefreshOutcome
+
+    device_id = await seed_device(nso_device_name="rd-keptrec", netbox_device_id=7710)
+    async with _device_session(device_id) as (db, device):
+        client = _nso_client_with_data(isis={}, bgp={})
+        client._sections["ospf-config"] = RuntimeError("boom")
+
+        ok = await refresh_redistribution_for_device(db, device, client, refresh_source="test")
+
+        assert ok is False
+        outcome_rows = (
+            (
+                await db.execute(
+                    select(RefreshOutcome)
+                    .where(RefreshOutcome.device_id == device_id, RefreshOutcome.family == "redistribution")
+                    .order_by(RefreshOutcome.id.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert outcome_rows
+        assert (outcome_rows[0].read_outcome, outcome_rows[0].succeeded) == ("unavailable", False)
