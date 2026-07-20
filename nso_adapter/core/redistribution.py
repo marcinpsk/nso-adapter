@@ -18,7 +18,16 @@ import structlog
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
+from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.read_outcome import (
+    AbsentAuthoritative,
+    EmptyPolicy,
+    Present,
+    Unavailable,
+    UnavailableReason,
+    classify_read,
+)
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceRedistribution
 
 logger = structlog.get_logger(__name__)
@@ -52,7 +61,7 @@ def _build_rows(
     refresh_source: str,
 ) -> list[DeviceRedistribution]:
     rows = []
-    for entry in redist_list:
+    for entry in as_list(redist_list):
         src_proto = str(entry.get("source-protocol", "")).strip()
         src_ref = str(entry.get("source-ref", "")).strip()
         if not src_proto:
@@ -74,6 +83,41 @@ def _build_rows(
     return rows
 
 
+def _ospf_redistribution_rows(device_id: int, entry: dict, now: datetime, refresh_source: str) -> list:
+    rows: list[DeviceRedistribution] = []
+    for inst in as_list(entry.get("instance")):
+        rows.extend(_build_rows(device_id, "ospf", _ospf_dest_ref(inst), inst.get("redistribute"), now, refresh_source))
+    return rows
+
+
+def _isis_redistribution_rows(device_id: int, entry: dict, now: datetime, refresh_source: str) -> list:
+    rows: list[DeviceRedistribution] = []
+    for proc in as_list(entry.get("process")):
+        rows.extend(_build_rows(device_id, "isis", _isis_dest_ref(proc), proc.get("redistribute"), now, refresh_source))
+    return rows
+
+
+def _bgp_redistribution_rows(device_id: int, entry: dict, now: datetime, refresh_source: str) -> list:
+    rows: list[DeviceRedistribution] = []
+    for router in as_list(entry.get("router")):
+        asn = str(router.get("asn", ""))
+        for scope in as_list(router.get("scope")):
+            scope_dest_ref = _bgp_dest_ref(asn, scope)
+            for af in as_list(scope.get("address-family")):
+                afi = str(af.get("afi", ""))
+                dest_ref = f"{scope_dest_ref}/{afi}" if afi else scope_dest_ref
+                rows.extend(_build_rows(device_id, "bgp", dest_ref, af.get("redistribute"), now, refresh_source))
+    return rows
+
+
+# Each source protocol: its getter + the row builder that partitions on this dest_protocol.
+_REDIST_COMPONENTS = (
+    ("ospf", lambda c, n: c.get_ospf(n), _ospf_redistribution_rows),
+    ("isis", lambda c, n: c.get_isis_interfaces(n), _isis_redistribution_rows),
+    ("bgp", lambda c, n: c.get_bgp_config(n), _bgp_redistribution_rows),
+)
+
+
 async def refresh_redistribution_for_device(
     db: AsyncSession,
     device: Device,
@@ -81,87 +125,68 @@ async def refresh_redistribution_for_device(
     *,
     refresh_source: str = "poll",
 ) -> bool:
-    """Read OSPF/ISIS/BGP oper-data for *device* and upsert redistribution rows.
+    """Read OSPF/ISIS/BGP oper-data for *device* and refresh redistribution rows.
 
-    Performs a full-replace: deletes all existing DeviceRedistribution rows for the
-    device, then re-inserts from fresh oper-data.  Three NSO requests are made —
-    get_ospf, get_isis_interfaces, get_bgp_config.  Individual failures are logged
-    and skipped; the remaining protocols still get upserted.
+    Composite family (READSEM §2.6): each of the three source-protocol reads is classified
+    independently into the :data:`~nso_adapter.nso.read_outcome.ReadOutcome` vocabulary, then a
+    declared merge policy applies:
 
-    Returns True when all three source reads succeeded; False when any of them failed
-    (the surface is degraded — the upserted rows are missing that protocol's data).
+    * Any read that is a **confirmed fleet-wide export outage** (``NsoExportUnavailableError`` →
+      ``export_down``) → **keep everything** untouched and return ``False``. Every protocol would
+      report empty; full-replacing then would wipe the mirror over a transient blip.
+    * Otherwise **per-component retention** (operator decision): a protocol whose read is
+      authoritative (Present / confirmed-absent) full-replaces its ``dest_protocol`` partition; a
+      protocol whose read failed with a non-outage error KEEPS its last-known rows. Returns
+      ``True`` only when all three reads were authoritative, ``False`` if any was kept-stale.
     """
     if not device.nso_device_name:
         logger.debug("redistribution.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
         return True
 
+    name = device.nso_device_name
     now = datetime.now(UTC).replace(tzinfo=None)
-    rows: list[DeviceRedistribution] = []
-    ok = True
-    # A per-protocol read error (5xx / parse) still full-replaces from whatever succeeded — one
-    # broken protocol must not freeze the other two (graceful partial failure). But a CONFIRMED
-    # fleet-wide export outage (NsoExportUnavailableError: the getter probed the parent container
-    # and it too was 404) means the whole export is down and every protocol would report empty —
-    # full-replacing then would wipe this device's redistribution mirror over a transient blip.
-    outage = False
 
-    # ── OSPF ─────────────────────────────────────────────────────────────────
-    try:
-        ospf_entry = await nso_client.get_ospf(device.nso_device_name)
-        for inst in (ospf_entry or {}).get("instance", []):
-            dest_ref = _ospf_dest_ref(inst)
-            rows.extend(_build_rows(device.id, "ospf", dest_ref, inst.get("redistribute", []), now, refresh_source))
-    except Exception as exc:
-        logger.warning("redistribution.refresh.ospf_error", device_id=device.id, error=repr(exc))
-        ok = False
-        outage = outage or isinstance(exc, NsoExportUnavailableError)
+    # Classify each component read independently. Each getter is a pop-policy config family: a
+    # container-confirmed 404 → AbsentAuthoritative (that protocol has no redistribution).
+    outcomes: dict[str, object] = {}
+    for proto, getter, _builder in _REDIST_COMPONENTS:
+        outcomes[proto] = await classify_read(lambda g=getter: g(nso_client, name), EmptyPolicy.pop)
 
-    # ── ISIS ─────────────────────────────────────────────────────────────────
-    try:
-        isis_entry = await nso_client.get_isis_interfaces(device.nso_device_name)
-        for proc in (isis_entry or {}).get("process", []):
-            dest_ref = _isis_dest_ref(proc)
-            rows.extend(_build_rows(device.id, "isis", dest_ref, proc.get("redistribute", []), now, refresh_source))
-    except Exception as exc:
-        logger.warning("redistribution.refresh.isis_error", device_id=device.id, error=repr(exc))
-        ok = False
-        outage = outage or isinstance(exc, NsoExportUnavailableError)
-
-    # ── BGP ──────────────────────────────────────────────────────────────────
-    try:
-        bgp_entry = await nso_client.get_bgp_config(device.nso_device_name)
-        for router in (bgp_entry or {}).get("router", []):
-            asn = str(router.get("asn", ""))
-            for scope in router.get("scope", []):
-                scope_dest_ref = _bgp_dest_ref(asn, scope)
-                for af in scope.get("address-family", []):
-                    afi = str(af.get("afi", ""))
-                    dest_ref = f"{scope_dest_ref}/{afi}" if afi else scope_dest_ref
-                    rows.extend(
-                        _build_rows(device.id, "bgp", dest_ref, af.get("redistribute", []), now, refresh_source)
-                    )
-    except Exception as exc:
-        logger.warning("redistribution.refresh.bgp_error", device_id=device.id, error=repr(exc))
-        ok = False
-        outage = outage or isinstance(exc, NsoExportUnavailableError)
-
-    # ── Upsert ───────────────────────────────────────────────────────────────
-    if outage:
-        # Confirmed fleet-wide export outage — leave the last-known rows untouched rather than
-        # full-replacing them away over a transient blip (the fleet-wide clobber the container
-        # probe exists to prevent). A per-protocol error (ok=False, outage=False) still falls
-        # through and full-replaces from whatever succeeded.
-        logger.warning(
-            "redistribution.refresh.degraded",
-            device_id=device.id,
-            device_name=device.nso_device_name,
-        )
+    # Tier 1 — any confirmed export outage aborts the whole refresh, rows untouched.
+    if any(isinstance(o, Unavailable) and o.reason is UnavailableReason.export_down for o in outcomes.values()):
+        logger.warning("redistribution.refresh.degraded", device_id=device.id, device_name=name)
         return False
-    await db.execute(delete(DeviceRedistribution).where(DeviceRedistribution.device_id == device.id))
+
+    # Tier 2 — per-component retention. Build the fresh rows for the authoritative protocols and
+    # full-replace only those partitions; a read_error protocol keeps its rows (never deleted).
+    all_authoritative = True
+    rebuilt: list[DeviceRedistribution] = []
+    for proto, _getter, builder in _REDIST_COMPONENTS:
+        outcome = outcomes[proto]
+        if isinstance(outcome, (Present, AbsentAuthoritative)):
+            entry = outcome.data if isinstance(outcome, Present) else {}
+            await db.execute(
+                delete(DeviceRedistribution).where(
+                    DeviceRedistribution.device_id == device.id,
+                    DeviceRedistribution.dest_protocol == proto,
+                )
+            )
+            rebuilt.extend(builder(device.id, entry, now, refresh_source))
+        else:
+            all_authoritative = False
+            logger.warning(
+                "redistribution.refresh.component_kept",
+                device_id=device.id,
+                device_name=name,
+                protocol=proto,
+                reason=outcome.reason.value,
+            )
+
     # First-wins in-refresh dedup: a duplicate identity tuple in the export would otherwise
-    # IntegrityError on commit and roll back the whole full-replace (uq_deviceredistribution_identity).
+    # IntegrityError on commit (uq_deviceredistribution_identity). dest_protocol is part of the
+    # identity, so this only collides within a single rebuilt protocol's rows.
     seen: set[tuple[str, str, str, str]] = set()
-    for row in rows:
+    for row in rebuilt:
         key = (row.dest_protocol, row.dest_ref, row.source_protocol, row.source_ref)
         if key in seen:
             continue
@@ -172,8 +197,8 @@ async def refresh_redistribution_for_device(
     logger.info(
         "redistribution.refresh.done",
         device_id=device.id,
-        device_name=device.nso_device_name,
-        row_count=len(rows),
+        device_name=name,
+        row_count=len(rebuilt),
         refresh_source=refresh_source,
     )
-    return ok
+    return all_authoritative

@@ -221,6 +221,59 @@ async def test_refresh_keeps_rows_when_a_read_is_degraded(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_refresh_keeps_failed_protocol_rows_per_component(adapter_client):
+    """Per-component retention (operator decision): a non-outage read error on ONE protocol
+    KEEPS that protocol's rows, while the successfully-read protocols still full-replace.
+
+    RED against the old full-replace-from-successes, which deleted the failed protocol's rows
+    and re-inserted only from whatever succeeded — silently wiping ospf redistribution here.
+    """
+    device_id = await seed_device(nso_device_name="rd-percomp-sw01", netbox_device_id=7720)
+    async with _device_session(device_id) as (db, device):
+        # Healthy seed: one ospf row + one isis row.
+        healthy = _nso_client_with_data(
+            ospf={
+                "instance": [{"process-id": 1, "redistribute": [{"source-protocol": "connected", "source-ref": ""}]}]
+            },
+            isis={
+                "process": [{"process-tag": "CORE", "redistribute": [{"source-protocol": "ospf", "source-ref": "1"}]}]
+            },
+        )
+        await refresh_redistribution_for_device(db, device, healthy, refresh_source="test")
+        seeded = (
+            (await db.execute(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        assert {(r.dest_protocol, r.source_protocol) for r in seeded} == {("ospf", "connected"), ("isis", "ospf")}
+
+        # Second refresh: ospf read errors (non-outage), isis reports NEW data, bgp is empty.
+        degraded = _nso_client_with_data(
+            isis={
+                "process": [{"process-tag": "CORE", "redistribute": [{"source-protocol": "static", "source-ref": ""}]}]
+            },
+            bgp={},
+        )
+        degraded.get_ospf.side_effect = RuntimeError("ospf read timeout")  # read_error, NOT an outage
+
+        ok = await refresh_redistribution_for_device(db, device, degraded, refresh_source="test")
+
+        assert ok is False  # degraded surface — one protocol read failed
+        rows = (
+            (await db.execute(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        by_proto = {r.dest_protocol: r for r in rows}
+        # ospf rows KEPT (last-known), because ospf's read failed with a non-outage error.
+        assert "ospf" in by_proto
+        assert by_proto["ospf"].source_protocol == "connected"
+        # isis rows REPLACED from the fresh read (ospf→static), because its read succeeded.
+        assert by_proto["isis"].source_protocol == "static"
+        assert len(rows) == 2
+
+
+@pytest.mark.anyio
 async def test_refresh_empty_nso_response(adapter_client):
     """Empty NSO responses produce zero rows (no crash)."""
     device_id = await seed_device(nso_device_name="rd-empty-sw01", netbox_device_id=7704)
