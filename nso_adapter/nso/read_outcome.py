@@ -55,12 +55,16 @@ class EmptyPolicy(str, enum.Enum):
 class Freshness(str, enum.Enum):
     fresh = "fresh"  # served from a live/recent read
     aged = "aged"  # last-updated older than the family's staleness horizon (approximation)
+    stale = "stale"  # WIRE-DECLARED by the envelope: the export served last-known after a failed extract
 
 
 class UnavailableReason(str, enum.Enum):
     export_down = "export_down"  # confirmed: parent container 404 → NsoExportUnavailableError
     read_error = "read_error"  # 5xx / transport / parse — no cached answer
     not_authoritative = "not_authoritative"  # keep-on-None family 404 (unsupported / unknown / not-ready)
+    # Envelope-declared (READSEM S3) — the wire finally distinguishes what not_authoritative merges:
+    unsupported = "unsupported"  # this NED has no reader for the family — keep rows, not degraded
+    not_ready = "not_ready"  # no record yet (post-reload / NED remount) — the engine escalates to the action
 
 
 @dataclass(frozen=True)
@@ -112,3 +116,50 @@ async def classify_read(
     if empty_policy is EmptyPolicy.pop:
         return AbsentAuthoritative()
     return Unavailable(UnavailableReason.not_authoritative)
+
+
+def classify_envelope_section(section: dict | None, empty_policy: EmptyPolicy) -> ReadOutcome:
+    """Classify one device-state envelope section into a :data:`ReadOutcome` (READSEM S3).
+
+    The envelope carries the ground truth the legacy wire could not: a per-family
+    ``status`` leaf. Classification is therefore a direct mapping — no probes, no
+    empty-policy inference at the section level:
+
+    * ``ok`` → :class:`Present` (fresh). RESTCONF omits empty lists, so ok with absent
+      list keys IS the authoritative empty — the full-replace materialize path clears.
+    * ``stale`` → :class:`Present` with ``Freshness.stale`` — **degraded-success**
+      (operator decision): the rows are the export's best-known and replace, but the
+      recorded outcome carries the degradation.
+    * ``unsupported`` → :class:`Unavailable`(``unsupported``): declared not-authoritative
+      absence — keep rows. (The legacy wire conflated this with authoritative emptiness
+      and cleared; the envelope ends that.)
+    * ``not-ready`` → :class:`Unavailable`(``not_ready``): no record under the current
+      mount (post-reload, NED remount). The engine escalates to ``device-state-read run``
+      exactly once — the envelope itself never extracts.
+    * ``error`` → :class:`Unavailable`(``read_error``) with the wire's ``error-reason``.
+
+    ``section is None`` is DEVICE-level absence (the client already confirmed the
+    ``device-state`` container is alive): the one branch where :class:`EmptyPolicy` still
+    applies — ``pop`` reads it as the device (and thus its config) being genuinely gone,
+    ``present`` keeps rows. This preserves today's device-removed semantics; the policy
+    column dissolves entirely at S5.
+
+    An unknown/missing status is never guessed at: ``Unavailable(read_error)``, rows kept.
+    """
+    if section is None:
+        if empty_policy is EmptyPolicy.pop:
+            return AbsentAuthoritative()
+        return Unavailable(UnavailableReason.not_authoritative)
+
+    status = section.get("status")
+    if status == "ok":
+        return Present(section)
+    if status == "stale":
+        return Present(section, Freshness.stale)
+    if status == "unsupported":
+        return Unavailable(UnavailableReason.unsupported)
+    if status == "not-ready":
+        return Unavailable(UnavailableReason.not_ready)
+    if status == "error":
+        return Unavailable(UnavailableReason.read_error, detail=str(section.get("error-reason") or ""))
+    return Unavailable(UnavailableReason.read_error, detail=f"unrecognized envelope status {status!r}")
