@@ -16,36 +16,18 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.lag_topology import parse_changed_nso_devices
+from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceSvi
 
 logger = structlog.get_logger(__name__)
 
 
-async def refresh_svi_for_device(
-    db: AsyncSession,
-    device: Device,
-    nso_client: NsoClient,
-    *,
-    refresh_source: str = "poll",
-) -> bool:
-    """Read svi oper-data for *device* and full-replace its device_svi rows.
-
-    Returns True on a successful read (or an intentional skip); False when the NSO read
-    failed and the last-known rows were left untouched (a degraded surface).
-    """
-    if not device.nso_device_name:
-        return True
-    try:
-        entry = await nso_client.get_svi(device.nso_device_name)
-    except Exception as exc:
-        logger.warning("svi.refresh.error", device_id=device.id, error=repr(exc))
-        return False
-
-    interfaces = as_list((entry or {}).get("interface")) if entry else []
+async def _upsert_svi(db: AsyncSession, device: Device, interfaces: list[dict], refresh_source: str) -> None:
+    """Full-replace the device's SVI/IRB rows (the materializer)."""
     now = datetime.now(UTC).replace(tzinfo=None)
-
     await db.execute(delete(DeviceSvi).where(DeviceSvi.device_id == device.id))
     for item in interfaces:
         name = item.get("interface-name")
@@ -63,14 +45,30 @@ async def refresh_svi_for_device(
             )
         )
     await db.commit()
-    logger.info(
-        "svi.refresh.done",
-        device_id=device.id,
-        device_name=device.nso_device_name,
-        count=len(interfaces),
-        refresh_source=refresh_source,
-    )
-    return True
+
+
+SVI_SPEC = FamilySpec(
+    name="svi",
+    empty_policy=EmptyPolicy.pop,
+    getter=lambda client, name: client.get_svi(name),
+    extract=lambda data: as_list(data.get("interface")),
+    materialize=_upsert_svi,
+)
+
+
+async def refresh_svi_for_device(
+    db: AsyncSession,
+    device: Device,
+    nso_client: NsoClient,
+    *,
+    refresh_source: str = "poll",
+) -> bool:
+    """Read svi oper-data for *device* and full-replace its device_svi rows (via the shared engine).
+
+    Returns True on a successful read (or an intentional skip); False when the NSO read
+    failed and the last-known rows were left untouched (a degraded surface).
+    """
+    return await run_family_refresh(db, device, nso_client, SVI_SPEC, refresh_source=refresh_source)
 
 
 async def handle_svi_change(

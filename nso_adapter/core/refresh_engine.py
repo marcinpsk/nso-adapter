@@ -48,16 +48,23 @@ class FamilySpec:
     * ``empty_policy`` — how a ``None`` read is interpreted (see :class:`EmptyPolicy`).
     * ``getter`` — ``(client, device_name) -> Awaitable[dict | None]``; the existing
       ``NsoClient.get_*`` coroutine (so mocks that patch the getter keep working).
-    * ``extract`` — ``data -> list[dict]``; pull the family's row list out of the read entry.
-    * ``materialize`` — ``(db, device, rows, refresh_source) -> Awaitable[None]``; the
+    * ``extract`` — ``data -> payload``; pull the family's payload out of the read entry. A
+      single-table family returns its row ``list``; a multi-table family (bgp, isis, snmp, …)
+      can return the whole entry ``dict`` (or any structure) for its materializer to destructure.
+    * ``materialize`` — ``(db, device, payload, refresh_source) -> Awaitable[None]``; the
       family-owned full-replace/upsert that also commits.
+
+    An authoritative clear (``AbsentAuthoritative``) is expressed by feeding the extractor an
+    empty entry ``{}`` — so ``extract({})`` yields the family's "nothing" payload (``[]`` for a
+    list family, ``{}`` for a dict family) and the SAME materialize path performs the clear. No
+    separate clear hook, and no per-family "empty value" to keep in sync.
     """
 
     name: str
     empty_policy: EmptyPolicy
     getter: Callable[[NsoClient, str], Awaitable[dict | None]]
-    extract: Callable[[dict], list]
-    materialize: Callable[[AsyncSession, Device, list, str], Awaitable[None]]
+    extract: Callable[[dict], object]
+    materialize: Callable[[AsyncSession, Device, object, str], Awaitable[None]]
 
 
 async def run_family_refresh(
@@ -84,20 +91,21 @@ async def run_family_refresh(
     )
 
     if isinstance(outcome, Present):
-        rows = spec.extract(outcome.data)
-        await spec.materialize(db, device, rows, refresh_source)
+        payload = spec.extract(outcome.data)
+        await spec.materialize(db, device, payload, refresh_source)
         logger.info(
             f"{spec.name}.refresh.done",
             device_id=device.id,
             device_name=device.nso_device_name,
-            row_count=len(rows),
+            row_count=len(payload) if isinstance(payload, (list, tuple)) else None,
             freshness=outcome.freshness.value,
             refresh_source=refresh_source,
         )
         return True
 
     if isinstance(outcome, AbsentAuthoritative):
-        await spec.materialize(db, device, [], refresh_source)
+        # Clear by materializing the "nothing" payload for this family (extract of an empty entry).
+        await spec.materialize(db, device, spec.extract({}), refresh_source)
         logger.info(
             f"{spec.name}.refresh.cleared",
             device_id=device.id,

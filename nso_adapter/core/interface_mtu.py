@@ -16,7 +16,10 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.lag_topology import parse_changed_nso_devices
+from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.read_outcome import EmptyPolicy
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceInterfaceMtu
 
 logger = structlog.get_logger(__name__)
@@ -31,29 +34,9 @@ def _int_or_none(value) -> int | None:
         return None
 
 
-async def refresh_interface_mtu_for_device(
-    db: AsyncSession,
-    device: Device,
-    nso_client: NsoClient,
-    *,
-    refresh_source: str = "poll",
-) -> bool:
-    """Read interface-mtu oper-data for *device* and full-replace its rows.
-
-    Returns True on a successful read (or an intentional skip); False when the NSO read
-    failed and the last-known rows were left untouched (a degraded surface).
-    """
-    if not device.nso_device_name:
-        return True
-    try:
-        entry = await nso_client.get_interface_mtu(device.nso_device_name)
-    except Exception as exc:
-        logger.warning("interface_mtu.refresh.error", device_id=device.id, error=repr(exc))
-        return False
-
-    interfaces = (entry or {}).get("interface", []) if entry else []
+async def _upsert_interface_mtu(db: AsyncSession, device: Device, interfaces: list[dict], refresh_source: str) -> None:
+    """Full-replace the device's interface-MTU rows (the materializer)."""
     now = datetime.now(UTC).replace(tzinfo=None)
-
     await db.execute(delete(DeviceInterfaceMtu).where(DeviceInterfaceMtu.device_id == device.id))
     for item in interfaces:
         name = item.get("interface-name")
@@ -72,14 +55,31 @@ async def refresh_interface_mtu_for_device(
             )
         )
     await db.commit()
-    logger.info(
-        "interface_mtu.refresh.done",
-        device_id=device.id,
-        device_name=device.nso_device_name,
-        count=len(interfaces),
-        refresh_source=refresh_source,
-    )
-    return True
+
+
+INTERFACE_MTU_SPEC = FamilySpec(
+    name="interface_mtu",
+    empty_policy=EmptyPolicy.pop,
+    getter=lambda client, name: client.get_interface_mtu(name),
+    # as_list guards the singleton-rendered-as-bare-dict case (was a raw .get → crash).
+    extract=lambda data: as_list(data.get("interface")),
+    materialize=_upsert_interface_mtu,
+)
+
+
+async def refresh_interface_mtu_for_device(
+    db: AsyncSession,
+    device: Device,
+    nso_client: NsoClient,
+    *,
+    refresh_source: str = "poll",
+) -> bool:
+    """Read interface-mtu oper-data for *device* and full-replace its rows (via the shared engine).
+
+    Returns True on a successful read (or an intentional skip); False when the NSO read
+    failed and the last-known rows were left untouched (a degraded surface).
+    """
+    return await run_family_refresh(db, device, nso_client, INTERFACE_MTU_SPEC, refresh_source=refresh_source)
 
 
 async def handle_interface_mtu_change(

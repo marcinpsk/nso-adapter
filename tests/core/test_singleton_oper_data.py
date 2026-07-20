@@ -20,8 +20,10 @@ from sqlalchemy import select
 from nso_adapter.core.bgp import refresh_bgp_config_for_device
 from nso_adapter.core.importer import _attrs_to_interface_list
 from nso_adapter.core.interface_ip import refresh_interface_ips_for_device
+from nso_adapter.core.interface_mtu import refresh_interface_mtu_for_device
 from nso_adapter.core.l2_service import refresh_l2_services_for_device
 from nso_adapter.core.lag_topology import refresh_lag_topology_for_device
+from nso_adapter.core.logging_config import refresh_logging_config_for_device
 from nso_adapter.core.ospf import refresh_ospf_for_device
 from nso_adapter.core.subinterface import refresh_subinterface_for_device
 from nso_adapter.core.svi import refresh_svi_for_device
@@ -36,7 +38,9 @@ from nso_adapter.store.models import (
     DeviceBgpPeerGroupAddressFamily,
     DeviceBgpRouter,
     DeviceBgpScope,
+    DeviceInterfaceMtu,
     DeviceL2Sap,
+    DeviceLoggingHost,
     DeviceOspfInstance,
     DeviceOspfInterface,
     DeviceSubinterface,
@@ -173,6 +177,51 @@ async def test_subinterface_singleton_bare_object(adapter_client):
         assert len(rows) == 1
         assert rows[0].interface_name == "GigabitEthernet0/0.10"
         assert rows[0].dot1q_vlan == 10
+
+
+@pytest.mark.anyio
+async def test_interface_mtu_singleton_bare_object(adapter_client):
+    """A single interface-mtu rendered as a bare object → one row (was a raw .get → crash)."""
+    device_id = await seed_device(nso_device_name="single-mtu", netbox_device_id=2650)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_interface_mtu.return_value = {
+            "interface": {"interface-name": "GigabitEthernet0/1", "mtu": 9000, "ip-mtu": 1500}
+        }
+
+        await refresh_interface_mtu_for_device(db, device, nso_client, refresh_source="poll")
+
+        rows = (
+            (await db.execute(select(DeviceInterfaceMtu).where(DeviceInterfaceMtu.device_id == device.id)))
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+        assert rows[0].interface_name == "GigabitEthernet0/1"
+        assert rows[0].mtu == 9000
+        assert rows[0].ip_mtu == 1500
+
+
+@pytest.mark.anyio
+async def test_logging_host_singleton_bare_object(adapter_client):
+    """A single logging host rendered as a bare object → one row (was a raw .get → crash)."""
+    device_id = await seed_device(nso_device_name="single-log", netbox_device_id=2651)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_logging_config.return_value = {
+            "host": {"address": "10.0.0.53", "port": 514, "severity": "informational"}
+        }
+
+        await refresh_logging_config_for_device(db, device, nso_client, refresh_source="poll")
+
+        rows = (
+            (await db.execute(select(DeviceLoggingHost).where(DeviceLoggingHost.device_id == device.id)))
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+        assert rows[0].address == "10.0.0.53"
+        assert rows[0].port == 514
 
 
 @pytest.mark.anyio
