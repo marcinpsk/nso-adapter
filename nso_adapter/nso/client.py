@@ -52,6 +52,10 @@ class NsoClient:
         self._timeout = 30.0
         # Actions (sync-from, compare-config, connect) may take up to 2 min on real devices
         self._action_timeout = 120.0
+        # device-state-read extracts EVERY requested family inside one txid-bracketed CDB
+        # build; the fleet whale (rc1: all-18 in 75.6s) needs ~2x headroom over the live
+        # worst case, which the 120s action timeout does not give.
+        self._device_state_read_timeout = 180.0
 
     def _client(self, timeout: float | None = None) -> httpx.AsyncClient:
         headers = dict(RESTCONF_HEADERS)
@@ -390,6 +394,90 @@ class NsoClient:
         (see _get_device_oper_entry). Raises httpx.HTTPStatusError on other errors.
         """
         return await self._get_device_oper_entry("bfd-config", device_name, confirm_404=True)
+
+    # ── device-state envelope (READSEM S3) — status-declared per-family reads ─────────
+
+    async def get_device_state_section(self, device_name: str, wire_family: str) -> dict | None:
+        """GET one family's section from the device-state envelope.
+
+        *wire_family* is the YANG section name (e.g. ``"ospf-config"``, ``"interface-ip"``).
+        Returns the section dict — ``status`` (``ok|stale|unsupported|not-ready|error``) plus
+        optional ``error-reason``/``last-updated`` and the family's list keys. RESTCONF omits
+        empty lists, so an authoritative empty is ``status=ok`` with the list keys ABSENT —
+        consumers must ``.get(key, [])``, never infer from key presence.
+
+        A section on an EXISTING device always serves (the status leaf is always set), so a
+        404 here can only mean the device is unknown to NSO — or the whole export is down.
+        The ambiguity is resolved exactly like :meth:`_get_device_oper_entry`: probe the
+        ``device-state`` container; alive → None (device genuinely absent); container 404 →
+        raise :class:`NsoExportUnavailableError`.
+        """
+        base = f"{self._base}/restconf/data/network-state-export:device-state"
+        async with self._client() as c:
+            resp = await c.get(f"{base}/device={_url_key(device_name)}/{wire_family}")
+            if resp.status_code == 404:
+                probe = await c.get(base)
+                if probe.status_code == 404:
+                    raise NsoExportUnavailableError(
+                        f"network-state-export:device-state is not exported by NSO — refusing to "
+                        f"read {device_name!r}'s 404 as 'device absent'."
+                    )
+                probe.raise_for_status()
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            section = data.get(f"network-state-export:{wire_family}")
+            if section is None:
+                section = data.get(wire_family)
+            return section if section is not None else {}
+
+    async def get_device_state_doc(self, device_name: str) -> dict | None:
+        """GET one device's WHOLE device-state envelope entry (all 18 family sections).
+
+        The record-served projection (READSEM fetch grain b): warm, cheap, non-atomic by
+        declared design. Same 404 disambiguation as :meth:`get_device_state_section`.
+        """
+        base = f"{self._base}/restconf/data/network-state-export:device-state"
+        async with self._client() as c:
+            resp = await c.get(f"{base}/device={_url_key(device_name)}")
+            if resp.status_code == 404:
+                probe = await c.get(base)
+                if probe.status_code == 404:
+                    raise NsoExportUnavailableError(
+                        f"network-state-export:device-state is not exported by NSO — refusing to "
+                        f"read {device_name!r}'s 404 as 'device absent'."
+                    )
+                probe.raise_for_status()
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            entries = data.get("network-state-export:device") or data.get("device", [])
+            return entries[0] if entries else None
+
+    async def run_device_state_read(self, device_name: str, wire_families: list[str]) -> dict:
+        """POST the ``device-state-read run`` action — the on-demand ATOMIC multi-family read.
+
+        Extracts every requested family inside ONE txid-bracketed CDB build and CAS-updates
+        the export's state records (re-warming the envelope — the designed record-refresh
+        path; the envelope itself never extracts). Returns the action output dict:
+        ``atomic`` (always true on success — bracket exhaustion raises an action ERROR
+        instead, so torn data is never returned), ``last-updated``, and one section per
+        requested family with terminal status ``ok|unsupported|error`` (never ``not-ready``
+        or ``stale``).
+
+        Raises ``httpx.HTTPStatusError`` on an action error (bracket exhaustion, unknown
+        device) — callers keep rows for every requested family.
+        """
+        url = f"{self._base}/restconf/operations/network-state-export:device-state-read/run"
+        body = {"network-state-export:input": {"device": device_name, "family": list(wire_families)}}
+        async with self._client(self._device_state_read_timeout) as c:
+            resp = await c.post(url, json=body)
+            resp.raise_for_status()
+            data = resp.json()
+            output = data.get("network-state-export:output")
+            if output is None:
+                output = data.get("output", {})
+            return output
 
     async def check_sync(self, device_name: str) -> bool:
         """Return True if the device is in-sync with NSO's internal CDB.
