@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import select
 
+from nso_adapter.core.bfd import refresh_bfd_interfaces_for_device
 from nso_adapter.core.bgp import refresh_bgp_config_for_device
 from nso_adapter.core.importer import _attrs_to_interface_list
 from nso_adapter.core.interface_ip import refresh_interface_ips_for_device
@@ -31,6 +32,7 @@ from nso_adapter.core.vlan import refresh_switchport_for_device, refresh_vlan_da
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import (
     Device,
+    DeviceBfdInterface,
     DeviceBgpAddressFamily,
     DeviceBgpPeer,
     DeviceBgpPeerAddressFamily,
@@ -177,6 +179,28 @@ async def test_subinterface_singleton_bare_object(adapter_client):
         assert len(rows) == 1
         assert rows[0].interface_name == "GigabitEthernet0/0.10"
         assert rows[0].dot1q_vlan == 10
+
+
+@pytest.mark.anyio
+async def test_bfd_singleton_bare_object(adapter_client):
+    """A single bfd interface rendered as a bare object → one row (was a raw .get → crash)."""
+    device_id = await seed_device(nso_device_name="single-bfd", netbox_device_id=2652)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_bfd_config.return_value = {
+            "interface": {"interface-name": "GigabitEthernet0/1", "min-tx": 300, "min-rx": 300, "multiplier": 3}
+        }
+
+        await refresh_bfd_interfaces_for_device(db, device, nso_client, refresh_source="poll")
+
+        rows = (
+            (await db.execute(select(DeviceBfdInterface).where(DeviceBfdInterface.device_id == device.id)))
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+        assert rows[0].interface_name == "GigabitEthernet0/1"
+        assert rows[0].multiplier == 3
 
 
 @pytest.mark.anyio

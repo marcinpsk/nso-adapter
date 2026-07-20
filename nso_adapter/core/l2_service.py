@@ -18,7 +18,9 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.lag_topology import parse_changed_nso_devices
+from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceL2Sap
 
@@ -62,6 +64,15 @@ async def _upsert_l2_saps(
     await db.commit()
 
 
+L2_SERVICE_SPEC = FamilySpec(
+    name="l2_service",
+    empty_policy=EmptyPolicy.pop,
+    getter=lambda client, name: client.get_l2_services(name),
+    extract=lambda data: as_list(data.get("service")),
+    materialize=_upsert_l2_saps,
+)
+
+
 async def refresh_l2_services_for_device(
     db: AsyncSession,
     device: Device,
@@ -69,31 +80,12 @@ async def refresh_l2_services_for_device(
     *,
     refresh_source: str = "poll",
 ) -> bool:
-    """Read L2-service oper-data for *device* from NSO and upsert DB rows.
+    """Read L2-service oper-data for *device* from NSO and upsert DB rows (via the shared engine).
 
     Returns True on a successful read (or an intentional skip); False when the NSO read
     failed and the last-known rows were left untouched (a degraded surface).
     """
-    if not device.nso_device_name:
-        logger.debug("l2_service.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
-        return True
-
-    try:
-        entry = await nso_client.get_l2_services(device.nso_device_name)
-    except Exception as exc:
-        logger.warning("l2_service.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return False
-
-    services_data = as_list(entry.get("service")) if entry else []
-    await _upsert_l2_saps(db, device, services_data, refresh_source)
-    logger.info(
-        "l2_service.refresh.done",
-        device_id=device.id,
-        device_name=device.nso_device_name,
-        service_count=len(services_data),
-        refresh_source=refresh_source,
-    )
-    return True
+    return await run_family_refresh(db, device, nso_client, L2_SERVICE_SPEC, refresh_source=refresh_source)
 
 
 async def handle_l2_service_change(

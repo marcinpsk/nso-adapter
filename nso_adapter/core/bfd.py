@@ -10,7 +10,10 @@ import structlog
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.read_outcome import EmptyPolicy
+from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceBfdInterface
 
 logger = structlog.get_logger(__name__)
@@ -48,6 +51,16 @@ async def _upsert_bfd_data(
     await db.commit()
 
 
+BFD_SPEC = FamilySpec(
+    name="bfd",
+    empty_policy=EmptyPolicy.pop,
+    getter=lambda client, name: client.get_bfd_config(name),
+    # as_list guards the singleton-rendered-as-bare-dict case (was a raw .get → crash).
+    extract=lambda data: as_list(data.get("interface")),
+    materialize=_upsert_bfd_data,
+)
+
+
 async def refresh_bfd_interfaces_for_device(
     db: AsyncSession,
     device: Device,
@@ -55,26 +68,9 @@ async def refresh_bfd_interfaces_for_device(
     *,
     refresh_source: str = "poll",
 ) -> bool:
-    """Read BFD oper-data for *device* from NSO and upsert DB rows.
+    """Read BFD oper-data for *device* from NSO and upsert DB rows (via the shared engine).
 
     Returns True on a successful read (or nothing to read); False when the NSO read
     failed and the last-known rows were left untouched (a degraded surface).
     """
-    if not device.nso_device_name:
-        logger.debug("bfd.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
-        return True
-    try:
-        entry = await nso_client.get_bfd_config(device.nso_device_name)
-    except Exception as exc:
-        logger.warning("bfd.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return False
-    interfaces = entry.get("interface", []) if entry else []
-    await _upsert_bfd_data(db, device, interfaces, refresh_source)
-    logger.info(
-        "bfd.refresh.done",
-        device_id=device.id,
-        device_name=device.nso_device_name,
-        interface_count=len(interfaces),
-        refresh_source=refresh_source,
-    )
-    return True
+    return await run_family_refresh(db, device, nso_client, BFD_SPEC, refresh_source=refresh_source)
