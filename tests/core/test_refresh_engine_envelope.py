@@ -405,3 +405,34 @@ async def test_real_client_envelope_refresh_end_to_end(adapter_client):
         assert url.endswith("/restconf/data/network-state-export:device-state/device=eng-env-realclient/static-route")
         outcome_row = await _latest_outcome(db, device_id)
         assert (outcome_row.read_outcome, outcome_row.result) == ("present", "replaced")
+
+
+# ── live-found: a store failure that POISONS the session must stay best-effort ──────
+
+
+@pytest.mark.anyio
+async def test_poisoned_session_store_failure_stays_best_effort(adapter_client, monkeypatch):
+    """Found live: the outcome store's INSERT failed at the DB level (missing table on
+    the un-migrated PG), which put the session in pending-rollback and expired the ORM
+    instances — the 'best-effort' handler then crashed on device attribute access
+    (PendingRollbackError), taking the whole refresh down with it. The engine must
+    recover the session and still complete the mirror refresh."""
+    from nso_adapter.store import outcome_store as outcome_store_mod
+
+    device_id = await seed_device(nso_device_name="eng-env-poison", netbox_device_id=9719)
+    await _seed_one_route(device_id)
+    async with _device_session(device_id) as (db, device):
+
+        async def _poisoning_record(db_, device_id_, family, outcome, *, refresh_source):
+            # The live PG failure's EFFECT: the doomed transaction gets rolled back and
+            # every ORM instance expires — then the store raises. (A plain `raise` leaves
+            # the session healthy, which is why the old best-effort test stayed green.)
+            await db_.rollback()
+            raise RuntimeError("relation refresh_outcome does not exist")
+
+        monkeypatch.setattr(outcome_store_mod, "record_read_outcome", _poisoning_record)
+
+        ok = await run_family_refresh(db, device, _client(section=OK_SECTION), ENV_SPEC)
+
+        assert ok is True, "a telemetry-write failure must never fail the refresh"
+        assert await _routes(db, device_id) == ["172.16.0.0/12"], "the mirror must still refresh"

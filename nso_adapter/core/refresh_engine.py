@@ -78,11 +78,27 @@ def _action_semaphore() -> asyncio.Semaphore:
 async def _record_read(
     db: AsyncSession, device: Device, spec: FamilySpec, outcome: ReadOutcome, refresh_source: str
 ) -> int | None:
-    """Best-effort phase-1 outcome record; a store failure must never break the mirror refresh."""
+    """Best-effort phase-1 outcome record; a store failure must never break the mirror refresh.
+
+    A store failure at the DB level (found live: INSERT against an un-migrated PG) dooms
+    the whole transaction and expires every ORM instance — "best-effort" then requires
+    active recovery: log with a PRE-SNAPSHOTTED id (an expired ``device.id`` access
+    raises), roll the doomed transaction back, and re-load the device so the downstream
+    materializer's attribute access stays sync-safe.
+    """
+    device_id = device.id  # snapshot: after a failed flush the instance may be expired
     try:
-        return await outcome_store.record_read_outcome(db, device.id, spec.name, outcome, refresh_source=refresh_source)
+        return await outcome_store.record_read_outcome(db, device_id, spec.name, outcome, refresh_source=refresh_source)
     except Exception as exc:  # noqa: BLE001 — telemetry write; the mirror is the source of truth
-        logger.warning(f"{spec.name}.outcome.read_record_failed", device_id=device.id, error=repr(exc))
+        logger.warning(f"{spec.name}.outcome.read_record_failed", device_id=device_id, error=repr(exc))
+        try:
+            if not db.sync_session.is_active:
+                await db.rollback()  # the transaction was doomed at the DB level
+            await db.refresh(device)  # un-expire; one SELECT, failure path only
+        except Exception as recovery_exc:  # noqa: BLE001 — nothing more we can do; let the refresh try
+            logger.warning(
+                f"{spec.name}.outcome.session_recovery_failed", device_id=device_id, error=repr(recovery_exc)
+            )
         return None
 
 
