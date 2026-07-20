@@ -14,6 +14,7 @@ from nso_adapter.core.vlan import (
     refresh_switchport_for_device,
     refresh_vlan_database_for_device,
 )
+from nso_adapter.nso.client import NsoExportUnavailableError
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, DeviceSwitchport, DeviceVlan
 from tests.conftest import seed_device
@@ -66,3 +67,79 @@ async def test_refresh_switchport_links_vlans(adapter_client):
         assert sp.mode == "trunk"
         uv = await db.get(DeviceVlan, sp.untagged_vlan_id)
         assert uv.vlan_id == 99
+
+
+@pytest.mark.anyio
+async def test_refresh_vlan_database_clear_on_none_prunes_all(adapter_client):
+    """A pop-policy None (container-confirmed absent) prunes every VLAN row (authoritative clear)."""
+    device_id = await seed_device(nso_device_name="vsw-clr", netbox_device_id=1302)
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        nso.get_vlan_database.return_value = {"vlan": [{"vlan-id": 10, "name": "MGMT"}]}
+        await refresh_vlan_database_for_device(db, device, nso)
+        assert (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))).scalars().all()
+
+        nso.get_vlan_database.return_value = None  # container-confirmed absent → clear
+        ok = await refresh_vlan_database_for_device(db, device, nso)
+        assert ok is True
+        rows = (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))).scalars().all()
+        assert rows == []
+
+
+@pytest.mark.anyio
+async def test_refresh_vlan_database_keep_on_export_down(adapter_client):
+    """A confirmed export outage keeps the last-known VLAN rows and reports degraded (False)."""
+    device_id = await seed_device(nso_device_name="vsw-keep", netbox_device_id=1303)
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        nso.get_vlan_database.return_value = {"vlan": [{"vlan-id": 10, "name": "MGMT"}]}
+        await refresh_vlan_database_for_device(db, device, nso)
+
+        nso.get_vlan_database.side_effect = NsoExportUnavailableError("export down")
+        ok = await refresh_vlan_database_for_device(db, device, nso)
+        assert ok is False
+        rows = (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))).scalars().all()
+        assert {r.vlan_id for r in rows} == {10}  # kept
+
+
+@pytest.mark.anyio
+async def test_refresh_switchport_clear_on_none_prunes_all(adapter_client):
+    """A pop-policy None prunes every switchport row (authoritative clear)."""
+    device_id = await seed_device(nso_device_name="vsw-sp-clr", netbox_device_id=1304)
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        nso.get_vlan_database.return_value = {"vlan": [{"vlan-id": 10, "name": "A"}]}
+        await refresh_vlan_database_for_device(db, device, nso)
+        nso.get_switchport.return_value = {"interface": [{"interface-name": "Gi0/1", "mode": "access"}]}
+        await refresh_switchport_for_device(db, device, nso)
+        assert (
+            (await db.execute(select(DeviceSwitchport).where(DeviceSwitchport.device_id == device.id))).scalars().all()
+        )
+
+        nso.get_switchport.return_value = None
+        ok = await refresh_switchport_for_device(db, device, nso)
+        assert ok is True
+        rows = (
+            (await db.execute(select(DeviceSwitchport).where(DeviceSwitchport.device_id == device.id))).scalars().all()
+        )
+        assert rows == []
+
+
+@pytest.mark.anyio
+async def test_refresh_switchport_keep_on_read_error(adapter_client):
+    """A read error keeps the last-known switchport rows and reports degraded (False)."""
+    device_id = await seed_device(nso_device_name="vsw-sp-keep", netbox_device_id=1305)
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        nso.get_vlan_database.return_value = {"vlan": [{"vlan-id": 10, "name": "A"}]}
+        await refresh_vlan_database_for_device(db, device, nso)
+        nso.get_switchport.return_value = {"interface": [{"interface-name": "Gi0/1", "mode": "access"}]}
+        await refresh_switchport_for_device(db, device, nso)
+
+        nso.get_switchport.side_effect = RuntimeError("timeout")
+        ok = await refresh_switchport_for_device(db, device, nso)
+        assert ok is False
+        rows = (
+            (await db.execute(select(DeviceSwitchport).where(DeviceSwitchport.device_id == device.id))).scalars().all()
+        )
+        assert [r.interface_name for r in rows] == ["Gi0/1"]  # kept

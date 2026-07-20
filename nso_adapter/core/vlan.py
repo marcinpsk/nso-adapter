@@ -17,7 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from nso_adapter.core.lag_topology import parse_changed_nso_devices
+from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
     Device,
@@ -62,27 +64,18 @@ def _parse_vlan_string(raw) -> list[int]:
     return sorted(vlans)
 
 
-async def refresh_vlan_database_for_device(
+async def _upsert_vlans(
     db: AsyncSession,
     device: Device,
-    nso_client: NsoClient,
-    *,
-    refresh_source: str = "poll",
-) -> bool:
-    """Read the VLAN database for *device* and upsert+prune DeviceVlan rows.
+    vlans: list[dict],
+    refresh_source: str,
+) -> None:
+    """Diff-by-key materializer: upsert each read VLAN by vlan-id, prune the unseen.
 
-    Returns True on a successful read (or an intentional skip); False when the NSO read
-    failed and the last-known rows were left untouched (a degraded surface).
+    NOT a full-replace — existing rows are updated in place so their FKs (switchport
+    untagged/tagged links) survive. An empty *vlans* list (the AbsentAuthoritative clear)
+    prunes every row, which is the correct authoritative clear.
     """
-    if not device.nso_device_name:
-        return True
-    try:
-        entry = await nso_client.get_vlan_database(device.nso_device_name)
-    except Exception as exc:
-        logger.warning("vlan.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return False
-
-    vlans = as_list((entry or {}).get("vlan") or (entry or {}).get("vlans"))
     existing = {
         r.vlan_id: r
         for r in (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))).scalars().all()
@@ -104,34 +97,46 @@ async def refresh_vlan_database_for_device(
         if vid not in seen:
             await db.delete(row)
     await db.commit()
-    logger.info("vlan.refresh.done", device_id=device.id, vlans=len(seen), source=refresh_source)
-    return True
 
 
-async def refresh_switchport_for_device(
+VLAN_DATABASE_SPEC = FamilySpec(
+    name="vlan",
+    empty_policy=EmptyPolicy.pop,  # config family: a container-confirmed 404 is an authoritative clear
+    getter=lambda client, name: client.get_vlan_database(name),
+    # as_list guards the singleton-rendered-as-bare-dict case; extract({}) → [] → prune all (clear).
+    extract=lambda data: as_list(data.get("vlan") or data.get("vlans")),
+    materialize=_upsert_vlans,
+)
+
+
+async def refresh_vlan_database_for_device(
     db: AsyncSession,
     device: Device,
     nso_client: NsoClient,
     *,
     refresh_source: str = "poll",
 ) -> bool:
-    """Read switchport state for *device* and upsert+prune DeviceSwitchport rows.
-
-    Resolves untagged/tagged VLAN ids to the device's DeviceVlan rows (by vlan-id);
-    unknown vlan-ids are simply left unlinked (untagged) / skipped (tagged).
+    """Read the VLAN database for *device* and upsert+prune DeviceVlan rows (via the shared refresh engine).
 
     Returns True on a successful read (or an intentional skip); False when the NSO read
     failed and the last-known rows were left untouched (a degraded surface).
     """
-    if not device.nso_device_name:
-        return True
-    try:
-        entry = await nso_client.get_switchport(device.nso_device_name)
-    except Exception as exc:
-        logger.warning("switchport.refresh.nso_error", device_id=device.id, error=repr(exc))
-        return False
+    return await run_family_refresh(db, device, nso_client, VLAN_DATABASE_SPEC, refresh_source=refresh_source)
 
-    interfaces = as_list((entry or {}).get("interface") or (entry or {}).get("interfaces"))
+
+async def _upsert_switchports(
+    db: AsyncSession,
+    device: Device,
+    interfaces: list[dict],
+    refresh_source: str,
+) -> None:
+    """Diff-by-key materializer: upsert each switchport by interface-name, prune the unseen.
+
+    Resolves untagged/tagged VLAN ids to the device's DeviceVlan rows (by vlan-id) — so the
+    VLAN database must already be refreshed (caller ordering); unknown vlan-ids are left
+    unlinked (untagged) / skipped (tagged). An empty *interfaces* list (the AbsentAuthoritative
+    clear) prunes every switchport.
+    """
     vlan_by_vid = {
         r.vlan_id: r
         for r in (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))).scalars().all()
@@ -174,8 +179,34 @@ async def refresh_switchport_for_device(
         if name not in seen:
             await db.delete(row)
     await db.commit()
-    logger.info("switchport.refresh.done", device_id=device.id, interfaces=len(seen), source=refresh_source)
-    return True
+
+
+SWITCHPORT_SPEC = FamilySpec(
+    name="switchport",
+    empty_policy=EmptyPolicy.pop,  # config family: a container-confirmed 404 is an authoritative clear
+    getter=lambda client, name: client.get_switchport(name),
+    # as_list guards the singleton-rendered-as-bare-dict case; extract({}) → [] → prune all (clear).
+    extract=lambda data: as_list(data.get("interface") or data.get("interfaces")),
+    materialize=_upsert_switchports,
+)
+
+
+async def refresh_switchport_for_device(
+    db: AsyncSession,
+    device: Device,
+    nso_client: NsoClient,
+    *,
+    refresh_source: str = "poll",
+) -> bool:
+    """Read switchport state for *device* and upsert+prune DeviceSwitchport rows (via the shared refresh engine).
+
+    Resolves untagged/tagged VLAN ids to the device's DeviceVlan rows (by vlan-id);
+    unknown vlan-ids are simply left unlinked (untagged) / skipped (tagged).
+
+    Returns True on a successful read (or an intentional skip); False when the NSO read
+    failed and the last-known rows were left untouched (a degraded surface).
+    """
+    return await run_family_refresh(db, device, nso_client, SWITCHPORT_SPEC, refresh_source=refresh_source)
 
 
 async def _handle_change(event_data, db, nso_clients, refresh_fn) -> None:
