@@ -74,6 +74,10 @@ class SchedulerConfig(BaseModel):
     enable_snmp_sync: bool = True
     enable_logging_sync: bool = True
     enable_bfd_sync: bool = True
+    # bfd otherwise refreshes only via sync_device's fan-out (scoped devices) + SSE — so an
+    # UNSCOPED nso-managed device never self-heals its bfd mirror. This per-family poll closes
+    # that gap, matching isis/bgp/ospf (polls every nso-named device, not just scoped ones).
+    bfd_poll_interval: int = 300
     snmp_poll_interval: int = 300
     logging_poll_interval: int = 300
     enable_static_routing_sync: bool = True

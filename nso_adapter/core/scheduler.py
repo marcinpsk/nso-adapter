@@ -318,6 +318,18 @@ async def _scheduled_isis_refresh() -> None:
     await _refresh_all_devices(refresh_isis_interfaces_for_device, "isis")
 
 
+async def _scheduled_bfd_refresh() -> None:
+    """Periodic fallback: refresh BFD interfaces for all managed devices.
+
+    bfd otherwise refreshes only via sync_device's fan-out (scoped devices) + SSE, so an
+    UNSCOPED nso-managed device never self-heals its bfd mirror. This poll covers every
+    nso-named device (via _refresh_all_devices), not just those with a ManagedScope.
+    """
+    from nso_adapter.core.bfd import refresh_bfd_interfaces_for_device
+
+    await _refresh_all_devices(refresh_bfd_interfaces_for_device, "bfd")
+
+
 async def _scheduled_bgp_refresh() -> None:
     """Periodic fallback: refresh BGP config for all managed devices."""
     from nso_adapter.core.bgp import refresh_bgp_config_for_device
@@ -647,6 +659,7 @@ _JOB_SPECS: tuple[_JobSpec, ...] = (
         True,
     ),
     _JobSpec(_scheduled_isis_refresh, "isis_refresh", "isis_poll_interval", "enable_isis_sync", True),
+    _JobSpec(_scheduled_bfd_refresh, "bfd_refresh", "bfd_poll_interval", "enable_bfd_sync", True),
     _JobSpec(_scheduled_bgp_refresh, "bgp_refresh", "bgp_poll_interval", "enable_bgp_sync", True),
     _JobSpec(_scheduled_ospf_refresh, "ospf_refresh", "ospf_poll_interval", "enable_ospf_sync", True),
     _JobSpec(

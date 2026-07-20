@@ -53,6 +53,7 @@ _WRAPPERS = [
     ("_scheduled_interface_ip_refresh", "nso_adapter.core.interface_ip.refresh_interface_ips_for_device"),
     ("_scheduled_static_route_refresh", "nso_adapter.core.static_route.refresh_static_routes_for_device"),
     ("_scheduled_isis_refresh", "nso_adapter.core.isis.refresh_isis_interfaces_for_device"),
+    ("_scheduled_bfd_refresh", "nso_adapter.core.bfd.refresh_bfd_interfaces_for_device"),
     ("_scheduled_bgp_refresh", "nso_adapter.core.bgp.refresh_bgp_config_for_device"),
     ("_scheduled_ospf_refresh", "nso_adapter.core.ospf.refresh_ospf_for_device"),
     ("_scheduled_redistribution_refresh", "nso_adapter.core.redistribution.refresh_redistribution_for_device"),
@@ -78,6 +79,18 @@ async def test_family_refresh_wrapper_refreshes_all_devices(adapter_client, monk
     assert all(c.kwargs["refresh_source"] == "poll" for c in refresh.await_args_list)
     # The resolved client must reach refresh as the 3rd positional arg (db, device, nso_client, ...).
     assert all(c.args[2] is nso_client for c in refresh.await_args_list)
+
+
+def test_bfd_poll_job_is_registered():
+    """bfd had NO periodic poll job, so an unscoped device (no ManagedScope → never hit by
+    _scheduled_sync_all's fan-out) never self-healed its bfd mirror. It must be a first-class
+    poll family like isis/bgp/ospf: its own _JobSpec, interval, and enable flag."""
+    by_id = {spec.job_id: spec for spec in sched._JOB_SPECS}
+    assert "bfd_refresh" in by_id, "bfd is missing a periodic poll job (_JobSpec)"
+    spec = by_id["bfd_refresh"]
+    assert spec.interval_attr == "bfd_poll_interval"
+    assert spec.enable_attr == "enable_bfd_sync"
+    assert spec.gate_on_interval is True
 
 
 @pytest.mark.anyio
