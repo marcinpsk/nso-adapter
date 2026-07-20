@@ -225,6 +225,75 @@ async def test_refresh_handles_nso_none_gracefully(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_refresh_clears_stale_rows_when_device_reports_none(adapter_client):
+    """Operator removed all SNMP config → export 404s (client → None) → mirror CLEARS.
+
+    snmp-config is a pop-on-empty export family: a synced device that genuinely carries
+    no SNMP config 404s (never a present-empty entry), and per the export's deliberate
+    design that None is authoritative. So the adapter must delete the previously-mirrored
+    rows to match — unlike interface_ip (a present-empty family that keeps-on-None).
+
+    RED against the old ``if not entry: return True`` keep-guard, which left the rows
+    stranded forever after a legitimate removal.
+    """
+    device_id = await seed_device(nso_device_name="snmp-clear-sw01", netbox_device_id=969)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        # First refresh — a device with a full spread of SNMP config across all four tables.
+        nso_client.get_snmp_config.return_value = {
+            "name": "snmp-clear-sw01",
+            "community": [{"name": "clear_me_abcd1234", "access": "RO"}],
+            "v3-user": [{"username": "monitor", "has-auth-secret": True, "has-priv-secret": False}],
+            "host": [{"address": "10.0.9.9", "version": "2c", "notify-type": "trap"}],
+            "location": "ITC-Lab",
+            "contact": "noc@example.com",
+        }
+        await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
+
+        # Sanity: every table populated before the removal.
+        for model in (SnmpCommunity, SnmpV3User, SnmpHost, SnmpSystemInfo):
+            rows = (await db.execute(select(model).where(model.device_id == device.id))).scalars().all()
+            assert rows, f"{model.__name__} should be seeded before the clear"
+
+        # Second refresh — the export now 404s (operator removed all SNMP config).
+        nso_client.get_snmp_config.return_value = None
+        result = await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
+
+        # A clean 404 is a successful (authoritative-empty) read, not a degraded one.
+        assert result is True
+        # Every table must be cleared — no stale rows survive the removal.
+        for model in (SnmpCommunity, SnmpV3User, SnmpHost, SnmpSystemInfo):
+            rows = (await db.execute(select(model).where(model.device_id == device.id))).scalars().all()
+            assert rows == [], f"{model.__name__} rows should be cleared when the device reports None"
+
+
+@pytest.mark.anyio
+async def test_refresh_keeps_rows_on_read_error(adapter_client):
+    """A transient read FAILURE (not a 404) leaves the last-known rows untouched.
+
+    Locks in the distinction the clear-on-None fix depends on: ``entry is None`` is an
+    authoritative empty (clear), but an exception is a degraded read (keep + return False).
+    """
+    device_id = await seed_device(nso_device_name="snmp-degraded-sw01", netbox_device_id=970)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_snmp_config.return_value = {
+            "name": "snmp-degraded-sw01",
+            "community": [{"name": "keep_me_efgh5678", "access": "RW"}],
+        }
+        await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
+
+        # A subsequent read blows up (transport error, NSO mid-reload, ...).
+        nso_client.get_snmp_config.side_effect = Exception("RESTCONF transport error")
+        result = await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
+
+        assert result is False  # degraded surface
+        rows = (await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device.id))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].community_hash == "keep_me_efgh5678"
+
+
+@pytest.mark.anyio
 async def test_handle_snmp_config_change_dispatches_to_affected_devices(adapter_client):
     """SSE event → refresh is triggered for each affected managed device."""
     device_id = await seed_device(nso_device_name="snmp-sse-sw01", netbox_device_id=968)

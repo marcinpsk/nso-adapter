@@ -18,7 +18,7 @@ import structlog
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.nso.client import NsoClient
+from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
 from nso_adapter.store.models import Device, DeviceRedistribution
 
 logger = structlog.get_logger(__name__)
@@ -98,6 +98,12 @@ async def refresh_redistribution_for_device(
     now = datetime.now(UTC).replace(tzinfo=None)
     rows: list[DeviceRedistribution] = []
     ok = True
+    # A per-protocol read error (5xx / parse) still full-replaces from whatever succeeded — one
+    # broken protocol must not freeze the other two (graceful partial failure). But a CONFIRMED
+    # fleet-wide export outage (NsoExportUnavailableError: the getter probed the parent container
+    # and it too was 404) means the whole export is down and every protocol would report empty —
+    # full-replacing then would wipe this device's redistribution mirror over a transient blip.
+    outage = False
 
     # ── OSPF ─────────────────────────────────────────────────────────────────
     try:
@@ -108,6 +114,7 @@ async def refresh_redistribution_for_device(
     except Exception as exc:
         logger.warning("redistribution.refresh.ospf_error", device_id=device.id, error=repr(exc))
         ok = False
+        outage = outage or isinstance(exc, NsoExportUnavailableError)
 
     # ── ISIS ─────────────────────────────────────────────────────────────────
     try:
@@ -118,6 +125,7 @@ async def refresh_redistribution_for_device(
     except Exception as exc:
         logger.warning("redistribution.refresh.isis_error", device_id=device.id, error=repr(exc))
         ok = False
+        outage = outage or isinstance(exc, NsoExportUnavailableError)
 
     # ── BGP ──────────────────────────────────────────────────────────────────
     try:
@@ -135,8 +143,20 @@ async def refresh_redistribution_for_device(
     except Exception as exc:
         logger.warning("redistribution.refresh.bgp_error", device_id=device.id, error=repr(exc))
         ok = False
+        outage = outage or isinstance(exc, NsoExportUnavailableError)
 
     # ── Upsert ───────────────────────────────────────────────────────────────
+    if outage:
+        # Confirmed fleet-wide export outage — leave the last-known rows untouched rather than
+        # full-replacing them away over a transient blip (the fleet-wide clobber the container
+        # probe exists to prevent). A per-protocol error (ok=False, outage=False) still falls
+        # through and full-replaces from whatever succeeded.
+        logger.warning(
+            "redistribution.refresh.degraded",
+            device_id=device.id,
+            device_name=device.nso_device_name,
+        )
+        return False
     await db.execute(delete(DeviceRedistribution).where(DeviceRedistribution.device_id == device.id))
     # First-wins in-refresh dedup: a duplicate identity tuple in the export would otherwise
     # IntegrityError on commit and roll back the whole full-replace (uq_deviceredistribution_identity).

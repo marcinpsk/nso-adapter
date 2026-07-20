@@ -419,9 +419,17 @@ async def test_device_oper_getter_returns_entry_and_targets_resource(method, res
     assert f"network-state-export:{resource}/device=sw01" in transport.url
 
 
+# The clear-on-None families confirm a bare 404 against the parent container before returning None
+# (their refresher DELETES the mirror on None, so a false None wipes the whole fleet's rows), so
+# they are exercised by the parametrized probe test below — not this single-404-for-everything one.
+# Only the keep-on-None inventory families (interface-ip / interface-attributes) map 404 → None.
+_KEEP_ON_NONE = {"get_interface_ips", "get_interface_attributes"}
+_PROBE_ON_404 = {m for m, _ in _DEVICE_OPER_METHODS if m not in _KEEP_ON_NONE}
+
+
 @pytest.mark.parametrize(
     ("method", "resource"),
-    [(m, r) for m, r in _DEVICE_OPER_METHODS if m != "get_route_policy"],
+    [(m, r) for m, r in _DEVICE_OPER_METHODS if m not in _PROBE_ON_404],
 )
 async def test_device_oper_getter_returns_none_on_404(method, resource):
     client = _make_client()
@@ -497,6 +505,54 @@ async def test_route_policy_happy_path_does_not_probe():
     transport = _capture(client, 200, {"network-state-export:device": [{"device-name": "sw01"}]})
     assert await client.get_route_policy("sw01") == {"device-name": "sw01"}
     assert "/device=sw01" in transport.url
+
+
+# ── every clear-on-None getter confirms a bare 404 before it is believed ───────────────────────
+#
+# Each of these families' refresher DELETES the device's mirror when the getter returns None. A
+# mid-`packages reload` / package-down 404 hits EVERY device at once, so a getter that mapped it
+# straight to None would wipe that family's mirror for the whole fleet in one scheduler pass,
+# reported as a successful refresh. get_route_policy pioneered the parent-container confirmation;
+# this parametrizes the same contract across all of them (see NsoClient._get_device_oper_entry).
+
+
+@pytest.mark.parametrize(
+    ("method", "resource"),
+    [(m, r) for m, r in _DEVICE_OPER_METHODS if m in _PROBE_ON_404],
+)
+async def test_clear_on_none_getter_confirms_404_against_container(method, resource):
+    # (1) export healthy, this device simply absent → None, after confirming. container_status=200
+    # is ALSO the globally-empty case (the last device removed its config): the top container carries
+    # its own tailf:callpoint, so it answers 200 with an empty device list whenever the package is up
+    # — never a 404 — so the last device's rows still clear (regression guard for a refuted review P1).
+    client = _make_client()
+    transport = _path_aware(client, device_status=404, container_status=200)
+    assert await getattr(client, method)("sw01") is None
+    assert len(transport.urls) == 2, f"{method}: the 404 must be confirmed against the parent container"
+
+    # (2) whole export gone (every device 404s) → raise, never a silent fleet-wide wipe.
+    client_missing = _make_client()
+    _path_aware(client_missing, device_status=404, container_status=404)
+    with pytest.raises(NsoExportUnavailableError, match="not exported"):
+        await getattr(client_missing, method)("sw01")
+
+    # (3) a 500 on the probe is a failure too — never silently a delete.
+    client_broken = _make_client()
+    _path_aware(client_broken, device_status=404, container_status=500)
+    with pytest.raises(httpx.HTTPStatusError):
+        await getattr(client_broken, method)("sw01")
+
+
+@pytest.mark.parametrize(
+    ("method", "resource"),
+    [(m, r) for m, r in _DEVICE_OPER_METHODS if m in _KEEP_ON_NONE],
+)
+async def test_keep_on_none_getter_does_not_probe_on_404(method, resource):
+    """interface-ip / interface-attributes never delete on None, so a bare 404 → None, no probe."""
+    client = _make_client()
+    transport = _path_aware(client, device_status=404, container_status=200)
+    assert await getattr(client, method)("sw01") is None
+    assert len(transport.urls) == 1, f"{method}: keep-on-None must NOT probe the container"
 
 
 @pytest.mark.parametrize(("method", "resource"), _DEVICE_OPER_METHODS)

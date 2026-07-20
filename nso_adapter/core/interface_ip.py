@@ -90,6 +90,14 @@ async def refresh_interface_ips_for_device(
         # `interface` list (200 — see network-state-export ips.py `_refresh_device`), so a real
         # total-clear still wipes below. Keep the last-known rows rather than committing an empty
         # mirror over a transient/absent read (the onboarding empty-wipe class).
+        #
+        # Contract note — do NOT copy this keep-on-None to the other refreshers. interface_ip
+        # (and interface-attrs) are PRESENT-EMPTY "inventory" families: a synced device always
+        # returns 200, so None means only unsupported-NED and keeping is safe. Every *config*
+        # family (snmp, lag, svi, subinterface, vlan, static-route, isis, ospf, bgp, bfd, mtu,
+        # logging, route-policy, ...) is POP-ON-EMPTY by deliberate export design: a synced-but-
+        # empty device 404s so the adapter CLEARS. There, None is authoritative and keep-on-None
+        # would strand legitimately-removed rows — clear-on-None is correct (see core/snmp.py).
         logger.info(
             "interface_ip.refresh.empty_suspect",
             device_id=device.id,

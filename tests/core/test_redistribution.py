@@ -11,6 +11,7 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.core.redistribution import refresh_redistribution_for_device
+from nso_adapter.nso.client import NsoExportUnavailableError
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, DeviceRedistribution
 from tests.conftest import seed_device
@@ -176,6 +177,47 @@ async def test_refresh_full_replace_semantics(adapter_client):
         rows = result.scalars().all()
         assert len(rows) == 1
         assert rows[0].source_protocol == "static"
+
+
+@pytest.mark.anyio
+async def test_refresh_keeps_rows_when_a_read_is_degraded(adapter_client):
+    """A degraded read must NOT full-replace — the last-known rows are kept, refresh returns False.
+
+    redistribution reads three exports (ospf/isis/bgp). When one raises — e.g. a fleet-wide outage
+    mid-`packages reload`, where the getter confirms the 404 against the parent container and raises
+    NsoExportUnavailableError — full-replacing would wipe this device's redistribution mirror over a
+    transient blip. RED against the old unconditional delete, which wiped the rows even though the
+    read was degraded (ok=False).
+    """
+    device_id = await seed_device(nso_device_name="rd-degraded-sw01", netbox_device_id=7715)
+    async with _device_session(device_id) as (db, device):
+        # Seed rows via a healthy refresh.
+        nso_client = _nso_client_with_data(
+            ospf={"instance": [{"process-id": 1, "redistribute": [{"source-protocol": "connected", "source-ref": ""}]}]}
+        )
+        await refresh_redistribution_for_device(db, device, nso_client, refresh_source="test")
+        seeded = (
+            (await db.execute(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        assert len(seeded) == 1
+
+        # A subsequent refresh hits a fleet-wide export outage: the ospf getter raises.
+        degraded = _nso_client_with_data(bgp={"router": []}, isis={"process": []})
+        degraded.get_ospf.side_effect = NsoExportUnavailableError(
+            "network-state-export:ospf-config is not exported by NSO"
+        )
+        result = await refresh_redistribution_for_device(db, device, degraded, refresh_source="test")
+
+        assert result is False  # degraded surface
+        rows = (
+            (await db.execute(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1  # kept, NOT wiped over the transient outage
+        assert rows[0].source_protocol == "connected"
 
 
 @pytest.mark.anyio
