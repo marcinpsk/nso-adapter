@@ -148,18 +148,25 @@ async def refresh_redistribution_for_device(
         logger.debug("redistribution.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
         return True
 
-    # Classify each component's envelope section independently (pop policy: a confirmed
-    # DEVICE absence is an authoritative clear for every partition).
-    outcomes: dict[str, ReadOutcome] = {}
-    for proto, wire_name, _builder in _REDIST_COMPONENTS:
-        outcomes[proto] = await classify_envelope_family_read(
-            device,
-            nso_client,
-            wire_name=wire_name,
-            empty_policy=EmptyPolicy.pop,
-            family_name=f"redistribution.{proto}",
+    # Whole-span family lock (codex S3-R4): classify + materialize under "redistribution",
+    # so the projected batch (which holds the same key) and this poll cannot interleave an
+    # older snapshot over a newer one. Lock-before-semaphore ordering is preserved (the
+    # escalation inside classify takes the shared action semaphore).
+    from nso_adapter.core import refresh_engine as _engine
+
+    async with _engine._family_lock(device.id, "redistribution"):
+        outcomes: dict[str, ReadOutcome] = {}
+        for proto, wire_name, _builder in _REDIST_COMPONENTS:
+            outcomes[proto] = await classify_envelope_family_read(
+                device,
+                nso_client,
+                wire_name=wire_name,
+                empty_policy=EmptyPolicy.pop,
+                family_name=f"redistribution.{proto}",
+            )
+        return await refresh_redistribution_from_outcomes(
+            db, device, outcomes, refresh_source=refresh_source, own_lock=False
         )
-    return await refresh_redistribution_from_outcomes(db, device, outcomes, refresh_source=refresh_source)
 
 
 async def refresh_redistribution_from_outcomes(
@@ -168,6 +175,7 @@ async def refresh_redistribution_from_outcomes(
     outcomes: dict[str, ReadOutcome],
     *,
     refresh_source: str = "sync",
+    own_lock: bool = True,
 ) -> bool:
     """Aggregate + materialize from PRE-CLASSIFIED component outcomes.
 
@@ -180,7 +188,14 @@ async def refresh_redistribution_from_outcomes(
     back + terminalize the same attempt; commit-time death → recover the session + a
     fresh terminal row); phase 2 terminalizes on success.
     """
+    from nso_adapter.core import refresh_engine as _engine
     from nso_adapter.core.refresh_engine import _recover_session
+
+    if own_lock:
+        async with _engine._family_lock(device.id, "redistribution"):
+            return await refresh_redistribution_from_outcomes(
+                db, device, outcomes, refresh_source=refresh_source, own_lock=False
+            )
 
     name = device.nso_device_name
     device_id = device.id
@@ -223,33 +238,7 @@ async def refresh_redistribution_from_outcomes(
     rebuilt: list[DeviceRedistribution] = []
     savepoint = await db.begin_nested()
     try:
-        for proto, _wire_name, builder in _REDIST_COMPONENTS:
-            outcome = outcomes[proto]
-            if isinstance(outcome, (Present, AbsentAuthoritative)):
-                entry = outcome.data if isinstance(outcome, Present) else {}
-                await db.execute(
-                    delete(DeviceRedistribution).where(
-                        DeviceRedistribution.device_id == device_id,
-                        DeviceRedistribution.dest_protocol == proto,
-                    )
-                )
-                rebuilt.extend(builder(device_id, entry, now, refresh_source))
-            elif isinstance(outcome, Unavailable) and outcome.reason is UnavailableReason.unsupported:
-                logger.info(
-                    "redistribution.refresh.component_unsupported",
-                    device_id=device_id,
-                    device_name=name,
-                    protocol=proto,
-                )
-            else:
-                logger.warning(
-                    "redistribution.refresh.component_kept",
-                    device_id=device_id,
-                    device_name=name,
-                    protocol=proto,
-                    reason=outcome.reason.value,
-                )
-
+        rebuilt = await _rebuild_partitions(db, device_id, name, outcomes, now, refresh_source)
         # First-wins in-refresh dedup: a duplicate identity tuple in the export would otherwise
         # IntegrityError on commit (uq_deviceredistribution_identity).
         seen: set[tuple[str, str, str, str]] = set()
@@ -321,3 +310,42 @@ async def _record_composite(
     except Exception as exc:  # noqa: BLE001 — telemetry write; the mirror is the source of truth
         logger.warning("redistribution.outcome.record_failed", device_id=device_id, error=repr(exc))
         await _recover_session(db, device, "redistribution", device_id)
+
+
+async def _rebuild_partitions(
+    db: AsyncSession,
+    device_id: int,
+    name: str,
+    outcomes: dict[str, ReadOutcome],
+    now: datetime,
+    refresh_source: str,
+) -> list[DeviceRedistribution]:
+    """Apply the per-component aggregation (R1-F7): replace / keep-unsupported / keep-failed."""
+    rebuilt: list[DeviceRedistribution] = []
+    for proto, _wire_name, builder in _REDIST_COMPONENTS:
+        outcome = outcomes[proto]
+        if isinstance(outcome, (Present, AbsentAuthoritative)):
+            entry = outcome.data if isinstance(outcome, Present) else {}
+            await db.execute(
+                delete(DeviceRedistribution).where(
+                    DeviceRedistribution.device_id == device_id,
+                    DeviceRedistribution.dest_protocol == proto,
+                )
+            )
+            rebuilt.extend(builder(device_id, entry, now, refresh_source))
+        elif isinstance(outcome, Unavailable) and outcome.reason is UnavailableReason.unsupported:
+            logger.info(
+                "redistribution.refresh.component_unsupported",
+                device_id=device_id,
+                device_name=name,
+                protocol=proto,
+            )
+        else:
+            logger.warning(
+                "redistribution.refresh.component_kept",
+                device_id=device_id,
+                device_name=name,
+                protocol=proto,
+                reason=outcome.reason.value,
+            )
+    return rebuilt

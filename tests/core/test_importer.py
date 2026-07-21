@@ -1563,3 +1563,60 @@ async def test_sync_device_atomic_reaches_the_action_not_the_doc(db_session: Asy
     args, kwargs = nso_client.run_device_state_read.await_args
     assert kwargs.get("timeout") == 360.0
     nso_client.get_device_state_doc.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_projected_batch_locks_by_spec_name_and_covers_redistribution(db_session: AsyncSession, monkeypatch):
+    """Codex S3-R4: the batch must lock the SAME identities grain-a locks — spec.name
+    (lag_topology's spec is named 'lag'; a label-keyed lock excludes no one) — and
+    redistribution must be inside the lock regime (its poll job can otherwise interleave
+    a newer snapshot between the batch's fetch and apply)."""
+    from nso_adapter.core import refresh_engine as engine_mod
+    from nso_adapter.core.importer import refresh_all_surfaces_for_device
+
+    device = Device(nso_instance="nso-dev", nso_device_name="sw-locks", ned_id="x", netbox_device_id=7)
+    db_session.add(device)
+    await db_session.commit()
+
+    acquired: list[str] = []
+    real_lock = engine_mod._family_lock
+
+    def _recording_lock(device_id, family):
+        acquired.append(family)
+        return real_lock(device_id, family)
+
+    monkeypatch.setattr(engine_mod, "_family_lock", _recording_lock)
+    # the importer resolves _family_lock at call time from the engine module
+    nso_client = AsyncMock(spec=NsoClient)
+    nso_client.get_device_state_doc.return_value = {"device-name": "sw-locks"}  # sections coerce to error
+
+    await refresh_all_surfaces_for_device(db_session, device, nso_client, refresh_source="sync")
+
+    assert "lag" in acquired, acquired
+    assert "lag_topology" not in acquired, "label-keyed lock would exclude nobody (grain-a locks 'lag')"
+    assert "redistribution" in acquired, "redistribution must join the batch lock regime"
+
+
+@pytest.mark.anyio
+async def test_standalone_redistribution_takes_its_family_lock(db_session: AsyncSession, monkeypatch):
+    from nso_adapter.core import refresh_engine as engine_mod
+    from nso_adapter.core.redistribution import refresh_redistribution_for_device
+
+    device = Device(nso_instance="nso-dev", nso_device_name="sw-rlock", ned_id="x", netbox_device_id=8)
+    db_session.add(device)
+    await db_session.commit()
+
+    acquired: list[str] = []
+    real_lock = engine_mod._family_lock
+
+    def _recording_lock(device_id, family):
+        acquired.append(family)
+        return real_lock(device_id, family)
+
+    monkeypatch.setattr(engine_mod, "_family_lock", _recording_lock)
+    nso_client = AsyncMock(spec=NsoClient)
+    nso_client.get_device_state_section.return_value = {"status": "ok"}
+
+    await refresh_redistribution_for_device(db_session, device, nso_client, refresh_source="poll")
+
+    assert "redistribution" in acquired, acquired

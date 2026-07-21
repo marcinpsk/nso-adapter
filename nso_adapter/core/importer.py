@@ -282,8 +282,8 @@ async def _run_surfaces_projected(
     """
     from contextlib import AsyncExitStack
 
+    from nso_adapter.core import refresh_engine as _engine
     from nso_adapter.core.redistribution import _REDIST_COMPONENTS, refresh_redistribution_from_outcomes
-    from nso_adapter.core.refresh_engine import _family_lock
 
     spec_by_name = {name: _projectable_spec(name) for name, _ in surfaces}
     wire_names = [spec.wire_name for spec in spec_by_name.values() if spec is not None]
@@ -298,9 +298,14 @@ async def _run_surfaces_projected(
     # our apply, and the delayed projection overwrites it with older data. Sorted
     # acquisition (single order, no nesting elsewhere) keeps it deadlock-free; the apply
     # calls below pass own_lock=False.
+    # Codex S3-R4: lock the SPEC NAMES (grain-a's identities — lag_topology's spec is
+    # named "lag"; a label-keyed lock excludes no one) + redistribution's own key.
+    lock_names = {spec.name for spec in spec_by_name.values() if spec is not None}
+    if "redistribution" in spec_by_name:
+        lock_names.add("redistribution")
     async with AsyncExitStack() as lock_stack:
-        for name in sorted(n for n, spec in spec_by_name.items() if spec is not None):
-            await lock_stack.enter_async_context(_family_lock(device.id, name))
+        for lock_name in sorted(lock_names):
+            await lock_stack.enter_async_context(_engine._family_lock(device.id, lock_name))
         sections, supplier_outcome = await _fetch_projection(nso_client, device, wire_names, atomic=atomic)
 
         failed: list[str] = []
@@ -319,7 +324,7 @@ async def _run_surfaces_projected(
                             for proto, w, _b in _REDIST_COMPONENTS
                         }
                     ok = await refresh_redistribution_from_outcomes(
-                        db, device, component_outcomes, refresh_source=refresh_source
+                        db, device, component_outcomes, refresh_source=refresh_source, own_lock=False
                     )
                 elif spec is None:
                     ok = await fn(db, device, nso_client, refresh_source=refresh_source)
