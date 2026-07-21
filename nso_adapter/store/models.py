@@ -56,9 +56,6 @@ class JobStatus(str, enum.Enum):
 
 class JobType(str, enum.Enum):
     sync = "sync"
-    # Operator-triggered Sync-Now: same body as sync but READSEM grain c - the mirror
-    # fan-out reads ONE atomic device-state-read build instead of the record-served doc.
-    sync_now = "sync_now"
     # value MUST equal the name: Enum(JobType) persists the member NAME, so a divergent
     # value silently misses a raw-value filter/write or DataErrors (was "detect-drift").
     detect_drift = "detect_drift"
@@ -66,6 +63,11 @@ class JobType(str, enum.Enum):
     apply = "apply"  # Phase 2: push accepted intent to NSO
     removal = "removal"  # async PUT-replace to revert removed intent (see core/removal.py)
     provision = "provision"  # async device onboarding into NSO (see core/onboarding.provision_nso_device)
+    # Operator-triggered Sync-Now: same body as sync but READSEM grain c - the mirror
+    # fan-out reads ONE atomic device-state-read build instead of the record-served doc.
+    # Declared LAST: its migration appends via ALTER TYPE ADD VALUE, so the deployed pg
+    # enum has it last — member order must match or the schema-parity gate diffs.
+    sync_now = "sync_now"
 
 
 class SyncState(str, enum.Enum):
