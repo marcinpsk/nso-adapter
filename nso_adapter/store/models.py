@@ -56,6 +56,9 @@ class JobStatus(str, enum.Enum):
 
 class JobType(str, enum.Enum):
     sync = "sync"
+    # Operator-triggered Sync-Now: same body as sync but READSEM grain c - the mirror
+    # fan-out reads ONE atomic device-state-read build instead of the record-served doc.
+    sync_now = "sync_now"
     # value MUST equal the name: Enum(JobType) persists the member NAME, so a divergent
     # value silently misses a raw-value filter/write or DataErrors (was "detect-drift").
     detect_drift = "detect_drift"

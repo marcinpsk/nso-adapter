@@ -73,13 +73,13 @@ async def test_trigger_success_enqueues_real_job(adapter_client):
 # ── individual action endpoints ───────────────────────────────────────────────
 
 
-async def test_action_sync_enqueues_sync_job(adapter_client):
-    """action_sync enqueues a real job of type sync."""
+async def test_action_sync_enqueues_sync_now_job(adapter_client):
+    """Operator Sync-Now enqueues the grain-c ATOMIC job type (READSEM S3 B7)."""
     device_id = await _seed_device("actions-sync-01", 1320)
     async for db in get_session():
         result = await action_sync(device_id=device_id, db=db)
         job = await db.get(Job, result["job_id"])
-        assert job.job_type == JobType.sync
+        assert job.job_type == JobType.sync_now
         assert job.status == JobStatus.queued
         break
 

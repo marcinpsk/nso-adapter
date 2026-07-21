@@ -120,7 +120,10 @@ async def action_sync(
     device_id: int,
     db: AsyncSession = Depends(get_db),
 ):
-    return await _trigger(device_id, JobType.sync, db)
+    # Operator Sync-Now = READSEM grain c: the mirror fan-out reads ONE atomic
+    # device-state-read build. The plugin's sync-notify below stays grain b (automatic,
+    # frequent - the record-served projection).
+    return await _trigger(device_id, JobType.sync_now, db)
 
 
 @router.post(

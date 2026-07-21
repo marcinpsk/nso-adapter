@@ -52,7 +52,14 @@ _EMPTY_POLL_INTERVAL = 2.0
 # re-reads the CURRENT accepted rows and PUT-replaces, so re-running only
 # re-asserts the already-decided desired state (idempotent), and dropping it
 # would leave orphaned device config behind.
-_REQUEUE_ON_RESTART = {JobType.sync, JobType.detect_drift, JobType.connect, JobType.removal, JobType.provision}
+_REQUEUE_ON_RESTART = {
+    JobType.sync,
+    JobType.sync_now,  # idempotent read (grain-c atomic mirror refresh)
+    JobType.detect_drift,
+    JobType.connect,
+    JobType.removal,
+    JobType.provision,
+}
 
 _workers: list[asyncio.Task] = []
 _stop: asyncio.Event | None = None

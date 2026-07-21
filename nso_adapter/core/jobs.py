@@ -167,6 +167,18 @@ async def _run_sync(job_id: int, device_id: int) -> None:
     await _run_with_db(job_id, device_id, sync_device)
 
 
+async def _run_sync_now(job_id: int, device_id: int) -> None:
+    """Operator Sync-Now: the sync body on READSEM grain c (one atomic device-state-read)."""
+    from nso_adapter.core.importer import sync_device
+
+    logger.info("job.sync_now.start", job_id=job_id, device_id=device_id)
+
+    async def _atomic_sync(device_id_: int, db) -> dict:
+        return await sync_device(device_id_, db, atomic=True)
+
+    await _run_with_db(job_id, device_id, _atomic_sync)
+
+
 async def _run_detect_drift(job_id: int, device_id: int) -> None:
     from nso_adapter.core.importer import detect_drift
 
@@ -299,6 +311,7 @@ async def _run_provision(job_id: int, device_id: int | None) -> None:
 
 _JOB_RUNNERS = {
     JobType.sync: _run_sync,
+    JobType.sync_now: _run_sync_now,
     JobType.detect_drift: _run_detect_drift,
     JobType.connect: _run_connect,
     JobType.apply: _run_apply,

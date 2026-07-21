@@ -1411,3 +1411,96 @@ async def test_projection_heals_not_ready_sections_with_one_action(db_session: A
         .all()
     )
     assert [r.prefix for r in rows] == ["10.8.0.0/16"]
+
+
+@pytest.mark.anyio
+async def test_atomic_fanout_uses_one_action_with_the_long_timeout(db_session: AsyncSession):
+    """READSEM grain c (B7): refresh_all(atomic=True) issues ONE device-state-read for
+    every enabled wire family with the 360s budget (the action may rebuild everything up
+    to 3x under commit churn - 3 x rc1 75.6s outruns the 180s default)."""
+    from sqlalchemy import select as _select
+
+    from nso_adapter.core.importer import refresh_all_surfaces_for_device
+    from nso_adapter.store.models import DeviceStaticRoute
+
+    device = Device(nso_instance="nso-dev", nso_device_name="sw01", ned_id="x", netbox_device_id=4)
+    db_session.add(device)
+    await db_session.commit()
+
+    nso_client = AsyncMock(spec=NsoClient)
+    ok_empty = {"status": "ok"}
+    nso_client.run_device_state_read.return_value = {
+        "atomic": True,
+        "static-route": {"status": "ok", "route": [{"vrf": "", "prefix": "10.9.0.0/16", "next-hop": "5.5.5.5"}]},
+        **{
+            w: ok_empty
+            for w in (
+                "isis-interface",
+                "bgp-config",
+                "ospf-config",
+                "route-policy",
+                "snmp-config",
+                "logging-config",
+                "bfd-config",
+                "interface-ip",
+                "vlan-database",
+                "svi",
+                "subinterface",
+                "interface-mtu",
+                "lag-topology",
+                "lag-config",
+                "l2-service",
+                "switchport",
+            )
+        },
+    }
+
+    with patch("nso_adapter.core.redistribution.refresh_redistribution_for_device", AsyncMock(return_value=True)):
+        failed = await refresh_all_surfaces_for_device(
+            db_session, device, nso_client, refresh_source="onboard", atomic=True
+        )
+
+    assert failed == []
+    nso_client.get_device_state_doc.assert_not_awaited()  # grain c never reads the record-served doc
+    assert nso_client.run_device_state_read.await_count == 1
+    args, kwargs = nso_client.run_device_state_read.await_args
+    assert args[0] == "sw01"
+    assert kwargs.get("timeout") == 360.0
+    assert "static-route" in args[1] and "l2-service" in args[1]  # comprehensive family set
+    rows = (
+        (await db_session.execute(_select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id)))
+        .scalars()
+        .all()
+    )
+    assert [r.prefix for r in rows] == ["10.9.0.0/16"]
+
+
+@pytest.mark.anyio
+async def test_atomic_fanout_action_error_keeps_every_family(db_session: AsyncSession):
+    """Grain c: an action error (bracket exhaustion, unknown device) keeps ALL rows."""
+    from sqlalchemy import select as _select
+
+    from nso_adapter.core.importer import refresh_all_surfaces_for_device
+    from nso_adapter.store.models import DeviceStaticRoute
+
+    device = Device(nso_instance="nso-dev", nso_device_name="sw01", ned_id="x", netbox_device_id=5)
+    db_session.add(device)
+    await db_session.commit()
+    db_session.add(DeviceStaticRoute(device_id=device.id, vrf="", prefix="10.10.0.0/16", next_hop="6.6.6.6"))
+    await db_session.commit()
+
+    nso_client = AsyncMock(spec=NsoClient)
+    nso_client.run_device_state_read.side_effect = RuntimeError("bracket exhausted")
+
+    with patch("nso_adapter.core.redistribution.refresh_redistribution_for_device", AsyncMock(return_value=False)):
+        failed = await refresh_all_surfaces_for_device(
+            db_session, device, nso_client, refresh_source="onboard", atomic=True
+        )
+
+    assert "static_route" in failed
+    rows = (
+        (await db_session.execute(_select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id)))
+        .scalars()
+        .all()
+    )
+    assert [r.prefix for r in rows] == ["10.10.0.0/16"], "torn/failed atomic reads never clear"

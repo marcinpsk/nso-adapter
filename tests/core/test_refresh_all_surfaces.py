@@ -98,15 +98,28 @@ class _FakeDevice:
 
 @pytest.mark.anyio
 async def test_refresh_all_surfaces_reports_failed_family(adapter_client):
-    """End-to-end through the real registry + store: a family whose NSO read fails lands in
-    the returned failed list; interface_ip is exercised as the operator-visible pain family."""
+    """End-to-end through the real registry + store: a family whose section is degraded
+    lands in the returned failed list; interface_ip is exercised as the operator-visible
+    pain family. Under the READSEM projection (B6) ONE doc GET feeds every spec surface —
+    attempts are proven by per-family outcome rows, not per-family GETs."""
+    from sqlalchemy import select as _select
+
+    from nso_adapter.store.models import RefreshOutcome
+
     device_id = await seed_device(nso_device_name="all-surfaces")
     async with _device_session(device_id) as (db, device):
         client = _RecordingClient(fail={"interface-ip"})  # interface_ip is envelope-flipped (S3)
         failed = await refresh_all_surfaces_for_device(db, device, client, refresh_source="test")
         assert "interface_ip" in failed
-        # every family was attempted (each family reads at least one getter)
-        assert len(client.called) >= 18
+        # every family was attempted: each records an outcome row (the projection makes
+        # one doc GET, so call-counting can no longer prove per-family coverage)
+        fams = {
+            o.family
+            for o in (await db.execute(_select(RefreshOutcome).where(RefreshOutcome.device_id == device.id)))
+            .scalars()
+            .all()
+        }
+        assert len(fams) >= 18, sorted(fams)
 
 
 class _RecordingClient:
@@ -120,14 +133,44 @@ class _RecordingClient:
         self.called: list[str] = []
         self._fail = fail
 
+    _WIRE_FAMILIES = (
+        "static-route",
+        "isis-interface",
+        "bgp-config",
+        "ospf-config",
+        "route-policy",
+        "snmp-config",
+        "logging-config",
+        "bfd-config",
+        "interface-ip",
+        "vlan-database",
+        "svi",
+        "subinterface",
+        "interface-mtu",
+        "lag-topology",
+        "lag-config",
+        "l2-service",
+        "switchport",
+        "interface-attributes",
+    )
+
     def __getattr__(self, name):
         import httpx
 
-        async def _getter(device_name, *args):
+        async def _getter(device_name, *args, **kwargs):
             called_as = args[0] if name == "get_device_state_section" else name
             self.called.append(called_as)
             if called_as in self._fail:
                 raise httpx.ConnectError("boom")
+            if name == "get_device_state_doc":
+                # The B6 projection supplier: one doc carrying every family's section;
+                # families named in *fail* serve an error section (degraded, kept).
+                doc = {"device-name": device_name}
+                for wire in self._WIRE_FAMILIES:
+                    doc[wire] = (
+                        {"status": "error", "error-reason": "faked failure"} if wire in self._fail else {"status": "ok"}
+                    )
+                return doc
             if name == "get_device_state_section":
                 return {"status": "ok"}
             return {}

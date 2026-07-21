@@ -208,7 +208,7 @@ def _projectable_spec(name: str):
     }.get(name)
 
 
-async def _fetch_projection(nso_client, device, wire_names: list[str]):
+async def _fetch_projection(nso_client, device, wire_names: list[str], *, atomic: bool = False):
     """Grain-b supplier: ONE record-served doc GET + ONE heal action for the not-ready set.
 
     Returns ``(sections, supplier_outcome)``: on supplier failure sections is empty and
@@ -216,6 +216,19 @@ async def _fetch_projection(nso_client, device, wire_names: list[str]):
     ``run_family_refresh_from_outcome`` — NEVER a fabricated section (codex S3-R1 F8).
     A confirmed device absence yields ``{wire: None}`` (per-family EmptyPolicy applies).
     """
+    if atomic:
+        # READSEM grain c: ONE txid-bracketed build for every requested family. Output
+        # sections are terminal (ok|unsupported|error); an action error (bracket
+        # exhaustion, unknown device) keeps every family. 360s: the action may rebuild
+        # everything up to 3x under commit churn (3 x rc1 75.6s outruns the 180s default).
+        try:
+            output = await nso_client.run_device_state_read(device.nso_device_name, wire_names, timeout=360.0)
+        except Exception as exc:  # noqa: BLE001 — action error keeps every family
+            return {}, Unavailable(UnavailableReason.read_error, detail=repr(exc))
+        return {
+            w: output.get(w, {"status": "error", "error-reason": "action output missing the section"})
+            for w in wire_names
+        }, None
     try:
         doc = await nso_client.get_device_state_doc(device.nso_device_name)
     except NsoExportUnavailableError as exc:
@@ -243,15 +256,17 @@ async def _run_surfaces_projected(
     nso_client: NsoClient,
     surfaces: list[tuple[str, object]],
     refresh_source: str,
+    *,
+    atomic: bool = False,
 ) -> list[str]:
-    """READSEM grain b: feed every spec-backed surface from ONE projected doc.
+    """READSEM grains b/c: feed every spec-backed surface from ONE projected read.
 
     Same contract as :func:`_run_surfaces` (failed-name list, per-surface isolation);
     non-spec surfaces (redistribution) still run their own warm section reads.
     """
     spec_by_name = {name: _projectable_spec(name) for name, _ in surfaces}
     wire_names = [spec.wire_name for spec in spec_by_name.values() if spec is not None]
-    sections, supplier_outcome = await _fetch_projection(nso_client, device, wire_names)
+    sections, supplier_outcome = await _fetch_projection(nso_client, device, wire_names, atomic=atomic)
 
     failed: list[str] = []
     for name, fn in surfaces:
@@ -387,6 +402,7 @@ async def refresh_routing_surfaces_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "sync",
+    atomic: bool = False,
 ) -> list[str]:
     """Fan-out for ``sync_device``: refresh the routing/extra surfaces (incl. interface_ip).
 
@@ -407,6 +423,7 @@ async def refresh_config_surfaces_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "apply",
+    atomic: bool = False,
 ) -> list[str]:
     """Best-effort refresh of the L2 / interface config surfaces (VLAN / SVI / subinterface / MTU).
 
@@ -426,6 +443,7 @@ async def refresh_all_surfaces_for_device(
     nso_client: NsoClient,
     *,
     refresh_source: str = "refresh",
+    atomic: bool = False,
 ) -> list[str]:
     """Comprehensive on-demand refresh of EVERY enabled read-mirror family for one device.
 
@@ -437,7 +455,7 @@ async def refresh_all_surfaces_for_device(
     """
     cfg = get_config().scheduler
     surfaces = _routing_surfaces(cfg) + _config_surfaces(cfg) + _extra_mirror_surfaces(cfg)
-    return await _run_surfaces(db, device, nso_client, surfaces, refresh_source)
+    return await _run_surfaces_projected(db, device, nso_client, surfaces, refresh_source, atomic=atomic)
 
 
 class _WriteCtx(NamedTuple):
@@ -659,8 +677,12 @@ async def _record_attrs_result(db, attempt_id, *, available: bool, row_count: in
         logger.warning("interface_attributes.outcome.result_record_failed", attempt_id=attempt_id, error=repr(exc))
 
 
-async def sync_device(device_id: int, db: AsyncSession) -> dict:
-    """Full sync: NSO → DB → NetBox. Returns job result summary dict."""
+async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False) -> dict:
+    """Full sync: NSO → DB → NetBox. Returns job result summary dict.
+
+    ``atomic=True`` is READSEM grain c (operator Sync-Now): the surface fan-out reads ONE
+    txid-bracketed ``device-state-read`` build instead of the record-served projection.
+    """
     device = await db.get(Device, device_id)
     if not device:
         raise ValueError(f"Device {device_id} not found")
@@ -738,7 +760,7 @@ async def sync_device(device_id: int, db: AsyncSession) -> dict:
     # Fan out to the routing/extra surfaces so one sync refreshes everything the device
     # exposes (IS-IS/BGP/OSPF/route-policy/...), not just interface attributes. Done
     # before the plugin notify so its reconcile sees the fresh surface state in one pass.
-    degraded = await refresh_routing_surfaces_for_device(db, device, client, refresh_source="sync")
+    degraded = await refresh_routing_surfaces_for_device(db, device, client, refresh_source="sync", atomic=atomic)
     if not attrs_available:
         degraded = [*degraded, "interface_attributes"]
 

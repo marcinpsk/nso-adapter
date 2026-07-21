@@ -333,3 +333,15 @@ async def test_start_and_stop_workers(adapter_client):
 
     assert worker._workers == []
     assert (await _get_job(orphan)).status == JobStatus.succeeded
+
+
+def test_sync_now_is_requeue_safe_and_runnable():
+    """READSEM S3 B7 (codex R1-F10): a process death mid-sync_now must not 409-block the
+    device forever — the grain-c refresh is an idempotent read, so the orphan reaper
+    requeues it; and the runner registry knows the type (enqueue_job rejects unknowns)."""
+    from nso_adapter.core.jobs import _JOB_RUNNERS
+    from nso_adapter.core.worker import _REQUEUE_ON_RESTART
+    from nso_adapter.store.models import JobType
+
+    assert JobType.sync_now in _REQUEUE_ON_RESTART
+    assert JobType.sync_now in _JOB_RUNNERS
