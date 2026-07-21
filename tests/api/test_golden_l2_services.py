@@ -13,7 +13,25 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import (
+    GOLDEN_BORN_ISO,
+    GOLDEN_INCARNATION,
+    VALID_TOKEN,
+    pin_store_incarnation,
+    seed_device,
+)
+
+_SYNTH_READ_STATE = {
+    "outcome": "unavailable",
+    "reason": "not_ready",
+    "freshness": None,
+    "result": None,
+    "succeeded": None,
+    "read_at": None,
+    "attempt_id": None,
+    "incarnation": GOLDEN_INCARNATION,
+    "incarnation_born": GOLDEN_BORN_ISO,
+}
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -71,6 +89,7 @@ async def _seed_l2(device_id: int) -> None:
 @pytest.mark.anyio
 async def test_l2_services_golden_body(adapter_client):
     device_id = await seed_device(nso_device_name="l2-golden", netbox_device_id=7997)
+    await pin_store_incarnation()
     await _seed_l2(device_id)
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/l2-services", headers=AUTH)).json()
@@ -78,6 +97,7 @@ async def test_l2_services_golden_body(adapter_client):
     # Rows ordered by (service_name, sap_id) → services grouped in first-seen order.
     assert body == {
         "device_id": device_id,
+        "read_state": _SYNTH_READ_STATE,
         "services": [
             {
                 "service_name": "EPIPE-1",
@@ -101,5 +121,6 @@ async def test_l2_services_golden_body(adapter_client):
 @pytest.mark.anyio
 async def test_l2_services_golden_empty(adapter_client):
     device_id = await seed_device(nso_device_name="l2-golden-empty", netbox_device_id=7998)
+    await pin_store_incarnation()
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/l2-services", headers=AUTH)).json()
-    assert body == {"device_id": device_id, "services": []}
+    assert body == {"device_id": device_id, "read_state": _SYNTH_READ_STATE, "services": []}

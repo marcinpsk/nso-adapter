@@ -147,6 +147,9 @@
             ],
             "title": "Last Refreshed At"
           },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
+          },
           "refresh_source": {
             "title": "Refresh Source",
             "type": "string"
@@ -155,6 +158,7 @@
         "required": [
           "device_id",
           "refresh_source",
+          "read_state",
           "interfaces"
         ],
         "title": "BfdConfigOut",
@@ -344,6 +348,9 @@
             ],
             "title": "Last Refreshed At"
           },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
+          },
           "refresh_source": {
             "title": "Refresh Source",
             "type": "string"
@@ -359,6 +366,7 @@
         "required": [
           "device_id",
           "refresh_source",
+          "read_state",
           "routers"
         ],
         "title": "BgpConfigOut",
@@ -2588,6 +2596,9 @@
             ],
             "title": "Last Refreshed At"
           },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
+          },
           "refresh_source": {
             "title": "Refresh Source",
             "type": "string"
@@ -2596,6 +2607,7 @@
         "required": [
           "device_id",
           "refresh_source",
+          "read_state",
           "interfaces"
         ],
         "title": "InterfaceIpsOut",
@@ -2741,10 +2753,14 @@
             },
             "title": "Interfaces",
             "type": "array"
+          },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
           }
         },
         "required": [
           "device_id",
+          "read_state",
           "interfaces"
         ],
         "title": "InterfaceMtuOut",
@@ -2879,6 +2895,32 @@
           "last_checked_at"
         ],
         "title": "InterfaceStateOut",
+        "type": "object"
+      },
+      "InterfacesDocOut": {
+        "description": "Object-shaped interfaces document (READSEM S4 D1) \u2014 the S4 plugin consumes THIS;\nthe bare-list /interfaces stays byte-identical for pre-S4 consumers until S5.",
+        "properties": {
+          "device_id": {
+            "title": "Device Id",
+            "type": "integer"
+          },
+          "interfaces": {
+            "items": {
+              "$ref": "#/components/schemas/InterfaceOut"
+            },
+            "title": "Interfaces",
+            "type": "array"
+          },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
+          }
+        },
+        "required": [
+          "device_id",
+          "read_state",
+          "interfaces"
+        ],
+        "title": "InterfacesDocOut",
         "type": "object"
       },
       "IpAddressEntry": {
@@ -3517,6 +3559,9 @@
             "title": "Processes",
             "type": "array"
           },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
+          },
           "refresh_source": {
             "title": "Refresh Source",
             "type": "string"
@@ -3525,6 +3570,7 @@
         "required": [
           "device_id",
           "refresh_source",
+          "read_state",
           "processes",
           "interfaces"
         ],
@@ -4383,6 +4429,9 @@
             "title": "Device Id",
             "type": "integer"
           },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
+          },
           "services": {
             "items": {
               "$ref": "#/components/schemas/L2ServiceOut"
@@ -4393,6 +4442,7 @@
         },
         "required": [
           "device_id",
+          "read_state",
           "services"
         ],
         "title": "L2ServicesOut",
@@ -4663,6 +4713,9 @@
             ],
             "title": "Last Refreshed At"
           },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
+          },
           "refresh_source": {
             "title": "Refresh Source",
             "type": "string"
@@ -4671,6 +4724,7 @@
         "required": [
           "device_id",
           "refresh_source",
+          "read_state",
           "bundles"
         ],
         "title": "LagConfigOut",
@@ -4814,6 +4868,9 @@
             ],
             "title": "Last Refreshed At"
           },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
+          },
           "refresh_source": {
             "title": "Refresh Source",
             "type": "string"
@@ -4822,6 +4879,7 @@
         "required": [
           "device_id",
           "refresh_source",
+          "read_state",
           "lags"
         ],
         "title": "LagTopologyOut",
@@ -5316,6 +5374,9 @@
             ],
             "title": "Last Refreshed At"
           },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
+          },
           "refresh_source": {
             "title": "Refresh Source",
             "type": "string"
@@ -5324,6 +5385,7 @@
         "required": [
           "device_id",
           "refresh_source",
+          "read_state",
           "instances",
           "interfaces"
         ],
@@ -5803,6 +5865,9 @@
             ],
             "title": "Last Refreshed At"
           },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
+          },
           "refresh_source": {
             "title": "Refresh Source",
             "type": "string"
@@ -5811,6 +5876,7 @@
         "required": [
           "device_id",
           "refresh_source",
+          "read_state",
           "entries"
         ],
         "title": "RedistributionConfigOut",
@@ -6060,6 +6126,9 @@
             "title": "Prefix Lists",
             "type": "array"
           },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
+          },
           "route_maps": {
             "items": {
               "$ref": "#/components/schemas/RoutePolicyRouteMapOut"
@@ -6070,6 +6139,7 @@
         },
         "required": [
           "device_id",
+          "read_state",
           "prefix_lists",
           "community_lists",
           "as_paths",
@@ -6702,6 +6772,9 @@
             ],
             "title": "Last Refreshed At"
           },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
+          },
           "refresh_source": {
             "title": "Refresh Source",
             "type": "string"
@@ -6727,6 +6800,7 @@
         "required": [
           "device_id",
           "refresh_source",
+          "read_state",
           "communities",
           "v3_users",
           "hosts",
@@ -7510,10 +7584,14 @@
             },
             "title": "Interfaces",
             "type": "array"
+          },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
           }
         },
         "required": [
           "device_id",
+          "read_state",
           "interfaces"
         ],
         "title": "SubinterfaceOut",
@@ -7620,10 +7698,14 @@
             },
             "title": "Interfaces",
             "type": "array"
+          },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
           }
         },
         "required": [
           "device_id",
+          "read_state",
           "interfaces"
         ],
         "title": "SviOut",
@@ -7801,10 +7883,14 @@
             },
             "title": "Interfaces",
             "type": "array"
+          },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
           }
         },
         "required": [
           "device_id",
+          "read_state",
           "interfaces"
         ],
         "title": "SwitchportOut",
@@ -7856,6 +7942,9 @@
             "title": "Device Id",
             "type": "integer"
           },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
+          },
           "vlans": {
             "items": {
               "$ref": "#/components/schemas/VlanOut"
@@ -7866,6 +7955,7 @@
         },
         "required": [
           "device_id",
+          "read_state",
           "vlans"
         ],
         "title": "VlanDatabaseOut",
@@ -10102,6 +10192,73 @@
           }
         ],
         "summary": "List Interfaces",
+        "tags": [
+          "interfaces"
+        ]
+      }
+    },
+    "/api/v1/devices/{device_id}/interfaces-doc": {
+      "get": {
+        "operationId": "get_interfaces_doc_api_v1_devices__device_id__interfaces_doc_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InterfacesDocOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Device not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request validation failed (envelope shape)"
+          }
+        },
+        "security": [
+          {
+            "_OptionalBearer": []
+          }
+        ],
+        "summary": "Get Interfaces Doc",
         "tags": [
           "interfaces"
         ]

@@ -19,7 +19,25 @@ from datetime import datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import (
+    GOLDEN_BORN_ISO,
+    GOLDEN_INCARNATION,
+    VALID_TOKEN,
+    pin_store_incarnation,
+    seed_device,
+)
+
+_SYNTH_READ_STATE = {
+    "outcome": "unavailable",
+    "reason": "not_ready",
+    "freshness": None,
+    "result": None,
+    "succeeded": None,
+    "read_at": None,
+    "attempt_id": None,
+    "incarnation": GOLDEN_INCARNATION,
+    "incarnation_born": GOLDEN_BORN_ISO,
+}
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -80,6 +98,7 @@ async def _seed_ospf(device_id: int) -> None:
 @pytest.mark.anyio
 async def test_ospf_golden_body(adapter_client):
     device_id = await seed_device(nso_device_name="ospf-golden", netbox_device_id=7935)
+    await pin_store_incarnation()
     await _seed_ospf(device_id)
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/ospf", headers=AUTH)).json()
@@ -88,6 +107,7 @@ async def test_ospf_golden_body(adapter_client):
         "device_id": device_id,
         "last_refreshed_at": "2026-06-01T10:00:00",  # RAW datetime — no trailing "Z"
         "refresh_source": "poll",
+        "read_state": _SYNTH_READ_STATE,
         "instances": [
             {"process_id": "1", "vrf": "", "areas": ["0.0.0.0"], "router_id": "10.0.0.1", "enabled": False},
             {"process_id": "2", "vrf": "", "areas": []},
@@ -112,11 +132,13 @@ async def test_ospf_golden_body(adapter_client):
 @pytest.mark.anyio
 async def test_ospf_golden_empty(adapter_client):
     device_id = await seed_device(nso_device_name="ospf-golden-empty", netbox_device_id=7936)
+    await pin_store_incarnation()
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/ospf", headers=AUTH)).json()
     assert body == {
         "device_id": device_id,
         "last_refreshed_at": None,
         "refresh_source": "never",
+        "read_state": _SYNTH_READ_STATE,
         "instances": [],
         "interfaces": [],
     }

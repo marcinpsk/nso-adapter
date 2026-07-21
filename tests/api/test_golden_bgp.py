@@ -22,7 +22,26 @@ from datetime import datetime
 import pytest
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_bgp_config, seed_device
+from tests.conftest import (
+    GOLDEN_BORN_ISO,
+    GOLDEN_INCARNATION,
+    VALID_TOKEN,
+    pin_store_incarnation,
+    seed_bgp_config,
+    seed_device,
+)
+
+_SYNTH_READ_STATE = {
+    "outcome": "unavailable",
+    "reason": "not_ready",
+    "freshness": None,
+    "result": None,
+    "succeeded": None,
+    "read_at": None,
+    "attempt_id": None,
+    "incarnation": GOLDEN_INCARNATION,
+    "incarnation_born": GOLDEN_BORN_ISO,
+}
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -45,6 +64,7 @@ async def _set_router_refreshed(device_id: int) -> None:
 @pytest.mark.anyio
 async def test_bgp_golden_body(adapter_client):
     device_id = await seed_device(nso_device_name="bgp-golden", netbox_device_id=7915)
+    await pin_store_incarnation()
     await seed_bgp_config(
         device_id,
         asn="65100",
@@ -104,6 +124,7 @@ async def test_bgp_golden_body(adapter_client):
         "device_id": device_id,
         "last_refreshed_at": "2026-06-01T10:00:00Z",
         "refresh_source": "test",
+        "read_state": _SYNTH_READ_STATE,
         "routers": [
             {
                 "asn": "65100",
@@ -167,6 +188,7 @@ async def test_bgp_golden_body(adapter_client):
 async def test_bgp_golden_router_id_null(adapter_client):
     """router_id is ALWAYS present (null when unset); empty peer/peer-group lists stay []."""
     device_id = await seed_device(nso_device_name="bgp-golden-null", netbox_device_id=7916)
+    await pin_store_incarnation()
     # Default scope: one af, no peers, no peer-groups; router_id unset. last_refreshed_at stays NULL.
     await seed_bgp_config(device_id, asn="65200")
 
@@ -175,6 +197,7 @@ async def test_bgp_golden_router_id_null(adapter_client):
         "device_id": device_id,
         "last_refreshed_at": None,
         "refresh_source": "test",
+        "read_state": _SYNTH_READ_STATE,
         "routers": [
             {
                 "asn": "65200",
@@ -195,10 +218,12 @@ async def test_bgp_golden_router_id_null(adapter_client):
 @pytest.mark.anyio
 async def test_bgp_golden_empty(adapter_client):
     device_id = await seed_device(nso_device_name="bgp-golden-empty", netbox_device_id=7917)
+    await pin_store_incarnation()
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/bgp-config", headers=AUTH)).json()
     assert body == {
         "device_id": device_id,
         "last_refreshed_at": None,
         "refresh_source": "never",
+        "read_state": _SYNTH_READ_STATE,
         "routers": [],
     }

@@ -25,7 +25,15 @@ from tests.conftest import VALID_TOKEN, seed_device
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-REQUIRED_TOP_KEYS = {"device_id", "last_refreshed_at", "prefix_lists", "community_lists", "as_paths", "route_maps"}
+REQUIRED_TOP_KEYS = {
+    "device_id",
+    "last_refreshed_at",
+    "read_state",
+    "prefix_lists",
+    "community_lists",
+    "as_paths",
+    "route_maps",
+}
 REQUIRED_PL_KEYS = {"name", "family", "entries"}
 REQUIRED_PL_ENTRY_KEYS = {"sequence", "action", "prefix"}
 OPTIONAL_PL_ENTRY_KEYS = {"ge", "le"}

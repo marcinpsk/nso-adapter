@@ -11,9 +11,11 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.api.deps import get_db, verify_token
+from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, IntentApplyResult, api_error
+from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.core.removal import is_cleared
+from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, DeviceSettings, DeviceSvi, SviIntent
 
 router = APIRouter(prefix="/api/v1/devices", tags=["svi"])
@@ -29,6 +31,7 @@ class SviIfaceOut(BaseModel):
 
 class SviOut(BaseModel):
     device_id: int
+    read_state: FamilyReadState  # the S4 truth (this family never had legacy freshness fields)
     interfaces: list[SviIfaceOut]
 
 
@@ -38,10 +41,13 @@ class SviOut(BaseModel):
     response_model=SviOut,
     responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
 )
-async def get_svi(device_id: int, db: AsyncSession = Depends(get_db)):
+async def get_svi(device_id: int, db: AsyncSession = Depends(get_read_db)):
     """Return the device's SVIs/IRBs (no IPs — those ride interface-ip)."""
     if await db.get(Device, device_id) is None:
         raise api_error(404, "not_found", "Device not found")
+
+    # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
+    read_state = read_state_payload(await outcome_store.get_current_outcome(db, device_id, "svi"))
     rows = (
         (await db.execute(select(DeviceSvi).where(DeviceSvi.device_id == device_id).order_by(DeviceSvi.vlan_id)))
         .scalars()
@@ -49,6 +55,7 @@ async def get_svi(device_id: int, db: AsyncSession = Depends(get_db)):
     )
     return {
         "device_id": device_id,
+        "read_state": read_state,
         "interfaces": [
             {
                 "interface_name": r.interface_name,

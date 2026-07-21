@@ -20,7 +20,7 @@ from tests.conftest import VALID_TOKEN, seed_device
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-REQUIRED_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "instances", "interfaces"}
+REQUIRED_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "read_state", "instances", "interfaces"}
 REQUIRED_INSTANCE_KEYS = {"process_id", "vrf", "areas"}
 OPTIONAL_INSTANCE_KEYS = {"router_id"}
 REQUIRED_IFACE_KEYS = {"interface_name", "passive", "auth_present"}

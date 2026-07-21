@@ -19,7 +19,7 @@ from tests.conftest import VALID_TOKEN, seed_device
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "bundles"}
+TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "read_state", "bundles"}
 BUNDLE_REQUIRED_KEYS = {"name", "lag_id", "members"}
 BUNDLE_OPTIONAL_KEYS = {"min_links", "system_priority", "system_id", "timer", "admin_key"}
 MEMBER_REQUIRED_KEYS = {"interface_name"}

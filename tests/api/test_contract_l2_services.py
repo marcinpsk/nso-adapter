@@ -18,7 +18,7 @@ from tests.conftest import VALID_TOKEN, seed_device
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TOP_KEYS = {"device_id", "services"}
+TOP_KEYS = {"device_id", "read_state", "services"}
 SERVICE_KEYS = {"service_name", "service_type", "service_id", "saps"}
 SAP_KEYS = {"sap_id", "port", "outer_tag", "inner_tag"}
 

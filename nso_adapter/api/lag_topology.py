@@ -10,8 +10,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from nso_adapter.api.deps import get_db, verify_token
+from nso_adapter.api.deps import get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.read_state import FamilyReadState, read_state_payload
+from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, LagInterface
 
 router = APIRouter(prefix="/api/v1/devices", tags=["lag-topology"])
@@ -35,7 +37,8 @@ class LagTopologyLagOut(BaseModel):
 class LagTopologyOut(BaseModel):
     device_id: int
     last_refreshed_at: str | None = None  # reader formats "<iso>Z"; None when never refreshed
-    refresh_source: str
+    refresh_source: str  # legacy freshness (S5 retires it); read_state is the S4 truth
+    read_state: FamilyReadState
     lags: list[LagTopologyLagOut]
 
 
@@ -45,10 +48,13 @@ class LagTopologyOut(BaseModel):
     response_model=LagTopologyOut,
     responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
 )
-async def get_lag_topology(device_id: int, db: AsyncSession = Depends(get_db)):
+async def get_lag_topology(device_id: int, db: AsyncSession = Depends(get_read_db)):
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+
+    # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
+    read_state = read_state_payload(await outcome_store.get_current_outcome(db, device_id, "lag"))
 
     result = await db.execute(
         select(LagInterface).where(LagInterface.device_id == device_id).options(selectinload(LagInterface.members))
@@ -60,6 +66,7 @@ async def get_lag_topology(device_id: int, db: AsyncSession = Depends(get_db)):
             "device_id": device_id,
             "last_refreshed_at": None,
             "refresh_source": "never",
+            "read_state": read_state,
             "lags": [],
         }
 
@@ -69,6 +76,7 @@ async def get_lag_topology(device_id: int, db: AsyncSession = Depends(get_db)):
         "device_id": device_id,
         "last_refreshed_at": latest.last_refreshed_at.isoformat() + "Z",
         "refresh_source": latest.refresh_source,
+        "read_state": read_state,
         "lags": [
             {
                 "name": lag.name,

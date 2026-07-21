@@ -17,7 +17,10 @@ async def test_svi_returns_seeded_rows(adapter_client):
     await seed_svi(device_id, [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "MGMT"}])
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/svi", headers=AUTH)
     assert resp.status_code == 200
-    assert resp.json() == {
+    body = resp.json()
+    # read_state rides every family GET (S4); byte-level pins live in the golden test.
+    assert body.pop("read_state")["outcome"] == "unavailable"
+    assert body == {
         "device_id": device_id,
         "interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "MGMT", "source": "svi"}],
     }

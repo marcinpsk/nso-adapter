@@ -24,7 +24,7 @@ from tests.conftest import VALID_TOKEN, seed_bgp_config, seed_device
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 # ── The contract. Keep in lockstep with the plugin mirror + docs/api-contract.md. ──
-REQUIRED_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "routers"}
+REQUIRED_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "read_state", "routers"}
 # router_id is always present (null when unset), like the top-level last_refreshed_at.
 REQUIRED_ROUTER_KEYS = {"asn", "router_id", "scopes"}
 REQUIRED_SCOPE_KEYS = {"vrf", "address_families", "peers", "peer_groups"}

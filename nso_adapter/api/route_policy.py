@@ -12,9 +12,11 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.api.deps import get_db, verify_token
+from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.core.removal import lost_content
+from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
     Device,
     DeviceRoutePolicyASPath,
@@ -161,6 +163,7 @@ class RoutePolicyRouteMapOut(BaseModel):
 class RoutePolicyConfigOut(BaseModel):
     device_id: int
     last_refreshed_at: str | None = None  # reader formats "<iso>Z"; None when never refreshed (no refresh_source here)
+    read_state: FamilyReadState  # the S4 truth — supersedes the never-added refresh_source (§7 drift)
     prefix_lists: list[RoutePolicyPrefixListOut]
     community_lists: list[RoutePolicyCommunityListOut]
     as_paths: list[RoutePolicyASPathOut]
@@ -174,7 +177,7 @@ class RoutePolicyConfigOut(BaseModel):
     response_model_exclude_unset=True,
     responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
 )
-async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_db)):
+async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_read_db)):
     """Return the route-policy config read-mirror for this device.
 
     Response shape matches the YANG contract in m17-route-policy-contract.md §3.
@@ -182,6 +185,9 @@ async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+
+    # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
+    read_state = read_state_payload(await outcome_store.get_current_outcome(db, device_id, "route_policy"))
 
     prefix_lists = await _load_named(db, DeviceRoutePolicyPrefixList, device_id)
     community_lists = await _load_named(db, DeviceRoutePolicyCommunityList, device_id)
@@ -231,6 +237,7 @@ async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_db)):
     return {
         "device_id": device_id,
         "last_refreshed_at": last_refreshed_at.isoformat() + "Z" if last_refreshed_at else None,
+        "read_state": read_state,
         "prefix_lists": [_serialize_prefix_list(pl, pl_entries.get(pl.id, [])) for pl in prefix_lists],
         "community_lists": [_serialize_community_list(cl, cl_entries.get(cl.id, [])) for cl in community_lists],
         "as_paths": [_serialize_as_path(ap, ap_entries.get(ap.id, [])) for ap in as_paths],

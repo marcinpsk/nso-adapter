@@ -21,13 +21,13 @@ from tests.conftest import VALID_TOKEN, seed_device
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-VLAN_TOP_KEYS = {"device_id", "vlans"}
+VLAN_TOP_KEYS = {"device_id", "read_state", "vlans"}
 VLAN_KEYS = {"vlan_id", "name", "source"}
-SWITCHPORT_TOP_KEYS = {"device_id", "interfaces"}
+SWITCHPORT_TOP_KEYS = {"device_id", "read_state", "interfaces"}
 SWITCHPORT_IFACE_KEYS = {"interface_name", "mode", "untagged_vlan", "tagged_vlans", "source"}
-SVI_TOP_KEYS = {"device_id", "interfaces"}
+SVI_TOP_KEYS = {"device_id", "read_state", "interfaces"}
 SVI_IFACE_KEYS = {"interface_name", "vlan_id", "type", "vrf", "source"}
-SUBIF_TOP_KEYS = {"device_id", "interfaces"}
+SUBIF_TOP_KEYS = {"device_id", "read_state", "interfaces"}
 SUBIF_IFACE_KEYS = {"interface_name", "parent_interface", "dot1q_vlan", "type", "vrf", "source"}
 
 

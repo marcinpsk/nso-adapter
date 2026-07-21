@@ -12,8 +12,10 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.api.deps import get_db, verify_token
+from nso_adapter.api.deps import get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.read_state import FamilyReadState, read_state_payload
+from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, DeviceRedistribution
 
 logger = structlog.get_logger(__name__)
@@ -36,7 +38,8 @@ class RedistributionOut(BaseModel):
 class RedistributionConfigOut(BaseModel):
     device_id: int
     last_refreshed_at: datetime | None = None  # reader passes the raw datetime (no "Z")
-    refresh_source: str
+    refresh_source: str  # legacy freshness (S5 retires it); read_state is the S4 truth
+    read_state: FamilyReadState
     entries: list[RedistributionOut]
 
 
@@ -47,7 +50,7 @@ class RedistributionConfigOut(BaseModel):
     response_model_exclude_unset=True,
     responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
 )
-async def get_redistribution(device_id: int, db: AsyncSession = Depends(get_db)):
+async def get_redistribution(device_id: int, db: AsyncSession = Depends(get_read_db)):
     """Return all redistribution statements cached from NSO for *device_id*.
 
     Returns 404 when the device is unknown, empty list when no rows are cached.
@@ -57,6 +60,9 @@ async def get_redistribution(device_id: int, db: AsyncSession = Depends(get_db))
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+
+    # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
+    read_state = read_state_payload(await outcome_store.get_current_outcome(db, device_id, "redistribution"))
 
     result = await db.execute(
         select(DeviceRedistribution)
@@ -74,6 +80,7 @@ async def get_redistribution(device_id: int, db: AsyncSession = Depends(get_db))
             "device_id": device_id,
             "last_refreshed_at": None,
             "refresh_source": "never",
+            "read_state": read_state,
             "entries": [],
         }
 
@@ -99,5 +106,6 @@ async def get_redistribution(device_id: int, db: AsyncSession = Depends(get_db))
         "device_id": device_id,
         "last_refreshed_at": latest.last_refreshed_at,
         "refresh_source": latest.refresh_source,
+        "read_state": read_state,
         "entries": entries,
     }

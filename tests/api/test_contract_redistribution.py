@@ -21,7 +21,7 @@ from tests.conftest import VALID_TOKEN, seed_device
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-REQUIRED_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "entries"}
+REQUIRED_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "read_state", "entries"}
 REQUIRED_ENTRY_KEYS = {"dest_protocol", "dest_ref", "source_protocol", "source_ref"}
 OPTIONAL_ENTRY_KEYS = {"route_map", "metric", "metric_type"}
 

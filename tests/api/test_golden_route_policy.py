@@ -15,7 +15,25 @@ from datetime import datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import (
+    GOLDEN_BORN_ISO,
+    GOLDEN_INCARNATION,
+    VALID_TOKEN,
+    pin_store_incarnation,
+    seed_device,
+)
+
+_SYNTH_READ_STATE = {
+    "outcome": "unavailable",
+    "reason": "not_ready",
+    "freshness": None,
+    "result": None,
+    "succeeded": None,
+    "read_at": None,
+    "attempt_id": None,
+    "incarnation": GOLDEN_INCARNATION,
+    "incarnation_born": GOLDEN_BORN_ISO,
+}
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -82,6 +100,7 @@ async def _seed_route_policy(device_id: int) -> None:
 @pytest.mark.anyio
 async def test_route_policy_golden_body(adapter_client):
     device_id = await seed_device(nso_device_name="rp-golden", netbox_device_id=7945)
+    await pin_store_incarnation()
     await _seed_route_policy(device_id)
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/route-policy", headers=AUTH)).json()
@@ -89,6 +108,7 @@ async def test_route_policy_golden_body(adapter_client):
     assert body == {
         "device_id": device_id,
         "last_refreshed_at": "2026-06-01T10:00:00Z",
+        "read_state": _SYNTH_READ_STATE,
         "prefix_lists": [
             {
                 "name": "PL-1",
@@ -129,10 +149,12 @@ async def test_route_policy_golden_body(adapter_client):
 @pytest.mark.anyio
 async def test_route_policy_golden_empty(adapter_client):
     device_id = await seed_device(nso_device_name="rp-golden-empty", netbox_device_id=7946)
+    await pin_store_incarnation()
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/route-policy", headers=AUTH)).json()
     assert body == {
         "device_id": device_id,
         "last_refreshed_at": None,
+        "read_state": _SYNTH_READ_STATE,
         "prefix_lists": [],
         "community_lists": [],
         "as_paths": [],

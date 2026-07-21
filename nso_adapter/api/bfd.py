@@ -12,9 +12,11 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.api.deps import get_db, verify_token
+from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, IntentApplyResult, api_error
+from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.core.removal import is_cleared
+from nso_adapter.store import outcome_store
 from nso_adapter.store.models import BfdIntent, Device, DeviceBfdInterface, DeviceSettings
 
 logger = structlog.get_logger(__name__)
@@ -40,7 +42,8 @@ class BfdInterfaceOut(BaseModel):
 class BfdConfigOut(BaseModel):
     device_id: int
     last_refreshed_at: str | None = None  # reader formats "<iso>Z"; None when never refreshed
-    refresh_source: str
+    refresh_source: str  # legacy freshness (S5 retires it); read_state is the S4 truth
+    read_state: FamilyReadState
     interfaces: list[BfdInterfaceOut]
 
 
@@ -51,11 +54,14 @@ class BfdConfigOut(BaseModel):
     response_model_exclude_unset=True,
     responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
 )
-async def get_bfd(device_id: int, db: AsyncSession = Depends(get_db)):
+async def get_bfd(device_id: int, db: AsyncSession = Depends(get_read_db)):
     """Return the per-interface BFD read-mirror for this device."""
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+
+    # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
+    read_state = read_state_payload(await outcome_store.get_current_outcome(db, device_id, "bfd"))
 
     rows = (
         (
@@ -91,6 +97,7 @@ async def get_bfd(device_id: int, db: AsyncSession = Depends(get_db)):
         "device_id": device_id,
         "last_refreshed_at": latest.isoformat() + "Z" if latest else None,
         "refresh_source": rows[0].refresh_source if rows else "never",
+        "read_state": read_state,
         "interfaces": interfaces,
     }
 

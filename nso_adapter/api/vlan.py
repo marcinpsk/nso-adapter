@@ -13,11 +13,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from nso_adapter.api.deps import get_db, verify_token
+from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, IntentApplyResult, api_error
+from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.core.importer import get_nso_client
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.core.switchport_intent import apply_switchport_config as apply_switchport_core
+from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, DeviceSettings, DeviceSwitchport, DeviceVlan, VlanIntent
 
 router = APIRouter(prefix="/api/v1/devices", tags=["vlan"])
@@ -47,6 +49,7 @@ class VlanOut(BaseModel):
 
 class VlanDatabaseOut(BaseModel):
     device_id: int
+    read_state: FamilyReadState  # the S4 truth (this family never had legacy freshness fields)
     vlans: list[VlanOut]
 
 
@@ -60,6 +63,7 @@ class SwitchportIfaceOut(BaseModel):
 
 class SwitchportOut(BaseModel):
     device_id: int
+    read_state: FamilyReadState  # the S4 truth (this family never had legacy freshness fields)
     interfaces: list[SwitchportIfaceOut]
 
 
@@ -69,9 +73,13 @@ class SwitchportOut(BaseModel):
     response_model=VlanDatabaseOut,
     responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
 )
-async def get_vlan_database(device_id: int, db: AsyncSession = Depends(get_db)):
+async def get_vlan_database(device_id: int, db: AsyncSession = Depends(get_read_db)):
     if await db.get(Device, device_id) is None:
         raise api_error(404, "not_found", "Device not found")
+
+    # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
+    read_state = read_state_payload(await outcome_store.get_current_outcome(db, device_id, "vlan"))
+
     rows = (
         (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device_id).order_by(DeviceVlan.vlan_id)))
         .scalars()
@@ -79,6 +87,7 @@ async def get_vlan_database(device_id: int, db: AsyncSession = Depends(get_db)):
     )
     return {
         "device_id": device_id,
+        "read_state": read_state,
         "vlans": [{"vlan_id": r.vlan_id, "name": r.name or "", "source": "vlan-database"} for r in rows],
     }
 
@@ -89,9 +98,13 @@ async def get_vlan_database(device_id: int, db: AsyncSession = Depends(get_db)):
     response_model=SwitchportOut,
     responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
 )
-async def get_switchport(device_id: int, db: AsyncSession = Depends(get_db)):
+async def get_switchport(device_id: int, db: AsyncSession = Depends(get_read_db)):
     if await db.get(Device, device_id) is None:
         raise api_error(404, "not_found", "Device not found")
+
+    # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
+    read_state = read_state_payload(await outcome_store.get_current_outcome(db, device_id, "switchport"))
+
     rows = (
         (
             await db.execute(
@@ -109,6 +122,7 @@ async def get_switchport(device_id: int, db: AsyncSession = Depends(get_db)):
     )
     return {
         "device_id": device_id,
+        "read_state": read_state,
         "interfaces": [
             {
                 "interface_name": r.interface_name,

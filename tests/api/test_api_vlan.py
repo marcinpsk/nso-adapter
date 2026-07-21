@@ -17,7 +17,10 @@ async def test_vlan_database_returns_seeded_rows(adapter_client):
     await seed_vlan_database(device_id, [{"vlan_id": 10, "name": "MGMT"}])
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/vlan-database", headers=AUTH)
     assert resp.status_code == 200
-    assert resp.json() == {
+    body = resp.json()
+    # read_state rides every family GET (S4); byte-level pins live in the golden test.
+    assert body.pop("read_state")["outcome"] == "unavailable"
+    assert body == {
         "device_id": device_id,
         "vlans": [{"vlan_id": 10, "name": "MGMT", "source": "vlan-database"}],
     }

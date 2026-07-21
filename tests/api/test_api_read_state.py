@@ -127,3 +127,33 @@ async def test_inline_read_state_synthesized_when_pointerless(adapter_client):
     rs = resp.json()["read_state"]
     assert (rs["outcome"], rs["reason"], rs["attempt_id"]) == ("unavailable", "not_ready", None)
     assert rs["incarnation"] == get_store_incarnation()[0]
+
+
+@pytest.mark.anyio
+async def test_interfaces_doc_wraps_legacy_list(adapter_client):
+    """R1-F1: the legacy list-shaped GET /interfaces cannot gain a top-level key, so the
+    object-shaped /interfaces-doc serves the S4 plugin: same interfaces payload
+    BYTE-IDENTICAL to the legacy list, plus the interface_attributes read_state."""
+    device_id = await seed_device(nso_device_name="rs-ifdoc1", netbox_device_id=8905)
+    a1 = await _terminalize(
+        device_id,
+        "interface_attributes",
+        Present({"i": []}, Freshness.fresh),
+        result="replaced",
+        succeeded=True,
+        rows=1,
+    )
+    legacy = await adapter_client.get(f"/api/v1/devices/{device_id}/interfaces", headers=_AUTH)
+    doc = await adapter_client.get(f"/api/v1/devices/{device_id}/interfaces-doc", headers=_AUTH)
+    assert legacy.status_code == 200 and doc.status_code == 200
+    body = doc.json()
+    assert body["device_id"] == device_id
+    assert body["interfaces"] == legacy.json(), "doc payload must equal the legacy list byte-for-byte"
+    assert (body["read_state"]["outcome"], body["read_state"]["attempt_id"]) == ("present", a1)
+
+
+@pytest.mark.anyio
+async def test_interfaces_doc_unknown_device_404(adapter_client):
+    resp = await adapter_client.get("/api/v1/devices/999999/interfaces-doc", headers=_AUTH)
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "not_found"

@@ -28,7 +28,10 @@ async def test_subinterface_returns_seeded_rows(adapter_client):
     )
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/subinterface", headers=AUTH)
     assert resp.status_code == 200
-    assert resp.json() == {
+    body = resp.json()
+    # read_state rides every family GET (S4); byte-level pins live in the golden test.
+    assert body.pop("read_state")["outcome"] == "unavailable"
+    assert body == {
         "device_id": device_id,
         "interfaces": [
             {

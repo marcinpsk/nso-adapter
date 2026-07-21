@@ -27,7 +27,7 @@ from tests.conftest import VALID_TOKEN, seed_device
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "processes", "interfaces"}
+TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "read_state", "processes", "interfaces"}
 
 PROC_REQUIRED_KEYS = {"process_tag"}
 PROC_OPTIONAL_SCALARS = {

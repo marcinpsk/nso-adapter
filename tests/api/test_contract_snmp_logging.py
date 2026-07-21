@@ -20,7 +20,16 @@ from tests.conftest import VALID_TOKEN, seed_device
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-SNMP_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "communities", "v3_users", "hosts", "system_info"}
+SNMP_TOP_KEYS = {
+    "device_id",
+    "last_refreshed_at",
+    "refresh_source",
+    "read_state",
+    "communities",
+    "v3_users",
+    "hosts",
+    "system_info",
+}
 SNMP_COMMUNITY_KEYS = {"community_hash", "access", "acl"}
 SNMP_V3USER_KEYS = {"username", "has_auth_secret", "has_priv_secret"}
 # `username` = the SNMPv3 security user name (v3 hosts only). NOT a secret, and the field both
