@@ -1567,10 +1567,9 @@ async def test_sync_device_atomic_reaches_the_action_not_the_doc(db_session: Asy
 
 @pytest.mark.anyio
 async def test_projected_batch_locks_by_spec_name_and_covers_redistribution(db_session: AsyncSession, monkeypatch):
-    """Codex S3-R4: the batch must lock the SAME identities grain-a locks — spec.name
-    (lag_topology's spec is named 'lag'; a label-keyed lock excludes no one) — and
-    redistribution must be inside the lock regime (its poll job can otherwise interleave
-    a newer snapshot between the batch's fetch and apply)."""
+    """Codex S3-R4/R5: the batch must lock EXACTLY the grain-a identities — the complete,
+    deduplicated, SORTED spec-name list plus 'redistribution' (lag_topology's spec is
+    named 'lag'; a label-keyed lock excludes no one)."""
     from nso_adapter.core import refresh_engine as engine_mod
     from nso_adapter.core.importer import refresh_all_surfaces_for_device
 
@@ -1586,23 +1585,78 @@ async def test_projected_batch_locks_by_spec_name_and_covers_redistribution(db_s
         return real_lock(device_id, family)
 
     monkeypatch.setattr(engine_mod, "_family_lock", _recording_lock)
-    # the importer resolves _family_lock at call time from the engine module
     nso_client = AsyncMock(spec=NsoClient)
     nso_client.get_device_state_doc.return_value = {"device-name": "sw-locks"}  # sections coerce to error
 
     await refresh_all_surfaces_for_device(db_session, device, nso_client, refresh_source="sync")
 
-    assert "lag" in acquired, acquired
-    assert "lag_topology" not in acquired, "label-keyed lock would exclude nobody (grain-a locks 'lag')"
-    assert "redistribution" in acquired, "redistribution must join the batch lock regime"
+    # The batch prefix must be the COMPLETE ordered key list (identity + dedup + sort);
+    # per-family apply and the composite may take further looks afterwards, but the
+    # first len(expected) acquisitions ARE the batch's exit-stack in order.
+    expected = sorted(
+        [
+            "static_route",
+            "isis",
+            "bgp",
+            "ospf",
+            "route_policy",
+            "snmp",
+            "logging",
+            "bfd",
+            "interface_ip",
+            "vlan",
+            "svi",
+            "subinterface",
+            "interface_mtu",
+            "lag",
+            "lag_config",
+            "l2_service",
+            "switchport",
+            "redistribution",
+        ]
+    )
+    assert acquired[: len(expected)] == expected, acquired[: len(expected)]
+    assert "lag_topology" not in acquired
 
 
 @pytest.mark.anyio
-async def test_standalone_redistribution_takes_its_family_lock(db_session: AsyncSession, monkeypatch):
+async def test_standalone_redistribution_holds_its_lock_across_the_reads(db_session: AsyncSession, monkeypatch):
+    """The standalone wrapper's lock must span CLASSIFICATION too — locking only the
+    materialization would readmit the original stale-over-newer race (S3-R5)."""
     from nso_adapter.core import refresh_engine as engine_mod
     from nso_adapter.core.redistribution import refresh_redistribution_for_device
 
     device = Device(nso_instance="nso-dev", nso_device_name="sw-rlock", ned_id="x", netbox_device_id=8)
+    db_session.add(device)
+    await db_session.commit()
+    device_id = device.id
+
+    real_lock = engine_mod._family_lock
+    held_during_reads: list[bool] = []
+
+    nso_client = AsyncMock(spec=NsoClient)
+
+    async def _section(device_name, wire_family):
+        held_during_reads.append(real_lock(device_id, "redistribution").locked())
+        return {"status": "ok"}
+
+    nso_client.get_device_state_section.side_effect = _section
+
+    await refresh_redistribution_for_device(db_session, device, nso_client, refresh_source="poll")
+
+    assert held_during_reads == [True, True, True], held_during_reads
+
+
+@pytest.mark.anyio
+async def test_from_outcomes_lock_discipline(db_session: AsyncSession, monkeypatch):
+    """refresh_redistribution_from_outcomes: default path acquires 'redistribution'
+    exactly once; own_lock=False must not re-acquire (asyncio.Lock is not reentrant —
+    a re-acquisition under the batch's held lock would deadlock)."""
+    from nso_adapter.core import refresh_engine as engine_mod
+    from nso_adapter.core.redistribution import refresh_redistribution_from_outcomes
+    from nso_adapter.nso.read_outcome import AbsentAuthoritative
+
+    device = Device(nso_instance="nso-dev", nso_device_name="sw-flock", ned_id="x", netbox_device_id=9)
     db_session.add(device)
     await db_session.commit()
 
@@ -1614,9 +1668,13 @@ async def test_standalone_redistribution_takes_its_family_lock(db_session: Async
         return real_lock(device_id, family)
 
     monkeypatch.setattr(engine_mod, "_family_lock", _recording_lock)
-    nso_client = AsyncMock(spec=NsoClient)
-    nso_client.get_device_state_section.return_value = {"status": "ok"}
+    outcomes = {proto: AbsentAuthoritative() for proto in ("ospf", "isis", "bgp")}
 
-    await refresh_redistribution_for_device(db_session, device, nso_client, refresh_source="poll")
+    ok = await refresh_redistribution_from_outcomes(db_session, device, outcomes, refresh_source="sync")
+    assert ok is True
+    assert acquired.count("redistribution") == 1, acquired
 
-    assert "redistribution" in acquired, acquired
+    acquired.clear()
+    ok = await refresh_redistribution_from_outcomes(db_session, device, outcomes, refresh_source="sync", own_lock=False)
+    assert ok is True
+    assert acquired == [], "own_lock=False must not touch the lock registry"
