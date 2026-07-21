@@ -36,7 +36,7 @@ SNMP_V3USER_KEYS = {"username", "has_auth_secret", "has_priv_secret"}
 # NSO host writers KEY the receiver on — without it a v3 trap host cannot be pushed (CR-P16).
 SNMP_HOST_KEYS = {"address", "version", "notify_type", "port", "username"}
 SNMP_SYSINFO_KEYS = {"location", "contact"}
-LOGGING_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "hosts"}
+LOGGING_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "read_state", "hosts"}
 LOGGING_HOST_REQUIRED_KEYS = {"address"}
 LOGGING_HOST_OPTIONAL_KEYS = {"port", "severity", "facility", "transport", "vrf", "source"}
 

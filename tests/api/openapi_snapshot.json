@@ -2898,7 +2898,7 @@
         "type": "object"
       },
       "InterfacesDocOut": {
-        "description": "Object-shaped interfaces document (READSEM S4 D1) \u2014 the S4 plugin consumes THIS;\nthe bare-list /interfaces stays byte-identical for pre-S4 consumers until S5.",
+        "description": "Object-shaped interfaces document (READSEM S4 D1).\n\nThe S4 plugin consumes THIS; the bare-list /interfaces stays byte-identical for\npre-S4 consumers until S5.",
         "properties": {
           "device_id": {
             "title": "Device Id",
@@ -5041,6 +5041,9 @@
               }
             ]
           },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
+          },
           "refresh_source": {
             "title": "Refresh Source",
             "type": "string"
@@ -5049,6 +5052,7 @@
         "required": [
           "device_id",
           "refresh_source",
+          "read_state",
           "hosts"
         ],
         "title": "LoggingConfigOut",
