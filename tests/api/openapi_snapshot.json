@@ -4688,6 +4688,88 @@
         "title": "LagTopologyOut",
         "type": "object"
       },
+      "LocalLevelsEntry": {
+        "description": "Owned local-levels intent (NX-P4a); an omitted severity = that destination unmanaged.",
+        "properties": {
+          "accepted_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted At"
+          },
+          "console_severity": {
+            "anyOf": [
+              {
+                "enum": [
+                  "EMERGENCY",
+                  "ALERT",
+                  "CRITICAL",
+                  "ERROR",
+                  "WARNING",
+                  "NOTICE",
+                  "INFORMATIONAL",
+                  "DEBUG"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Console Severity"
+          },
+          "module_severity": {
+            "anyOf": [
+              {
+                "enum": [
+                  "EMERGENCY",
+                  "ALERT",
+                  "CRITICAL",
+                  "ERROR",
+                  "WARNING",
+                  "NOTICE",
+                  "INFORMATIONAL",
+                  "DEBUG"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Module Severity"
+          },
+          "monitor_severity": {
+            "anyOf": [
+              {
+                "enum": [
+                  "EMERGENCY",
+                  "ALERT",
+                  "CRITICAL",
+                  "ERROR",
+                  "WARNING",
+                  "NOTICE",
+                  "INFORMATIONAL",
+                  "DEBUG"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Monitor Severity"
+          }
+        },
+        "title": "LocalLevelsEntry",
+        "type": "object"
+      },
       "LocalLevelsOut": {
         "description": "Per-device local logging severities (OC grain); each key omitted when unset.",
         "properties": {
@@ -4924,6 +5006,16 @@
             },
             "title": "Hosts",
             "type": "array"
+          },
+          "local_levels": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LocalLevelsEntry"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -10607,7 +10699,7 @@
     },
     "/api/v1/devices/{device_id}/logging-intent": {
       "put": {
-        "description": "Replace the adapter's remote-syslog intent mirror for this device atomically.\n\nFull-replace semantics: rows not present in the request body are deleted.\n``accepted_at`` defaults to now if not supplied. If ``auto_apply`` is enabled\non the device, an apply job is enqueued after the upsert.",
+        "description": "Replace the adapter's remote-syslog + local-levels intent mirror atomically.\n\nFull-replace semantics for ``hosts``: rows not present in the request body are\ndeleted. ``local_levels`` is presence-sensitive \u2014 see :class:`LoggingIntentUpdate`.\n``accepted_at`` defaults to now if not supplied. If ``auto_apply`` is enabled\non the device, an apply job is enqueued after the upsert.",
         "operationId": "put_logging_intent_api_v1_devices__device_id__logging_intent_put",
         "parameters": [
           {

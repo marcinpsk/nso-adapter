@@ -1018,20 +1018,48 @@ async def apply_static_routes(
     )
 
 
+def local_levels_write_enabled() -> bool:
+    """Whether to emit the logging ``local-levels`` container (NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE).
+
+    Off by default — the NX-P4a deploy gate (design R2/F4): every outbound
+    local-levels write goes through apply_logging_config, so this single choke
+    point keeps the adapter from sending the container to a pre-reload
+    logging-reconciler that would reject the unknown node. Flipped on once the
+    reloaded packages are live.
+    """
+    return os.environ.get("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+#: service leaf name → intent-row attribute, for the local-levels container.
+_LOCAL_LEVEL_LEAVES = (
+    ("console-severity", "console_severity"),
+    ("monitor-severity", "monitor_severity"),
+    ("module-severity", "module_severity"),
+)
+
+
 async def apply_logging_config(
     client: NsoClient,
     device_name: str,
     host_intent_rows: list,
     *,
+    levels_intent_row=None,
     replace: bool = False,
     dry_run: bool = False,
     stage: dict[str, list] | None = None,
 ) -> str | None:
-    """Write the full remote-syslog intent snapshot for a device to NSO.
+    """Write the full remote-syslog + local-levels intent snapshot for a device to NSO.
 
     Builds a logging-reconciler body from the supplied rows; the service adopts
     pre-existing brownfield logging config (reconcile). ``replace=True`` PUT-replaces
-    the keyed instance so removed hosts are reverted. No secrets.
+    the keyed instance so removed hosts / cleared severities are reverted. No secrets.
+
+    ``levels_intent_row`` is the device's accepted local-levels singleton (NX-P4a);
+    only SET severities are emitted (an absent leaf = unmanaged; removal is FASTMAP
+    retraction via replace, never an explicit clear). Emission is gated by
+    :func:`local_levels_write_enabled` — with the gate off an accepted levels intent
+    is NOT silently dropped from the operator's view: it stays in the store and a
+    warning names it on every apply until the gate opens.
     """
     hosts = []
     for row in host_intent_rows:
@@ -1050,12 +1078,25 @@ async def apply_logging_config(
             entry["source"] = row.source
         hosts.append(entry)
 
+    body: dict = {"device": device_name, "host": hosts}
+    if levels_intent_row is not None:
+        levels = {leaf: val for leaf, attr in _LOCAL_LEVEL_LEAVES if (val := getattr(levels_intent_row, attr))}
+        if levels and local_levels_write_enabled():
+            body["local-levels"] = levels
+        elif levels:
+            logger.warning(
+                "apply.local_levels_gated",
+                device=device_name,
+                levels=levels,
+                hint="accepted local-levels intent withheld: NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE is off",
+            )
+
     return await _send_service_config(
         client,
         _LOGGING_SERVICE_PATH,
         "logging-reconciler:logging-config",
         device_name,
-        {"device": device_name, "host": hosts},
+        body,
         scope="logging",
         replace=replace,
         dry_run=dry_run,

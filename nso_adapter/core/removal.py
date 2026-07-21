@@ -33,6 +33,8 @@ logger = structlog.get_logger(__name__)
 
 # scope → (intent store model name, apply function name) for the "simple" services
 # whose apply takes a single ``(client, device_name, rows, replace=True)`` signature.
+# logging is listed for the model→scope map/valid-scope set but dispatches bespoke
+# (_replace_logging): its PUT-replace must also carry the local-levels singleton.
 _SIMPLE_TARGETS: dict[str, tuple[str, str]] = {
     "route_policy": ("RoutePolicyObjectIntent", "apply_route_policy_config"),
     "bfd": ("BfdIntent", "apply_bfd_config"),
@@ -615,6 +617,43 @@ async def _replace_simple(db: AsyncSession, device, client, scope: str, context:
     await _guarded_apply(client, device, scope, context, _apply)
 
 
+async def _replace_logging(db: AsyncSession, device, client, context: dict | None = None) -> None:
+    """PUT-replace the logging-reconciler with hosts AND the local-levels singleton.
+
+    Bespoke (not routed through :func:`_replace_simple`) because the replace body must
+    re-assert the ACCEPTED local-levels intent alongside the remaining hosts — a
+    host-only body would FASTMAP-retract the owned severities, and on NX a retracted
+    ``console`` leaf DISABLES the destination (default enabled@2), not a benign revert.
+    Only accepted rows ride (never imported/staged intent), like every replace path.
+    """
+    from nso_adapter.nso.apply import apply_logging_config
+    from nso_adapter.store.models import LoggingHostIntent, LoggingLevelsIntent
+
+    rows = (
+        (
+            await db.execute(
+                select(LoggingHostIntent).where(
+                    LoggingHostIntent.device_id == device.id, LoggingHostIntent.accepted_at.is_not(None)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    levels = (
+        await db.execute(
+            select(LoggingLevelsIntent).where(
+                LoggingLevelsIntent.device_id == device.id, LoggingLevelsIntent.accepted_at.is_not(None)
+            )
+        )
+    ).scalar_one_or_none()
+
+    async def _apply(**kwargs):
+        return await apply_logging_config(client, device.nso_device_name, rows, levels_intent_row=levels, **kwargs)
+
+    await _guarded_apply(client, device, "logging", context, _apply)
+
+
 async def _replace_ospf(db: AsyncSession, device, client, context: dict | None = None) -> None:
     from nso_adapter.nso.apply import apply_ospf_config
     from nso_adapter.store.models import OspfInstanceIntent, OspfInterfaceIntent, RedistributionIntent
@@ -847,6 +886,8 @@ async def _dispatch_scope(db: AsyncSession, device, client, scope: str, context:
         await _replace_snmp(db, device, client, context)
     elif scope == "isis":
         await _replace_isis(db, device, client, context)
+    elif scope == "logging":
+        await _replace_logging(db, device, client, context)
     elif scope == "interface_config":
         await _replace_interface_config(db, device, client, (context or {}).get("interfaces") or [])
     elif scope in _SIMPLE_TARGETS:

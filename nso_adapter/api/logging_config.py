@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
@@ -14,7 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, IntentApplyResult, api_error
 from nso_adapter.core.removal import is_cleared
-from nso_adapter.store.models import Device, DeviceLoggingHost, DeviceLoggingLevels, DeviceSettings, LoggingHostIntent
+from nso_adapter.store.models import (
+    Device,
+    DeviceLoggingHost,
+    DeviceLoggingLevels,
+    DeviceSettings,
+    LoggingHostIntent,
+    LoggingLevelsIntent,
+)
 
 router = APIRouter(prefix="/api/v1/devices", tags=["logging-config"])
 
@@ -117,6 +125,19 @@ class LoggingHostEntry(BaseModel):
     accepted_at: datetime | None = None
 
 
+#: The closed OC severity vocabulary — the reconciler's log-severity-oc enum verbatim.
+OcSeverity = Literal["EMERGENCY", "ALERT", "CRITICAL", "ERROR", "WARNING", "NOTICE", "INFORMATIONAL", "DEBUG"]
+
+
+class LocalLevelsEntry(BaseModel):
+    """Owned local-levels intent (NX-P4a); an omitted severity = that destination unmanaged."""
+
+    console_severity: OcSeverity | None = None
+    monitor_severity: OcSeverity | None = None
+    module_severity: OcSeverity | None = None
+    accepted_at: datetime | None = None
+
+
 # Scalars the writer emits only when set — `if row.port is not None:` / `if row.severity:` (nso/apply.py). Most are NOT NULL default='' so the clear is '' rather than None — is_cleared() covers both.
 # A merge-PATCH apply can never drop one that goes back to unset, so clearing any of
 # them must enqueue a PUT-replace retract. See core.removal.is_cleared.
@@ -125,6 +146,38 @@ _STATE_FIELDS = ("port", "severity", "facility", "transport", "vrf", "source")
 
 class LoggingIntentUpdate(BaseModel):
     hosts: list[LoggingHostEntry]
+    # Presence-sensitive (R2/F10): OMITTED = preserve the stored levels intent (an old
+    # hosts-only client must never clear it); a dict = replace; an explicit null (or an
+    # entry with every severity unset) = un-manage → delete the row + retract.
+    local_levels: LocalLevelsEntry | None = None
+
+
+async def _sync_local_levels(
+    db: AsyncSession, device_id: int, entry: LocalLevelsEntry | None, now: datetime
+) -> tuple[bool, int]:
+    """Replace the levels singleton intent; returns ``(cleared, managed_count)``.
+
+    ``cleared`` reports any previously-set severity going back to unset — the #83
+    cleared-owned-scalar shape a merge-PATCH can never revert, so the caller must
+    enqueue the PUT-replace retract.
+    """
+    existing = (
+        await db.execute(select(LoggingLevelsIntent).where(LoggingLevelsIntent.device_id == device_id))
+    ).scalar_one_or_none()
+    before = {f: getattr(existing, f) for f in _LEVEL_FIELDS} if existing is not None else None
+    values = {f: (getattr(entry, f) if entry is not None else None) for f in _LEVEL_FIELDS}
+    cleared = before is not None and any(is_cleared(before[f], values[f]) for f in _LEVEL_FIELDS)
+    if not any(values.values()):
+        if existing is not None:
+            await db.delete(existing)
+        return cleared, 0
+    if existing is None:
+        existing = LoggingLevelsIntent(device_id=device_id)
+        db.add(existing)
+    for f in _LEVEL_FIELDS:
+        setattr(existing, f, values[f])
+    existing.accepted_at = entry.accepted_at.replace(tzinfo=None) if entry.accepted_at else now
+    return cleared, 1
 
 
 @router.put(
@@ -134,9 +187,10 @@ class LoggingIntentUpdate(BaseModel):
     responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
 )
 async def put_logging_intent(device_id: int, body: LoggingIntentUpdate, db: AsyncSession = Depends(get_db)):
-    """Replace the adapter's remote-syslog intent mirror for this device atomically.
+    """Replace the adapter's remote-syslog + local-levels intent mirror atomically.
 
-    Full-replace semantics: rows not present in the request body are deleted.
+    Full-replace semantics for ``hosts``: rows not present in the request body are
+    deleted. ``local_levels`` is presence-sensitive — see :class:`LoggingIntentUpdate`.
     ``accepted_at`` defaults to now if not supplied. If ``auto_apply`` is enabled
     on the device, an apply job is enqueued after the upsert.
     """
@@ -174,11 +228,16 @@ async def put_logging_intent(device_id: int, body: LoggingIntentUpdate, db: Asyn
             cleared = True
         count += 1
 
+    levels_cleared = False
+    levels_count = 0
+    if "local_levels" in body.model_fields_set:
+        levels_cleared, levels_count = await _sync_local_levels(db, device_id, body.local_levels, now)
+
     await db.flush()
 
     settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
     settings = settings_result.scalar_one_or_none()
-    if settings and settings.auto_apply and count > 0:
+    if settings and settings.auto_apply and (count > 0 or levels_count > 0):
         from nso_adapter.core.apply import enqueue_apply
 
         await enqueue_apply(db, device_id, force=True)
@@ -186,12 +245,12 @@ async def put_logging_intent(device_id: int, body: LoggingIntentUpdate, db: Asyn
     await db.commit()
 
     replaced = False
-    if removed or cleared:
+    if removed or cleared or levels_cleared:
         from nso_adapter.core.removal import replace_on_removal
         from nso_adapter.nso.apply import apply_logging_config
 
         replaced = await replace_on_removal(
-            db, device, removed, LoggingHostIntent, apply_logging_config, retract=cleared
+            db, device, removed, LoggingHostIntent, apply_logging_config, retract=cleared or levels_cleared
         )
 
     return {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}

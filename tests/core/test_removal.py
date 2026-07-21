@@ -180,6 +180,58 @@ async def test_dispatch_scope_simple_calls_apply_replace_true(adapter_client):
     assert kwargs == {"replace": True}
 
 
+async def test_dispatch_scope_logging_carries_accepted_levels(adapter_client):
+    """The logging PUT-replace must re-assert the ACCEPTED local-levels intent alongside
+    the remaining hosts — otherwise any host removal would FASTMAP-retract the owned
+    severities (on NX that DISABLES the destination, not a benign revert)."""
+    from nso_adapter.store.models import LoggingHostIntent, LoggingLevelsIntent
+
+    device_id = await _seed_device(nso_device_name="nx-t11")
+    async for db in get_session():
+        db.add(LoggingHostIntent(device_id=device_id, address="10.9.2.1", accepted_at=_NOW))
+        db.add(LoggingLevelsIntent(device_id=device_id, console_severity="CRITICAL", accepted_at=_NOW))
+        await db.commit()
+        break
+
+    apply_fn = AsyncMock()
+    client = _guard_client(None)  # no service instance in NSO → collateral guard no-ops
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        with patch("nso_adapter.nso.apply.apply_logging_config", apply_fn):
+            await removal_mod._dispatch_scope(db, device, client, "logging")
+        break
+
+    apply_fn.assert_awaited_once()
+    args, kwargs = apply_fn.await_args
+    assert [r.address for r in args[2]] == ["10.9.2.1"]
+    assert kwargs["replace"] is True
+    assert kwargs["levels_intent_row"] is not None
+    assert kwargs["levels_intent_row"].console_severity == "CRITICAL"
+
+
+async def test_dispatch_scope_logging_excludes_unaccepted_levels(adapter_client):
+    """A not-yet-accepted levels intent must never ride a PUT-replace (un-reviewed config)."""
+    from nso_adapter.store.models import LoggingHostIntent, LoggingLevelsIntent
+
+    device_id = await _seed_device(nso_device_name="nx-t12", netbox_device_id=43)
+    async for db in get_session():
+        db.add(LoggingHostIntent(device_id=device_id, address="10.9.2.2", accepted_at=_NOW))
+        db.add(LoggingLevelsIntent(device_id=device_id, console_severity="ERROR", accepted_at=None))
+        await db.commit()
+        break
+
+    apply_fn = AsyncMock()
+    client = _guard_client(None)
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        with patch("nso_adapter.nso.apply.apply_logging_config", apply_fn):
+            await removal_mod._dispatch_scope(db, device, client, "logging")
+        break
+
+    apply_fn.assert_awaited_once()
+    assert apply_fn.await_args.kwargs["levels_intent_row"] is None
+
+
 async def test_dispatch_scope_ospf_uses_multi_row_apply(adapter_client):
     """OSPF dispatch fetches ONLY accepted instances+interfaces+redist(ospf only), replace=True.
 
@@ -801,7 +853,7 @@ async def test_generic_no_service_instance_skips_guard(adapter_client):
         assert job.status == JobStatus.succeeded
         break
     apply_fn.assert_awaited_once()
-    assert apply_fn.await_args.kwargs == {"replace": True}
+    assert apply_fn.await_args.kwargs == {"replace": True, "levels_intent_row": None}
 
 
 async def test_replace_on_removal_threads_removed_keys(adapter_client):

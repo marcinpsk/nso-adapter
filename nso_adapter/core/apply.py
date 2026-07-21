@@ -42,6 +42,7 @@ from nso_adapter.store.models import (
     JobType,
     L2SapIntent,
     LoggingHostIntent,
+    LoggingLevelsIntent,
     OspfInstanceIntent,
     OspfInterfaceIntent,
     RedistributionIntent,
@@ -305,6 +306,8 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
     snmp_sysinfo = snmp_sysinfo_rows[0] if snmp_sysinfo_rows else None
     sr = await _accepted(StaticRouteIntent)
     lg = await _accepted(LoggingHostIntent)
+    lgl_rows = await _accepted(LoggingLevelsIntent)
+    lgl = lgl_rows[0] if lgl_rows else None
     svi = await _accepted(SviIntent)
     subif = await _accepted(SubinterfaceIntent)
     vlan = await _accepted(VlanIntent)
@@ -386,9 +389,9 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
         ),
         (
             "logging",
-            [lg],
+            [lg, [lgl] if lgl else []],
             lambda: nso_apply.apply_logging_config(
-                client=client, device_name=device_name, host_intent_rows=lg, dry_run=fmt
+                client=client, device_name=device_name, host_intent_rows=lg, levels_intent_row=lgl, dry_run=fmt
             ),
         ),
         (
@@ -936,7 +939,13 @@ async def _stage_atomic_modules(elig, client, device, device_name) -> tuple[dict
             elig["static_route"],
             lambda: apply_static_routes(client, device_name, elig["static_route"], stage=modules),
         ),
-        ("logging", elig["logging"], lambda: apply_logging_config(client, device_name, elig["logging"], stage=modules)),
+        (
+            "logging",
+            [*elig["logging"], *([elig["logging_levels"]] if elig["logging_levels"] else [])],
+            lambda: apply_logging_config(
+                client, device_name, elig["logging"], levels_intent_row=elig["logging_levels"], stage=modules
+            ),
+        ),
         ("svi", elig["svi"], lambda: apply_svi_config(client, device_name, elig["svi"], stage=modules)),
         ("vlan", elig["vlan"], lambda: apply_vlan_config(client, device_name, elig["vlan"], stage=modules)),
         ("bfd", elig["bfd"], lambda: apply_bfd_config(client, device_name, elig["bfd"], stage=modules)),
@@ -1575,6 +1584,9 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
 
     sr_eligible = await _collect_eligible(db, StaticRouteIntent, device_id, force)
     logging_eligible = await _collect_eligible(db, LoggingHostIntent, device_id, force)
+    logging_levels_rows = await _collect_eligible(db, LoggingLevelsIntent, device_id, force)
+    logging_levels = logging_levels_rows[0] if logging_levels_rows else None
+    logging_rows = [*logging_eligible, *([logging_levels] if logging_levels else [])]
     svi_eligible = await _collect_eligible(db, SviIntent, device_id, force)
     subif_eligible = await _collect_eligible(db, SubinterfaceIntent, device_id, force)
     vlan_eligible = await _collect_eligible(db, VlanIntent, device_id, force)
@@ -1614,7 +1626,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             ip_eligible_by_iface,
             snmp_rows,
             sr_eligible,
-            logging_eligible,
+            logging_rows,
             svi_eligible,
             subif_eligible,
             vlan_eligible,
@@ -1649,6 +1661,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             "snmp_sysinfo": snmp_sysinfo,
             "static_route": sr_eligible,
             "logging": logging_eligible,
+            "logging_levels": logging_levels,
             "svi": svi_eligible,
             "vlan": vlan_eligible,
             "bfd": bfd_eligible,
@@ -1731,8 +1744,13 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         _Scope(
             "logging",
             "logging",
-            logging_eligible,
-            lambda: apply_logging_config(client=client, device_name=device_name, host_intent_rows=logging_eligible),
+            logging_rows,
+            lambda: apply_logging_config(
+                client=client,
+                device_name=device_name,
+                host_intent_rows=logging_eligible,
+                levels_intent_row=logging_levels,
+            ),
         ),
         _Scope(
             "svi",

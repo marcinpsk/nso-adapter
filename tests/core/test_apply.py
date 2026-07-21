@@ -1276,6 +1276,67 @@ async def test_run_apply_scope_success(adapter_client, model_name, kwargs, apply
         break
 
 
+async def test_run_apply_logging_threads_and_stamps_levels_intent(adapter_client):
+    """The accepted local-levels singleton rides the logging scope: threaded to
+    apply_logging_config as levels_intent_row and stamped alongside the host rows."""
+    from nso_adapter.store.models import LoggingHostIntent, LoggingLevelsIntent
+
+    device_id = await _seed_device("rtr-logging-lvl", 311)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(LoggingHostIntent(device_id=device_id, address="10.9.0.98", accepted_at=datetime.utcnow()))
+        db.add(LoggingLevelsIntent(device_id=device_id, console_severity="CRITICAL", accepted_at=datetime.utcnow()))
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_logging_config", new_callable=AsyncMock) as mock_apply,
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    mock_apply.assert_awaited_once()
+    assert mock_apply.await_args.kwargs["levels_intent_row"] is not None
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        # both the host row and the levels singleton count and get stamped
+        assert job.result["logging_count_by_outcome"] == {"in_sync": 2, "apply_failed": 0}
+        row = (
+            await db.execute(select(LoggingLevelsIntent).where(LoggingLevelsIntent.device_id == device_id))
+        ).scalar_one()
+        assert row.last_apply_at is not None
+        assert row.last_apply_error is None
+        break
+
+
+async def test_run_apply_logging_levels_only_is_eligible(adapter_client):
+    """A levels-only accept (no host intent at all) must still trigger the logging scope."""
+    from nso_adapter.store.models import LoggingLevelsIntent
+
+    device_id = await _seed_device("rtr-logging-lvl2", 312)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(LoggingLevelsIntent(device_id=device_id, monitor_severity="NOTICE", accepted_at=datetime.utcnow()))
+        await db.commit()
+        break
+
+    mock_client = AsyncMock()
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_logging_config", new_callable=AsyncMock) as mock_apply,
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    mock_apply.assert_awaited_once()
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        assert job.result["logging_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
+        break
+
+
 async def test_run_apply_scope_failure_marks_error(adapter_client):
     """A scope NsoApplyError fails the job, stamps last_apply_error, and tags the item."""
     from nso_adapter.nso.apply import NsoApplyError

@@ -461,6 +461,55 @@ async def test_apply_logging_config_builds_host_body():
     assert hosts[1] == {"address": "192.0.2.6"}  # all optionals falsy → omitted
 
 
+def _levels_row(console=None, monitor=None, module=None):
+    return SimpleNamespace(console_severity=console, monitor_severity=monitor, module_severity=module)
+
+
+async def test_apply_logging_config_emits_local_levels_when_gate_on(monkeypatch):
+    """With the R2/F4 write-gate ON, the accepted levels intent rides the service body;
+    unset severities are omitted (no clears — FASTMAP retraction owns removal)."""
+    monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "1")
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+
+    await apply_logging_config(
+        client, "nx-t11", [], levels_intent_row=_levels_row(console="CRITICAL", module="NOTICE"), dry_run=True
+    )
+
+    entry = _sent_body(transport)["logging-reconciler:logging-config"][0]
+    assert entry["local-levels"] == {"console-severity": "CRITICAL", "module-severity": "NOTICE"}
+
+
+async def test_apply_logging_config_gate_off_omits_local_levels(monkeypatch):
+    """Default gate OFF: local-levels never reaches the wire (a pre-reload reconciler
+    would reject the unknown node) — even with an accepted levels intent."""
+    monkeypatch.delenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", raising=False)
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+
+    await apply_logging_config(
+        client,
+        "nx-t11",
+        [SimpleNamespace(address="192.0.2.7", port=None, severity="", facility="", transport="", vrf="", source="")],
+        levels_intent_row=_levels_row(console="CRITICAL"),
+        dry_run=True,
+    )
+
+    entry = _sent_body(transport)["logging-reconciler:logging-config"][0]
+    assert "local-levels" not in entry
+    assert entry["host"] == [{"address": "192.0.2.7"}]  # hosts unaffected by the gate
+
+
+async def test_apply_logging_config_no_levels_row_no_container(monkeypatch):
+    monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "1")
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+
+    await apply_logging_config(client, "sw03", [], levels_intent_row=None, dry_run=True)
+
+    assert "local-levels" not in _sent_body(transport)["logging-reconciler:logging-config"][0]
+
+
 async def test_apply_isis_interfaces_builds_process_and_interface_config():
     transport = _RecordingTransport()
     client = _client_with(transport)
