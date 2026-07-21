@@ -4688,6 +4688,46 @@
         "title": "LagTopologyOut",
         "type": "object"
       },
+      "LocalLevelsOut": {
+        "description": "Per-device local logging severities (OC grain); each key omitted when unset.",
+        "properties": {
+          "console_severity": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Console Severity"
+          },
+          "module_severity": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Module Severity"
+          },
+          "monitor_severity": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Monitor Severity"
+          }
+        },
+        "title": "LocalLevelsOut",
+        "type": "object"
+      },
       "LoggingConfigOut": {
         "properties": {
           "device_id": {
@@ -4711,6 +4751,16 @@
               }
             ],
             "title": "Last Refreshed At"
+          },
+          "local_levels": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LocalLevelsOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "refresh_source": {
             "title": "Refresh Source",
@@ -10489,7 +10539,7 @@
     },
     "/api/v1/devices/{device_id}/logging-config": {
       "get": {
-        "description": "Return the device's remote syslog servers.",
+        "description": "Return the device's remote syslog servers + local logging levels.",
         "operationId": "get_logging_config_api_v1_devices__device_id__logging_config_get",
         "parameters": [
           {

@@ -14,13 +14,19 @@ from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.nso.shape import as_list
-from nso_adapter.store.models import Device, DeviceLoggingHost
+from nso_adapter.store.models import Device, DeviceLoggingHost, DeviceLoggingLevels
 
 logger = structlog.get_logger(__name__)
 
 
-async def _upsert_logging_config(db: AsyncSession, device: Device, hosts: list[dict], refresh_source: str) -> None:
-    """Full-replace the device's logging hosts (the materializer)."""
+async def _upsert_logging_config(db: AsyncSession, device: Device, entry: dict, refresh_source: str) -> None:
+    """Full-replace the device's logging hosts + local-levels singleton (the materializer).
+
+    ``entry`` is the whole logging-config payload; ``extract({})`` feeds ``{}`` so the
+    authoritative clear runs the same path: no hosts, no local-levels → both wiped.
+    """
+    # as_list guards the singleton-rendered-as-bare-dict case (was a raw .get → crash).
+    hosts = as_list(entry.get("host"))
     await db.execute(delete(DeviceLoggingHost).where(DeviceLoggingHost.device_id == device.id))
     now = datetime.now(UTC).replace(tzinfo=None)
     for h in hosts:
@@ -41,6 +47,24 @@ async def _upsert_logging_config(db: AsyncSession, device: Device, hosts: list[d
                 refresh_source=refresh_source,
             )
         )
+
+    # local-levels (NX-P4a): a pure device mirror — present iff the export reports ≥1
+    # severity (observational presence, not ownership); absent → delete the row.
+    levels = entry.get("local-levels") or {}
+    row = (
+        await db.execute(select(DeviceLoggingLevels).where(DeviceLoggingLevels.device_id == device.id))
+    ).scalar_one_or_none()
+    if levels:
+        if row is None:
+            row = DeviceLoggingLevels(device_id=device.id)
+            db.add(row)
+        row.console_severity = levels.get("console-severity")
+        row.monitor_severity = levels.get("monitor-severity")
+        row.module_severity = levels.get("module-severity")
+        row.last_refreshed_at = now
+        row.refresh_source = refresh_source
+    elif row is not None:
+        await db.delete(row)
     await db.commit()
 
 
@@ -48,8 +72,9 @@ LOGGING_CONFIG_SPEC = FamilySpec(
     name="logging",
     empty_policy=EmptyPolicy.pop,
     getter=lambda client, name: client.get_logging_config(name),
-    # as_list guards the singleton-rendered-as-bare-dict case (was a raw .get → crash).
-    extract=lambda data: as_list(data.get("host")),
+    # Whole-entry payload: the materializer destructures host + local-levels itself
+    # (extract({}) == {} is the authoritative-clear "nothing" payload).
+    extract=lambda data: data,
     materialize=_upsert_logging_config,
     wire_name="logging-config",  # READSEM S3: fetch from the device-state envelope
 )

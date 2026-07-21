@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, IntentApplyResult, api_error
 from nso_adapter.core.removal import is_cleared
-from nso_adapter.store.models import Device, DeviceLoggingHost, DeviceSettings, LoggingHostIntent
+from nso_adapter.store.models import Device, DeviceLoggingHost, DeviceLoggingLevels, DeviceSettings, LoggingHostIntent
 
 router = APIRouter(prefix="/api/v1/devices", tags=["logging-config"])
 
@@ -31,11 +31,23 @@ class LoggingHostOut(BaseModel):
     source: str | None = None
 
 
+class LocalLevelsOut(BaseModel):
+    """Per-device local logging severities (OC grain); each key omitted when unset."""
+
+    console_severity: str | None = None
+    monitor_severity: str | None = None
+    module_severity: str | None = None
+
+
 class LoggingConfigOut(BaseModel):
     device_id: int
     last_refreshed_at: str | None = None  # reader formats "<iso>Z"; None when never refreshed
     refresh_source: str
     hosts: list[LoggingHostOut]
+    local_levels: LocalLevelsOut | None = None  # omitted entirely when the device sets no level
+
+
+_LEVEL_FIELDS = ("console_severity", "monitor_severity", "module_severity")
 
 
 @router.get(
@@ -46,7 +58,7 @@ class LoggingConfigOut(BaseModel):
     responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
 )
 async def get_logging_config(device_id: int, db: AsyncSession = Depends(get_db)):
-    """Return the device's remote syslog servers."""
+    """Return the device's remote syslog servers + local logging levels."""
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
@@ -62,10 +74,13 @@ async def get_logging_config(device_id: int, db: AsyncSession = Depends(get_db))
         .scalars()
         .all()
     )
-    if not rows:
+    levels_row = (
+        await db.execute(select(DeviceLoggingLevels).where(DeviceLoggingLevels.device_id == device_id))
+    ).scalar_one_or_none()
+    if not rows and levels_row is None:
         return {"device_id": device_id, "last_refreshed_at": None, "refresh_source": "never", "hosts": []}
 
-    latest = max(rows, key=lambda r: r.last_refreshed_at or "")
+    latest = max([*rows, *([levels_row] if levels_row else [])], key=lambda r: r.last_refreshed_at or "")
     hosts = []
     for r in rows:
         entry: dict = {"address": r.address}
@@ -75,12 +90,15 @@ async def get_logging_config(device_id: int, db: AsyncSession = Depends(get_db))
                 entry[attr] = val
         hosts.append(entry)
     ts = latest.last_refreshed_at
-    return {
+    out = {
         "device_id": device_id,
         "last_refreshed_at": ts.isoformat() + "Z" if ts else None,
         "refresh_source": latest.refresh_source,
         "hosts": hosts,
     }
+    if levels_row is not None:
+        out["local_levels"] = {f: getattr(levels_row, f) for f in _LEVEL_FIELDS if getattr(levels_row, f) is not None}
+    return out
 
 
 # ---------------------------------------------------------------------------

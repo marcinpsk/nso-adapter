@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from nso_adapter.core.logging_config import refresh_logging_config_for_device
 from nso_adapter.store.db import get_session
-from nso_adapter.store.models import Device, DeviceLoggingHost
+from nso_adapter.store.models import Device, DeviceLoggingHost, DeviceLoggingLevels
 from tests.conftest import seed_device
 
 
@@ -75,3 +75,88 @@ async def test_refresh_none_clears(adapter_client):
         nso_client.get_device_state_section.return_value = None
         await refresh_logging_config_for_device(db, device, nso_client, refresh_source="test")
         assert len(await _hosts(db, device_id)) == 0
+
+
+# ── local-levels singleton (NX-P4a) ──────────────────────────────────────────
+
+
+async def _levels(db, device_id):
+    return (
+        await db.execute(select(DeviceLoggingLevels).where(DeviceLoggingLevels.device_id == device_id))
+    ).scalar_one_or_none()
+
+
+@pytest.mark.anyio
+async def test_refresh_inserts_local_levels(adapter_client):
+    device_id = await seed_device(nso_device_name="log-nx01", netbox_device_id=973)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "host": [{"address": "10.0.0.1"}],
+            "local-levels": {
+                "console-severity": "CRITICAL",
+                "monitor-severity": "NOTICE",
+                "module-severity": "NOTICE",
+            },
+        }
+        await refresh_logging_config_for_device(db, device, nso_client, refresh_source="test")
+        row = await _levels(db, device_id)
+        assert row is not None
+        assert row.console_severity == "CRITICAL"
+        assert row.monitor_severity == "NOTICE"
+        assert row.module_severity == "NOTICE"
+        assert row.refresh_source == "test"
+        assert "10.0.0.1" in await _hosts(db, device_id)  # hosts ride the same payload
+
+
+@pytest.mark.anyio
+async def test_refresh_partial_levels_leaves_unset_none(adapter_client):
+    device_id = await seed_device(nso_device_name="log-nx02", netbox_device_id=974)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "local-levels": {"console-severity": "ERROR"},
+        }
+        await refresh_logging_config_for_device(db, device, nso_client, refresh_source="test")
+        row = await _levels(db, device_id)
+        assert row is not None
+        assert row.console_severity == "ERROR"
+        assert row.monitor_severity is None
+        assert row.module_severity is None
+
+
+@pytest.mark.anyio
+async def test_refresh_levels_absent_deletes_row(adapter_client):
+    """A payload that stops reporting local-levels is an authoritative device mirror — clear it."""
+    device_id = await seed_device(nso_device_name="log-nx03", netbox_device_id=975)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "local-levels": {"console-severity": "CRITICAL"},
+        }
+        await refresh_logging_config_for_device(db, device, nso_client, refresh_source="test")
+        assert await _levels(db, device_id) is not None
+        nso_client.get_device_state_section.return_value = {"status": "ok", "host": [{"address": "10.0.0.4"}]}
+        await refresh_logging_config_for_device(db, device, nso_client, refresh_source="test")
+        assert await _levels(db, device_id) is None
+        assert "10.0.0.4" in await _hosts(db, device_id)
+
+
+@pytest.mark.anyio
+async def test_refresh_none_clears_levels_too(adapter_client):
+    """The authoritative-empty (None read, EmptyPolicy.pop) clear covers the levels singleton."""
+    device_id = await seed_device(nso_device_name="log-nx04", netbox_device_id=976)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "local-levels": {"module-severity": "DEBUG"},
+        }
+        await refresh_logging_config_for_device(db, device, nso_client, refresh_source="test")
+        assert await _levels(db, device_id) is not None
+        nso_client.get_device_state_section.return_value = None
+        await refresh_logging_config_for_device(db, device, nso_client, refresh_source="test")
+        assert await _levels(db, device_id) is None

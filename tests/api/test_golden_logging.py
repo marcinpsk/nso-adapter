@@ -81,3 +81,47 @@ async def test_logging_golden_empty(adapter_client):
         "refresh_source": "never",
         "hosts": [],
     }
+
+
+async def _seed_levels(device_id: int, **severities) -> None:
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import DeviceLoggingLevels
+
+    async for db in get_session():
+        db.add(DeviceLoggingLevels(device_id=device_id, last_refreshed_at=TS, refresh_source="poll", **severities))
+        await db.commit()
+        break
+
+
+@pytest.mark.anyio
+async def test_logging_golden_local_levels(adapter_client):
+    """local_levels rides the body when the mirror row exists; unset severities are OMITTED."""
+    device_id = await seed_device(nso_device_name="log-golden-lvl", netbox_device_id=7970)
+    await _seed_levels(device_id, console_severity="CRITICAL", monitor_severity="NOTICE")
+
+    body = (await adapter_client.get(f"/api/v1/devices/{device_id}/logging-config", headers=AUTH)).json()
+
+    # A levels-only device: freshness comes from the levels row; hosts stay [].
+    assert body == {
+        "device_id": device_id,
+        "last_refreshed_at": "2026-06-01T10:00:00Z",
+        "refresh_source": "poll",
+        "hosts": [],
+        "local_levels": {"console_severity": "CRITICAL", "monitor_severity": "NOTICE"},
+    }
+
+
+@pytest.mark.anyio
+async def test_logging_golden_hosts_and_levels(adapter_client):
+    device_id = await seed_device(nso_device_name="log-golden-both", netbox_device_id=7971)
+    await _seed_logging(device_id)
+    await _seed_levels(device_id, console_severity="CRITICAL", monitor_severity="NOTICE", module_severity="NOTICE")
+
+    body = (await adapter_client.get(f"/api/v1/devices/{device_id}/logging-config", headers=AUTH)).json()
+
+    assert body["local_levels"] == {
+        "console_severity": "CRITICAL",
+        "monitor_severity": "NOTICE",
+        "module_severity": "NOTICE",
+    }
+    assert [h["address"] for h in body["hosts"]] == ["10.0.0.5", "10.0.0.6"]

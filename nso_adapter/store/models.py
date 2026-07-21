@@ -149,6 +149,9 @@ class Device(Base):
     logging_hosts: Mapped[list[DeviceLoggingHost]] = relationship(
         "DeviceLoggingHost", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
+    logging_levels: Mapped[DeviceLoggingLevels | None] = relationship(
+        "DeviceLoggingLevels", back_populates="device", uselist=False, cascade="all, delete-orphan", lazy="raise"
+    )
     snmp_community_intents: Mapped[list[SnmpCommunityIntent]] = relationship(
         "SnmpCommunityIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )
@@ -184,6 +187,9 @@ class Device(Base):
     )
     logging_host_intents: Mapped[list[LoggingHostIntent]] = relationship(
         "LoggingHostIntent", back_populates="device", cascade="all, delete-orphan", lazy="raise"
+    )
+    logging_levels_intent: Mapped[LoggingLevelsIntent | None] = relationship(
+        "LoggingLevelsIntent", back_populates="device", uselist=False, cascade="all, delete-orphan", lazy="raise"
     )
     isis_processes: Mapped[list[DeviceIsisProcess]] = relationship(
         "DeviceIsisProcess", back_populates="device", cascade="all, delete-orphan", lazy="raise"
@@ -803,6 +809,30 @@ class DeviceLoggingHost(Base):
     device: Mapped[Device] = relationship("Device", back_populates="logging_hosts")
 
 
+class DeviceLoggingLevels(Base):
+    """Read mirror of the per-device local logging severity levels (NX-P4a).
+
+    One row per device (unique on device_id) mirroring the export's ``local-levels``
+    container: console/monitor/module severity at the OC grain (EMERGENCY..DEBUG).
+    A destination the device leaves unset is NULL; a device with no level set at
+    all has NO row (observational presence, not ownership).
+    """
+
+    __tablename__ = "device_logging_levels"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
+    )
+    console_severity: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    monitor_severity: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    module_severity: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    last_refreshed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    refresh_source: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    device: Mapped[Device] = relationship("Device", back_populates="logging_levels")
+
+
 class SnmpSystemInfo(Base):
     """Read mirror of SNMP sysLocation / sysContact per device.
 
@@ -1117,6 +1147,32 @@ class LoggingHostIntent(Base):
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     device: Mapped[Device] = relationship("Device", back_populates="logging_host_intents")
+
+
+class LoggingLevelsIntent(Base):
+    """Write-path intent for the per-device local logging levels accepted by the operator (NX-P4a).
+
+    One row per device (unique on device_id). Only the severities PRESENT here are
+    owned/managed by the reconciler service; a NULL destination is unmanaged. Clearing
+    a previously-set severity (or deleting the row) must PUT-replace the service so
+    FASTMAP retracts the leaf — on NX that DISABLES the destination (default enabled@2),
+    not a benign revert.
+    """
+
+    __tablename__ = "logging_levels_intent"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
+    )
+    console_severity: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    monitor_severity: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    module_severity: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    device: Mapped[Device] = relationship("Device", back_populates="logging_levels_intent")
 
 
 class DeviceL2Sap(Base):
