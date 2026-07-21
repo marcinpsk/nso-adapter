@@ -148,9 +148,6 @@ async def refresh_redistribution_for_device(
         logger.debug("redistribution.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
         return True
 
-    name = device.nso_device_name
-    now = datetime.now(UTC).replace(tzinfo=None)
-
     # Classify each component's envelope section independently (pop policy: a confirmed
     # DEVICE absence is an authoritative clear for every partition).
     outcomes: dict[str, ReadOutcome] = {}
@@ -162,10 +159,36 @@ async def refresh_redistribution_for_device(
             empty_policy=EmptyPolicy.pop,
             family_name=f"redistribution.{proto}",
         )
+    return await refresh_redistribution_from_outcomes(db, device, outcomes, refresh_source=refresh_source)
+
+
+async def refresh_redistribution_from_outcomes(
+    db: AsyncSession,
+    device: Device,
+    outcomes: dict[str, ReadOutcome],
+    *,
+    refresh_source: str = "sync",
+) -> bool:
+    """Aggregate + materialize from PRE-CLASSIFIED component outcomes.
+
+    Shared by the wrapper above (own section reads, grain a) and the projected fan-out
+    (codex S3-R3 F2: grains b/c classify redistribution's three components from the SAME
+    fetched doc/action snapshot — no extra NSO reads, one source of truth per sweep).
+
+    Record discipline (codex S3-R3 F4): phase 1 is recorded BEFORE materialization; the
+    mutation runs under the engine's two-mode failure guard (savepoint alive → roll it
+    back + terminalize the same attempt; commit-time death → recover the session + a
+    fresh terminal row); phase 2 terminalizes on success.
+    """
+    from nso_adapter.core.refresh_engine import _recover_session
+
+    name = device.nso_device_name
+    device_id = device.id
+    now = datetime.now(UTC).replace(tzinfo=None)
 
     # Tier 1 — any confirmed export outage aborts the whole refresh, rows untouched.
     if any(isinstance(o, Unavailable) and o.reason is UnavailableReason.export_down for o in outcomes.values()):
-        logger.warning("redistribution.refresh.degraded", device_id=device.id, device_name=name)
+        logger.warning("redistribution.refresh.degraded", device_id=device_id, device_name=name)
         await _record_composite(
             db,
             device,
@@ -177,82 +200,101 @@ async def refresh_redistribution_for_device(
         )
         return False
 
-    # Tier 2 — per-component aggregation (codex S3-R1 F7, explicit):
-    # * Present (fresh OR stale=degraded-success) / AbsentAuthoritative → full-replace the
-    #   partition (stale carries the degraded marker into the composite outcome record);
-    # * declared `unsupported` → keep the partition AND count as success — an ArcOS device
-    #   (OSPF unsupported, ISIS/BGP supported) must not sit permanently `partial`;
-    # * anything else (read_error, failed escalation) → keep the partition + failure.
-    all_authoritative = True
-    any_stale = False
-    rebuilt: list[DeviceRedistribution] = []
-    for proto, _wire_name, builder in _REDIST_COMPONENTS:
-        outcome = outcomes[proto]
-        if isinstance(outcome, (Present, AbsentAuthoritative)):
-            if isinstance(outcome, Present) and outcome.freshness is Freshness.stale:
-                any_stale = True
-            entry = outcome.data if isinstance(outcome, Present) else {}
-            await db.execute(
-                delete(DeviceRedistribution).where(
-                    DeviceRedistribution.device_id == device.id,
-                    DeviceRedistribution.dest_protocol == proto,
-                )
-            )
-            rebuilt.extend(builder(device.id, entry, now, refresh_source))
-        elif isinstance(outcome, Unavailable) and outcome.reason is UnavailableReason.unsupported:
-            logger.info(
-                "redistribution.refresh.component_unsupported",
-                device_id=device.id,
-                device_name=name,
-                protocol=proto,
-            )
-        else:
-            all_authoritative = False
-            logger.warning(
-                "redistribution.refresh.component_kept",
-                device_id=device.id,
-                device_name=name,
-                protocol=proto,
-                reason=outcome.reason.value,
-            )
+    # Merged phase-1 outcome (worst-of), recorded BEFORE any mutation.
+    kept = [
+        p for p, o in outcomes.items() if isinstance(o, Unavailable) and o.reason is not UnavailableReason.unsupported
+    ]
+    all_authoritative = not kept
+    any_stale = any(isinstance(o, Present) and o.freshness is Freshness.stale for o in outcomes.values())
+    if all_authoritative:
+        merged: ReadOutcome = Present({}, Freshness.stale if any_stale else Freshness.fresh)
+    else:
+        merged = Unavailable(UnavailableReason.read_error, detail=f"components kept: {kept}")
+    attempt_id = None
+    try:
+        attempt_id = await outcome_store.record_read_outcome(
+            db, device_id, "redistribution", merged, refresh_source=refresh_source
+        )
+    except Exception as exc:  # noqa: BLE001 — telemetry write; the mirror is the source of truth
+        logger.warning("redistribution.outcome.read_record_failed", device_id=device_id, error=repr(exc))
+        await _recover_session(db, device, "redistribution", device_id)
 
-    # First-wins in-refresh dedup: a duplicate identity tuple in the export would otherwise
-    # IntegrityError on commit (uq_deviceredistribution_identity). dest_protocol is part of the
-    # identity, so this only collides within a single rebuilt protocol's rows.
-    seen: set[tuple[str, str, str, str]] = set()
-    for row in rebuilt:
-        key = (row.dest_protocol, row.dest_ref, row.source_protocol, row.source_ref)
-        if key in seen:
-            continue
-        seen.add(key)
-        db.add(row)
-    await db.commit()
+    # Tier 2 — per-component aggregation under the two-mode materialization guard.
+    rebuilt: list[DeviceRedistribution] = []
+    savepoint = await db.begin_nested()
+    try:
+        for proto, _wire_name, builder in _REDIST_COMPONENTS:
+            outcome = outcomes[proto]
+            if isinstance(outcome, (Present, AbsentAuthoritative)):
+                entry = outcome.data if isinstance(outcome, Present) else {}
+                await db.execute(
+                    delete(DeviceRedistribution).where(
+                        DeviceRedistribution.device_id == device_id,
+                        DeviceRedistribution.dest_protocol == proto,
+                    )
+                )
+                rebuilt.extend(builder(device_id, entry, now, refresh_source))
+            elif isinstance(outcome, Unavailable) and outcome.reason is UnavailableReason.unsupported:
+                logger.info(
+                    "redistribution.refresh.component_unsupported",
+                    device_id=device_id,
+                    device_name=name,
+                    protocol=proto,
+                )
+            else:
+                logger.warning(
+                    "redistribution.refresh.component_kept",
+                    device_id=device_id,
+                    device_name=name,
+                    protocol=proto,
+                    reason=outcome.reason.value,
+                )
+
+        # First-wins in-refresh dedup: a duplicate identity tuple in the export would otherwise
+        # IntegrityError on commit (uq_deviceredistribution_identity).
+        seen: set[tuple[str, str, str, str]] = set()
+        for row in rebuilt:
+            key = (row.dest_protocol, row.dest_ref, row.source_protocol, row.source_ref)
+            if key in seen:
+                continue
+            seen.add(key)
+            db.add(row)
+        await db.commit()
+    except Exception:
+        try:
+            if savepoint.is_active:
+                await savepoint.rollback()
+                if attempt_id is not None:
+                    await outcome_store.record_result(db, attempt_id, result="error", succeeded=False, row_count=None)
+            else:
+                await _recover_session(db, device, "redistribution", device_id)
+                failed_id = await outcome_store.record_read_outcome(
+                    db, device_id, "redistribution", merged, refresh_source=refresh_source
+                )
+                await outcome_store.record_result(db, failed_id, result="error", succeeded=False, row_count=None)
+        except Exception as store_exc:  # noqa: BLE001 — telemetry; the materialization error is the story
+            logger.warning("redistribution.outcome.terminalize_failed", device_id=device_id, error=repr(store_exc))
+        raise
 
     logger.info(
         "redistribution.refresh.done",
-        device_id=device.id,
+        device_id=device_id,
         device_name=name,
         row_count=len(rebuilt),
         refresh_source=refresh_source,
     )
-    # Composite outcome record (codex S3-R1 F7 — redistribution never recorded): the merged
-    # worst-of view. Success (incl. unsupported-skips) → Present, stale if ANY component was;
-    # a kept component → Unavailable(read_error) with succeeded=False.
-    if all_authoritative:
-        merged: ReadOutcome = Present({}, Freshness.stale if any_stale else Freshness.fresh)
-        await _record_composite(
-            db, device, merged, refresh_source, result="replaced", succeeded=True, row_count=len(rebuilt)
-        )
-    else:
-        kept = [
-            p
-            for p, o in outcomes.items()
-            if isinstance(o, Unavailable) and o.reason is not UnavailableReason.unsupported
-        ]
-        merged = Unavailable(UnavailableReason.read_error, detail=f"components kept: {kept}")
-        await _record_composite(
-            db, device, merged, refresh_source, result="kept", succeeded=False, row_count=len(rebuilt)
-        )
+    try:
+        if attempt_id is not None:
+            await outcome_store.record_result(
+                db,
+                attempt_id,
+                result="replaced" if all_authoritative else "kept",
+                succeeded=all_authoritative,
+                row_count=len(rebuilt),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("redistribution.outcome.result_record_failed", device_id=device_id, error=repr(exc))
+        await _recover_session(db, device, "redistribution", device_id)
     return all_authoritative
 
 
@@ -266,13 +308,9 @@ async def _record_composite(
     succeeded: bool,
     row_count: int | None,
 ) -> None:
-    """Best-effort two-phase outcome record for the composite family (never breaks the refresh).
-
-    Same session-recovery contract as the engine's phase helpers (codex S3-R2 F2 class): a
-    store write that dies at the DB level dooms the caller's transaction and expires the
-    ORM instances — recover so the caller's next work stays usable.
-    """
+    """Best-effort two-phase record for paths that never materialize (tier-1 outage)."""
     from nso_adapter.core.refresh_engine import _recover_session
+    from nso_adapter.store import outcome_store
 
     device_id = device.id
     try:

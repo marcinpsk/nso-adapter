@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.config import get_config
 from nso_adapter.core.refresh_engine import (
+    _action_semaphore,
     classify_envelope_family_read,
     run_family_refresh_from_outcome,
     run_family_refresh_from_section,
@@ -222,13 +223,15 @@ async def _fetch_projection(nso_client, device, wire_names: list[str], *, atomic
         # exhaustion, unknown device) keeps every family. 360s: the action may rebuild
         # everything up to 3x under commit churn (3 x rc1 75.6s outruns the 180s default).
         try:
-            output = await nso_client.run_device_state_read(device.nso_device_name, wire_names, timeout=360.0)
+            async with _action_semaphore():
+                output = await nso_client.run_device_state_read(device.nso_device_name, wire_names, timeout=360.0)
         except Exception as exc:  # noqa: BLE001 — action error keeps every family
             return {}, Unavailable(UnavailableReason.read_error, detail=repr(exc))
-        return {
-            w: output.get(w, {"status": "error", "error-reason": "action output missing the section"})
-            for w in wire_names
-        }, None
+        # Codex S3-R3 F5: a non-mapping output or atomic!=True must NEVER be materialized
+        # as an atomic read — fan out read_error (keep) instead.
+        if not isinstance(output, dict) or output.get("atomic") is not True:
+            return {}, Unavailable(UnavailableReason.read_error, detail="action output malformed or not atomic")
+        return {w: _section_or_error(output.get(w)) for w in wire_names}, None
     try:
         doc = await nso_client.get_device_state_doc(device.nso_device_name)
     except NsoExportUnavailableError as exc:
@@ -237,17 +240,30 @@ async def _fetch_projection(nso_client, device, wire_names: list[str], *, atomic
         return {}, Unavailable(UnavailableReason.read_error, detail=repr(exc))
     if doc is None:
         return {w: None for w in wire_names}, None
-    sections = {w: doc.get(w, {"status": "error", "error-reason": "doc missing the section"}) for w in wire_names}
-    not_ready = [w for w, sec in sections.items() if isinstance(sec, dict) and sec.get("status") == "not-ready"]
+    # Codex S3-R3 F5: only the confirmed whole-doc 404 above may mean device absence. A
+    # present-but-null/scalar section inside a 200 doc is MALFORMED - an error section
+    # (keep), never None (which would authoritatively clear pop families).
+    sections = {w: _section_or_error(doc.get(w)) for w in wire_names}
+    not_ready = [w for w, sec in sections.items() if sec.get("status") == "not-ready"]
     if not_ready:
         try:
-            output = await nso_client.run_device_state_read(device.nso_device_name, not_ready)
+            async with _action_semaphore():
+                output = await nso_client.run_device_state_read(device.nso_device_name, not_ready)
+            if not isinstance(output, dict):
+                raise TypeError(f"action output is {type(output).__name__}, not a mapping")
             for w in not_ready:
-                sections[w] = output.get(w, {"status": "error", "error-reason": "action output missing the section"})
+                sections[w] = _section_or_error(output.get(w))
         except Exception as exc:  # noqa: BLE001 — heal failure degrades only the not-ready set
             for w in not_ready:
                 sections[w] = {"status": "error", "error-reason": f"heal action failed: {exc!r}"}
     return sections, None
+
+
+def _section_or_error(section) -> dict:
+    """Coerce a projected section to a dict; anything else becomes an error section."""
+    if isinstance(section, dict):
+        return section
+    return {"status": "error", "error-reason": f"malformed section ({type(section).__name__})"}
 
 
 async def _run_surfaces_projected(
@@ -264,38 +280,74 @@ async def _run_surfaces_projected(
     Same contract as :func:`_run_surfaces` (failed-name list, per-surface isolation);
     non-spec surfaces (redistribution) still run their own warm section reads.
     """
+    from contextlib import AsyncExitStack
+
+    from nso_adapter.core.redistribution import _REDIST_COMPONENTS, refresh_redistribution_from_outcomes
+    from nso_adapter.core.refresh_engine import _family_lock
+
     spec_by_name = {name: _projectable_spec(name) for name, _ in surfaces}
     wire_names = [spec.wire_name for spec in spec_by_name.values() if spec is not None]
-    sections, supplier_outcome = await _fetch_projection(nso_client, device, wire_names, atomic=atomic)
+    if "redistribution" in spec_by_name:
+        # Codex S3-R3 F2: redistribution's three components classify from the SAME fetched
+        # snapshot — force their wires into the fetch even if those family surfaces are
+        # individually disabled (a missing section would read as device absence and WIPE
+        # the partition).
+        wire_names = sorted({*wire_names, *(w for _p, w, _b in _REDIST_COMPONENTS)})
+    # Codex S3-R3 F3: hold EVERY spec surface's family lock across fetch+apply -
+    # otherwise a grain-a/SSE refresh can materialize a NEWER read between our fetch and
+    # our apply, and the delayed projection overwrites it with older data. Sorted
+    # acquisition (single order, no nesting elsewhere) keeps it deadlock-free; the apply
+    # calls below pass own_lock=False.
+    async with AsyncExitStack() as lock_stack:
+        for name in sorted(n for n, spec in spec_by_name.items() if spec is not None):
+            await lock_stack.enter_async_context(_family_lock(device.id, name))
+        sections, supplier_outcome = await _fetch_projection(nso_client, device, wire_names, atomic=atomic)
 
-    failed: list[str] = []
-    for name, fn in surfaces:
-        spec = spec_by_name[name]
-        try:
-            if spec is None:
-                ok = await fn(db, device, nso_client, refresh_source=refresh_source)
-            elif supplier_outcome is not None:
-                ok = await run_family_refresh_from_outcome(
-                    db, device, spec, supplier_outcome, refresh_source=refresh_source
-                )
-            else:
-                section = sections[spec.wire_name]
-                if section is None:
+        failed: list[str] = []
+        for name, fn in surfaces:
+            spec = spec_by_name[name]
+            try:
+                if spec is None and name == "redistribution":
+                    if supplier_outcome is not None:
+                        component_outcomes = {proto: supplier_outcome for proto, _w, _b in _REDIST_COMPONENTS}
+                    else:
+                        component_outcomes = {
+                            proto: classify_envelope_section(
+                                sections[w] if sections[w] is None else _section_or_error(sections[w]),
+                                EmptyPolicy.pop,
+                            )
+                            for proto, w, _b in _REDIST_COMPONENTS
+                        }
+                    ok = await refresh_redistribution_from_outcomes(
+                        db, device, component_outcomes, refresh_source=refresh_source
+                    )
+                elif spec is None:
+                    ok = await fn(db, device, nso_client, refresh_source=refresh_source)
+                elif supplier_outcome is not None:
                     ok = await run_family_refresh_from_outcome(
-                        db,
-                        device,
-                        spec,
-                        classify_envelope_section(None, spec.empty_policy),
-                        refresh_source=refresh_source,
+                        db, device, spec, supplier_outcome, refresh_source=refresh_source, own_lock=False
                     )
                 else:
-                    ok = await run_family_refresh_from_section(db, device, spec, section, refresh_source=refresh_source)
-            if not ok:
+                    section = sections[spec.wire_name]
+                    if section is None:
+                        ok = await run_family_refresh_from_outcome(
+                            db,
+                            device,
+                            spec,
+                            classify_envelope_section(None, spec.empty_policy),
+                            refresh_source=refresh_source,
+                            own_lock=False,
+                        )
+                    else:
+                        ok = await run_family_refresh_from_section(
+                            db, device, spec, section, refresh_source=refresh_source, own_lock=False
+                        )
+                if not ok:
+                    failed.append(name)
+            except Exception as exc:  # noqa: BLE001 — one surface must not take down the rest
+                logger.warning("sync.surface_refresh_failed", device_id=device.id, surface=name, error=repr(exc))
                 failed.append(name)
-        except Exception as exc:  # noqa: BLE001 — one surface must not take down the rest
-            logger.warning("sync.surface_refresh_failed", device_id=device.id, surface=name, error=repr(exc))
-            failed.append(name)
-    return failed
+        return failed
 
 
 def _routing_surfaces(cfg) -> list[tuple[str, object]]:
@@ -413,7 +465,7 @@ async def refresh_routing_surfaces_for_device(
     :func:`_run_surfaces`); the caller records them so the device reports ``partial``.
     """
     return await _run_surfaces_projected(
-        db, device, nso_client, _routing_surfaces(get_config().scheduler), refresh_source
+        db, device, nso_client, _routing_surfaces(get_config().scheduler), refresh_source, atomic=atomic
     )
 
 
@@ -433,7 +485,7 @@ async def refresh_config_surfaces_for_device(
     FAILED surface names (callers may ignore the list — apply just wants the best-effort refresh).
     """
     return await _run_surfaces_projected(
-        db, device, nso_client, _config_surfaces(get_config().scheduler), refresh_source
+        db, device, nso_client, _config_surfaces(get_config().scheduler), refresh_source, atomic=atomic
     )
 
 
@@ -647,24 +699,34 @@ def _sync_from_succeeded(output) -> bool:
 
 
 async def _record_attrs_read(db, device, outcome, refresh_source: str):
-    """Best-effort phase-1 outcome record for the importer-owned attrs read (R1-F7)."""
+    """Best-effort phase-1 outcome record for the importer-owned attrs read (R1-F7).
+
+    With the engine's session-recovery discipline (codex S3-R3 F4): a store write that
+    dies at the DB level dooms sync_device's batched transaction — recover it or the
+    interface reconcile and every later surface inherit PendingRollbackError.
+    """
+    from nso_adapter.core.refresh_engine import _recover_session
     from nso_adapter.store import outcome_store
 
+    device_id = device.id  # snapshot before the store call can poison the session
     try:
         return await outcome_store.record_read_outcome(
-            db, device.id, "interface_attributes", outcome, refresh_source=refresh_source
+            db, device_id, "interface_attributes", outcome, refresh_source=refresh_source
         )
     except Exception as exc:  # noqa: BLE001 — telemetry write; the sync is the story
-        logger.warning("interface_attributes.outcome.read_record_failed", device_id=device.id, error=repr(exc))
+        logger.warning("interface_attributes.outcome.read_record_failed", device_id=device_id, error=repr(exc))
+        await _recover_session(db, device, "interface_attributes", device_id)
         return None
 
 
-async def _record_attrs_result(db, attempt_id, *, available: bool, row_count: int | None) -> None:
-    """Best-effort phase-2 terminalization for the attrs read."""
+async def _record_attrs_result(db, device, attempt_id, *, available: bool, row_count: int | None) -> None:
+    """Best-effort phase-2 terminalization for the attrs read (same recovery discipline)."""
+    from nso_adapter.core.refresh_engine import _recover_session
     from nso_adapter.store import outcome_store
 
     if attempt_id is None:
         return
+    device_id = device.id
     try:
         await outcome_store.record_result(
             db,
@@ -675,6 +737,7 @@ async def _record_attrs_result(db, attempt_id, *, available: bool, row_count: in
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("interface_attributes.outcome.result_record_failed", attempt_id=attempt_id, error=repr(exc))
+        await _recover_session(db, device, "interface_attributes", device_id)
 
 
 async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False) -> dict:
@@ -755,7 +818,7 @@ async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False)
     # the fan-out so a silently-failed surface read cannot hide under a premature 'succeeded'.
     device.last_sync_at = _utcnow()
     await db.commit()
-    await _record_attrs_result(db, attrs_attempt_id, available=attrs_available, row_count=interfaces_written)
+    await _record_attrs_result(db, device, attrs_attempt_id, available=attrs_available, row_count=interfaces_written)
 
     # Fan out to the routing/extra surfaces so one sync refreshes everything the device
     # exposes (IS-IS/BGP/OSPF/route-policy/...), not just interface attributes. Done

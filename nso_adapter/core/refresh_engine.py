@@ -268,6 +268,7 @@ async def run_family_refresh_from_section(
     section: dict,
     *,
     refresh_source: str = "sync",
+    own_lock: bool = True,
 ) -> bool:
     """Refresh one family from a PRE-FETCHED envelope section (READSEM fetch grains b/c).
 
@@ -287,7 +288,12 @@ async def run_family_refresh_from_section(
             "failures / device absence via run_family_refresh_from_outcome"
         )
     return await run_family_refresh_from_outcome(
-        db, device, spec, classify_envelope_section(section, spec.empty_policy), refresh_source=refresh_source
+        db,
+        device,
+        spec,
+        classify_envelope_section(section, spec.empty_policy),
+        refresh_source=refresh_source,
+        own_lock=own_lock,
     )
 
 
@@ -298,6 +304,7 @@ async def run_family_refresh_from_outcome(
     outcome: ReadOutcome,
     *,
     refresh_source: str = "sync",
+    own_lock: bool = True,
 ) -> bool:
     """Refresh one family from an ALREADY-CLASSIFIED outcome (READSEM fetch grains b/c).
 
@@ -311,6 +318,11 @@ async def run_family_refresh_from_outcome(
         logger.debug(f"{spec.name}.refresh.skipped", device_id=device.id, reason="no_nso_device_name")
         return True
 
+    if not own_lock:
+        # The projected batch runner (codex S3-R3 F3) holds every family lock for the
+        # whole fetch+apply span - re-acquiring here would deadlock (asyncio.Lock is
+        # not reentrant).
+        return await _apply_outcome(db, device, spec, outcome, refresh_source)
     async with _family_lock(device.id, spec.name):
         return await _apply_outcome(db, device, spec, outcome, refresh_source)
 

@@ -550,12 +550,11 @@ async def test_refresh_routing_surfaces_isolates_failures(db_session: AsyncSessi
         "interface-ip": {"status": "ok"},
     }
 
-    redistribution = AsyncMock(return_value=True)
-    with patch("nso_adapter.core.redistribution.refresh_redistribution_for_device", redistribution):
-        failed = await refresh_routing_surfaces_for_device(db_session, device, nso_client, refresh_source="sync")
+    failed = await refresh_routing_surfaces_for_device(db_session, device, nso_client, refresh_source="sync")
 
     # isis raised inside its materializer, bgp signalled failure; NEITHER aborted the rest:
-    # static_route (earlier) materialized its row and redistribution (later) still ran.
+    # static_route (earlier) materialized its row, and redistribution (later, S3-R3 F2:
+    # classified from the SAME snapshot, no wrapper) still recorded a composite outcome.
     assert "isis" in failed
     rows = (
         (await db_session.execute(_select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id)))
@@ -563,8 +562,15 @@ async def test_refresh_routing_surfaces_isolates_failures(db_session: AsyncSessi
         .all()
     )
     assert [r.prefix for r in rows] == ["10.5.0.0/16"]
-    redistribution.assert_awaited_once()
-    nso_client.get_device_state_doc.assert_awaited_once()  # ONE doc GET fed every spec surface
+    from nso_adapter.store.models import RefreshOutcome as _RO
+
+    redis_outcomes = (
+        (await db_session.execute(_select(_RO).where(_RO.device_id == device.id, _RO.family == "redistribution")))
+        .scalars()
+        .all()
+    )
+    assert redis_outcomes, "redistribution must classify from the shared snapshot and record"
+    nso_client.get_device_state_doc.assert_awaited_once()  # ONE doc GET fed every surface incl. redistribution
 
 
 async def test_surface_refresher_returns_false_on_read_error(db_session: AsyncSession):
@@ -619,10 +625,11 @@ async def test_refresh_routing_surfaces_returns_failed_surfaces(db_session: Asyn
         "interface-ip": {"status": "ok"},
     }
 
-    with patch("nso_adapter.core.redistribution.refresh_redistribution_for_device", AsyncMock(return_value=True)):
-        failed = await refresh_routing_surfaces_for_device(db_session, device, nso_client, refresh_source="sync")
+    failed = await refresh_routing_surfaces_for_device(db_session, device, nso_client, refresh_source="sync")
 
-    assert sorted(failed) == ["bgp", "isis"]
+    # bgp's error section also degrades redistribution's bgp COMPONENT (same snapshot,
+    # per-component retention) - the composite honestly reports too (S3-R3 F2).
+    assert sorted(failed) == ["bgp", "isis", "redistribution"]
 
 
 async def test_refresh_config_surfaces_isolates_failures(db_session: AsyncSession):
@@ -1400,11 +1407,13 @@ async def test_projection_heals_not_ready_sections_with_one_action(db_session: A
         "isis-interface": {"status": "ok"},
     }
 
-    with patch("nso_adapter.core.redistribution.refresh_redistribution_for_device", AsyncMock(return_value=True)):
-        failed = await refresh_routing_surfaces_for_device(db_session, device, nso_client, refresh_source="sync")
+    failed = await refresh_routing_surfaces_for_device(db_session, device, nso_client, refresh_source="sync")
 
     assert failed == []
-    nso_client.run_device_state_read.assert_awaited_once_with("sw01", ["static-route", "isis-interface"])
+    assert nso_client.run_device_state_read.await_count == 1
+    heal_args, _ = nso_client.run_device_state_read.await_args
+    assert heal_args[0] == "sw01"
+    assert sorted(heal_args[1]) == ["isis-interface", "static-route"]  # order follows the sorted wire set
     rows = (
         (await db_session.execute(_select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id)))
         .scalars()
@@ -1504,3 +1513,53 @@ async def test_atomic_fanout_action_error_keeps_every_family(db_session: AsyncSe
         .all()
     )
     assert [r.prefix for r in rows] == ["10.10.0.0/16"], "torn/failed atomic reads never clear"
+
+
+@pytest.mark.anyio
+async def test_sync_device_atomic_reaches_the_action_not_the_doc(db_session: AsyncSession):
+    """Codex S3-R3 F1 (BLOCKER): the atomic flag must survive the WRAPPER hop — sync_device
+    -> refresh_routing_surfaces_for_device -> _run_surfaces_projected. A dropped flag
+    silently downgrades operator Sync-Now to the record-served doc (grain b)."""
+    device = Device(
+        nso_instance="nso-dev", nso_device_name="sw-atomic", ned_id="cisco-ios-cli-6.95", netbox_device_id=6
+    )
+    db_session.add(device)
+    await db_session.commit()
+
+    nso_client = _make_nso_client({"device-name": "sw-atomic", "interface": []})
+    ok_empty = {"status": "ok"}
+    nso_client.run_device_state_read = AsyncMock(
+        return_value={
+            "atomic": True,
+            **{
+                w: ok_empty
+                for w in (
+                    "static-route",
+                    "isis-interface",
+                    "bgp-config",
+                    "ospf-config",
+                    "route-policy",
+                    "snmp-config",
+                    "logging-config",
+                    "bfd-config",
+                    "interface-ip",
+                )
+            },
+        }
+    )
+
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = nso_client
+    imp._netbox_client = None
+
+    with (
+        patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock),
+        patch("nso_adapter.core.redistribution.refresh_redistribution_for_device", AsyncMock(return_value=True)),
+    ):
+        await sync_device(device.id, db_session, atomic=True)
+
+    assert nso_client.run_device_state_read.await_count == 1
+    args, kwargs = nso_client.run_device_state_read.await_args
+    assert kwargs.get("timeout") == 360.0
+    nso_client.get_device_state_doc.assert_not_awaited()
