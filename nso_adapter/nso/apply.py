@@ -1057,9 +1057,13 @@ async def apply_logging_config(
     ``levels_intent_row`` is the device's accepted local-levels singleton (NX-P4a);
     only SET severities are emitted (an absent leaf = unmanaged; removal is FASTMAP
     retraction via replace, never an explicit clear). Emission is gated by
-    :func:`local_levels_write_enabled` — with the gate off an accepted levels intent
-    is NOT silently dropped from the operator's view: it stays in the store and a
-    warning names it on every apply until the gate opens.
+    :func:`local_levels_write_enabled` — and a CLOSED gate with an accepted levels
+    intent REFUSES (NsoApplyError) rather than sending a weaker host-only body:
+    proceeding would stamp the levels row in_sync without any severity landing, and
+    a replace-mode body missing local-levels would FASTMAP-retract previously-owned
+    severities (on NX that DISABLES the destination). The scope fails visibly
+    (apply_failed / stage_errors / removal_failed) until the gate opens or the
+    operator un-manages the levels.
     """
     hosts = []
     for row in host_intent_rows:
@@ -1081,15 +1085,16 @@ async def apply_logging_config(
     body: dict = {"device": device_name, "host": hosts}
     if levels_intent_row is not None:
         levels = {leaf: val for leaf, attr in _LOCAL_LEVEL_LEAVES if (val := getattr(levels_intent_row, attr))}
-        if levels and local_levels_write_enabled():
-            body["local-levels"] = levels
-        elif levels:
-            logger.warning(
-                "apply.local_levels_gated",
-                device=device_name,
-                levels=levels,
-                hint="accepted local-levels intent withheld: NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE is off",
+        if levels and not local_levels_write_enabled():
+            raise NsoApplyError(
+                "local_levels_gated",
+                "accepted local-levels intent cannot be applied: the "
+                "NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE gate is off (open it once the "
+                "reloaded logging-reconciler is live, or un-manage the levels)",
+                {"device": device_name, "levels": levels},
             )
+        if levels:
+            body["local-levels"] = levels
 
     return await _send_service_config(
         client,

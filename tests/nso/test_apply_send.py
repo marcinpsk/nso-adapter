@@ -480,24 +480,51 @@ async def test_apply_logging_config_emits_local_levels_when_gate_on(monkeypatch)
     assert entry["local-levels"] == {"console-severity": "CRITICAL", "module-severity": "NOTICE"}
 
 
-async def test_apply_logging_config_gate_off_omits_local_levels(monkeypatch):
-    """Default gate OFF: local-levels never reaches the wire (a pre-reload reconciler
-    would reject the unknown node) — even with an accepted levels intent."""
+async def test_apply_logging_config_gate_off_refuses_levels_intent(monkeypatch):
+    """Default gate OFF + an accepted levels intent → structured REFUSAL, nothing sent.
+
+    Proceeding with a host-only body would stamp the levels row in_sync without any
+    severity landing (a silent drop), and a replace-mode body missing local-levels
+    would FASTMAP-retract previously-owned severities — on NX that DISABLES the
+    destination. Weaker-than-intent must never report success (codex P4a-adapter P1).
+    """
+    monkeypatch.delenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", raising=False)
+    transport = _RecordingTransport()
+    client = _client_with(transport)
+
+    with pytest.raises(NsoApplyError, match="NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE"):
+        await apply_logging_config(
+            client,
+            "nx-t11",
+            [
+                SimpleNamespace(
+                    address="192.0.2.7", port=None, severity="", facility="", transport="", vrf="", source=""
+                )
+            ],
+            levels_intent_row=_levels_row(console="CRITICAL"),
+            dry_run=True,
+        )
+    assert not transport.requests  # refused before anything was sent
+
+
+async def test_apply_logging_config_gate_off_hosts_only_unaffected(monkeypatch):
+    """The gate only guards the levels container: a hosts-only apply (levels_intent_row
+    None — every non-NX device today) proceeds untouched with the gate off."""
     monkeypatch.delenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", raising=False)
     transport = _RecordingTransport()
     client = _client_with(transport)
 
     await apply_logging_config(
         client,
-        "nx-t11",
+        "sw03",
         [SimpleNamespace(address="192.0.2.7", port=None, severity="", facility="", transport="", vrf="", source="")],
-        levels_intent_row=_levels_row(console="CRITICAL"),
+        levels_intent_row=None,
         dry_run=True,
     )
 
     entry = _sent_body(transport)["logging-reconciler:logging-config"][0]
     assert "local-levels" not in entry
-    assert entry["host"] == [{"address": "192.0.2.7"}]  # hosts unaffected by the gate
+    assert entry["host"] == [{"address": "192.0.2.7"}]
 
 
 async def test_apply_logging_config_no_levels_row_no_container(monkeypatch):

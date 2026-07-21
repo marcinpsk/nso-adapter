@@ -209,6 +209,29 @@ async def test_dispatch_scope_logging_carries_accepted_levels(adapter_client):
     assert kwargs["levels_intent_row"].console_severity == "CRITICAL"
 
 
+async def test_dispatch_scope_logging_gate_off_refuses_not_retracts(adapter_client, monkeypatch):
+    """Gate OFF + owned levels: the REAL builder refuses the replace instead of
+    committing a levels-less body that would FASTMAP-retract the owned severities
+    (NX destination disable). The removal job then fails honestly (removal_failed)."""
+    from nso_adapter.nso.apply import NsoApplyError
+    from nso_adapter.store.models import LoggingHostIntent, LoggingLevelsIntent
+
+    monkeypatch.delenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", raising=False)
+    device_id = await _seed_device(nso_device_name="nx-t13", netbox_device_id=44)
+    async for db in get_session():
+        db.add(LoggingHostIntent(device_id=device_id, address="10.9.2.3", accepted_at=_NOW))
+        db.add(LoggingLevelsIntent(device_id=device_id, console_severity="CRITICAL", accepted_at=_NOW))
+        await db.commit()
+        break
+
+    client = _guard_client(None)  # no service instance → guard no-ops, plain replace
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        with pytest.raises(NsoApplyError, match="NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE"):
+            await removal_mod._dispatch_scope(db, device, client, "logging")
+        break
+
+
 async def test_dispatch_scope_logging_excludes_unaccepted_levels(adapter_client):
     """A not-yet-accepted levels intent must never ride a PUT-replace (un-reviewed config)."""
     from nso_adapter.store.models import LoggingHostIntent, LoggingLevelsIntent
