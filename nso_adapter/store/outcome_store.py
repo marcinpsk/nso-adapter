@@ -30,7 +30,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.nso.read_outcome import AbsentAuthoritative, Present, ReadOutcome, Unavailable
@@ -101,19 +101,32 @@ async def record_result(
     row.row_count = row_count
     row.completed_at = datetime.now(UTC)
 
-    pointer = (
-        await db.execute(
-            select(RefreshOutcomePointer).where(
-                RefreshOutcomePointer.device_id == row.device_id,
-                RefreshOutcomePointer.family == row.family,
-            )
-        )
-    ).scalar_one_or_none()
-    if pointer is None:
-        db.add(RefreshOutcomePointer(device_id=row.device_id, family=row.family, attempt_id=attempt_id))
-    elif attempt_id > pointer.attempt_id:
-        pointer.attempt_id = attempt_id
+    await db.execute(_pointer_advance_stmt(db, row.device_id, row.family, attempt_id))
     await db.commit()
+
+
+def _pointer_advance_stmt(db: AsyncSession, device_id: int, family: str, attempt_id: int):
+    """Build the database-atomic monotonic pointer upsert (READSEM S4 D6).
+
+    ``INSERT … ON CONFLICT (device_id, family) DO UPDATE … WHERE excluded.attempt_id >
+    attempt_id`` — the monotonic guard evaluates INSIDE the database at write time, so a
+    session that decided from a pre-window snapshot cannot regress the pointer (the old
+    SELECT→compare-in-Python→UPDATE protocol lost that update; proven red-first by
+    ``tests/store/test_pointer_concurrency.py``). Dialect-branched because the construct
+    lives on each dialect's ``insert()``; both PG and SQLite (≥3.24) support the
+    update-side WHERE. ``updated_at`` is set explicitly — ORM ``onupdate`` does not fire
+    for core statements.
+    """
+    if db.bind.dialect.name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
+    stmt = dialect_insert(RefreshOutcomePointer).values(device_id=device_id, family=family, attempt_id=attempt_id)
+    return stmt.on_conflict_do_update(
+        index_elements=["device_id", "family"],
+        set_={"attempt_id": stmt.excluded.attempt_id, "updated_at": func.now()},
+        where=stmt.excluded.attempt_id > RefreshOutcomePointer.attempt_id,
+    )
 
 
 # ── S4 read accessors (the pointer join the API serves) ──────────────────────────────────
