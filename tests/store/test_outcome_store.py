@@ -224,3 +224,71 @@ async def test_engine_records_unavailable_outcome(adapter_client):
     assert row.read_reason == "export_down"
     assert row.result == "kept"
     assert row.succeeded is False
+
+
+# ── S4 read accessors (the pointer join the API serves) ──────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_get_current_outcome_returns_newest_terminal(adapter_client):
+    """The accessor resolves the pointer to the newest TERMINAL attempt's full row."""
+    device_id = await seed_device(nso_device_name="oc-acc1", netbox_device_id=8811)
+    async for db in get_session():
+        a1 = await outcome_store.record_read_outcome(
+            db, device_id, "static_route", Present({"r": []}, Freshness.fresh), refresh_source="poll"
+        )
+        await outcome_store.record_result(db, a1, result="replaced", succeeded=True, row_count=3)
+        a2 = await outcome_store.record_read_outcome(
+            db,
+            device_id,
+            "static_route",
+            Unavailable(UnavailableReason.export_down, "boom"),
+            refresh_source="poll",
+        )
+        await outcome_store.record_result(db, a2, result="kept", succeeded=False)
+        break
+    async for db in get_session():
+        row = await outcome_store.get_current_outcome(db, device_id, "static_route")
+        assert row is not None
+        assert row.id == a2  # the newest terminal — a failure stays visible
+        assert (row.read_outcome, row.read_reason, row.result, row.succeeded) == (
+            "unavailable",
+            "export_down",
+            "kept",
+            False,
+        )
+        break
+
+
+@pytest.mark.anyio
+async def test_get_current_outcome_none_without_pointer(adapter_client):
+    """No pointer (family never terminalized) → None; the API synthesizes not_ready from it."""
+    device_id = await seed_device(nso_device_name="oc-acc2", netbox_device_id=8812)
+    async for db in get_session():
+        # a phase-1-only attempt must NOT surface (not terminal, no pointer)
+        await outcome_store.record_read_outcome(
+            db, device_id, "bgp", Present({"routers": []}, Freshness.fresh), refresh_source="poll"
+        )
+        assert await outcome_store.get_current_outcome(db, device_id, "bgp") is None
+        break
+
+
+@pytest.mark.anyio
+async def test_get_current_outcomes_maps_families_in_one_query(adapter_client):
+    """The bulk accessor returns {family: newest-terminal-row} for every pointed family."""
+    device_id = await seed_device(nso_device_name="oc-acc3", netbox_device_id=8813)
+    async for db in get_session():
+        a1 = await outcome_store.record_read_outcome(
+            db, device_id, "svi", Present({"svis": []}, Freshness.fresh), refresh_source="poll"
+        )
+        await outcome_store.record_result(db, a1, result="replaced", succeeded=True, row_count=1)
+        a2 = await outcome_store.record_read_outcome(db, device_id, "bfd", AbsentAuthoritative(), refresh_source="poll")
+        await outcome_store.record_result(db, a2, result="cleared", succeeded=True, row_count=0)
+        break
+    async for db in get_session():
+        by_family = await outcome_store.get_current_outcomes(db, device_id)
+        assert set(by_family) == {"svi", "bfd"}
+        assert by_family["svi"].id == a1
+        assert by_family["bfd"].id == a2
+        assert by_family["bfd"].read_outcome == "absent_authoritative"
+        break

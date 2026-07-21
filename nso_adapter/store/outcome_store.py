@@ -114,3 +114,37 @@ async def record_result(
     elif attempt_id > pointer.attempt_id:
         pointer.attempt_id = attempt_id
     await db.commit()
+
+
+# ── S4 read accessors (the pointer join the API serves) ──────────────────────────────────
+
+
+async def get_current_outcome(db: AsyncSession, device_id: int, family: str) -> RefreshOutcome | None:
+    """Return the newest TERMINAL attempt for (device, family) via the pointer, or None.
+
+    None means the family was never terminalized for this device (no pointer row) — the
+    API synthesizes a ``not_ready`` read_state from it; it must never be conflated with a
+    recorded ``unavailable``.
+    """
+    return (
+        await db.execute(
+            select(RefreshOutcome)
+            .join(RefreshOutcomePointer, RefreshOutcomePointer.attempt_id == RefreshOutcome.id)
+            .where(
+                RefreshOutcomePointer.device_id == device_id,
+                RefreshOutcomePointer.family == family,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def get_current_outcomes(db: AsyncSession, device_id: int) -> dict[str, RefreshOutcome]:
+    """Return every pointed family's newest terminal attempt for *device_id*, in ONE query."""
+    rows = (
+        await db.execute(
+            select(RefreshOutcome)
+            .join(RefreshOutcomePointer, RefreshOutcomePointer.attempt_id == RefreshOutcome.id)
+            .where(RefreshOutcomePointer.device_id == device_id)
+        )
+    ).scalars()
+    return {row.family: row for row in rows}

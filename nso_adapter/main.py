@@ -89,6 +89,11 @@ async def _init_database(cfg) -> None:
     if engine.dialect.name == "sqlite":
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+    # Mint/load the store incarnation (READSEM S4 D3) — idempotent; on PostgreSQL the
+    # migration inserted the row, on sqlite/create_all this backfills it.
+    from nso_adapter.store.meta import ensure_store_meta
+
+    await ensure_store_meta()
     logger.info("db.ready", url=cfg.database_url)
 
 

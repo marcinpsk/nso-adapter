@@ -14,6 +14,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum,
     Float,
@@ -2207,6 +2208,24 @@ class DeviceCapability(Base):
     detail: Mapped[str] = mapped_column(String(256), default="")
     source: Mapped[str] = mapped_column(String(16))  # probe | apply | read
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
+
+
+class StoreMeta(Base):
+    """The store incarnation singleton (READSEM S4 D3) — exactly one row, ``id == 1``.
+
+    ``(incarnation, born)`` is minted once when this database is first initialised and
+    never changes for the database's lifetime; a rebuilt database mints a new pair. The
+    pair rides every ``read_state`` block on the wire — it is the plugin's only reliable
+    signal that the outcome store was reset (attempt ids restart low after a rebuild, and
+    a numeric device id can be reissued, so neither can carry reset semantics).
+    """
+
+    __tablename__ = "store_meta"
+    __table_args__ = (CheckConstraint("id = 1", name="ck_store_meta_singleton"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    incarnation: Mapped[str] = mapped_column(String(36), nullable=False)
+    born: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
 
 
 class RefreshOutcome(Base):
