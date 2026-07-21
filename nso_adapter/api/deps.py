@@ -9,6 +9,7 @@ from collections.abc import AsyncGenerator
 import structlog
 from fastapi import Depends, HTTPException, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.errors import ApiError
@@ -51,3 +52,25 @@ async def verify_token(
 
 async def get_db(session: AsyncSession = Depends(get_session)) -> AsyncGenerator[AsyncSession, None]:
     yield session
+
+
+async def get_read_db(session: AsyncSession = Depends(get_session)) -> AsyncGenerator[AsyncSession, None]:
+    """One read-only SNAPSHOT transaction per request (READSEM S4 D2).
+
+    Family GETs assemble multi-SELECT payloads (BGP = router + six graph queries); without
+    a snapshot a full-replace commit landing between two SELECTs produces a TORN payload.
+    PostgreSQL: REPEATABLE READ applied on the connection BEFORE the first statement.
+    SQLite: an explicit ``BEGIN`` — legacy sqlite3 transaction mode opens NO transaction
+    for a bare SELECT (a plain session reads torn; see test_read_db_snapshot.py's control).
+    Dedicated dependency — ``get_db`` still serves committing endpoints unchanged.
+    """
+    if session.bind.dialect.name == "postgresql":
+        await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+    else:
+        await session.execute(sa_text("BEGIN"))
+    try:
+        yield session
+    finally:
+        # End the read transaction: nothing to persist, and a lingering snapshot must not
+        # ride the pooled connection into the next request.
+        await session.rollback()

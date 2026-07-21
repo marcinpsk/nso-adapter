@@ -203,6 +203,30 @@ def fake_netbox_client():
     return m
 
 
+# READSEM S4 golden determinism: the store incarnation is a random per-DB (uuid, born)
+# pair riding every read_state block; golden tests pin it to these fixed values first.
+GOLDEN_INCARNATION = "00000000-0000-0000-0000-000000000001"
+GOLDEN_BORN_ISO = "2026-06-01T00:00:00Z"
+
+
+async def pin_store_incarnation() -> None:
+    """Overwrite the test DB's store_meta pair with the fixed golden values and reload
+    the process cache (ensure_store_meta always re-reads)."""
+    from datetime import datetime
+
+    from sqlalchemy import update
+
+    from nso_adapter.store.db import get_session as _get_session
+    from nso_adapter.store.meta import ensure_store_meta
+    from nso_adapter.store.models import StoreMeta
+
+    async for db in _get_session():
+        await db.execute(update(StoreMeta).values(incarnation=GOLDEN_INCARNATION, born=datetime(2026, 6, 1, 0, 0, 0)))
+        await db.commit()
+        break
+    await ensure_store_meta()
+
+
 async def seed_device(
     *,
     nso_instance: str = "nso-dev",

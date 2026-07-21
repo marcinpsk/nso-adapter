@@ -1506,6 +1506,32 @@
         "title": "DeviceProvision",
         "type": "object"
       },
+      "DeviceReadStateOut": {
+        "properties": {
+          "device_id": {
+            "title": "Device Id",
+            "type": "integer"
+          },
+          "families": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/FamilyReadState"
+            },
+            "title": "Families",
+            "type": "object"
+          },
+          "families_version": {
+            "title": "Families Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "device_id",
+          "families_version",
+          "families"
+        ],
+        "title": "DeviceReadStateOut",
+        "type": "object"
+      },
       "DeviceScopeRef": {
         "properties": {
           "attributes": {
@@ -1776,6 +1802,119 @@
           }
         },
         "title": "FailoverConfigUpdate",
+        "type": "object"
+      },
+      "FamilyReadState": {
+        "description": "The declared truth of one family's newest terminal read attempt.",
+        "properties": {
+          "attempt_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attempt Id"
+          },
+          "freshness": {
+            "anyOf": [
+              {
+                "enum": [
+                  "fresh",
+                  "aged",
+                  "stale"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Freshness"
+          },
+          "incarnation": {
+            "title": "Incarnation",
+            "type": "string"
+          },
+          "incarnation_born": {
+            "title": "Incarnation Born",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "present",
+              "absent_authoritative",
+              "unavailable"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "read_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Read At"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "export_down",
+                  "read_error",
+                  "not_authoritative",
+                  "unsupported",
+                  "not_ready"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "enum": [
+                  "replaced",
+                  "cleared",
+                  "kept",
+                  "error"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result"
+          },
+          "succeeded": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Succeeded"
+          }
+        },
+        "required": [
+          "outcome",
+          "incarnation",
+          "incarnation_born"
+        ],
+        "title": "FamilyReadState",
         "type": "object"
       },
       "ForceRemovalBody": {
@@ -7216,6 +7355,9 @@
             ],
             "title": "Last Refreshed At"
           },
+          "read_state": {
+            "$ref": "#/components/schemas/FamilyReadState"
+          },
           "refresh_source": {
             "title": "Refresh Source",
             "type": "string"
@@ -7231,6 +7373,7 @@
         "required": [
           "device_id",
           "refresh_source",
+          "read_state",
           "routes"
         ],
         "title": "StaticRoutesOut",
@@ -10917,6 +11060,74 @@
         "summary": "Put Ospf Intent",
         "tags": [
           "ospf"
+        ]
+      }
+    },
+    "/api/v1/devices/{device_id}/read-state": {
+      "get": {
+        "description": "Every canonical family's current read state in one pointer-join query.\n\nPointerless families synthesize ``not_ready`` \u2014 the full 19-key vocabulary is always\npresent, so the plugin can render a complete per-family picture from one call.",
+        "operationId": "get_device_read_state_api_v1_devices__device_id__read_state_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceReadStateOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Device not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request validation failed (envelope shape)"
+          }
+        },
+        "security": [
+          {
+            "_OptionalBearer": []
+          }
+        ],
+        "summary": "Get Device Read State",
+        "tags": [
+          "read-state"
         ]
       }
     },

@@ -19,11 +19,40 @@ from datetime import datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import (
+    GOLDEN_BORN_ISO,
+    GOLDEN_INCARNATION,
+    VALID_TOKEN,
+    pin_store_incarnation,
+    seed_device,
+)
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 TS = datetime(2026, 6, 1, 10, 0, 0)
+
+
+async def _seed_pinned_outcome(device_id: int) -> int:
+    """Terminalize one static_route attempt and pin its timestamps to TS — the golden
+    body byte-pins the full REAL read_state block (attempt_id 1 in a fresh test DB)."""
+    from sqlalchemy import update
+
+    from nso_adapter.nso.read_outcome import Freshness, Present
+    from nso_adapter.store import outcome_store
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import RefreshOutcome
+
+    async for db in get_session():
+        attempt_id = await outcome_store.record_read_outcome(
+            db, device_id, "static_route", Present({"r": []}, Freshness.fresh), refresh_source="poll"
+        )
+        await outcome_store.record_result(db, attempt_id, result="replaced", succeeded=True, row_count=2)
+        await db.execute(
+            update(RefreshOutcome).where(RefreshOutcome.id == attempt_id).values(started_at=TS, completed_at=TS)
+        )
+        await db.commit()
+        return attempt_id
+    raise AssertionError("no session")
 
 
 async def _seed_static_routes(device_id: int) -> None:
@@ -66,6 +95,8 @@ async def _seed_static_routes(device_id: int) -> None:
 @pytest.mark.anyio
 async def test_static_routes_golden_body(adapter_client):
     device_id = await seed_device(nso_device_name="sr-golden", netbox_device_id=7975)
+    await pin_store_incarnation()
+    attempt_id = await _seed_pinned_outcome(device_id)
     await _seed_static_routes(device_id)
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/static-routes", headers=AUTH)).json()
@@ -75,6 +106,17 @@ async def test_static_routes_golden_body(adapter_client):
         "device_id": device_id,
         "last_refreshed_at": "2026-06-01T10:00:00Z",
         "refresh_source": "poll",
+        "read_state": {
+            "outcome": "present",
+            "reason": None,
+            "freshness": "fresh",
+            "result": "replaced",
+            "succeeded": True,
+            "read_at": "2026-06-01T10:00:00Z",
+            "attempt_id": attempt_id,
+            "incarnation": GOLDEN_INCARNATION,
+            "incarnation_born": GOLDEN_BORN_ISO,
+        },
         "routes": [
             {"vrf": "", "prefix": "0.0.0.0/0", "next_hop": "192.0.2.254"},
             {
@@ -95,10 +137,23 @@ async def test_static_routes_golden_body(adapter_client):
 @pytest.mark.anyio
 async def test_static_routes_golden_empty(adapter_client):
     device_id = await seed_device(nso_device_name="sr-golden-empty", netbox_device_id=7976)
+    await pin_store_incarnation()
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/static-routes", headers=AUTH)).json()
     assert body == {
         "device_id": device_id,
         "last_refreshed_at": None,
         "refresh_source": "never",
+        # Pointerless → the SYNTHESIZED block, byte-pinned: never read_state: null (D3).
+        "read_state": {
+            "outcome": "unavailable",
+            "reason": "not_ready",
+            "freshness": None,
+            "result": None,
+            "succeeded": None,
+            "read_at": None,
+            "attempt_id": None,
+            "incarnation": GOLDEN_INCARNATION,
+            "incarnation_born": GOLDEN_BORN_ISO,
+        },
         "routes": [],
     }
