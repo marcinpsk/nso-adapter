@@ -15,11 +15,11 @@ after a rebuild; numeric device ids can be reissued).
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
 import structlog
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, field_serializer
+from pydantic import BaseModel, PlainSerializer, WithJsonSchema
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_read_db, verify_token
@@ -32,6 +32,25 @@ from nso_adapter.store.models import Device, RefreshOutcome
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/devices", tags=["read-state"])
+
+
+def _iso_z(ts: datetime | None) -> str | None:
+    if ts is None:
+        return None
+    # Store convention: naive-UTC in sqlite, tz-aware in PG — serialize both as "<iso>Z".
+    naive = ts.replace(tzinfo=None) if ts.tzinfo is not None else ts
+    return naive.isoformat() + "Z"
+
+
+# Wire datetime (SA-2 round 2): serializes as the store's "<iso>Z" (valid RFC 3339) while
+# the OpenAPI schema stays an honest non-nullable string/format=date-time — a bare
+# field_serializer returning `str | None` published unformatted NULLABLE strings, letting
+# a schema-generated consumer accept a null incarnation_born (load-bearing for adoption).
+IsoZDateTime = Annotated[
+    datetime,
+    PlainSerializer(_iso_z, return_type=str, when_used="json"),
+    WithJsonSchema({"type": "string", "format": "date-time"}),
+]
 
 
 class FamilyReadState(BaseModel):
@@ -47,23 +66,10 @@ class FamilyReadState(BaseModel):
     succeeded: bool | None = None
     # Phase-1 started_at — WHEN THE READ HAPPENED (SA-2: completed_at would make data look
     # newer than its read under a slow materializer). Display-only, never an ordering key.
-    read_at: datetime | None = None
+    read_at: IsoZDateTime | None = None
     attempt_id: int | None = None  # null = synthesized (no pointer); sorts below every real attempt
     incarnation: str
-    incarnation_born: datetime  # adoption orders on this; adapter clock domain only
-
-    @field_serializer("read_at", "incarnation_born")
-    def _serialize_iso_z(self, ts: datetime | None) -> str | None:
-        """Emit the store convention "<iso>Z" (naive-UTC; PG's tz-aware normalized)."""
-        return _iso_z(ts)
-
-
-def _iso_z(ts: datetime | None) -> str | None:
-    if ts is None:
-        return None
-    # Store convention: naive-UTC in sqlite, tz-aware in PG — serialize both as "<iso>Z".
-    naive = ts.replace(tzinfo=None) if ts.tzinfo is not None else ts
-    return naive.isoformat() + "Z"
+    incarnation_born: IsoZDateTime  # adoption orders on this; adapter clock domain only — NEVER null
 
 
 def read_state_payload(row: RefreshOutcome | None) -> dict:

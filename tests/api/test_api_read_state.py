@@ -185,3 +185,23 @@ async def test_read_at_is_the_read_time_not_completion(adapter_client):
     assert resp.json()["read_state"]["read_at"] == "2026-06-01T10:00:00Z", (
         "read_at must serialize started_at (the read), not completed_at (the materialization)"
     )
+
+
+def test_openapi_schema_pins_datetime_formats():
+    """SA-2 round 2: FamilyReadState's OpenAPI schema must declare read_at and
+    incarnation_born as string/format=date-time, with incarnation_born NON-nullable —
+    a schema-generated consumer must never accept a null incarnation birth."""
+    import json
+    from pathlib import Path
+
+    snapshot = json.loads(Path("tests/api/openapi_snapshot.json").read_text())
+    schema = snapshot["components"]["schemas"]["FamilyReadState"]
+    props = schema["properties"]
+
+    born = props["incarnation_born"]
+    assert born == {"type": "string", "format": "date-time", "title": "Incarnation Born"}, born
+    assert "incarnation_born" in schema["required"]
+
+    read_at = props["read_at"]
+    assert {"type": "string", "format": "date-time"} in read_at.get("anyOf", []), read_at
+    assert {"type": "null"} in read_at.get("anyOf", []), read_at  # read_at IS nullable (synthesized)

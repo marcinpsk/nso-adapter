@@ -1847,15 +1847,9 @@
             "type": "string"
           },
           "incarnation_born": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Incarnation Born"
+            "format": "date-time",
+            "title": "Incarnation Born",
+            "type": "string"
           },
           "outcome": {
             "enum": [
@@ -1869,6 +1863,7 @@
           "read_at": {
             "anyOf": [
               {
+                "format": "date-time",
                 "type": "string"
               },
               {
