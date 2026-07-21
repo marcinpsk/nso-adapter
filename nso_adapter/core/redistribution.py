@@ -215,16 +215,39 @@ async def refresh_redistribution_from_outcomes(
         )
         return False
 
-    # Merged phase-1 outcome (worst-of), recorded BEFORE any mutation.
-    kept = [
+    # Merged phase-1 outcome, recorded BEFORE any mutation — the COMPLETE terminal
+    # contract (READSEM S4 D7). Buckets: replaced = authoritative (Present rebuilds /
+    # AbsentAuthoritative clears its partition), errors = retained by a real failure,
+    # unsupported = declared no-reader (deliberately non-failing, the ArcOS asymmetry).
+    assert _REDIST_COMPONENTS, "empty _REDIST_COMPONENTS is a programming error"
+    replaced = [p for p, o in outcomes.items() if not isinstance(o, Unavailable)]
+    errors = [
         p for p, o in outcomes.items() if isinstance(o, Unavailable) and o.reason is not UnavailableReason.unsupported
     ]
-    all_authoritative = not kept
+    unsupported_only = [
+        p for p, o in outcomes.items() if isinstance(o, Unavailable) and o.reason is UnavailableReason.unsupported
+    ]
     any_stale = any(isinstance(o, Present) and o.freshness is Freshness.stale for o in outcomes.values())
-    if all_authoritative:
-        merged: ReadOutcome = Present({}, Freshness.stale if any_stale else Freshness.fresh)
+    if replaced:
+        # ≥1 partition authoritatively rebuilt → the mirror IS serve-worthy (present/
+        # replaced/succeeded). A retained-by-error partition degrades freshness to stale
+        # AND keeps the device partial (fn returns False); retained-only-unsupported
+        # stays non-failing with the worst freshness among the replaced components.
+        merged: ReadOutcome = Present({}, Freshness.stale if (errors or any_stale) else Freshness.fresh)
+        terminal_result, terminal_succeeded = "replaced", True
+        composite_ok = not errors
+    elif errors:
+        # Nothing replaced, at least one real failure → unavailable with the WORST reason.
+        merged = Unavailable(
+            _worst_reason([o for o in outcomes.values() if isinstance(o, Unavailable)]),
+            detail=f"components kept: {sorted(errors + unsupported_only)}",
+        )
+        terminal_result, terminal_succeeded, composite_ok = "kept", False, False
     else:
-        merged = Unavailable(UnavailableReason.read_error, detail=f"components kept: {kept}")
+        # All components declared unsupported: nothing was read — never claim
+        # fresh-present/replaced. Still a non-failure (no partial).
+        merged = Unavailable(UnavailableReason.unsupported)
+        terminal_result, terminal_succeeded, composite_ok = "kept", True, True
     attempt_id = None
     try:
         attempt_id = await outcome_store.record_read_outcome(
@@ -277,14 +300,34 @@ async def refresh_redistribution_from_outcomes(
             await outcome_store.record_result(
                 db,
                 attempt_id,
-                result="replaced" if all_authoritative else "kept",
-                succeeded=all_authoritative,
+                result=terminal_result,
+                succeeded=terminal_succeeded,
                 row_count=len(rebuilt),
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning("redistribution.outcome.result_record_failed", device_id=device_id, error=repr(exc))
         await _recover_session(db, device, "redistribution", device_id)
-    return all_authoritative
+    return composite_ok
+
+
+# Reason severity for the no-authoritative-component merge (D7): a real failure always
+# outranks a declared capability gap.
+_REASON_SEVERITY = (
+    UnavailableReason.export_down,
+    UnavailableReason.read_error,
+    UnavailableReason.not_ready,
+    UnavailableReason.not_authoritative,
+    UnavailableReason.unsupported,
+)
+
+
+def _worst_reason(unavailables: list[Unavailable]) -> UnavailableReason:
+    """Pick the most severe reason among *unavailables* per :data:`_REASON_SEVERITY`."""
+    reasons = {o.reason for o in unavailables}
+    for reason in _REASON_SEVERITY:
+        if reason in reasons:
+            return reason
+    return UnavailableReason.read_error  # unreachable with a non-empty input
 
 
 async def _record_composite(

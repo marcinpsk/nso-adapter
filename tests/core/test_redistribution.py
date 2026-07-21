@@ -502,4 +502,175 @@ async def test_kept_component_records_a_failed_composite_outcome(adapter_client)
             .all()
         )
         assert outcome_rows
-        assert (outcome_rows[0].read_outcome, outcome_rows[0].succeeded) == ("unavailable", False)
+        # READSEM S4 D7: with isis/bgp authoritative and only ospf error-kept, the
+        # composite is degraded-success (present/stale/replaced/True) — the mirror IS
+        # serve-worthy including the retained partition — while ok=False above keeps the
+        # device partial. (Pre-S4 this recorded unavailable/False, which would make the
+        # plugin gate skip a payload whose other partitions genuinely replaced.)
+        assert (
+            outcome_rows[0].read_outcome,
+            outcome_rows[0].freshness,
+            outcome_rows[0].result,
+            outcome_rows[0].succeeded,
+        ) == ("present", "stale", "replaced", True)
+
+
+# ── READSEM S4 D7: the complete merge terminal contract (codex R2-3/R3-5/R4-3/R5-6) ──
+
+
+async def _seed_redist_rows(db, device_id: int, entries: list[tuple[str, str]]) -> None:
+    """Pre-seed (dest_protocol, source_protocol) partition rows to prove retention."""
+    from datetime import UTC, datetime
+
+    from nso_adapter.store.models import DeviceRedistribution
+
+    ts = datetime.now(UTC).replace(tzinfo=None)
+    for dest, source in entries:
+        db.add(
+            DeviceRedistribution(
+                device_id=device_id,
+                dest_protocol=dest,
+                dest_ref="",
+                source_protocol=source,
+                source_ref="",
+                last_refreshed_at=ts,
+                refresh_source="seed",
+            )
+        )
+    await db.commit()
+
+
+async def _latest_outcome(device_id: int):
+    from nso_adapter.store.models import RefreshOutcome
+
+    async for db in get_session():
+        return (
+            await db.execute(
+                select(RefreshOutcome)
+                .where(RefreshOutcome.device_id == device_id, RefreshOutcome.family == "redistribution")
+                .order_by(RefreshOutcome.id.desc())
+                .limit(1)
+            )
+        ).scalar_one()
+    raise AssertionError("no session")
+
+
+@pytest.mark.anyio
+async def test_mixed_replaced_and_error_retained_is_degraded_present(adapter_client):
+    """D7: >=1 component replaced + >=1 retained-by-ERROR -> the composite records
+    (present, stale, replaced, succeeded=True) — the payload IS mirror truth including
+    the retained partition — while the fn still returns False (device stays partial).
+
+    The old merge recorded (unavailable/read_error, kept, False): under the S4 plugin
+    gate that would SKIP a payload whose isis partition genuinely replaced."""
+    device_id = await seed_device(nso_device_name="rd-mixed-err", netbox_device_id=7711)
+    async with _device_session(device_id) as (db, device):
+        await _seed_redist_rows(db, device_id, [("ospf", "static"), ("isis", "connected")])
+        client = _nso_client_with_data(
+            isis={"process": [{"process-tag": "CORE", "redistribute": [{"source-protocol": "bgp", "source-ref": ""}]}]},
+            bgp={},
+        )
+        client._sections["ospf-config"] = {"status": "error", "reason": "boom"}
+
+        ok = await refresh_redistribution_for_device(db, device, client, refresh_source="test")
+
+        assert ok is False, "a retained-by-error partition keeps the device partial"
+        rows = (
+            (await db.execute(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        got = {(r.dest_protocol, r.source_protocol) for r in rows}
+        assert got == {("ospf", "static"), ("isis", "bgp")}, "ospf partition retained (error), isis partition replaced"
+    outcome = await _latest_outcome(device_id)
+    assert (outcome.read_outcome, outcome.freshness, outcome.result, outcome.succeeded) == (
+        "present",
+        "stale",
+        "replaced",
+        True,
+    ), "mixed replaced+error-retained is degraded-success on the wire, not unavailable"
+
+
+@pytest.mark.anyio
+async def test_all_unsupported_is_declared_unavailable_not_fresh_present(adapter_client):
+    """D7: NO component replaced, all unsupported -> (unavailable/unsupported, kept,
+    succeeded=True, return True, rows kept). The old merge computed all_authoritative=True
+    and misreported fresh-present/replaced although nothing was read."""
+    device_id = await seed_device(nso_device_name="rd-all-unsup", netbox_device_id=7712)
+    async with _device_session(device_id) as (db, device):
+        await _seed_redist_rows(db, device_id, [("ospf", "static"), ("bgp", "connected")])
+        client = _nso_client_with_data()
+        for section in ("ospf-config", "isis-interface", "bgp-config"):
+            client._sections[section] = {"status": "unsupported"}
+
+        ok = await refresh_redistribution_for_device(db, device, client, refresh_source="test")
+
+        assert ok is True, "declared unsupported is a non-failure (no partial)"
+        rows = (
+            (await db.execute(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        assert {(r.dest_protocol, r.source_protocol) for r in rows} == {("ospf", "static"), ("bgp", "connected")}
+    outcome = await _latest_outcome(device_id)
+    assert (outcome.read_outcome, outcome.read_reason, outcome.result, outcome.succeeded) == (
+        "unavailable",
+        "unsupported",
+        "kept",
+        True,
+    ), "zero authoritative components must never claim fresh-present/replaced"
+
+
+@pytest.mark.anyio
+async def test_stale_replaced_with_unsupported_propagates_stale(adapter_client):
+    """D7/R5-6: freshness = worst among the REPLACED authoritative components; an
+    unsupported bystander neither hides nor causes staleness."""
+    device_id = await seed_device(nso_device_name="rd-stale-unsup", netbox_device_id=7713)
+    async with _device_session(device_id) as (db, device):
+        client = _nso_client_with_data(bgp={})
+        client._sections["ospf-config"] = {"status": "unsupported"}
+        client._sections["isis-interface"] = {
+            "status": "stale",
+            "process": [{"process-tag": "C", "redistribute": [{"source-protocol": "static", "source-ref": ""}]}],
+        }
+
+        ok = await refresh_redistribution_for_device(db, device, client, refresh_source="test")
+
+        assert ok is True
+    outcome = await _latest_outcome(device_id)
+    assert (outcome.read_outcome, outcome.freshness, outcome.result, outcome.succeeded) == (
+        "present",
+        "stale",
+        "replaced",
+        True,
+    )
+
+
+@pytest.mark.anyio
+async def test_no_authoritative_component_records_worst_reason(adapter_client):
+    """D7: no component replaced, mixed error+unsupported -> unavailable with the WORST
+    reason (read_error > unsupported), kept, succeeded=False, return False, rows kept."""
+    device_id = await seed_device(nso_device_name="rd-none-auth", netbox_device_id=7714)
+    async with _device_session(device_id) as (db, device):
+        await _seed_redist_rows(db, device_id, [("isis", "static")])
+        client = _nso_client_with_data()
+        client._sections["ospf-config"] = {"status": "error", "reason": "boom"}
+        client._sections["isis-interface"] = {"status": "unsupported"}
+        client._sections["bgp-config"] = {"status": "error", "reason": "boom"}
+
+        ok = await refresh_redistribution_for_device(db, device, client, refresh_source="test")
+
+        assert ok is False
+        rows = (
+            (await db.execute(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        assert {(r.dest_protocol, r.source_protocol) for r in rows} == {("isis", "static")}
+    outcome = await _latest_outcome(device_id)
+    assert (outcome.read_outcome, outcome.read_reason, outcome.result, outcome.succeeded) == (
+        "unavailable",
+        "read_error",
+        "kept",
+        False,
+    )
