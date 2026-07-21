@@ -227,13 +227,20 @@ async def refresh_redistribution_from_outcomes(
     unsupported_only = [
         p for p, o in outcomes.items() if isinstance(o, Unavailable) and o.reason is UnavailableReason.unsupported
     ]
-    any_stale = any(isinstance(o, Present) and o.freshness is Freshness.stale for o in outcomes.values())
+    # Worst freshness among the REPLACED authoritative components: fresh < aged < stale
+    # (SA-1 — a lone stale check silently demoted aged to fresh).
+    _FRESHNESS_RANK = {Freshness.fresh: 0, Freshness.aged: 1, Freshness.stale: 2}
+    worst_freshness = max(
+        (o.freshness for o in outcomes.values() if isinstance(o, Present)),
+        key=lambda f: _FRESHNESS_RANK[f],
+        default=Freshness.fresh,
+    )
     if replaced:
         # ≥1 partition authoritatively rebuilt → the mirror IS serve-worthy (present/
         # replaced/succeeded). A retained-by-error partition degrades freshness to stale
         # AND keeps the device partial (fn returns False); retained-only-unsupported
         # stays non-failing with the worst freshness among the replaced components.
-        merged: ReadOutcome = Present({}, Freshness.stale if (errors or any_stale) else Freshness.fresh)
+        merged: ReadOutcome = Present({}, Freshness.stale if errors else worst_freshness)
         terminal_result, terminal_succeeded = "replaced", True
         composite_ok = not errors
     elif errors:

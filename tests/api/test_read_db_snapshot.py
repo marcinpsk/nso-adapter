@@ -151,3 +151,174 @@ async def test_get_read_db_is_read_only_scoped(tmp_path):
             await session.execute(text("SELECT 1"))
     finally:
         await engine.dispose()
+
+
+# ── SA-3: END-TO-END coverage — real HTTP family GETs, not just the dependency ─────────
+
+
+_FAMILY_GET_PATHS = {
+    # canonical family key → the family GET path (device id formatted in)
+    "static_route": "/api/v1/devices/{id}/static-routes",
+    "redistribution": "/api/v1/devices/{id}/redistribution",
+    "bgp": "/api/v1/devices/{id}/bgp-config",
+    "isis": "/api/v1/devices/{id}/isis-interfaces",
+    "ospf": "/api/v1/devices/{id}/ospf",
+    "route_policy": "/api/v1/devices/{id}/route-policy",
+    "bfd": "/api/v1/devices/{id}/bfd",
+    "l2_service": "/api/v1/devices/{id}/l2-services",
+    "vlan": "/api/v1/devices/{id}/vlan-database",
+    "switchport": "/api/v1/devices/{id}/switchport",
+    "svi": "/api/v1/devices/{id}/svi",
+    "subinterface": "/api/v1/devices/{id}/subinterface",
+    "interface_mtu": "/api/v1/devices/{id}/interface-mtu",
+    "interface_ip": "/api/v1/devices/{id}/interface-ips",
+    "snmp": "/api/v1/devices/{id}/snmp-config",
+    "logging": "/api/v1/devices/{id}/logging-config",
+    "lag_config": "/api/v1/devices/{id}/lag-config",
+    "lag": "/api/v1/devices/{id}/lag-topology",
+    "interface_attributes": "/api/v1/devices/{id}/interfaces-doc",
+}
+
+
+@pytest.mark.anyio
+async def test_family_get_serves_snapshot_across_midrequest_commit(adapter_client, tmp_path):
+    """END-TO-END (SA-3): a REAL static-routes GET whose mirror-rows SELECT races a commit.
+
+    A before_cursor_execute hook fires a SYNC sqlite writer (WAL) the moment the handler's
+    device_static_route SELECT begins — i.e. AFTER the snapshot opened and the pointer was
+    read. The response must serve the pre-commit row set; without get_read_db the second
+    row leaks in (sqlite legacy mode has no read transaction — the checked-in control)."""
+    import sqlite3
+
+    from sqlalchemy import event
+
+    from nso_adapter.store.db import get_engine, get_session
+    from tests.conftest import VALID_TOKEN, seed_device
+
+    auth = {"Authorization": f"Bearer {VALID_TOKEN}"}
+    device_id = await seed_device(nso_device_name="tear-e2e", netbox_device_id=8951)
+    db_path = None
+    engine = get_engine()
+    db_path = engine.url.database
+    # WAL so the mid-request writer can commit while the request's read txn is open.
+    sync = sqlite3.connect(db_path, timeout=5)
+    sync.execute("PRAGMA journal_mode=WAL")
+    sync.commit()
+
+    async for db in get_session():
+        from datetime import datetime
+
+        from nso_adapter.store.models import DeviceStaticRoute
+
+        db.add(
+            DeviceStaticRoute(
+                device_id=device_id,
+                vrf="",
+                prefix="10.0.0.0/8",
+                next_hop="192.0.2.1",
+                last_refreshed_at=datetime(2026, 6, 1, 10, 0, 0),
+                refresh_source="poll",
+            )
+        )
+        await db.commit()
+        break
+
+    fired = []
+
+    def _mid_request_write(conn, cursor, statement, parameters, context, executemany):
+        if "device_static_route" in statement and statement.lstrip().upper().startswith("SELECT") and not fired:
+            fired.append(statement)
+            sync.execute(
+                "INSERT INTO device_static_route "
+                "(device_id, vrf, prefix, next_hop, last_refreshed_at, refresh_source) "
+                "VALUES (?, '', '172.16.0.0/12', '192.0.2.9', '2026-06-01 10:00:00', 'poll')",
+                (device_id,),
+            )
+            sync.commit()
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _mid_request_write)
+    try:
+        resp = await adapter_client.get(f"/api/v1/devices/{device_id}/static-routes", headers=auth)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _mid_request_write)
+        sync.close()
+
+    assert resp.status_code == 200
+    assert fired, "the hook must have observed the mirror-rows SELECT"
+    prefixes = [r["prefix"] for r in resp.json()["routes"]]
+    assert prefixes == ["10.0.0.0/8"], (
+        f"mid-request commit leaked into the response ({prefixes}) — the family GET is not "
+        "running on the get_read_db snapshot"
+    )
+
+
+@pytest.mark.anyio
+async def test_every_family_get_reads_pointer_before_rows(adapter_client):
+    """SA-3 sweep: for EVERY family GET, the refresh_outcome_pointer SELECT must precede
+    any mirror-table SELECT (the benign-direction ordering, D2) — a family whose handler
+    moves its pointer fetch after the rows regresses here, not in prod."""
+    from sqlalchemy import event
+
+    from nso_adapter.store.db import get_engine
+    from tests.conftest import VALID_TOKEN, seed_device
+
+    auth = {"Authorization": f"Bearer {VALID_TOKEN}"}
+    device_id = await seed_device(nso_device_name="tear-order", netbox_device_id=8952)
+    engine = get_engine()
+
+    for family, path in _FAMILY_GET_PATHS.items():
+        statements: list[str] = []
+
+        def _record(conn, cursor, statement, parameters, context, executemany, _s=statements):
+            _s.append(statement)
+
+        event.listen(engine.sync_engine, "before_cursor_execute", _record)
+        try:
+            resp = await adapter_client.get(path.format(id=device_id), headers=auth)
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", _record)
+        assert resp.status_code == 200, f"{family}: {resp.status_code}"
+
+        pointer_idx = next((i for i, s in enumerate(statements) if "refresh_outcome_pointer" in s), None)
+        assert pointer_idx is not None, f"{family}: no pointer SELECT — read_state not resolved from the store"
+        mirror_selects = [
+            i
+            for i, s in enumerate(statements)
+            if s.lstrip().upper().startswith("SELECT")
+            and "refresh_outcome" not in s
+            and "devices" not in s.split("FROM")[-1][:60]
+        ]
+        early_mirror = [i for i in mirror_selects if i < pointer_idx]
+        assert not early_mirror, (
+            f"{family}: mirror SELECT(s) at {early_mirror} precede the pointer SELECT at "
+            f"{pointer_idx} — rows-before-pointer breaks the benign direction"
+        )
+
+
+@pytest.mark.anyio
+async def test_every_family_get_depends_on_get_read_db(adapter_client):
+    """SA-3 no-bypass: every family GET route must inject get_read_db (a silent revert to
+    get_db keeps every other test green while dropping the snapshot guarantee)."""
+    from nso_adapter.api.deps import get_read_db
+    from nso_adapter.main import create_app
+
+    app = create_app()
+    by_path = {}
+    for route in app.routes:
+        if getattr(route, "methods", None) == {"GET"}:
+            by_path[route.path] = route
+
+    for family, path_tpl in _FAMILY_GET_PATHS.items():
+        path = path_tpl.replace("{id}", "{device_id}")
+        route = by_path.get(path)
+        assert route is not None, f"{family}: route {path} not found"
+        flat = set(_walk_dependant(route.dependant))
+        assert get_read_db in flat, f"{family}: GET {path} does not inject get_read_db"
+
+
+def _walk_dependant(dependant):
+    out = []
+    for d in dependant.dependencies:
+        out.append(d.call)
+        out.extend(_walk_dependant(d))
+    return out

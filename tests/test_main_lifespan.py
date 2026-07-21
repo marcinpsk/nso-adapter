@@ -398,15 +398,27 @@ def test_build_netbox_client_defaults_verify_true(clean_netbox_registry):
 async def test_init_database_skips_create_all_on_postgres(monkeypatch):
     """s3-25: on PostgreSQL the entrypoint already ran `alembic upgrade head`, so the lifespan
     must NOT run create_all (two schema sources → DuplicateTable). The fake engine has no
-    .begin(); reaching the create_all block would raise, so a clean return proves the gate."""
+    .begin(); reaching the create_all block would raise, so a clean return proves the gate.
+
+    SA-4: ensure_store_meta (S4) needs a real session this isolated test never primes —
+    patch it AND assert it ran (the incarnation backfill is part of the init contract)."""
     import nso_adapter.main as main_mod
+    from nso_adapter.store import meta as store_meta
 
     fake_pg_engine = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
     monkeypatch.setattr(main_mod, "init_db", lambda url: None)
     monkeypatch.setattr(main_mod, "get_engine", lambda: fake_pg_engine)
+    ensure_calls = []
+
+    async def _fake_ensure():
+        ensure_calls.append(True)
+        return ("00000000-0000-0000-0000-000000000001", None)
+
+    monkeypatch.setattr(store_meta, "ensure_store_meta", _fake_ensure)
 
     await _init_database(SimpleNamespace(database_url="postgresql+asyncpg://u:p@db/adapter"))
     # no AttributeError on fake_pg_engine.begin → the create_all block was skipped
+    assert ensure_calls, "the store-incarnation backfill must run at init"
 
 
 # --------------------------------------------------------------------------- #

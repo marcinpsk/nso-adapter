@@ -19,7 +19,7 @@ from typing import Literal
 
 import structlog
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_read_db, verify_token
@@ -45,10 +45,17 @@ class FamilyReadState(BaseModel):
     # response-validation-fail those real rows (codex R1-F3).
     result: Literal["replaced", "cleared", "kept", "error"] | None = None
     succeeded: bool | None = None
-    read_at: str | None = None  # "<iso>Z", display-only — never an ordering key (R4-2)
+    # Phase-1 started_at — WHEN THE READ HAPPENED (SA-2: completed_at would make data look
+    # newer than its read under a slow materializer). Display-only, never an ordering key.
+    read_at: datetime | None = None
     attempt_id: int | None = None  # null = synthesized (no pointer); sorts below every real attempt
     incarnation: str
-    incarnation_born: str  # "<iso>Z"; adoption orders on this, adapter clock domain only
+    incarnation_born: datetime  # adoption orders on this; adapter clock domain only
+
+    @field_serializer("read_at", "incarnation_born")
+    def _serialize_iso_z(self, ts: datetime | None) -> str | None:
+        """Emit the store convention "<iso>Z" (naive-UTC; PG's tz-aware normalized)."""
+        return _iso_z(ts)
 
 
 def _iso_z(ts: datetime | None) -> str | None:
@@ -62,7 +69,7 @@ def _iso_z(ts: datetime | None) -> str | None:
 def read_state_payload(row: RefreshOutcome | None) -> dict:
     """Build the wire block from the pointed terminal attempt, or synthesize not_ready."""
     incarnation, born = get_store_incarnation()
-    base = {"incarnation": incarnation, "incarnation_born": _iso_z(born)}
+    base = {"incarnation": incarnation, "incarnation_born": born}
     if row is None:
         return {
             **base,
@@ -81,7 +88,7 @@ def read_state_payload(row: RefreshOutcome | None) -> dict:
         "freshness": row.freshness,
         "result": row.result,
         "succeeded": row.succeeded,
-        "read_at": _iso_z(row.completed_at or row.started_at),
+        "read_at": row.started_at,
         "attempt_id": row.id,
     }
 

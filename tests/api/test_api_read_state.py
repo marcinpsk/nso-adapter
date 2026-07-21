@@ -157,3 +157,31 @@ async def test_interfaces_doc_unknown_device_404(adapter_client):
     resp = await adapter_client.get("/api/v1/devices/999999/interfaces-doc", headers=_AUTH)
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "not_found"
+
+
+@pytest.mark.anyio
+async def test_read_at_is_the_read_time_not_completion(adapter_client):
+    """SA-2: read_at = phase-1 started_at (when the READ happened). Serving completed_at
+    would make data look newer than its actual read under a slow materializer."""
+    from datetime import datetime
+
+    from sqlalchemy import update
+
+    from nso_adapter.store.models import RefreshOutcome
+
+    device_id = await seed_device(nso_device_name="rs-times1", netbox_device_id=8906)
+    a1 = await _terminalize(
+        device_id, "static_route", Present({"r": []}, Freshness.fresh), result="replaced", succeeded=True
+    )
+    started = datetime(2026, 6, 1, 10, 0, 0)
+    completed = datetime(2026, 6, 1, 10, 5, 0)  # slow materializer: +5 min
+    async for db in get_session():
+        await db.execute(
+            update(RefreshOutcome).where(RefreshOutcome.id == a1).values(started_at=started, completed_at=completed)
+        )
+        await db.commit()
+        break
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/static-routes", headers=_AUTH)
+    assert resp.json()["read_state"]["read_at"] == "2026-06-01T10:00:00Z", (
+        "read_at must serialize started_at (the read), not completed_at (the materialization)"
+    )

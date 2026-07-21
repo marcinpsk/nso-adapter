@@ -140,10 +140,24 @@ async def test_pg_lost_update_window_cannot_regress_pointer():
                     await outcome_store.record_result(db_v, a_victim, result="kept", succeeded=False)
 
             victim_task = asyncio.create_task(victim())
-            # Let the victim reach its blocked write: its SELECT (sees a_base) happens
-            # immediately; its flush/commit then waits on the holder's row lock.
-            await asyncio.sleep(0.5)
-            assert not victim_task.done(), "victim should be blocked on the holder's row lock"
+            # SA-5: "task not done after a sleep" does not prove the victim passed its
+            # SELECT — synchronize on the OBSERVED lock wait: poll pg_stat_activity until
+            # a backend in this scratch DB is waiting on a Lock (the victim's write
+            # blocked on the holder's row lock). Only then is the interleave proven.
+            async with admin.connect() as probe:
+                for _ in range(100):
+                    waiting = (
+                        await probe.exec_driver_sql(
+                            "SELECT count(*) FROM pg_stat_activity "
+                            f"WHERE datname = '{scratch}' AND wait_event_type = 'Lock'"
+                        )
+                    ).scalar()
+                    if waiting:
+                        break
+                    await asyncio.sleep(0.05)
+                else:
+                    raise AssertionError("victim never reached the blocked write")
+            assert not victim_task.done()
             await holder.execute(text("COMMIT"))  # pointer = a_holder, victim unblocks
             await asyncio.wait_for(victim_task, timeout=10)
 

@@ -394,6 +394,8 @@ async def test_arcos_asymmetry_unsupported_component_is_not_a_failure(adapter_cl
     permanently `partial`. Declared unsupported must keep the partition AND succeed."""
     device_id = await seed_device(nso_device_name="rd-arcos", netbox_device_id=7707)
     async with _device_session(device_id) as (db, device):
+        # SA-1: pre-seed an OSPF partition row — the unsupported component must RETAIN it.
+        await _seed_redist_rows(db, device_id, [("ospf", "connected")])
         client = _nso_client_with_data(
             isis={
                 "process": [{"process-tag": "CORE", "redistribute": [{"source-protocol": "static", "source-ref": ""}]}]
@@ -410,7 +412,18 @@ async def test_arcos_asymmetry_unsupported_component_is_not_a_failure(adapter_cl
             .scalars()
             .all()
         )
-        assert {(r.dest_protocol, r.source_protocol) for r in rows} == {("isis", "static")}
+        assert {(r.dest_protocol, r.source_protocol) for r in rows} == {
+            ("ospf", "connected"),  # retained by the unsupported component
+            ("isis", "static"),  # replaced by the authoritative one
+        }
+    # SA-1: pin the FULL terminal tuple, not just the return value.
+    outcome = await _latest_outcome(device_id)
+    assert (outcome.read_outcome, outcome.freshness, outcome.result, outcome.succeeded) == (
+        "present",
+        "fresh",
+        "replaced",
+        True,
+    )
 
 
 @pytest.mark.anyio
@@ -673,4 +686,35 @@ async def test_no_authoritative_component_records_worst_reason(adapter_client):
         "read_error",
         "kept",
         False,
+    )
+
+
+@pytest.mark.anyio
+async def test_aged_replaced_with_unsupported_propagates_aged(adapter_client):
+    """SA-1: freshness ranks fresh < aged < stale over the REPLACED components — an aged
+    authoritative read beside an unsupported bystander must record present/AGED, never
+    fresh (the plugin would render healthy instead of aged). ``aged`` cannot arrive via
+    the envelope (unknown statuses fail closed); it reaches the merge only through the
+    pre-classified from_outcomes entry, so the test drives that entry directly."""
+    from nso_adapter.core.redistribution import refresh_redistribution_from_outcomes
+    from nso_adapter.nso.read_outcome import Freshness, Present, Unavailable, UnavailableReason
+
+    device_id = await seed_device(nso_device_name="rd-aged-unsup", netbox_device_id=7715)
+    async with _device_session(device_id) as (db, device):
+        outcomes = {
+            "ospf": Unavailable(UnavailableReason.unsupported),
+            "isis": Present(
+                {"process": [{"process-tag": "C", "redistribute": [{"source-protocol": "static", "source-ref": ""}]}]},
+                Freshness.aged,
+            ),
+            "bgp": Present({}, Freshness.fresh),
+        }
+        ok = await refresh_redistribution_from_outcomes(db, device, outcomes, refresh_source="test")
+        assert ok is True
+    outcome = await _latest_outcome(device_id)
+    assert (outcome.read_outcome, outcome.freshness, outcome.result, outcome.succeeded) == (
+        "present",
+        "aged",
+        "replaced",
+        True,
     )

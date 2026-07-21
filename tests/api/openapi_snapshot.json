@@ -1847,8 +1847,15 @@
             "type": "string"
           },
           "incarnation_born": {
-            "title": "Incarnation Born",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Incarnation Born"
           },
           "outcome": {
             "enum": [
