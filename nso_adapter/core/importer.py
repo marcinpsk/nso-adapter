@@ -745,11 +745,14 @@ async def _record_attrs_result(db, device, attempt_id, *, available: bool, row_c
         await _recover_session(db, device, "interface_attributes", device_id)
 
 
-async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False) -> dict:
+async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False, comprehensive: bool = False) -> dict:
     """Full sync: NSO → DB → NetBox. Returns job result summary dict.
 
     ``atomic=True`` is READSEM grain c (operator Sync-Now): the surface fan-out reads ONE
     txid-bracketed ``device-state-read`` build instead of the record-served projection.
+    ``comprehensive=True`` (S5a, operator Sync-Now) widens the fan-out from the lean
+    routing set to ALL surfaces — the doc families have no other read source on quiet
+    devices. The periodic sync job stays lean.
     """
     device = await db.get(Device, device_id)
     if not device:
@@ -828,7 +831,10 @@ async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False)
     # Fan out to the routing/extra surfaces so one sync refreshes everything the device
     # exposes (IS-IS/BGP/OSPF/route-policy/...), not just interface attributes. Done
     # before the plugin notify so its reconcile sees the fresh surface state in one pass.
-    degraded = await refresh_routing_surfaces_for_device(db, device, client, refresh_source="sync", atomic=atomic)
+    if comprehensive:
+        degraded = await refresh_all_surfaces_for_device(db, device, client, refresh_source="sync", atomic=atomic)
+    else:
+        degraded = await refresh_routing_surfaces_for_device(db, device, client, refresh_source="sync", atomic=atomic)
     if not attrs_available:
         degraded = [*degraded, "interface_attributes"]
 

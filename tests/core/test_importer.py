@@ -524,6 +524,137 @@ async def test_sync_device_fans_out_to_routing_surfaces(db_session: AsyncSession
     assert fanout.await_args.kwargs.get("refresh_source") == "sync"
 
 
+async def test_sync_device_comprehensive_uses_all_surfaces(db_session: AsyncSession):
+    """A1 (READSEM S5a): comprehensive=True swaps the fan-out from the lean routing set to
+    refresh_all_surfaces_for_device (all 18 surfaces), keeping sync-from + attrs + source."""
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="sw01",
+        ned_id="cisco-ios-cli-6.95",
+        netbox_device_id=1,
+    )
+    db_session.add(device)
+    db_session.add(ManagedScope(device=device, attribute="description"))
+    await db_session.commit()
+
+    nso_client = _make_nso_client({"device-name": "sw01", "interface": []})
+
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = nso_client
+    imp._netbox_client = None
+
+    with (
+        patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock),
+        patch(
+            "nso_adapter.core.importer.refresh_all_surfaces_for_device",
+            new_callable=AsyncMock,
+            return_value=[],
+        ) as fanout,
+        patch(
+            "nso_adapter.core.importer.refresh_routing_surfaces_for_device",
+            new_callable=AsyncMock,
+            return_value=[],
+        ) as lean,
+    ):
+        await sync_device(device.id, db_session, atomic=True, comprehensive=True)
+
+    fanout.assert_awaited_once()
+    assert fanout.await_args.args[1].id == device.id
+    assert fanout.await_args.kwargs.get("refresh_source") == "sync"
+    assert fanout.await_args.kwargs.get("atomic") is True
+    lean.assert_not_awaited()
+
+
+async def test_sync_device_comprehensive_records_doc_family_outcomes(db_session: AsyncSession):
+    """A1 end-to-end (the B5 false alarm): the comprehensive path lands declared outcomes
+    for the DOC families (vlan/switchport/...), which the lean fan-out never touches."""
+    from sqlalchemy import select as _select
+
+    from nso_adapter.store.models import RefreshOutcome as _RO
+
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="sw01",
+        ned_id="cisco-ios-cli-6.95",
+        netbox_device_id=1,
+    )
+    db_session.add(device)
+    db_session.add(ManagedScope(device=device, attribute="description"))
+    await db_session.commit()
+
+    nso_client = _make_nso_client({"device-name": "sw01", "interface": []})
+    # Grain-b projected doc: minimal ok sections for the doc families under test.
+    nso_client.get_device_state_doc.return_value = {
+        "device-name": "sw01",
+        "vlan-database": {"status": "ok"},
+        "switchport": {"status": "ok"},
+    }
+
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = nso_client
+    imp._netbox_client = None
+
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+        await sync_device(device.id, db_session, comprehensive=True)
+
+    doc_outcomes = (
+        (
+            await db_session.execute(
+                _select(_RO).where(_RO.device_id == device.id, _RO.family.in_(["vlan", "switchport"]))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert {o.family for o in doc_outcomes} == {"vlan", "switchport"}
+
+
+async def test_sync_device_default_stays_lean(db_session: AsyncSession):
+    """A1 lean pin: the periodic sync path (comprehensive unset) must NOT widen — doc
+    families stay untouched so the 15-min fleet cadence keeps its load contract."""
+    from sqlalchemy import select as _select
+
+    from nso_adapter.store.models import RefreshOutcome as _RO
+
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="sw01",
+        ned_id="cisco-ios-cli-6.95",
+        netbox_device_id=1,
+    )
+    db_session.add(device)
+    db_session.add(ManagedScope(device=device, attribute="description"))
+    await db_session.commit()
+
+    nso_client = _make_nso_client({"device-name": "sw01", "interface": []})
+    nso_client.get_device_state_doc.return_value = {
+        "device-name": "sw01",
+        "vlan-database": {"status": "ok"},
+        "switchport": {"status": "ok"},
+    }
+
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = nso_client
+    imp._netbox_client = None
+
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+        await sync_device(device.id, db_session)
+
+    doc_outcomes = (
+        (
+            await db_session.execute(
+                _select(_RO).where(_RO.device_id == device.id, _RO.family.in_(["vlan", "switchport"]))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert doc_outcomes == []
+
+
 async def test_refresh_routing_surfaces_isolates_failures(db_session: AsyncSession):
     """READSEM grain b: ONE projected doc feeds the fan-out; a surface whose
     materialization raises must not abort the others."""

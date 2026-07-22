@@ -168,13 +168,17 @@ async def _run_sync(job_id: int, device_id: int) -> None:
 
 
 async def _run_sync_now(job_id: int, device_id: int) -> None:
-    """Operator Sync-Now: the sync body on READSEM grain c (one atomic device-state-read)."""
+    """Operator Sync-Now: grain-c atomic AND comprehensive (S5a).
+
+    One atomic ``device-state-read`` covering ALL surfaces, not just the lean routing
+    set — the doc families have no other read source on quiet devices.
+    """
     from nso_adapter.core.importer import sync_device
 
     logger.info("job.sync_now.start", job_id=job_id, device_id=device_id)
 
     async def _atomic_sync(device_id_: int, db) -> dict:
-        return await sync_device(device_id_, db, atomic=True)
+        return await sync_device(device_id_, db, atomic=True, comprehensive=True)
 
     await _run_with_db(job_id, device_id, _atomic_sync)
 

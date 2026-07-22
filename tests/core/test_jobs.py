@@ -332,6 +332,22 @@ async def test_run_sync_calls_run_with_db(adapter_client):
         assert mock_run.call_args[0][1] == device_id
 
 
+async def test_run_sync_now_requests_comprehensive_atomic(adapter_client):
+    """A1 (READSEM S5a, codex R1-F9): the RUNNER must pass BOTH flags — a direct
+    sync_device test alone stays green if the runner edit is forgotten."""
+    from nso_adapter.core.jobs import _run_sync_now
+
+    device_id = await _seed_device()
+    job_id = await _seed_job(device_id)
+
+    with patch("nso_adapter.core.importer.sync_device", new_callable=AsyncMock, return_value={}) as sd:
+        await _run_sync_now(job_id, device_id)
+
+    sd.assert_awaited_once()
+    assert sd.await_args.kwargs.get("atomic") is True
+    assert sd.await_args.kwargs.get("comprehensive") is True
+
+
 async def test_run_detect_drift_calls_run_with_db(adapter_client):
     """_run_detect_drift delegates to _run_with_db."""
     device_id = await _seed_device("rtr-21", 31)
