@@ -18,6 +18,7 @@ import structlog
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.core.cancelsafe import await_uncancellable
 from nso_adapter.core.refresh_engine import classify_envelope_family_read
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.read_outcome import (
@@ -265,12 +266,87 @@ async def refresh_redistribution_from_outcomes(
         await _recover_session(db, device, "redistribution", device_id)
 
     # Tier 2 — per-component aggregation under the two-mode materialization guard.
+    # S5a A3: the whole [rebuild → commit → terminalize] region runs as ONE
+    # cancellation-atomic span — a budget/shutdown cancel between the commit and the
+    # record_result left rebuilt partitions under the old composite outcome.
+    return await await_uncancellable(
+        _tier2_span(
+            db,
+            device,
+            name,
+            outcomes,
+            now,
+            refresh_source,
+            merged=merged,
+            attempt_id=attempt_id,
+            terminal_result=terminal_result,
+            terminal_succeeded=terminal_succeeded,
+            composite_ok=composite_ok,
+        )
+    )
+
+
+async def _tier2_span(
+    db: AsyncSession,
+    device: Device,
+    name: str,
+    outcomes: dict[str, ReadOutcome],
+    now: datetime,
+    refresh_source: str,
+    *,
+    merged: ReadOutcome,
+    attempt_id: int | None,
+    terminal_result: str,
+    terminal_succeeded: bool,
+    composite_ok: bool,
+) -> bool:
+    """Run the cancellation-atomic tier-2 span: rebuild → commit → terminalize (S5a A3)."""
+    from nso_adapter.core.refresh_engine import _recover_session
+
+    device_id = device.id
+    rebuilt = await _commit_partitions(db, device, name, outcomes, now, refresh_source, merged, attempt_id)
+    logger.info(
+        "redistribution.refresh.done",
+        device_id=device_id,
+        device_name=name,
+        row_count=len(rebuilt),
+        refresh_source=refresh_source,
+    )
+    try:
+        if attempt_id is not None:
+            await outcome_store.record_result(
+                db,
+                attempt_id,
+                result=terminal_result,
+                succeeded=terminal_succeeded,
+                row_count=len(rebuilt),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("redistribution.outcome.result_record_failed", device_id=device_id, error=repr(exc))
+        await _recover_session(db, device, "redistribution", device_id)
+    return composite_ok
+
+
+async def _commit_partitions(
+    db: AsyncSession,
+    device: Device,
+    name: str,
+    outcomes: dict[str, ReadOutcome],
+    now: datetime,
+    refresh_source: str,
+    merged: ReadOutcome,
+    attempt_id: int | None,
+) -> list[DeviceRedistribution]:
+    """Rebuild + dedup + commit the partition rows under the two-mode failure guard."""
+    from nso_adapter.core.refresh_engine import _recover_session
+
+    device_id = device.id
     rebuilt: list[DeviceRedistribution] = []
     savepoint = await db.begin_nested()
     try:
         rebuilt = await _rebuild_partitions(db, device_id, name, outcomes, now, refresh_source)
-        # First-wins in-refresh dedup: a duplicate identity tuple in the export would otherwise
-        # IntegrityError on commit (uq_deviceredistribution_identity).
+        # First-wins in-refresh dedup: a duplicate identity tuple in the export would
+        # otherwise IntegrityError on commit (uq_deviceredistribution_identity).
         seen: set[tuple[str, str, str, str]] = set()
         for row in rebuilt:
             key = (row.dest_protocol, row.dest_ref, row.source_protocol, row.source_ref)
@@ -294,27 +370,7 @@ async def refresh_redistribution_from_outcomes(
         except Exception as store_exc:  # noqa: BLE001 — telemetry; the materialization error is the story
             logger.warning("redistribution.outcome.terminalize_failed", device_id=device_id, error=repr(store_exc))
         raise
-
-    logger.info(
-        "redistribution.refresh.done",
-        device_id=device_id,
-        device_name=name,
-        row_count=len(rebuilt),
-        refresh_source=refresh_source,
-    )
-    try:
-        if attempt_id is not None:
-            await outcome_store.record_result(
-                db,
-                attempt_id,
-                result=terminal_result,
-                succeeded=terminal_succeeded,
-                row_count=len(rebuilt),
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("redistribution.outcome.result_record_failed", device_id=device_id, error=repr(exc))
-        await _recover_session(db, device, "redistribution", device_id)
-    return composite_ok
+    return rebuilt
 
 
 # Reason severity for the no-authoritative-component merge (D7): a real failure always

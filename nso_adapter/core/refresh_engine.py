@@ -27,6 +27,7 @@ from dataclasses import dataclass
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.core.cancelsafe import await_uncancellable
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
@@ -388,32 +389,43 @@ async def _apply_outcome(
     attempt_id = await _record_read(db, device, spec, outcome, refresh_source)
 
     if isinstance(outcome, Present):
-        payload = await _materialize_guarded(
-            db, device, spec, attempt_id, lambda: spec.extract(outcome.data), refresh_source, outcome
-        )
-        row_count = len(payload) if isinstance(payload, (list, tuple)) else None
-        logger.info(
-            f"{spec.name}.refresh.done",
-            device_id=device.id,
-            device_name=device.nso_device_name,
-            row_count=row_count,
-            freshness=outcome.freshness.value,
-            refresh_source=refresh_source,
-        )
-        await _record_result(db, device, spec, attempt_id, result="replaced", succeeded=True, row_count=row_count)
-        return True
+        # S5a A3: the [materialize → record_result] span must be atomic under CANCELLATION —
+        # a budget/shutdown cancel between the materializer's commit and the pointer
+        # terminalization leaves new rows under the old outcome (codex R1-F4). The parent
+        # keeps session + family locks alive while the span task completes.
+        async def _present_span() -> bool:
+            payload = await _materialize_guarded(
+                db, device, spec, attempt_id, lambda: spec.extract(outcome.data), refresh_source, outcome
+            )
+            row_count = len(payload) if isinstance(payload, (list, tuple)) else None
+            logger.info(
+                f"{spec.name}.refresh.done",
+                device_id=device.id,
+                device_name=device.nso_device_name,
+                row_count=row_count,
+                freshness=outcome.freshness.value,
+                refresh_source=refresh_source,
+            )
+            await _record_result(db, device, spec, attempt_id, result="replaced", succeeded=True, row_count=row_count)
+            return True
+
+        return await await_uncancellable(_present_span())
 
     if isinstance(outcome, AbsentAuthoritative):
-        # Clear by materializing the "nothing" payload for this family (extract of an empty entry).
-        await _materialize_guarded(db, device, spec, attempt_id, lambda: spec.extract({}), refresh_source, outcome)
-        logger.info(
-            f"{spec.name}.refresh.cleared",
-            device_id=device.id,
-            device_name=device.nso_device_name,
-            refresh_source=refresh_source,
-        )
-        await _record_result(db, device, spec, attempt_id, result="cleared", succeeded=True, row_count=0)
-        return True
+        # Clear by materializing the "nothing" payload for this family (extract of an empty
+        # entry). Same cancellation-atomic span as the Present branch (S5a A3).
+        async def _cleared_span() -> bool:
+            await _materialize_guarded(db, device, spec, attempt_id, lambda: spec.extract({}), refresh_source, outcome)
+            logger.info(
+                f"{spec.name}.refresh.cleared",
+                device_id=device.id,
+                device_name=device.nso_device_name,
+                refresh_source=refresh_source,
+            )
+            await _record_result(db, device, spec, attempt_id, result="cleared", succeeded=True, row_count=0)
+            return True
+
+        return await await_uncancellable(_cleared_span())
 
     # Unavailable — keep the last-known rows in every case.
     assert isinstance(outcome, Unavailable)

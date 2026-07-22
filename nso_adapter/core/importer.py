@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.config import get_config
+from nso_adapter.core.cancelsafe import await_uncancellable
 from nso_adapter.core.refresh_engine import (
     _action_semaphore,
     classify_envelope_family_read,
@@ -822,12 +823,20 @@ async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False,
             device_id=device_id,
             reason=attrs_outcome.reason.value,
         )
+
     # Commit the interface work now, but defer BOTH last_sync_at and last_sync_status until
     # after the fan-out: a premature timestamp under a job-budget cancel would show the
     # operator a fresh timestamp with a stale status and a failed job (S5a R1-F3/R2-F8);
     # a silently-failed surface read must not hide under a premature 'succeeded'.
-    await db.commit()
-    await _record_attrs_result(db, device, attrs_attempt_id, available=attrs_available, row_count=interfaces_written)
+    # S5a A3: [commit → attrs terminalization] is one cancellation-atomic span — a cancel
+    # between them left committed interface rows under a non-terminal attrs outcome.
+    async def _attrs_span() -> None:
+        await db.commit()
+        await _record_attrs_result(
+            db, device, attrs_attempt_id, available=attrs_available, row_count=interfaces_written
+        )
+
+    await await_uncancellable(_attrs_span())
 
     # Fan out to the routing/extra surfaces so one sync refreshes everything the device
     # exposes (IS-IS/BGP/OSPF/route-policy/...), not just interface attributes. Done
