@@ -271,9 +271,12 @@ async def _scheduled_orphan_reap() -> None:
     worker pool: idempotent orphans → requeued, an interrupted apply → failed (never silently
     re-pushed). APScheduler ``max_instances=1`` keeps two reaps from overlapping.
     """
-    from nso_adapter.core.worker import requeue_orphaned_jobs
+    from nso_adapter.core import worker as _worker
 
-    await requeue_orphaned_jobs()
+    await _worker.requeue_orphaned_jobs()
+    # S5a A2 (codex R3-6): the reap is also the pool's liveness driver — a requeued job
+    # is only useful if a live worker exists to drain it.
+    _worker.ensure_workers()
 
 
 async def _scheduled_lag_topology_refresh() -> None:

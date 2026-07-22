@@ -822,9 +822,10 @@ async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False,
             device_id=device_id,
             reason=attrs_outcome.reason.value,
         )
-    # Commit the interface work + timestamp now, but defer the final last_sync_status until after
-    # the fan-out so a silently-failed surface read cannot hide under a premature 'succeeded'.
-    device.last_sync_at = _utcnow()
+    # Commit the interface work now, but defer BOTH last_sync_at and last_sync_status until
+    # after the fan-out: a premature timestamp under a job-budget cancel would show the
+    # operator a fresh timestamp with a stale status and a failed job (S5a R1-F3/R2-F8);
+    # a silently-failed surface read must not hide under a premature 'succeeded'.
     await db.commit()
     await _record_attrs_result(db, device, attrs_attempt_id, available=attrs_available, row_count=interfaces_written)
 
@@ -847,6 +848,7 @@ async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False,
     # Record the outcome only AFTER the fan-out. A surface whose NSO read failed leaves a
     # stale mirror, so the device reports 'partial' (naming the offending surfaces) rather
     # than a misleading 'succeeded'; a clean sync clears any prior degraded marker.
+    device.last_sync_at = _utcnow()
     if degraded:
         device.last_sync_status = LastSyncStatus.partial
         device.degraded_surfaces = sorted(degraded)

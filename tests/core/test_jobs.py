@@ -332,6 +332,77 @@ async def test_run_sync_calls_run_with_db(adapter_client):
         assert mock_run.call_args[0][1] == device_id
 
 
+async def test_run_sync_now_uses_the_900s_budget(adapter_client):
+    """A2 (codex R1-F3): the comprehensive runner's legal child waits sum to ~720s — the
+    default 600s budget would cancel a slow-but-valid whale run."""
+    from nso_adapter.core.jobs import _run_sync_now
+
+    device_id = await _seed_device()
+    job_id = await _seed_job(device_id)
+
+    with patch("nso_adapter.core.jobs._run_with_db", new_callable=AsyncMock) as rwd:
+        await _run_sync_now(job_id, device_id)
+
+    rwd.assert_awaited_once()
+    assert rwd.await_args.kwargs.get("timeout") == 900.0
+
+
+async def test_sync_now_timeout_leaves_last_sync_pair_untouched(adapter_client):
+    """A2 regression (codex R2-F8, red against the pre-move importer.py:824): a job-budget
+    cancel mid-fan-out must NOT leave an ADVANCED last_sync_at under the OLD status — the
+    operator would see a fresh timestamp, a stale status, and a failed job."""
+    from datetime import datetime
+
+    from nso_adapter.core import importer as imp
+    from nso_adapter.core.importer import sync_device
+    from nso_adapter.store.models import LastSyncStatus
+
+    prior_ts = datetime(2026, 1, 1, 12, 0, 0)
+    async for db in get_session():
+        d = Device(
+            nso_instance="nso-dev",
+            nso_device_name="t-rtr",
+            netbox_device_id=1,
+            ned_id="cisco-ios-cli-6.95",
+            last_sync_at=prior_ts,
+            last_sync_status=LastSyncStatus.succeeded,
+        )
+        db.add(d)
+        await db.commit()
+        await db.refresh(d)
+        device_id = d.id
+        break
+    job_id = await _seed_job(device_id)
+
+    client = AsyncMock(spec=NsoClient)
+    client.get_device_ned_id = AsyncMock(return_value="cisco-ios-cli-6.95")
+    client.get_device_state_section = AsyncMock(return_value={"status": "ok", "device-name": "t-rtr", "interface": []})
+    imp._nso_clients["nso-dev"] = client
+    imp._netbox_client = None
+
+    async def _stalled_fanout(*a, **k):
+        await asyncio.sleep(30)
+        return []
+
+    async def _factory(device_id_: int, db) -> dict:
+        return await sync_device(device_id_, db, atomic=True, comprehensive=True)
+
+    with (
+        patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock),
+        patch("nso_adapter.core.importer.refresh_all_surfaces_for_device", side_effect=_stalled_fanout),
+    ):
+        await _run_with_db(job_id, device_id, _factory, timeout=0.5)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.error["code"] == "timeout"
+        device = await db.get(Device, device_id)
+        assert device.last_sync_status == LastSyncStatus.succeeded
+        assert device.last_sync_at == prior_ts, "timestamp must not advance on a cancelled sync"
+        break
+
+
 async def test_run_sync_now_requests_comprehensive_atomic(adapter_client):
     """A1 (READSEM S5a, codex R1-F9): the RUNNER must pass BOTH flags — a direct
     sync_device test alone stays green if the runner edit is forgotten."""

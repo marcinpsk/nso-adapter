@@ -163,6 +163,12 @@ async def _worker_loop(worker_id: int, stop: asyncio.Event) -> None:
                 device_id=device_id,
             )
             await runner(job_id, device_id)
+        except asyncio.CancelledError:
+            # Graceful shutdown cancelled a mid-run claim (S5a A2, codex R2-F7): return it
+            # to the queue now instead of leaving the device 409-blocked until the periodic
+            # reap's staleness window passes on the next restart/tick.
+            await _requeue_own_claim(job_id, job_type)
+            raise
         except Exception as exc:
             # Runners normally catch their own errors; this is a last resort so a
             # runner bug can't strand the job in ``running``.
@@ -174,6 +180,51 @@ async def _worker_loop(worker_id: int, stop: asyncio.Event) -> None:
                 await hb
 
     logger.info("worker.stopped", worker_id=worker_id)
+
+
+async def _requeue_own_claim(job_id: int, job_type: JobType) -> None:
+    """Best-effort: return a cancelled mid-run claim to the queue (S5a A2).
+
+    Status-guarded (codex R4-4): the runner may have committed a terminal status and been
+    cancelled at the very next await — ``WHERE status = 'running'`` never re-runs a
+    finished job. Only whitelisted (idempotent) types are requeued; an interrupted apply
+    keeps its existing never-requeue semantics. Best-effort: a second cancel landing
+    mid-requeue leaves recovery to the periodic reap instead.
+    """
+    if job_type not in _REQUEUE_ON_RESTART:
+        return
+    try:
+        async for db in get_session():
+            res = await db.execute(
+                sa_update(Job)
+                .where(Job.id == job_id, Job.status == JobStatus.running)
+                .values(status=JobStatus.queued, started_at=None, heartbeat_at=None)
+            )
+            await db.commit()
+            if res.rowcount:
+                logger.warning("worker.requeued_cancelled_claim", job_id=job_id)
+    except Exception as exc:
+        logger.warning("worker.cancel_requeue_failed", job_id=job_id, error=repr(exc))
+
+
+def ensure_workers() -> None:
+    """Respawn dead worker tasks (S5a A2, codex R3-6).
+
+    The periodic reap can requeue a stale job, but the pool is created once and
+    unsupervised — a dead sole worker would leave requeued jobs queued forever while
+    ``get_active_job`` 409s every new job for those devices. Called from the periodic
+    orphan-reap tick. No-ops once shutdown has set the stop event (it is set before the
+    event loop yields to teardown, so a mid-shutdown tick cannot respawn a stray worker).
+    """
+    if _stop is None or _stop.is_set():
+        return
+    respawned = 0
+    for i, task in enumerate(_workers):
+        if task.done():
+            _workers[i] = asyncio.create_task(_worker_loop(i, _stop))
+            respawned += 1
+    if respawned:
+        logger.warning("worker.respawned", count=respawned)
 
 
 async def requeue_orphaned_jobs() -> None:

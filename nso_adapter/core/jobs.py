@@ -129,31 +129,32 @@ async def _mark_job_failed(db: AsyncSession, job_id: int, error: dict) -> None:
         await db.commit()
 
 
-async def _run_with_db(job_id: int, device_id: int, coro_factory) -> None:
+async def _run_with_db(job_id: int, device_id: int, coro_factory, *, timeout: float = 600.0) -> None:
     from nso_adapter.store.db import get_session
 
-    # Total job timeout: 10 minutes.  This guards against NSO hung connections
-    # that outlast the per-request httpx timeout (e.g. TCP keepalive issues or
-    # mid-response stalls that don't trigger the read timeout).
-    _JOB_TIMEOUT = 600.0
-
+    # Total job timeout, default 10 minutes: guards against NSO hung connections that
+    # outlast the per-request httpx timeout (e.g. TCP keepalive issues or mid-response
+    # stalls). The comprehensive runners (sync_now, sync_from_nso) pass 900s — their
+    # legal child waits alone sum to ~720s (NED resolve 30 + sync-from 120 + attrs
+    # 30+180 escalation + atomic action 360; codex S5a R1-F3).
     async for db in get_session():
         job = await db.get(Job, job_id)
         if not job:
             return
         job.status = JobStatus.running
         await db.commit()
+        logger.info("job.budget", job_id=job_id, device_id=device_id, timeout=timeout)
         try:
-            result = await asyncio.wait_for(coro_factory(device_id, db), timeout=_JOB_TIMEOUT)
+            result = await asyncio.wait_for(coro_factory(device_id, db), timeout=timeout)
             job.status = JobStatus.succeeded
             job.result = result
             await db.commit()
         except TimeoutError:
-            logger.error("job.timeout", job_id=job_id, device_id=device_id, timeout=_JOB_TIMEOUT)
+            logger.error("job.timeout", job_id=job_id, device_id=device_id, timeout=timeout)
             await _mark_job_failed(
                 db,
                 job_id,
-                {"code": "timeout", "message": f"Job exceeded {int(_JOB_TIMEOUT)}s timeout", "detail": {}},
+                {"code": "timeout", "message": f"Job exceeded {int(timeout)}s timeout", "detail": {}},
             )
         except Exception as exc:
             logger.exception("job.failed", job_id=job_id, device_id=device_id, error=repr(exc))
@@ -180,7 +181,7 @@ async def _run_sync_now(job_id: int, device_id: int) -> None:
     async def _atomic_sync(device_id_: int, db) -> dict:
         return await sync_device(device_id_, db, atomic=True, comprehensive=True)
 
-    await _run_with_db(job_id, device_id, _atomic_sync)
+    await _run_with_db(job_id, device_id, _atomic_sync, timeout=900.0)
 
 
 async def _run_detect_drift(job_id: int, device_id: int) -> None:

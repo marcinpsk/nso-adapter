@@ -335,6 +335,121 @@ async def test_start_and_stop_workers(adapter_client):
     assert (await _get_job(orphan)).status == JobStatus.succeeded
 
 
+async def test_cancelled_worker_requeues_its_running_claim(adapter_client):
+    """A2 (S5a, codex R2-F7 residual): a graceful-shutdown cancel mid-run returns the
+    worker's own whitelisted claim to the queue, so the device isn't 409-blocked until
+    the periodic reap tick's staleness window passes."""
+    device_id = await _seed_device("wrk-cancel", 713)
+    job_id = await _seed_job(device_id, JobType.sync, JobStatus.queued)
+
+    started = asyncio.Event()
+
+    async def hanging_runner(jid: int, did: int) -> None:
+        started.set()
+        await asyncio.sleep(60)
+
+    stop = asyncio.Event()
+    with patch.dict("nso_adapter.core.jobs._JOB_RUNNERS", {JobType.sync: hanging_runner}):
+        task = asyncio.create_task(worker._worker_loop(0, stop))
+        await asyncio.wait_for(started.wait(), timeout=5.0)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    job = await _get_job(job_id)
+    assert job.status == JobStatus.queued
+    assert job.started_at is None
+    assert job.heartbeat_at is None
+
+
+async def test_cancel_after_success_never_requeues(adapter_client):
+    """A2 guard (codex R4-4): a commit can succeed and deliver the CancelledError before
+    the await returns — the requeue must be status-guarded so a finished job never
+    re-runs after restart."""
+    device_id = await _seed_device("wrk-cancel-done", 714)
+    job_id = await _seed_job(device_id, JobType.sync, JobStatus.queued)
+
+    done = asyncio.Event()
+
+    async def succeed_then_hang(jid: int, did: int) -> None:
+        async for db in get_session():
+            job = await db.get(Job, jid)
+            job.status = JobStatus.succeeded
+            await db.commit()
+        done.set()
+        await asyncio.sleep(60)
+
+    stop = asyncio.Event()
+    with patch.dict("nso_adapter.core.jobs._JOB_RUNNERS", {JobType.sync: succeed_then_hang}):
+        task = asyncio.create_task(worker._worker_loop(0, stop))
+        await asyncio.wait_for(done.wait(), timeout=5.0)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert (await _get_job(job_id)).status == JobStatus.succeeded
+
+
+async def test_ensure_workers_respawns_dead_worker(adapter_client):
+    """A2 (codex R3-6): the periodic reap requeues stale jobs, but nothing drains them if
+    the (unsupervised, created-once) pool has no live task — ensure_workers respawns."""
+
+    async def noop_runner(jid: int, did: int) -> None:
+        async for db in get_session():
+            job = await db.get(Job, jid)
+            job.status = JobStatus.succeeded
+            await db.commit()
+
+    with patch.dict("nso_adapter.core.jobs._JOB_RUNNERS", {JobType.sync: noop_runner}):
+        await worker.start_workers(concurrency=1)
+        try:
+            worker._workers[0].cancel()
+            await asyncio.gather(worker._workers[0], return_exceptions=True)
+
+            device_id = await _seed_device("wrk-respawn", 715)
+            job_id = await _seed_job(device_id, JobType.sync, JobStatus.queued)
+
+            worker.ensure_workers()
+
+            for _ in range(100):
+                if (await _get_job(job_id)).status == JobStatus.succeeded:
+                    break
+                await asyncio.sleep(0.05)
+            assert (await _get_job(job_id)).status == JobStatus.succeeded
+        finally:
+            await worker.stop_workers()
+
+
+async def test_ensure_workers_noops_once_stopping(adapter_client):
+    """A2 (codex R4 note): shutdown sets the stop event before yielding — a reap tick
+    landing mid-shutdown must not respawn a stray worker into a disposing process."""
+    await worker.start_workers(concurrency=1)
+    try:
+        worker._stop.set()  # simulate: shutdown began, tasks not yet reaped
+        worker._workers[0].cancel()
+        await asyncio.gather(worker._workers[0], return_exceptions=True)
+
+        worker.ensure_workers()
+
+        assert worker._workers[0].done(), "no respawn once the stop event is set"
+    finally:
+        await worker.stop_workers()
+
+
+async def test_orphan_reap_tick_ensures_workers(adapter_client):
+    """A2 wiring: the periodic reap tick is the liveness driver — it must call
+    ensure_workers so requeued orphans always have a drainer."""
+    from unittest.mock import AsyncMock
+
+    from nso_adapter.core.scheduler import _scheduled_orphan_reap
+
+    with (
+        patch("nso_adapter.core.worker.requeue_orphaned_jobs", new_callable=AsyncMock),
+        patch("nso_adapter.core.worker.ensure_workers") as ew,
+    ):
+        await _scheduled_orphan_reap()
+
+    ew.assert_called_once()
+
+
 def test_sync_now_is_requeue_safe_and_runnable():
     """READSEM S3 B7 (codex R1-F10): a process death mid-sync_now must not 409-block the
     device forever — the grain-c refresh is an idempotent read, so the orphan reaper
