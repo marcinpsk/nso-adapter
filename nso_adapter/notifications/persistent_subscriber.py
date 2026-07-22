@@ -10,7 +10,7 @@ from collections.abc import Callable
 import httpx
 import structlog
 
-from .sse_subscriber import SSESubscriber
+from .sse_subscriber import SseIdleTimeout, SSESubscriber
 
 logger = structlog.get_logger(__name__)
 
@@ -39,11 +39,22 @@ async def persistent_subscriber(
             delay = initial_delay_s
         except asyncio.CancelledError:
             raise
+        except SseIdleTimeout:
+            # S5a E: healthy-but-quiet stream — reconnect after a short pause and RESET
+            # the backoff (the connection WAS established). Never the 60s error ladder:
+            # that was the standing ~40%% event blind window (item 1335).
+            logger.info("sse.idle_reconnect", stream_url=stream_url)
+            delay = initial_delay_s
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=1.0)
+            except asyncio.TimeoutError:  # noqa: UP041 - explicit wait_for timeout handling
+                pass
+            continue
         except (httpx.RequestError, httpx.HTTPStatusError) as exc:
             logger.warning(
                 "sse.reconnect_after_error",
                 stream_url=stream_url,
-                error=str(exc),
+                error=str(exc) or repr(exc),
                 next_delay_s=delay,
             )
             try:

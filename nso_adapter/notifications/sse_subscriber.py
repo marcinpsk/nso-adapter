@@ -13,6 +13,17 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
+
+class SseIdleTimeout(Exception):
+    """The idle watchdog fired on an ESTABLISHED stream (headers accepted, then quiet).
+
+    NSO's NETCONF stream sends no keepalives, so a quiet watchdog window is HEALTHY —
+    the reconnect loop takes the fast path instead of the transport-error backoff
+    (S5a E, item 1335: the 90s-watchdog + 60s-backoff cycle was a ~40%% blind window).
+    A PRE-header ReadTimeout (overloaded/hung server) stays a plain transport error.
+    """
+
+
 # Idle read-timeout watchdog: how long the stream may go without ANY bytes (an SSE
 # event OR a keep-alive comment) before httpx raises ReadTimeout. Must exceed NSO's
 # SSE keep-alive interval, or a healthy but quiet stream will reconnect needlessly.
@@ -76,12 +87,15 @@ class SSESubscriber:
         ``aiter_lines`` blocking forever. ``None`` disables it (the old unbounded
         ``read=None`` behaviour — the stream can wedge indefinitely).
         """
+        established = False
 
         async def _run() -> None:
+            nonlocal established
             streaming_timeout = httpx.Timeout(connect=10.0, read=idle_read_timeout_s, write=10.0, pool=10.0)
             async with self._client(timeout=streaming_timeout) as c:
                 async with c.stream("GET", stream_url, headers={"Accept": "text/event-stream"}) as response:
                     response.raise_for_status()
+                    established = True
                     current_block: list[str] = []
                     async for line in response.aiter_lines():
                         if line.startswith("data:"):
@@ -105,6 +119,17 @@ class SSESubscriber:
             await asyncio.wait_for(_run(), timeout=duration)
         except TimeoutError:
             logger.info("sse_subscribe_complete", stream=stream_url, duration=duration)
+        except httpx.ReadTimeout as exc:
+            # S5a E (item 1335): a POST-header ReadTimeout is the idle watchdog firing on
+            # an ESTABLISHED-but-quiet stream (NSO sends no keepalives) — healthy, fast
+            # reconnect. Pre-header (no 200 accepted: overloaded/hung server) stays a
+            # transport error and backs off. str(ReadTimeout) is often EMPTY — repr
+            # fallback so the error is never logged as ''.
+            if established:
+                logger.info("sse_idle_timeout", stream=stream_url, error=str(exc) or repr(exc))
+                raise SseIdleTimeout(str(exc) or "idle watchdog") from exc
+            logger.warning("sse_subscribe_error", stream=stream_url, error=str(exc) or repr(exc))
+            raise
         except (httpx.HTTPStatusError, httpx.RequestError) as exc:
-            logger.warning("sse_subscribe_error", stream=stream_url, error=str(exc))
+            logger.warning("sse_subscribe_error", stream=stream_url, error=str(exc) or repr(exc))
             raise

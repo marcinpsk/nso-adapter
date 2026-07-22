@@ -149,6 +149,76 @@ STREAM_URL = "http://nso:8080/restconf/streams/NETCONF/json"
 # ── subscribe ─────────────────────────────────────────────────────────────────
 
 
+class _PostHeaderTimeoutTransport(httpx.AsyncBaseTransport):
+    """200 + headers accepted, then the body stream raises ReadTimeout (the idle
+    watchdog firing on an established-but-quiet stream)."""
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        async def _raising_body():
+            raise httpx.ReadTimeout("idle watchdog", request=request)
+            yield b""  # pragma: no cover - makes this an async generator
+
+        return httpx.Response(
+            200,
+            stream=_PostHeaderTimeoutTransport._AsyncByteStream(_raising_body()),
+            headers={"content-type": "text/event-stream"},
+            request=request,
+        )
+
+    class _AsyncByteStream(httpx.AsyncByteStream):
+        def __init__(self, agen):
+            self._agen = agen
+
+        async def __aiter__(self):
+            async for chunk in self._agen:
+                yield chunk
+
+
+class _PreHeaderTimeoutTransport(httpx.AsyncBaseTransport):
+    """The server never sends response headers (overloaded/hung) — ReadTimeout fires
+    while ENTERING the stream, before any 200 was accepted."""
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("no response headers", request=request)
+
+
+async def test_post_header_idle_raises_sse_idle_timeout():
+    """S5a E (codex R1-F10/R2-F10): only a POST-header ReadTimeout is the healthy-but-quiet
+    idle watchdog — it must surface as SseIdleTimeout so the reconnect loop can take the
+    fast path."""
+    from nso_adapter.notifications.sse_subscriber import SseIdleTimeout
+
+    sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    original = sub._client
+    sub._client = lambda timeout=None: httpx.AsyncClient(
+        transport=_PostHeaderTimeoutTransport(), base_url="http://nso:8080"
+    )
+    try:
+        with pytest.raises(SseIdleTimeout):
+            await sub.subscribe(STREAM_URL, lambda raw, parsed: None, duration=5.0, idle_read_timeout_s=0.5)
+    finally:
+        sub._client = original
+
+
+async def test_pre_header_read_timeout_stays_a_transport_error():
+    """A ReadTimeout with NO headers accepted is an overloaded/hung server, NOT a quiet
+    stream — it must stay a plain transport error so the reconnect loop backs off."""
+    from nso_adapter.notifications.sse_subscriber import SseIdleTimeout
+
+    sub = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    original = sub._client
+    sub._client = lambda timeout=None: httpx.AsyncClient(
+        transport=_PreHeaderTimeoutTransport(), base_url="http://nso:8080"
+    )
+    try:
+        with pytest.raises(httpx.ReadTimeout):
+            await sub.subscribe(STREAM_URL, lambda raw, parsed: None, duration=5.0, idle_read_timeout_s=0.5)
+    except SseIdleTimeout:  # pragma: no cover - the failure mode under test
+        raise AssertionError("pre-header ReadTimeout must not classify as idle")
+    finally:
+        sub._client = original
+
+
 async def test_subscribe_calls_on_event_for_each_sse_block():
     received: list[tuple[str, dict | None]] = []
 
@@ -292,8 +362,13 @@ async def test_subscribe_idle_read_timeout_unwedges_half_open_connection():
                 sub.subscribe(url, lambda *_: None, duration=float("inf"), idle_read_timeout_s=None),
                 timeout=1.5,
             )
-        # Watchdog → httpx surfaces ReadTimeout well before the 5s bound.
-        with pytest.raises(httpx.ReadTimeout):
+        # Watchdog → the POST-header idle fires well before the 5s bound. S5a E: an
+        # established-then-silent stream is the HEALTHY quiet case → SseIdleTimeout
+        # (fast reconnect), no longer a plain ReadTimeout (60s backoff) — this real
+        # socket is the codex-requested headers-then-silence proof.
+        from nso_adapter.notifications.sse_subscriber import SseIdleTimeout
+
+        with pytest.raises(SseIdleTimeout):
             await _asyncio.wait_for(
                 sub.subscribe(url, lambda *_: None, duration=float("inf"), idle_read_timeout_s=0.5),
                 timeout=5,

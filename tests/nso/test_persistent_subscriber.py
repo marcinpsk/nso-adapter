@@ -69,6 +69,54 @@ async def test_persistent_subscriber_reconnects_after_clean_eof(monkeypatch: pyt
     assert wait_for_calls == []
 
 
+async def test_idle_timeout_reconnects_fast_and_resets_backoff(monkeypatch: pytest.MonkeyPatch):
+    """S5a E (item 1335): the idle watchdog on a healthy-but-quiet stream must NOT eat the
+    60s error backoff (the live ~40%% blind window) — short jitter, delay reset to initial."""
+    module, persistent_subscriber = load_persistent_subscriber()
+    from nso_adapter.notifications.sse_subscriber import SseIdleTimeout
+
+    subscriber = SSESubscriber("http://nso:8080", ("admin", "secret"))
+    stop_event = asyncio.Event()
+    wait_for_calls: list[float] = []
+    attempts = 0
+
+    async def subscribe_side_effect(
+        stream_url: str, on_event: OnEvent, duration: float, idle_read_timeout_s: float | None = 90.0
+    ) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise SseIdleTimeout("quiet stream")
+        if attempts == 2:
+            raise httpx.ConnectError("real failure")  # after the idle cycle, a REAL error
+        stop_event.set()  # third attempt: clean return; the loop sees stop and exits
+
+    async def fake_wait_for(awaitable, timeout: float):
+        wait_for_calls.append(timeout)
+        if hasattr(awaitable, "close"):
+            awaitable.close()
+        if stop_event.is_set():
+            return
+        raise asyncio.TimeoutError  # noqa: UP041 - explicit wait_for timeout behavior
+
+    monkeypatch.setattr(module.asyncio, "wait_for", fake_wait_for)
+    monkeypatch.setattr(subscriber, "subscribe", subscribe_side_effect)
+
+    task = asyncio.create_task(
+        persistent_subscriber(
+            subscriber, STREAM_URL, lambda raw, parsed: None, stop_event=stop_event, initial_delay_s=5.0
+        )
+    )
+    # plain await: asyncio.wait_for is monkeypatched module-wide above
+    await task
+
+    assert attempts == 3
+    # idle cycle: SHORT jitter (~1s), not the 5s initial backoff; the following REAL
+    # error then waits the RESET initial delay (5s), not a doubled one.
+    assert wait_for_calls[0] <= 1.5, f"idle reconnect must be fast, got {wait_for_calls[0]}"
+    assert wait_for_calls[1] == 5.0, f"backoff must reset after a healthy idle cycle, got {wait_for_calls[1]}"
+
+
 async def test_persistent_subscriber_retries_after_transport_error(monkeypatch: pytest.MonkeyPatch):
     module, persistent_subscriber = load_persistent_subscriber()
     subscriber = SSESubscriber("http://nso:8080", ("admin", "secret"))
