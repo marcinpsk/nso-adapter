@@ -3,8 +3,7 @@
 """Route-policy config refresh — reads NSO oper-data and upserts the DB.
 
 Entry points:
-- refresh_route_policy_for_device() — called on-demand by scheduler
-- handle_route_policy_change()      — placeholder for future SSE hook
+- refresh_route_policy_for_device() — called on-demand by scheduler / SSE coalescer
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ import json
 from datetime import UTC, datetime
 
 import structlog
-from sqlalchemy import delete, select
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.community_dialect import community_dialect_for
@@ -239,13 +238,3 @@ async def refresh_route_policy_for_device(
     failed and the last-known rows were left untouched (a degraded surface).
     """
     return await run_family_refresh(db, device, nso_client, ROUTE_POLICY_SPEC, refresh_source=refresh_source)
-
-
-async def handle_route_policy_change(device_name: str, db: AsyncSession, nso_client: NsoClient) -> None:
-    """Refresh route-policy for a single device by name (placeholder SSE hook)."""
-    result = await db.execute(select(Device).where(Device.nso_device_name == device_name))
-    device = result.scalar_one_or_none()
-    if device is None:
-        logger.debug("route_policy.sse.device_not_found", device_name=device_name)
-        return
-    await refresh_route_policy_for_device(db, device, nso_client, refresh_source="sse")

@@ -420,7 +420,7 @@ async def test_duplicate_afis_and_peer_group_names_deduped(adapter_client):
         break
 
 
-# ── refresh_bgp_config_for_device + handle_bgp_config_change (the wrappers) ────
+# ── refresh_bgp_config_for_device (the wrapper) ────
 
 
 async def test_refresh_skips_device_without_nso_name(adapter_client):
@@ -499,37 +499,6 @@ async def test_refresh_empty_entry_clears_rows(adapter_client):
         rows = (await db.execute(select(DeviceBgpRouter).where(DeviceBgpRouter.device_id == device_id))).scalars().all()
         assert rows == []
         break
-
-
-async def test_handle_bgp_change_unknown_device_is_noop(adapter_client):
-    """An SSE event for an unknown device returns without touching NSO."""
-    from nso_adapter.core.bgp import handle_bgp_config_change
-    from nso_adapter.store.db import get_session
-
-    fake = _FakeNso(entry={"router": []})
-    async for db in get_session():
-        await handle_bgp_config_change(db, "no-such-device", fake)  # returns, no crash
-        break
-    assert fake.calls == []
-
-
-async def test_handle_bgp_change_known_device_refreshes(adapter_client):
-    """An SSE event for a known device drives a refresh tagged refresh_source='sse'."""
-    from nso_adapter.core.bgp import handle_bgp_config_change
-    from nso_adapter.store.db import get_session
-    from nso_adapter.store.models import DeviceBgpRouter
-
-    device_id = await seed_device(nso_device_name="bgp-sse", netbox_device_id=895)
-    fake = _FakeNso(entry={"router": [{"asn": "65100", "scope": []}]})
-    async for db in get_session():
-        await handle_bgp_config_change(db, "bgp-sse", fake)
-        routers = (
-            (await db.execute(select(DeviceBgpRouter).where(DeviceBgpRouter.device_id == device_id))).scalars().all()
-        )
-        assert [r.asn for r in routers] == ["65100"]
-        assert routers[0].refresh_source == "sse"
-        break
-    assert fake.calls == ["bgp-sse"]
 
 
 async def test_same_neighbor_af_conflict_across_groups_is_observable(adapter_client):

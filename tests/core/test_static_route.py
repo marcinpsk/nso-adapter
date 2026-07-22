@@ -12,7 +12,6 @@ from sqlalchemy import select
 
 from nso_adapter.core.static_route import (
     STATIC_ROUTE_SPEC,
-    handle_static_route_change,
     refresh_static_routes_for_device,
 )
 from nso_adapter.store.db import get_session
@@ -150,36 +149,6 @@ async def test_refresh_skips_device_without_nso_name(adapter_client):
         nso_client = AsyncMock()
         await refresh_static_routes_for_device(db, device, nso_client)
         nso_client.get_device_state_section.assert_not_awaited()
-
-
-@pytest.mark.anyio
-async def test_handle_sse_event_refreshes_device(adapter_client):
-    """SSE handler resolves Device by nso_device_name and triggers refresh."""
-    device_id = await seed_device(nso_device_name="sr-sse-sw01", netbox_device_id=985)
-    async for db in get_session():
-        nso_client = AsyncMock()
-        nso_client.get_device_state_section.return_value = {
-            "status": "ok",
-            "route": [{"vrf": "", "prefix": "10.100.0.0/24", "next-hop": "192.168.0.1"}],
-        }
-        await handle_static_route_change(db, "sr-sse-sw01", nso_client)
-
-        result = await db.execute(select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device_id))
-        rows = result.scalars().all()
-        assert len(rows) == 1
-        assert rows[0].prefix == "10.100.0.0/24"
-        assert rows[0].refresh_source == "sse"
-        break
-
-
-@pytest.mark.anyio
-async def test_handle_sse_event_unknown_device_is_noop(adapter_client):
-    """SSE event for unknown nso_device_name → no error, no DB writes."""
-    async for db in get_session():
-        nso_client = AsyncMock()
-        await handle_static_route_change(db, "nonexistent-device", nso_client)
-        nso_client.get_device_state_section.assert_not_awaited()
-        break
 
 
 # ── READSEM S3: the B1 envelope flip ────────────────────────────────────────────────

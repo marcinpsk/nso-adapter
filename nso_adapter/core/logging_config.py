@@ -93,11 +93,3 @@ async def refresh_logging_config_for_device(
     failed and the last-known rows were left untouched (a degraded surface).
     """
     return await run_family_refresh(db, device, nso_client, LOGGING_CONFIG_SPEC, refresh_source=refresh_source)
-
-
-async def handle_logging_config_change(db: AsyncSession, nso_device_name: str, nso_client: NsoClient) -> None:
-    """SSE hook: refresh logging for the device named *nso_device_name*."""
-    result = await db.execute(select(Device).where(Device.nso_device_name == nso_device_name))
-    device = result.scalar_one_or_none()
-    if device is not None:
-        await refresh_logging_config_for_device(db, device, nso_client, refresh_source="sse")

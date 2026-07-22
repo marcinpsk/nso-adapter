@@ -3,8 +3,7 @@
 """Static route refresh — reads NSO oper-data and upserts the DB.
 
 Entry points:
-- refresh_static_routes_for_device() — called on-demand by scheduler
-- handle_static_route_change()       — placeholder for future SSE hook
+- refresh_static_routes_for_device() — called on-demand by scheduler / SSE coalescer
 """
 
 from __future__ import annotations
@@ -80,25 +79,3 @@ async def refresh_static_routes_for_device(
     failed and the last-known rows were left untouched (a degraded surface).
     """
     return await run_family_refresh(db, device, nso_client, STATIC_ROUTE_SPEC, refresh_source=refresh_source)
-
-
-async def handle_static_route_change(
-    db: AsyncSession,
-    nso_device_name: str,
-    nso_client: NsoClient,
-) -> None:
-    """Handle an SSE notification that static routes changed for *nso_device_name*.
-
-    Finds the Device row, then delegates to refresh_static_routes_for_device.
-    """
-    from sqlalchemy import select
-
-    from nso_adapter.store.models import Device
-
-    result = await db.execute(select(Device).where(Device.nso_device_name == nso_device_name))
-    device = result.scalar_one_or_none()
-    if device is None:
-        logger.debug("static_route.sse.unknown_device", nso_device_name=nso_device_name)
-        return
-
-    await refresh_static_routes_for_device(db, device, nso_client, refresh_source="sse")

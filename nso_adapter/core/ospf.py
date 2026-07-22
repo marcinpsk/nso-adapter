@@ -3,8 +3,7 @@
 """OSPF refresh — reads NSO oper-data and upserts the DB.
 
 Entry points:
-- refresh_ospf_for_device() — called on-demand by scheduler
-- handle_ospf_change()      — placeholder for future SSE hook
+- refresh_ospf_for_device() — called on-demand by scheduler / SSE coalescer
 """
 
 from __future__ import annotations
@@ -12,7 +11,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import structlog
-from sqlalchemy import delete, select
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
@@ -117,21 +116,3 @@ async def refresh_ospf_for_device(
     failed and the last-known rows were left untouched (a degraded surface).
     """
     return await run_family_refresh(db, device, nso_client, OSPF_SPEC, refresh_source=refresh_source)
-
-
-async def handle_ospf_change(
-    db: AsyncSession,
-    nso_device_name: str,
-    nso_client: NsoClient,
-) -> None:
-    """Handle an SSE notification that OSPF config changed for *nso_device_name*.
-
-    Finds the Device row, then delegates to refresh_ospf_for_device.
-    """
-    result = await db.execute(select(Device).where(Device.nso_device_name == nso_device_name))
-    device = result.scalar_one_or_none()
-    if device is None:
-        logger.debug("ospf.sse.unknown_device", nso_device_name=nso_device_name)
-        return
-
-    await refresh_ospf_for_device(db, device, nso_client, refresh_source="sse")
