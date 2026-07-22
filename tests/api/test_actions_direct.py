@@ -84,6 +84,52 @@ async def test_action_sync_enqueues_sync_now_job(adapter_client):
         break
 
 
+async def test_action_sync_from_nso_enqueues_its_job(adapter_client):
+    """S5a B: the comprehensive CDB-only read gets its own job type + endpoint."""
+    from nso_adapter.api.actions import action_sync_from_nso
+
+    device_id = await _seed_device("actions-sfn-01", 1321)
+    async for db in get_session():
+        result = await action_sync_from_nso(device_id=device_id, db=db)
+        job = await db.get(Job, result["job_id"])
+        assert job.job_type == JobType.sync_from_nso
+        assert job.status == JobStatus.queued
+        break
+
+
+async def test_action_sync_from_nso_404_unknown_device(adapter_client):
+    """Unknown device -> the shared _trigger 404."""
+    from fastapi import HTTPException
+
+    from nso_adapter.api.actions import action_sync_from_nso
+
+    async for db in get_session():
+        try:
+            await action_sync_from_nso(device_id=999999, db=db)
+            raise AssertionError("expected HTTPException")
+        except HTTPException as exc:
+            assert exc.status_code == 404
+        break
+
+
+async def test_action_sync_from_nso_409_on_active_job(adapter_client):
+    """An active job for the device 409s with the incumbent id (shared _trigger)."""
+    from fastapi import HTTPException
+
+    from nso_adapter.api.actions import action_sync_from_nso
+
+    device_id = await _seed_device("actions-sfn-02", 1322)
+    async for db in get_session():
+        first = await action_sync_from_nso(device_id=device_id, db=db)
+        try:
+            await action_sync_from_nso(device_id=device_id, db=db)
+            raise AssertionError("expected HTTPException")
+        except HTTPException as exc:
+            assert exc.status_code == 409
+            assert exc.detail["error"]["detail"]["job_id"] == first["job_id"]
+        break
+
+
 async def test_action_force_removal_enqueues_forced_removal_job(adapter_client):
     """The operator override for a removal_blocked_collateral failure: enqueues a
     removal job with force=True so the guard is skipped ON PURPOSE (reviewed flush)."""

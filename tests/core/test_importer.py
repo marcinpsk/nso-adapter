@@ -549,7 +549,7 @@ async def test_sync_device_comprehensive_uses_all_surfaces(db_session: AsyncSess
         patch(
             "nso_adapter.core.importer.refresh_all_surfaces_for_device",
             new_callable=AsyncMock,
-            return_value=[],
+            return_value=([], None),
         ) as fanout,
         patch(
             "nso_adapter.core.importer.refresh_routing_surfaces_for_device",
@@ -1600,7 +1600,7 @@ async def test_atomic_fanout_uses_one_action_with_the_long_timeout(db_session: A
             db_session, device, nso_client, refresh_source="onboard", atomic=True
         )
 
-    assert failed == []
+    assert failed == ([], None)
     nso_client.get_device_state_doc.assert_not_awaited()  # grain c never reads the record-served doc
     assert nso_client.run_device_state_read.await_count == 1
     args, kwargs = nso_client.run_device_state_read.await_args
@@ -1633,10 +1633,11 @@ async def test_atomic_fanout_action_error_keeps_every_family(db_session: AsyncSe
     nso_client.run_device_state_read.side_effect = RuntimeError("bracket exhausted")
 
     with patch("nso_adapter.core.redistribution.refresh_redistribution_for_device", AsyncMock(return_value=False)):
-        failed = await refresh_all_surfaces_for_device(
+        failed, supplier = await refresh_all_surfaces_for_device(
             db_session, device, nso_client, refresh_source="onboard", atomic=True
         )
 
+    assert supplier is not None  # S5a B: the TOTAL supplier failure is now observable
     assert "static_route" in failed
     rows = (
         (await db_session.execute(_select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id)))

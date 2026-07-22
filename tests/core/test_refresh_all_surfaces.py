@@ -56,6 +56,29 @@ async def _device_session(device_id: int):
     raise RuntimeError("no session")
 
 
+def test_projected_wrappers_return_shapes():
+    """S5a B (codex R2-F4/R3-7): refresh_all_surfaces_for_device returns
+    (failed, supplier_outcome) so callers can distinguish a TOTAL supplier failure
+    from per-family degradation; the routing and config wrappers keep their public
+    list[str] shape (unpack internally)."""
+    import inspect
+
+    from nso_adapter.core.importer import (
+        refresh_all_surfaces_for_device as _all,
+    )
+    from nso_adapter.core.importer import (
+        refresh_config_surfaces_for_device as _cfg,
+    )
+    from nso_adapter.core.importer import (
+        refresh_routing_surfaces_for_device as _routing,
+    )
+
+    all_ret = inspect.signature(_all).return_annotation
+    assert "tuple" in str(all_ret), f"comprehensive wrapper must return a tuple, got {all_ret!r}"
+    assert "list[str]" in str(inspect.signature(_routing).return_annotation)
+    assert "list[str]" in str(inspect.signature(_cfg).return_annotation)
+
+
 def test_registry_covers_exactly_the_18_families():
     """With every enable flag on (defaults), the combined registry is exactly the 18 families,
     with no duplicates — so a family can never silently fall out of the comprehensive refresh."""
@@ -109,7 +132,8 @@ async def test_refresh_all_surfaces_reports_failed_family(adapter_client):
     device_id = await seed_device(nso_device_name="all-surfaces")
     async with _device_session(device_id) as (db, device):
         client = _RecordingClient(fail={"interface-ip"})  # interface_ip is envelope-flipped (S3)
-        failed = await refresh_all_surfaces_for_device(db, device, client, refresh_source="test")
+        failed, supplier = await refresh_all_surfaces_for_device(db, device, client, refresh_source="test")
+        assert supplier is None  # per-family failure, not a total supplier outage
         assert "interface_ip" in failed
         # every family was attempted: each records an outcome row (the projection makes
         # one doc GET, so call-counting can no longer prove per-family coverage)

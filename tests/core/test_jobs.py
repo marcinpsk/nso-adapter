@@ -403,6 +403,96 @@ async def test_sync_now_timeout_leaves_last_sync_pair_untouched(adapter_client):
         break
 
 
+async def test_run_sync_from_nso_reads_all_surfaces_without_device_contact(adapter_client):
+    """S5a B: the runner is a comprehensive CDB-only mirror read — refresh_all_surfaces
+    atomic, NO device sync-from, no last_sync_* writes; notify best-effort."""
+    from nso_adapter.core import importer as imp
+    from nso_adapter.core.jobs import _run_sync_from_nso
+    from nso_adapter.nso.client import NsoClient as _NsoClient
+
+    device_id = await _seed_device("sfn-rtr", 91)
+    job_id = await _seed_job(device_id)
+
+    client = AsyncMock(spec=_NsoClient)
+    imp._nso_clients["nso-dev"] = client
+    nb = AsyncMock()
+    imp._netbox_client = nb
+
+    with (
+        patch(
+            "nso_adapter.core.importer.refresh_all_surfaces_for_device",
+            new_callable=AsyncMock,
+            return_value=(["bgp"], None),
+        ) as fanout,
+        patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock) as sf,
+    ):
+        await _run_sync_from_nso(job_id, device_id)
+
+    fanout.assert_awaited_once()
+    assert fanout.await_args.kwargs.get("atomic") is True
+    assert fanout.await_args.kwargs.get("refresh_source") == "sync_from_nso"
+    sf.assert_not_awaited()  # pins the no-device-round-trip contract
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        assert job.result == {"degraded_surfaces": ["bgp"]}
+        device = await db.get(Device, device_id)
+        assert device.last_sync_at is None  # grain (b) never claims a device sync
+        break
+    nb.notify_sync_complete.assert_awaited_once()
+
+
+async def test_run_sync_from_nso_fails_job_on_total_supplier_failure(adapter_client):
+    """S5a B (codex R1-F2/R2-F4): an export/action outage refreshed NOTHING — the job
+    must FAIL with an honest message, never report green success."""
+    from nso_adapter.core import importer as imp
+    from nso_adapter.core.jobs import _run_sync_from_nso
+    from nso_adapter.nso.client import NsoClient as _NsoClient
+    from nso_adapter.nso.read_outcome import Unavailable, UnavailableReason
+
+    device_id = await _seed_device("sfn-rtr-down", 92)
+    job_id = await _seed_job(device_id)
+
+    client = AsyncMock(spec=_NsoClient)
+    imp._nso_clients["nso-dev"] = client
+    imp._netbox_client = None
+
+    supplier = Unavailable(UnavailableReason.read_error, detail="action boom")
+    all_kept = [
+        "static_route",
+        "isis",
+        "bgp",
+        "ospf",
+        "redistribution",
+        "route_policy",
+        "snmp",
+        "logging",
+        "bfd",
+        "interface_ip",
+        "vlan",
+        "svi",
+        "subinterface",
+        "interface_mtu",
+        "switchport",
+        "l2_service",
+        "lag_topology",
+        "lag_config",
+    ]
+    with patch(
+        "nso_adapter.core.importer.refresh_all_surfaces_for_device",
+        new_callable=AsyncMock,
+        return_value=(all_kept, supplier),
+    ):
+        await _run_sync_from_nso(job_id, device_id)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert "nothing refreshed" in job.error["message"].lower()
+        break
+
+
 async def test_run_sync_now_requests_comprehensive_atomic(adapter_client):
     """A1 (READSEM S5a, codex R1-F9): the RUNNER must pass BOTH flags — a direct
     sync_device test alone stays green if the runner edit is forgotten."""

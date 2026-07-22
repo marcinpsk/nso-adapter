@@ -55,6 +55,7 @@ _EMPTY_POLL_INTERVAL = 2.0
 _REQUEUE_ON_RESTART = {
     JobType.sync,
     JobType.sync_now,  # idempotent read (grain-c atomic mirror refresh)
+    JobType.sync_from_nso,  # idempotent read (S5a comprehensive CDB-only mirror refresh)
     JobType.detect_drift,
     JobType.connect,
     JobType.removal,

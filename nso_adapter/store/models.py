@@ -69,6 +69,9 @@ class JobType(str, enum.Enum):
     # Declared LAST: its migration appends via ALTER TYPE ADD VALUE, so the deployed pg
     # enum has it last — member order must match or the schema-parity gate diffs.
     sync_now = "sync_now"
+    # Operator "Sync from NSO" (S5a): comprehensive CDB-only mirror read — all surfaces,
+    # atomic, NO device sync-from. Declared LAST (same ADD VALUE append-order rule).
+    sync_from_nso = "sync_from_nso"
 
 
 class SyncState(str, enum.Enum):

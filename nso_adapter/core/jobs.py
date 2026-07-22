@@ -184,6 +184,42 @@ async def _run_sync_now(job_id: int, device_id: int) -> None:
     await _run_with_db(job_id, device_id, _atomic_sync, timeout=900.0)
 
 
+async def _run_sync_from_nso(job_id: int, device_id: int) -> None:
+    """Operator "Sync from NSO" (S5a B): comprehensive CDB-only mirror read.
+
+    All surfaces from ONE atomic ``device-state-read`` — NO device ``sync-from``, no
+    ``last_sync_*`` writes (those describe device-reread truthfulness, which this job
+    does not perform). A TOTAL supplier failure (the one read itself failed — nothing
+    refreshed) FAILS the job honestly instead of reporting green success (codex R1-F2).
+    """
+    from nso_adapter.core.importer import get_netbox_client, get_nso_client, refresh_all_surfaces_for_device
+    from nso_adapter.store.models import Device
+
+    logger.info("job.sync_from_nso.start", job_id=job_id, device_id=device_id)
+
+    async def _mirror_read(device_id_: int, db) -> dict:
+        device = await db.get(Device, device_id_)
+        if not device:
+            raise ValueError(f"Device {device_id_} not found")
+        client = get_nso_client(device.nso_instance)
+        failed, supplier_outcome = await refresh_all_surfaces_for_device(
+            db, device, client, refresh_source="sync_from_nso", atomic=True
+        )
+        if supplier_outcome is not None:
+            raise RuntimeError("NSO read unavailable — nothing refreshed; last-known data kept")
+        nb_client = get_netbox_client()
+        if nb_client and device.netbox_device_id:
+            try:
+                await nb_client.notify_sync_complete(device.netbox_device_id)
+            except Exception as exc:  # noqa: BLE001 — best-effort; the mirror is refreshed
+                logger.warning(
+                    "netbox.sync_complete_notify_failed", device_id=device_id_, error=str(exc) or type(exc).__name__
+                )
+        return {"degraded_surfaces": sorted(failed)}
+
+    await _run_with_db(job_id, device_id, _mirror_read, timeout=900.0)
+
+
 async def _run_detect_drift(job_id: int, device_id: int) -> None:
     from nso_adapter.core.importer import detect_drift
 
@@ -317,6 +353,7 @@ async def _run_provision(job_id: int, device_id: int | None) -> None:
 _JOB_RUNNERS = {
     JobType.sync: _run_sync,
     JobType.sync_now: _run_sync_now,
+    JobType.sync_from_nso: _run_sync_from_nso,
     JobType.detect_drift: _run_detect_drift,
     JobType.connect: _run_connect,
     JobType.apply: _run_apply,

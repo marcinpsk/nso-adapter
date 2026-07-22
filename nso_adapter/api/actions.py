@@ -127,6 +127,23 @@ async def action_sync(
 
 
 @router.post(
+    "/{device_id}/actions/sync-from-nso",
+    status_code=202,
+    dependencies=[Depends(verify_token)],
+    response_model=JobTriggerOut,
+    responses=_TRIGGER_ERRORS,
+)
+async def action_sync_from_nso(
+    device_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    # Operator "Sync from NSO" (S5a): comprehensive CDB-only mirror read — every surface
+    # from ONE atomic device-state-read, NO device round-trip (Sync Now above runs the
+    # device sync-from first; this re-reads what NSO already knows).
+    return await _trigger(device_id, JobType.sync_from_nso, db)
+
+
+@router.post(
     "/{device_id}/actions/detect-drift",
     status_code=202,
     dependencies=[Depends(verify_token)],

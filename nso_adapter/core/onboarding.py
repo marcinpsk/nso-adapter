@@ -281,7 +281,9 @@ async def _initial_mirror_refresh(db: AsyncSession, device_id: int, client) -> N
         device = await db.get(Device, device_id)
         if device is None:
             return
-        degraded = await refresh_all_surfaces_for_device(db, device, client, refresh_source="onboard", atomic=True)
+        degraded, _supplier = await refresh_all_surfaces_for_device(
+            db, device, client, refresh_source="onboard", atomic=True
+        )
         await db.commit()
         if degraded:
             logger.warning("device.onboard_mirror.partial", device_id=device_id, degraded_surfaces=sorted(degraded))

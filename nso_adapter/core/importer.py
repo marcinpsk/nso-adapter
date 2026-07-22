@@ -275,11 +275,15 @@ async def _run_surfaces_projected(
     refresh_source: str,
     *,
     atomic: bool = False,
-) -> list[str]:
+) -> tuple[list[str], object | None]:
     """READSEM grains b/c: feed every spec-backed surface from ONE projected read.
 
-    Same contract as :func:`_run_surfaces` (failed-name list, per-surface isolation);
-    non-spec surfaces (redistribution) still run their own warm section reads.
+    Same per-surface isolation as :func:`_run_surfaces`. Returns
+    ``(failed_names, supplier_outcome)`` — the supplier outcome is already fanned out
+    per-family (outcomes terminalized) before return; surfacing it lets callers
+    distinguish a TOTAL supplier failure (doc GET / atomic action failed — nothing was
+    read) from per-family degradation (S5a B, codex R2-F4). Non-spec surfaces
+    (redistribution) still classify from the same snapshot.
     """
     from contextlib import AsyncExitStack
 
@@ -353,7 +357,7 @@ async def _run_surfaces_projected(
             except Exception as exc:  # noqa: BLE001 — one surface must not take down the rest
                 logger.warning("sync.surface_refresh_failed", device_id=device.id, surface=name, error=repr(exc))
                 failed.append(name)
-        return failed
+        return failed, supplier_outcome
 
 
 def _routing_surfaces(cfg) -> list[tuple[str, object]]:
@@ -470,9 +474,10 @@ async def refresh_routing_surfaces_for_device(
     demand, gated by the scheduler enable flags. Returns the FAILED surface names (see
     :func:`_run_surfaces`); the caller records them so the device reports ``partial``.
     """
-    return await _run_surfaces_projected(
+    failed, _supplier = await _run_surfaces_projected(
         db, device, nso_client, _routing_surfaces(get_config().scheduler), refresh_source, atomic=atomic
     )
+    return failed
 
 
 async def refresh_config_surfaces_for_device(
@@ -490,9 +495,10 @@ async def refresh_config_surfaces_for_device(
     device Apply lets the row settle instead of waiting for that surface's next poll. Returns the
     FAILED surface names (callers may ignore the list — apply just wants the best-effort refresh).
     """
-    return await _run_surfaces_projected(
+    failed, _supplier = await _run_surfaces_projected(
         db, device, nso_client, _config_surfaces(get_config().scheduler), refresh_source, atomic=atomic
     )
+    return failed
 
 
 async def refresh_all_surfaces_for_device(
@@ -502,14 +508,15 @@ async def refresh_all_surfaces_for_device(
     *,
     refresh_source: str = "refresh",
     atomic: bool = False,
-) -> list[str]:
+) -> tuple[list[str], object | None]:
     """Comprehensive on-demand refresh of EVERY enabled read-mirror family for one device.
 
     The single "refresh this device's whole mirror now" primitive, used at the moments that
     matter (onboarding, an explicit refresh) where reading all 18 families is worth it — as
     opposed to the lean per-15-min ``sync_device`` path (routing + interface_ip only). Each
-    surface is enable-gated and isolated; returns the FAILED surface names so the caller can
-    report ``partial``. The caller commits.
+    surface is enable-gated and isolated. Returns ``(failed_names, supplier_outcome)``
+    (S5a B): a non-None supplier outcome means the ONE projected read itself failed —
+    nothing was refreshed, every family kept last-known rows. The caller commits.
     """
     cfg = get_config().scheduler
     surfaces = _routing_surfaces(cfg) + _config_surfaces(cfg) + _extra_mirror_surfaces(cfg)
@@ -842,7 +849,9 @@ async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False,
     # exposes (IS-IS/BGP/OSPF/route-policy/...), not just interface attributes. Done
     # before the plugin notify so its reconcile sees the fresh surface state in one pass.
     if comprehensive:
-        degraded = await refresh_all_surfaces_for_device(db, device, client, refresh_source="sync", atomic=atomic)
+        degraded, _supplier = await refresh_all_surfaces_for_device(
+            db, device, client, refresh_source="sync", atomic=atomic
+        )
     else:
         degraded = await refresh_routing_surfaces_for_device(db, device, client, refresh_source="sync", atomic=atomic)
     if not attrs_available:

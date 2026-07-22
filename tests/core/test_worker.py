@@ -460,3 +460,6 @@ def test_sync_now_is_requeue_safe_and_runnable():
 
     assert JobType.sync_now in _REQUEUE_ON_RESTART
     assert JobType.sync_now in _JOB_RUNNERS
+    # S5a B: same guarantees for the comprehensive CDB-only read (idempotent mirror job).
+    assert JobType.sync_from_nso in _REQUEUE_ON_RESTART
+    assert JobType.sync_from_nso in _JOB_RUNNERS
