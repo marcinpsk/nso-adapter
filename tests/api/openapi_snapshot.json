@@ -9152,6 +9152,83 @@
         ]
       }
     },
+    "/api/v1/devices/{device_id}/actions/sync-from-nso": {
+      "post": {
+        "operationId": "action_sync_from_nso_api_v1_devices__device_id__actions_sync_from_nso_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobTriggerOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A job is already running for this device"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request validation failed (envelope shape)"
+          }
+        },
+        "security": [
+          {
+            "_OptionalBearer": []
+          }
+        ],
+        "summary": "Action Sync From Nso",
+        "tags": [
+          "actions"
+        ]
+      }
+    },
     "/api/v1/devices/{device_id}/apply/preflight": {
       "post": {
         "description": "Check the scopes the next apply will push against this device's capability matrix.\n\nThe generic analog of ``/route-policy/preflight``: the plugin passes the scopes from its\napply diff; any the matrix marks ``unsupported``/``skipped`` (recorded reactively on a prior\napply failure, see ``_record_atomic_capability``) are returned so the operator is warned\nBEFORE a device write. ``refresh=false`` (default) is the cheap cache-only read; the device\nmust have a known ``(ned, sw)`` key (probed at least once) or the result is fail-open.",
