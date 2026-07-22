@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import select
 
-from nso_adapter.core.snmp import handle_snmp_config_change, refresh_snmp_config_for_device
+from nso_adapter.core.snmp import refresh_snmp_config_for_device
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, SnmpCommunity, SnmpHost, SnmpSystemInfo, SnmpV3User
 from tests.conftest import seed_device
@@ -300,44 +300,3 @@ async def test_refresh_keeps_rows_on_read_error(adapter_client):
         rows = (await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device.id))).scalars().all()
         assert len(rows) == 1
         assert rows[0].community_hash == "keep_me_efgh5678"
-
-
-@pytest.mark.anyio
-async def test_handle_snmp_config_change_dispatches_to_affected_devices(adapter_client):
-    """SSE event → refresh is triggered for each affected managed device."""
-    device_id = await seed_device(nso_device_name="snmp-sse-sw01", netbox_device_id=968)
-    nso_client = AsyncMock()
-    nso_client.get_device_state_section.return_value = {
-        "status": "ok",
-        "name": "snmp-sse-sw01",
-        "community": [{"name": "aaabbbccc1112233", "access": "RO"}],
-    }
-
-    # Simulate a NETCONF config-change event mentioning this device
-    event_data = {
-        "ietf-restconf:notification": {
-            "eventTime": "2026-06-10T09:00:00.000Z",
-            "netconf-config-change": {
-                "changed-by": {"username": "admin"},
-                "edit": [
-                    {
-                        "target": "/ncs:devices/device[name='snmp-sse-sw01']/ncs:config",
-                        "operation": "merge",
-                    }
-                ],
-            },
-        }
-    }
-
-    async for db in get_session():
-        await handle_snmp_config_change(event_data, db, {"nso-dev": nso_client})
-        break
-
-    nso_client.get_device_state_section.assert_awaited_once_with("snmp-sse-sw01", "snmp-config")
-
-    async for db in get_session():
-        result = await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device_id))
-        rows = result.scalars().all()
-        assert len(rows) == 1
-        assert rows[0].community_hash == "aaabbbccc1112233"
-        break

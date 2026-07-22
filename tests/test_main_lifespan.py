@@ -5,8 +5,10 @@ These cover the pieces the ``adapter_client`` fixture never exercises (it runs
 lifespan with no NSO instances and SSE disabled): the per-instance NSO client
 loop, the SSE event-dispatch fan-out + its config gating, stream startup, and
 the teardown tail. Everything runs the real helpers; collaborators that are
-already tested elsewhere (the nine ``handle_*`` change handlers, the persistent
-SSE subscriber) are replaced with small async fakes, never MagicMocks.
+already tested elsewhere (the surface refreshers, the persistent SSE subscriber)
+are replaced with small async fakes, never MagicMocks. S5a D: the per-event
+dispatch is a coalesced comprehensive refresh per changed device (the former
+nine-handler fan-out is gone).
 """
 
 from __future__ import annotations
@@ -20,31 +22,12 @@ from nso_adapter.main import (
     _build_netbox_client,
     _build_nso_clients,
     _close_netbox,
-    _dispatch_netconf_change,
     _dispose_engine,
     _init_database,
     _make_sse_event_handler,
     _shutdown_sse,
     _start_sse_streams,
 )
-
-# The change handlers _dispatch_netconf_change invokes, in call order. The three
-# annotated with a flag only fire when that scheduler sync flag is enabled.
-_HANDLERS = [
-    "handle_netconf_config_change",
-    "handle_l2_service_change",
-    ("handle_interface_ip_change", "enable_interface_ip_sync"),
-    ("handle_snmp_config_change", "enable_snmp_sync"),
-    "handle_vlan_database_change",
-    "handle_switchport_change",
-    "handle_svi_change",
-    "handle_subinterface_change",
-    ("handle_interface_mtu_change", "enable_interface_mtu_sync"),
-]
-
-
-def _handler_name(entry):
-    return entry[0] if isinstance(entry, tuple) else entry
 
 
 def _scheduler(**flags):
@@ -56,22 +39,6 @@ def _scheduler(**flags):
     }
     base.update(flags)
     return SimpleNamespace(**base)
-
-
-def _patch_recording_handlers(monkeypatch):
-    """Replace the nine change handlers with async recorders; return the call log."""
-    calls: list[str] = []
-
-    def make(name):
-        async def _rec(parsed, db, clients):
-            calls.append(name)
-
-        return _rec
-
-    for entry in _HANDLERS:
-        name = _handler_name(entry)
-        monkeypatch.setattr(f"nso_adapter.main.{name}", make(name))
-    return calls
 
 
 class _Provider:
@@ -97,40 +64,208 @@ def _instance(name):
 
 
 # --------------------------------------------------------------------------- #
-# _dispatch_netconf_change — the config-gated fan-out
+# _dispatch_netconf_change — covered by the S5a D coalesced-dispatch tests below
 # --------------------------------------------------------------------------- #
 
 
-async def test_dispatch_runs_all_handlers_when_flags_on(monkeypatch):
-    calls = _patch_recording_handlers(monkeypatch)
-    cfg = SimpleNamespace(
-        scheduler=_scheduler(
-            enable_interface_ip_sync=True,
-            enable_snmp_sync=True,
-            enable_interface_mtu_sync=True,
-        )
-    )
-
-    await _dispatch_netconf_change(cfg, {"k": 1}, db="DB", clients={"i": object()})
-
-    assert calls == [_handler_name(e) for e in _HANDLERS]
+# --------------------------------------------------------------------------- #
+# S5a D — coalesced comprehensive dispatch (replaces the nine-handler fan-out)
+# --------------------------------------------------------------------------- #
 
 
-async def test_dispatch_skips_gated_handlers_when_flags_off(monkeypatch):
-    calls = _patch_recording_handlers(monkeypatch)
-    cfg = SimpleNamespace(scheduler=_scheduler())  # all three sync flags off
-
-    await _dispatch_netconf_change(cfg, {"k": 1}, db="DB", clients={"i": object()})
-
-    gated = {_handler_name(e) for e in _HANDLERS if isinstance(e, tuple)}
-    assert gated == {
-        "handle_interface_ip_change",
-        "handle_snmp_config_change",
-        "handle_interface_mtu_change",
+def _sse_event(*names):
+    return {
+        "ietf-restconf:notification": {
+            "netconf-config-change": {
+                "edit": [{"target": f"/ncs:devices/device[name='{n}']/config/x", "operation": "replace"} for n in names]
+            }
+        }
     }
-    assert set(calls).isdisjoint(gated)
-    # the ungated handlers still ran, in order
-    assert calls == [_handler_name(e) for e in _HANDLERS if not isinstance(e, tuple)]
+
+
+async def _seed_sse_device(name="sse-rtr", instance="nso-dev", netbox_id=8801):
+    from nso_adapter.store.db import get_session as _gs
+    from nso_adapter.store.models import Device as _Device
+
+    async for db in _gs():
+        d = _Device(nso_instance=instance, nso_device_name=name, netbox_device_id=netbox_id)
+        db.add(d)
+        await db.commit()
+        await db.refresh(d)
+        return d.id
+    raise RuntimeError("no session")
+
+
+async def _drain_coalescer(tasks: set[asyncio.Task]) -> None:
+    while tasks:
+        await asyncio.gather(*list(tasks), return_exceptions=True)
+
+
+async def test_dispatch_runs_one_comprehensive_refresh_per_changed_device(adapter_client, monkeypatch):
+    """S5a D (RED vs the nine-handler fan-out): a change event triggers ONE grain-b
+    comprehensive projected refresh for the device — every family, one doc GET —
+    instead of nine per-family section refreshes."""
+    from nso_adapter import main as main_mod
+    from nso_adapter.store.db import get_session as _gs
+
+    device_id = await _seed_sse_device("sse-rtr-1", netbox_id=8802)
+    calls: list[tuple[int, str, bool]] = []
+
+    async def rec_refresh(db, device, client, *, refresh_source, atomic=False):
+        calls.append((device.id, refresh_source, atomic))
+        return [], None
+
+    monkeypatch.setattr("nso_adapter.core.importer.refresh_all_surfaces_for_device", rec_refresh)
+
+    tasks: set[asyncio.Task] = set()
+    coalescer = main_mod._DeviceRefreshCoalescer({"nso-dev": object()}, tasks, tasks.discard)
+    cfg = SimpleNamespace(scheduler=_scheduler())
+    async for db in _gs():
+        await main_mod._dispatch_netconf_change(cfg, _sse_event("sse-rtr-1"), db, {"nso-dev": object()}, coalescer)
+        break
+    await _drain_coalescer(tasks)
+
+    assert calls == [(device_id, "notification", False)]
+
+
+async def test_dispatch_scopes_to_the_handler_instance_map(adapter_client, monkeypatch):
+    """codex R1-F8: a same-name device on an UNMAPPED instance is untouched."""
+    from nso_adapter import main as main_mod
+    from nso_adapter.store.db import get_session as _gs
+
+    await _seed_sse_device("sse-dup", instance="nso-other", netbox_id=8803)
+    calls: list[int] = []
+
+    async def rec_refresh(db, device, client, *, refresh_source, atomic=False):
+        calls.append(device.id)
+        return [], None
+
+    monkeypatch.setattr("nso_adapter.core.importer.refresh_all_surfaces_for_device", rec_refresh)
+
+    tasks: set[asyncio.Task] = set()
+    coalescer = main_mod._DeviceRefreshCoalescer({"nso-dev": object()}, tasks, tasks.discard)
+    async for db in _gs():
+        await main_mod._dispatch_netconf_change(
+            SimpleNamespace(scheduler=_scheduler()), _sse_event("sse-dup"), db, {"nso-dev": object()}, coalescer
+        )
+        break
+    await _drain_coalescer(tasks)
+
+    assert calls == []
+
+
+async def test_coalescer_merges_bursts_into_one_rerun(adapter_client, monkeypatch):
+    """A trigger landing mid-refresh sets the dirty edge — exactly ONE rerun, even for
+    several rapid triggers (the R6-4 bound)."""
+    from nso_adapter import main as main_mod
+
+    device_id = await _seed_sse_device("sse-burst", netbox_id=8804)
+    starts: list[int] = []
+    release = asyncio.Event()
+
+    async def slow_refresh(db, device, client, *, refresh_source, atomic=False):
+        starts.append(device.id)
+        await release.wait()
+        return [], None
+
+    monkeypatch.setattr("nso_adapter.core.importer.refresh_all_surfaces_for_device", slow_refresh)
+
+    tasks: set[asyncio.Task] = set()
+    coalescer = main_mod._DeviceRefreshCoalescer({"nso-dev": object()}, tasks, tasks.discard)
+    coalescer.trigger(device_id, "nso-dev", None)
+    await asyncio.sleep(0.02)  # first refresh is in flight
+    coalescer.trigger(device_id, "nso-dev", None)
+    coalescer.trigger(device_id, "nso-dev", None)
+    coalescer.trigger(device_id, "nso-dev", None)
+    release.set()
+    await _drain_coalescer(tasks)
+
+    assert starts == [device_id, device_id]  # one in-flight + exactly one rerun
+
+
+async def test_coalescer_consumes_dirty_edge_after_a_failing_refresh(adapter_client, monkeypatch):
+    """codex R2-F5: event B arrives while refresh A is failing — the dirty edge must be
+    consumed by an immediate rerun, not stranded until event C."""
+    from nso_adapter import main as main_mod
+
+    device_id = await _seed_sse_device("sse-fail", netbox_id=8805)
+    attempts: list[int] = []
+    gate = asyncio.Event()
+
+    async def flaky_refresh(db, device, client, *, refresh_source, atomic=False):
+        attempts.append(1)
+        if len(attempts) == 1:
+            await gate.wait()
+            raise RuntimeError("refresh A boom")
+        return [], None
+
+    monkeypatch.setattr("nso_adapter.core.importer.refresh_all_surfaces_for_device", flaky_refresh)
+
+    tasks: set[asyncio.Task] = set()
+    coalescer = main_mod._DeviceRefreshCoalescer({"nso-dev": object()}, tasks, tasks.discard)
+    coalescer.trigger(device_id, "nso-dev", None)
+    await asyncio.sleep(0.02)
+    coalescer.trigger(device_id, "nso-dev", None)  # B lands while A is mid-flight
+    gate.set()  # A now fails
+    await _drain_coalescer(tasks)
+
+    assert len(attempts) == 2, "the dirty edge must rerun despite A's failure"
+
+
+async def test_coalescer_notifies_once_per_completed_refresh(adapter_client, monkeypatch):
+    """One notify per completed run (after the refresh, before the dirty check); a notify
+    failure is swallowed."""
+    from nso_adapter import main as main_mod
+    from nso_adapter.core import importer as imp
+
+    device_id = await _seed_sse_device("sse-notify", netbox_id=8806)
+
+    async def ok_refresh(db, device, client, *, refresh_source, atomic=False):
+        return [], None
+
+    monkeypatch.setattr("nso_adapter.core.importer.refresh_all_surfaces_for_device", ok_refresh)
+
+    notified: list[int] = []
+
+    class _NB:
+        async def notify_sync_complete(self, nb_id):
+            notified.append(nb_id)
+            raise RuntimeError("plugin down")  # must be swallowed
+
+    monkeypatch.setattr(imp, "_netbox_client", _NB())
+
+    tasks: set[asyncio.Task] = set()
+    coalescer = main_mod._DeviceRefreshCoalescer({"nso-dev": object()}, tasks, tasks.discard)
+    coalescer.trigger(device_id, "nso-dev", 8806)
+    await _drain_coalescer(tasks)
+
+    assert notified == [8806]
+
+
+async def test_coalescer_child_is_shutdown_cancellable(adapter_client, monkeypatch):
+    """codex R1-F6: the REAL refresh task is registered in dispatch_tasks — shutdown
+    cancellation reaches it (not just the outer per-event task)."""
+    from nso_adapter import main as main_mod
+
+    device_id = await _seed_sse_device("sse-shutdown", netbox_id=8807)
+    entered = asyncio.Event()
+
+    async def hanging_refresh(db, device, client, *, refresh_source, atomic=False):
+        entered.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr("nso_adapter.core.importer.refresh_all_surfaces_for_device", hanging_refresh)
+
+    tasks: set[asyncio.Task] = set()
+    coalescer = main_mod._DeviceRefreshCoalescer({"nso-dev": object()}, tasks, tasks.discard)
+    coalescer.trigger(device_id, "nso-dev", None)
+    await asyncio.wait_for(entered.wait(), timeout=5.0)
+    assert len(tasks) == 1
+    for t in list(tasks):
+        t.cancel()
+    await asyncio.gather(*list(tasks), return_exceptions=True)
+    # a fresh trigger after the cancel starts a new run (latch not wedged)
+    assert coalescer._state[device_id]["running"] is False
 
 
 # --------------------------------------------------------------------------- #
@@ -139,7 +274,12 @@ async def test_dispatch_skips_gated_handlers_when_flags_off(monkeypatch):
 
 
 async def test_sse_handler_ignores_unparseable_frame(monkeypatch):
-    calls = _patch_recording_handlers(monkeypatch)
+    dispatched: list = []
+
+    async def rec_dispatch(cfg, parsed, db, clients, coalescer):
+        dispatched.append(parsed)
+
+    monkeypatch.setattr("nso_adapter.main._dispatch_netconf_change", rec_dispatch)
     handler = _make_sse_event_handler(SimpleNamespace(scheduler=_scheduler()), {"i": object()}, set())
 
     before = asyncio.all_tasks()
@@ -147,59 +287,55 @@ async def test_sse_handler_ignores_unparseable_frame(monkeypatch):
     new = [t for t in asyncio.all_tasks() if t not in before and t is not asyncio.current_task()]
 
     assert new == []
-    assert calls == []
+    assert dispatched == []
 
 
 async def test_sse_handler_dispatches_parsed_frame(monkeypatch):
-    calls = _patch_recording_handlers(monkeypatch)
+    dispatched: list = []
+
+    async def rec_dispatch(cfg, parsed, db, clients, coalescer):
+        dispatched.append((parsed, db, coalescer))
+
+    monkeypatch.setattr("nso_adapter.main._dispatch_netconf_change", rec_dispatch)
 
     async def fake_session():
         yield "DB-SESSION"
 
     monkeypatch.setattr("nso_adapter.main.get_session", fake_session)
-    cfg = SimpleNamespace(
-        scheduler=_scheduler(
-            enable_interface_ip_sync=True,
-            enable_snmp_sync=True,
-            enable_interface_mtu_sync=True,
-        )
-    )
     dispatch_tasks: set[asyncio.Task] = set()
-    handler = _make_sse_event_handler(cfg, {"i": object()}, dispatch_tasks)
+    handler = _make_sse_event_handler(SimpleNamespace(scheduler=_scheduler()), {"i": object()}, dispatch_tasks)
 
     before = asyncio.all_tasks()
     handler("raw-frame", {"k": 1})
     spawned = [t for t in asyncio.all_tasks() if t not in before and t is not asyncio.current_task()]
     assert len(spawned) == 1
     assert len(dispatch_tasks) == 1  # retained (not GC'd), trackable for shutdown
-
     await asyncio.gather(*spawned)
-    assert calls == [_handler_name(e) for e in _HANDLERS]
-    assert dispatch_tasks == set()  # done-callback discarded it
+    assert len(dispatched) == 1
+    assert dispatched[0][0] == {"k": 1}
+    assert dispatched[0][1] == "DB-SESSION"
+    assert dispatched[0][2] is not None  # the lifespan-owned coalescer rides along
+    assert dispatch_tasks == set()  # done-callback discards
 
 
 async def test_sse_handler_logs_and_does_not_leak_failed_dispatch(monkeypatch):
-    """A dispatch that raises must be surfaced via the done-callback and removed from the
-    tracking set — not silently swallowed by a fire-and-forget create_task (s3-12)."""
-    from unittest.mock import AsyncMock
+    async def boom_dispatch(cfg, parsed, db, clients, coalescer):
+        raise RuntimeError("dispatch boom")
+
+    monkeypatch.setattr("nso_adapter.main._dispatch_netconf_change", boom_dispatch)
 
     async def fake_session():
         yield "DB-SESSION"
 
     monkeypatch.setattr("nso_adapter.main.get_session", fake_session)
-    monkeypatch.setattr(
-        "nso_adapter.main._dispatch_netconf_change", AsyncMock(side_effect=RuntimeError("dispatch boom"))
-    )
     dispatch_tasks: set[asyncio.Task] = set()
     handler = _make_sse_event_handler(SimpleNamespace(scheduler=_scheduler()), {"i": object()}, dispatch_tasks)
 
     handler("raw-frame", {"k": 1})
-    assert len(dispatch_tasks) == 1
-    task = next(iter(dispatch_tasks))
-    await asyncio.gather(task, return_exceptions=True)  # must not raise out of the handler/task
-
-    assert dispatch_tasks == set()  # discarded despite the failure
-    assert isinstance(task.exception(), RuntimeError)  # captured, not lost
+    await asyncio.gather(*list(dispatch_tasks), return_exceptions=True)
+    for _ in range(3):
+        await asyncio.sleep(0)  # let the done-callback run
+    assert dispatch_tasks == set()  # failed task discarded, not leaked
 
 
 # --------------------------------------------------------------------------- #
@@ -424,39 +560,3 @@ async def test_init_database_skips_create_all_on_postgres(monkeypatch):
 # --------------------------------------------------------------------------- #
 # B3 — SSE emits notify_sync_complete per changed device (real overlay backstop)
 # --------------------------------------------------------------------------- #
-
-
-async def test_notify_changed_devices_notifies_plugin(adapter_client):
-    """B3: an SSE config-change for a NetBox-linked device fires exactly one notify_sync_complete
-    so the change reaches the plugin overlays — the SSE path was mirror-only (no notify) before."""
-    from unittest.mock import AsyncMock
-
-    from nso_adapter.core.importer import set_netbox_client
-    from nso_adapter.main import _notify_changed_devices
-    from nso_adapter.store.db import get_session
-    from tests.conftest import seed_device
-
-    await seed_device(nso_device_name="sse-dev", netbox_device_id=555)
-    nb = AsyncMock()
-    set_netbox_client(nb)
-    try:
-        event = {"netconf-config-change": {"edit": [{"target": "/ncs:devices/device[name='sse-dev']/config/x"}]}}
-        async for db in get_session():
-            await _notify_changed_devices(event, db)
-            break
-        nb.notify_sync_complete.assert_awaited_once_with(555)
-    finally:
-        set_netbox_client(None)
-
-
-async def test_notify_changed_devices_noop_without_netbox_client(adapter_client):
-    """No NetBox client registered → the notify path is a clean no-op (never raises)."""
-    from nso_adapter.core.importer import set_netbox_client
-    from nso_adapter.main import _notify_changed_devices
-    from nso_adapter.store.db import get_session
-
-    set_netbox_client(None)
-    event = {"netconf-config-change": {"edit": [{"target": "/ncs:devices/device[name='ghost']/config/x"}]}}
-    async for db in get_session():
-        await _notify_changed_devices(event, db)  # must not raise
-        break

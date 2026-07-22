@@ -44,16 +44,8 @@ from nso_adapter.api.svi import router as svi_router
 from nso_adapter.api.vlan import router as vlan_router
 from nso_adapter.config import get_config, get_env_settings
 from nso_adapter.core.importer import register_nso_client, set_netbox_client
-from nso_adapter.core.interface_ip import handle_interface_ip_change
-from nso_adapter.core.interface_mtu import handle_interface_mtu_change
-from nso_adapter.core.l2_service import handle_l2_service_change
-from nso_adapter.core.lag_topology import handle_netconf_config_change
 from nso_adapter.core.request_flags import DELETE_ORIGIN, STORE_ONLY, parse_store_only
 from nso_adapter.core.scheduler import start_scheduler, stop_scheduler
-from nso_adapter.core.snmp import handle_snmp_config_change
-from nso_adapter.core.subinterface import handle_subinterface_change
-from nso_adapter.core.svi import handle_svi_change
-from nso_adapter.core.vlan import handle_switchport_change, handle_vlan_database_change
 from nso_adapter.core.worker import start_workers, stop_workers
 from nso_adapter.notifications.persistent_subscriber import persistent_subscriber
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
@@ -126,68 +118,123 @@ def _build_netbox_client(app: FastAPI, cfg, provider):
     return netbox_client
 
 
-async def _dispatch_netconf_change(cfg, parsed: dict, db, clients: dict[str, NsoClient]) -> None:
-    """Fan a parsed NETCONF change out to every config handler, honouring the per-feature sync flags."""
-    await handle_netconf_config_change(parsed, db, clients)
-    await handle_l2_service_change(parsed, db, clients)
-    if cfg.scheduler.enable_interface_ip_sync:
-        await handle_interface_ip_change(parsed, db, clients)
-    if cfg.scheduler.enable_snmp_sync:
-        await handle_snmp_config_change(parsed, db, clients)
-    await handle_vlan_database_change(parsed, db, clients)
-    await handle_switchport_change(parsed, db, clients)
-    await handle_svi_change(parsed, db, clients)
-    await handle_subinterface_change(parsed, db, clients)
-    if cfg.scheduler.enable_interface_mtu_sync:
-        await handle_interface_mtu_change(parsed, db, clients)
-    # B3: the handlers above refreshed the adapter mirror, but the SSE path historically never
-    # notified the plugin — so a config change did not reach the NSO*State overlays until the next
-    # 15-min sync. Emit ONE notify_sync_complete per changed device so the change reconciles promptly,
-    # making SSE a real overlay backstop (not just a mirror-only refresh).
-    await _notify_changed_devices(parsed, db)
+class _DeviceRefreshCoalescer:
+    """Per-device coalescing latch for SSE-triggered comprehensive refreshes (S5a D).
+
+    One change event = ONE grain-b projected refresh (a record-served doc GET feeds all
+    18 surfaces) instead of the former nine per-family section refreshes. A trigger
+    landing mid-refresh sets a dirty edge consumed by exactly one rerun; both success
+    AND ordinary failure reach the dirty check (codex R2-F5), and cancellation never
+    consumes an edge. Real refresh tasks register in the lifespan's dispatch_tasks set
+    so shutdown cancellation reaches them (codex R1-F6). Single-event-loop discipline:
+    latch mutations only in synchronous sections.
+    """
+
+    def __init__(self, clients: dict[str, NsoClient], dispatch_tasks: set, on_done) -> None:
+        self._clients = clients
+        self._tasks = dispatch_tasks
+        self._on_done = on_done
+        self._state: dict[int, dict] = {}
+
+    def trigger(self, device_id: int, nso_instance: str, netbox_device_id: int | None) -> None:
+        st = self._state.setdefault(device_id, {"running": False, "dirty": False})
+        if st["running"]:
+            st["dirty"] = True
+            return
+        st["running"] = True
+        task = asyncio.create_task(self._run(device_id, nso_instance, netbox_device_id))
+        self._tasks.add(task)
+        task.add_done_callback(self._discard)
+
+    def _discard(self, task: asyncio.Task) -> None:
+        self._tasks.discard(task)
+        if callable(self._on_done):
+            self._on_done(task)
+
+    async def _run(self, device_id: int, nso_instance: str, netbox_device_id: int | None) -> None:
+        st = self._state[device_id]
+        try:
+            while True:
+                try:
+                    await self._refresh_once(device_id, nso_instance, netbox_device_id)
+                except asyncio.CancelledError:
+                    raise  # shutdown: no respawn, no dirty consumption
+                except Exception as exc:  # noqa: BLE001 — fallthrough: the dirty check still runs
+                    logger.warning("sse.coalesced_refresh_failed", device_id=device_id, error=repr(exc))
+                if st["dirty"]:  # synchronous check-and-transition — no awaits between
+                    st["dirty"] = False
+                    continue
+                break
+        finally:
+            st["running"] = False
+
+    async def _refresh_once(self, device_id: int, nso_instance: str, netbox_device_id: int | None) -> None:
+        from nso_adapter.core.importer import get_netbox_client, refresh_all_surfaces_for_device
+        from nso_adapter.store.models import Device
+
+        client = self._clients.get(nso_instance)
+        if client is None:
+            return
+        async for db in get_session():
+            device = await db.get(Device, device_id)  # RE-FETCH by id — never a foreign session's row
+            if device is None:
+                return
+            await refresh_all_surfaces_for_device(db, device, client, refresh_source="notification", atomic=False)
+            break
+        # Notify AFTER the refresh and BEFORE the dirty check (codex R1-F5 ordering): the
+        # plugin reconciles the refreshed mirror; failures are swallowed (best-effort).
+        nb_client = get_netbox_client()
+        if nb_client is not None and netbox_device_id:
+            try:
+                await nb_client.notify_sync_complete(netbox_device_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "sse.notify_failed", netbox_device_id=netbox_device_id, error=str(exc) or type(exc).__name__
+                )
 
 
-async def _notify_changed_devices(parsed: dict, db) -> None:
-    """Emit one deduped notify_sync_complete per NetBox-linked device named in the change (B3).
+async def _dispatch_netconf_change(
+    cfg, parsed: dict, db, clients: dict[str, NsoClient], coalescer: _DeviceRefreshCoalescer
+) -> None:
+    """S5a D: per changed device, ONE coalesced comprehensive refresh (grain b).
 
-    Best-effort: a notify failure is logged and swallowed — the mirror is already refreshed, and
-    the periodic sync/reconcile still reconciles the overlays later.
+    Replaces the former nine per-family handler calls — cfg enable flags apply inside
+    the surface builders. Device resolution is scoped to THIS handler's instance map
+    (codex R1-F8: nso_device_name is not globally unique across NSO instances).
     """
     from sqlalchemy import select
 
-    from nso_adapter.core.importer import get_netbox_client
     from nso_adapter.core.lag_topology import parse_changed_nso_devices
     from nso_adapter.store.models import Device
 
-    nb_client = get_netbox_client()
-    if nb_client is None:
-        return
     changed = parse_changed_nso_devices(parsed)
     if not changed:
         return
     devices = (
         (
             await db.execute(
-                select(Device).where(Device.nso_device_name.in_(changed), Device.netbox_device_id.is_not(None))
+                select(Device).where(Device.nso_device_name.in_(changed), Device.nso_instance.in_(list(clients.keys())))
             )
         )
         .scalars()
         .all()
     )
-    # dedup by NetBox id so one event → at most one reconcile-notify per device
-    for netbox_id in {d.netbox_device_id for d in devices}:
-        try:
-            await nb_client.notify_sync_complete(netbox_id)
-        except Exception as exc:
-            logger.warning("sse.notify_failed", netbox_device_id=netbox_id, error=str(exc) or type(exc).__name__)
+    for device in devices:
+        coalescer.trigger(device.id, device.nso_instance, device.netbox_device_id)
 
 
-def _make_sse_event_handler(cfg, clients: dict[str, NsoClient], dispatch_tasks: set[asyncio.Task]):
+def _make_sse_event_handler(
+    cfg,
+    clients: dict[str, NsoClient],
+    dispatch_tasks: set[asyncio.Task],
+    coalescer: _DeviceRefreshCoalescer | None = None,
+):
     """Build the SSE on-event callback: ignore unparseable frames, else dispatch on its own task/session.
 
     Each dispatch task is retained in *dispatch_tasks* (a bare create_task can be garbage-
     collected mid-flight and its exception swallowed) with a done-callback that logs failures
-    and discards it; the set is cancelled at shutdown so a device change can't be lost silently.
+    and discards it; the set is cancelled at shutdown — and the coalescer registers its
+    REAL refresh tasks in the same set, so shutdown reaches them too (S5a D, codex R1-F6).
     """
 
     def _on_done(task: asyncio.Task) -> None:
@@ -195,13 +242,16 @@ def _make_sse_event_handler(cfg, clients: dict[str, NsoClient], dispatch_tasks: 
         if not task.cancelled() and task.exception() is not None:
             logger.warning("sse.dispatch_failed", error=repr(task.exception()))
 
+    if coalescer is None:
+        coalescer = _DeviceRefreshCoalescer(clients, dispatch_tasks, _on_done)
+
     def on_event(raw: str, parsed: dict | None) -> None:
         if parsed is None:
             return
 
         async def _run() -> None:
             async for db in get_session():
-                await _dispatch_netconf_change(cfg, parsed, db, clients)
+                await _dispatch_netconf_change(cfg, parsed, db, clients, coalescer)
 
         task = asyncio.create_task(_run())
         dispatch_tasks.add(task)

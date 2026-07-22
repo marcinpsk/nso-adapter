@@ -12,10 +12,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import structlog
-from sqlalchemy import delete, select
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.lag_topology import parse_changed_nso_devices
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.read_outcome import EmptyPolicy
@@ -92,28 +91,3 @@ async def refresh_interface_ips_for_device(
     False when the NSO read failed and the last-known rows were left untouched (degraded).
     """
     return await run_family_refresh(db, device, nso_client, INTERFACE_IP_SPEC, refresh_source=refresh_source)
-
-
-async def handle_interface_ip_change(
-    event_data: dict,
-    db: AsyncSession,
-    nso_clients: dict[str, NsoClient],
-) -> None:
-    """Process a NETCONF config-change event and refresh interface IP addresses."""
-    changed = parse_changed_nso_devices(event_data)
-    if not changed:
-        return
-
-    result = await db.execute(select(Device).where(Device.nso_device_name.in_(changed)))
-    devices = result.scalars().all()
-
-    for device in devices:
-        nso_client = nso_clients.get(device.nso_instance)
-        if nso_client is None:
-            logger.debug(
-                "interface_ip.event.no_client",
-                device_id=device.id,
-                instance=device.nso_instance,
-            )
-            continue
-        await refresh_interface_ips_for_device(db, device, nso_client, refresh_source="notification")

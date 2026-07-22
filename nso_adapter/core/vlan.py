@@ -16,7 +16,6 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from nso_adapter.core.lag_topology import parse_changed_nso_devices
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.read_outcome import EmptyPolicy
@@ -209,25 +208,3 @@ async def refresh_switchport_for_device(
     failed and the last-known rows were left untouched (a degraded surface).
     """
     return await run_family_refresh(db, device, nso_client, SWITCHPORT_SPEC, refresh_source=refresh_source)
-
-
-async def _handle_change(event_data, db, nso_clients, refresh_fn) -> None:
-    changed = parse_changed_nso_devices(event_data)
-    if not changed:
-        return
-    devices = (await db.execute(select(Device).where(Device.nso_device_name.in_(changed)))).scalars().all()
-    for device in devices:
-        nso_client = nso_clients.get(device.nso_instance)
-        if nso_client is None:
-            continue
-        await refresh_fn(db, device, nso_client, refresh_source="notification")
-
-
-async def handle_vlan_database_change(event_data, db, nso_clients) -> None:
-    """SSE: refresh the VLAN database for devices in a netconf-config-change event."""
-    await _handle_change(event_data, db, nso_clients, refresh_vlan_database_for_device)
-
-
-async def handle_switchport_change(event_data, db, nso_clients) -> None:
-    """SSE: refresh switchport state for devices in a netconf-config-change event."""
-    await _handle_change(event_data, db, nso_clients, refresh_switchport_for_device)

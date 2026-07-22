@@ -12,10 +12,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import structlog
-from sqlalchemy import delete, select
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.lag_topology import parse_changed_nso_devices
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.read_outcome import EmptyPolicy
@@ -81,20 +80,3 @@ async def refresh_interface_mtu_for_device(
     failed and the last-known rows were left untouched (a degraded surface).
     """
     return await run_family_refresh(db, device, nso_client, INTERFACE_MTU_SPEC, refresh_source=refresh_source)
-
-
-async def handle_interface_mtu_change(
-    event_data: dict,
-    db: AsyncSession,
-    nso_clients: dict[str, NsoClient],
-) -> None:
-    """Process a NETCONF config-change event and refresh interface-mtu rows."""
-    changed = parse_changed_nso_devices(event_data)
-    if not changed:
-        return
-    result = await db.execute(select(Device).where(Device.nso_device_name.in_(changed)))
-    for device in result.scalars().all():
-        nso_client = nso_clients.get(device.nso_instance)
-        if nso_client is None:
-            continue
-        await refresh_interface_mtu_for_device(db, device, nso_client, refresh_source="notification")

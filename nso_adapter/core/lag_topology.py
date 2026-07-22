@@ -116,24 +116,3 @@ async def refresh_lag_topology_for_device(
     failed and the last-known rows were left untouched (a degraded surface).
     """
     return await run_family_refresh(db, device, nso_client, LAG_TOPOLOGY_SPEC, refresh_source=refresh_source)
-
-
-async def handle_netconf_config_change(
-    event_data: dict,
-    db: AsyncSession,
-    nso_clients: dict[str, NsoClient],
-) -> None:
-    """Process a NETCONF config-change event and refresh LAG topology."""
-    changed = parse_changed_nso_devices(event_data)
-    if not changed:
-        return
-
-    result = await db.execute(select(Device).where(Device.nso_device_name.in_(changed)))
-    devices = result.scalars().all()
-
-    for device in devices:
-        nso_client = nso_clients.get(device.nso_instance)
-        if nso_client is None:
-            logger.debug("lag.event.no_client", device_id=device.id, instance=device.nso_instance)
-            continue
-        await refresh_lag_topology_for_device(db, device, nso_client, refresh_source="notification")

@@ -13,7 +13,6 @@ from sqlalchemy import select
 
 from nso_adapter.core.interface_ip import (
     INTERFACE_IP_SPEC,
-    handle_interface_ip_change,
     refresh_interface_ips_for_device,
 )
 from nso_adapter.store.db import get_session
@@ -238,61 +237,6 @@ async def test_refresh_transport_error_leaves_existing_rows(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_handle_interface_ip_change_dispatches(adapter_client):
-    """SSE handler dispatches to refresh for matching device."""
-    device_id = await seed_device(nso_device_name="ip-sw05", netbox_device_id=914)
-    async with _device_session(device_id) as (db, _device):
-        nso_client = AsyncMock()
-        nso_client.get_device_state_section.return_value = {"status": "ok", "name": "ip-sw05", "interface": []}
-        event = {
-            "netconf-config-change": {
-                "edit": [{"target": "/ncs:devices/device[name='ip-sw05']/config/ios:interface/GigabitEthernet0/1"}]
-            }
-        }
-
-        await handle_interface_ip_change(event, db, {"nso-dev": nso_client})
-
-        nso_client.get_device_state_section.assert_awaited_once_with("ip-sw05", "interface-ip")
-
-
-@pytest.mark.anyio
-async def test_handle_interface_ip_change_unknown_device_no_dispatch(adapter_client):
-    """SSE handler silently skips events for unrecognised device names."""
-    async for db in get_session():
-        nso_client = AsyncMock()
-        event = {"netconf-config-change": {"edit": [{"target": "/ncs:devices/device[name='ghost-device']/config/..."}]}}
-
-        await handle_interface_ip_change(event, db, {"nso-dev": nso_client})
-
-        nso_client.get_device_state_section.assert_not_awaited()
-        break
-
-
-@pytest.mark.anyio
-async def test_handle_interface_ip_change_no_changed_devices_is_noop(adapter_client):
-    """An event carrying no device edits parses to nothing → early return, no NSO call."""
-    async for db in get_session():
-        nso_client = AsyncMock()
-        await handle_interface_ip_change({}, db, {"nso-dev": nso_client})
-        nso_client.get_device_state_section.assert_not_awaited()
-        break
-
-
-@pytest.mark.anyio
-async def test_handle_interface_ip_change_no_client_for_instance_skips(adapter_client):
-    """A matched device whose NSO instance has no client → skipped, not an error."""
-    await seed_device(nso_device_name="ip-noclient", netbox_device_id=915)
-    async for db in get_session():
-        event = {
-            "netconf-config-change": {
-                "edit": [{"target": "/ncs:devices/device[name='ip-noclient']/config/ios:interface/GE0/1"}]
-            }
-        }
-        # nso_clients dict lacks the device's instance ("nso-dev") → nso_clients.get(...) is None.
-        await handle_interface_ip_change(event, db, {"other-instance": AsyncMock()})
-        break  # no exception = the no_client branch was taken
-
-
 @pytest.mark.anyio
 async def test_refresh_skips_addressless_entry(adapter_client):
     """An interface whose address entry carries no `address` value is skipped, not inserted."""

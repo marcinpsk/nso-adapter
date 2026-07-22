@@ -11,7 +11,6 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.core.lag_topology import (
-    handle_netconf_config_change,
     parse_changed_nso_devices,
     refresh_lag_topology_for_device,
 )
@@ -129,37 +128,6 @@ async def test_refresh_lag_topology_transport_error(adapter_client):
 
         result = await db.execute(select(LagInterface).where(LagInterface.device_id == device.id))
         assert result.scalars().all() == []
-
-
-@pytest.mark.anyio
-async def test_handle_netconf_config_change_dispatches(adapter_client):
-    device_id = await seed_device(nso_device_name="sw03", netbox_device_id=903)
-    async with _device_session(device_id) as (db, _device):
-        nso_client = AsyncMock()
-        nso_client.get_device_state_section.return_value = {"status": "ok", "device-name": "sw03", "lag": []}
-        event = {
-            "netconf-config-change": {
-                "edit": [{"target": "/ncs:devices/device[name='sw03']/config/ios:interface/GigabitEthernet1"}]
-            }
-        }
-
-        await handle_netconf_config_change(event, db, {"nso-dev": nso_client})
-
-        nso_client.get_device_state_section.assert_awaited_once_with("sw03", "lag-topology")
-
-
-@pytest.mark.anyio
-async def test_handle_netconf_config_change_unknown_device(adapter_client):
-    async for db in get_session():
-        nso_client = AsyncMock()
-        event = {
-            "netconf-config-change": {"edit": [{"target": "/ncs:devices/device[name='unknown-device']/config/..."}]}
-        }
-
-        await handle_netconf_config_change(event, db, {"nso-dev": nso_client})
-
-        nso_client.get_device_state_section.assert_not_awaited()
-        break
 
 
 @pytest.mark.anyio
