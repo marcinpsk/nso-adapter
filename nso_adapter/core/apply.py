@@ -14,6 +14,7 @@ Concurrency: relies on the existing one-job-per-device rule in core/jobs.py.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import NamedTuple
@@ -1042,26 +1043,74 @@ def _stamp_ip_atomic(ip_rows_flat, commit_error, iface_failed, err, msg, now) ->
 
 async def _atomic_reader_compare(
     client, device, scope_rows, scope_outcomes, scope_failures, *, job_id, device_name
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, list[str]]]:
     """#108 presence check per staged scope after a clean atomic commit.
 
-    Mutates scope_outcomes/scope_failures for scopes with silently-dropped keys and
-    returns the per-scope reader_compare status map for job.result.
+    Every scope committed in ONE transaction → ONE post-commit point → ONE batched
+    device-state action for all checkable wire_names (r1-m3: no per-scope enlargement on
+    the atomic path). Prepares each eligible scope (expected + Vault translation), fetches
+    the sections whose translated set is non-empty in a single action, then classifies each
+    scope independently. A batched-action raise → every checkable scope records ``error``
+    (non-fatal). Mutates scope_outcomes/scope_failures for scopes with silently-dropped keys
+    and returns ``(reader_compare, reader_compare_unverifiable)`` for job.result.
     """
-    reader_compare: dict[str, str] = {}
+    from nso_adapter.core.removal import _VERIFY_BATCH_TIMEOUT, _live_family_sections
+
+    ned_id = getattr(device, "ned_id", None)
+    preps: dict[str, object] = {}  # scope → prep tuple | None (uncheckable) | "error" (translate raised)
     for key, rows in scope_rows.items():
         s_ok, s_failed = scope_outcomes.get(key, (0, 0))
         if not rows or s_failed:
             continue
-        n_ok, n_failed, fails, rc_status = await _reader_compare_scope(
-            client, device, key, rows, ok=s_ok, job_id=job_id, device_name=device_name
-        )
-        if rc_status is not None:
-            reader_compare[key] = rc_status
+        try:
+            preps[key] = await _reader_compare_prepare(key, rows, ned_id)
+        except Exception as exc:  # noqa: BLE001 — a scope's translation must never fail the apply
+            logger.warning("apply.reader_compare_error", job_id=job_id, device=device_name, scope=key, error=repr(exc))
+            preps[key] = "error"
+
+    wires = sorted({prep[3] for prep in preps.values() if isinstance(prep, tuple) and prep[0]})
+    sections: dict[str, dict] = {}
+    action_error: Exception | None = None
+    if wires:
+        try:
+            sections = await _live_family_sections(client, device.nso_device_name, wires, timeout=_VERIFY_BATCH_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 — a batched read failure fails no scope's apply
+            action_error = exc
+            logger.warning("apply.reader_compare_error", job_id=job_id, device=device_name, error=repr(exc))
+
+    reader_compare: dict[str, str] = {}
+    reader_compare_unverifiable: dict[str, list[str]] = {}
+    for key, prep in preps.items():
+        s_ok, _s_failed = scope_outcomes.get(key, (0, 0))
+        if prep is None:
+            continue  # structurally uncheckable → no entry
+        if prep == "error":
+            reader_compare[key] = "error"
+            continue
+        translated, unverifiable, spec, wire = prep
+        if not translated:  # every key Vault-unverifiable → nothing to look for
+            n_ok, n_failed, fails, status = s_ok, 0, [], "unknown"
+        elif action_error is not None:
+            n_ok, n_failed, fails, status = s_ok, 0, [], "error"
+        else:
+            try:
+                # guarded (codex P2): a malformed 'ok' section must not let the walker's exception
+                # escape and fail the whole atomic job — classify "error" for just this scope.
+                n_ok, n_failed, fails, status = _classify_fetched_section(
+                    key, translated, unverifiable, spec, sections[wire], s_ok, job_id=job_id, device_name=device_name
+                )
+            except Exception as exc:  # noqa: BLE001 — a read-side glitch never fails a good commit
+                logger.warning(
+                    "apply.reader_compare_error", job_id=job_id, device=device_name, scope=key, error=repr(exc)
+                )
+                n_ok, n_failed, fails, status = s_ok, 0, [], "error"
+        reader_compare[key] = status
+        if unverifiable:
+            reader_compare_unverifiable[key] = unverifiable
         if n_failed:
             scope_outcomes[key] = (n_ok, n_failed)
             scope_failures.setdefault(key, []).extend(fails)
-    return reader_compare
+    return reader_compare, reader_compare_unverifiable
 
 
 def _stamp_batch_scopes_atomic(scope_rows, offenders, commit_error, err, msg, now) -> tuple[dict, dict]:
@@ -1183,8 +1232,9 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
     # presence check per staged scope and re-flag any silently-dropped keys. Unstaged
     # scopes are excluded: they were never pushed, so "not on the device" is not a drop.
     reader_compare: dict[str, str] = {}
+    reader_compare_unverifiable: dict[str, list[str]] = {}
     if commit_error is None:
-        reader_compare = await _atomic_reader_compare(
+        reader_compare, reader_compare_unverifiable = await _atomic_reader_compare(
             client, device, staged_rows, scope_outcomes, scope_failures, job_id=job_id, device_name=device_name
         )
 
@@ -1199,6 +1249,7 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
         scope_outcomes,
         scope_failures,
         reader_compare=reader_compare,
+        reader_compare_unverifiable=reader_compare_unverifiable,
     )
 
 
@@ -1334,68 +1385,67 @@ async def _translate_expected(scope: str, expected: list[tuple[object, str, tupl
     return out, sorted(unverifiable)
 
 
-async def _reader_compare_scope(client, device, scope, rows, *, ok, job_id, device_name):
-    """Post-apply presence check (#108, the #26 silent-drop class) → (ok, failed, fails, status).
+def _reader_compare_checkable(scope, rows, ned_id) -> bool:
+    """Whether *scope* has any keyed grain the post-apply presence check could verify.
 
-    ``_verify_native_or_raise`` re-diffs the committed payload against the CDB SERVICE
-    tree — both sides sit behind the same FASTMAP writer, so a writer that silently
-    drops an object is invisible (proven live on rg03, #26). This check reads the far
-    side of the writer instead: the scope's network-state-export DEVICE-tree view
-    (a data-provider computed from current CDB at GET time, so it reflects the commit
-    just made). Every intended key must be present; a missing key stamps its rows
-    ``reader_compare_missing`` (retryable — last_apply_error keeps them eligible) and
-    fails the scope, so the plugin settles deploying→apply_failed on the immediate
-    post-apply reconcile instead of waiting out stuck_deploying_grace_minutes.
-    Status: "ok" / "missing" / "unknown" (the reader has no view of this scope on this
-    device — absence proves nothing) / "error" (never fails a good apply on reader
-    trouble) / None (nothing checkable — e.g. only nested non-keyed rows in the batch).
-    NOT covered: NED/device-side divergence (CDB is the near edge of the device —
-    that needs check-sync) and redistribution rows (nested non-keyed, guard parity).
+    A cheap, Vault-free predicate (used to decide whether a budget-SKIPPED scope records
+    ``unknown`` vs stays absent): a scope with no expected keyed grain — only nested
+    non-keyed rows (redistribution / flex-algo / level) — is structurally uncheckable and
+    keeps NO reader_compare entry, exactly as before (r3-M3).
     """
-    from nso_adapter.core.removal import _RESIDUE_READERS, _guard_specs, _norm_key, _reader_keys
+    from nso_adapter.core.removal import _RESIDUE_WIRE_NAMES, _guard_specs
 
-    try:
-        expected = _reader_compare_expected(scope, rows, getattr(device, "ned_id", None))
-        reader = _RESIDUE_READERS.get(scope)
-        spec = _guard_specs().get(scope)
-        if not expected or reader is None or spec is None:
-            return ok, 0, [], None
-        expected, unverifiable = await _translate_expected(scope, expected)
-        if unverifiable:
-            # Named, never folded into "ok" silently: these keys were not checked at all.
-            logger.warning(
-                "apply.reader_compare_unverifiable",
-                job_id=job_id,
-                device=device_name,
-                scope=scope,
-                keys=unverifiable,
-            )
-        if not expected:
-            return ok, 0, [], "unknown"
-        entry = await getattr(client, reader)(device.nso_device_name)
-        if not entry:
-            # The reader answered with NOTHING. Every reader returns None by design when the
-            # device has no such config or the NED has no export surface for the scope
-            # (get_isis_interfaces: "Returns None if the device has no IS-IS config"). That
-            # is UNKNOWN, not "the writer silently dropped every key" — coercing it to {}
-            # classified every intended key as missing and pinned the scope permanently
-            # apply_failed on a device where NSO had committed the intent. An empty LIST
-            # inside a real payload ({"route": []}) is a different thing and still a drop.
-            logger.info("apply.reader_compare_unknown", job_id=job_id, device=device_name, scope=scope, reader=reader)
-            return ok, 0, [], "unknown"
-        present = {gl.label: _reader_keys(scope, entry, gl) for gl in spec.lists}
-        row_by_id: dict[int, object] = {}
-        missing: dict[int, list[str]] = {}
-        for row, label, key in expected:
-            if _norm_key(key) in present.get(label, set()):
-                continue
-            row_by_id[id(row)] = row
-            missing.setdefault(id(row), []).append(f"{label} {list(key)}")
-    except Exception as exc:  # noqa: BLE001 — the check must never fail a good apply
-        logger.warning("apply.reader_compare_error", job_id=job_id, device=device_name, scope=scope, error=repr(exc))
-        return ok, 0, [], "error"
+    return bool(
+        _reader_compare_expected(scope, rows, ned_id)
+        and scope in _RESIDUE_WIRE_NAMES
+        and _guard_specs().get(scope) is not None
+    )
+
+
+async def _reader_compare_prepare(scope, rows, ned_id):
+    """Compute the translatable expected set for *scope* → ``(translated, unverifiable, spec, wire)``.
+
+    Returns ``None`` when the scope is structurally uncheckable (no expected keyed grain / no
+    envelope wire / no guard spec) — the caller records no reader_compare entry. Otherwise
+    ``translated`` is the export-namespace expected set (may be empty when EVERY key is
+    Vault-unverifiable → the caller records ``unknown`` and runs NO action, r2-m3), and
+    ``unverifiable`` names the keys that could not be re-keyed (persisted symmetrically with
+    the residue path's ``residue_unverifiable``). Runs the Vault translation (may block).
+    """
+    from nso_adapter.core.removal import _RESIDUE_WIRE_NAMES, _guard_specs
+
+    expected = _reader_compare_expected(scope, rows, ned_id)
+    spec = _guard_specs().get(scope)
+    wire = _RESIDUE_WIRE_NAMES.get(scope)
+    if not expected or spec is None or wire is None:
+        return None
+    translated, unverifiable = await _translate_expected(scope, expected)
+    if unverifiable:
+        # Named, never folded into "ok" silently: these keys were not checked at all.
+        logger.warning("apply.reader_compare_unverifiable", scope=scope, keys=unverifiable)
+    return translated, unverifiable, spec, wire
+
+
+def _reader_compare_walk(scope, translated, unverifiable, section, spec, ok, *, job_id, device_name):
+    """Walk an ``ok`` device-state *section* for the presence of every translated key.
+
+    Present-all → ``ok``, unless some grain was ``unverifiable`` (never checked) → ``partial``
+    (the r3-M2 fix for the mixed community+host false-green — ``partial`` beats ``ok`` but
+    ``missing`` still beats ``partial``). A missing key stamps its rows ``reader_compare_missing``
+    and fails the scope. Returns ``(ok, failed, fails, status)``.
+    """
+    from nso_adapter.core.removal import _norm_key, _reader_keys
+
+    present = {gl.label: _reader_keys(scope, section, gl) for gl in spec.lists}
+    row_by_id: dict[int, object] = {}
+    missing: dict[int, list[str]] = {}
+    for row, label, key in translated:
+        if _norm_key(key) in present.get(label, set()):
+            continue
+        row_by_id[id(row)] = row
+        missing.setdefault(id(row), []).append(f"{label} {list(key)}")
     if not missing:
-        return ok, 0, [], "ok"
+        return ok, 0, [], ("partial" if unverifiable else "ok")
     fails = []
     for rid, keys in missing.items():
         msg = (
@@ -1410,6 +1460,112 @@ async def _reader_compare_scope(client, device, scope, rows, *, ok, job_id, devi
         fails.append({"error": msg})
     logger.error("apply.reader_compare_missing", job_id=job_id, device=device_name, scope=scope, missing=len(missing))
     return ok - len(missing), len(missing), fails, "missing"
+
+
+def _classify_fetched_section(scope, translated, unverifiable, spec, section, ok, *, job_id, device_name):
+    """Classify a CERTIFIED device-state *section* (status ok|unsupported|error) → (ok, failed, fails, status).
+
+    ``error`` (the family read errored) → ``error``; ``unsupported`` (no export surface — absence
+    proves nothing) → ``unknown``; ``ok`` → walk. Shared by the default per-scope path and the
+    batched atomic path; the section is already status-terminal thanks to client certification.
+    """
+    from nso_adapter.core.removal import _verifier_section_status
+
+    status = _verifier_section_status(section)
+    if status == "error":
+        logger.warning(
+            "apply.reader_compare_error", job_id=job_id, device=device_name, scope=scope, error="section status=error"
+        )
+        return ok, 0, [], "error"
+    if status == "unknown":  # the NED does not export this family
+        logger.info("apply.reader_compare_unknown", job_id=job_id, device=device_name, scope=scope)
+        return ok, 0, [], "unknown"
+    return _reader_compare_walk(
+        scope, translated, unverifiable, section, spec, ok, job_id=job_id, device_name=device_name
+    )
+
+
+async def _reader_compare_scope(client, device, scope, rows, *, ok, job_id, device_name, timeout):
+    """Post-apply presence check (#108, the #26 silent-drop class) → (ok, failed, fails, status, unverifiable).
+
+    ``_verify_native_or_raise`` re-diffs the committed payload against the CDB SERVICE
+    tree — both sides sit behind the same FASTMAP writer, so a writer that silently
+    drops an object is invisible (proven live on rg03, #26). This check reads the far
+    side of the writer instead: the scope's device-state ``ACTION`` section — a fresh
+    post-commit CDB extraction inside a whole-build txid bracket, read as soon as
+    possible after the commit (the record-served facade is stale post-commit; the legacy
+    subscriber-cache-backed getters can lag it). Every intended key must be present; a
+    missing key stamps its rows ``reader_compare_missing`` (retryable — last_apply_error
+    keeps them eligible) and fails the scope, so the plugin settles deploying→apply_failed
+    on the immediate post-apply reconcile instead of waiting out stuck_deploying_grace_minutes.
+    Status: "ok" / "partial" (checked keys present, some grain unverifiable) / "missing" /
+    "unknown" (the NED has no export surface, or every key is Vault-unverifiable — absence
+    proves nothing) / "error" (never fails a good apply on read trouble) / None (nothing
+    checkable — e.g. only nested non-keyed rows in the batch). ``unverifiable`` names the keys
+    that could not be re-keyed (recorded whenever non-empty, symmetric with residue).
+    The ONE-family action runs inside the caller's wall-clock budget (*timeout*); an all-
+    unverifiable scope returns "unknown" WITHOUT running it. NOT covered: NED/device-side
+    divergence (needs check-sync) and redistribution rows (nested non-keyed, guard parity).
+    """
+    from nso_adapter.core.removal import _live_family_sections
+
+    unverifiable: list[str] = []  # hoisted so the except still reports it (codex P3)
+    try:
+        prep = await _reader_compare_prepare(scope, rows, getattr(device, "ned_id", None))
+        if prep is None:
+            return ok, 0, [], None, []
+        translated, unverifiable, spec, wire = prep
+        if not translated:  # every key Vault-unverifiable → nothing to look for, run NO action
+            return ok, 0, [], "unknown", unverifiable
+        section = (await _live_family_sections(client, device.nso_device_name, [wire], timeout=timeout))[wire]
+        # The walk stays INSIDE the try (codex P2): a malformed 'ok' section (a non-dict where a
+        # keyed entry belongs) makes _reader_keys raise — that must classify "error", never escape
+        # and turn a successful commit into an internal job failure.
+        n_ok, n_failed, fails, status = _classify_fetched_section(
+            scope, translated, unverifiable, spec, section, ok, job_id=job_id, device_name=device_name
+        )
+        return n_ok, n_failed, fails, status, unverifiable
+    except Exception as exc:  # noqa: BLE001 — the check must never fail a good apply
+        logger.warning("apply.reader_compare_error", job_id=job_id, device=device_name, scope=scope, error=repr(exc))
+        return ok, 0, [], "error", unverifiable
+
+
+async def _reader_compare_default_path(client, device, sc, scope_ok, *, remaining, ned_id, job_id, device_name):
+    """Default-path per-scope verify under the HARD verify-time budget → (ok, failed, fails, status, unverifiable).
+
+    ``remaining`` is the VERIFY budget still unspent (``_VERIFY_TOTAL_BUDGET`` minus the time already
+    spent verifying earlier scopes — device COMMIT latency deliberately does NOT count, codex P1, so
+    a slow early commit cannot starve later scopes of silent-drop detection). Budget spent → the scope
+    is SKIPPED without running the action: a checkable scope records ``unknown`` (never silently
+    absent), a structurally-uncheckable one keeps no entry. Otherwise the whole per-scope verify —
+    translation + semaphore acquire + HTTP — runs inside a single ``asyncio.wait_for`` clipped to the
+    remaining budget (so semaphore contention cannot push total default-path verify time past the
+    budget), with the action's own timeout clipped to ``min(_VERIFY_PER_CALL_TIMEOUT, remaining)``. A
+    cut verify → ``unknown``.
+    """
+    from nso_adapter.core.removal import _VERIFY_PER_CALL_TIMEOUT
+
+    if remaining <= 0:
+        status = "unknown" if _reader_compare_checkable(sc.key, sc.rows, ned_id) else None
+        return scope_ok, 0, [], status, []
+    try:
+        return await asyncio.wait_for(
+            _reader_compare_scope(
+                client,
+                device,
+                sc.key,
+                sc.rows,
+                ok=scope_ok,
+                job_id=job_id,
+                device_name=device_name,
+                timeout=min(_VERIFY_PER_CALL_TIMEOUT, remaining),
+            ),
+            timeout=remaining,
+        )
+    except TimeoutError:  # asyncio.TimeoutError is TimeoutError on 3.11+
+        # The whole per-scope verify (translate + semaphore + HTTP) blew the budget; only a
+        # checkable scope ever reaches the action, so a cut verify is always "unknown".
+        return scope_ok, 0, [], "unknown", []
 
 
 async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_error=None) -> tuple[int, int, list]:
@@ -1453,13 +1609,15 @@ async def _finalize_job(
     scope_outcomes: dict,
     scope_failures: dict,
     reader_compare: dict | None = None,
+    reader_compare_unverifiable: dict | None = None,
 ) -> None:
     """Assemble job.result/status from the pass outcomes and commit.
 
     With nothing eligible the job succeeds with an all-zero result and returns early.
     Otherwise the per-scope counts are emitted (plus the per-scope post-apply
-    reader_compare statuses, #108); any failure flips the job to failed and collects
-    the per-item errors.
+    reader_compare statuses, #108, and any reader_compare_unverifiable labels — the keys a
+    scope's presence check could not verify, mirroring the residue path); any failure flips
+    the job to failed and collects the per-item errors.
     """
     if not any_eligible:
         logger.info("apply.nothing_eligible", job_id=job_id, device_id=device_id)
@@ -1494,6 +1652,8 @@ async def _finalize_job(
         result[f"{key}_count_by_outcome"] = {"in_sync": scope_ok, "apply_failed": scope_failed}
     if reader_compare:
         result["reader_compare"] = reader_compare
+    if reader_compare_unverifiable:
+        result["reader_compare_unverifiable"] = reader_compare_unverifiable
     job.result = result
 
     total_failed = attr_failed + ip_failed + sum(failed for _ok, failed in scope_outcomes.values())
@@ -1836,9 +1996,24 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         ),
     ]
 
+    # #108/1328: each scope commits then verifies immediately (default path, atomic-apply OFF)
+    # — the per-scope action reads the far side of the FASTMAP writer as soon as possible after
+    # ITS OWN commit (preserving the legacy immediate-per-scope timing, r2-M2). The action is
+    # HEAVY (a live CDB build, not the cache-backed legacy GET), so a HARD budget bounds the total
+    # default-path VERIFY time: once spent, remaining scopes skip to "unknown" rather than
+    # serialising 60s each behind the shared 4-slot action semaphore (r3-M3/r4-M1). Only verify
+    # time is charged — device COMMIT latency is excluded (codex P1), so a slow early commit can
+    # never starve later scopes of silent-drop detection.
+    from nso_adapter.core.removal import _VERIFY_TOTAL_BUDGET
+
+    loop = asyncio.get_running_loop()
+    verify_spent = 0.0
+    device_ned_id = getattr(device, "ned_id", None)
+
     scope_outcomes: dict[str, tuple[int, int]] = {}
     scope_failures: dict[str, list] = {}
     reader_compare: dict[str, str] = {}
+    reader_compare_unverifiable: dict[str, list[str]] = {}
     for sc in scopes:
         if not sc.rows:
             scope_outcomes[sc.key] = (0, 0)
@@ -1854,12 +2029,23 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         )
         if scope_failed == 0:
             # #108: the commit reported success — require every intended key to be
-            # present in the scope's device-tree view (the #26 silent-drop class).
-            scope_ok, scope_failed, fails, rc_status = await _reader_compare_scope(
-                client, device, sc.key, sc.rows, ok=scope_ok, job_id=job_id, device_name=device_name
+            # present in the scope's device-state section (the #26 silent-drop class).
+            verify_started = loop.time()
+            scope_ok, scope_failed, fails, rc_status, rc_unver = await _reader_compare_default_path(
+                client,
+                device,
+                sc,
+                scope_ok,
+                remaining=_VERIFY_TOTAL_BUDGET - verify_spent,
+                ned_id=device_ned_id,
+                job_id=job_id,
+                device_name=device_name,
             )
+            verify_spent += loop.time() - verify_started  # charge only verify time, not the commit
             if rc_status is not None:
                 reader_compare[sc.key] = rc_status
+            if rc_unver:
+                reader_compare_unverifiable[sc.key] = rc_unver
         scope_outcomes[sc.key] = (scope_ok, scope_failed)
         if fails:
             scope_failures[sc.key] = fails
@@ -1876,6 +2062,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         scope_outcomes,
         scope_failures,
         reader_compare=reader_compare,
+        reader_compare_unverifiable=reader_compare_unverifiable,
     )
 
 

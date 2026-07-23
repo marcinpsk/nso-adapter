@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -2578,10 +2579,27 @@ async def test_run_apply_atomic_failure_marks_both_subif_and_ip(adapter_client, 
 # both sides sit behind the same FASTMAP writer, so a writer that silently drops an
 # object stays invisible (#26, proven live on rg03). The reader-compare closes that
 # hole from the other side: after a scope's batch commit reports success, re-read the
-# scope's network-state-export DEVICE-tree view and require every intended key to be
-# present. A missing key marks those rows apply_failed (retryable) and fails the JOB,
+# scope's device-state ACTION section (READSEM 1328) and require every intended key to
+# be present. A missing key marks those rows apply_failed (retryable) and fails the JOB,
 # so the plugin settles deploying→apply_failed on the immediate post-apply reconcile
 # instead of waiting out stuck_deploying_grace_minutes.
+
+# reader-compare reads the device-state-read ACTION now — a test seeds the post-commit
+# device view as the action's certified output: {atomic, device-name, <wire>: <section>}.
+# A method-level mock bypasses NsoClient certification (exercised end-to-end in
+# tests/nso/test_device_state_client.py); the section still carries a terminal status.
+_RC_WIRE = {
+    "static_route": "static-route",
+    "snmp": "snmp-config",
+    "route_policy": "route-policy",
+    "bgp": "bgp-config",
+    "isis": "isis-interface",
+}
+
+
+def _rc_action(device_name: str, scope: str, section: dict) -> dict:
+    """A certified device-state-read output carrying one scope's post-commit section."""
+    return {"atomic": True, "device-name": device_name, _RC_WIRE[scope]: section}
 
 
 async def test_run_apply_reader_compare_flags_silent_drop(adapter_client):
@@ -2605,7 +2623,9 @@ async def test_run_apply_reader_compare_flags_silent_drop(adapter_client):
         break
 
     mock_client = AsyncMock(spec=NsoClient)
-    mock_client.get_static_routes.return_value = {"route": []}  # commit "ok", key never landed
+    mock_client.run_device_state_read.return_value = _rc_action(
+        "rtr-rc-drop", "static_route", {"status": "ok", "route": []}
+    )  # commit "ok", key never landed
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
@@ -2647,9 +2667,11 @@ async def test_run_apply_reader_compare_ok_when_key_lands(adapter_client):
         break
 
     mock_client = AsyncMock(spec=NsoClient)
-    mock_client.get_static_routes.return_value = {
-        "route": [{"vrf": "", "prefix": "198.18.27.0/24", "next-hop": "10.0.0.1"}]
-    }
+    mock_client.run_device_state_read.return_value = _rc_action(
+        "rtr-rc-ok",
+        "static_route",
+        {"status": "ok", "route": [{"vrf": "", "prefix": "198.18.27.0/24", "next-hop": "10.0.0.1"}]},
+    )
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
@@ -2757,14 +2779,9 @@ async def test_run_apply_reader_compare_still_catches_a_dropped_snmp_host(adapte
         break
 
     mock_client = AsyncMock(spec=NsoClient)
-    mock_client.get_device_state_section.return_value = {
-        "status": "ok",
-        "community": [],
-        "v3-user": [],
-        "host": [],
-    }  # never landed
-    # reader-compare still reads the LEGACY getter (its migration is scoped separately)
-    mock_client.get_snmp_config.return_value = mock_client.get_device_state_section.return_value
+    mock_client.run_device_state_read.return_value = _rc_action(
+        "rtr-rc-snmp-host", "snmp", {"status": "ok", "community": [], "v3-user": [], "host": []}
+    )  # never landed
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock),
@@ -2781,14 +2798,14 @@ async def test_run_apply_reader_compare_still_catches_a_dropped_snmp_host(adapte
 
 
 async def test_run_apply_reader_compare_absent_reader_surface_is_not_a_drop(adapter_client):
-    """A reader that returns NOTHING means "unknown", not "the writer dropped everything".
+    """A section the NED does not export (status=unsupported) means "unknown", not "the
+    writer dropped everything".
 
-    Every reader in _RESIDUE_READERS returns None by design when the device has no such
-    config / the NED has no export surface for the scope (the isis-interface section read:
-    "Returns None if the device has no IS-IS config"). Coercing that to {} made `present`
-    the empty set for every list, so every intended key was classified a silent writer
-    drop: the scope went permanently apply_failed on a device where NSO had committed the
-    intent and the config was on the box — and no retry could ever clear it.
+    The device-state action declares status=unsupported for a family the NED has no export
+    surface for — absence there proves nothing, so the scope stays "unknown" and green. The
+    legacy None→{} coercion classified every intended key a silent writer drop and pinned the
+    scope permanently apply_failed on a device where NSO had committed the intent; the
+    envelope's status closes that blind spot.
     """
     from nso_adapter.store.models import StaticRouteIntent
 
@@ -2808,7 +2825,9 @@ async def test_run_apply_reader_compare_absent_reader_surface_is_not_a_drop(adap
         break
 
     mock_client = AsyncMock(spec=NsoClient)
-    mock_client.get_static_routes.return_value = None  # no export surface on this NED
+    mock_client.run_device_state_read.return_value = _rc_action(
+        "rtr-rc-none", "static_route", {"status": "unsupported"}
+    )  # no export surface on this NED
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
@@ -2850,7 +2869,9 @@ async def test_run_apply_reader_compare_empty_list_payload_is_still_a_drop(adapt
         break
 
     mock_client = AsyncMock(spec=NsoClient)
-    mock_client.get_static_routes.return_value = {"route": []}  # answered — and the route is NOT there
+    mock_client.run_device_state_read.return_value = _rc_action(
+        "rtr-rc-empty", "static_route", {"status": "ok", "route": []}
+    )  # answered — and the route is NOT there
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
@@ -2957,14 +2978,13 @@ async def test_run_apply_reader_compare_still_fails_a_representable_community_li
         break
 
     mock_client = AsyncMock(spec=NsoClient)
-    mock_client.get_device_state_section.return_value = {
-        "status": "ok",
-        "community-list": [],
-        "prefix-list": [],
-        "route-map": [],
+    # reader-compare reads the device-state ACTION; device-name is echoed by the real action but
+    # ignored on this method mock (cert is exercised in test_device_state_client.py).
+    mock_client.run_device_state_read.return_value = {
+        "atomic": True,
+        "device-name": None,
+        "route-policy": {"status": "ok", "community-list": [], "prefix-list": [], "route-map": []},
     }
-    # reader-compare still reads the LEGACY getter (its migration is scoped separately)
-    mock_client.get_route_policy.return_value = mock_client.get_device_state_section.return_value
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_route_policy_config", new_callable=AsyncMock),
@@ -2999,7 +3019,7 @@ async def test_run_apply_reader_compare_reader_error_is_nonfatal(adapter_client)
         break
 
     mock_client = AsyncMock(spec=NsoClient)
-    mock_client.get_static_routes.side_effect = RuntimeError("reader down")
+    mock_client.run_device_state_read.side_effect = RuntimeError("reader down")
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
@@ -3034,12 +3054,11 @@ async def test_run_apply_reader_compare_bgp_checks_router_and_peers(adapter_clie
         break
 
     mock_client = AsyncMock(spec=NsoClient)
-    mock_client.get_device_state_section.return_value = {
-        "status": "ok",
-        "router": [{"asn": 65100, "scope": [{"vrf": "", "peer": [{"peer-address": "10.0.0.7"}]}]}],
-    }  # 10.0.0.9 silently dropped
-    # reader-compare still reads the LEGACY getter (its migration is scoped separately)
-    mock_client.get_bgp_config.return_value = mock_client.get_device_state_section.return_value
+    mock_client.run_device_state_read.return_value = _rc_action(
+        "rtr-rc-bgp",
+        "bgp",
+        {"status": "ok", "router": [{"asn": 65100, "scope": [{"vrf": "", "peer": [{"peer-address": "10.0.0.7"}]}]}]},
+    )  # 10.0.0.9 silently dropped
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_bgp_config", new_callable=AsyncMock),
@@ -3077,13 +3096,15 @@ async def test_run_apply_reader_compare_isis_flags_only_missing_model(adapter_cl
         break
 
     mock_client = AsyncMock(spec=NsoClient)
-    mock_client.get_device_state_section.return_value = {
-        "status": "ok",
-        "interface": [{"interface-name": "ge-0/0/0", "af": "ipv4"}],
-        "process": [],  # process silently dropped
-    }
-    # reader-compare still reads the LEGACY getter (its migration is scoped separately)
-    mock_client.get_isis_interfaces.return_value = mock_client.get_device_state_section.return_value
+    mock_client.run_device_state_read.return_value = _rc_action(
+        "rtr-rc-isis",
+        "isis",
+        {
+            "status": "ok",
+            "interface": [{"interface-name": "ge-0/0/0", "af": "ipv4"}],
+            "process": [],  # process silently dropped
+        },
+    )
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_isis_interfaces", new_callable=AsyncMock),
@@ -3141,9 +3162,14 @@ async def _seed_community(device_id: int, *, label="prod-ro", vault_ref=SNMP_VAU
 
 async def _apply_snmp(device_id: int, job_id: int, snmp_view: dict) -> Job:
     mock_client = AsyncMock(spec=NsoClient)
-    mock_client.get_device_state_section.return_value = {"status": "ok", **snmp_view}
-    # reader-compare still reads the LEGACY getter (its migration is scoped separately)
-    mock_client.get_snmp_config.return_value = mock_client.get_device_state_section.return_value
+    section = {"status": "ok", **snmp_view}
+
+    async def _read(device_name, families, *, timeout=None):
+        # reader-compare reads the device-state ACTION; echo the requested device (as the real
+        # action does) so the shape is faithful — cert itself is covered in test_device_state_client.py.
+        return {"atomic": True, "device-name": device_name, "snmp-config": section}
+
+    mock_client.run_device_state_read.side_effect = _read
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock),
@@ -3259,4 +3285,379 @@ async def test_a_dropped_HOST_is_still_caught_when_the_community_grain_goes_dark
     async for db in get_session():
         host = (await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))).scalars().one()
         assert host.last_apply_error["code"] == "reader_compare_missing"
+        break
+
+
+# ── READSEM 1328 — the reader-compare/action-migration behaviours ─────────────────────────────
+
+
+async def test_mixed_community_and_host_vault_down_is_PARTIAL_not_ok(adapter_client, vault):
+    """r3-M2 (a PRE-EXISTING false-green fixed here): a Vault-unverifiable community alongside a
+    host that DID land must NOT report a clean 'ok' after checking only the host. It reports
+    'partial' and names the unchecked community — symmetric with the residue path's 'partial'.
+    'missing' still beats 'partial', so this only fires when nothing checkable is actually absent.
+    """
+    from nso_adapter.store.models import SnmpHostIntent
+
+    vault(fail=True)  # the community grain goes dark
+    device_id = await _seed_device("rtr-a17-partial", 435)
+    job_id = await _seed_apply_job(device_id)
+    await _seed_community(device_id)
+    async for db in get_session():
+        db.add(
+            SnmpHostIntent(
+                device_id=device_id,
+                address="198.18.5.9",
+                version="2c",
+                notify_type="traps",
+                community_or_user="prod-ro",
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+
+    # the host IS on the device; the community cannot be re-keyed (Vault down)
+    job = await _apply_snmp(device_id, job_id, {"community": [], "v3-user": [], "host": [{"address": "198.18.5.9"}]})
+
+    assert job.status == JobStatus.succeeded  # partial is not a failure
+    assert job.result["reader_compare"]["snmp"] == "partial"
+    assert job.result["reader_compare_unverifiable"]["snmp"], "the unchecked community must be named"
+    async for db in get_session():
+        host = (await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))).scalars().one()
+        assert host.last_apply_error is None  # the host landed and was verified
+        break
+
+
+async def test_all_unverifiable_scope_runs_NO_action_and_is_unknown(adapter_client, vault):
+    """r2-m3: a scope whose every expected key is Vault-unverifiable (a lone community, Vault down)
+    must record 'unknown' WITHOUT ever running the (heavy) device-state action — there is nothing
+    to look for on the device."""
+    vault(fail=True)
+    device_id = await _seed_device("rtr-a17-allunver", 436)
+    job_id = await _seed_apply_job(device_id)
+    await _seed_community(device_id)
+
+    mock_client = AsyncMock(spec=NsoClient)
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    mock_client.run_device_state_read.assert_not_awaited()  # never ran the action
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        assert job.result["reader_compare"]["snmp"] == "unknown"
+        break
+
+
+async def test_reader_compare_budget_exhaustion_yields_unknown(adapter_client, monkeypatch):
+    """r4-M1: the default-path verify is HARD-bounded. The FIRST scope's action blocks past the
+    wall-clock budget → it is asyncio.wait_for-cut to 'unknown'; a LATER checkable scope then sees
+    the budget already spent and SKIPS to 'unknown' without running the (heavy) action at all. The
+    apply still SUCCEEDS — a slow or semaphore-contended action can never wedge or fail a good apply.
+    Exercises both the timeout branch and the remaining<=0 skip (via _reader_compare_checkable)."""
+    from nso_adapter.store.models import StaticRouteIntent, VlanIntent
+
+    # shrink both the per-apply budget and the per-call ceiling to sub-second (generous enough
+    # that the first scope reliably reaches the action, tight enough that its cut spends the budget)
+    monkeypatch.setattr("nso_adapter.core.removal._VERIFY_TOTAL_BUDGET", 0.3)
+    monkeypatch.setattr("nso_adapter.core.removal._VERIFY_PER_CALL_TIMEOUT", 0.3)
+    device_id = await _seed_device("rtr-rc-budget", 440)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id, vrf="", prefix="198.18.40.0/24", next_hop="10.0.0.1", accepted_at=datetime.utcnow()
+            )
+        )
+        db.add(VlanIntent(device_id=device_id, vlan_id=444, name="rc-budget", accepted_at=datetime.utcnow()))
+        await db.commit()
+        break
+
+    mock_client = AsyncMock(spec=NsoClient)
+    reads: list[str] = []
+
+    async def _slow_read(device_name, families, *, timeout=None):
+        reads.append(families[0])
+        await asyncio.sleep(5)  # far past the 0.05s budget — must be cancelled, not awaited
+        return _rc_action(device_name, "static_route", {"status": "ok", "route": []})
+
+    mock_client.run_device_state_read.side_effect = _slow_read
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
+        patch("nso_adapter.nso.apply.apply_vlan_config", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    # exactly ONE scope ever reached the action (the first); the budget was spent, so the
+    # second scope skipped to unknown without a second action call.
+    assert len(reads) == 1, f"a budget-spent scope must NOT run the action, got {reads}"
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded  # the verify never fails the apply
+        assert job.result["reader_compare"]["static_route"] == "unknown"  # budget-cut
+        assert job.result["reader_compare"]["vlan"] == "unknown"  # budget-spent skip
+        row = (
+            (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        assert row.last_apply_error is None  # never accused of a silent drop
+        break
+
+
+async def test_atomic_reader_compare_batches_ONE_action_for_all_scopes(adapter_client, monkeypatch):
+    """r1-m3: with atomic apply on, every scope commits in ONE transaction, so the presence check
+    runs ONE batched device-state action for all checkable wire_names (not one per scope), and
+    classifies each section independently — a landed route stays ok while a dropped host fails."""
+    from nso_adapter.store.models import SnmpHostIntent, StaticRouteIntent
+
+    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+    device_id = await _seed_device(name="sw01-atomic-rc")
+    async for db in get_session():
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id, vrf="", prefix="10.9.9.0/24", next_hop="1.1.1.1", accepted_at=datetime.utcnow()
+            )
+        )
+        db.add(
+            SnmpHostIntent(
+                device_id=device_id,
+                address="198.18.5.9",
+                version="2c",
+                notify_type="traps",
+                community_or_user="x",
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+    job_id = await _seed_apply_job(device_id)
+
+    calls: list[list[str]] = []
+
+    async def _read(device_name, families, *, timeout=None):
+        calls.append(sorted(families))
+        return {
+            "atomic": True,
+            "device-name": device_name,
+            "static-route": {"status": "ok", "route": [{"vrf": "", "prefix": "10.9.9.0/24", "next-hop": "1.1.1.1"}]},
+            "snmp-config": {"status": "ok", "community": [], "v3-user": [], "host": []},  # host dropped
+        }
+
+    mock_client = AsyncMock()
+    mock_client.run_device_state_read.side_effect = _read
+    with ExitStack() as stack:
+        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
+        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", AsyncMock(return_value=None)))
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    assert len(calls) == 1, f"expected exactly one batched action, got {calls}"
+    assert set(calls[0]) == {"static-route", "snmp-config"}
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.result["reader_compare"]["static_route"] == "ok"
+        assert job.result["reader_compare"]["snmp"] == "missing"  # the host never landed
+        assert job.status == JobStatus.failed
+        break
+
+
+async def test_reader_compare_non_terminal_section_is_error(adapter_client):
+    """A section carrying a NON-terminal status (a torn 'not-ready' the action should never emit)
+    is classified 'error', never walked — the classifier must not treat it as present data. The
+    real transport rejects such a response at certification (test_device_state_client.py); here the
+    method mock bypasses cert to prove the classifier's own defence."""
+    from nso_adapter.store.models import StaticRouteIntent
+
+    device_id = await _seed_device("rtr-rc-notready", 441)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id, vrf="", prefix="198.18.41.0/24", next_hop="10.0.0.1", accepted_at=datetime.utcnow()
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock(spec=NsoClient)
+    mock_client.run_device_state_read.return_value = _rc_action(
+        "rtr-rc-notready", "static_route", {"status": "not-ready"}
+    )
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded  # error never fails a good apply
+        assert job.result["reader_compare"]["static_route"] == "error"
+        break
+
+
+# ── codex review (READSEM 1328): verifier robustness ──────────────────────────────────────────
+
+
+async def test_reader_compare_malformed_ok_section_is_error_not_job_crash(adapter_client):
+    """codex P2: a terminal 'ok' section whose nested data is malformed (route: [1] — an int where
+    a keyed dict belongs) makes the walker raise. That raise must be contained to reader_compare=
+    'error', never escape and turn a SUCCESSFUL device commit into an internal job failure."""
+    from nso_adapter.store.models import StaticRouteIntent
+
+    device_id = await _seed_device("rtr-rc-malformed", 442)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id, vrf="", prefix="198.18.42.0/24", next_hop="10.0.0.1", accepted_at=datetime.utcnow()
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock(spec=NsoClient)
+    mock_client.run_device_state_read.return_value = _rc_action(
+        "rtr-rc-malformed",
+        "static_route",
+        {"status": "ok", "route": [1]},  # int, not a keyed dict
+    )
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded  # the commit landed — a read-side glitch must not fail it
+        assert job.result["reader_compare"]["static_route"] == "error"
+        row = (
+            (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
+            .scalars()
+            .one()
+        )
+        assert row.last_apply_error is None  # never accused of a silent drop
+        break
+
+
+async def test_atomic_reader_compare_malformed_section_is_error_not_job_crash(adapter_client, monkeypatch):
+    """codex P2 (atomic path): the batched classifier is likewise guarded — a malformed section
+    for one scope records 'error' and leaves the successful atomic commit intact."""
+    from nso_adapter.store.models import StaticRouteIntent
+
+    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+    device_id = await _seed_device(name="sw01-atomic-malformed")
+    async for db in get_session():
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id, vrf="", prefix="10.9.42.0/24", next_hop="1.1.1.1", accepted_at=datetime.utcnow()
+            )
+        )
+        await db.commit()
+        break
+    job_id = await _seed_apply_job(device_id)
+
+    mock_client = AsyncMock()
+    mock_client.run_device_state_read.return_value = {
+        "atomic": True,
+        "device-name": "sw01-atomic-malformed",
+        "static-route": {"status": "ok", "route": [1]},  # malformed
+    }
+    with ExitStack() as stack:
+        stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
+        stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", AsyncMock(return_value=None)))
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        assert job.result["reader_compare"]["static_route"] == "error"
+        break
+
+
+async def test_action_failure_preserves_unverifiable_labels(adapter_client, vault):
+    """codex P3: when the action RAISES after translation already flagged a Vault-unverifiable
+    community (a translatable host kept the scope checkable, so the action did run), the default
+    path must still record reader_compare_unverifiable — symmetric with the atomic and residue
+    paths — not drop it on the error branch."""
+    from nso_adapter.store.models import SnmpHostIntent
+
+    vault(fail=True)  # the community grain is unverifiable
+    device_id = await _seed_device("rtr-a17-actfail", 443)
+    job_id = await _seed_apply_job(device_id)
+    await _seed_community(device_id)
+    async for db in get_session():
+        db.add(
+            SnmpHostIntent(
+                device_id=device_id,
+                address="198.18.5.9",
+                version="2c",
+                notify_type="traps",
+                community_or_user="prod-ro",
+                accepted_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock(spec=NsoClient)
+    mock_client.run_device_state_read.side_effect = RuntimeError("action exploded")
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded  # a read error never fails a good apply
+        assert job.result["reader_compare"]["snmp"] == "error"
+        assert job.result["reader_compare_unverifiable"]["snmp"], "the unverifiable community must survive the error"
+        break
+
+
+async def test_verifier_budget_excludes_commit_latency(adapter_client, monkeypatch):
+    """codex P1: only VERIFY time counts against _VERIFY_TOTAL_BUDGET — a slow device COMMIT must
+    not starve the scope's own silent-drop verification. With a 0.1s budget and a 0.5s commit, the
+    scope must STILL be verified ('ok'), not skipped to 'unknown' because the commit ate the clock."""
+    from nso_adapter.store.models import StaticRouteIntent
+
+    monkeypatch.setattr("nso_adapter.core.removal._VERIFY_TOTAL_BUDGET", 0.1)
+    device_id = await _seed_device("rtr-rc-commitslow", 444)
+    job_id = await _seed_apply_job(device_id)
+    async for db in get_session():
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id, vrf="", prefix="198.18.44.0/24", next_hop="10.0.0.1", accepted_at=datetime.utcnow()
+            )
+        )
+        await db.commit()
+        break
+
+    mock_client = AsyncMock(spec=NsoClient)
+    mock_client.run_device_state_read.return_value = _rc_action(
+        "rtr-rc-commitslow",
+        "static_route",
+        {"status": "ok", "route": [{"vrf": "", "prefix": "198.18.44.0/24", "next-hop": "10.0.0.1"}]},
+    )
+
+    async def _slow_commit(*_a, **_k):
+        await asyncio.sleep(0.5)  # the device commit dwarfs the 0.1s verify budget
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock, side_effect=_slow_commit),
+    ):
+        await run_apply(job_id=job_id, device_id=device_id, force=True)
+
+    async for db in get_session():
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.succeeded
+        assert job.result["reader_compare"]["static_route"] == "ok"  # verified despite the slow commit
         break

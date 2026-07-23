@@ -941,53 +941,61 @@ async def test_enqueue_removal_serializes_removed_tuples(adapter_client):
 # unowned mirrors immediately.
 
 
-class _ReaderClient:
-    """Real-shape fake of the reader surface: canned network-state-export entries.
+# short scope tag → device-state envelope SECTION (wire) name, mirroring
+# removal._RESIDUE_WIRE_NAMES. Residue tests seed canned data by the short tag; the fake
+# serves it as the ACTION's certified per-section output keyed by the wire name.
+_TAG_TO_WIRE = {
+    "svi": "svi",
+    "subinterface": "subinterface",
+    "static_route": "static-route",
+    "vlan": "vlan-database",
+    "logging": "logging-config",
+    "interface_mtu": "interface-mtu",
+    "bfd": "bfd-config",
+    "l2": "l2-service",
+    "bgp": "bgp-config",
+    "isis": "isis-interface",
+    "ospf": "ospf-config",
+    "route_policy": "route-policy",
+    "snmp": "snmp-config",
+    "interface_ips": "interface-ip",
+}
 
-    Method names MUST be real NsoClient method names —
-    test_residue_readers_resolve_on_the_real_client pins both this fake and the
-    _RESIDUE_READERS mapping to the real surface. (#104-A shipped bfd/l2_sap
-    pointing at nonexistent get_bfd/get_l2_service and the fake matched the typo,
-    so every real bfd/l2 removal silently degraded to residue_check='error'.)
+
+class _ReaderClient:
+    """Real-shape fake of the device-state-read ACTION surface (READSEM 1328).
+
+    Exposes exactly one coroutine — ``run_device_state_read`` — matching the real
+    NsoClient method the residue check now calls. Canned per-family data is passed by the
+    short scope tag (``svi=…``, ``snmp=…``) and served as the action's CERTIFIED output:
+    ``{"atomic": True, "device-name": name, <wire>: <section>}`` with a terminal per-section
+    ``status`` — defaulting to ``ok`` when the canned dict omits one, so a test forces
+    ``unsupported``/``error`` by passing ``{"status": …}`` verbatim. A supported family with
+    no canned data reads as authoritative-empty (``status=ok``, no list keys — the shape
+    RESTCONF emits for a genuinely empty family). ``reads`` counts action calls, so the
+    pre-check short-circuits (force-removal, cleared-scalar retract) still assert ``reads==0``.
+
+    ``test_residue_wire_names_match_the_envelope_sections`` pins the wire mapping to the real
+    envelope section set; certification itself is exercised end-to-end (through the real
+    transport) in tests/nso/test_device_state_client.py — a method fake bypasses it.
     """
 
     def __init__(self, *, raise_on_read=False, **entries):
-        self._entries = entries  # short scope tag → canned reader entry
+        self._sections = {
+            _TAG_TO_WIRE[tag]: (data if "status" in data else {"status": "ok", **data}) for tag, data in entries.items()
+        }
         self._raise = raise_on_read
         self.reads = 0
 
-    def _read(self, tag):
+    async def run_device_state_read(self, device_name, families, *, timeout=None):
         self.reads += 1
         if self._raise:
             raise RuntimeError("reader down")
-        return self._entries.get(tag)
-
-    async def get_svi(self, device_name):
-        return self._read("svi")
-
-    async def get_l2_services(self, device_name):
-        return self._read("l2")
-
-    async def get_bfd_config(self, device_name):
-        return self._read("bfd")
-
-    async def get_bgp_config(self, device_name):
-        return self._read("bgp")
-
-    async def get_isis_interfaces(self, device_name):
-        return self._read("isis")
-
-    async def get_ospf(self, device_name):
-        return self._read("ospf")
-
-    async def get_route_policy(self, device_name):
-        return self._read("route_policy")
-
-    async def get_snmp_config(self, device_name):
-        return self._read("snmp")
-
-    async def get_interface_ips(self, device_name):
-        return self._read("interface_ips")
+        return {
+            "atomic": True,
+            "device-name": device_name,
+            **{wire: self._sections.get(wire, {"status": "ok"}) for wire in families},
+        }
 
 
 async def _run(job_id: int, device_id: int, client) -> None:
@@ -1128,22 +1136,50 @@ def test_an_uncomparable_grain_is_only_reader_compared_if_it_can_be_TRANSLATED()
     )
 
 
-def test_residue_readers_resolve_on_the_real_client():
-    """Every _RESIDUE_READERS target must be a real NsoClient coroutine — and so must
-    every get_* method on the test fake. #104-A shipped bfd→get_bfd and
-    l2_sap→get_l2_service (neither exists); the fake carried the same typo, so the
-    suite stayed green while real removals degraded to residue_check='error'."""
+# removal scope → the FamilySpec surface name whose wire_name the residue read must target.
+# The mirror engine reads each family through FamilySpec.wire_name, so pinning
+# _RESIDUE_WIRE_NAMES to that registry means a section rename breaks the residue check and
+# the mirror together (never silently). This is the #104-A trap — a wire that the action
+# would 404 on, matched by a fake that carried the same typo — foreclosed at the contract level.
+_SCOPE_TO_SURFACE = {
+    "svi": "svi",
+    "subinterface": "subinterface",
+    "static_route": "static_route",
+    "vlan": "vlan",
+    "logging": "logging",
+    "interface_mtu": "interface_mtu",
+    "bfd": "bfd",
+    "l2_sap": "l2_service",
+    "bgp": "bgp",
+    "isis": "isis",
+    "ospf": "ospf",
+    "route_policy": "route_policy",
+    "snmp": "snmp",
+    "interface_config": "interface_ip",
+}
+
+
+def test_residue_wire_names_match_the_envelope_sections():
+    """Every _RESIDUE_WIRE_NAMES value must equal the FamilySpec.wire_name the mirror reads,
+    and the fake must expose the real action method. #104-A shipped bfd→get_bfd and
+    l2_sap→get_l2_service (neither existed) and the fake carried the same typo, so the suite
+    stayed green while real removals degraded to residue_check='error'. Its reborn form is a
+    wire-name typo the action would 404 on — pinned here to ground truth."""
     import inspect
 
-    from nso_adapter.core.removal import _RESIDUE_READERS
+    from nso_adapter.core.importer import _projectable_spec
+    from nso_adapter.core.removal import _RESIDUE_WIRE_NAMES
     from nso_adapter.nso.client import NsoClient
 
-    for scope, name in _RESIDUE_READERS.items():
-        fn = getattr(NsoClient, name, None)
-        assert fn is not None and inspect.iscoroutinefunction(fn), f"{scope} → {name} is not a real NsoClient reader"
-    for name in dir(_ReaderClient):
-        if name.startswith("get_"):
-            assert hasattr(NsoClient, name), f"_ReaderClient.{name} drifted off the real NsoClient surface"
+    assert set(_RESIDUE_WIRE_NAMES) == set(_SCOPE_TO_SURFACE)  # no scope drifts out of coverage
+    for scope, wire in _RESIDUE_WIRE_NAMES.items():
+        spec = _projectable_spec(_SCOPE_TO_SURFACE[scope])
+        assert spec is not None, f"{scope} → surface {_SCOPE_TO_SURFACE[scope]!r} has no FamilySpec"
+        assert spec.wire_name == wire, f"{scope}: residue wire {wire!r} != mirror wire_name {spec.wire_name!r}"
+    # The residue read and the fake both go through the real action method, not a getter.
+    action = getattr(NsoClient, "run_device_state_read", None)
+    assert action is not None and inspect.iscoroutinefunction(action)
+    assert inspect.iscoroutinefunction(getattr(_ReaderClient, "run_device_state_read", None))
 
 
 async def test_run_removal_residue_bgp_router_and_peer(adapter_client):
@@ -1322,9 +1358,10 @@ async def test_run_removal_residue_route_policy_per_family_lists(adapter_client)
     assert job.result["residue"] == {"route-map": [["RM-X"]]}
 
 
-async def test_run_removal_residue_bfd_uses_real_reader_name(adapter_client):
-    """#104-A regression: the bfd mapping pointed at nonexistent get_bfd, so every
-    bfd residue check errored. With the real get_bfd_config it must work."""
+async def test_run_removal_residue_bfd_reads_the_bfd_config_section(adapter_client):
+    """#104-A regression, READSEM 1328 form: the bfd residue read must target the real
+    ``bfd-config`` envelope section (a typo'd wire would 404 on the action and degrade
+    every bfd removal to residue_check='error')."""
     device_id = await _seed_device(nso_device_name="sw3")
     job_id = await _seed_removal_job(device_id, "bfd", {"removed": {"interface": [["ge-0/0/2"]]}})
     client = _ReaderClient(bfd={"interface": [{"interface-name": "ge-0/0/2"}]})
@@ -1433,11 +1470,64 @@ async def test_run_removal_residue_interface_config_normalizes_ipv6(adapter_clie
     assert job.result["residue"] == {"address": [["ge-0/0/1", "2001:DB8:0:0::1/64", "CUST"]]}
 
 
+async def test_run_removal_residue_interface_config_unsupported_section(adapter_client):
+    """READSEM 1328, value-grain path: a NED with no interface-ip surface (status=unsupported)
+    reports residue_check="unsupported" — the value compare cannot run, so never a silent clean."""
+    device_id = await _seed_device(nso_device_name="rm-ic-4")
+    job_id = await _seed_removal_job(
+        device_id,
+        "interface_config",
+        {"interfaces": ["Gi0/3"], "removed": {"address": [["Gi0/3", "10.0.0.2/24", ""]]}},
+    )
+    client = _ReaderClient(interface_ips={"status": "unsupported"})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.status == JobStatus.succeeded
+    assert job.result["residue_check"] == "unsupported"
+    assert client.reads == 1
+
+
 async def test_run_removal_residue_reader_error_is_nonfatal(adapter_client):
     device_id = await _seed_device(nso_device_name="sw3")
     job_id = await _seed_removal_job(device_id, "svi", {"removed": {"interface": [["Vlan987"]]}})
 
     await _run(job_id, device_id, _ReaderClient(raise_on_read=True))
+
+    job = await _job_after(job_id)
+    assert job.status == JobStatus.succeeded
+    assert job.result["residue_check"] == "error"
+
+
+async def test_run_removal_residue_unsupported_section_is_transparent(adapter_client):
+    """READSEM 1328: a section the NED does not export (status=unsupported) reports
+    residue_check="unsupported" — the honest verdict the legacy None→{}→"clean" fabricated.
+
+    The device WAS read (reads==1), but the family has no export surface here, so the
+    check truly could not run — never a clean bill on config that might still be live.
+    """
+    device_id = await _seed_device(nso_device_name="sw3")
+    job_id = await _seed_removal_job(device_id, "svi", {"removed": {"interface": [["Vlan987"]]}})
+    client = _ReaderClient(svi={"status": "unsupported"})
+
+    await _run(job_id, device_id, client)
+
+    job = await _job_after(job_id)
+    assert job.status == JobStatus.succeeded
+    assert job.result["residue_check"] == "unsupported"
+    assert client.reads == 1  # the action DID run — the NED just has no surface for this family
+
+
+async def test_run_removal_residue_error_section_is_nonfatal(adapter_client):
+    """READSEM 1328: a section whose family read errored (status=error) reports
+    residue_check="error" and never fails the removal — the action's terminal error
+    status must not read as a clean/found verdict."""
+    device_id = await _seed_device(nso_device_name="sw3")
+    job_id = await _seed_removal_job(device_id, "svi", {"removed": {"interface": [["Vlan987"]]}})
+    client = _ReaderClient(svi={"status": "error", "error-reason": "extract failed"})
+
+    await _run(job_id, device_id, client)
 
     job = await _job_after(job_id)
     assert job.status == JobStatus.succeeded

@@ -31,6 +31,53 @@ from sqlalchemy.ext.asyncio import AsyncSession
 logger = structlog.get_logger(__name__)
 
 
+# ── device-state verify budget (READSEM 1328) ────────────────────────────────
+# The post-commit verifiers (removal residue + apply reader-compare) read the far side of
+# the FASTMAP writer through the device-state-read ACTION. That action is HEAVY — it runs a
+# live whole-device CDB extraction inside a txid bracket (not the cache-backed legacy GET),
+# so it needs an explicit wall-clock bound. _VERIFY_BATCH_TIMEOUT bounds one batched/residue
+# action; the default-path per-scope budget lives in apply.py (_VERIFY_PER_CALL_TIMEOUT /
+# _VERIFY_TOTAL_BUDGET) and wraps translate + semaphore + HTTP together.
+_VERIFY_PER_CALL_TIMEOUT = 60.0  # single-family action ceiling (default reader-compare path)
+_VERIFY_TOTAL_BUDGET = 120.0  # per-apply default-path reader-compare wall-clock budget
+_VERIFY_BATCH_TIMEOUT = 360.0  # atomic reader-compare batch + single-scope residue action
+
+
+async def _live_family_sections(client, device_name: str, wire_names: list[str], *, timeout: float) -> dict[str, dict]:
+    """Fetch each family's section via the device-state-read ACTION, behind the action semaphore.
+
+    The action output is CERTIFIED inside :meth:`NsoClient.run_device_state_read` (atomic,
+    device-name echo, terminal per-section status) — so a version-skewed / wrong-device /
+    non-terminal response raises :class:`NsoReadContractError` there and every caller's
+    catch→keep-rows handling takes over. Here we only serialize against the shared 4-slot
+    action semaphore and pick the requested sections out. A requested wire absent from the
+    certified output is a contract bug (the action always answers a requested family) → the
+    ``KeyError`` propagates to the caller's except → "error", never a fabricated clean/present.
+    """
+    from nso_adapter.core.refresh_engine import _action_semaphore
+
+    async with _action_semaphore():
+        output = await client.run_device_state_read(device_name, list(wire_names), timeout=timeout)
+    return {wire: output[wire] for wire in wire_names}
+
+
+def _verifier_section_status(section: dict) -> str:
+    """Classify a certified device-state section for the post-commit verifiers → "ok"|"unknown"|"error".
+
+    Certification guarantees the status is terminal (``ok|unsupported|error``); this maps it to
+    the shared verify verdict the residue and reader-compare consumers each refine:
+    ``ok`` → walk the section; ``unsupported`` → "unknown" (no export surface — absence proves
+    nothing: residue reads it as unsupported, reader-compare as unknown); ``error`` (the family
+    read errored) → "error", which each caller turns into its error verdict.
+    """
+    status = section.get("status")
+    if status == "ok":
+        return "ok"
+    if status == "unsupported":
+        return "unknown"
+    return "error"
+
+
 # scope → (intent store model name, apply function name) for the "simple" services
 # whose apply takes a single ``(client, device_name, rows, replace=True)`` signature.
 # logging is listed for the model→scope map/valid-scope set but dispatches bespoke
@@ -278,34 +325,37 @@ def _removed_context(scope: str, context: dict) -> dict[str, list]:
     return removed
 
 
-# Scope → the NsoClient reader serving that scope's device-tree view. The
-# network-state-export lists are data-provider callbacks (computed at GET time from
-# the current CDB config), so a read right after the replace commit reflects exactly
-# what FASTMAP left behind. Scopes absent here get residue_check="unsupported" in the
-# job result — transparency over a silent "clean" (intent-integrity principle).
-# Names are pinned to the real NsoClient surface by
-# test_residue_readers_resolve_on_the_real_client (#104-A shipped two typos whose
-# test fake matched the misspelling).
-_RESIDUE_READERS: dict[str, str] = {
-    "svi": "get_svi",
-    "subinterface": "get_subinterface",
-    "static_route": "get_static_routes",
-    "vlan": "get_vlan_database",
-    "logging": "get_logging_config",
-    "interface_mtu": "get_interface_mtu",
-    "bfd": "get_bfd_config",
-    "l2_sap": "get_l2_services",
+# Scope → the device-state envelope SECTION name for that scope (READSEM 1328). The residue
+# check reads the section through the ``device-state-read`` ACTION (a fresh post-commit CDB
+# extraction inside a whole-build txid bracket, read as soon as possible after the replace
+# commit) rather than the legacy per-family getter. The action is fresher than those getters
+# (they are SUBSCRIBER-CACHE-backed — served from a cache re-extracted only on a miss or an
+# async CDB-subscriber notification, so they can lag a just-made commit) and never serves the
+# record-served facade's stale/not-ready. Its terminal per-family status closes the legacy
+# None/empty blind spot: an ``unsupported`` section reports residue_check="unsupported"
+# (transparency over a silent "clean" — intent-integrity), never a fabricated clean bill.
+# Names are pinned to the real envelope section set by
+# test_residue_wire_names_match_the_envelope_sections.
+_RESIDUE_WIRE_NAMES: dict[str, str] = {
+    "svi": "svi",
+    "subinterface": "subinterface",
+    "static_route": "static-route",
+    "vlan": "vlan-database",
+    "logging": "logging-config",
+    "interface_mtu": "interface-mtu",
+    "bfd": "bfd-config",
+    "l2_sap": "l2-service",
     # #104 phase-2 — the guarded complex scopes; same key grain as the guard lists.
-    "bgp": "get_bgp_config",
-    "isis": "get_isis_interfaces",
-    "ospf": "get_ospf",
-    "route_policy": "get_route_policy",
-    "snmp": "get_snmp_config",
+    "bgp": "bgp-config",
+    "isis": "isis-interface",
+    "ospf": "ospf-config",
+    "route_policy": "route-policy",
+    "snmp": "snmp-config",
     # #104 phase-3 — value grain, bespoke compare in _interface_config_residue: the
     # per-instance replace/delete retracts address VALUES, not keyed rows, so the
     # check intersects the trigger's removed (interface, address, vrf) triples with
-    # the interface-ip export instead of walking a guard spec.
-    "interface_config": "get_interface_ips",
+    # the interface-ip section instead of walking a guard spec.
+    "interface_config": "interface-ip",
 }
 
 # Guard-list label → the network-state-export list path, for the scopes where the
@@ -418,19 +468,27 @@ async def _interface_config_residue(client, device, context: dict) -> dict[str, 
 
     The per-instance PUT-replace/DELETE retracts address VALUES rather than keyed
     service rows, so the check intersects the trigger's just-removed
-    (interface, address, vrf) triples with the interface-ip export view. A
-    surviving address — whether a kept-adopted leaf or a husk entry — is reported:
-    the operator deleted the IP in NetBox and would otherwise believe it left the
-    device. Jobs without captured values (legacy queue rows, actions/force-removal)
-    return ``None`` → residue_check="unsupported", never a silent "clean".
+    (interface, address, vrf) triples with the interface-ip section read through the
+    ACTION. A surviving address — whether a kept-adopted leaf or a husk entry — is
+    reported: the operator deleted the IP in NetBox and would otherwise believe it
+    left the device. Jobs without captured values (legacy queue rows,
+    actions/force-removal) return ``None`` → residue_check="unsupported", never a
+    silent "clean"; a NED with no interface-ip surface (status ``unsupported``) is
+    likewise ``None``, and a ``status=error`` section raises → residue_check="error".
     """
     removed = (context.get("removed") or {}).get("address")
     if removed is None:
         return None
-    entry = await getattr(client, _RESIDUE_READERS["interface_config"])(device.nso_device_name) or {}
+    wire = _RESIDUE_WIRE_NAMES["interface_config"]
+    section = (await _live_family_sections(client, device.nso_device_name, [wire], timeout=_VERIFY_BATCH_TIMEOUT))[wire]
+    status = _verifier_section_status(section)
+    if status == "error":
+        raise RuntimeError(f"device-state read of {wire!r} returned status=error: {section.get('error-reason')!r}")
+    if status == "unknown":  # unsupported — no interface-ip surface on this NED
+        return None
     present = {
         (str(iface.get("interface-name", "")), _norm_addr(addr.get("address", "")), str(addr.get("vrf") or ""))
-        for iface in entry.get("interface") or []
+        for iface in section.get("interface") or []
         for addr in iface.get("address") or []
     }
     survivors = sorted([str(p) for p in t] for t in removed if _norm_ip_triple(t) in present)
@@ -443,8 +501,9 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> t
     FASTMAP's reverse diff keeps service-created entries that picked up foreign
     leaves (sw03 Vlan987: a sync between apply and removal imported the
     device-rendered ``no ip address`` into the CDB entry), so a removal can report
-    SUCCESS while its keys survive in the device tree. Re-read the scope's reader —
-    the NED-agnostic device-tree view — and report survivors per YANG list
+    SUCCESS while its keys survive in the device tree. Re-read the scope's
+    device-state section through the ACTION — the NED-agnostic device-tree view,
+    freshly extracted after the replace commit — and report survivors per YANG list
     (interface_config compares removed VALUES instead — see
     :func:`_interface_config_residue`).
 
@@ -452,18 +511,21 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> t
 
     ``residue``      survivors per YANG list; ``{}`` means every list that COULD be
                      checked came back clean; ``None`` means nothing could be checked at
-                     all (no reader mapping / no captured keys) → residue_check
-                     "unsupported".
+                     all (no wire mapping / no captured keys / the NED does not export
+                     the section — status ``unsupported``) → residue_check "unsupported".
     ``unverifiable`` labels whose grain cannot be key-matched against the export
                      (:data:`UNCOMPARABLE_LISTS`). Their keys are neither silently
                      intersected (an empty intersection would read as "clean" for a
                      credential still live on the router) nor guessed at.
+
+    A ``status=error`` section (the family read errored) RAISES, so
+    :func:`_record_residue` records residue_check="error" rather than a fabricated verdict.
     """
     if scope == "interface_config":
         return await _interface_config_residue(client, device, context), []
-    reader = _RESIDUE_READERS.get(scope)
+    wire = _RESIDUE_WIRE_NAMES.get(scope)
     spec = _guard_specs().get(scope)
-    if reader is None or spec is None:
+    if wire is None or spec is None:
         return None, []
     removed = _removed_context(scope, context)
     if not any(removed.values()):
@@ -493,7 +555,13 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> t
     if not keymaps:
         return None, unverifiable  # nothing in any grain could be translated
 
-    entry = await getattr(client, reader)(device.nso_device_name) or {}
+    section = (await _live_family_sections(client, device.nso_device_name, [wire], timeout=_VERIFY_BATCH_TIMEOUT))[wire]
+    status = _verifier_section_status(section)
+    if status == "error":
+        raise RuntimeError(f"device-state read of {wire!r} returned status=error: {section.get('error-reason')!r}")
+    if status == "unknown":  # unsupported — the NED does not export this section
+        return None, unverifiable
+    entry = section
     residue: dict[str, list] = {}
     for guard_list in spec.lists:
         keymap = keymaps.get(guard_list.label)
