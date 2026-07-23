@@ -65,14 +65,14 @@ async def test_refresh_full_replace(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_refresh_none_clears(adapter_client):
+async def test_refresh_authoritative_empty_clears(adapter_client):
     device_id = await seed_device(nso_device_name="log-sw03", netbox_device_id=972)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
         nso_client.get_device_state_section.return_value = {"status": "ok", "host": [{"address": "10.0.0.9"}]}
         await refresh_logging_config_for_device(db, device, nso_client, refresh_source="test")
         assert len(await _hosts(db, device_id)) == 1
-        nso_client.get_device_state_section.return_value = None
+        nso_client.get_device_state_section.return_value = {"status": "ok"}
         await refresh_logging_config_for_device(db, device, nso_client, refresh_source="test")
         assert len(await _hosts(db, device_id)) == 0
 
@@ -146,8 +146,9 @@ async def test_refresh_levels_absent_deletes_row(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_refresh_none_clears_levels_too(adapter_client):
-    """The authoritative-empty (None read, EmptyPolicy.pop) clear covers the levels singleton."""
+async def test_refresh_authoritative_empty_clears_levels_too(adapter_client):
+    """The authoritative-empty (status=ok with the lists absent — RESTCONF omits empties) clear
+    covers the levels singleton. (Device-absence, section None, now KEEPS rows — READSEM S5.)"""
     device_id = await seed_device(nso_device_name="log-nx04", netbox_device_id=976)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
@@ -157,6 +158,6 @@ async def test_refresh_none_clears_levels_too(adapter_client):
         }
         await refresh_logging_config_for_device(db, device, nso_client, refresh_source="test")
         assert await _levels(db, device_id) is not None
-        nso_client.get_device_state_section.return_value = None
+        nso_client.get_device_state_section.return_value = {"status": "ok"}
         await refresh_logging_config_for_device(db, device, nso_client, refresh_source="test")
         assert await _levels(db, device_id) is None

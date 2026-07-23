@@ -83,8 +83,9 @@ async def test_refresh_replaces_existing_rows(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_refresh_nso_returns_none_clears_rows(adapter_client):
-    """NSO returns None (device not found) → rows cleared."""
+async def test_refresh_authoritative_empty_clears_rows(adapter_client):
+    """An authoritatively-empty read (status=ok, no routes — RESTCONF omits empty lists) clears the
+    rows. (Device-absence, section None, now KEEPS — READSEM S5.)"""
     from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceStaticRoute
 
@@ -103,7 +104,7 @@ async def test_refresh_nso_returns_none_clears_rows(adapter_client):
 
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
-        nso_client.get_device_state_section.return_value = None
+        nso_client.get_device_state_section.return_value = {"status": "ok"}
         await refresh_static_routes_for_device(db, device, nso_client)
 
         result = await db.execute(select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id))

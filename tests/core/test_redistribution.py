@@ -690,31 +690,33 @@ async def test_no_authoritative_component_records_worst_reason(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_aged_replaced_with_unsupported_propagates_aged(adapter_client):
-    """SA-1: freshness ranks fresh < aged < stale over the REPLACED components — an aged
-    authoritative read beside an unsupported bystander must record present/AGED, never
-    fresh (the plugin would render healthy instead of aged). ``aged`` cannot arrive via
-    the envelope (unknown statuses fail closed); it reaches the merge only through the
-    pre-classified from_outcomes entry, so the test drives that entry directly."""
-    from nso_adapter.core.redistribution import refresh_redistribution_from_outcomes
-    from nso_adapter.nso.read_outcome import Freshness, Present, Unavailable, UnavailableReason
-
-    device_id = await seed_device(nso_device_name="rd-aged-unsup", netbox_device_id=7715)
+async def test_all_components_device_absent_keeps_and_succeeds(adapter_client):
+    """READSEM S5 (1327): device-level absence (every component section None →
+    not_authoritative) is a KEPT SUCCESS for redistribution too — consistent with every
+    FamilySpec family (`_apply_outcome`), NOT a degraded failure. Before keep-rows, device-absence
+    was AbsentAuthoritative (cleared → replaced/succeeded); the bucketing must not now misfile a
+    non-failing keep as an error."""
+    device_id = await seed_device(nso_device_name="rd-absent", netbox_device_id=7716)
     async with _device_session(device_id) as (db, device):
-        outcomes = {
-            "ospf": Unavailable(UnavailableReason.unsupported),
-            "isis": Present(
-                {"process": [{"process-tag": "C", "redistribute": [{"source-protocol": "static", "source-ref": ""}]}]},
-                Freshness.aged,
-            ),
-            "bgp": Present({}, Freshness.fresh),
-        }
-        ok = await refresh_redistribution_from_outcomes(db, device, outcomes, refresh_source="test")
-        assert ok is True
+        await _seed_redist_rows(db, device_id, [("isis", "static")])
+        client = _nso_client_with_data()
+        client._sections["ospf-config"] = None
+        client._sections["isis-interface"] = None
+        client._sections["bgp-config"] = None
+
+        ok = await refresh_redistribution_for_device(db, device, client, refresh_source="test")
+
+        assert ok is True  # kept, non-failing — not a degraded surface
+        rows = (
+            (await db.execute(select(DeviceRedistribution).where(DeviceRedistribution.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        assert {(r.dest_protocol, r.source_protocol) for r in rows} == {("isis", "static")}  # kept
     outcome = await _latest_outcome(device_id)
-    assert (outcome.read_outcome, outcome.freshness, outcome.result, outcome.succeeded) == (
-        "present",
-        "aged",
-        "replaced",
+    assert (outcome.read_outcome, outcome.read_reason, outcome.result, outcome.succeeded) == (
+        "unavailable",
+        "not_authoritative",
+        "kept",
         True,
     )

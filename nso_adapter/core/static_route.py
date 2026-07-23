@@ -16,7 +16,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.store.models import Device, DeviceStaticRoute
 
 logger = structlog.get_logger(__name__)
@@ -58,8 +57,6 @@ async def _upsert_static_routes(
 
 STATIC_ROUTE_SPEC = FamilySpec(
     name="static_route",
-    empty_policy=EmptyPolicy.pop,  # config family: a container-confirmed 404 is an authoritative clear
-    getter=lambda client, name: client.get_static_routes(name),
     extract=lambda data: data.get("route", []),
     materialize=_upsert_static_routes,
     wire_name="static-route",  # READSEM S3: fetch from the device-state envelope

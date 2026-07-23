@@ -259,6 +259,42 @@ async def test_offboard_cascades_interfaces_and_scope(adapter_client_with_nso):
         break
 
 
+async def test_offboard_cascades_mirror_rows_the_keeprows_change_relies_on(adapter_client_with_nso):
+    """READSEM S5 (1327): device-absence now KEEPS mirror rows, so a device removed from NSO is
+    cleaned up ONLY by offboard. Prove offboard removes the mirror for the families a bare 404 no
+    longer clears — a pop family (static_route) + device_settings — so keep-rows can't strand
+    immortal rows on a deleted device."""
+    from nso_adapter.core.onboarding import offboard_device
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import DeviceSettings, DeviceStaticRoute
+    from tests.conftest import seed_device
+
+    device_id = await seed_device(
+        nso_instance="nso-dev",
+        nso_device_name="offboard-mirror",
+        netbox_device_id=402,
+        attributes=["description"],
+    )
+
+    async for db in get_session():
+        db.add(DeviceStaticRoute(device_id=device_id, vrf="", prefix="10.9.0.0/16", next_hop="1.1.1.1"))
+        db.add(DeviceSettings(device_id=device_id, auto_apply=True))
+        await db.commit()
+        break
+
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        await offboard_device(db, device)
+        routes = await db.execute(select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device_id))
+        assert routes.scalars().all() == [], "static_route rows orphaned after offboard"
+        settings = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+        assert settings.scalars().all() == [], "device_settings row orphaned after offboard"
+        scope = await db.execute(select(ManagedScope).where(ManagedScope.device_id == device_id))
+        assert scope.scalars().all() == []
+        assert await db.get(Device, device_id) is None
+        break
+
+
 # ── set_scope ────────────────────────────────────────────────────────────────
 
 

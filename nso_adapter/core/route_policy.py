@@ -19,7 +19,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
     Device,
@@ -215,8 +214,6 @@ async def _upsert_route_policy_data(
 
 ROUTE_POLICY_SPEC = FamilySpec(
     name="route_policy",
-    empty_policy=EmptyPolicy.pop,  # config family: a container-confirmed 404 is an authoritative clear
-    getter=lambda client, name: client.get_route_policy(name),
     # The materializer takes the whole entry dict; extract({}) → the four-family clear. The engine
     # logs the clear (route_policy.refresh.cleared) — fixing the old silent clear-on-None path.
     extract=lambda data: data,

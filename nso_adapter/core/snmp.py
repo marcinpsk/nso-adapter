@@ -17,7 +17,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, SnmpCommunity, SnmpHost, SnmpSystemInfo, SnmpV3User
 
@@ -111,8 +110,6 @@ SNMP_SPEC = FamilySpec(
     # here is a container-confirmed per-device absence → AbsentAuthoritative → clear. This is the
     # opposite of interface_ip, a present-empty inventory family whose 404 means only
     # unsupported-NED, so it KEEPS.
-    empty_policy=EmptyPolicy.pop,
-    getter=lambda client, name: client.get_snmp_config(name),
     # The materializer takes the whole entry dict; extract({}) → the clear (delete all + add none).
     extract=lambda data: data,
     materialize=_upsert_snmp_config,

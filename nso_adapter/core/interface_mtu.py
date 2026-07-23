@@ -17,7 +17,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceInterfaceMtu
 
@@ -58,8 +57,6 @@ async def _upsert_interface_mtu(db: AsyncSession, device: Device, interfaces: li
 
 INTERFACE_MTU_SPEC = FamilySpec(
     name="interface_mtu",
-    empty_policy=EmptyPolicy.pop,
-    getter=lambda client, name: client.get_interface_mtu(name),
     # as_list guards the singleton-rendered-as-bare-dict case (was a raw .get → crash).
     extract=lambda data: as_list(data.get("interface")),
     materialize=_upsert_interface_mtu,

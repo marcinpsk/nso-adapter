@@ -31,7 +31,6 @@ from nso_adapter.domain.models import Interface, InterfaceAttr
 from nso_adapter.nso import actions as nso_actions
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import (  # noqa: F401 — Present used below
-    EmptyPolicy,
     Present,
     Unavailable,
     UnavailableReason,
@@ -216,7 +215,8 @@ async def _fetch_projection(nso_client, device, wire_names: list[str], *, atomic
     Returns ``(sections, supplier_outcome)``: on supplier failure sections is empty and
     the outcome (export_down / read_error) fans out to every family via
     ``run_family_refresh_from_outcome`` — NEVER a fabricated section (codex S3-R1 F8).
-    A confirmed device absence yields ``{wire: None}`` (per-family EmptyPolicy applies).
+    A confirmed device absence yields ``{wire: None}`` → ``Unavailable(not_authoritative)``,
+    keeping the last-known rows for every family (READSEM S5 retired the pop/present policy).
     """
     if atomic:
         # READSEM grain c: ONE txid-bracketed build for every requested family. Output
@@ -323,8 +323,7 @@ async def _run_surfaces_projected(
                     else:
                         component_outcomes = {
                             proto: classify_envelope_section(
-                                sections[w] if sections[w] is None else _section_or_error(sections[w]),
-                                EmptyPolicy.pop,
+                                sections[w] if sections[w] is None else _section_or_error(sections[w])
                             )
                             for proto, w, _b in _REDIST_COMPONENTS
                         }
@@ -344,7 +343,7 @@ async def _run_surfaces_projected(
                             db,
                             device,
                             spec,
-                            classify_envelope_section(None, spec.empty_policy),
+                            classify_envelope_section(None),
                             refresh_source=refresh_source,
                             own_lock=False,
                         )
@@ -785,7 +784,6 @@ async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False,
         device,
         client,
         wire_name="interface-attributes",
-        empty_policy=EmptyPolicy.present,
         family_name="interface_attributes",
     )
     attrs_available = isinstance(attrs_outcome, Present)
@@ -912,7 +910,6 @@ async def detect_drift(device_id: int, db: AsyncSession) -> dict:
         device,
         client,
         wire_name="interface-attributes",
-        empty_policy=EmptyPolicy.present,
         family_name="interface_attributes",
     )
     if isinstance(attrs_outcome, Present):

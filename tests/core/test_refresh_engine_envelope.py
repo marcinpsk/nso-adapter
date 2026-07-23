@@ -20,7 +20,6 @@ from sqlalchemy import select
 from nso_adapter.core.refresh_engine import run_family_refresh, run_family_refresh_from_section
 from nso_adapter.core.static_route import STATIC_ROUTE_SPEC
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
-from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, DeviceStaticRoute, RefreshOutcome
 from tests.conftest import seed_device
@@ -230,26 +229,17 @@ async def test_escalation_output_missing_the_section_keeps_rows(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_device_absent_clears_a_pop_family(adapter_client):
-    """Section None = device unknown to a HEALTHY export — pop semantics preserved."""
+async def test_device_absent_keeps_rows_for_every_family(adapter_client):
+    """READSEM S5 (1327): section None = device unknown to a HEALTHY export. With ``empty_policy``
+    retired, device-absence resolves UNIFORMLY to ``Unavailable(not_authoritative)`` — KEEP the
+    last-known rows for EVERY family (was: pop families cleared). A device blip must never wipe a
+    mirror; a true removal is handled by the device-lifecycle deleting the Device row."""
     device_id = await seed_device(nso_device_name="eng-env-devgone", netbox_device_id=9710)
     await _seed_one_route(device_id)
     async with _device_session(device_id) as (db, device):
         ok = await run_family_refresh(db, device, _client(section=None), ENV_SPEC)
 
-        assert ok is True
-        assert await _routes(db, device_id) == []
-
-
-@pytest.mark.anyio
-async def test_device_absent_keeps_a_present_family(adapter_client):
-    device_id = await seed_device(nso_device_name="eng-env-devkeep", netbox_device_id=9711)
-    await _seed_one_route(device_id)
-    present_spec = dataclasses.replace(ENV_SPEC, empty_policy=EmptyPolicy.present)
-    async with _device_session(device_id) as (db, device):
-        ok = await run_family_refresh(db, device, _client(section=None), present_spec)
-
-        assert ok is True
+        assert ok is True  # not_authoritative = declared absence → kept, not a degraded surface
         assert await _routes(db, device_id) == ["10.0.0.0/8"]
 
 
@@ -265,26 +255,6 @@ async def test_export_down_keeps_rows(adapter_client):
 
         assert ok is False
         assert await _routes(db, device_id) == ["10.0.0.0/8"]
-
-
-# ── the legacy path must be untouched by the flip machinery ─────────────────────────
-
-
-@pytest.mark.anyio
-async def test_wire_name_none_never_touches_the_envelope(adapter_client):
-    """An unflipped family is byte-for-byte on the legacy getter — the mixed-mode guarantee."""
-    device_id = await seed_device(nso_device_name="eng-env-legacy", netbox_device_id=9713)
-    async with _device_session(device_id) as (db, device):
-        client = AsyncMock(spec=NsoClient)
-        client.get_static_routes.return_value = {"route": [{"vrf": "", "prefix": "192.0.2.0/24", "next-hop": "x"}]}
-
-        legacy_spec = dataclasses.replace(STATIC_ROUTE_SPEC, wire_name=None)
-        ok = await run_family_refresh(db, device, client, legacy_spec)
-
-        assert ok is True
-        assert await _routes(db, device_id) == ["192.0.2.0/24"]
-        client.get_device_state_section.assert_not_awaited()
-        client.run_device_state_read.assert_not_awaited()
 
 
 # ── run_family_refresh_from_section (grains b/c) ────────────────────────────────────

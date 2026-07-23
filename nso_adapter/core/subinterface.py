@@ -17,7 +17,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceSubinterface
 
@@ -50,8 +49,6 @@ async def _upsert_subinterface(db: AsyncSession, device: Device, interfaces: lis
 
 SUBINTERFACE_SPEC = FamilySpec(
     name="subinterface",
-    empty_policy=EmptyPolicy.pop,
-    getter=lambda client, name: client.get_subinterface(name),
     extract=lambda data: as_list(data.get("interface")),
     materialize=_upsert_subinterface,
     wire_name="subinterface",  # READSEM S3: fetch from the device-state envelope

@@ -234,166 +234,6 @@ class NsoClient:
                     return device_type[key].get("ned-id")
             return None
 
-    async def _get_device_oper_entry(self, resource: str, device_name: str, *, confirm_404: bool) -> dict | None:
-        """GET one device's entry from a ``network-state-export`` oper-data list.
-
-        *resource* is the top-level list name (e.g. ``"snmp-config"``). Returns that device's
-        entry dict, or None when the device is genuinely absent from a HEALTHY export.
-
-        A per-device 404 is ambiguous: NSO returns it both for a device that simply carries none
-        of this config AND when the whole export is unavailable (package not loaded, mid-`packages
-        reload`, callpoint erroring) — in which case EVERY device 404s at once. Callers whose
-        refresher DELETES the mirror on None (``confirm_404=True``, the clear-on-None families)
-        must never act on the latter, so the 404 is confirmed against the parent container first:
-        container reachable → this device really is absent → None (delete is correct); container
-        unreachable → raise NsoExportUnavailableError, and the caller's degraded path (`except` →
-        keep rows) fires instead of wiping the fleet. The extra GET only ever runs on the 404 path.
-
-        Why the container probe is sound even when the resource is GLOBALLY empty (the last device
-        removed its config): every network-state-export top container carries ``tailf:callpoint`` on
-        the container itself (not merely on its ``device`` list), so a GET on the container is served
-        by the callpoint — returning ``{"device": []}`` with 200 — whenever the package is loaded,
-        and 404s ONLY when the callpoint is unregistered (package not loaded / mid-reload). So an
-        empty-but-healthy resource is a container-200 (→ None → clear the last device), never a
-        container-404. A container-404 is unambiguously "the export is down".
-
-        Keep-on-None callers (interface-ip / interface-attributes) pass ``confirm_404=False``: they
-        never delete on None, so the ambiguity is harmless and the container probe is skipped.
-
-        Raises httpx.HTTPStatusError on other errors.
-        """
-        base = f"{self._base}/restconf/data/network-state-export:{resource}"
-        async with self._client() as c:
-            resp = await c.get(f"{base}/device={_url_key(device_name)}")
-            if resp.status_code == 404:
-                if confirm_404:
-                    probe = await c.get(base)
-                    if probe.status_code == 404:
-                        raise NsoExportUnavailableError(
-                            f"network-state-export:{resource} is not exported by NSO — refusing to "
-                            f"read {device_name!r}'s 404 as 'this device has no {resource}'. Treating "
-                            "it that way would DELETE the mirrored rows for every device at once."
-                        )
-                    probe.raise_for_status()
-                return None
-            resp.raise_for_status()
-            data = resp.json()
-            entries = data.get("network-state-export:device") or data.get("device", [])
-            return entries[0] if entries else None
-
-    async def get_lag_topology(self, device_name: str) -> dict | None:
-        """Return the lag-topology entry for *device_name*, or None if it genuinely has none.
-
-        Clear-on-None caller → a bare 404 is confirmed against the parent container first
-        (see _get_device_oper_entry). Raises httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("lag-topology", device_name, confirm_404=True)
-
-    async def get_svi(self, device_name: str) -> dict | None:
-        """Return the svi entry for *device_name*, or None if it genuinely has none.
-
-        Clear-on-None caller → a bare 404 is confirmed against the parent container first
-        (see _get_device_oper_entry). Raises httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("svi", device_name, confirm_404=True)
-
-    async def get_subinterface(self, device_name: str) -> dict | None:
-        """Return the subinterface entry for *device_name*, or None if it genuinely has none.
-
-        Clear-on-None caller → a bare 404 is confirmed against the parent container first
-        (see _get_device_oper_entry). Raises httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("subinterface", device_name, confirm_404=True)
-
-    async def get_interface_mtu(self, device_name: str) -> dict | None:
-        """Return the interface-mtu entry for *device_name*, or None if it genuinely has none (Phase 2b).
-
-        Clear-on-None caller → a bare 404 is confirmed against the parent container first
-        (see _get_device_oper_entry). Raises httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("interface-mtu", device_name, confirm_404=True)
-
-    async def get_lag_config(self, device_name: str) -> dict | None:
-        """Return the lag-config entry for *device_name*, or None if it genuinely has none.
-
-        Clear-on-None caller → a bare 404 is confirmed against the parent container first
-        (see _get_device_oper_entry). Raises httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("lag-config", device_name, confirm_404=True)
-
-    async def get_vlan_database(self, device_name: str) -> dict | None:
-        """Return the vlan-database entry for *device_name*, or None if it genuinely has none.
-
-        Clear-on-None caller → a bare 404 is confirmed against the parent container first
-        (see _get_device_oper_entry). Raises httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("vlan-database", device_name, confirm_404=True)
-
-    async def get_switchport(self, device_name: str) -> dict | None:
-        """Return the switchport entry for *device_name*, or None if it genuinely has none.
-
-        Clear-on-None caller → a bare 404 is confirmed against the parent container first
-        (see _get_device_oper_entry). Raises httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("switchport", device_name, confirm_404=True)
-
-    async def get_interface_ips(self, device_name: str) -> dict | None:
-        """Return the interface-ip entry for *device_name* (None on 404).
-
-        Keep-on-None caller (present-empty inventory family) → confirm_404=False, no container
-        probe (see _get_device_oper_entry). Raises httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("interface-ip", device_name, confirm_404=False)
-
-    async def get_interface_attributes(self, device_name: str) -> dict | None:
-        """Return the interface-attributes entry for *device_name* (None on 404 or empty list).
-
-        Keep-on-None caller (present-empty inventory family) → confirm_404=False, no container
-        probe (see _get_device_oper_entry). Raises httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("interface-attributes", device_name, confirm_404=False)
-
-    async def get_snmp_config(self, device_name: str) -> dict | None:
-        """Return the snmp-config entry for *device_name*, or None if it genuinely has none.
-
-        Clear-on-None caller (`refresh_snmp_config_for_device` DELETES the mirror on None) → a bare
-        404 is confirmed against the parent container first (see _get_device_oper_entry). Raises
-        httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("snmp-config", device_name, confirm_404=True)
-
-    async def get_logging_config(self, device_name: str) -> dict | None:
-        """Return the logging-config entry for *device_name*, or None if it genuinely has none.
-
-        Clear-on-None caller → a bare 404 is confirmed against the parent container first
-        (see _get_device_oper_entry). Raises httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("logging-config", device_name, confirm_404=True)
-
-    async def get_static_routes(self, device_name: str) -> dict | None:
-        """Return the static-route entry for *device_name*, or None if it genuinely has none.
-
-        Clear-on-None caller → a bare 404 is confirmed against the parent container first
-        (see _get_device_oper_entry). Raises httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("static-route", device_name, confirm_404=True)
-
-    async def get_l2_services(self, device_name: str) -> dict | None:
-        """Return the l2-service entry for *device_name*, or None if it genuinely has none.
-
-        Clear-on-None caller → a bare 404 is confirmed against the parent container first
-        (see _get_device_oper_entry). Raises httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("l2-service", device_name, confirm_404=True)
-
-    async def get_isis_interfaces(self, device_name: str) -> dict | None:
-        """Return the isis-interface entry for *device_name*, or None if it genuinely has none.
-
-        Clear-on-None caller → a bare 404 is confirmed against the parent container first
-        (see _get_device_oper_entry). Raises httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("isis-interface", device_name, confirm_404=True)
-
     async def get_service_config(self, service_path: str, device_name: str) -> dict | None:
         """Return the device's current reconciler service instance, or None when absent.
 
@@ -414,39 +254,6 @@ class NsoClient:
             entries = data.get(root) or data.get(root.split(":", 1)[-1], [])
             return entries[0] if entries else None
 
-    async def get_bgp_config(self, device_name: str) -> dict | None:
-        """Return the bgp-config entry for *device_name*, or None if it genuinely has none.
-
-        Clear-on-None caller → a bare 404 is confirmed against the parent container first
-        (see _get_device_oper_entry). Raises httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("bgp-config", device_name, confirm_404=True)
-
-    async def get_route_policy(self, device_name: str) -> dict | None:
-        """Return the route-policy entry for *device_name*, or None if it genuinely has none.
-
-        Clear-on-None caller (`refresh_route_policy_for_device` DELETES the mirror on None) → a bare
-        404 is confirmed against the parent container first (see _get_device_oper_entry). Raises
-        httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("route-policy", device_name, confirm_404=True)
-
-    async def get_ospf(self, device_name: str) -> dict | None:
-        """Return the ospf-config entry for *device_name*, or None if it genuinely has none.
-
-        Clear-on-None caller → a bare 404 is confirmed against the parent container first
-        (see _get_device_oper_entry). Raises httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("ospf-config", device_name, confirm_404=True)
-
-    async def get_bfd_config(self, device_name: str) -> dict | None:
-        """Return the bfd-config entry for *device_name* (per-interface BFD), or None if it genuinely has none.
-
-        Clear-on-None caller → a bare 404 is confirmed against the parent container first
-        (see _get_device_oper_entry). Raises httpx.HTTPStatusError on other errors.
-        """
-        return await self._get_device_oper_entry("bfd-config", device_name, confirm_404=True)
-
     # ── device-state envelope (READSEM S3) — status-declared per-family reads ─────────
 
     async def get_device_state_section(self, device_name: str, wire_family: str) -> dict | None:
@@ -460,9 +267,8 @@ class NsoClient:
 
         A section on an EXISTING device always serves (the status leaf is always set), so a
         404 here can only mean the device is unknown to NSO — or the whole export is down.
-        The ambiguity is resolved exactly like :meth:`_get_device_oper_entry`: probe the
-        ``device-state`` container; alive → None (device genuinely absent); container 404 →
-        raise :class:`NsoExportUnavailableError`.
+        The ambiguity is resolved by probing the ``device-state`` container: alive → None
+        (device genuinely absent); container 404 → raise :class:`NsoExportUnavailableError`.
         """
         base = f"{self._base}/restconf/data/network-state-export:device-state"
         async with self._client() as c:

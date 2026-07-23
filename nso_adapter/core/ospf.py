@@ -16,7 +16,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceOspfInstance, DeviceOspfInterface
 
@@ -95,8 +94,6 @@ async def _materialize_ospf(db: AsyncSession, device: Device, entry: dict, refre
 
 OSPF_SPEC = FamilySpec(
     name="ospf",
-    empty_policy=EmptyPolicy.pop,  # config family: a container-confirmed 404 is an authoritative clear
-    getter=lambda client, name: client.get_ospf(name),
     extract=lambda data: data,
     materialize=_materialize_ospf,
     wire_name="ospf-config",  # READSEM S3: fetch from the device-state envelope

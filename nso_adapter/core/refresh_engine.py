@@ -3,8 +3,9 @@
 """The shared read-mirror refresh engine (READSEM S1).
 
 One executor replaces the ~18 copy-pasted ``refresh_<family>_for_device`` bodies. Each family
-declares a :class:`FamilySpec` (getter + empty-policy + extractor + materializer); the engine
-does the invariant part uniformly — skip unmapped devices, read once, classify the result into
+declares a :class:`FamilySpec` (wire_name + extractor + materializer); the engine does the
+invariant part uniformly — skip unmapped devices, read the device-state envelope section once,
+classify the result into
 the :data:`~nso_adapter.nso.read_outcome.ReadOutcome` vocabulary, and drive the mirror action:
 
 * **Present** → materialize the extracted rows (a present-but-empty read replaces → clears).
@@ -31,13 +32,11 @@ from nso_adapter.core.cancelsafe import await_uncancellable
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
-    EmptyPolicy,
     Present,
     ReadOutcome,
     Unavailable,
     UnavailableReason,
     classify_envelope_section,
-    classify_read,
 )
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device
@@ -139,18 +138,14 @@ class FamilySpec:
     """Declarative description of one read-mirror family (the policy-table row).
 
     * ``name`` — the surface name used in logs and degraded-surface lists (e.g. ``"static_route"``).
-    * ``empty_policy`` — how a ``None`` read is interpreted (see :class:`EmptyPolicy`).
-    * ``getter`` — ``(client, device_name) -> Awaitable[dict | None]``; the existing
-      ``NsoClient.get_*`` coroutine (so mocks that patch the getter keep working).
     * ``extract`` — ``data -> payload``; pull the family's payload out of the read entry. A
       single-table family returns its row ``list``; a multi-table family (bgp, isis, snmp, …)
       can return the whole entry ``dict`` (or any structure) for its materializer to destructure.
     * ``materialize`` — ``(db, device, payload, refresh_source) -> Awaitable[None]``; the
       family-owned full-replace/upsert that also commits.
-    * ``wire_name`` — the device-state envelope section name (e.g. ``"static-route"``).
-      **This is the READSEM S3 fetch-source flip**: ``None`` keeps the legacy per-family
-      getter path byte-for-byte; set, the engine reads the family's envelope section
-      (status-declared) and ``getter`` goes unused. Flips per family, one line each.
+    * ``wire_name`` — the device-state envelope section name (e.g. ``"static-route"``). Every
+      family reads its envelope section (status-declared); READSEM S5 retired the legacy
+      per-family getters + the ``empty_policy`` pop/present column.
 
     An authoritative clear (``AbsentAuthoritative``) is expressed by feeding the extractor an
     empty entry ``{}`` — so ``extract({})`` yields the family's "nothing" payload (``[]`` for a
@@ -159,16 +154,12 @@ class FamilySpec:
     """
 
     name: str
-    empty_policy: EmptyPolicy
-    getter: Callable[[NsoClient, str], Awaitable[dict | None]]
     extract: Callable[[dict], object]
     materialize: Callable[[AsyncSession, Device, object, str], Awaitable[None]]
-    wire_name: str | None = None
+    wire_name: str
 
 
-async def _escalate_not_ready(
-    device: Device, nso_client: NsoClient, wire_name: str, empty_policy: EmptyPolicy
-) -> ReadOutcome:
+async def _escalate_not_ready(device: Device, nso_client: NsoClient, wire_name: str) -> ReadOutcome:
     """``not-ready`` → ONE ``device-state-read run`` for this family (READSEM S3).
 
     The envelope never extracts and its records are in-process — after a `packages reload`
@@ -186,7 +177,7 @@ async def _escalate_not_ready(
     section = output.get(wire_name)
     if section is None:
         return Unavailable(UnavailableReason.read_error, detail="action output missing the requested section")
-    outcome = classify_envelope_section(section, empty_policy)
+    outcome = classify_envelope_section(section)
     if isinstance(outcome, Unavailable) and outcome.reason is UnavailableReason.not_ready:
         return Unavailable(UnavailableReason.read_error, detail="action returned not-ready (contract violation)")
     return outcome
@@ -197,7 +188,6 @@ async def classify_envelope_family_read(
     nso_client: NsoClient,
     *,
     wire_name: str,
-    empty_policy: EmptyPolicy,
     family_name: str,
 ) -> ReadOutcome:
     """Envelope section GET + classification + single-shot not-ready escalation.
@@ -213,27 +203,20 @@ async def classify_envelope_family_read(
         return Unavailable(UnavailableReason.export_down, detail=repr(exc))
     except Exception as exc:  # noqa: BLE001 — any read failure is Unavailable; the mirror is kept
         return Unavailable(UnavailableReason.read_error, detail=repr(exc))
-    outcome = classify_envelope_section(section, empty_policy)
+    outcome = classify_envelope_section(section)
     if isinstance(outcome, Unavailable) and outcome.reason is UnavailableReason.not_ready:
         logger.info(
             f"{family_name}.refresh.not_ready_escalating",
             device_id=device.id,
             device_name=device.nso_device_name,
         )
-        outcome = await _escalate_not_ready(device, nso_client, wire_name, empty_policy)
+        outcome = await _escalate_not_ready(device, nso_client, wire_name)
     return outcome
 
 
 async def _classify_family_read(device: Device, nso_client: NsoClient, spec: FamilySpec) -> ReadOutcome:
-    """Read + classify one family for one device, honoring the spec's fetch source."""
-    if spec.wire_name is None:
-        return await classify_read(
-            lambda: spec.getter(nso_client, device.nso_device_name),
-            spec.empty_policy,
-        )
-    return await classify_envelope_family_read(
-        device, nso_client, wire_name=spec.wire_name, empty_policy=spec.empty_policy, family_name=spec.name
-    )
+    """Read + classify one family for one device from its device-state envelope section."""
+    return await classify_envelope_family_read(device, nso_client, wire_name=spec.wire_name, family_name=spec.name)
 
 
 async def run_family_refresh(
@@ -280,8 +263,8 @@ async def run_family_refresh_from_section(
 
     ``section`` must be a real section dict. Supplier-level failures (action error, doc GET
     failure) and confirmed DEVICE absence are NOT sections — represent them explicitly via
-    :func:`run_family_refresh_from_outcome`; normalizing them to ``None`` here would classify
-    as device-absence and WIPE every pop family (codex S3-R1 F8).
+    :func:`run_family_refresh_from_outcome`; normalizing them to ``None`` here would misclassify
+    a supplier failure as a clean device read (codex S3-R1 F8).
     """
     if section is None:
         raise ValueError(
@@ -292,7 +275,7 @@ async def run_family_refresh_from_section(
         db,
         device,
         spec,
-        classify_envelope_section(section, spec.empty_policy),
+        classify_envelope_section(section),
         refresh_source=refresh_source,
         own_lock=own_lock,
     )

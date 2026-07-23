@@ -18,7 +18,6 @@ from sqlalchemy.orm import selectinload
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import (
     Device,
@@ -100,8 +99,6 @@ async def _upsert_vlans(
 
 VLAN_DATABASE_SPEC = FamilySpec(
     name="vlan",
-    empty_policy=EmptyPolicy.pop,  # config family: a container-confirmed 404 is an authoritative clear
-    getter=lambda client, name: client.get_vlan_database(name),
     # as_list guards the singleton-rendered-as-bare-dict case; extract({}) → [] → prune all (clear).
     extract=lambda data: as_list(data.get("vlan") or data.get("vlans")),
     materialize=_upsert_vlans,
@@ -183,8 +180,6 @@ async def _upsert_switchports(
 
 SWITCHPORT_SPEC = FamilySpec(
     name="switchport",
-    empty_policy=EmptyPolicy.pop,  # config family: a container-confirmed 404 is an authoritative clear
-    getter=lambda client, name: client.get_switchport(name),
     # as_list guards the singleton-rendered-as-bare-dict case; extract({}) → [] → prune all (clear).
     extract=lambda data: as_list(data.get("interface") or data.get("interfaces")),
     materialize=_upsert_switchports,

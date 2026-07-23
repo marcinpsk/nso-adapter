@@ -94,7 +94,7 @@ async def test_refresh_lag_topology_happy(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_refresh_lag_topology_clears_on_404(adapter_client):
+async def test_refresh_lag_topology_clears_on_authoritative_empty(adapter_client):
     device_id = await seed_device(nso_device_name="sw03", netbox_device_id=901)
     async with _device_session(device_id) as (db, device):
         db.add(
@@ -109,7 +109,7 @@ async def test_refresh_lag_topology_clears_on_404(adapter_client):
         await db.commit()
 
         nso_client = AsyncMock()
-        nso_client.get_device_state_section.return_value = None
+        nso_client.get_device_state_section.return_value = {"status": "ok"}
 
         await refresh_lag_topology_for_device(db, device, nso_client, refresh_source="poll")
 

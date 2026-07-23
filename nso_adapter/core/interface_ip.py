@@ -17,7 +17,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, InterfaceIpAddress
 
@@ -62,16 +61,13 @@ async def _upsert_ip_addresses(
     await db.commit()
 
 
-# interface_ip is a keep-on-None PRESENT-EMPTY "inventory" family: a synced device always
-# returns a 200 (a present entry, empty `interface: []` when it genuinely has no addresses —
-# see network-state-export ips.py `_refresh_device`), so a client `None` (404) means only
-# unsupported-NED / unknown / not-ready and must NOT wipe the mirror. That semantics is now
-# DECLARED as EmptyPolicy.present (the engine keeps rows + reports success on that 404, and
-# still full-replaces to empty on a real present-empty read) — no longer per-file prose.
+# interface_ip is a PRESENT-EMPTY "inventory" family: a synced device always returns a 200 (a
+# present entry, empty `interface: []` when it genuinely has no addresses — see
+# network-state-export ips.py `_refresh_device`). Under the device-state envelope the meaning is
+# read straight off the `status` leaf (ok+empty full-replaces to empty; unsupported/error/absent
+# keep the mirror) — READSEM S5 retired the per-family `empty_policy` pop/present column.
 INTERFACE_IP_SPEC = FamilySpec(
     name="interface_ip",
-    empty_policy=EmptyPolicy.present,
-    getter=lambda client, name: client.get_interface_ips(name),
     extract=lambda data: as_list(data.get("interface")),
     materialize=_upsert_ip_addresses,
     wire_name="interface-ip",  # READSEM S3: fetch from the device-state envelope

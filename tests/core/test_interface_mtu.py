@@ -76,7 +76,8 @@ async def test_refresh_full_replace(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_refresh_none_clears(adapter_client):
+async def test_refresh_authoritative_empty_clears(adapter_client):
+    """An authoritatively-empty read (status=ok, no list keys) clears the rows. (Device-absence, section None, now KEEPS — READSEM S5.)"""
     device_id = await seed_device(nso_device_name="mtu-rtr03", netbox_device_id=982)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
@@ -85,6 +86,6 @@ async def test_refresh_none_clears(adapter_client):
             "interface": [{"interface-name": "ae10", "mtu": 9192}],
         }
         await refresh_interface_mtu_for_device(db, device, nso_client, refresh_source="test")
-        nso_client.get_device_state_section.return_value = None
+        nso_client.get_device_state_section.return_value = {"status": "ok"}
         await refresh_interface_mtu_for_device(db, device, nso_client, refresh_source="test")
         assert await _rows(db, device_id) == {}

@@ -1831,7 +1831,6 @@
               {
                 "enum": [
                   "fresh",
-                  "aged",
                   "stale"
                 ],
                 "type": "string"

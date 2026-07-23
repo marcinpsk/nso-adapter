@@ -62,7 +62,7 @@ def _client() -> NsoClient:
 async def main() -> None:
     init_db(get_config().database_url)
     c = _client()
-    rp = await c.get_route_policy(SRC)
+    rp = await c.get_device_state_section(SRC, "route-policy")
     rm = next((x for x in (rp.get("route-map") or []) if x["name"] == RM_NAME), None)
     if rm is None:
         print(f"route-map {RM_NAME} not found on {SRC}")

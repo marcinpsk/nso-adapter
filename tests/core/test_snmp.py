@@ -232,16 +232,13 @@ async def test_refresh_handles_nso_none_gracefully(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_refresh_clears_stale_rows_when_device_reports_none(adapter_client):
-    """Operator removed all SNMP config → export 404s (client → None) → mirror CLEARS.
+async def test_refresh_clears_stale_rows_on_authoritative_empty(adapter_client):
+    """Operator removed all SNMP config → the envelope serves status=ok with no
+    community/v3-user/host lists (RESTCONF omits empty lists) → mirror CLEARS.
 
-    snmp-config is a pop-on-empty export family: a synced device that genuinely carries
-    no SNMP config 404s (never a present-empty entry), and per the export's deliberate
-    design that None is authoritative. So the adapter must delete the previously-mirrored
-    rows to match — unlike interface_ip (a present-empty family that keeps-on-None).
-
-    RED against the old ``if not entry: return True`` keep-guard, which left the rows
-    stranded forever after a legitimate removal.
+    An authoritative-empty read (ok + absent list keys) is the device genuinely carrying no SNMP
+    config, so the adapter deletes the previously-mirrored rows to match. (READSEM S5: device
+    ABSENCE — section None — now KEEPS rows instead; the clear signal is ok-empty, not None.)
     """
     device_id = await seed_device(nso_device_name="snmp-clear-sw01", netbox_device_id=969)
     async with _device_session(device_id) as (db, device):
@@ -263,11 +260,11 @@ async def test_refresh_clears_stale_rows_when_device_reports_none(adapter_client
             rows = (await db.execute(select(model).where(model.device_id == device.id))).scalars().all()
             assert rows, f"{model.__name__} should be seeded before the clear"
 
-        # Second refresh — the export now 404s (operator removed all SNMP config).
-        nso_client.get_device_state_section.return_value = None
+        # Second refresh — the operator removed all SNMP config: status=ok, no list keys.
+        nso_client.get_device_state_section.return_value = {"status": "ok", "name": "snmp-clear-sw01"}
         result = await refresh_snmp_config_for_device(db, device, nso_client, refresh_source="poll")
 
-        # A clean 404 is a successful (authoritative-empty) read, not a degraded one.
+        # An authoritative-empty read is a successful read, not a degraded one.
         assert result is True
         # Every table must be cleared — no stale rows survive the removal.
         for model in (SnmpCommunity, SnmpV3User, SnmpHost, SnmpSystemInfo):

@@ -94,9 +94,9 @@ async def test_refresh_switchport_links_vlans(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_refresh_vlan_database_device_absent_prunes_all(adapter_client):
-    """A confirmed DEVICE absence (section None, container alive) prunes every VLAN row
-    for this pop family (authoritative clear) — the S3 shape of the old None case."""
+async def test_refresh_vlan_database_authoritative_empty_prunes_all(adapter_client):
+    """An authoritatively-empty read (status=ok, no vlan list — RESTCONF omits empties) prunes
+    every VLAN row for this pop family. (Device-absence, section None, now KEEPS — READSEM S5.)"""
     device_id = await seed_device(nso_device_name="vsw-clr", netbox_device_id=1302)
     async with _device_session(device_id) as (db, device):
         nso = AsyncMock()
@@ -105,7 +105,7 @@ async def test_refresh_vlan_database_device_absent_prunes_all(adapter_client):
         await refresh_vlan_database_for_device(db, device, nso)
         assert (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))).scalars().all()
 
-        sections["vlan-database"] = None  # device unknown to a HEALTHY export → clear
+        sections["vlan-database"] = {"status": "ok"}  # authoritative empty → clear
         ok = await refresh_vlan_database_for_device(db, device, nso)
         assert ok is True
         rows = (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))).scalars().all()
@@ -130,8 +130,9 @@ async def test_refresh_vlan_database_keep_on_export_down(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_refresh_switchport_device_absent_prunes_all(adapter_client):
-    """A confirmed device absence prunes every switchport row (authoritative clear)."""
+async def test_refresh_switchport_authoritative_empty_prunes_all(adapter_client):
+    """An authoritatively-empty read (status=ok, no interface list) prunes every switchport row.
+    (Device-absence, section None, now KEEPS — READSEM S5.)"""
     device_id = await seed_device(nso_device_name="vsw-sp-clr", netbox_device_id=1304)
     async with _device_session(device_id) as (db, device):
         nso = AsyncMock()
@@ -144,7 +145,7 @@ async def test_refresh_switchport_device_absent_prunes_all(adapter_client):
             (await db.execute(select(DeviceSwitchport).where(DeviceSwitchport.device_id == device.id))).scalars().all()
         )
 
-        sections["switchport"] = None
+        sections["switchport"] = {"status": "ok"}  # authoritative empty → clear
         ok = await refresh_switchport_for_device(db, device, nso)
         assert ok is True
         rows = (

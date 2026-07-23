@@ -12,7 +12,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceBfdInterface
 
@@ -53,8 +52,6 @@ async def _upsert_bfd_data(
 
 BFD_SPEC = FamilySpec(
     name="bfd",
-    empty_policy=EmptyPolicy.pop,
-    getter=lambda client, name: client.get_bfd_config(name),
     # as_list guards the singleton-rendered-as-bare-dict case (was a raw .get → crash).
     extract=lambda data: as_list(data.get("interface")),
     materialize=_upsert_bfd_data,

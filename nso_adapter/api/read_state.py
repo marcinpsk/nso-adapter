@@ -58,7 +58,7 @@ class FamilyReadState(BaseModel):
 
     outcome: Literal["present", "absent_authoritative", "unavailable"]
     reason: Literal["export_down", "read_error", "not_authoritative", "unsupported", "not_ready"] | None = None
-    freshness: Literal["fresh", "aged", "stale"] | None = None
+    freshness: Literal["fresh", "stale"] | None = None
     # 'error' included deliberately: the engine terminalizes materializer failures as
     # result="error"/succeeded=False (refresh_engine) — a narrower literal would
     # response-validation-fail those real rows (codex R1-F3).

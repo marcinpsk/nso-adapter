@@ -17,7 +17,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.core.isis_canon import isis_level
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, DeviceIsisInterface, DeviceIsisProcess
 
@@ -174,8 +173,6 @@ async def _materialize_isis(db: AsyncSession, device: Device, entry: dict, refre
 
 ISIS_SPEC = FamilySpec(
     name="isis",
-    empty_policy=EmptyPolicy.pop,  # config family: a container-confirmed 404 is an authoritative clear
-    getter=lambda client, name: client.get_isis_interfaces(name),
     extract=lambda data: data,
     materialize=_materialize_isis,
     wire_name="isis-interface",  # READSEM S3: fetch from the device-state envelope

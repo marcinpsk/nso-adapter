@@ -23,7 +23,6 @@ from nso_adapter.core.refresh_engine import classify_envelope_family_read
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
-    EmptyPolicy,
     Freshness,
     Present,
     ReadOutcome,
@@ -162,7 +161,6 @@ async def refresh_redistribution_for_device(
                 device,
                 nso_client,
                 wire_name=wire_name,
-                empty_policy=EmptyPolicy.pop,
                 family_name=f"redistribution.{proto}",
             )
         return await refresh_redistribution_from_outcomes(
@@ -219,18 +217,18 @@ async def refresh_redistribution_from_outcomes(
     # Merged phase-1 outcome, recorded BEFORE any mutation — the COMPLETE terminal
     # contract (READSEM S4 D7). Buckets: replaced = authoritative (Present rebuilds /
     # AbsentAuthoritative clears its partition), errors = retained by a real failure,
-    # unsupported = declared no-reader (deliberately non-failing, the ArcOS asymmetry).
+    # kept_nonfailing = declared no-reader (unsupported — the ArcOS asymmetry) OR device-level
+    # absence (not_authoritative — READSEM S5 keep-rows): deliberately non-failing, exactly as
+    # every FamilySpec family treats them (_apply_outcome), so a device-absent read is a KEPT
+    # success here too, never a false degrade.
+    _NONFAILING_KEEP = (UnavailableReason.unsupported, UnavailableReason.not_authoritative)
     assert _REDIST_COMPONENTS, "empty _REDIST_COMPONENTS is a programming error"
     replaced = [p for p, o in outcomes.items() if not isinstance(o, Unavailable)]
-    errors = [
-        p for p, o in outcomes.items() if isinstance(o, Unavailable) and o.reason is not UnavailableReason.unsupported
-    ]
-    unsupported_only = [
-        p for p, o in outcomes.items() if isinstance(o, Unavailable) and o.reason is UnavailableReason.unsupported
-    ]
-    # Worst freshness among the REPLACED authoritative components: fresh < aged < stale
-    # (SA-1 — a lone stale check silently demoted aged to fresh).
-    _FRESHNESS_RANK = {Freshness.fresh: 0, Freshness.aged: 1, Freshness.stale: 2}
+    errors = [p for p, o in outcomes.items() if isinstance(o, Unavailable) and o.reason not in _NONFAILING_KEEP]
+    kept_nonfailing = [p for p, o in outcomes.items() if isinstance(o, Unavailable) and o.reason in _NONFAILING_KEEP]
+    # Worst freshness among the REPLACED authoritative components: fresh < stale
+    # (READSEM S5 retired the `aged` approximation — the envelope carries `stale` directly).
+    _FRESHNESS_RANK = {Freshness.fresh: 0, Freshness.stale: 1}
     worst_freshness = max(
         (o.freshness for o in outcomes.values() if isinstance(o, Present)),
         key=lambda f: _FRESHNESS_RANK[f],
@@ -248,13 +246,14 @@ async def refresh_redistribution_from_outcomes(
         # Nothing replaced, at least one real failure → unavailable with the WORST reason.
         merged = Unavailable(
             _worst_reason([o for o in outcomes.values() if isinstance(o, Unavailable)]),
-            detail=f"components kept: {sorted(errors + unsupported_only)}",
+            detail=f"components kept: {sorted(errors + kept_nonfailing)}",
         )
         terminal_result, terminal_succeeded, composite_ok = "kept", False, False
     else:
-        # All components declared unsupported: nothing was read — never claim
-        # fresh-present/replaced. Still a non-failure (no partial).
-        merged = Unavailable(UnavailableReason.unsupported)
+        # All components are non-failing keeps (unsupported and/or device-absent
+        # not_authoritative): nothing was read — never claim fresh-present/replaced, but this is a
+        # KEPT SUCCESS (no partial), carrying the most severe of the keep reasons for telemetry.
+        merged = Unavailable(_worst_reason([o for o in outcomes.values() if isinstance(o, Unavailable)]))
         terminal_result, terminal_succeeded, composite_ok = "kept", True, True
     attempt_id = None
     try:

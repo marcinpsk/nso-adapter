@@ -81,7 +81,7 @@ async def main() -> int:
 
     overall_clean = True
     for device_name, ned_id in targets:
-        read = await client.get_route_policy(device_name)
+        read = await client.get_device_state_section(device_name, "route-policy")
         if not read:
             print(f"{device_name}: no route-policy read data")
             continue

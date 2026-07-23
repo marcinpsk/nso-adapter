@@ -19,7 +19,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.nso.read_outcome import EmptyPolicy
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.models import Device, LagInterface, LagMember
 
@@ -94,8 +93,6 @@ async def _upsert_lags(
 
 LAG_TOPOLOGY_SPEC = FamilySpec(
     name="lag",
-    empty_policy=EmptyPolicy.pop,  # config family: a container-confirmed 404 is an authoritative clear
-    getter=lambda client, name: client.get_lag_topology(name),
     # as_list guards the singleton-rendered-as-bare-dict case; extract({}) → [] → clear.
     extract=lambda data: as_list(data.get("lag")),
     materialize=_upsert_lags,

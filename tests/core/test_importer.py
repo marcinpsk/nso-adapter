@@ -175,8 +175,9 @@ async def test_sync_device_creates_interface_rows(db_session: AsyncSession):
     assert ifaces[0].name == "GigabitEthernet0/1"
 
 
-async def test_sync_device_calls_get_interface_attributes(db_session: AsyncSession):
-    """sync_device() uses get_interface_attributes() instead of get_device_config() + normalize."""
+async def test_sync_device_reads_interface_attributes_from_the_envelope(db_session: AsyncSession):
+    """sync_device() reads interface-attributes via the device-state envelope section, not
+    get_device_config() + normalize (READSEM S5 retired the legacy interface-attributes getter)."""
     device = Device(
         nso_instance="nso-dev",
         nso_device_name="sw04",
@@ -1478,8 +1479,10 @@ async def test_projection_supplier_failure_keeps_pop_families(db_session: AsyncS
 
 
 @pytest.mark.anyio
-async def test_projection_device_absent_clears_pop_families(db_session: AsyncSession):
-    """Grain b: a confirmed device-level absence (doc GET None) clears pop families."""
+async def test_projection_device_absent_keeps_pop_families(db_session: AsyncSession):
+    """Grain b (READSEM S5): a confirmed device-level absence (doc GET None) now KEEPS pop families
+    — device-absence resolves to Unavailable(not_authoritative), not an authoritative clear. A true
+    removal is handled by offboard, never by a bare projection 404 wiping a mirror."""
     from sqlalchemy import select as _select
 
     from nso_adapter.core.importer import refresh_routing_surfaces_for_device
@@ -1494,15 +1497,18 @@ async def test_projection_device_absent_clears_pop_families(db_session: AsyncSes
     nso_client = AsyncMock(spec=NsoClient)
     nso_client.get_device_state_doc.return_value = None  # confirmed 404: device unknown to NSO
 
-    with patch("nso_adapter.core.redistribution.refresh_redistribution_for_device", AsyncMock(return_value=True)):
-        await refresh_routing_surfaces_for_device(db_session, device, nso_client, refresh_source="sync")
+    # Exercise the REAL redistribution path (projection calls refresh_redistribution_from_outcomes
+    # directly, not _for_device) — device-absence must be a KEPT SUCCESS for it too, so no surface
+    # is falsely reported as failed.
+    failed = await refresh_routing_surfaces_for_device(db_session, device, nso_client, refresh_source="sync")
 
+    assert "redistribution" not in failed, f"device-absence falsely degraded surfaces: {failed}"
     rows = (
         (await db_session.execute(_select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id)))
         .scalars()
         .all()
     )
-    assert rows == []
+    assert {r.prefix for r in rows} == {"10.7.0.0/16"}  # kept: device-absence no longer clears
 
 
 @pytest.mark.anyio

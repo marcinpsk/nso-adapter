@@ -70,7 +70,8 @@ async def test_refresh_full_replace(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_refresh_none_clears(adapter_client):
+async def test_refresh_authoritative_empty_clears(adapter_client):
+    """An authoritatively-empty read (status=ok, no list keys) clears the rows. (Device-absence, section None, now KEEPS — READSEM S5.)"""
     device_id = await seed_device(nso_device_name="svi-sw03", netbox_device_id=982)
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
@@ -79,6 +80,6 @@ async def test_refresh_none_clears(adapter_client):
             "interface": [{"interface-name": "Vlan10", "vlan-id": 10, "type": "svi"}],
         }
         await refresh_svi_for_device(db, device, nso_client, refresh_source="test")
-        nso_client.get_device_state_section.return_value = None
+        nso_client.get_device_state_section.return_value = {"status": "ok"}
         await refresh_svi_for_device(db, device, nso_client, refresh_source="test")
         assert await _svis(db, device_id) == {}

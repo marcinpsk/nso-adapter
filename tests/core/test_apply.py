@@ -2736,8 +2736,6 @@ async def test_run_apply_reader_compare_does_not_fail_a_landed_community(adapter
         "v3-user": [],
         "host": [],
     }
-    # reader-compare still reads the LEGACY getter (its migration is scoped separately)
-    mock_client.get_snmp_config.return_value = mock_client.get_device_state_section.return_value
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock),
@@ -2937,8 +2935,6 @@ async def test_run_apply_reader_compare_skips_a_fully_unrepresentable_community_
         "prefix-list": [],
         "route-map": [],
     }
-    # reader-compare still reads the LEGACY getter (its migration is scoped separately)
-    mock_client.get_route_policy.return_value = mock_client.get_device_state_section.return_value
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_route_policy_config", new_callable=AsyncMock),
