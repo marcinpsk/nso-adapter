@@ -25,6 +25,54 @@ class NsoExportUnavailableError(RuntimeError):
     """
 
 
+class NsoReadContractError(RuntimeError):
+    """A ``device-state-read`` action response that the server did not certify (READSEM 1328).
+
+    The action's contract is a single ATOMIC, device-scoped snapshot whose every section carries a
+    TERMINAL status (``ok|unsupported|error`` — never ``stale``/``not-ready``). A response that is
+    non-atomic, echoes the wrong device, or carries a non-terminal/malformed section is a
+    version-skew / proxy-garbage failure, NOT authoritative data. Raised so every consumer — the
+    not-ready escalation, the atomic importer, and the apply/removal verifiers — abstains and KEEPS
+    rows rather than materializing a fabricated section (an ok-empty one would wipe a pop family).
+    """
+
+
+# The only statuses a device-state-read action section may carry: the build is a terminal
+# extraction (never the record-served facade's stale/not-ready). See _certify_device_state_output.
+_TERMINAL_SECTION_STATUSES = frozenset({"ok", "unsupported", "error"})
+
+
+def _certify_device_state_output(output: object, device_name: str, wire_families: list[str]) -> None:
+    """Validate a ``device-state-read`` action response before any consumer trusts it (READSEM 1328).
+
+    Raises :class:`NsoReadContractError` unless the server certified an ATOMIC, device-scoped
+    snapshot whose every requested-and-present section is a dict with a TERMINAL status. Presence is
+    NOT required here (a missing requested section is the caller's to interpret — the escalation
+    reads it as read_error, the verifiers as a contract bug); this function only refuses a response
+    that would be actively misleading if walked.
+    """
+    if not isinstance(output, dict) or output.get("atomic") is not True:
+        raise NsoReadContractError(f"device-state-read for {device_name!r} did not certify an atomic snapshot")
+    echoed = output.get("device-name")
+    if echoed != device_name:
+        raise NsoReadContractError(
+            f"device-state-read echoed device {echoed!r}, expected {device_name!r} — refusing a "
+            "version-skewed / wrong-device snapshot"
+        )
+    for wire in wire_families:
+        section = output.get(wire)
+        if section is None:
+            continue
+        if not isinstance(section, dict):
+            raise NsoReadContractError(f"device-state-read section {wire!r} is not a dict")
+        status = section.get("status")
+        if status not in _TERMINAL_SECTION_STATUSES:
+            raise NsoReadContractError(
+                f"device-state-read section {wire!r} has non-terminal status {status!r} "
+                f"(expected one of {sorted(_TERMINAL_SECTION_STATUSES)})"
+            )
+
+
 def _url_key(value: str) -> str:
     """Percent-encode a value for use as a RESTCONF list-key URL path segment (RFC 8040).
 
@@ -499,6 +547,7 @@ class NsoClient:
             output = data.get("network-state-export:output")
             if output is None:
                 output = data.get("output", {})
+            _certify_device_state_output(output, device_name, wire_families)
             return output
 
     async def check_sync(self, device_name: str) -> bool:

@@ -17,7 +17,7 @@ import httpx
 import pytest
 
 from nso_adapter.config import NsoInstanceConfig
-from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
+from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError, NsoReadContractError
 
 
 def _make_client() -> NsoClient:
@@ -180,6 +180,7 @@ async def test_action_posts_module_qualified_input_and_returns_output(patch_clie
     action_body = {
         "network-state-export:output": {
             "atomic": True,
+            "device-name": "sw01",
             "last-updated": "2026-07-20T12:00:00+00:00",
             "ospf-config": {"status": "ok", "instance": []},
             "logging-config": {"status": "unsupported"},
@@ -207,7 +208,7 @@ async def test_action_error_raises_http_status_error(patch_client):
 async def test_action_runs_on_the_device_state_read_timeout(patch_client):
     """The whale (rc1: all-18 in 75.6s) outlives the 120s action timeout — 180s is load-bearing."""
     client = _make_client()
-    body = {"network-state-export:output": {"atomic": True}}
+    body = {"network-state-export:output": {"atomic": True, "device-name": "rc1", "ospf-config": {"status": "ok"}}}
     with patch_client(client, EnvelopeTransport(action_body=body)) as seen_timeouts:
         await client.run_device_state_read("rc1", ["ospf-config"])
     assert seen_timeouts == [client._device_state_read_timeout]
@@ -244,3 +245,72 @@ async def test_doc_malformed_200_raises_never_absence(patch_client, body):
     with patch_client(client, EnvelopeTransport(device_body=body)):
         with pytest.raises(NsoExportUnavailableError):
             await client.get_device_state_doc("sw01")
+
+
+# ── READSEM 1328: run_device_state_read certifies the snapshot before any consumer walks it ──
+
+
+def _action(output: dict) -> dict:
+    return {"network-state-export:output": output}
+
+
+async def test_action_non_atomic_response_is_a_contract_violation(patch_client):
+    client = _make_client()
+    body = _action({"device-name": "sw01", "ospf-config": {"status": "ok"}})  # no atomic:true
+    with patch_client(client, EnvelopeTransport(action_body=body)):
+        with pytest.raises(NsoReadContractError):
+            await client.run_device_state_read("sw01", ["ospf-config"])
+
+
+async def test_action_wrong_device_echo_is_a_contract_violation(patch_client):
+    """A version-skewed response for ANOTHER device must never be read as this device's state."""
+    client = _make_client()
+    body = _action({"atomic": True, "device-name": "other", "ospf-config": {"status": "ok"}})
+    with patch_client(client, EnvelopeTransport(action_body=body)):
+        with pytest.raises(NsoReadContractError):
+            await client.run_device_state_read("sw01", ["ospf-config"])
+
+
+async def test_action_missing_device_echo_is_a_contract_violation(patch_client):
+    client = _make_client()
+    body = _action({"atomic": True, "ospf-config": {"status": "ok"}})
+    with patch_client(client, EnvelopeTransport(action_body=body)):
+        with pytest.raises(NsoReadContractError):
+            await client.run_device_state_read("sw01", ["ospf-config"])
+
+
+async def test_action_non_terminal_section_status_is_a_contract_violation(patch_client):
+    """The action is terminal by design; a stale/not-ready section is proxy garbage, not data
+    (the shared classifier would otherwise map stale→Present and materialize it)."""
+    client = _make_client()
+    for bad in ("stale", "not-ready", "bogus"):
+        body = _action({"atomic": True, "device-name": "sw01", "ospf-config": {"status": bad}})
+        with patch_client(client, EnvelopeTransport(action_body=body)):
+            with pytest.raises(NsoReadContractError):
+                await client.run_device_state_read("sw01", ["ospf-config"])
+
+
+async def test_action_non_dict_section_is_a_contract_violation(patch_client):
+    client = _make_client()
+    body = _action({"atomic": True, "device-name": "sw01", "ospf-config": ["nope"]})
+    with patch_client(client, EnvelopeTransport(action_body=body)):
+        with pytest.raises(NsoReadContractError):
+            await client.run_device_state_read("sw01", ["ospf-config"])
+
+
+async def test_action_certified_terminal_sections_pass(patch_client):
+    """ok / unsupported / error are all valid terminal states and pass certification."""
+    client = _make_client()
+    body = _action(
+        {
+            "atomic": True,
+            "device-name": "sw01",
+            "ospf-config": {"status": "ok", "instance": []},
+            "logging-config": {"status": "unsupported"},
+            "bgp-config": {"status": "error", "error-reason": "boom"},
+        }
+    )
+    with patch_client(client, EnvelopeTransport(action_body=body)):
+        out = await client.run_device_state_read("sw01", ["ospf-config", "logging-config", "bgp-config"])
+    assert out["ospf-config"]["status"] == "ok"
+    assert out["bgp-config"]["status"] == "error"
