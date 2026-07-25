@@ -47,7 +47,6 @@ async def _upsert_bfd_data(
                 refresh_source=refresh_source,
             )
         )
-    await db.commit()
 
 
 BFD_SPEC = FamilySpec(

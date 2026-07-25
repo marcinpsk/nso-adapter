@@ -413,8 +413,9 @@ async def test_poisoned_session_store_failure_stays_best_effort(adapter_client, 
 
 @pytest.mark.anyio
 async def test_commit_time_materializer_failure_recovers_and_terminalizes(adapter_client):
-    """Codex S3-R2 F1: materializers COMMIT internally, releasing the savepoint — a DB
-    error surfacing at flush/commit dooms the whole transaction. The engine must recover
+    """A transaction-neutral materializer leaves a bad row for the ENGINE commit.
+
+    A DB error surfacing at that boundary dooms the whole transaction. The engine must recover
     the session and record a FRESH terminal failure row (the flushed phase-1 row died
     with the transaction), and the session must be usable afterwards."""
     from sqlalchemy.exc import IntegrityError
@@ -426,9 +427,8 @@ async def test_commit_time_materializer_failure_recovers_and_terminalizes(adapte
     async with _device_session(device_id) as (db, device):
 
         async def _bad_materialize(db_, device_, payload, refresh_source):
-            # A NOT NULL violation that only surfaces at flush-inside-commit.
+            # A NOT NULL violation that must surface at the engine's commit.
             db_.add(RefreshOutcome(device_id=None, family=None, read_outcome=None))
-            await db_.commit()
 
         spec = dataclasses.replace(ENV_SPEC, materialize=_bad_materialize)
         with pytest.raises(IntegrityError):
@@ -465,6 +465,11 @@ async def test_phase2_store_poisoning_recovers_the_session(adapter_client, monke
         ok = await run_family_refresh(db, device, _client(section=OK_SECTION), ENV_SPEC)
 
         assert ok is True, "phase-2 telemetry failure must never fail the refresh"
+        async for fresh_db in get_session():
+            assert await _routes(fresh_db, device_id) == ["172.16.0.0/12"], (
+                "phase-2 recovery must not roll back the committed mirror"
+            )
+            break
         # The next family's refresh on the SAME session must work (sync_device fan-out shape).
         monkeypatch.undo()
         ok2 = await run_family_refresh(db, device, _client(section=OK_SECTION), ENV_SPEC)

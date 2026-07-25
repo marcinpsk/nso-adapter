@@ -12,11 +12,12 @@ the :data:`~nso_adapter.nso.read_outcome.ReadOutcome` vocabulary, and drive the 
 * **AbsentAuthoritative** → materialize an empty row set (clear; the device genuinely has none).
 * **Unavailable** → keep the last-known rows and return ``False`` (a degraded surface).
 
-The family's *writes* stay family-owned in its materializer (bgp's multi-table flush,
-vlan/switchport diff-by-key, etc.); only the empty/error *semantics* are centralized here. The
-returned ``bool`` preserves the legacy ``refresh_*_for_device`` contract (``True`` = read
-succeeded or nothing-to-read; ``False`` = read failed, rows untouched) so existing callers,
-``_run_surfaces``, and monkeypatching tests keep working unchanged.
+The family's SQL stays family-owned in its transaction-neutral materializer (bgp's multi-table
+flush, vlan/switchport diff-by-key, etc.); the engine owns the successful commit, failure
+recovery, and empty/error semantics. The returned ``bool`` preserves the legacy
+``refresh_*_for_device`` contract (``True`` = read succeeded or nothing-to-read; ``False`` =
+read failed, rows untouched) so existing callers, ``_run_surfaces``, and monkeypatching tests
+keep working unchanged.
 """
 
 from __future__ import annotations
@@ -141,8 +142,9 @@ class FamilySpec:
     * ``extract`` — ``data -> payload``; pull the family's payload out of the read entry. A
       single-table family returns its row ``list``; a multi-table family (bgp, isis, snmp, …)
       can return the whole entry ``dict`` (or any structure) for its materializer to destructure.
-    * ``materialize`` — ``(db, device, payload, refresh_source) -> Awaitable[None]``; the
-      family-owned full-replace/upsert that also commits.
+    * ``materialize`` — ``(db, device, payload, refresh_source) -> Awaitable[None]``; stage the
+      family-owned full-replace/upsert in the caller's transaction. It must not commit or roll
+      back; the engine owns that boundary.
     * ``wire_name`` — the device-state envelope section name (e.g. ``"static-route"``). Every
       family reads its envelope section (status-declared); READSEM S5 retired the legacy
       per-family getters + the ``empty_policy`` pop/present column.
@@ -329,22 +331,23 @@ async def _materialize_guarded(
     + every surface in ONE session — `_run_surfaces` isolates a raising surface and
     carries on). The savepoint scopes the discard to the materializer's own writes; the
     phase-1 row was flushed BEFORE it and survives, so the SAME attempt is terminalized.
-    A materializer that already committed (its normal last step) deactivates the
-    savepoint — nothing to roll back. The exception always re-raises (legacy contract).
+    The engine's successful commit deactivates the savepoint. The exception always
+    re-raises (legacy contract).
     """
     device_id = device.id  # snapshot: a commit-time failure expires the instance
     savepoint = await db.begin_nested()
     try:
         payload = payload_fn()
         await spec.materialize(db, device, payload, refresh_source)
+        await db.commit()
         return payload
     except Exception:
         # Two failure modes (codex S3-R2 F1): a Python-level materializer error leaves the
         # savepoint alive — roll IT back (sibling caller work survives) and terminalize the
-        # SAME attempt. A flush/commit-time DB error dooms the WHOLE transaction (the
-        # materializers commit internally, releasing the savepoint) — sibling work was lost
-        # to the DB failure itself; recover the session and record a FRESH terminal row
-        # (the flushed phase-1 row died with the transaction).
+        # SAME attempt. A DB error during the engine-owned root commit dooms the WHOLE
+        # transaction and releases the savepoint — sibling work was lost to the DB failure
+        # itself; recover the session and record a FRESH terminal row (the flushed phase-1 row
+        # died with the transaction).
         try:
             if savepoint.is_active:
                 await savepoint.rollback()
@@ -373,7 +376,7 @@ async def _apply_outcome(
 
     if isinstance(outcome, Present):
         # S5a A3: the [materialize → record_result] span must be atomic under CANCELLATION —
-        # a budget/shutdown cancel between the materializer's commit and the pointer
+        # a budget/shutdown cancel between the engine's mirror commit and the pointer
         # terminalization leaves new rows under the old outcome (codex R1-F4). The parent
         # keeps session + family locks alive while the span task completes.
         async def _present_span() -> bool:

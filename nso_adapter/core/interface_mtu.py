@@ -52,7 +52,6 @@ async def _upsert_interface_mtu(db: AsyncSession, device: Device, interfaces: li
                 refresh_source=refresh_source,
             )
         )
-    await db.commit()
 
 
 INTERFACE_MTU_SPEC = FamilySpec(

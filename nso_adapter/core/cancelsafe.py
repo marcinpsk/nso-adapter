@@ -2,12 +2,12 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Cancellation-safe spans for two-phase mirror producers (READSEM S5a A3).
 
-A materializer COMMITS mirror rows, then a separate await terminalizes the outcome
-pointer. A cancellation (job budget timeout, shutdown) landing between the two leaves
-NEW rows under the OLD outcome — the plugin then gates fresh data on a stale outcome
-(codex S5a R1-F4). :func:`await_uncancellable` runs that span as a task while the
-PARENT coroutine stays alive absorbing cancels — so the caller's AsyncSession and the
-engine's family locks remain owned until the span completes (a detached task raced
+The refresh engine COMMITS staged mirror rows, then a separate await terminalizes the
+outcome pointer. A cancellation (job budget timeout, shutdown) landing between the two
+leaves NEW rows under the OLD outcome — the plugin then gates fresh data on a stale
+outcome (codex S5a R1-F4). :func:`await_uncancellable` runs that span as a task while
+the PARENT coroutine stays alive absorbing cancels — so the caller's AsyncSession and
+the engine's family locks remain owned until the span completes (a detached task raced
 the parent's rollback and ran outside released locks — codex R3-4) — then re-raises
 the cancellation.
 

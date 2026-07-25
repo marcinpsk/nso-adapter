@@ -59,7 +59,6 @@ async def _upsert_l2_saps(
                     refresh_source=refresh_source,
                 )
             )
-    await db.commit()
 
 
 L2_SERVICE_SPEC = FamilySpec(

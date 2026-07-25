@@ -64,7 +64,6 @@ async def _upsert_logging_config(db: AsyncSession, device: Device, entry: dict, 
         row.refresh_source = refresh_source
     elif row is not None:
         await db.delete(row)
-    await db.commit()
 
 
 LOGGING_CONFIG_SPEC = FamilySpec(

@@ -42,7 +42,6 @@ async def _upsert_svi(db: AsyncSession, device: Device, interfaces: list[dict], 
                 refresh_source=refresh_source,
             )
         )
-    await db.commit()
 
 
 SVI_SPEC = FamilySpec(

@@ -99,8 +99,6 @@ async def _upsert_snmp_config(
             )
         )
 
-    await db.commit()
-
 
 SNMP_SPEC = FamilySpec(
     name="snmp",

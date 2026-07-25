@@ -209,8 +209,6 @@ async def _upsert_route_policy_data(
     await _upsert_as_paths(db, device, as_list(data.get("as-path")), now, refresh_source)
     await _upsert_route_maps(db, device, as_list(data.get("route-map")), now, refresh_source)
 
-    await db.commit()
-
 
 ROUTE_POLICY_SPEC = FamilySpec(
     name="route_policy",

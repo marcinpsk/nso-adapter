@@ -52,7 +52,6 @@ async def _upsert_static_routes(
                 refresh_source=refresh_source,
             )
         )
-    await db.commit()
 
 
 STATIC_ROUTE_SPEC = FamilySpec(

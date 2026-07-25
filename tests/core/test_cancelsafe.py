@@ -2,9 +2,9 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """S5a A3: cancellation-safe terminalization (codex R1-F4/R2-F6/R3-4/R3-5/R4-3/R5-1/R6-1).
 
-A job-budget cancel (900s whale timeout) or shutdown cancel landing between a
-materializer's COMMIT and the outcome-store terminalization leaves NEW mirror rows
-under the OLD outcome pointer — the plugin then gates fresh data on a stale outcome.
+A job-budget cancel (900s whale timeout) or shutdown cancel landing between the
+engine's mirror COMMIT and outcome-store terminalization leaves NEW mirror rows under
+the OLD outcome pointer — the plugin then gates fresh data on a stale outcome.
 The `await_uncancellable` helper runs the [materialize → record_result] span as a task
 the parent shields-and-absorbs: the parent keeps its session and family locks alive
 until the span completes, then re-raises the cancellation.
@@ -59,7 +59,7 @@ async def device_db(adapter_client):
 
 
 async def test_engine_cancel_between_commit_and_terminalize_keeps_pointer_consistent(device_db, monkeypatch):
-    """Engine window: cancel lands right after the materializer committed rows.
+    """Engine window: cancel lands right after the engine committed staged rows.
 
     RED today: DeviceStaticRoute rows exist but the outcome pointer never advances —
     the exact new-rows-under-old-pointer inversion. GREEN with the span wrapped: the
@@ -85,7 +85,7 @@ async def test_engine_cancel_between_commit_and_terminalize_keeps_pointer_consis
             db, device, STATIC_ROUTE_SPEC, section, refresh_source="poll"
         )
 
-    assert await _fresh_static_route_prefixes(device.id) == ["10.99.0.0/16"], "materializer committed pre-cancel"
+    assert await _fresh_static_route_prefixes(device.id) == ["10.99.0.0/16"], "engine committed pre-cancel"
     outcome = await _fresh_outcome(device.id, "static_route")
     assert outcome is not None, "terminal outcome must be recorded despite the cancel"
     assert outcome.result == "replaced"

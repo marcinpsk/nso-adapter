@@ -44,7 +44,6 @@ async def _upsert_subinterface(db: AsyncSession, device: Device, interfaces: lis
                 refresh_source=refresh_source,
             )
         )
-    await db.commit()
 
 
 SUBINTERFACE_SPEC = FamilySpec(

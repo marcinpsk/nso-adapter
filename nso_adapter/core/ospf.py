@@ -73,8 +73,6 @@ async def _upsert_ospf_data(
             )
         )
 
-    await db.commit()
-
 
 async def _materialize_ospf(db: AsyncSession, device: Device, entry: dict, refresh_source: str) -> None:
     """Engine materializer: destructure the OSPF entry into its two lists and full-replace.

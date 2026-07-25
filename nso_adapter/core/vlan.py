@@ -94,7 +94,6 @@ async def _upsert_vlans(
     for vid, row in existing.items():
         if vid not in seen:
             await db.delete(row)
-    await db.commit()
 
 
 VLAN_DATABASE_SPEC = FamilySpec(
@@ -175,7 +174,6 @@ async def _upsert_switchports(
     for name, row in existing.items():
         if name not in seen:
             await db.delete(row)
-    await db.commit()
 
 
 SWITCHPORT_SPEC = FamilySpec(

@@ -88,7 +88,6 @@ async def _upsert_lags(
                     mode=member.get("mode", "unknown"),
                 )
             )
-    await db.commit()
 
 
 LAG_TOPOLOGY_SPEC = FamilySpec(

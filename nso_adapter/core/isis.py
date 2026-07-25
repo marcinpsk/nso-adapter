@@ -152,8 +152,6 @@ async def _upsert_isis_data(
             )
         )
 
-    await db.commit()
-
 
 async def _materialize_isis(db: AsyncSession, device: Device, entry: dict, refresh_source: str) -> None:
     """Engine materializer: destructure the IS-IS entry into its two lists and full-replace.

@@ -230,8 +230,6 @@ async def _upsert_bgp_data(
         for scope_data in as_list(router_data.get("scope")):
             await _insert_bgp_scope(db, router.id, scope_data, device.id)
 
-    await db.commit()
-
 
 BGP_SPEC = FamilySpec(
     name="bgp",

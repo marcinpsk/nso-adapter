@@ -58,7 +58,6 @@ async def _upsert_ip_addresses(
                     refresh_source=refresh_source,
                 )
             )
-    await db.commit()
 
 
 # interface_ip is a PRESENT-EMPTY "inventory" family: a synced device always returns a 200 (a

@@ -75,7 +75,6 @@ async def _upsert_lag_configs(
                     port_priority=member.get("port-priority"),
                 )
             )
-    await db.commit()
 
 
 LAG_CONFIG_SPEC = FamilySpec(

@@ -10,13 +10,15 @@ Every read-mirror refresh attempt records its truth here, in two phases on the C
 * **Phase 2** (:func:`record_result`) — the materialization result + returned success flag, AFTER
   the materializer. Terminalizes the attempt, advances the per-(device, family) pointer, and
   commits — so the outcome + pointer persist regardless of whether the caller commits again.
+  For engine families, the preceding engine mirror commit already made phase 1 and the staged
+  mirror durable.
 
 Why the caller's session, not an independent one: a second connection to the caller's engine
 deadlocks on file-backed SQLite (the unit-test store). The two aiosqlite threads share one
 asyncio task, so when the caller's ``db`` holds an uncommitted write (e.g. mid-Apply,
 ``apply._post_apply_refresh_and_notify``), the second connection's commit blocks on the file lock
 that only the caller — now parked awaiting this coroutine — can release. Reusing ``db`` sidesteps
-that entirely; the outcome rides the family's own commit boundary. (On PostgreSQL a separate
+that entirely; the outcome rides the producer's commit boundary. (On PostgreSQL a separate
 connection would be safe; this trades that theoretical independence for a deadlock-free store.)
 
 The pointer advances to the **newest TERMINAL attempt by start order** (attempt id): a terminal
@@ -60,8 +62,8 @@ async def record_read_outcome(
     """Phase 1: persist the classified read outcome; return the new attempt id.
 
     Flushed (not committed) on the caller's session, so it is assigned its PK and rides the
-    caller's transaction — :func:`record_result` (or the family materializer's own commit) makes
-    it durable.
+    caller's transaction — :func:`record_result` (or the refresh engine's preceding mirror
+    commit) makes it durable.
     """
     read_outcome, read_reason, freshness = _decompose(outcome)
     row = RefreshOutcome(
