@@ -376,7 +376,16 @@ async def test_sync_now_timeout_leaves_last_sync_pair_untouched(adapter_client):
 
     client = AsyncMock(spec=NsoClient)
     client.get_device_ned_id = AsyncMock(return_value="cisco-ios-cli-6.95")
-    client.get_device_state_section = AsyncMock(return_value={"status": "ok", "device-name": "t-rtr", "interface": []})
+    client.run_device_state_read = AsyncMock(
+        return_value={
+            "atomic": True,
+            "interface-attributes": {
+                "status": "ok",
+                "device-name": "t-rtr",
+                "interface": [],
+            },
+        }
+    )
     imp._nso_clients["nso-dev"] = client
     imp._netbox_client = None
 
@@ -388,8 +397,8 @@ async def test_sync_now_timeout_leaves_last_sync_pair_untouched(adapter_client):
         return await sync_device(device_id_, db, atomic=True, comprehensive=True)
 
     with (
-        patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock),
-        patch("nso_adapter.core.importer.refresh_all_surfaces_for_device", side_effect=_stalled_fanout),
+        patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})),
+        patch("nso_adapter.core.importer._apply_projected", side_effect=_stalled_fanout),
     ):
         await _run_with_db(job_id, device_id, _factory, timeout=0.5)
 

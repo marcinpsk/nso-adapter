@@ -105,8 +105,14 @@ async def test_attrs_cancel_between_commit_and_terminalize_records_anyway(device
 
     client = AsyncMock(spec=NsoClient)
     client.get_device_ned_id = AsyncMock(return_value="cisco-ios-cli-6.95")
-    client.get_device_state_section = AsyncMock(
-        return_value={"status": "ok", "device-name": device.nso_device_name, "interface": []}
+    client.get_device_state_doc = AsyncMock(
+        return_value={
+            "interface-attributes": {
+                "status": "ok",
+                "device-name": device.nso_device_name,
+                "interface": [],
+            }
+        }
     )
     imp._nso_clients[device.nso_instance] = client
     imp._netbox_client = None
@@ -123,16 +129,123 @@ async def test_attrs_cancel_between_commit_and_terminalize_records_anyway(device
     from unittest.mock import patch as _patch
 
     with (
-        _patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock),
-        _patch(
-            "nso_adapter.core.importer.refresh_routing_surfaces_for_device", new_callable=AsyncMock, return_value=[]
-        ),
+        _patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})),
         pytest.raises(asyncio.CancelledError),
     ):
         await imp.sync_device(device.id, db)
 
     outcome = await _fresh_outcome(device.id, "interface_attributes")
     assert outcome is not None, "attrs outcome must terminalize despite the cancel"
+
+
+async def test_attrs_commit_failure_after_parent_cancel_terminalizes_error(device_db, monkeypatch):
+    """A child commit error cannot hide behind the parent's absorbed cancellation."""
+    from unittest.mock import AsyncMock
+
+    from nso_adapter.core import importer as imp
+    from nso_adapter.nso.client import NsoClient
+
+    db, device = device_db
+    device.ned_id = "cisco-ios-cli-6.95"
+    await db.commit()
+    device_id = device.id
+
+    client = AsyncMock(spec=NsoClient)
+    client.get_device_ned_id = AsyncMock(return_value="cisco-ios-cli-6.95")
+    client.get_device_state_doc = AsyncMock(
+        return_value={
+            "interface-attributes": {
+                "status": "ok",
+                "device-name": device.nso_device_name,
+                "interface": [{"interface-name": "Loopback1331"}],
+            }
+        }
+    )
+    imp._nso_clients[device.nso_instance] = client
+    imp._netbox_client = None
+
+    commit_started = asyncio.Event()
+    release_commit = asyncio.Event()
+    real_commit = db.commit
+    calls = 0
+
+    async def fail_first_commit():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            commit_started.set()
+            await release_commit.wait()
+            raise RuntimeError("injected commit failure")
+        await real_commit()
+
+    monkeypatch.setattr(db, "commit", fail_first_commit)
+
+    from unittest.mock import patch as _patch
+
+    with _patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
+        task = asyncio.create_task(imp.sync_device(device_id, db))
+        await commit_started.wait()
+        task.cancel()
+        release_commit.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    outcome = await _fresh_outcome(device_id, "interface_attributes")
+    assert outcome is not None
+    assert (outcome.result, outcome.succeeded) == ("error", False)
+    assert await db.get(Device, device_id) is not None, "cleanup must leave the caller session usable"
+
+
+async def test_attrs_cancel_after_phase_one_flush_terminalizes_error(device_db, monkeypatch):
+    """Cancellation before savepoint assignment still recovers the started attempt."""
+    from unittest.mock import AsyncMock
+
+    from nso_adapter.core import importer as imp
+    from nso_adapter.nso.client import NsoClient
+
+    db, device = device_db
+    device.ned_id = "cisco-ios-cli-6.95"
+    await db.commit()
+    device_id = device.id
+
+    client = AsyncMock(spec=NsoClient)
+    client.get_device_ned_id = AsyncMock(return_value="cisco-ios-cli-6.95")
+    client.get_device_state_doc = AsyncMock(
+        return_value={
+            "interface-attributes": {
+                "status": "ok",
+                "device-name": device.nso_device_name,
+                "interface": [],
+            }
+        }
+    )
+    imp._nso_clients[device.nso_instance] = client
+    imp._netbox_client = None
+
+    phase_one_flushed = asyncio.Event()
+    real_record = imp._record_attrs_read
+
+    async def _pause_after_real_flush(*args, **kwargs):
+        attempt_id = await real_record(*args, **kwargs)
+        phase_one_flushed.set()
+        await asyncio.Event().wait()
+        return attempt_id
+
+    monkeypatch.setattr(imp, "_record_attrs_read", _pause_after_real_flush)
+
+    from unittest.mock import patch as _patch
+
+    with _patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
+        task = asyncio.create_task(imp.sync_device(device_id, db))
+        await phase_one_flushed.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    outcome = await _fresh_outcome(device_id, "interface_attributes")
+    assert outcome is not None
+    assert (outcome.result, outcome.succeeded) == ("error", False)
+    assert await db.get(Device, device_id) is not None
 
 
 async def test_redistribution_cancel_between_commit_and_terminalize_records_anyway(device_db, monkeypatch):

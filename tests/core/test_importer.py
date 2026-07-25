@@ -25,6 +25,27 @@ from nso_adapter.store.models import (
     MappingStatus,
 )
 
+_ALL_PROJECTED_WIRES = (
+    "static-route",
+    "isis-interface",
+    "bgp-config",
+    "ospf-config",
+    "route-policy",
+    "snmp-config",
+    "logging-config",
+    "bfd-config",
+    "interface-ip",
+    "vlan-database",
+    "svi",
+    "subinterface",
+    "interface-mtu",
+    "lag-topology",
+    "lag-config",
+    "l2-service",
+    "switchport",
+    "interface-attributes",
+)
+
 
 @pytest_asyncio.fixture
 async def db_session():
@@ -56,6 +77,7 @@ def _make_nso_client(iface_entry=None, sections=None):
         return routed.get(wire_family, {"status": "error", "error-reason": "not stubbed in this test"})
 
     client.get_device_state_section = AsyncMock(side_effect=_get_section)
+    client.get_device_state_doc = AsyncMock(return_value=routed)
     return client
 
 
@@ -140,7 +162,7 @@ def test_attrs_to_interface_list_enabled_absent_yields_none():
     assert result[0].nso.enabled is None
 
 
-async def test_sync_device_creates_interface_rows(db_session: AsyncSession):
+async def test_sync_device_creates_interface_rows(db_session: AsyncSession, adapter_client):
     device = Device(
         nso_instance="nso-dev",
         nso_device_name="sw01",
@@ -165,7 +187,7 @@ async def test_sync_device_creates_interface_rows(db_session: AsyncSession):
     imp._nso_clients["nso-dev"] = nso_client
     imp._netbox_client = None
 
-    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
         summary = await sync_device(device.id, db_session)
 
     assert summary["interfaces_created"] == 1
@@ -175,9 +197,8 @@ async def test_sync_device_creates_interface_rows(db_session: AsyncSession):
     assert ifaces[0].name == "GigabitEthernet0/1"
 
 
-async def test_sync_device_reads_interface_attributes_from_the_envelope(db_session: AsyncSession):
-    """sync_device() reads interface-attributes via the device-state envelope section, not
-    get_device_config() + normalize (READSEM S5 retired the legacy interface-attributes getter)."""
+async def test_sync_device_reads_interface_attributes_from_the_envelope(db_session: AsyncSession, adapter_client):
+    """READSEM 1331A: sync_device consumes attrs from its one projected document."""
     device = Device(
         nso_instance="nso-dev",
         nso_device_name="sw04",
@@ -194,10 +215,11 @@ async def test_sync_device_reads_interface_attributes_from_the_envelope(db_sessi
     imp._nso_clients["nso-dev"] = nso_client
     imp._netbox_client = None
 
-    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
         await sync_device(device.id, db_session)
 
-    nso_client.get_device_state_section.assert_any_await("sw04", "interface-attributes")
+    nso_client.get_device_state_doc.assert_awaited_once_with("sw04")
+    nso_client.get_device_state_section.assert_not_awaited()
     # get_device_config must NOT be called
     nso_client.get_device_config.assert_not_called()
 
@@ -224,7 +246,7 @@ async def test_sync_device_marks_unmatched_interfaces_when_empty(db_session: Asy
     imp._nso_clients["nso-dev"] = nso_client
     imp._netbox_client = None
 
-    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
         await sync_device(device.id, db_session)
 
     await db_session.refresh(device)
@@ -256,7 +278,7 @@ async def test_sync_device_keeps_mapping_when_attrs_unavailable(db_session: Asyn
     imp._nso_clients["nso-dev"] = nso_client
     imp._netbox_client = None
 
-    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
         await sync_device(device.id, db_session)
 
     await db_session.refresh(device)
@@ -308,11 +330,58 @@ async def test_detect_drift_uses_interface_attributes(db_session: AsyncSession):
 
     imp._nso_clients["nso-dev"] = nso_client
 
-    with patch("nso_adapter.core.importer.nso_actions.compare_config", new_callable=AsyncMock):
+    with patch("nso_adapter.core.importer.nso_actions.compare_config", new=AsyncMock(return_value={"result": True})):
         summary = await detect_drift(device.id, db_session)
 
     nso_client.get_device_state_section.assert_any_await("sw03", "interface-attributes")
     assert summary["changes_detected"] == 1
+
+
+async def test_detect_drift_holds_attrs_lock_through_commit_and_releases_before_notify(
+    db_session: AsyncSession,
+):
+    """Detect Drift shares the attrs ordering lock and keeps notification outside it."""
+    from nso_adapter.core import importer as imp
+    from nso_adapter.core import refresh_engine as engine_mod
+    from nso_adapter.core.importer import detect_drift
+
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="sw-drift-lock",
+        ned_id="cisco-ios-cli-6.95",
+        netbox_device_id=1334,
+    )
+    db_session.add(device)
+    await db_session.commit()
+
+    attrs_lock = engine_mod._family_lock(device.id, "interface_attributes")
+    nso_client = _make_nso_client({"device-name": "sw-drift-lock", "interface": []})
+
+    async def _attrs_read(_device_name, wire_name):
+        assert wire_name == "interface-attributes"
+        assert attrs_lock.locked()
+        return {"status": "ok", "device-name": "sw-drift-lock", "interface": []}
+
+    nso_client.get_device_state_section.side_effect = _attrs_read
+    imp._nso_clients["nso-dev"] = nso_client
+
+    nb = AsyncMock(spec=NetboxClient)
+    nb.list_interfaces = AsyncMock(return_value=[])
+
+    async def _notify(_device_id):
+        assert not attrs_lock.locked()
+
+    nb.notify_sync_complete = AsyncMock(side_effect=_notify)
+    imp._netbox_client = nb
+    try:
+        with patch(
+            "nso_adapter.core.importer.nso_actions.compare_config", new=AsyncMock(return_value={"result": True})
+        ):
+            await detect_drift(device.id, db_session)
+    finally:
+        imp._netbox_client = None
+
+    nb.notify_sync_complete.assert_awaited_once_with(1334)
 
 
 async def test_detect_drift_sees_value_set_directly_in_netbox(db_session: AsyncSession):
@@ -366,7 +435,9 @@ async def test_detect_drift_sees_value_set_directly_in_netbox(db_session: AsyncS
     imp._netbox_client = nb
 
     try:
-        with patch("nso_adapter.core.importer.nso_actions.compare_config", new_callable=AsyncMock):
+        with patch(
+            "nso_adapter.core.importer.nso_actions.compare_config", new=AsyncMock(return_value={"result": True})
+        ):
             summary = await detect_drift(device.id, db_session)
     finally:
         imp._netbox_client = None
@@ -419,7 +490,7 @@ async def test_sync_change_detection_skips_unchanged_on_resync(db_session: Async
     imp._netbox_client = nb
 
     try:
-        with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+        with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
             first = await sync_device(device.id, db_session)
             assert first["interfaces_written"] > 0  # first run writes
             patched_batches.clear()
@@ -463,7 +534,7 @@ async def test_sync_failed_patch_not_marked_synced(db_session: AsyncSession):
     imp._netbox_client = nb
 
     try:
-        with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+        with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
             first = await sync_device(device.id, db_session)
             assert first["interfaces_written"] == 0  # nothing confirmed
             # state must NOT be marked synced
@@ -491,8 +562,9 @@ async def test_sync_failed_patch_not_marked_synced(db_session: AsyncSession):
 
 
 async def test_sync_device_fans_out_to_routing_surfaces(db_session: AsyncSession):
-    """sync_device runs the routing-surface fan-out so 'Sync Now' refreshes IS-IS/BGP/
-    OSPF/route-policy/... for the device, not just interface attributes."""
+    """sync_device applies routing outcomes from the same projection as attrs."""
+    from nso_adapter.store.models import RefreshOutcome
+
     device = Device(
         nso_instance="nso-dev",
         nso_device_name="sw01",
@@ -510,24 +582,22 @@ async def test_sync_device_fans_out_to_routing_surfaces(db_session: AsyncSession
     imp._nso_clients["nso-dev"] = nso_client
     imp._netbox_client = None
 
-    with (
-        patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock),
-        patch(
-            "nso_adapter.core.importer.refresh_routing_surfaces_for_device",
-            new_callable=AsyncMock,
-            return_value=[],
-        ) as fanout,
-    ):
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
         await sync_device(device.id, db_session)
 
-    fanout.assert_awaited_once()
-    assert fanout.await_args.args[1].id == device.id
-    assert fanout.await_args.kwargs.get("refresh_source") == "sync"
+    families = {
+        row.family
+        for row in (await db_session.execute(select(RefreshOutcome).where(RefreshOutcome.device_id == device.id)))
+        .scalars()
+        .all()
+    }
+    assert {"interface_attributes", "static_route", "isis", "bgp", "ospf"} <= families
+    assert "vlan" not in families
+    nso_client.get_device_state_doc.assert_awaited_once_with("sw01")
 
 
 async def test_sync_device_comprehensive_uses_all_surfaces(db_session: AsyncSession):
-    """A1 (READSEM S5a): comprehensive=True swaps the fan-out from the lean routing set to
-    refresh_all_surfaces_for_device (all 18 surfaces), keeping sync-from + attrs + source."""
+    """Comprehensive Sync Now requests attrs plus all generic wires in one action."""
     device = Device(
         nso_instance="nso-dev",
         nso_device_name="sw01",
@@ -539,32 +609,24 @@ async def test_sync_device_comprehensive_uses_all_surfaces(db_session: AsyncSess
     await db_session.commit()
 
     nso_client = _make_nso_client({"device-name": "sw01", "interface": []})
+    nso_client.run_device_state_read.return_value = {
+        "atomic": True,
+        **{wire: {"status": "ok"} for wire in _ALL_PROJECTED_WIRES},
+    }
 
     from nso_adapter.core import importer as imp
 
     imp._nso_clients["nso-dev"] = nso_client
     imp._netbox_client = None
 
-    with (
-        patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock),
-        patch(
-            "nso_adapter.core.importer.refresh_all_surfaces_for_device",
-            new_callable=AsyncMock,
-            return_value=([], None),
-        ) as fanout,
-        patch(
-            "nso_adapter.core.importer.refresh_routing_surfaces_for_device",
-            new_callable=AsyncMock,
-            return_value=[],
-        ) as lean,
-    ):
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
         await sync_device(device.id, db_session, atomic=True, comprehensive=True)
 
-    fanout.assert_awaited_once()
-    assert fanout.await_args.args[1].id == device.id
-    assert fanout.await_args.kwargs.get("refresh_source") == "sync"
-    assert fanout.await_args.kwargs.get("atomic") is True
-    lean.assert_not_awaited()
+    nso_client.run_device_state_read.assert_awaited_once()
+    args, kwargs = nso_client.run_device_state_read.await_args
+    assert kwargs["timeout"] == 360.0
+    assert set(args[1]) == set(_ALL_PROJECTED_WIRES)
+    nso_client.get_device_state_doc.assert_not_awaited()
 
 
 async def test_sync_device_comprehensive_records_doc_family_outcomes(db_session: AsyncSession):
@@ -597,7 +659,7 @@ async def test_sync_device_comprehensive_records_doc_family_outcomes(db_session:
     imp._nso_clients["nso-dev"] = nso_client
     imp._netbox_client = None
 
-    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
         await sync_device(device.id, db_session, comprehensive=True)
 
     doc_outcomes = (
@@ -641,7 +703,7 @@ async def test_sync_device_default_stays_lean(db_session: AsyncSession):
     imp._nso_clients["nso-dev"] = nso_client
     imp._netbox_client = None
 
-    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
         await sync_device(device.id, db_session)
 
     doc_outcomes = (
@@ -979,7 +1041,7 @@ async def test_sync_device_swallows_bulk_ensure_error(db_session: AsyncSession):
     imp._netbox_client = nb
 
     try:
-        with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+        with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
             summary = await sync_device(device.id, db_session)  # must not raise
     finally:
         imp._netbox_client = None
@@ -1021,7 +1083,7 @@ async def test_sync_device_skips_enabled_write_when_nso_omits_it(db_session: Asy
     imp._netbox_client = nb
 
     try:
-        with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+        with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
             await sync_device(device.id, db_session)
     finally:
         imp._netbox_client = None
@@ -1050,7 +1112,7 @@ async def test_sync_device_phase2_uses_intent_state(db_session: AsyncSession):
     )
     imp._netbox_client = None
 
-    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
         summary = await sync_device(device.id, db_session)
 
     # intent != live NSO → Phase-2 'drifted'. changes_detected counts only Phase-1 'changed'.
@@ -1078,7 +1140,7 @@ async def test_sync_device_resolves_ned_when_unset(db_session: AsyncSession):
     )
     imp._netbox_client = None
 
-    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
         summary = await sync_device(device.id, db_session)
 
     await db_session.refresh(device)
@@ -1108,7 +1170,7 @@ async def test_sync_device_updates_ned_when_changed_in_nso(db_session: AsyncSess
     imp._nso_clients["nso-dev"] = client
     imp._netbox_client = None
 
-    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
         await sync_device(device.id, db_session)
 
     await db_session.refresh(device)
@@ -1131,7 +1193,7 @@ async def test_sync_device_keeps_ned_when_nso_read_returns_nothing(db_session: A
     imp._nso_clients["nso-dev"] = client
     imp._netbox_client = None
 
-    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
         await sync_device(device.id, db_session)
 
     await db_session.refresh(device)
@@ -1172,7 +1234,7 @@ async def test_sync_device_survives_a_raising_ned_id_read(db_session: AsyncSessi
     imp._nso_clients["nso-dev"] = client
     imp._netbox_client = None
 
-    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
         await sync_device(device.id, db_session)  # must not raise
 
     await db_session.refresh(device)
@@ -1228,7 +1290,7 @@ async def test_sync_device_swallows_notify_failure(db_session: AsyncSession):
     imp._netbox_client = nb
 
     try:
-        with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+        with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
             summary = await sync_device(device.id, db_session)  # must not raise
     finally:
         imp._netbox_client = None
@@ -1278,7 +1340,9 @@ async def test_detect_drift_falls_back_to_cache_on_netbox_read_error(db_session:
     imp._netbox_client = nb
 
     try:
-        with patch("nso_adapter.core.importer.nso_actions.compare_config", new_callable=AsyncMock):
+        with patch(
+            "nso_adapter.core.importer.nso_actions.compare_config", new=AsyncMock(return_value={"result": True})
+        ):
             summary = await detect_drift(device.id, db_session)
     finally:
         imp._netbox_client = None
@@ -1301,7 +1365,7 @@ async def test_detect_drift_skips_interface_not_in_db(db_session: AsyncSession):
     )
     imp._netbox_client = None
 
-    with patch("nso_adapter.core.importer.nso_actions.compare_config", new_callable=AsyncMock):
+    with patch("nso_adapter.core.importer.nso_actions.compare_config", new=AsyncMock(return_value={"result": True})):
         summary = await detect_drift(device.id, db_session)
 
     assert summary["changes_detected"] == 0  # no DbInterface → skipped
@@ -1322,7 +1386,7 @@ async def test_detect_drift_skips_attr_without_state(db_session: AsyncSession):
     imp._nso_clients["nso-dev"] = _make_nso_client({"interface": [{"interface-name": "Gi0/0", "description": "x"}]})
     imp._netbox_client = None
 
-    with patch("nso_adapter.core.importer.nso_actions.compare_config", new_callable=AsyncMock):
+    with patch("nso_adapter.core.importer.nso_actions.compare_config", new=AsyncMock(return_value={"result": True})):
         summary = await detect_drift(device.id, db_session)
 
     assert summary["changes_detected"] == 0  # no attr_state → skipped
@@ -1344,7 +1408,9 @@ async def test_detect_drift_swallows_notify_failure(db_session: AsyncSession):
     imp._netbox_client = nb
 
     try:
-        with patch("nso_adapter.core.importer.nso_actions.compare_config", new_callable=AsyncMock):
+        with patch(
+            "nso_adapter.core.importer.nso_actions.compare_config", new=AsyncMock(return_value={"result": True})
+        ):
             summary = await detect_drift(device.id, db_session)  # must not raise
     finally:
         imp._netbox_client = None
@@ -1381,7 +1447,7 @@ async def test_sync_device_reports_partial_on_failed_sync_from(db_session: Async
     assert "sync_from" in (device.degraded_surfaces or [])
 
 
-async def test_sync_device_succeeds_on_ok_sync_from(db_session: AsyncSession):
+async def test_sync_device_succeeds_on_ok_sync_from(db_session: AsyncSession, adapter_client):
     """A clean sync-from (result:true) with no degraded surfaces reports ``succeeded`` and does
     not spuriously mark ``sync_from`` degraded."""
     device = Device(
@@ -1392,13 +1458,27 @@ async def test_sync_device_succeeds_on_ok_sync_from(db_session: AsyncSession):
 
     from nso_adapter.core import importer as imp
 
-    imp._nso_clients["nso-dev"] = _make_nso_client({"interface": []})
+    ok_empty = {"status": "ok"}
+    imp._nso_clients["nso-dev"] = _make_nso_client(
+        {"interface": []},
+        sections={
+            wire: ok_empty
+            for wire in (
+                "static-route",
+                "isis-interface",
+                "bgp-config",
+                "ospf-config",
+                "route-policy",
+                "snmp-config",
+                "logging-config",
+                "bfd-config",
+                "interface-ip",
+            )
+        },
+    )
     imp._netbox_client = None
 
-    with (
-        patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})),
-        patch("nso_adapter.core.importer.refresh_routing_surfaces_for_device", new=AsyncMock(return_value=[])),
-    ):
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
         await sync_device(device.id, db_session)
 
     await db_session.refresh(device)
@@ -1428,7 +1508,7 @@ async def test_sync_device_records_attrs_outcome_rows(db_session: AsyncSession):
     imp._nso_clients["nso-dev"] = nso_client
     imp._netbox_client = None
 
-    with patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock):
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
         await sync_device(device.id, db_session)
 
     rows = (
@@ -1476,6 +1556,68 @@ async def test_projection_supplier_failure_keeps_pop_families(db_session: AsyncS
         .all()
     )
     assert [r.prefix for r in rows] == ["10.6.0.0/16"], "an outage must never clear the mirror"
+
+
+@pytest.mark.anyio
+async def test_sync_device_document_failure_keeps_attrs_and_never_uses_second_source(
+    db_session: AsyncSession,
+    adapter_client,
+):
+    """A total grain-b failure fans one outcome to attrs and generic families."""
+    from nso_adapter.nso.client import NsoExportUnavailableError
+    from nso_adapter.store.models import RefreshOutcome
+
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="sw-doc-down",
+        ned_id="cisco-ios-cli-6.95",
+        netbox_device_id=1335,
+        mapping_status=MappingStatus.mapped,
+    )
+    db_session.add(device)
+    await db_session.commit()
+    db_session.add(DbInterface(device_id=device.id, name="Loopback-before-outage"))
+    await db_session.commit()
+
+    nso_client = _make_nso_client(
+        {
+            "device-name": "sw-doc-down",
+            "interface": [{"interface-name": "Hostile-second-source"}],
+        }
+    )
+    nso_client.get_device_state_doc.side_effect = NsoExportUnavailableError("export unavailable")
+
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = nso_client
+    imp._netbox_client = None
+
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
+        await sync_device(device.id, db_session)
+
+    nso_client.get_device_state_section.assert_not_awaited()
+    nso_client.run_device_state_read.assert_not_awaited()
+    await db_session.refresh(device)
+    assert device.mapping_status == MappingStatus.mapped
+    interfaces = (
+        (await db_session.execute(select(DbInterface).where(DbInterface.device_id == device.id))).scalars().all()
+    )
+    assert [row.name for row in interfaces] == ["Loopback-before-outage"]
+
+    outcomes = (
+        (
+            await db_session.execute(
+                select(RefreshOutcome).where(
+                    RefreshOutcome.device_id == device.id,
+                    RefreshOutcome.family.in_(("interface_attributes", "static_route")),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert {row.family for row in outcomes} == {"interface_attributes", "static_route"}
+    assert {(row.read_reason, row.result, row.succeeded) for row in outcomes} == {("export_down", "kept", False)}
 
 
 @pytest.mark.anyio
@@ -1654,7 +1796,7 @@ async def test_atomic_fanout_action_error_keeps_every_family(db_session: AsyncSe
 
 
 @pytest.mark.anyio
-async def test_sync_device_atomic_reaches_the_action_not_the_doc(db_session: AsyncSession):
+async def test_sync_device_atomic_reaches_the_action_not_the_doc(db_session: AsyncSession, adapter_client):
     """Codex S3-R3 F1 (BLOCKER): the atomic flag must survive the WRAPPER hop — sync_device
     -> refresh_routing_surfaces_for_device -> _run_surfaces_projected. A dropped flag
     silently downgrades operator Sync-Now to the record-served doc (grain b)."""
@@ -1669,6 +1811,11 @@ async def test_sync_device_atomic_reaches_the_action_not_the_doc(db_session: Asy
     nso_client.run_device_state_read = AsyncMock(
         return_value={
             "atomic": True,
+            "interface-attributes": {
+                "status": "ok",
+                "device-name": "sw-atomic",
+                "interface": [{"interface-name": "Loopback1331", "description": "atomic-snapshot"}],
+            },
             **{
                 w: ok_empty
                 for w in (
@@ -1692,7 +1839,7 @@ async def test_sync_device_atomic_reaches_the_action_not_the_doc(db_session: Asy
     imp._netbox_client = None
 
     with (
-        patch("nso_adapter.core.importer.nso_actions.sync_from", new_callable=AsyncMock),
+        patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})),
         patch("nso_adapter.core.redistribution.refresh_redistribution_for_device", AsyncMock(return_value=True)),
     ):
         await sync_device(device.id, db_session, atomic=True)
@@ -1700,7 +1847,158 @@ async def test_sync_device_atomic_reaches_the_action_not_the_doc(db_session: Asy
     assert nso_client.run_device_state_read.await_count == 1
     args, kwargs = nso_client.run_device_state_read.await_args
     assert kwargs.get("timeout") == 360.0
+    assert "interface-attributes" in args[1]
     nso_client.get_device_state_doc.assert_not_awaited()
+    nso_client.get_device_state_section.assert_not_awaited()
+
+    rows = (await db_session.execute(select(DbInterface).where(DbInterface.device_id == device.id))).scalars().all()
+    assert [row.name for row in rows] == ["Loopback1331"]
+
+
+@pytest.mark.anyio
+async def test_sync_device_heals_attrs_and_surface_with_one_subset_action(db_session: AsyncSession, adapter_client):
+    """One grain-b document and one combined action heal every not-ready section."""
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="sw-combined-heal",
+        ned_id="cisco-ios-cli-6.95",
+        netbox_device_id=1331,
+    )
+    db_session.add(device)
+    await db_session.commit()
+
+    nso_client = _make_nso_client(
+        None,
+        sections={
+            "interface-attributes": {"status": "not-ready"},
+            "static-route": {"status": "not-ready"},
+        },
+    )
+    nso_client.run_device_state_read = AsyncMock(
+        return_value={
+            "atomic": True,
+            "interface-attributes": {
+                "status": "ok",
+                "device-name": "sw-combined-heal",
+                "interface": [{"interface-name": "Loopback1331"}],
+            },
+            "static-route": {"status": "ok"},
+        }
+    )
+
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = nso_client
+    imp._netbox_client = None
+
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
+        await sync_device(device.id, db_session)
+
+    nso_client.get_device_state_doc.assert_awaited_once_with("sw-combined-heal")
+    nso_client.get_device_state_section.assert_not_awaited()
+    nso_client.run_device_state_read.assert_awaited_once()
+    args, kwargs = nso_client.run_device_state_read.await_args
+    assert kwargs == {}
+    assert sorted(args[1]) == ["interface-attributes", "static-route"]
+
+    rows = (await db_session.execute(select(DbInterface).where(DbInterface.device_id == device.id))).scalars().all()
+    assert [row.name for row in rows] == ["Loopback1331"]
+
+
+@pytest.mark.anyio
+async def test_sync_device_projection_batch_includes_interface_attributes_lock(
+    db_session: AsyncSession, adapter_client, monkeypatch
+):
+    """The composite sync locks attrs with the projected families; standalone wrappers do not."""
+    from nso_adapter.core import importer as imp
+    from nso_adapter.core import refresh_engine as engine_mod
+
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="sw-attrs-lock",
+        ned_id="cisco-ios-cli-6.95",
+        netbox_device_id=1332,
+    )
+    db_session.add(device)
+    await db_session.commit()
+
+    acquired: list[str] = []
+    real_lock = engine_mod._family_lock
+
+    def _recording_lock(device_id, family):
+        acquired.append(family)
+        return real_lock(device_id, family)
+
+    monkeypatch.setattr(engine_mod, "_family_lock", _recording_lock)
+    nso_client = _make_nso_client({"device-name": "sw-attrs-lock", "interface": []})
+    imp._nso_clients["nso-dev"] = nso_client
+    imp._netbox_client = None
+
+    with patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})):
+        await sync_device(device.id, db_session)
+
+    assert acquired.count("interface_attributes") == 1
+    assert acquired == sorted(acquired)
+
+
+@pytest.mark.anyio
+async def test_sync_device_terminalizes_and_rolls_back_failed_attrs_reconcile(
+    db_session: AsyncSession, adapter_client, monkeypatch
+):
+    """A partial local reconcile is discarded and its started outcome becomes terminal."""
+    from nso_adapter.core import importer as imp
+    from nso_adapter.store.models import RefreshOutcome
+
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="sw-attrs-failure",
+        ned_id="cisco-ios-cli-6.95",
+        netbox_device_id=1333,
+    )
+    db_session.add(device)
+    await db_session.commit()
+
+    nso_client = _make_nso_client(
+        {
+            "device-name": "sw-attrs-failure",
+            "interface": [{"interface-name": "Loopback1331"}],
+        }
+    )
+    imp._nso_clients["nso-dev"] = nso_client
+    imp._netbox_client = None
+
+    real_reconcile = imp._reconcile_interface
+
+    async def _write_then_fail(*args, **kwargs):
+        await real_reconcile(*args, **kwargs)
+        raise RuntimeError("injected after the real DB write")
+
+    monkeypatch.setattr(imp, "_reconcile_interface", _write_then_fail)
+
+    with (
+        patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})),
+        pytest.raises(RuntimeError, match="injected after"),
+    ):
+        await sync_device(device.id, db_session)
+
+    interfaces = (
+        (await db_session.execute(select(DbInterface).where(DbInterface.device_id == device.id))).scalars().all()
+    )
+    assert interfaces == []
+    outcomes = (
+        (
+            await db_session.execute(
+                select(RefreshOutcome).where(
+                    RefreshOutcome.device_id == device.id,
+                    RefreshOutcome.family == "interface_attributes",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(outcomes) == 1
+    assert (outcomes[0].result, outcomes[0].succeeded) == ("error", False)
 
 
 @pytest.mark.anyio

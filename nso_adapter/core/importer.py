@@ -11,6 +11,9 @@ Sync flow (docs/nso-adapter.md §7):
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import NamedTuple
 
@@ -24,7 +27,6 @@ from nso_adapter.core.refresh_engine import (
     _action_semaphore,
     classify_envelope_family_read,
     run_family_refresh_from_outcome,
-    run_family_refresh_from_section,
 )
 from nso_adapter.core.sync_state import compute_sync_state
 from nso_adapter.domain.models import Interface, InterfaceAttr
@@ -32,6 +34,7 @@ from nso_adapter.nso import actions as nso_actions
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import (  # noqa: F401 — Present used below
     Present,
+    ReadOutcome,
     Unavailable,
     UnavailableReason,
     classify_envelope_section,
@@ -267,6 +270,130 @@ def _section_or_error(section) -> dict:
     return {"status": "error", "error-reason": f"malformed section ({type(section).__name__})"}
 
 
+@dataclass(frozen=True)
+class _ProjectionLayout:
+    """The exact wire and lock sets for one projected fan-out."""
+
+    spec_by_name: dict[str, object | None]
+    wire_names: tuple[str, ...]
+    lock_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _ProjectedRead:
+    """One supplier result shared by every consumer in a projected batch."""
+
+    sections: dict[str, dict | None]
+    supplier_outcome: ReadOutcome | None
+
+    def outcome_for(self, wire_name: str) -> ReadOutcome:
+        if self.supplier_outcome is not None:
+            return self.supplier_outcome
+        return classify_envelope_section(self.sections[wire_name])
+
+
+def _projection_layout(
+    surfaces: list[tuple[str, object]],
+    *,
+    extra_wires: tuple[str, ...] = (),
+    extra_lock_names: tuple[str, ...] = (),
+) -> _ProjectionLayout:
+    """Build the deduplicated wire set and deterministic family-lock order."""
+    from nso_adapter.core.redistribution import _REDIST_COMPONENTS
+
+    spec_by_name = {name: _projectable_spec(name) for name, _ in surfaces}
+    wire_names = {spec.wire_name for spec in spec_by_name.values() if spec is not None}
+    lock_names = {spec.name for spec in spec_by_name.values() if spec is not None}
+    if "redistribution" in spec_by_name:
+        # Redistribution is one outcome family assembled from three projected wires.
+        wire_names.update(wire for _protocol, wire, _builder in _REDIST_COMPONENTS)
+        lock_names.add("redistribution")
+    wire_names.update(extra_wires)
+    lock_names.update(extra_lock_names)
+    return _ProjectionLayout(
+        spec_by_name=spec_by_name,
+        wire_names=tuple(sorted(wire_names)),
+        lock_names=tuple(sorted(lock_names)),
+    )
+
+
+@asynccontextmanager
+async def _projected_batch(
+    db: AsyncSession,
+    device: Device,
+    nso_client: NsoClient,
+    surfaces: list[tuple[str, object]],
+    *,
+    atomic: bool = False,
+    extra_wires: tuple[str, ...] = (),
+    extra_lock_names: tuple[str, ...] = (),
+):
+    """Acquire the complete batch lock set, fetch once, and retain locks for consumers."""
+    from nso_adapter.core import refresh_engine as _engine
+
+    layout = _projection_layout(
+        surfaces,
+        extra_wires=extra_wires,
+        extra_lock_names=extra_lock_names,
+    )
+    async with AsyncExitStack() as lock_stack:
+        for lock_name in layout.lock_names:
+            await lock_stack.enter_async_context(_engine._family_lock(device.id, lock_name))
+        sections, supplier_outcome = await _fetch_projection(
+            nso_client,
+            device,
+            list(layout.wire_names),
+            atomic=atomic,
+        )
+        yield layout, _ProjectedRead(sections, supplier_outcome)
+
+
+async def _apply_projected(
+    db: AsyncSession,
+    device: Device,
+    nso_client: NsoClient,
+    surfaces: list[tuple[str, object]],
+    refresh_source: str,
+    layout: _ProjectionLayout,
+    projection: _ProjectedRead,
+) -> list[str]:
+    """Apply generic surfaces from an already-fetched projection while locks are held."""
+    from nso_adapter.core.redistribution import _REDIST_COMPONENTS, refresh_redistribution_from_outcomes
+
+    failed: list[str] = []
+    for name, fn in surfaces:
+        spec = layout.spec_by_name[name]
+        try:
+            if spec is None and name == "redistribution":
+                component_outcomes = {
+                    protocol: projection.outcome_for(wire) for protocol, wire, _builder in _REDIST_COMPONENTS
+                }
+                ok = await refresh_redistribution_from_outcomes(
+                    db,
+                    device,
+                    component_outcomes,
+                    refresh_source=refresh_source,
+                    own_lock=False,
+                )
+            elif spec is None:
+                ok = await fn(db, device, nso_client, refresh_source=refresh_source)
+            else:
+                ok = await run_family_refresh_from_outcome(
+                    db,
+                    device,
+                    spec,
+                    projection.outcome_for(spec.wire_name),
+                    refresh_source=refresh_source,
+                    own_lock=False,
+                )
+            if not ok:
+                failed.append(name)
+        except Exception as exc:  # noqa: BLE001 — one surface must not take down the rest
+            logger.warning("sync.surface_refresh_failed", device_id=device.id, surface=name, error=repr(exc))
+            failed.append(name)
+    return failed
+
+
 async def _run_surfaces_projected(
     db: AsyncSession,
     device: Device,
@@ -275,88 +402,19 @@ async def _run_surfaces_projected(
     refresh_source: str,
     *,
     atomic: bool = False,
-) -> tuple[list[str], object | None]:
-    """READSEM grains b/c: feed every spec-backed surface from ONE projected read.
-
-    Same per-surface isolation as :func:`_run_surfaces`. Returns
-    ``(failed_names, supplier_outcome)`` — the supplier outcome is already fanned out
-    per-family (outcomes terminalized) before return; surfacing it lets callers
-    distinguish a TOTAL supplier failure (doc GET / atomic action failed — nothing was
-    read) from per-family degradation (S5a B, codex R2-F4). Non-spec surfaces
-    (redistribution) still classify from the same snapshot.
-    """
-    from contextlib import AsyncExitStack
-
-    from nso_adapter.core import refresh_engine as _engine
-    from nso_adapter.core.redistribution import _REDIST_COMPONENTS, refresh_redistribution_from_outcomes
-
-    spec_by_name = {name: _projectable_spec(name) for name, _ in surfaces}
-    wire_names = [spec.wire_name for spec in spec_by_name.values() if spec is not None]
-    if "redistribution" in spec_by_name:
-        # Codex S3-R3 F2: redistribution's three components classify from the SAME fetched
-        # snapshot — force their wires into the fetch even if those family surfaces are
-        # individually disabled (a missing section would read as device absence and WIPE
-        # the partition).
-        wire_names = sorted({*wire_names, *(w for _p, w, _b in _REDIST_COMPONENTS)})
-    # Codex S3-R3 F3: hold EVERY spec surface's family lock across fetch+apply -
-    # otherwise a grain-a/SSE refresh can materialize a NEWER read between our fetch and
-    # our apply, and the delayed projection overwrites it with older data. Sorted
-    # acquisition (single order, no nesting elsewhere) keeps it deadlock-free; the apply
-    # calls below pass own_lock=False.
-    # Codex S3-R4: lock the SPEC NAMES (grain-a's identities — lag_topology's spec is
-    # named "lag"; a label-keyed lock excludes no one) + redistribution's own key.
-    lock_names = {spec.name for spec in spec_by_name.values() if spec is not None}
-    if "redistribution" in spec_by_name:
-        lock_names.add("redistribution")
-    async with AsyncExitStack() as lock_stack:
-        for lock_name in sorted(lock_names):
-            await lock_stack.enter_async_context(_engine._family_lock(device.id, lock_name))
-        sections, supplier_outcome = await _fetch_projection(nso_client, device, wire_names, atomic=atomic)
-
-        failed: list[str] = []
-        for name, fn in surfaces:
-            spec = spec_by_name[name]
-            try:
-                if spec is None and name == "redistribution":
-                    if supplier_outcome is not None:
-                        component_outcomes = {proto: supplier_outcome for proto, _w, _b in _REDIST_COMPONENTS}
-                    else:
-                        component_outcomes = {
-                            proto: classify_envelope_section(
-                                sections[w] if sections[w] is None else _section_or_error(sections[w])
-                            )
-                            for proto, w, _b in _REDIST_COMPONENTS
-                        }
-                    ok = await refresh_redistribution_from_outcomes(
-                        db, device, component_outcomes, refresh_source=refresh_source, own_lock=False
-                    )
-                elif spec is None:
-                    ok = await fn(db, device, nso_client, refresh_source=refresh_source)
-                elif supplier_outcome is not None:
-                    ok = await run_family_refresh_from_outcome(
-                        db, device, spec, supplier_outcome, refresh_source=refresh_source, own_lock=False
-                    )
-                else:
-                    section = sections[spec.wire_name]
-                    if section is None:
-                        ok = await run_family_refresh_from_outcome(
-                            db,
-                            device,
-                            spec,
-                            classify_envelope_section(None),
-                            refresh_source=refresh_source,
-                            own_lock=False,
-                        )
-                    else:
-                        ok = await run_family_refresh_from_section(
-                            db, device, spec, section, refresh_source=refresh_source, own_lock=False
-                        )
-                if not ok:
-                    failed.append(name)
-            except Exception as exc:  # noqa: BLE001 — one surface must not take down the rest
-                logger.warning("sync.surface_refresh_failed", device_id=device.id, surface=name, error=repr(exc))
-                failed.append(name)
-        return failed, supplier_outcome
+) -> tuple[list[str], ReadOutcome | None]:
+    """READSEM grains b/c: feed every spec-backed surface from one projected read."""
+    async with _projected_batch(db, device, nso_client, surfaces, atomic=atomic) as (layout, projection):
+        failed = await _apply_projected(
+            db,
+            device,
+            nso_client,
+            surfaces,
+            refresh_source,
+            layout,
+            projection,
+        )
+        return failed, projection.supplier_outcome
 
 
 def _routing_surfaces(cfg) -> list[tuple[str, object]]:
@@ -731,14 +789,23 @@ async def _record_attrs_read(db, device, outcome, refresh_source: str):
         return None
 
 
-async def _record_attrs_result(db, device, attempt_id, *, available: bool, row_count: int | None) -> None:
+async def _record_attrs_result(
+    db,
+    device,
+    attempt_id,
+    *,
+    available: bool,
+    row_count: int | None,
+    device_id: int | None = None,
+) -> None:
     """Best-effort phase-2 terminalization for the attrs read (same recovery discipline)."""
     from nso_adapter.core.refresh_engine import _recover_session
     from nso_adapter.store import outcome_store
 
     if attempt_id is None:
         return
-    device_id = device.id
+    if device_id is None:
+        device_id = device.id
     try:
         await outcome_store.record_result(
             db,
@@ -750,6 +817,198 @@ async def _record_attrs_result(db, device, attempt_id, *, available: bool, row_c
     except Exception as exc:  # noqa: BLE001
         logger.warning("interface_attributes.outcome.result_record_failed", attempt_id=attempt_id, error=repr(exc))
         await _recover_session(db, device, "interface_attributes", device_id)
+
+
+class _AttrsSyncResult(NamedTuple):
+    available: bool
+    interfaces_created: int
+    changes_detected: int
+    interfaces_written: int
+
+
+async def _attrs_failure_cleanup(
+    db: AsyncSession,
+    device_id: int,
+    outcome: ReadOutcome,
+    attempt_id: int | None,
+    savepoint,
+    refresh_source: str,
+) -> None:
+    """Roll back partial attrs work and best-effort terminalize its outcome as error."""
+    from nso_adapter.store import outcome_store
+
+    try:
+        if savepoint is not None and db.sync_session.is_active and savepoint.is_active:
+            try:
+                await savepoint.rollback()
+            except Exception as rollback_exc:  # noqa: BLE001 — fall through to full recovery
+                logger.warning(
+                    "interface_attributes.savepoint_rollback_failed",
+                    device_id=device_id,
+                    error=repr(rollback_exc),
+                )
+            else:
+                if attempt_id is not None:
+                    await outcome_store.record_result(
+                        db,
+                        attempt_id,
+                        result="error",
+                        succeeded=False,
+                        row_count=None,
+                    )
+                return
+
+        # A DB failure may have invalidated both the savepoint and its flushed phase-1
+        # row. Recover the session, then create a fresh terminal attempt carrying the
+        # original read classification.
+        await db.rollback()
+        recovered_device = await db.get(Device, device_id)
+        if recovered_device is None:
+            logger.warning("interface_attributes.failure_device_missing", device_id=device_id)
+            return
+        failed_id = await outcome_store.record_read_outcome(
+            db,
+            device_id,
+            "interface_attributes",
+            outcome,
+            refresh_source=refresh_source,
+        )
+        await outcome_store.record_result(
+            db,
+            failed_id,
+            result="error",
+            succeeded=False,
+            row_count=None,
+        )
+    except Exception as store_exc:  # noqa: BLE001 — never mask the reconcile/commit failure
+        logger.warning(
+            "interface_attributes.outcome.terminalize_failed",
+            attempt_id=attempt_id,
+            device_id=device_id,
+            error=repr(store_exc),
+        )
+        try:
+            await db.rollback()
+        except Exception as recovery_exc:  # noqa: BLE001 — original failure remains primary
+            logger.warning(
+                "interface_attributes.outcome.session_recovery_failed",
+                device_id=device_id,
+                error=repr(recovery_exc),
+            )
+
+
+async def _consume_interface_attributes(
+    db: AsyncSession,
+    device: Device,
+    outcome: ReadOutcome,
+    nb_client,
+    *,
+    refresh_source: str,
+) -> _AttrsSyncResult:
+    """Reconcile one already-classified projected attrs outcome and terminalize it."""
+    device_id = device.id
+    available = isinstance(outcome, Present)
+    attempt_id = None
+    savepoint = None
+    interfaces_created = 0
+    changes_detected = 0
+    interfaces_written = 0
+    try:
+        # Phase 1 and savepoint acquisition are guarded too: cancellation can land
+        # after the outcome row flush but before begin_nested returns.
+        attempt_id = await _record_attrs_read(db, device, outcome, refresh_source)
+        savepoint = await db.begin_nested()
+        if available:
+            interfaces = _attrs_to_interface_list(outcome.data)
+            scope_result = await db.execute(select(ManagedScope).where(ManagedScope.device_id == device_id))
+            scope_attrs = [scope.attribute for scope in scope_result.scalars().all()]
+
+            result_rows = await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))
+            existing_ifaces = {row.name: row for row in result_rows.scalars().all()}
+
+            nb_id_by_name = await _ensure_netbox_interfaces(nb_client, device, device_id, interfaces)
+            ctx = _WriteCtx(nb_client, device, nb_id_by_name, {}, {})
+            for iface in interfaces:
+                created, changes = await _reconcile_interface(
+                    db,
+                    device_id,
+                    iface,
+                    scope_attrs,
+                    existing_ifaces,
+                    ctx,
+                )
+                interfaces_created += int(created)
+                changes_detected += changes
+
+            interfaces_written = await _flush_netbox_patches(
+                nb_client,
+                ctx.attr_patches,
+                ctx.pending_by_id,
+            )
+            device.mapping_status = MappingStatus.mapped if interfaces else MappingStatus.unmatched_interfaces
+        else:
+            assert isinstance(outcome, Unavailable)
+            logger.warning(
+                "sync.interface_attributes_unavailable",
+                device_id=device_id,
+                reason=outcome.reason.value,
+            )
+    except asyncio.CancelledError:
+        await await_uncancellable(
+            _attrs_failure_cleanup(
+                db,
+                device_id,
+                outcome,
+                attempt_id,
+                savepoint,
+                refresh_source,
+            )
+        )
+        raise
+    except Exception:
+        await await_uncancellable(
+            _attrs_failure_cleanup(
+                db,
+                device_id,
+                outcome,
+                attempt_id,
+                savepoint,
+                refresh_source,
+            )
+        )
+        raise
+
+    async def _success_span() -> None:
+        try:
+            await db.commit()
+        except Exception:
+            # This cleanup must happen inside the child: await_uncancellable masks a
+            # child exception behind CancelledError if parent cancellation was absorbed.
+            await _attrs_failure_cleanup(
+                db,
+                device_id,
+                outcome,
+                attempt_id,
+                savepoint,
+                refresh_source,
+            )
+            raise
+        await _record_attrs_result(
+            db,
+            device,
+            attempt_id,
+            available=available,
+            row_count=interfaces_written,
+            device_id=device_id,
+        )
+
+    await await_uncancellable(_success_span())
+    return _AttrsSyncResult(
+        available=available,
+        interfaces_created=interfaces_created,
+        changes_detected=changes_detected,
+        interfaces_written=interfaces_written,
+    )
 
 
 async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False, comprehensive: bool = False) -> dict:
@@ -773,105 +1032,55 @@ async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False,
     # read below is only as fresh as this made the CDB (A3b).
     sync_from_ok = _sync_from_succeeded(await nso_actions.sync_from(client, device.nso_device_name))
 
-    # Step 2: read canonical interface attributes from NSO package oper-data, through the
-    # read-outcome vocabulary. interface-attributes is a present-policy inventory family
-    # (get_interface_attributes → confirm_404=False), so a 404/None means the export is down /
-    # the NED is unsupported / the device is not-ready — NOT "this device has zero interfaces".
-    # Only an authoritative Present read may drive the interface reconcile and flip
-    # mapping_status; an Unavailable read leaves the prior mapping intact and reports the surface
-    # degraded, so a transient export blip never demotes a mapped device to unmatched_interfaces.
-    attrs_outcome = await classify_envelope_family_read(
+    nb_client = get_netbox_client()
+    cfg = get_config().scheduler
+    if comprehensive:
+        surfaces = _routing_surfaces(cfg) + _config_surfaces(cfg) + _extra_mirror_surfaces(cfg)
+    else:
+        surfaces = _routing_surfaces(cfg)
+
+    # Attributes and every generic surface consume one projected supplier result while
+    # the complete deterministic family-lock set remains held.
+    async with _projected_batch(
+        db,
         device,
         client,
-        wire_name="interface-attributes",
-        family_name="interface_attributes",
-    )
-    attrs_available = isinstance(attrs_outcome, Present)
-    # READSEM S3 B5 (codex R1-F7): attrs starts recording outcomes. Phase 1 here; phase 2
-    # after the interface reconcile below (best-effort — never breaks the sync).
-    attrs_attempt_id = await _record_attrs_read(db, device, attrs_outcome, "sync")
-
-    nb_client = get_netbox_client()
-    interfaces_created = 0
-    changes_detected = 0
-    interfaces_written = 0
-    if attrs_available:
-        interfaces = _attrs_to_interface_list(attrs_outcome.data)
-
-        scope_result = await db.execute(select(ManagedScope).where(ManagedScope.device_id == device_id))
-        scope_attrs = [s.attribute for s in scope_result.scalars().all()]
-
-        result_rows = await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))
-        existing_ifaces: dict[str, DbInterface] = {row.name: row for row in result_rows.scalars().all()}
-
-        # Phase 1: bulk interface inventory reconcile (plan Layer A).
-        nb_id_by_name = await _ensure_netbox_interfaces(nb_client, device, device_id, interfaces)
-
-        ctx = _WriteCtx(nb_client, device, nb_id_by_name, {}, {})
-        for iface in interfaces:
-            created, changes = await _reconcile_interface(db, device_id, iface, scope_attrs, existing_ifaces, ctx)
-            interfaces_created += int(created)
-            changes_detected += changes
-
-        # Phase 2 flush: push queued attribute updates, batched + isolated.
-        interfaces_written = await _flush_netbox_patches(nb_client, ctx.attr_patches, ctx.pending_by_id)
-
-        # The interface sync itself is done; its mapping is accurate regardless of what the
-        # routing surfaces do next. An authoritative present-empty read (zero interfaces) is a
-        # genuine unmatched_interfaces.
-        device.mapping_status = MappingStatus.mapped if interfaces else MappingStatus.unmatched_interfaces
-    else:
-        # Unavailable read: keep the prior mapping_status untouched; the surface is degraded and
-        # is added to the fan-out's degraded list below.
-        logger.warning(
-            "sync.interface_attributes_unavailable",
-            device_id=device_id,
-            reason=attrs_outcome.reason.value,
+        surfaces,
+        atomic=atomic,
+        extra_wires=("interface-attributes",),
+        extra_lock_names=("interface_attributes",),
+    ) as (layout, projection):
+        attrs = await _consume_interface_attributes(
+            db,
+            device,
+            projection.outcome_for("interface-attributes"),
+            nb_client,
+            refresh_source="sync",
         )
+        degraded = await _apply_projected(
+            db,
+            device,
+            client,
+            surfaces,
+            "sync",
+            layout,
+            projection,
+        )
+        if not attrs.available:
+            degraded.append("interface_attributes")
+        if not sync_from_ok:
+            degraded.append("sync_from")
 
-    # Commit the interface work now, but defer BOTH last_sync_at and last_sync_status until
-    # after the fan-out: a premature timestamp under a job-budget cancel would show the
-    # operator a fresh timestamp with a stale status and a failed job (S5a R1-F3/R2-F8);
-    # a silently-failed surface read must not hide under a premature 'succeeded'.
-    # S5a A3: [commit → attrs terminalization] is one cancellation-atomic span — a cancel
-    # between them left committed interface rows under a non-terminal attrs outcome.
-    async def _attrs_span() -> None:
+        # Publish final device metadata before releasing the common locks, so an older
+        # sync cannot resume and overwrite a newer sync's status.
+        device.last_sync_at = _utcnow()
+        if degraded:
+            device.last_sync_status = LastSyncStatus.partial
+            device.degraded_surfaces = sorted(degraded)
+        else:
+            device.last_sync_status = LastSyncStatus.succeeded
+            device.degraded_surfaces = None
         await db.commit()
-        await _record_attrs_result(
-            db, device, attrs_attempt_id, available=attrs_available, row_count=interfaces_written
-        )
-
-    await await_uncancellable(_attrs_span())
-
-    # Fan out to the routing/extra surfaces so one sync refreshes everything the device
-    # exposes (IS-IS/BGP/OSPF/route-policy/...), not just interface attributes. Done
-    # before the plugin notify so its reconcile sees the fresh surface state in one pass.
-    if comprehensive:
-        degraded, _supplier = await refresh_all_surfaces_for_device(
-            db, device, client, refresh_source="sync", atomic=atomic
-        )
-    else:
-        degraded = await refresh_routing_surfaces_for_device(db, device, client, refresh_source="sync", atomic=atomic)
-    if not attrs_available:
-        degraded = [*degraded, "interface_attributes"]
-
-    # A3b: a sync-from that did not actually pull (result:false / unreachable) means every surface
-    # was just re-read from STALE CDB — this sync is not a live device reread, so report it degraded
-    # rather than claim 'succeeded' with fresh data it does not have.
-    if not sync_from_ok:
-        degraded = [*degraded, "sync_from"]
-
-    # Record the outcome only AFTER the fan-out. A surface whose NSO read failed leaves a
-    # stale mirror, so the device reports 'partial' (naming the offending surfaces) rather
-    # than a misleading 'succeeded'; a clean sync clears any prior degraded marker.
-    device.last_sync_at = _utcnow()
-    if degraded:
-        device.last_sync_status = LastSyncStatus.partial
-        device.degraded_surfaces = sorted(degraded)
-    else:
-        device.last_sync_status = LastSyncStatus.succeeded
-        device.degraded_surfaces = None
-    await db.commit()
 
     # Notify the netbox-nso-plugin so it refreshes its NSO*State display cache off
     # the request path. Best-effort — a callback failure must not fail the sync.
@@ -884,25 +1093,21 @@ async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False,
             )
 
     summary = {
-        "interfaces_written": interfaces_written,
-        "interfaces_created": interfaces_created,
-        "changes_detected": changes_detected,
+        "interfaces_written": attrs.interfaces_written,
+        "interfaces_created": attrs.interfaces_created,
+        "changes_detected": attrs.changes_detected,
     }
     logger.info("sync.done", device_id=device_id, **summary)
     return summary
 
 
-async def detect_drift(device_id: int, db: AsyncSession) -> dict:
-    """Re-read NSO config and recompute sync_state WITHOUT writing to NetBox."""
-    device = await db.get(Device, device_id)
-    if not device:
-        raise ValueError(f"Device {device_id} not found")
-
-    client = get_nso_client(device.nso_instance)
-
-    # compare-config re-reads from NSO CDB vs live device
-    await nso_actions.compare_config(client, device.nso_device_name)
-
+async def _detect_drift_attributes(
+    device_id: int,
+    db: AsyncSession,
+    device: Device,
+    client: NsoClient,
+) -> tuple[int, object]:
+    """Read and commit interface drift while the caller owns the attrs family lock."""
     # Route the attrs read through the vocabulary (present-policy family): a 404/None or read
     # error is Unavailable, not "zero interfaces", so drift is computed only from an authoritative
     # Present read. An Unavailable read leaves the stored sync_state untouched (drift is read-only).
@@ -981,6 +1186,30 @@ async def detect_drift(device_id: int, db: AsyncSession) -> dict:
 
     device.last_sync_at = _utcnow()
     await db.commit()
+    return changes_detected, nb_client
+
+
+async def detect_drift(device_id: int, db: AsyncSession) -> dict:
+    """Re-read NSO config and recompute sync_state WITHOUT writing to NetBox."""
+    from nso_adapter.core import refresh_engine as _engine
+
+    device = await db.get(Device, device_id)
+    if not device:
+        raise ValueError(f"Device {device_id} not found")
+
+    client = get_nso_client(device.nso_instance)
+
+    # compare-config re-reads from NSO CDB vs live device. It stays outside the
+    # attribute critical section because it neither reads nor applies attribute state.
+    await nso_actions.compare_config(client, device.nso_device_name)
+
+    async with _engine._family_lock(device_id, "interface_attributes"):
+        changes_detected, nb_client = await _detect_drift_attributes(
+            device_id,
+            db,
+            device,
+            client,
+        )
 
     # Refresh the netbox-nso-plugin display cache so Detect Drift results are
     # visible immediately (mirrors sync_device). Without this, detect-drift updates
