@@ -4090,6 +4090,28 @@
             ],
             "title": "Segment Routing"
           },
+          "segment_routing_configured": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Segment Routing Configured"
+          },
+          "segment_routing_reported": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Segment Routing Reported"
+          },
           "settings": {
             "anyOf": [
               {

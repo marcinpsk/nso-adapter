@@ -289,6 +289,33 @@ async def test_refresh_persists_p2_levels_and_sr(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_refresh_preserves_segment_routing_absence_provenance(adapter_client):
+    device_id = await seed_device(nso_device_name="isis-sr-empty", netbox_device_id=975)
+    async with _device_session(device_id) as (db, device):
+        nso_client = AsyncMock()
+        nso_client.get_device_state_section.return_value = {
+            "status": "ok",
+            "process": [
+                {
+                    "process-tag": "CORE",
+                    "segment-routing-reported": True,
+                    "segment-routing-configured": False,
+                }
+            ],
+            "interface": [],
+        }
+
+        await refresh_isis_interfaces_for_device(db, device, nso_client, refresh_source="poll")
+
+        proc = (
+            await db.execute(select(DeviceIsisProcess).where(DeviceIsisProcess.device_id == device.id))
+        ).scalar_one()
+        assert proc.segment_routing_reported is True
+        assert proc.segment_routing_configured is False
+        assert proc.segment_routing is None
+
+
+@pytest.mark.anyio
 async def test_refresh_persists_srv6_locators(adapter_client):
     """The per-process srv6-locator list is mirrored to the srv6_locators column."""
     device_id = await seed_device(nso_device_name="isis-srv6-01", netbox_device_id=971)

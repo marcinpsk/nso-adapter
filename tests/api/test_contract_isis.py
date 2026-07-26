@@ -58,6 +58,8 @@ PROC_OPTIONAL_SCALARS = {
     "distance",
     "maximum_paths",
     "reference_bandwidth",
+    "segment_routing_reported",
+    "segment_routing_configured",
 }
 PROC_CONTAINER_KEYS = {"settings", "levels", "segment_routing", "flex_algos", "srv6_locators"}
 
@@ -221,6 +223,8 @@ async def _seed_isis(device_id: int) -> None:
                 distance=115,
                 maximum_paths=8,
                 reference_bandwidth=100000,
+                segment_routing_reported=True,
+                segment_routing_configured=True,
                 settings={"some-knob": "v"},
                 levels=[instance_level],
                 segment_routing=sr,
@@ -232,6 +236,17 @@ async def _seed_isis(device_id: int) -> None:
         )
         # MINIMAL process: only process_tag (every optional/container omitted).
         db.add(DeviceIsisProcess(device_id=device_id, process_tag="2", last_refreshed_at=ts, refresh_source="poll"))
+        # Explicit absence provenance from a current reader.
+        db.add(
+            DeviceIsisProcess(
+                device_id=device_id,
+                process_tag="3",
+                segment_routing_reported=True,
+                segment_routing_configured=False,
+                last_refreshed_at=ts,
+                refresh_source="poll",
+            )
+        )
         # MAXIMAL interface + MINIMAL interface.
         db.add(
             DeviceIsisInterface(
@@ -289,9 +304,14 @@ async def test_isis_payload_matches_contract_exactly(adapter_client):
     assert set(body.keys()) == TOP_KEYS
 
     procs = {p["process_tag"]: p for p in body["processes"]}
-    maximal, minimal = procs["1"], procs["2"]
+    maximal, minimal, empty_sr = procs["1"], procs["2"], procs["3"]
     assert set(maximal.keys()) == PROC_REQUIRED_KEYS | PROC_OPTIONAL_SCALARS | PROC_CONTAINER_KEYS
     assert set(minimal.keys()) == PROC_REQUIRED_KEYS  # all optionals + containers omitted
+    assert empty_sr == {
+        "process_tag": "3",
+        "segment_routing_reported": True,
+        "segment_routing_configured": False,
+    }
 
     # Nested bags: hyphen→snake normalised, fixed key sets the plugin reads.
     assert set(maximal["levels"][0].keys()) == INSTANCE_LEVEL_KEYS

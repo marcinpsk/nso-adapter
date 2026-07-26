@@ -1290,6 +1290,8 @@ class DeviceIsisProcess(Base):
     # per-level child rows [{level, default-metric, wide-metrics-only,...}]
     # and the segment-routing object {enabled, prefix-sid-range, ...}.
     levels: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    segment_routing_reported: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    segment_routing_configured: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     segment_routing: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # flex-algo child rows [{algo-id, metric-type, priority,...}].
     flex_algos: Mapped[list | None] = mapped_column(JSON, nullable=True)

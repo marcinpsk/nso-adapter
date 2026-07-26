@@ -71,6 +71,8 @@ _PROCESS_OPTIONAL_FIELDS = (
     "distance",
     "maximum_paths",
     "reference_bandwidth",
+    "segment_routing_reported",
+    "segment_routing_configured",
 )
 _INTERFACE_OPTIONAL_FIELDS = (
     "circuit_type",
@@ -100,7 +102,7 @@ def _serialize_isis_process(row: DeviceIsisProcess) -> dict:
         entry["settings"] = row.settings
     if row.levels:
         entry["levels"] = [_snake(lvl) for lvl in row.levels]
-    if row.segment_routing:
+    if row.segment_routing is not None:
         entry["segment_routing"] = _snake(row.segment_routing)
     if row.flex_algos:
         entry["flex_algos"] = [_snake(fa) for fa in row.flex_algos]
@@ -163,6 +165,8 @@ class IsisProcessOut(BaseModel):
     distance: int | None = None
     maximum_paths: int | None = None
     reference_bandwidth: int | None = None
+    segment_routing_reported: bool | None = None
+    segment_routing_configured: bool | None = None
     settings: dict | None = None
     levels: list | None = None
     segment_routing: dict | None = None
