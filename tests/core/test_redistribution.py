@@ -10,8 +10,9 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import select
 
-from nso_adapter.core.redistribution import refresh_redistribution_for_device
+from nso_adapter.core.redistribution import refresh_redistribution_for_device, refresh_redistribution_from_outcomes
 from nso_adapter.nso.client import NsoExportUnavailableError
+from nso_adapter.nso.read_outcome import Freshness, Present, Unavailable, UnavailableReason
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, DeviceRedistribution
 from tests.conftest import seed_device
@@ -49,6 +50,32 @@ def _nso_client_with_data(ospf=None, isis=None, bgp=None) -> AsyncMock:
 
     client.get_device_state_section.side_effect = _get
     return client
+
+
+@pytest.mark.anyio
+async def test_superseded_export_outage_does_not_degrade_newer_winner(adapter_client, monkeypatch):
+    from nso_adapter.core import redistribution
+
+    device_id = await seed_device(nso_device_name="rd-superseded", netbox_device_id=7699)
+
+    async def superseded_record(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(redistribution, "_record_composite", superseded_record)
+    async with _device_session(device_id) as (db, device):
+        ok = await refresh_redistribution_from_outcomes(
+            db,
+            device,
+            {
+                "ospf": Unavailable(UnavailableReason.export_down),
+                "isis": Present({}, Freshness.fresh),
+                "bgp": Present({}, Freshness.fresh),
+            },
+            refresh_source="test",
+            own_lock=False,
+        )
+
+    assert ok is True
 
 
 @pytest.mark.anyio

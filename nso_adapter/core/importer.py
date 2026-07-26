@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from typing import NamedTuple
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.config import get_config
@@ -781,7 +781,12 @@ async def _record_attrs_read(db, device, outcome, refresh_source: str):
     device_id = device.id  # snapshot before the store call can poison the session
     try:
         return await outcome_store.record_read_outcome(
-            db, device_id, "interface_attributes", outcome, refresh_source=refresh_source
+            db,
+            device_id,
+            "interface_attributes",
+            outcome,
+            refresh_source=refresh_source,
+            source_epoch=device.source_epoch,
         )
     except Exception as exc:  # noqa: BLE001 — telemetry write; the sync is the story
         logger.warning("interface_attributes.outcome.read_record_failed", device_id=device_id, error=repr(exc))
@@ -833,6 +838,7 @@ async def _attrs_failure_cleanup(
     attempt_id: int | None,
     savepoint,
     refresh_source: str,
+    source_epoch: int,
 ) -> None:
     """Roll back partial attrs work and best-effort terminalize its outcome as error."""
     from nso_adapter.store import outcome_store
@@ -872,6 +878,7 @@ async def _attrs_failure_cleanup(
             "interface_attributes",
             outcome,
             refresh_source=refresh_source,
+            source_epoch=source_epoch,
         )
         await outcome_store.record_result(
             db,
@@ -907,6 +914,7 @@ async def _consume_interface_attributes(
 ) -> _AttrsSyncResult:
     """Reconcile one already-classified projected attrs outcome and terminalize it."""
     device_id = device.id
+    source_epoch = device.source_epoch
     available = isinstance(outcome, Present)
     attempt_id = None
     savepoint = None
@@ -917,6 +925,24 @@ async def _consume_interface_attributes(
         # Phase 1 and savepoint acquisition are guarded too: cancellation can land
         # after the outcome row flush but before begin_nested returns.
         attempt_id = await _record_attrs_read(db, device, outcome, refresh_source)
+        if available and attempt_id is None:
+            raise RuntimeError("interface_attributes: cannot publish without an outcome attempt")
+        if attempt_id is not None:
+            from nso_adapter.store import outcome_store
+
+            outcome_row = await db.get(outcome_store.RefreshOutcome, attempt_id)
+            await outcome_store.acquire_family_fence(db, device_id, "interface_attributes")
+            if not await outcome_store.publication_is_current(db, outcome_row):
+                await outcome_store.stage_result(
+                    db,
+                    outcome_row,
+                    result="superseded",
+                    succeeded=True,
+                    row_count=None,
+                    publish_payload=False,
+                )
+                await db.commit()
+                return _AttrsSyncResult(True, 0, 0, 0)
         savepoint = await db.begin_nested()
         if available:
             interfaces = _attrs_to_interface_list(outcome.data)
@@ -962,6 +988,7 @@ async def _consume_interface_attributes(
                 attempt_id,
                 savepoint,
                 refresh_source,
+                source_epoch,
             )
         )
         raise
@@ -974,12 +1001,32 @@ async def _consume_interface_attributes(
                 attempt_id,
                 savepoint,
                 refresh_source,
+                source_epoch,
             )
         )
         raise
 
     async def _success_span() -> None:
         try:
+            if available:
+                selected = await outcome_store.stage_result(
+                    db,
+                    outcome_row,
+                    result="replaced",
+                    succeeded=True,
+                    row_count=interfaces_written,
+                    publish_payload=True,
+                )
+                if not selected:
+                    await savepoint.rollback()
+                    await outcome_store.stage_result(
+                        db,
+                        outcome_row,
+                        result="superseded",
+                        succeeded=True,
+                        row_count=None,
+                        publish_payload=False,
+                    )
             await db.commit()
         except Exception:
             # This cleanup must happen inside the child: await_uncancellable masks a
@@ -991,16 +1038,18 @@ async def _consume_interface_attributes(
                 attempt_id,
                 savepoint,
                 refresh_source,
+                source_epoch,
             )
             raise
-        await _record_attrs_result(
-            db,
-            device,
-            attempt_id,
-            available=available,
-            row_count=interfaces_written,
-            device_id=device_id,
-        )
+        if not available:
+            await _record_attrs_result(
+                db,
+                device,
+                attempt_id,
+                available=False,
+                row_count=None,
+                device_id=device_id,
+            )
 
     await await_uncancellable(_success_span())
     return _AttrsSyncResult(
@@ -1023,6 +1072,7 @@ async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False,
     device = await db.get(Device, device_id)
     if not device:
         raise ValueError(f"Device {device_id} not found")
+    source_epoch = device.source_epoch
 
     client = get_nso_client(device.nso_instance)
     await _resolve_ned_id(db, device, client)
@@ -1073,18 +1123,23 @@ async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False,
 
         # Publish final device metadata before releasing the common locks, so an older
         # sync cannot resume and overwrite a newer sync's status.
-        device.last_sync_at = _utcnow()
         if degraded:
-            device.last_sync_status = LastSyncStatus.partial
-            device.degraded_surfaces = sorted(degraded)
+            sync_status = LastSyncStatus.partial
+            degraded_surfaces = sorted(degraded)
         else:
-            device.last_sync_status = LastSyncStatus.succeeded
-            device.degraded_surfaces = None
-        await db.commit()
+            sync_status = LastSyncStatus.succeeded
+            degraded_surfaces = None
+        metadata_published = await _publish_sync_metadata(
+            db,
+            device_id,
+            source_epoch,
+            sync_status,
+            degraded_surfaces,
+        )
 
     # Notify the netbox-nso-plugin so it refreshes its NSO*State display cache off
     # the request path. Best-effort — a callback failure must not fail the sync.
-    if nb_client and device.netbox_device_id:
+    if metadata_published and nb_client and device.netbox_device_id:
         try:
             await nb_client.notify_sync_complete(device.netbox_device_id)
         except Exception as exc:
@@ -1099,6 +1154,30 @@ async def sync_device(device_id: int, db: AsyncSession, *, atomic: bool = False,
     }
     logger.info("sync.done", device_id=device_id, **summary)
     return summary
+
+
+async def _publish_sync_metadata(
+    db: AsyncSession,
+    device_id: int,
+    source_epoch: int,
+    status: LastSyncStatus,
+    degraded_surfaces: list[str] | None,
+) -> bool:
+    """Conditionally publish batch metadata in the source generation it describes."""
+    result = await db.execute(
+        update(Device)
+        .where(Device.id == device_id, Device.source_epoch == source_epoch)
+        .values(
+            last_sync_at=_utcnow(),
+            last_sync_status=status,
+            degraded_surfaces=degraded_surfaces,
+        )
+    )
+    await db.commit()
+    if result.rowcount == 0:
+        logger.info("sync.metadata.superseded", device_id=device_id, source_epoch=source_epoch)
+        return False
+    return True
 
 
 async def _detect_drift_attributes(
@@ -1126,6 +1205,30 @@ async def _detect_drift_attributes(
             reason=attrs_outcome.reason.value,
         )
         interfaces = []
+
+    from nso_adapter.store import outcome_store
+
+    attempt_id = await outcome_store.record_read_outcome(
+        db,
+        device_id,
+        "interface_attributes",
+        attrs_outcome,
+        refresh_source="detect_drift",
+        source_epoch=device.source_epoch,
+    )
+    outcome_row = await db.get(outcome_store.RefreshOutcome, attempt_id)
+    await outcome_store.acquire_family_fence(db, device_id, "interface_attributes")
+    if not await outcome_store.publication_is_current(db, outcome_row):
+        await outcome_store.stage_result(
+            db,
+            outcome_row,
+            result="superseded",
+            succeeded=True,
+            row_count=None,
+            publish_payload=False,
+        )
+        await db.commit()
+        return 0, get_netbox_client()
 
     scope_result2 = await db.execute(select(ManagedScope).where(ManagedScope.device_id == device_id))
     scope_attrs = [s.attribute for s in scope_result2.scalars().all()]
@@ -1185,6 +1288,14 @@ async def _detect_drift_attributes(
             attr_state.last_checked_at = _utcnow()
 
     device.last_sync_at = _utcnow()
+    await outcome_store.stage_result(
+        db,
+        outcome_row,
+        result="replaced" if isinstance(attrs_outcome, Present) else "kept",
+        succeeded=isinstance(attrs_outcome, Present),
+        row_count=changes_detected if isinstance(attrs_outcome, Present) else None,
+        publish_payload=isinstance(attrs_outcome, Present),
+    )
     await db.commit()
     return changes_detected, nb_client
 

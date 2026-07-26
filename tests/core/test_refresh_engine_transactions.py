@@ -66,14 +66,14 @@ async def _seed_route(device_id: int, prefix: str) -> None:
     ],
     ids=("present", "authoritative-clear"),
 )
-async def test_engine_commits_staged_mirror_before_phase_two(
+async def test_engine_publishes_mirror_and_phase_two_in_one_commit(
     adapter_client,
     monkeypatch,
     outcome,
     expected_before_phase_two,
     expected_result,
 ):
-    """A transaction-neutral materializer is durable before best-effort phase two."""
+    """A fresh reader cannot see the staged mirror before its declaration commits."""
     device_id = await seed_device(nso_device_name=f"engine-commit-{expected_result}")
     await _seed_route(device_id, "198.18.9.0/24")
 
@@ -96,26 +96,28 @@ async def test_engine_commits_staged_mirror_before_phase_two(
         materialize=_stage_routes,
         wire_name="transaction-probe",
     )
-    real_record_result = outcome_store.record_result
-    visible_before_phase_two: list[list[str]] = []
+    real_stage_result = outcome_store.stage_result
+    visible_during_phase_two: list[list[str]] = []
 
-    async def _observe_then_record(db, attempt_id, *, result, succeeded, row_count=None):
-        visible_before_phase_two.append(await _fresh_prefixes(device_id))
-        await real_record_result(
+    async def _observe_then_stage(db, row, *, result, succeeded, row_count, publish_payload=None):
+        visible_during_phase_two.append(await _fresh_prefixes(device_id))
+        return await real_stage_result(
             db,
-            attempt_id,
+            row,
             result=result,
             succeeded=succeeded,
             row_count=row_count,
+            publish_payload=publish_payload,
         )
 
-    monkeypatch.setattr(outcome_store, "record_result", _observe_then_record)
+    monkeypatch.setattr(outcome_store, "stage_result", _observe_then_stage)
 
     async with _device_session(device_id) as (db, device):
         ok = await run_family_refresh_from_outcome(db, device, spec, outcome)
 
     assert ok is True
-    assert visible_before_phase_two == [expected_before_phase_two]
+    assert visible_during_phase_two == [["198.18.9.0/24"]]
+    assert await _fresh_prefixes(device_id) == expected_before_phase_two
     assert await _fresh_prefixes(device_id) == expected_before_phase_two
     async for db in get_session():
         current = await outcome_store.get_current_outcome(db, device_id, spec.name)

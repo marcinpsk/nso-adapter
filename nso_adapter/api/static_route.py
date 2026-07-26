@@ -65,7 +65,9 @@ async def get_static_routes(device_id: int, db: AsyncSession = Depends(get_read_
 
     # Pointer FIRST, rows second, one snapshot (D2): rows can only be same-or-newer than
     # the outcome they're paired with — the benign direction for the plugin gate.
-    read_state = read_state_payload(await outcome_store.get_current_outcome(db, device_id, "static_route"))
+    read_state = read_state_payload(
+        await outcome_store.get_current_outcome(db, device_id, "static_route"), source_epoch=device.source_epoch
+    )
 
     result = await db.execute(
         select(DeviceStaticRoute)

@@ -231,7 +231,9 @@ async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_read_db)
         raise api_error(404, "not_found", "Device not found")
 
     # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
-    read_state = read_state_payload(await outcome_store.get_current_outcome(db, device_id, "bgp"))
+    read_state = read_state_payload(
+        await outcome_store.get_current_outcome(db, device_id, "bgp"), source_epoch=device.source_epoch
+    )
 
     bgp_routers = (
         (

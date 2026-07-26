@@ -90,7 +90,14 @@ async def _record_read(
     """
     device_id = device.id  # snapshot: after a failed flush the instance may be expired
     try:
-        return await outcome_store.record_read_outcome(db, device_id, spec.name, outcome, refresh_source=refresh_source)
+        return await outcome_store.record_read_outcome(
+            db,
+            device_id,
+            spec.name,
+            outcome,
+            refresh_source=refresh_source,
+            source_epoch=device.source_epoch,
+        )
     except Exception as exc:  # noqa: BLE001 — telemetry write; the mirror is the source of truth
         logger.warning(f"{spec.name}.outcome.read_record_failed", device_id=device_id, error=repr(exc))
         await _recover_session(db, device, spec.name, device_id)
@@ -122,16 +129,19 @@ async def _record_result(
     result: str,
     succeeded: bool,
     row_count: int | None,
-) -> None:
+) -> bool | None:
     """Best-effort phase-2 outcome record + pointer advance (with session recovery)."""
     if attempt_id is None:
-        return
+        return None
     device_id = device.id  # snapshot before the store call can poison the session
     try:
-        await outcome_store.record_result(db, attempt_id, result=result, succeeded=succeeded, row_count=row_count)
+        return await outcome_store.record_result(
+            db, attempt_id, result=result, succeeded=succeeded, row_count=row_count
+        )
     except Exception as exc:  # noqa: BLE001 — telemetry write; never fail the refresh over it
         logger.warning(f"{spec.name}.outcome.result_record_failed", attempt_id=attempt_id, error=repr(exc))
         await _recover_session(db, device, spec.name, device_id)
+        return None
 
 
 @dataclass(frozen=True)
@@ -317,12 +327,12 @@ async def _materialize_guarded(
     db: AsyncSession,
     device: Device,
     spec: FamilySpec,
-    attempt_id: int | None,
+    attempt_id: int,
     payload_fn,
     refresh_source: str,
     outcome: ReadOutcome,
 ):
-    """Run extract+materialize under a SAVEPOINT; terminalize the attempt on failure.
+    """Atomically publish mirror rows and their terminal declaration.
 
     Codex S3-R1 F6, scoped: a materializer exception must (a) not leave its PARTIAL
     mirror writes to be committed later, and (b) still terminalize phase 2 so the newest
@@ -335,12 +345,39 @@ async def _materialize_guarded(
     re-raises (legacy contract).
     """
     device_id = device.id  # snapshot: a commit-time failure expires the instance
+    row = await db.get(outcome_store.RefreshOutcome, attempt_id)
+    if row is None:
+        raise RuntimeError(f"{spec.name}: authoritative publication has no outcome attempt {attempt_id}")
+    await outcome_store.acquire_family_fence(db, row.device_id, row.family)
+    source_epoch = row.source_epoch
+    if not await outcome_store.publication_is_current(db, row):
+        await outcome_store.stage_result(
+            db, row, result="superseded", succeeded=True, row_count=None, publish_payload=False
+        )
+        await db.commit()
+        return None, True
+
     savepoint = await db.begin_nested()
     try:
         payload = payload_fn()
         await spec.materialize(db, device, payload, refresh_source)
+        row_count = len(payload) if isinstance(payload, (list, tuple)) else None
+        result = "cleared" if isinstance(outcome, AbsentAuthoritative) else "replaced"
+        selected = await outcome_store.stage_result(
+            db,
+            row,
+            result=result,
+            succeeded=True,
+            row_count=row_count,
+            publish_payload=True,
+        )
+        if not selected:
+            await savepoint.rollback()
+            await outcome_store.stage_result(
+                db, row, result="superseded", succeeded=True, row_count=None, publish_payload=False
+            )
         await db.commit()
-        return payload
+        return payload, not selected
     except Exception:
         # Two failure modes (codex S3-R2 F1): a Python-level materializer error leaves the
         # savepoint alive — roll IT back (sibling caller work survives) and terminalize the
@@ -355,7 +392,12 @@ async def _materialize_guarded(
             else:
                 await _recover_session(db, device, spec.name, device_id)
                 failed_id = await outcome_store.record_read_outcome(
-                    db, device_id, spec.name, outcome, refresh_source=refresh_source
+                    db,
+                    device_id,
+                    spec.name,
+                    outcome,
+                    refresh_source=refresh_source,
+                    source_epoch=source_epoch,
                 )
                 await outcome_store.record_result(db, failed_id, result="error", succeeded=False, row_count=None)
         except Exception as store_exc:  # noqa: BLE001 — telemetry; the materializer error is the story
@@ -375,14 +417,19 @@ async def _apply_outcome(
     attempt_id = await _record_read(db, device, spec, outcome, refresh_source)
 
     if isinstance(outcome, Present):
+        if attempt_id is None:
+            raise RuntimeError(f"{spec.name}: cannot publish an authoritative body without an outcome attempt")
+
         # S5a A3: the [materialize → record_result] span must be atomic under CANCELLATION —
         # a budget/shutdown cancel between the engine's mirror commit and the pointer
         # terminalization leaves new rows under the old outcome (codex R1-F4). The parent
         # keeps session + family locks alive while the span task completes.
         async def _present_span() -> bool:
-            payload = await _materialize_guarded(
+            payload, superseded = await _materialize_guarded(
                 db, device, spec, attempt_id, lambda: spec.extract(outcome.data), refresh_source, outcome
             )
+            if superseded:
+                return True
             row_count = len(payload) if isinstance(payload, (list, tuple)) else None
             logger.info(
                 f"{spec.name}.refresh.done",
@@ -392,23 +439,28 @@ async def _apply_outcome(
                 freshness=outcome.freshness.value,
                 refresh_source=refresh_source,
             )
-            await _record_result(db, device, spec, attempt_id, result="replaced", succeeded=True, row_count=row_count)
             return True
 
         return await await_uncancellable(_present_span())
 
     if isinstance(outcome, AbsentAuthoritative):
+        if attempt_id is None:
+            raise RuntimeError(f"{spec.name}: cannot publish an authoritative clear without an outcome attempt")
+
         # Clear by materializing the "nothing" payload for this family (extract of an empty
         # entry). Same cancellation-atomic span as the Present branch (S5a A3).
         async def _cleared_span() -> bool:
-            await _materialize_guarded(db, device, spec, attempt_id, lambda: spec.extract({}), refresh_source, outcome)
+            _, superseded = await _materialize_guarded(
+                db, device, spec, attempt_id, lambda: spec.extract({}), refresh_source, outcome
+            )
+            if superseded:
+                return True
             logger.info(
                 f"{spec.name}.refresh.cleared",
                 device_id=device.id,
                 device_name=device.nso_device_name,
                 refresh_source=refresh_source,
             )
-            await _record_result(db, device, spec, attempt_id, result="cleared", succeeded=True, row_count=0)
             return True
 
         return await await_uncancellable(_cleared_span())
@@ -437,5 +489,5 @@ async def _apply_outcome(
         reason=outcome.reason.value,
         detail=outcome.detail,
     )
-    await _record_result(db, device, spec, attempt_id, result="kept", succeeded=False, row_count=None)
-    return False
+    selected = await _record_result(db, device, spec, attempt_id, result="kept", succeeded=False, row_count=None)
+    return selected is False

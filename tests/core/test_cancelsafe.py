@@ -93,7 +93,7 @@ async def test_engine_cancel_between_commit_and_terminalize_keeps_pointer_consis
 
 
 async def test_attrs_cancel_between_commit_and_terminalize_records_anyway(device_db, monkeypatch):
-    """Importer attrs window (importer.py commit → _record_attrs_result)."""
+    """Importer attrs atomic publication survives cancellation before its commit."""
     from unittest.mock import AsyncMock
 
     from nso_adapter.core import importer as imp
@@ -118,13 +118,16 @@ async def test_attrs_cancel_between_commit_and_terminalize_records_anyway(device
     imp._netbox_client = None
 
     parent = asyncio.current_task()
-    real = imp._record_attrs_result
+    from nso_adapter.store import outcome_store
 
-    async def cancel_then_record(db_, device_, attempt_id_, **kw):
-        parent.cancel()  # cancel pending on the parent; unwrapped code dies at the next await
-        return await real(db_, device_, attempt_id_, **kw)
+    real = outcome_store.stage_result
 
-    monkeypatch.setattr(imp, "_record_attrs_result", cancel_then_record)
+    async def cancel_then_stage(db_, outcome_, **kw):
+        if kw.get("result") == "replaced":
+            parent.cancel()  # the atomic child must commit before cancellation propagates
+        return await real(db_, outcome_, **kw)
+
+    monkeypatch.setattr(outcome_store, "stage_result", cancel_then_stage)
 
     from unittest.mock import patch as _patch
 

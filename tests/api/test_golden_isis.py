@@ -35,6 +35,8 @@ _SYNTH_READ_STATE = {
     "succeeded": None,
     "read_at": None,
     "attempt_id": None,
+    "source_epoch": 1,
+    "payload_revision": None,
     "incarnation": GOLDEN_INCARNATION,
     "incarnation_born": GOLDEN_BORN_ISO,
 }

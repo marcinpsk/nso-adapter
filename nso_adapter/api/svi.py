@@ -43,11 +43,13 @@ class SviOut(BaseModel):
 )
 async def get_svi(device_id: int, db: AsyncSession = Depends(get_read_db)):
     """Return the device's SVIs/IRBs (no IPs — those ride interface-ip)."""
-    if await db.get(Device, device_id) is None:
+    if (device := await db.get(Device, device_id)) is None:
         raise api_error(404, "not_found", "Device not found")
 
     # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
-    read_state = read_state_payload(await outcome_store.get_current_outcome(db, device_id, "svi"))
+    read_state = read_state_payload(
+        await outcome_store.get_current_outcome(db, device_id, "svi"), source_epoch=device.source_epoch
+    )
     rows = (
         (await db.execute(select(DeviceSvi).where(DeviceSvi.device_id == device_id).order_by(DeviceSvi.vlan_id)))
         .scalars()

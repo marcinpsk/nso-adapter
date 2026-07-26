@@ -110,6 +110,7 @@ async def test_record_result_terminalizes_and_creates_pointer(adapter_client):
     assert row.completed_at is not None
     ptr = await _pointer(device_id, "isis")
     assert ptr is not None and ptr.attempt_id == attempt_id
+    assert ptr.payload_revision == attempt_id
 
 
 @pytest.mark.anyio
@@ -157,6 +158,51 @@ async def test_pointer_shows_newest_failure(adapter_client):
         current = await db.get(RefreshOutcome, ptr.attempt_id)
         break
     assert current.succeeded is False  # newest failure is the current, visible outcome
+
+
+@pytest.mark.anyio
+async def test_kept_outcome_advances_attempt_but_preserves_payload_revision(adapter_client):
+    """#1332: a failed/unavailable read changes declared truth but not the mirror body."""
+    device_id = await seed_device(nso_device_name="oc-revision-keep", netbox_device_id=8891)
+    async for db in get_session():
+        published = await outcome_store.record_read_outcome(
+            db, device_id, "static_route", Present({}, Freshness.fresh), refresh_source="poll"
+        )
+        await outcome_store.record_result(
+            db, published, result="replaced", succeeded=True, row_count=1, publish_payload=True
+        )
+        kept = await outcome_store.record_read_outcome(
+            db,
+            device_id,
+            "static_route",
+            Unavailable(UnavailableReason.export_down),
+            refresh_source="poll",
+        )
+        await outcome_store.record_result(db, kept, result="kept", succeeded=False)
+        break
+
+    ptr = await _pointer(device_id, "static_route")
+    assert ptr.attempt_id == kept
+    assert ptr.payload_revision == published
+
+
+@pytest.mark.anyio
+async def test_attempt_captures_device_source_epoch(adapter_client):
+    device_id = await seed_device(nso_device_name="oc-source-epoch", netbox_device_id=8892)
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        assert device.source_epoch == 1
+        attempt_id = await outcome_store.record_read_outcome(
+            db,
+            device_id,
+            "bfd",
+            Present({}, Freshness.fresh),
+            refresh_source="poll",
+            source_epoch=device.source_epoch,
+        )
+        row = await db.get(RefreshOutcome, attempt_id)
+        assert row.source_epoch == 1
+        break
 
 
 @pytest.mark.anyio

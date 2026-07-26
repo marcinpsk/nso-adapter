@@ -47,11 +47,13 @@ class SubinterfaceOut(BaseModel):
 )
 async def get_subinterface(device_id: int, db: AsyncSession = Depends(get_read_db)):
     """Return the device's dot1q subinterfaces (no IPs — those ride interface-ip)."""
-    if await db.get(Device, device_id) is None:
+    if (device := await db.get(Device, device_id)) is None:
         raise api_error(404, "not_found", "Device not found")
 
     # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
-    read_state = read_state_payload(await outcome_store.get_current_outcome(db, device_id, "subinterface"))
+    read_state = read_state_payload(
+        await outcome_store.get_current_outcome(db, device_id, "subinterface"), source_epoch=device.source_epoch
+    )
     rows = (
         (
             await db.execute(

@@ -32,13 +32,15 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.core.families import ALL_FAMILY_KEYS
 from nso_adapter.nso.read_outcome import AbsentAuthoritative, Present, ReadOutcome, Unavailable
-from nso_adapter.store.models import RefreshOutcome, RefreshOutcomePointer
+from nso_adapter.store.models import Device, RefreshOutcome, RefreshOutcomePointer
 
 logger = structlog.get_logger(__name__)
+_FAMILY_ORDINAL = {family: index + 1 for index, family in enumerate(ALL_FAMILY_KEYS)}
 
 
 def _decompose(outcome: ReadOutcome) -> tuple[str, str | None, str | None]:
@@ -58,6 +60,7 @@ async def record_read_outcome(
     outcome: ReadOutcome,
     *,
     refresh_source: str,
+    source_epoch: int | None = None,
 ) -> int:
     """Phase 1: persist the classified read outcome; return the new attempt id.
 
@@ -66,6 +69,10 @@ async def record_read_outcome(
     commit) makes it durable.
     """
     read_outcome, read_reason, freshness = _decompose(outcome)
+    if source_epoch is None:
+        source_epoch = await db.scalar(select(Device.source_epoch).where(Device.id == device_id))
+    if source_epoch is None:
+        raise LookupError(f"device {device_id} disappeared before read outcome recording")
     row = RefreshOutcome(
         device_id=device_id,
         family=family,
@@ -73,6 +80,7 @@ async def record_read_outcome(
         read_outcome=read_outcome,
         read_reason=read_reason,
         freshness=freshness,
+        source_epoch=source_epoch,
     )
     db.add(row)
     await db.flush()  # assign the PK (the attempt id) without committing
@@ -86,7 +94,8 @@ async def record_result(
     result: str,
     succeeded: bool,
     row_count: int | None = None,
-) -> None:
+    publish_payload: bool | None = None,
+) -> bool | None:
     """Phase 2: terminalize *attempt_id*, advance the per-(device, family) pointer, and commit.
 
     The pointer advances only when this attempt's id exceeds the currently-pointed one (newest
@@ -97,17 +106,106 @@ async def record_result(
     row = await db.get(RefreshOutcome, attempt_id)
     if row is None:
         logger.warning("outcome_store.record_result.unknown_attempt", attempt_id=attempt_id)
+        return None
+    await acquire_family_fence(db, row.device_id, row.family)
+    selected = await stage_result(
+        db,
+        row,
+        result=result,
+        succeeded=succeeded,
+        row_count=row_count,
+        publish_payload=publish_payload,
+    )
+    await db.commit()
+    return selected
+
+
+async def acquire_family_fence(db: AsyncSession, device_id: int, family: str) -> None:
+    """Serialize every terminal writer for one family at the PostgreSQL boundary."""
+    if db.bind.dialect.name != "postgresql":
         return
+    try:
+        ordinal = _FAMILY_ORDINAL[family]
+    except KeyError as exc:
+        raise ValueError(f"unknown read family {family!r}") from exc
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(:device_id, :family_ordinal)"),
+        {"device_id": device_id, "family_ordinal": ordinal},
+    )
+
+
+async def stage_result(
+    db: AsyncSession,
+    row: RefreshOutcome,
+    *,
+    result: str,
+    succeeded: bool,
+    row_count: int | None,
+    publish_payload: bool | None = None,
+) -> bool:
+    """Stage terminal truth + pointer without committing; return whether it selected the pointer.
+
+    Caller holds the family fence. A source-rekeyed or older attempt becomes historical
+    ``superseded`` and never creates/advances a pointer.
+    """
+    if publish_payload is None:
+        publish_payload = result in {"replaced", "cleared"}
+    current_epoch = await db.scalar(select(Device.source_epoch).where(Device.id == row.device_id))
+    current_attempt = await db.scalar(
+        select(RefreshOutcomePointer.attempt_id).where(
+            RefreshOutcomePointer.device_id == row.device_id,
+            RefreshOutcomePointer.family == row.family,
+        )
+    )
+    superseded = current_epoch != row.source_epoch or (current_attempt is not None and current_attempt > row.id)
+    if superseded:
+        result, succeeded, row_count, publish_payload = "superseded", True, None, False
+
     row.result = result
     row.succeeded = succeeded
     row.row_count = row_count
     row.completed_at = datetime.now(UTC)
+    if superseded:
+        return False
 
-    await db.execute(_pointer_advance_stmt(db, row.device_id, row.family, attempt_id))
-    await db.commit()
+    await db.execute(
+        _pointer_advance_stmt(
+            db,
+            row.device_id,
+            row.family,
+            row.id,
+            publish_payload=publish_payload,
+        )
+    )
+    selected = await db.scalar(
+        select(RefreshOutcomePointer.attempt_id).where(
+            RefreshOutcomePointer.device_id == row.device_id,
+            RefreshOutcomePointer.family == row.family,
+        )
+    )
+    return selected == row.id
 
 
-def _pointer_advance_stmt(db: AsyncSession, device_id: int, family: str, attempt_id: int):
+async def publication_is_current(db: AsyncSession, row: RefreshOutcome) -> bool:
+    """Return whether *row* may still publish after the caller acquired its family fence."""
+    current_epoch = await db.scalar(select(Device.source_epoch).where(Device.id == row.device_id))
+    current_attempt = await db.scalar(
+        select(RefreshOutcomePointer.attempt_id).where(
+            RefreshOutcomePointer.device_id == row.device_id,
+            RefreshOutcomePointer.family == row.family,
+        )
+    )
+    return current_epoch == row.source_epoch and (current_attempt is None or current_attempt <= row.id)
+
+
+def _pointer_advance_stmt(
+    db: AsyncSession,
+    device_id: int,
+    family: str,
+    attempt_id: int,
+    *,
+    publish_payload: bool,
+):
     """Build the database-atomic monotonic pointer upsert (READSEM S4 D6).
 
     ``INSERT … ON CONFLICT (device_id, family) DO UPDATE … WHERE excluded.attempt_id >
@@ -123,10 +221,21 @@ def _pointer_advance_stmt(db: AsyncSession, device_id: int, family: str, attempt
         from sqlalchemy.dialects.postgresql import insert as dialect_insert
     else:
         from sqlalchemy.dialects.sqlite import insert as dialect_insert
-    stmt = dialect_insert(RefreshOutcomePointer).values(device_id=device_id, family=family, attempt_id=attempt_id)
+    payload_revision = attempt_id if publish_payload else None
+    stmt = dialect_insert(RefreshOutcomePointer).values(
+        device_id=device_id,
+        family=family,
+        attempt_id=attempt_id,
+        payload_revision=payload_revision,
+    )
+    revision_update = stmt.excluded.payload_revision if publish_payload else RefreshOutcomePointer.payload_revision
     return stmt.on_conflict_do_update(
         index_elements=["device_id", "family"],
-        set_={"attempt_id": stmt.excluded.attempt_id, "updated_at": func.now()},
+        set_={
+            "attempt_id": stmt.excluded.attempt_id,
+            "payload_revision": revision_update,
+            "updated_at": func.now(),
+        },
         where=stmt.excluded.attempt_id > RefreshOutcomePointer.attempt_id,
     )
 
@@ -141,25 +250,34 @@ async def get_current_outcome(db: AsyncSession, device_id: int, family: str) -> 
     API synthesizes a ``not_ready`` read_state from it; it must never be conflated with a
     recorded ``unavailable``.
     """
-    return (
+    result = (
         await db.execute(
-            select(RefreshOutcome)
+            select(RefreshOutcome, RefreshOutcomePointer.payload_revision)
             .join(RefreshOutcomePointer, RefreshOutcomePointer.attempt_id == RefreshOutcome.id)
             .where(
                 RefreshOutcomePointer.device_id == device_id,
                 RefreshOutcomePointer.family == family,
             )
         )
-    ).scalar_one_or_none()
+    ).one_or_none()
+    if result is None:
+        return None
+    row, payload_revision = result
+    row.payload_revision = payload_revision
+    return row
 
 
 async def get_current_outcomes(db: AsyncSession, device_id: int) -> dict[str, RefreshOutcome]:
     """Return every pointed family's newest terminal attempt for *device_id*, in ONE query."""
     rows = (
         await db.execute(
-            select(RefreshOutcome)
+            select(RefreshOutcome, RefreshOutcomePointer.payload_revision)
             .join(RefreshOutcomePointer, RefreshOutcomePointer.attempt_id == RefreshOutcome.id)
             .where(RefreshOutcomePointer.device_id == device_id)
         )
-    ).scalars()
-    return {row.family: row for row in rows}
+    ).all()
+    by_family = {}
+    for row, payload_revision in rows:
+        row.payload_revision = payload_revision
+        by_family[row.family] = row
+    return by_family

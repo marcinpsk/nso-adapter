@@ -257,6 +257,29 @@ async def test_export_down_keeps_rows(adapter_client):
         assert await _routes(db, device_id) == ["10.0.0.0/8"]
 
 
+@pytest.mark.anyio
+async def test_superseded_unavailable_attempt_does_not_degrade_newer_winner(adapter_client, monkeypatch):
+    from nso_adapter.store import outcome_store
+
+    device_id = await seed_device(nso_device_name="eng-env-superseded", netbox_device_id=9713)
+    await _seed_one_route(device_id)
+
+    async def superseded_result(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(outcome_store, "record_result", superseded_result)
+    async with _device_session(device_id) as (db, device):
+        ok = await run_family_refresh(
+            db,
+            device,
+            _client(section={"status": "error", "error-reason": "older read failed"}),
+            ENV_SPEC,
+        )
+
+        assert ok is True
+        assert await _routes(db, device_id) == ["10.0.0.0/8"]
+
+
 # ── run_family_refresh_from_section (grains b/c) ────────────────────────────────────
 
 
@@ -381,19 +404,15 @@ async def test_real_client_envelope_refresh_end_to_end(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_poisoned_session_store_failure_stays_best_effort(adapter_client, monkeypatch):
-    """Found live: the outcome store's INSERT failed at the DB level (missing table on
-    the un-migrated PG), which put the session in pending-rollback and expired the ORM
-    instances — the 'best-effort' handler then crashed on device attribute access
-    (PendingRollbackError), taking the whole refresh down with it. The engine must
-    recover the session and still complete the mirror refresh."""
+async def test_poisoned_outcome_store_fails_closed_and_preserves_payload(adapter_client, monkeypatch):
+    """An authoritative body cannot publish without its matching revision record."""
     from nso_adapter.store import outcome_store as outcome_store_mod
 
     device_id = await seed_device(nso_device_name="eng-env-poison", netbox_device_id=9719)
     await _seed_one_route(device_id)
     async with _device_session(device_id) as (db, device):
 
-        async def _poisoning_record(db_, device_id_, family, outcome, *, refresh_source):
+        async def _poisoning_record(db_, device_id_, family, outcome, *, refresh_source, source_epoch):
             # The live PG failure's EFFECT: the doomed transaction gets rolled back and
             # every ORM instance expires — then the store raises. (A plain `raise` leaves
             # the session healthy, which is why the old best-effort test stayed green.)
@@ -402,10 +421,10 @@ async def test_poisoned_session_store_failure_stays_best_effort(adapter_client, 
 
         monkeypatch.setattr(outcome_store_mod, "record_read_outcome", _poisoning_record)
 
-        ok = await run_family_refresh(db, device, _client(section=OK_SECTION), ENV_SPEC)
+        with pytest.raises(RuntimeError, match="cannot publish an authoritative body"):
+            await run_family_refresh(db, device, _client(section=OK_SECTION), ENV_SPEC)
 
-        assert ok is True, "a telemetry-write failure must never fail the refresh"
-        assert await _routes(db, device_id) == ["172.16.0.0/12"], "the mirror must still refresh"
+        assert await _routes(db, device_id) == ["10.0.0.0/8"], "the prior payload must remain visible"
 
 
 # ── codex R2: commit-time materializer failure (F1) + phase-2 store poisoning (F2) ──

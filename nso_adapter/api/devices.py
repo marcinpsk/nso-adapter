@@ -77,6 +77,7 @@ def _device_out(d: Device) -> dict:
         "nso_instance": d.nso_instance,
         "nso_device_name": d.nso_device_name,
         "netbox_device_id": d.netbox_device_id,
+        "source_epoch": d.source_epoch,
         "mapping_status": d.mapping_status.value,
         "last_sync_at": d.last_sync_at.isoformat() + "Z" if d.last_sync_at else None,
         "last_sync_status": d.last_sync_status.value if d.last_sync_status else None,
@@ -150,6 +151,7 @@ class DeviceOut(BaseModel):
     nso_instance: str
     nso_device_name: str
     netbox_device_id: int | None
+    source_epoch: int
     mapping_status: str
     last_sync_at: str | None
     last_sync_status: str | None

@@ -62,20 +62,27 @@ class FamilyReadState(BaseModel):
     # 'error' included deliberately: the engine terminalizes materializer failures as
     # result="error"/succeeded=False (refresh_engine) — a narrower literal would
     # response-validation-fail those real rows (codex R1-F3).
-    result: Literal["replaced", "cleared", "kept", "error"] | None = None
+    result: Literal["replaced", "cleared", "kept", "error", "superseded"] | None = None
     succeeded: bool | None = None
     # Phase-1 started_at — WHEN THE READ HAPPENED (SA-2: completed_at would make data look
     # newer than its read under a slow materializer). Display-only, never an ordering key.
     read_at: IsoZDateTime | None = None
     attempt_id: int | None = None  # null = synthesized (no pointer); sorts below every real attempt
+    source_epoch: int
+    payload_revision: int | None = None
     incarnation: str
     incarnation_born: IsoZDateTime  # adoption orders on this; adapter clock domain only — NEVER null
 
 
-def read_state_payload(row: RefreshOutcome | None) -> dict:
+def read_state_payload(row: RefreshOutcome | None, *, source_epoch: int) -> dict:
     """Build the wire block from the pointed terminal attempt, or synthesize not_ready."""
     incarnation, born = get_store_incarnation()
-    base = {"incarnation": incarnation, "incarnation_born": born}
+    base = {
+        "incarnation": incarnation,
+        "incarnation_born": born,
+        "source_epoch": source_epoch,
+        "payload_revision": getattr(row, "payload_revision", None),
+    }
     if row is None:
         return {
             **base,
@@ -124,5 +131,7 @@ async def get_device_read_state(device_id: int, db: AsyncSession = Depends(get_r
     return {
         "device_id": device_id,
         "families_version": FAMILIES_VERSION,
-        "families": {key: read_state_payload(by_family.get(key)) for key in ALL_FAMILY_KEYS},
+        "families": {
+            key: read_state_payload(by_family.get(key), source_epoch=device.source_epoch) for key in ALL_FAMILY_KEYS
+        },
     }

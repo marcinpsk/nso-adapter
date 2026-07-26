@@ -74,11 +74,13 @@ class SwitchportOut(BaseModel):
     responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
 )
 async def get_vlan_database(device_id: int, db: AsyncSession = Depends(get_read_db)):
-    if await db.get(Device, device_id) is None:
+    if (device := await db.get(Device, device_id)) is None:
         raise api_error(404, "not_found", "Device not found")
 
     # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
-    read_state = read_state_payload(await outcome_store.get_current_outcome(db, device_id, "vlan"))
+    read_state = read_state_payload(
+        await outcome_store.get_current_outcome(db, device_id, "vlan"), source_epoch=device.source_epoch
+    )
 
     rows = (
         (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device_id).order_by(DeviceVlan.vlan_id)))
@@ -99,11 +101,13 @@ async def get_vlan_database(device_id: int, db: AsyncSession = Depends(get_read_
     responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
 )
 async def get_switchport(device_id: int, db: AsyncSession = Depends(get_read_db)):
-    if await db.get(Device, device_id) is None:
+    if (device := await db.get(Device, device_id)) is None:
         raise api_error(404, "not_found", "Device not found")
 
     # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
-    read_state = read_state_payload(await outcome_store.get_current_outcome(db, device_id, "switchport"))
+    read_state = read_state_payload(
+        await outcome_store.get_current_outcome(db, device_id, "switchport"), source_epoch=device.source_epoch
+    )
 
     rows = (
         (

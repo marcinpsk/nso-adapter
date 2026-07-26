@@ -187,7 +187,9 @@ async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_read_d
         raise api_error(404, "not_found", "Device not found")
 
     # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
-    read_state = read_state_payload(await outcome_store.get_current_outcome(db, device_id, "route_policy"))
+    read_state = read_state_payload(
+        await outcome_store.get_current_outcome(db, device_id, "route_policy"), source_epoch=device.source_epoch
+    )
 
     prefix_lists = await _load_named(db, DeviceRoutePolicyPrefixList, device_id)
     community_lists = await _load_named(db, DeviceRoutePolicyCommunityList, device_id)

@@ -90,7 +90,9 @@ async def get_snmp_config(device_id: int, db: AsyncSession = Depends(get_read_db
         raise api_error(404, "not_found", "Device not found")
 
     # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
-    read_state = read_state_payload(await outcome_store.get_current_outcome(db, device_id, "snmp"))
+    read_state = read_state_payload(
+        await outcome_store.get_current_outcome(db, device_id, "snmp"), source_epoch=device.source_epoch
+    )
 
     communities_result = await db.execute(select(SnmpCommunity).where(SnmpCommunity.device_id == device_id))
     communities = communities_result.scalars().all()

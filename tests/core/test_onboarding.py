@@ -131,10 +131,77 @@ async def test_rekey_changes_device_name(adapter_client_with_nso):
 
     async for db in get_session():
         device = await db.get(Device, device_id)
+        device.ned_id = "old-ned"
+        device.sw_version = "old-version"
+        device.degraded_surfaces = ["ospf"]
+        await db.commit()
         updated = await rekey_device(db, device, nso_device_name="new-name")
         assert updated.nso_device_name == "new-name"
         assert updated.ned_id is None
+        assert updated.sw_version is None
         assert updated.last_sync_at is None
+        assert updated.degraded_surfaces is None
+        assert updated.source_epoch == 2
+        break
+
+
+async def test_rekey_same_source_is_true_noop(adapter_client_with_nso):
+    """An idempotent source PATCH preserves the generation and read publications."""
+    from nso_adapter.core.onboarding import rekey_device
+    from nso_adapter.nso.read_outcome import Present
+    from nso_adapter.store import outcome_store
+    from nso_adapter.store.db import get_session
+    from tests.conftest import seed_device
+
+    device_id = await seed_device(nso_instance="nso-dev", nso_device_name="same-source", netbox_device_id=306)
+    async for db in get_session():
+        attempt = await outcome_store.record_read_outcome(db, device_id, "bfd", Present([]), refresh_source="poll")
+        await outcome_store.record_result(
+            db, attempt, result="replaced", succeeded=True, row_count=0, publish_payload=True
+        )
+        db.add(DbInterface(device_id=device_id, name="GE0/0"))
+        await db.commit()
+        device = await db.get(Device, device_id)
+        updated = await rekey_device(
+            db, device, nso_instance=device.nso_instance, nso_device_name=device.nso_device_name
+        )
+        assert updated.source_epoch == 1
+        assert (await outcome_store.get_current_outcome(db, device_id, "bfd")).id == attempt
+        assert await db.scalar(select(DbInterface).where(DbInterface.device_id == device_id)) is not None
+        break
+
+
+async def test_rekey_invalidates_all_read_publications(adapter_client_with_nso):
+    """A real source change clears routing mirrors and every family pointer atomically."""
+    from nso_adapter.core.onboarding import rekey_device
+    from nso_adapter.nso.read_outcome import Present
+    from nso_adapter.store import outcome_store
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import DeviceStaticRoute
+    from tests.conftest import seed_device
+
+    device_id = await seed_device(nso_instance="nso-dev", nso_device_name="old-source", netbox_device_id=307)
+    async for db in get_session():
+        db.add(
+            DeviceStaticRoute(
+                device_id=device_id,
+                vrf="",
+                prefix="198.18.20.0/24",
+                next_hop="198.18.0.2",
+                refresh_source="poll",
+            )
+        )
+        attempt = await outcome_store.record_read_outcome(
+            db, device_id, "static_route", Present([]), refresh_source="poll"
+        )
+        await outcome_store.record_result(
+            db, attempt, result="replaced", succeeded=True, row_count=1, publish_payload=True
+        )
+        device = await db.get(Device, device_id)
+        updated = await rekey_device(db, device, nso_device_name="new-source")
+        assert updated.source_epoch == 2
+        assert await db.scalar(select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device_id)) is None
+        assert await outcome_store.get_current_outcome(db, device_id, "static_route") is None
         break
 
 
@@ -161,6 +228,109 @@ async def test_rekey_clears_interface_state(adapter_client_with_nso):
         # interfaces should be gone
         result = await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))
         assert result.scalars().all() == []
+        break
+
+
+async def test_rekey_preserves_interface_intent_and_its_identity_anchor(adapter_client_with_nso):
+    from nso_adapter.core.onboarding import rekey_device
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import InterfaceIntent
+    from tests.conftest import seed_device
+
+    device_id = await seed_device(nso_instance="nso-dev", nso_device_name="intent-source", netbox_device_id=308)
+    async for db in get_session():
+        iface = DbInterface(
+            device_id=device_id,
+            name="GE0/0",
+            parent_binding="old-parent",
+            kind="physical",
+        )
+        db.add(iface)
+        await db.flush()
+        db.add(InterfaceAttrState(interface_id=iface.id, attribute="description", nso_value="old"))
+        db.add(
+            InterfaceIntent(
+                interface_id=iface.id,
+                attribute="description",
+                intent_value="operator-owned",
+            )
+        )
+        await db.commit()
+
+        device = await db.get(Device, device_id)
+        await rekey_device(db, device, nso_device_name="replacement-source")
+
+        kept_iface = await db.scalar(select(DbInterface).where(DbInterface.device_id == device_id))
+        assert kept_iface is not None
+        assert kept_iface.name == "GE0/0"
+        assert kept_iface.parent_binding is None
+        assert kept_iface.kind is None
+        intent = await db.scalar(select(InterfaceIntent).where(InterfaceIntent.interface_id == kept_iface.id))
+        assert intent is not None
+        assert intent.intent_value == "operator-owned"
+        assert (
+            await db.scalar(select(InterfaceAttrState).where(InterfaceAttrState.interface_id == kept_iface.id)) is None
+        )
+        break
+
+
+async def test_rekey_preserves_ip_only_intent_and_its_identity_anchor(adapter_client_with_nso):
+    from nso_adapter.core.onboarding import rekey_device
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import InterfaceIpIntent
+    from tests.conftest import seed_device
+
+    device_id = await seed_device(nso_instance="nso-dev", nso_device_name="ip-intent-source", netbox_device_id=310)
+    async for db in get_session():
+        iface = DbInterface(device_id=device_id, name="GE0/1")
+        db.add(iface)
+        await db.flush()
+        db.add(
+            InterfaceIpIntent(
+                interface_id=iface.id,
+                address="198.18.0.1/24",
+                vrf="",
+                family="ipv4",
+                secondary=False,
+            )
+        )
+        await db.commit()
+
+        device = await db.get(Device, device_id)
+        await rekey_device(db, device, nso_device_name="replacement-ip-source")
+
+        kept_iface = await db.scalar(select(DbInterface).where(DbInterface.device_id == device_id))
+        assert kept_iface is not None
+        intent = await db.scalar(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == kept_iface.id))
+        assert intent is not None
+        assert intent.address == "198.18.0.1/24"
+        break
+
+
+async def test_old_source_sync_metadata_cannot_overwrite_rekey_reset(adapter_client_with_nso):
+    from nso_adapter.core.importer import _publish_sync_metadata
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import LastSyncStatus
+    from tests.conftest import seed_device
+
+    device_id = await seed_device(nso_instance="nso-dev", nso_device_name="metadata-source", netbox_device_id=309)
+    async for db in get_session():
+        device = await db.get(Device, device_id)
+        device.source_epoch = 2
+        await db.commit()
+
+        published = await _publish_sync_metadata(
+            db,
+            device_id,
+            source_epoch=1,
+            status=LastSyncStatus.succeeded,
+            degraded_surfaces=None,
+        )
+
+        assert published is False
+        await db.refresh(device)
+        assert device.last_sync_at is None
+        assert device.last_sync_status is None
         break
 
 

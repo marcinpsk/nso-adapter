@@ -29,13 +29,13 @@ import os
 import uuid as uuid_mod
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from nso_adapter.nso.read_outcome import Freshness, Present
 from nso_adapter.store import outcome_store
 from nso_adapter.store.db import get_session
-from nso_adapter.store.models import Base, Device, RefreshOutcomePointer
+from nso_adapter.store.models import Base, Device, DeviceStaticRoute, RefreshOutcome, RefreshOutcomePointer
 from tests.conftest import seed_device
 
 _PARITY_URL = os.environ.get("ALEMBIC_PARITY_DB_URL")
@@ -174,6 +174,105 @@ async def test_pg_lost_update_window_cannot_regress_pointer():
                 "the lost-update window regressed the pointer — the advance must be "
                 "database-atomic (ON CONFLICT ... WHERE), not compare-in-Python"
             )
+    finally:
+        await engine.dispose()
+        async with admin.connect() as conn:
+            await conn.exec_driver_sql(f'DROP DATABASE "{scratch}" WITH (FORCE)')
+        await admin.dispose()
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(not _PARITY_URL, reason="ALEMBIC_PARITY_DB_URL not set — PostgreSQL lane (CI only)")
+async def test_pg_payload_and_revision_publish_or_rollback_together():
+    """Simulate crash-before-commit and success with two real PostgreSQL sessions."""
+    from sqlalchemy.engine import make_url
+
+    scratch = f"publication_{uuid_mod.uuid4().hex[:10]}"
+    admin = create_async_engine(_PARITY_URL.replace("+psycopg2", "+asyncpg"), isolation_level="AUTOCOMMIT")
+    async with admin.connect() as conn:
+        await conn.exec_driver_sql(f'CREATE DATABASE "{scratch}"')
+    scratch_url = make_url(_PARITY_URL.replace("+psycopg2", "+asyncpg")).set(database=scratch)
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with factory() as db:
+            device = Device(nso_device_name="publication", netbox_device_id=8841, nso_instance="default")
+            db.add(device)
+            await db.flush()
+            device_id = device.id
+            db.add(
+                DeviceStaticRoute(
+                    device_id=device_id,
+                    vrf="",
+                    prefix="198.18.10.0/24",
+                    next_hop="198.18.0.1",
+                    refresh_source="poll",
+                )
+            )
+            base = await outcome_store.record_read_outcome(
+                db, device_id, "static_route", Present({"route": []}), refresh_source="poll"
+            )
+            await outcome_store.record_result(
+                db, base, result="replaced", succeeded=True, row_count=1, publish_payload=True
+            )
+            attempt = await outcome_store.record_read_outcome(
+                db, device_id, "static_route", Present({"route": []}), refresh_source="poll"
+            )
+            await db.commit()
+
+        async with factory() as publisher:
+            row = await publisher.get(RefreshOutcome, attempt)
+            await outcome_store.acquire_family_fence(publisher, device_id, "static_route")
+            await publisher.execute(delete(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device_id))
+            publisher.add(
+                DeviceStaticRoute(
+                    device_id=device_id,
+                    vrf="",
+                    prefix="198.18.20.0/24",
+                    next_hop="198.18.0.2",
+                    refresh_source="poll",
+                )
+            )
+            assert await outcome_store.stage_result(
+                publisher, row, result="replaced", succeeded=True, row_count=1, publish_payload=True
+            )
+
+            async with factory() as observer:
+                assert await observer.scalar(select(DeviceStaticRoute.prefix)) == "198.18.10.0/24"
+                pointer = await observer.scalar(select(RefreshOutcomePointer))
+                assert (pointer.attempt_id, pointer.payload_revision) == (base, base)
+
+            await publisher.rollback()  # simulated process death before COMMIT
+
+        async with factory() as observer:
+            assert await observer.scalar(select(DeviceStaticRoute.prefix)) == "198.18.10.0/24"
+            pointer = await observer.scalar(select(RefreshOutcomePointer))
+            assert (pointer.attempt_id, pointer.payload_revision) == (base, base)
+
+        async with factory() as publisher:
+            row = await publisher.get(RefreshOutcome, attempt)
+            await outcome_store.acquire_family_fence(publisher, device_id, "static_route")
+            await publisher.execute(delete(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device_id))
+            publisher.add(
+                DeviceStaticRoute(
+                    device_id=device_id,
+                    vrf="",
+                    prefix="198.18.20.0/24",
+                    next_hop="198.18.0.2",
+                    refresh_source="poll",
+                )
+            )
+            assert await outcome_store.stage_result(
+                publisher, row, result="replaced", succeeded=True, row_count=1, publish_payload=True
+            )
+            await publisher.commit()
+
+        async with factory() as observer:
+            assert await observer.scalar(select(DeviceStaticRoute.prefix)) == "198.18.20.0/24"
+            pointer = await observer.scalar(select(RefreshOutcomePointer))
+            assert (pointer.attempt_id, pointer.payload_revision) == (attempt, attempt)
     finally:
         await engine.dispose()
         async with admin.connect() as conn:

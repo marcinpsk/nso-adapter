@@ -106,6 +106,9 @@ class Device(Base):
     nso_instance: Mapped[str] = mapped_column(String(128))
     nso_device_name: Mapped[str] = mapped_column(String(256), index=True)
     netbox_device_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # Monotonic generation of the mapped NSO source. Rekey increments it so a read
+    # fetched before an A→B→A mapping change cannot publish against the new source.
+    source_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1, server_default="1")
     ned_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     # Last platform version learned from a capability probe — lets the capability
     # cache resolve this device's (ned_id, sw_version) key WITHOUT a live probe.
@@ -2257,6 +2260,7 @@ class RefreshOutcome(Base):
     )
     family: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="poll")
+    source_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1, server_default="1")
     # Phase 1 — the classified read outcome.
     read_outcome: Mapped[str] = mapped_column(
         String(32), nullable=False
@@ -2267,7 +2271,9 @@ class RefreshOutcome(Base):
     freshness: Mapped[str | None] = mapped_column(String(16), nullable=True)  # fresh | aged
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
     # Phase 2 — the terminal materialization result. NULL until phase 2 is recorded.
-    result: Mapped[str | None] = mapped_column(String(16), nullable=True)  # replaced | cleared | kept
+    result: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )  # replaced | cleared | kept | error | superseded
     succeeded: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -2292,4 +2298,7 @@ class RefreshOutcomePointer(Base):
     attempt_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("refresh_outcome.id", ondelete="CASCADE"), nullable=False
     )
+    # Revision of the last authoritative mirror-body publication. Kept/error
+    # attempts advance attempt_id but deliberately preserve this value.
+    payload_revision: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())

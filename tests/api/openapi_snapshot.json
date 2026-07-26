@@ -1371,6 +1371,10 @@
               }
             ]
           },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          },
           "sync_state_summary": {
             "anyOf": [
               {
@@ -1391,6 +1395,7 @@
           "nso_instance",
           "nso_device_name",
           "netbox_device_id",
+          "source_epoch",
           "mapping_status",
           "last_sync_at",
           "last_sync_status",
@@ -1859,6 +1864,17 @@
             "title": "Outcome",
             "type": "string"
           },
+          "payload_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payload Revision"
+          },
           "read_at": {
             "anyOf": [
               {
@@ -1896,7 +1912,8 @@
                   "replaced",
                   "cleared",
                   "kept",
-                  "error"
+                  "error",
+                  "superseded"
                 ],
                 "type": "string"
               },
@@ -1905,6 +1922,10 @@
               }
             ],
             "title": "Result"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
           },
           "succeeded": {
             "anyOf": [
@@ -1920,6 +1941,7 @@
         },
         "required": [
           "outcome",
+          "source_epoch",
           "incarnation",
           "incarnation_born"
         ],

@@ -73,7 +73,9 @@ async def get_interface_ips(device_id: int, db: AsyncSession = Depends(get_read_
         raise api_error(404, "not_found", "Device not found")
 
     # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
-    read_state = read_state_payload(await outcome_store.get_current_outcome(db, device_id, "interface_ip"))
+    read_state = read_state_payload(
+        await outcome_store.get_current_outcome(db, device_id, "interface_ip"), source_epoch=device.source_epoch
+    )
 
     result = await db.execute(select(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device_id))
     rows = result.scalars().all()

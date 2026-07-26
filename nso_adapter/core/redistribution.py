@@ -198,12 +198,13 @@ async def refresh_redistribution_from_outcomes(
 
     name = device.nso_device_name
     device_id = device.id
+    source_epoch = device.source_epoch
     now = datetime.now(UTC).replace(tzinfo=None)
 
     # Tier 1 — any confirmed export outage aborts the whole refresh, rows untouched.
     if any(isinstance(o, Unavailable) and o.reason is UnavailableReason.export_down for o in outcomes.values()):
         logger.warning("redistribution.refresh.degraded", device_id=device_id, device_name=name)
-        await _record_composite(
+        selected = await _record_composite(
             db,
             device,
             Unavailable(UnavailableReason.export_down),
@@ -211,8 +212,9 @@ async def refresh_redistribution_from_outcomes(
             result="kept",
             succeeded=False,
             row_count=None,
+            source_epoch=source_epoch,
         )
-        return False
+        return selected is False
 
     # Merged phase-1 outcome, recorded BEFORE any mutation — the COMPLETE terminal
     # contract (READSEM S4 D7). Buckets: replaced = authoritative (Present rebuilds /
@@ -258,7 +260,12 @@ async def refresh_redistribution_from_outcomes(
     attempt_id = None
     try:
         attempt_id = await outcome_store.record_read_outcome(
-            db, device_id, "redistribution", merged, refresh_source=refresh_source
+            db,
+            device_id,
+            "redistribution",
+            merged,
+            refresh_source=refresh_source,
+            source_epoch=source_epoch,
         )
     except Exception as exc:  # noqa: BLE001 — telemetry write; the mirror is the source of truth
         logger.warning("redistribution.outcome.read_record_failed", device_id=device_id, error=repr(exc))
@@ -281,6 +288,7 @@ async def refresh_redistribution_from_outcomes(
             terminal_result=terminal_result,
             terminal_succeeded=terminal_succeeded,
             composite_ok=composite_ok,
+            source_epoch=source_epoch,
         )
     )
 
@@ -298,12 +306,25 @@ async def _tier2_span(
     terminal_result: str,
     terminal_succeeded: bool,
     composite_ok: bool,
+    source_epoch: int,
 ) -> bool:
     """Run the cancellation-atomic tier-2 span: rebuild → commit → terminalize (S5a A3)."""
-    from nso_adapter.core.refresh_engine import _recover_session
-
     device_id = device.id
-    rebuilt = await _commit_partitions(db, device, name, outcomes, now, refresh_source, merged, attempt_id)
+    if terminal_result == "replaced" and attempt_id is None:
+        raise RuntimeError("redistribution: cannot publish an authoritative body without an outcome attempt")
+    rebuilt, superseded = await _commit_partitions(
+        db,
+        device,
+        name,
+        outcomes,
+        now,
+        refresh_source,
+        merged,
+        attempt_id,
+        terminal_result,
+        terminal_succeeded,
+        source_epoch,
+    )
     logger.info(
         "redistribution.refresh.done",
         device_id=device_id,
@@ -311,19 +332,7 @@ async def _tier2_span(
         row_count=len(rebuilt),
         refresh_source=refresh_source,
     )
-    try:
-        if attempt_id is not None:
-            await outcome_store.record_result(
-                db,
-                attempt_id,
-                result=terminal_result,
-                succeeded=terminal_succeeded,
-                row_count=len(rebuilt),
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("redistribution.outcome.result_record_failed", device_id=device_id, error=repr(exc))
-        await _recover_session(db, device, "redistribution", device_id)
-    return composite_ok
+    return True if superseded else composite_ok
 
 
 async def _commit_partitions(
@@ -335,12 +344,29 @@ async def _commit_partitions(
     refresh_source: str,
     merged: ReadOutcome,
     attempt_id: int | None,
-) -> list[DeviceRedistribution]:
+    terminal_result: str,
+    terminal_succeeded: bool,
+    source_epoch: int,
+) -> tuple[list[DeviceRedistribution], bool]:
     """Rebuild + dedup + commit the partition rows under the two-mode failure guard."""
     from nso_adapter.core.refresh_engine import _recover_session
 
     device_id = device.id
     rebuilt: list[DeviceRedistribution] = []
+    outcome_row = await db.get(outcome_store.RefreshOutcome, attempt_id) if attempt_id is not None else None
+    if outcome_row is not None:
+        await outcome_store.acquire_family_fence(db, device_id, "redistribution")
+        if not await outcome_store.publication_is_current(db, outcome_row):
+            await outcome_store.stage_result(
+                db,
+                outcome_row,
+                result="superseded",
+                succeeded=True,
+                row_count=None,
+                publish_payload=False,
+            )
+            await db.commit()
+            return [], True
     savepoint = await db.begin_nested()
     try:
         rebuilt = await _rebuild_partitions(db, device_id, name, outcomes, now, refresh_source)
@@ -353,6 +379,25 @@ async def _commit_partitions(
                 continue
             seen.add(key)
             db.add(row)
+        if outcome_row is not None:
+            selected = await outcome_store.stage_result(
+                db,
+                outcome_row,
+                result=terminal_result,
+                succeeded=terminal_succeeded,
+                row_count=len(rebuilt),
+                publish_payload=terminal_result == "replaced",
+            )
+            if not selected:
+                await savepoint.rollback()
+                await outcome_store.stage_result(
+                    db,
+                    outcome_row,
+                    result="superseded",
+                    succeeded=True,
+                    row_count=None,
+                    publish_payload=False,
+                )
         await db.commit()
     except Exception:
         try:
@@ -363,13 +408,18 @@ async def _commit_partitions(
             else:
                 await _recover_session(db, device, "redistribution", device_id)
                 failed_id = await outcome_store.record_read_outcome(
-                    db, device_id, "redistribution", merged, refresh_source=refresh_source
+                    db,
+                    device_id,
+                    "redistribution",
+                    merged,
+                    refresh_source=refresh_source,
+                    source_epoch=source_epoch,
                 )
                 await outcome_store.record_result(db, failed_id, result="error", succeeded=False, row_count=None)
         except Exception as store_exc:  # noqa: BLE001 — telemetry; the materialization error is the story
             logger.warning("redistribution.outcome.terminalize_failed", device_id=device_id, error=repr(store_exc))
         raise
-    return rebuilt
+    return rebuilt, bool(outcome_row is not None and outcome_row.result == "superseded")
 
 
 # Reason severity for the no-authoritative-component merge (D7): a real failure always
@@ -401,7 +451,8 @@ async def _record_composite(
     result: str,
     succeeded: bool,
     row_count: int | None,
-) -> None:
+    source_epoch: int,
+) -> bool | None:
     """Best-effort two-phase record for paths that never materialize (tier-1 outage)."""
     from nso_adapter.core.refresh_engine import _recover_session
     from nso_adapter.store import outcome_store
@@ -409,12 +460,20 @@ async def _record_composite(
     device_id = device.id
     try:
         attempt_id = await outcome_store.record_read_outcome(
-            db, device_id, "redistribution", outcome, refresh_source=refresh_source
+            db,
+            device_id,
+            "redistribution",
+            outcome,
+            refresh_source=refresh_source,
+            source_epoch=source_epoch,
         )
-        await outcome_store.record_result(db, attempt_id, result=result, succeeded=succeeded, row_count=row_count)
+        return await outcome_store.record_result(
+            db, attempt_id, result=result, succeeded=succeeded, row_count=row_count
+        )
     except Exception as exc:  # noqa: BLE001 — telemetry write; the mirror is the source of truth
         logger.warning("redistribution.outcome.record_failed", device_id=device_id, error=repr(exc))
         await _recover_session(db, device, "redistribution", device_id)
+        return None
 
 
 async def _rebuild_partitions(

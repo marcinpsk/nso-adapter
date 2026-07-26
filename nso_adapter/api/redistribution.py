@@ -62,7 +62,9 @@ async def get_redistribution(device_id: int, db: AsyncSession = Depends(get_read
         raise api_error(404, "not_found", "Device not found")
 
     # Pointer first, rows second, one snapshot (S4 D2 — benign direction).
-    read_state = read_state_payload(await outcome_store.get_current_outcome(db, device_id, "redistribution"))
+    read_state = read_state_payload(
+        await outcome_store.get_current_outcome(db, device_id, "redistribution"), source_epoch=device.source_epoch
+    )
 
     result = await db.execute(
         select(DeviceRedistribution)

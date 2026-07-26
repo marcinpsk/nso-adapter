@@ -14,9 +14,50 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.config import get_config
-from nso_adapter.store.models import ActiveAddress, DbInterface, Device, ManagedScope, MappingStatus
+from nso_adapter.core.families import ALL_FAMILY_KEYS
+from nso_adapter.store import outcome_store
+from nso_adapter.store.models import (
+    ActiveAddress,
+    Base,
+    DbInterface,
+    Device,
+    ManagedScope,
+    MappingStatus,
+    RefreshOutcomePointer,
+)
 
 logger = structlog.get_logger(__name__)
+
+_READ_MIRROR_ROOTS = (
+    "interfaces",
+    "lag_interface",
+    "lag_bundle_config",
+    "device_vlan",
+    "device_switchport",
+    "interface_ip_address",
+    "snmp_community",
+    "snmp_v3_user",
+    "snmp_host",
+    "device_logging_host",
+    "device_logging_levels",
+    "snmp_system_info",
+    "device_static_route",
+    "device_svi",
+    "device_subinterface",
+    "device_interface_mtu",
+    "device_l2_sap",
+    "device_isis_interface",
+    "device_isis_process",
+    "device_bfd_interface",
+    "device_bgp_router",
+    "device_route_policy_prefix_list",
+    "device_route_policy_community_list",
+    "device_route_policy_as_path",
+    "device_route_policy_route_map",
+    "device_ospf_interface",
+    "device_ospf_instance",
+    "device_redistribution",
+)
 
 
 async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str | None) -> tuple[str, dict | None]:
@@ -346,11 +387,8 @@ async def rekey_device(
     nso_instance: str | None = None,
     nso_device_name: str | None = None,
 ) -> Device:
-    """Re-key a device (change NSO instance or device name).
-
-    Clears interface state; job history is retained.
-    """
-    from sqlalchemy import delete
+    """Atomically change source identity and invalidate every read publication."""
+    from sqlalchemy import delete, update
 
     cfg = get_config()
     known_instances = {inst.name for inst in cfg.nso_instances}
@@ -358,9 +396,20 @@ async def rekey_device(
     if nso_instance is not None and nso_instance not in known_instances:
         raise ValueError(f"NSO instance {nso_instance!r} not found in config")
 
-    # Check that the target (instance, device_name) pair is not already claimed by another device.
+    device_id = device.id
+    for family in ALL_FAMILY_KEYS:
+        await outcome_store.acquire_family_fence(db, device_id, family)
+    # Another rekey may have committed while this request was waiting for the
+    # canonical all-family fence. Re-read identity and generation under the fence.
+    await db.refresh(device)
+
     target_instance = nso_instance if nso_instance is not None else device.nso_instance
     target_name = nso_device_name if nso_device_name is not None else device.nso_device_name
+    if (target_instance, target_name) == (device.nso_instance, device.nso_device_name):
+        await db.commit()  # release transaction-scoped advisory locks
+        await db.refresh(device)
+        return device
+    # Check that the target pair is not already claimed while publication is fenced.
     dup = await db.execute(
         select(Device).where(
             Device.nso_instance == target_instance,
@@ -371,25 +420,63 @@ async def rekey_device(
     if dup.scalar_one_or_none():
         raise LookupError(f"NSO device {target_name!r} on {target_instance!r} is already claimed by another device")
 
-    if nso_instance is not None:
-        device.nso_instance = nso_instance
-    if nso_device_name is not None:
-        device.nso_device_name = nso_device_name
+    device.nso_instance = target_instance
+    device.nso_device_name = target_name
+    device.source_epoch += 1
 
-    # Clear interface attr state, then interfaces, then managed scope — explicit to avoid lazy load
+    # Child rows use ON DELETE CASCADE where applicable. Interfaces retain the
+    # established explicit cleanup because their oldest FKs predate DB cascades.
     iface_ids_result = await db.execute(select(DbInterface.id).where(DbInterface.device_id == device.id))
     iface_ids = list(iface_ids_result.scalars().all())
     if iface_ids:
-        from nso_adapter.store.models import InterfaceAttrState
+        from nso_adapter.store.models import InterfaceAttrState, InterfaceIntent, InterfaceIpIntent
 
         await db.execute(delete(InterfaceAttrState).where(InterfaceAttrState.interface_id.in_(iface_ids)))
-    await db.execute(delete(DbInterface).where(DbInterface.device_id == device.id))
+        intent_iface_ids = set(
+            (await db.execute(select(InterfaceIntent.interface_id).where(InterfaceIntent.interface_id.in_(iface_ids))))
+            .scalars()
+            .all()
+        )
+        intent_iface_ids.update(
+            (
+                await db.execute(
+                    select(InterfaceIpIntent.interface_id).where(InterfaceIpIntent.interface_id.in_(iface_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # Interface intents are operator-owned state, not a read mirror. Keep their
+        # minimal interface identity anchor so the next source read reuses the
+        # same row by name and the intent/history survives the rekey.
+        if intent_iface_ids:
+            await db.execute(
+                delete(DbInterface).where(
+                    DbInterface.device_id == device.id,
+                    DbInterface.id.not_in(intent_iface_ids),
+                )
+            )
+            await db.execute(
+                update(DbInterface)
+                .where(DbInterface.id.in_(intent_iface_ids))
+                .values(parent_binding=None, kind=None, encap_tag=None, vrf=None, service=None)
+            )
+        else:
+            await db.execute(delete(DbInterface).where(DbInterface.device_id == device.id))
+    for table_name in _READ_MIRROR_ROOTS:
+        if table_name == "interfaces":
+            continue  # handled above so operator-owned interface-intent anchors survive
+        table = Base.metadata.tables[table_name]
+        await db.execute(delete(table).where(table.c.device_id == device.id))
+    await db.execute(delete(RefreshOutcomePointer).where(RefreshOutcomePointer.device_id == device.id))
     await db.execute(delete(ManagedScope).where(ManagedScope.device_id == device.id))
 
     device.ned_id = None
+    device.sw_version = None
     device.mapping_status = MappingStatus.mapped
     device.last_sync_at = None
     device.last_sync_status = None
+    device.degraded_surfaces = None
 
     await db.commit()
     await db.refresh(device)

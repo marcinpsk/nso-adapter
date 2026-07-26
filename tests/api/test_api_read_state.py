@@ -52,6 +52,8 @@ async def test_aggregate_serves_all_families_with_synthesized_not_ready(adapter_
     assert sr["freshness"] == "fresh"
     assert sr["incarnation"] == incarnation
     assert sr["incarnation_born"] == born.isoformat() + "Z"
+    assert sr["source_epoch"] == 1
+    assert sr["payload_revision"] == a1
     assert sr["read_at"] is not None
 
     bgp = body["families"]["bgp"]  # never terminalized → synthesized
@@ -63,6 +65,8 @@ async def test_aggregate_serves_all_families_with_synthesized_not_ready(adapter_
     )
     assert bgp["incarnation"] == incarnation
     assert bgp["incarnation_born"] == born.isoformat() + "Z"
+    assert bgp["source_epoch"] == 1
+    assert bgp["payload_revision"] is None
 
 
 @pytest.mark.anyio
