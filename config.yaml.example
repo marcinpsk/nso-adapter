@@ -1,0 +1,38 @@
+# NSO Adapter — non-secret configuration
+# Copy to config.yaml and edit for your environment.
+# Config holds REFERENCES to secrets, never secret values themselves.
+# For vault provider:  reference format is  "kv-path#field"
+# For local provider:  reference is the env var name (e.g. "NSO_PASSWORD")
+
+secrets:
+  provider: vault          # "vault" or "local"
+  vault:
+    address: https://vault.example.com:8200
+    kv_mount: network      # KV v2 mount name
+    auth_method: approle
+    verify_ssl: true       # set false for self-signed certs
+
+nso_instances:
+  - name: nso-dev
+    base_url: http://nso-host:8080
+    host_header: nso.example.com   # NSO webui server-name (Host header)
+    username_ref: "credentials/example-svc#username"
+    password_ref: "credentials/example-svc#password"
+
+netbox:
+  # When running in Docker use the host gateway IP, not localhost.
+  # e.g. the Docker host gateway: http://192.0.2.1:8000
+  base_url: http://netbox:8000
+  api_token_ref: "credentials/example-svc#netbox_token"
+
+api:
+  adapter_token_ref: "credentials/example-svc#adapter_token"
+
+database_url: postgresql+asyncpg://nso_adapter:replace-me@postgres:5432/nso_adapter
+log_level: INFO
+log_format: json
+
+scheduler:
+  poll_interval: 15           # minutes between NSO device polls
+  scope_reconcile_interval: 5 # minutes between scope reconciliation runs
+  orphan_reap_interval: 5     # minutes between reaps of jobs stranded 'running' by a dead worker (0 disables)

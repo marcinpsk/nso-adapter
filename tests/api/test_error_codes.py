@@ -1,0 +1,122 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Closed error-code set + envelope contract for every non-2xx response.
+
+api-contract.md promises ONE error shape for all errors:
+    {"error": {"code": "<closed set>", "message": "...", "detail": {}}}
+Historically FastAPI's own request-validation failures leaked its default
+``{"detail": [...]}`` shape instead — a latent contract violation. These tests
+pin the envelope on that path too (the one deliberate wire change of the
+OpenAPI-truthfulness program) and enforce the closed code set mechanically:
+call sites ⊆ ERROR_CODES ⊆ api-contract.md.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+
+from nso_adapter.api.errors import ERROR_CODES, api_error
+from tests.conftest import VALID_TOKEN
+
+AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_PKG_DIR = _REPO_ROOT / "nso_adapter"
+_CONTRACT_DOC = _REPO_ROOT / "docs" / "api-contract.md"
+
+
+# ---------------------------------------------------------------- envelope on 422
+
+
+async def test_request_validation_error_uses_envelope(adapter_client):
+    """A Pydantic body-validation failure must return the documented envelope,
+    not FastAPI's default ``{"detail": [...]}`` shape."""
+    resp = await adapter_client.post(
+        "/api/v1/devices",
+        json={"netbox_device_id": "not-an-int"},
+        headers=AUTH,
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert set(body) == {"error"}, f"not the envelope: {body}"
+    err = body["error"]
+    assert err["code"] == "validation_error"
+    assert isinstance(err["message"], str) and err["message"]
+    # the pydantic error list rides inside detail (encoder-safe)
+    assert isinstance(err["detail"], dict)
+    assert isinstance(err["detail"]["errors"], list) and err["detail"]["errors"]
+
+
+async def test_validation_error_with_non_primitive_ctx(adapter_client):
+    """A validator raising ValueError puts the exception object into the pydantic
+    error ``ctx`` — the handler must encode it (jsonable_encoder), not 500."""
+    resp = await adapter_client.put(
+        "/api/v1/devices/1/snmp-intent",
+        json={
+            "communities": [
+                {"name": "public", "vault_ref": "not-a-valid-triple"},
+            ]
+        },
+        headers=AUTH,
+    )
+    assert resp.status_code == 422, resp.text
+    err = resp.json()["error"]
+    assert err["code"] == "validation_error"
+    # every leaf of the encoded error list must be JSON-native (it round-tripped)
+    assert isinstance(err["detail"]["errors"], list)
+
+
+# ---------------------------------------------------------------- closed set
+
+
+def test_api_error_rejects_unknown_code():
+    with pytest.raises(ValueError, match="unknown error code"):
+        api_error(400, "definitely_not_a_code", "boom")
+
+
+def test_every_code_roundtrips_envelope():
+    for code in sorted(ERROR_CODES):
+        exc = api_error(400, code, f"msg for {code}", {"k": "v"})
+        assert exc.detail == {"error": {"code": code, "message": f"msg for {code}", "detail": {"k": "v"}}}
+
+
+def test_call_site_codes_are_subset_of_error_codes():
+    """Every literal code passed to api_error() anywhere in the package is in the
+    closed set — a new code must be added to ERROR_CODES (and the doc) first."""
+    seen: dict[str, str] = {}
+    for path in _PKG_DIR.rglob("*.py"):
+        src = path.read_text()
+        for m in re.finditer(r'api_error\(\s*\d+\s*,\s*"([a-z_]+)"', src):
+            seen[m.group(1)] = str(path)
+        # no dynamic/non-literal code arguments allowed at all
+        for m in re.finditer(r"api_error\(\s*[\w.]+\s*,\s*([a-z_][\w.]*)\s*,", src):
+            raise AssertionError(f"non-literal error code at {path}: {m.group(1)}")
+    unknown = {c: p for c, p in seen.items() if c not in ERROR_CODES}
+    assert not unknown, f"codes at call sites missing from ERROR_CODES: {unknown}"
+
+
+def test_error_codes_all_documented():
+    """Every member of the closed set appears in docs/api-contract.md."""
+    doc = _CONTRACT_DOC.read_text()
+    missing = [c for c in sorted(ERROR_CODES) if c not in doc]
+    assert not missing, f"ERROR_CODES not documented in api-contract.md: {missing}"
+
+
+async def test_unauthorized_envelope(adapter_client):
+    """The shared verify_token dependency emits the same envelope (code=unauthorized)."""
+    resp = await adapter_client.get("/api/v1/devices")  # deliberately no auth header
+    assert resp.status_code == 401
+    body = resp.json()
+    assert body["error"]["code"] == "unauthorized"
+
+
+def test_version_single_source_matches_pyproject():
+    """nso_adapter.__version__ is THE version; pyproject must agree (no triplication)."""
+    import tomllib
+
+    from nso_adapter import __version__
+
+    pyproject = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text())
+    assert pyproject["project"]["version"] == __version__

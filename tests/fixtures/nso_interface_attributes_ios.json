@@ -1,0 +1,20 @@
+{
+  "device-name": "core-rtr-01",
+  "last-updated": "2025-01-01T00:00:00Z",
+  "interface": [
+    {
+      "interface-name": "GigabitEthernet0/0",
+      "description": "uplink to core",
+      "enabled": true
+    },
+    {
+      "interface-name": "GigabitEthernet0/1",
+      "description": "",
+      "enabled": false
+    },
+    {
+      "interface-name": "GigabitEthernet0/2",
+      "description": "no-shutdown-no-desc"
+    }
+  ]
+}

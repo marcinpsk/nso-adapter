@@ -1,0 +1,28 @@
+FROM python:3.12-slim
+WORKDIR /app
+
+# Inject corporate CA bundle (staged by `make build` from host /etc/ssl/certs/)
+COPY certs/ca-certificates.crt /usr/local/share/ca-certificates/corporate.crt
+RUN update-ca-certificates
+
+ENV PYTHONUNBUFFERED=1 \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    NO_PROXY="localhost,127.0.0.1" \
+    no_proxy="localhost,127.0.0.1"
+
+RUN pip install uv --no-cache-dir
+
+COPY pyproject.toml uv.lock* ./
+# Install deps into /opt/venv — separate from the source volume mount at /app
+RUN uv sync --all-groups --no-cache --native-tls
+
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Source is volume-mounted at /app — hot reload via watchfiles.
+# Entrypoint runs `alembic upgrade head` before uvicorn; the script + alembic
+# tree come from the /app bind mount at runtime.
+EXPOSE 8000
+ENTRYPOINT ["/app/scripts/docker-entrypoint.sh"]
+CMD ["uvicorn", "nso_adapter.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
