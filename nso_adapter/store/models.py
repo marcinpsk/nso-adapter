@@ -122,6 +122,22 @@ class Device(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
 
+    # Both identities are enforced in the DATABASE, not just by onboard_device's select-then-
+    # insert: two concurrent onboards can both find nothing and both insert, and the duplicates
+    # are permanent — the scope reconcile keys ownership by netbox_device_id and so keeps both.
+    # netbox_device_id is unique only where non-null (a device provisioned into NSO without a
+    # NetBox link is a legitimate leftover, and several may exist).
+    __table_args__ = (
+        UniqueConstraint("nso_instance", "nso_device_name", name="uq_device_nso_identity"),
+        Index(
+            "uq_device_netbox_device_id",
+            "netbox_device_id",
+            unique=True,
+            postgresql_where=text("netbox_device_id IS NOT NULL"),
+            sqlite_where=text("netbox_device_id IS NOT NULL"),
+        ),
+    )
+
     managed_scope: Mapped[list[ManagedScope]] = relationship(
         "ManagedScope", back_populates="device", cascade="all, delete-orphan", lazy="raise"
     )

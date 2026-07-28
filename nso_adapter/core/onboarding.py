@@ -11,6 +11,7 @@ import asyncio
 
 import structlog
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.config import get_config
@@ -134,12 +135,18 @@ async def onboard_device(
         raise ValueError(f"NSO instance {nso_instance!r} not found in config")
 
     # Is this exact NSO node (instance + name) already tracked by the adapter?
+    # FOR UPDATE: adoption of an unlinked row is a read-then-update, so without the row lock two
+    # callers can both read netbox_device_id NULL, both find their (different) target ids free,
+    # and both claim the same row — the last commit silently repointing ownership. The unique
+    # constraints cannot catch that: only one row exists and it is an UPDATE, not an insert.
     existing = (
         await db.execute(
-            select(Device).where(
+            select(Device)
+            .where(
                 Device.nso_instance == nso_instance,
                 Device.nso_device_name == nso_device_name,
             )
+            .with_for_update()
         )
     ).scalar_one_or_none()
     if existing is not None:
@@ -184,7 +191,28 @@ async def onboard_device(
         mapping_status=MappingStatus.mapped,
     )
     db.add(device)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Lost a race with a concurrent onboard of the same device. The checks above are
+        # select-then-insert, so both callers can find nothing and both insert; the DB
+        # constraints (uq_device_nso_identity / uq_device_netbox_device_id) are what actually
+        # decide. Re-read the winner and return it — onboarding is idempotent by contract, and
+        # a duplicate row here would be permanent (the scope reconcile keeps every row it sees).
+        await db.rollback()
+        winner = (
+            await db.execute(
+                select(Device).where(
+                    Device.nso_instance == nso_instance,
+                    Device.nso_device_name == nso_device_name,
+                )
+            )
+        ).scalar_one_or_none()
+        if winner is None or winner.netbox_device_id not in (None, netbox_device_id):
+            # The conflict was on netbox_device_id instead: another NSO node claimed it.
+            raise LookupError(f"NetBox device {netbox_device_id} is already onboarded") from None
+        logger.info("device.onboard_race_resolved", device_id=winner.id, nso_device=nso_device_name)
+        return winner
     await db.refresh(device)
     logger.info("device.onboarded", device_id=device.id, nso_device=nso_device_name)
     return device

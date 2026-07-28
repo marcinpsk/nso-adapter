@@ -118,6 +118,111 @@ async def test_onboard_is_idempotent_for_same_link(adapter_client_with_nso):
         break
 
 
+async def test_onboard_resolves_a_lost_insert_race(adapter_client_with_nso):
+    """A concurrent onboard that wins the insert is adopted, not duplicated.
+
+    onboard_device checks identity with select-then-insert, so two callers can both find
+    nothing and both insert. The duplicate would be permanent — the scope reconcile keys
+    ownership by netbox_device_id and keeps every row it finds — so the DB constraints decide
+    and the loser re-reads the winner. Simulated by inserting the competing row between this
+    caller's lookup and its commit, which is exactly what the lost race looks like.
+    """
+    from nso_adapter.core.onboarding import onboard_device
+    from nso_adapter.store.db import get_session
+    from tests.conftest import seed_device
+
+    async for db in get_session():
+        original_commit = db.commit
+        winner_id = {}
+
+        async def commit_after_a_competing_insert():
+            if not winner_id:
+                winner_id["id"] = await seed_device(
+                    nso_instance="nso-dev", nso_device_name="raced-rtr", netbox_device_id=91
+                )
+            db.commit = original_commit
+            await original_commit()
+
+        db.commit = commit_after_a_competing_insert
+        device = await onboard_device(db, "nso-dev", "raced-rtr", 91)
+        assert device.id == winner_id["id"]  # the winner's row, not a second one
+        break
+
+    async for db in get_session():
+        rows = (await db.execute(select(Device).where(Device.nso_device_name == "raced-rtr"))).scalars().all()
+        assert len(rows) == 1  # exactly one survivor
+        break
+
+
+async def test_duplicate_nso_identity_is_rejected_by_the_database(adapter_client_with_nso):
+    """The (nso_instance, nso_device_name) uniqueness is enforced in the DB, not just in code.
+
+    onboard_device's own guard can be bypassed by a race; the constraint cannot.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import MappingStatus
+    from tests.conftest import seed_device
+
+    await seed_device(nso_instance="nso-dev", nso_device_name="dup-guard", netbox_device_id=93)
+
+    with pytest.raises(IntegrityError):
+        async for db in get_session():
+            db.add(
+                Device(
+                    nso_instance="nso-dev",
+                    nso_device_name="dup-guard",
+                    netbox_device_id=94,
+                    mapping_status=MappingStatus.mapped,
+                )
+            )
+            await db.commit()
+            break
+
+
+async def test_duplicate_netbox_device_id_is_rejected_by_the_database(adapter_client_with_nso):
+    """netbox_device_id is unique where non-null — two NSO nodes cannot claim one NetBox device."""
+    from sqlalchemy.exc import IntegrityError
+
+    from nso_adapter.store.db import get_session
+    from nso_adapter.store.models import MappingStatus
+    from tests.conftest import seed_device
+
+    await seed_device(nso_instance="nso-dev", nso_device_name="nb-dup-a", netbox_device_id=95)
+
+    with pytest.raises(IntegrityError):
+        async for db in get_session():
+            db.add(
+                Device(
+                    nso_instance="nso-dev",
+                    nso_device_name="nb-dup-b",
+                    netbox_device_id=95,
+                    mapping_status=MappingStatus.mapped,
+                )
+            )
+            await db.commit()
+            break
+
+
+async def test_unlinked_devices_may_coexist(adapter_client_with_nso):
+    """The netbox_device_id index is PARTIAL: several unlinked leftovers are legitimate.
+
+    A device provisioned into NSO without a NetBox link carries netbox_device_id NULL, and a
+    plain unique index would have made the second one an error.
+    """
+    from nso_adapter.store.db import get_session
+    from tests.conftest import seed_device
+
+    await seed_device(nso_instance="nso-dev", nso_device_name="unlinked-a", netbox_device_id=None)
+    await seed_device(nso_instance="nso-dev", nso_device_name="unlinked-b", netbox_device_id=None)
+
+    async for db in get_session():
+        rows = (await db.execute(select(Device).where(Device.netbox_device_id.is_(None)))).scalars().all()
+        assert len(rows) >= 2
+        break
+
+
 # ── rekey_device ─────────────────────────────────────────────────────────────
 
 
