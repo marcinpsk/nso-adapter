@@ -11,11 +11,32 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+import pytest
+from sqlalchemy import select, text
 
 from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
+
+# Asked of PostgreSQL, not of Python: a JSON `null` also deserializes to Python None, so
+# comparing the loaded attribute against None cannot tell SQL NULL from 'null'::jsonb.
+# Only the former satisfies `IS NULL`, which is how "no proven predecessor" is tested.
+# Static statements per table — no SQL is ever assembled from a variable.
+_SQL_NULL_COUNT = {
+    "static_route_intent": text(
+        "SELECT count(*) FROM static_route_intent WHERE device_id = :d AND deployed_key IS NULL"
+    ),
+    "static_route_tombstone": text(
+        "SELECT count(*) FROM static_route_tombstone WHERE device_id = :d AND deployed_key IS NULL"
+    ),
+}
+
+
+async def count_sql_null_deployed_key(table: str, device_id: int) -> int:
+    """Rows whose ``deployed_key`` is SQL NULL. Pins the ``none_as_null=True`` binding."""
+    async with session() as db:
+        return await db.scalar(_SQL_NULL_COUNT[table], {"d": device_id})
+
 
 A = ("", "10.0.0.0/24", "192.0.2.1")
 B = ("", "10.0.1.0/24", "192.0.2.2")
@@ -84,6 +105,30 @@ async def read_intent(device_id: int) -> list[dict]:
         ]
 
 
+async def read_intent_all_columns(device_id: int) -> list[dict]:
+    """Every persisted column, derived from the mapper rather than hand-listed.
+
+    A field added later is compared automatically instead of silently escaping the
+    "nothing changed" assertions.
+    """
+    from nso_adapter.store.models import StaticRouteIntent
+
+    names = [c.name for c in StaticRouteIntent.__table__.columns]
+    async with session() as db:
+        rows = (
+            (
+                await db.execute(
+                    select(StaticRouteIntent)
+                    .where(StaticRouteIntent.device_id == device_id)
+                    .order_by(StaticRouteIntent.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return [{name: getattr(row, name) for name in names} for row in rows]
+
+
 async def read_tombstones(device_id: int) -> list[dict]:
     from nso_adapter.store.models import StaticRouteTombstone
 
@@ -133,6 +178,36 @@ async def enable_auto_apply(device_id: int) -> None:
     async with session() as db:
         db.add(DeviceSettings(device_id=device_id, auto_apply=True))
         await db.commit()
+
+
+async def test_python_none_binds_to_sql_null_on_both_columns(adapter_client):
+    """``none_as_null=True`` on both JSONB columns, pinned behaviorally.
+
+    Binds a Python ``None`` explicitly through the ORM — the case the flag governs.
+    Without it SQLAlchemy writes ``'null'::jsonb``, which is NOT NULL, so R2's
+    "no proven predecessor" test (`deployed_key IS NULL`) would silently stop matching
+    while every Python-side ``== None`` assertion stayed green.
+    """
+    from nso_adapter.store.models import StaticRouteTombstone
+
+    device_id = await seed_device(nso_device_name="sr-none-bind", netbox_device_id=9770)
+    await seed_intent(device_id, [{"triple": A, "route_id": 7, "deployed_key": None}])
+    async with session() as db:
+        db.add(
+            StaticRouteTombstone(
+                device_id=device_id,
+                route_id=7,
+                vrf=A[0],
+                prefix=A[1],
+                next_hop=A[2],
+                deployed_key=None,
+                marking="detach",
+            )
+        )
+        await db.commit()
+
+    assert await count_sql_null_deployed_key("static_route_intent", device_id) == 1
+    assert await count_sql_null_deployed_key("static_route_tombstone", device_id) == 1
 
 
 # ── M1: matching matrix ──────────────────────────────────────────────────────
@@ -213,6 +288,10 @@ async def test_no_match_inserts_with_null_deployed_key(adapter_client):
 
     rows = await read_intent(device_id)
     assert [(r["triple"], r["route_id"], r["deployed_key"]) for r in rows] == [(A, 7, None)]
+    # SQL NULL asked of PostgreSQL. The endpoint leaves the column unset on an insert, so
+    # this pins the server default; the ORM binding itself is pinned by
+    # test_python_none_binds_to_sql_null_on_both_columns.
+    assert await count_sql_null_deployed_key("static_route_intent", device_id) == 1
 
 
 async def test_disappearing_route_id_writes_a_tombstone(adapter_client):
@@ -228,6 +307,40 @@ async def test_disappearing_route_id_writes_a_tombstone(adapter_client):
     assert await read_tombstones(device_id) == [
         {"route_id": 7, "triple": A, "deployed_key": list(A), "marking": "detach", "job_id": None}
     ]
+
+
+async def test_delete_and_tombstone_roll_back_together(adapter_client, monkeypatch):
+    """M1.6, the other half: co-persistence on success proves nothing about rollback.
+
+    Fails after the tombstone insert and the row delete are both issued but before the
+    commit, by making the auto_apply enqueue raise. Neither half may survive — a
+    persisted tombstone for a row that is still live would authorize a deletion nothing
+    asked for, and a persisted delete with no carrier is the lost deletion R1 exists to
+    stop.
+    """
+    device_id = await seed_device(nso_device_name="sr-m1-6b", netbox_device_id=9715)
+    await enable_auto_apply(device_id)
+    ids = await seed_intent(
+        device_id,
+        [{"triple": A, "route_id": 7, "deployed_key": list(A)}, {"triple": B, "route_id": 8, "deployed_key": list(B)}],
+    )
+
+    boom = RuntimeError("forced failure after the tombstone/delete DML")
+
+    async def _explode(*args, **kwargs):
+        raise boom
+
+    # Imported inside the handler, so patch it at its source module.
+    monkeypatch.setattr("nso_adapter.core.apply.enqueue_apply", _explode)
+
+    with pytest.raises(RuntimeError):
+        await put_intent(adapter_client, device_id, [entry(A, route_id=7)])
+
+    # Row 8 is still live, and nothing claims authority to delete it.
+    rows = await read_intent(device_id)
+    assert sorted((r["id"], r["triple"], r["route_id"]) for r in rows) == sorted([(ids[A], A, 7), (ids[B], B, 8)])
+    assert await read_tombstones(device_id) == []
+    assert await read_jobs(device_id) == []
 
 
 async def test_a_to_b_to_a_leaves_no_tombstone(adapter_client):
@@ -307,6 +420,8 @@ async def test_never_applied_row_gets_a_detach_tombstone(adapter_client):
     assert await read_tombstones(device_id) == [
         {"route_id": 7, "triple": A, "deployed_key": None, "marking": "detach", "job_id": None}
     ]
+    # SQL NULL on the carrier too — the tombstone is what R2's CAS reads.
+    assert await count_sql_null_deployed_key("static_route_tombstone", device_id) == 1
     # today's detach path is unchanged for the device side
     removals = [j for j in await read_jobs(device_id) if j["job_type"] == "removal"]
     assert len(removals) == 1
@@ -382,16 +497,37 @@ async def test_reclaiming_a_deleted_rows_triple_is_not_a_duplicate(adapter_clien
     assert resp.status_code == 200, resp.text
 
 
-async def test_payload_refusal_leaves_the_store_byte_identical(adapter_client):
-    """M2.5 — the refusals fire before any DML: no row change, no job, no tombstone."""
+@pytest.mark.parametrize(
+    ("routes", "reason"),
+    [
+        ([entry(B, route_id=9), entry(B, route_id=10)], "duplicate_triple"),
+        ([entry(B, route_id=9), entry(C, route_id=9)], "duplicate_route_id"),
+    ],
+    ids=["duplicate_triple", "duplicate_route_id"],
+)
+async def test_payload_refusal_leaves_the_store_untouched(adapter_client, routes, reason):
+    """M2.5 — the refusals fire before any DML: no row change, no job, no tombstone.
+
+    Compares EVERY persisted column, both directions of the refusal. A four-field
+    snapshot would miss a mutation to accepted_at, an optional scalar or the apply
+    bookkeeping, all of which the endpoint writes on the success path.
+    """
     device_id = await seed_device(nso_device_name="sr-m2-5", netbox_device_id=9723)
-    await seed_intent(device_id, [{"triple": A, "route_id": 7, "deployed_key": list(A)}])
-    before = await read_intent(device_id)
+    await seed_intent(
+        device_id,
+        [{"triple": A, "route_id": 7, "deployed_key": list(A), "last_apply_at": datetime(2026, 6, 2, tzinfo=UTC)}],
+    )
+    before = await read_intent_all_columns(device_id)
+    assert before, "the fixture must persist a row for the comparison to mean anything"
+    # Guards the "every persisted column" claim: the fields a narrow snapshot would miss
+    # are exactly the ones the success path writes.
+    assert {"accepted_at", "last_apply_at", "last_apply_error", "metric", "tag", "name"} <= before[0].keys()
 
-    resp = await put_intent(adapter_client, device_id, [entry(B, route_id=9), entry(B, route_id=10)])
+    resp = await put_intent(adapter_client, device_id, routes)
     assert resp.status_code == 422
+    assert resp.json()["error"]["detail"]["reason"] == reason
 
-    assert await read_intent(device_id) == before
+    assert await read_intent_all_columns(device_id) == before
     assert await read_tombstones(device_id) == []
     assert await read_jobs(device_id) == []
 

@@ -119,16 +119,34 @@ def _column(engine, table: str, name: str) -> dict:
 # ── structural ───────────────────────────────────────────────────────────────
 
 
-def test_migration_chains_off_the_real_head():
-    """A stale down_revision creates a second head and `upgrade head` then refuses."""
+def test_migration_chains_off_its_parent_and_the_graph_stays_single_headed():
+    """A stale down_revision splits the graph in two and `upgrade head` then refuses.
+
+    Asserted on the revision GRAPH, not on "is this revision the tip": a legitimate
+    successor migration must not break this test. Membership in `alembic heads` would
+    do exactly that, and would not reject a two-head split either.
+
+    ``ScriptDirectory`` reads alembic.ini and the versions directory only — it never
+    runs ``env.py``, whose ``fileConfig`` would reconfigure the root logger in-process.
+    """
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
     module = _load_migration()
-    heads = _alembic(_url_for("postgres", driver="postgresql+psycopg2"), "heads")
-    assert module.revision in heads, f"{module.revision} is not the alembic head:\n{heads}"
+    assert module.down_revision == "f4c1b7d92a05"
+
+    script = ScriptDirectory.from_config(Config(str(_REPO_ROOT / "alembic.ini")))
+    heads = script.get_heads()
+    assert len(heads) == 1, f"the revision graph has {len(heads)} heads: {heads}"
+
+    ancestry = {rev.revision for rev in script.walk_revisions("base", heads[0])}
+    assert module.revision in ancestry, f"{module.revision} is not an ancestor of head {heads[0]}"
 
 
 def test_intent_columns_and_partial_unique_index(pg_admin):
+    module = _load_migration()
     with _private_database(pg_admin, "cols") as sync_url:
-        _alembic(sync_url, "upgrade", "head")
+        _alembic(sync_url, "upgrade", module.revision)
         with _engine_on(sync_url) as engine:
             route_id = _column(engine, "static_route_intent", "route_id")
             assert route_id["nullable"] is True
@@ -148,15 +166,17 @@ def test_intent_columns_and_partial_unique_index(pg_admin):
 
 def test_identity_constraint_is_deferrable_initially_deferred(pg_admin):
     """§3.7: an immediate constraint rejects legal same-payload swaps and reclaims."""
+    module = _load_migration()
     with _private_database(pg_admin, "defer") as sync_url:
-        _alembic(sync_url, "upgrade", "head")
+        _alembic(sync_url, "upgrade", module.revision)
         with _engine_on(sync_url) as engine:
             assert _deferrability(engine, "uq_staticrouteintent_identity") == (True, True)
 
 
 def test_tombstone_table_shape(pg_admin):
+    module = _load_migration()
     with _private_database(pg_admin, "tomb") as sync_url:
-        _alembic(sync_url, "upgrade", "head")
+        _alembic(sync_url, "upgrade", module.revision)
         with _engine_on(sync_url) as engine:
             insp = sa.inspect(engine)
             cols = {c["name"]: c for c in insp.get_columns("static_route_tombstone")}
@@ -182,8 +202,9 @@ def test_tombstone_table_shape(pg_admin):
 
 def test_new_foreign_keys_carry_their_intended_delete_rule(pg_admin):
     """B9: a DDL-only assertion passes against a restrictive FK that then breaks offboard."""
+    module = _load_migration()
     with _private_database(pg_admin, "fk") as sync_url:
-        _alembic(sync_url, "upgrade", "head")
+        _alembic(sync_url, "upgrade", module.revision)
         with _engine_on(sync_url) as engine:
             rules = _delete_rules(engine, "static_route_tombstone")
             assert rules["device_id"] == "CASCADE"
@@ -214,7 +235,7 @@ def test_backfill_sets_deployed_key_only_for_applied_rows(pg_admin):
                 "VALUES (2, 1, '', '10.0.1.0/24', '192.0.2.2', NULL)"
             )
 
-        _alembic(sync_url, "upgrade", "head")
+        _alembic(sync_url, "upgrade", module.revision)
 
         with _engine_on(sync_url) as engine, engine.connect() as conn:
             applied = conn.exec_driver_sql("SELECT deployed_key FROM static_route_intent WHERE id = 1").scalar_one()
@@ -233,10 +254,15 @@ def test_backfill_sets_deployed_key_only_for_applied_rows(pg_admin):
 
 
 def test_downgrade_restores_the_previous_shape(pg_admin):
+    """Both directions named by revision id, never "head"/"-1".
+
+    A successor migration would make "-1" revert only that successor, leave this
+    migration's schema in place, and turn every assertion below into a false pass.
+    """
     module = _load_migration()
     with _private_database(pg_admin, "down") as sync_url:
-        _alembic(sync_url, "upgrade", "head")
-        _alembic(sync_url, "downgrade", "-1")
+        _alembic(sync_url, "upgrade", module.revision)
+        _alembic(sync_url, "downgrade", module.down_revision)
         with _engine_on(sync_url) as engine:
             insp = sa.inspect(engine)
             assert "static_route_tombstone" not in insp.get_table_names()
@@ -246,11 +272,10 @@ def test_downgrade_restores_the_previous_shape(pg_admin):
             assert "uq_sr_intent_device_route_id" not in _index_predicates(engine, "static_route_intent")
             assert _deferrability(engine, "uq_staticrouteintent_identity") == (False, False)
 
-        _alembic(sync_url, "upgrade", "head")
+        _alembic(sync_url, "upgrade", module.revision)
         with _engine_on(sync_url) as engine:
             assert "static_route_tombstone" in sa.inspect(engine).get_table_names()
             assert _deferrability(engine, "uq_staticrouteintent_identity") == (True, True)
-        assert module.down_revision  # the module really was the one under test
 
 
 # ── FK behavior, against real rows ───────────────────────────────────────────
