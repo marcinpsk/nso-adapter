@@ -45,6 +45,32 @@ services:
     networks:
       - adapter-db
 
+  # Throwaway test server. NOT the dev application DB (adapter-db) — the suite CREATEs
+  # and DROPs a database per test and must never be pointed at dev data.
+  adapter-test-db:
+    image: postgres:16-alpine
+    container_name: nso-adapter-postgres-test
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    ports:
+      - "127.0.0.1:55433:5432"
+    # PGDATA on tmpfs + durability off: the data is worthless by construction, and
+    # CREATE DATABASE ... TEMPLATE is dominated by fsync.
+    tmpfs:
+      - /var/lib/postgresql/data
+    command: >
+      postgres -c fsync=off -c full_page_writes=off -c synchronous_commit=off
+               -c wal_level=minimal -c max_wal_senders=0 -c shared_buffers=256MB
+               -c max_connections=200
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
 networks:
   docker_frontend:
     external: true
