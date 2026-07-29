@@ -413,7 +413,7 @@ async def _apply_outcome(
     refresh_source: str,
 ) -> bool:
     """Drive the mirror action + two-phase outcome record for a classified read."""
-    # Phase 1: record the read outcome before the materializer runs (independent session).
+    # Phase 1: record the read outcome before the materializer runs, on the CALLER's session.
     attempt_id = await _record_read(db, device, spec, outcome, refresh_source)
 
     if isinstance(outcome, Present):

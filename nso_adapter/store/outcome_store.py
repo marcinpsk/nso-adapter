@@ -13,13 +13,19 @@ Every read-mirror refresh attempt records its truth here, in two phases on the C
   For engine families, the preceding engine mirror commit already made phase 1 and the staged
   mirror durable.
 
-Why the caller's session, not an independent one: a second connection to the caller's engine
-deadlocks on file-backed SQLite (the unit-test store). The two aiosqlite threads share one
-asyncio task, so when the caller's ``db`` holds an uncommitted write (e.g. mid-Apply,
-``apply._post_apply_refresh_and_notify``), the second connection's commit blocks on the file lock
-that only the caller — now parked awaiting this coroutine — can release. Reusing ``db`` sidesteps
-that entirely; the outcome rides the producer's commit boundary. (On PostgreSQL a separate
-connection would be safe; this trades that theoretical independence for a deadlock-free store.)
+**Why the caller's session, not an independent one.** Two load-bearing reasons, both about
+visibility inside one transaction:
+
+1. Phase 1 ends in ``flush()``, not ``commit()`` — the row has a PK but is not yet committed.
+   An independent session reading under READ COMMITTED cannot see it, so
+   :func:`record_result`'s ``db.get(RefreshOutcome, attempt_id)`` would return ``None`` and
+   the whole phase degrades to the "unknown_attempt" no-op.
+2. The atomic-publication invariant (1332): the mirror rows, the pointer and
+   ``payload_revision`` must become visible together, so a reader never sees a new pointer
+   over old rows. Only the session that holds the staged mirror writes can commit all three
+   in one transaction — see ``tests/store/test_pointer_concurrency.py``'s publication test.
+
+This is a contract, not a workaround: every caller passes the session it materializes on.
 
 The pointer advances to the **newest TERMINAL attempt by start order** (attempt id): a terminal
 attempt only advances the pointer when its id exceeds the pointed-to one, so a newest failure
@@ -33,6 +39,7 @@ from datetime import UTC, datetime
 
 import structlog
 from sqlalchemy import func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.families import ALL_FAMILY_KEYS
@@ -121,9 +128,7 @@ async def record_result(
 
 
 async def acquire_family_fence(db: AsyncSession, device_id: int, family: str) -> None:
-    """Serialize every terminal writer for one family at the PostgreSQL boundary."""
-    if db.bind.dialect.name != "postgresql":
-        return
+    """Serialize every terminal writer for one family at the database boundary."""
     try:
         ordinal = _FAMILY_ORDINAL[family]
     except KeyError as exc:
@@ -170,7 +175,6 @@ async def stage_result(
 
     await db.execute(
         _pointer_advance_stmt(
-            db,
             row.device_id,
             row.family,
             row.id,
@@ -199,7 +203,6 @@ async def publication_is_current(db: AsyncSession, row: RefreshOutcome) -> bool:
 
 
 def _pointer_advance_stmt(
-    db: AsyncSession,
     device_id: int,
     family: str,
     attempt_id: int,
@@ -212,17 +215,11 @@ def _pointer_advance_stmt(
     attempt_id`` — the monotonic guard evaluates INSIDE the database at write time, so a
     session that decided from a pre-window snapshot cannot regress the pointer (the old
     SELECT→compare-in-Python→UPDATE protocol lost that update; proven red-first by
-    ``tests/store/test_pointer_concurrency.py``). Dialect-branched because the construct
-    lives on each dialect's ``insert()``; both PG and SQLite (≥3.24) support the
-    update-side WHERE. ``updated_at`` is set explicitly — ORM ``onupdate`` does not fire
-    for core statements.
+    ``tests/store/test_pointer_concurrency.py``). ``updated_at`` is set explicitly — ORM
+    ``onupdate`` does not fire for core statements.
     """
-    if db.bind.dialect.name == "postgresql":
-        from sqlalchemy.dialects.postgresql import insert as dialect_insert
-    else:
-        from sqlalchemy.dialects.sqlite import insert as dialect_insert
     payload_revision = attempt_id if publish_payload else None
-    stmt = dialect_insert(RefreshOutcomePointer).values(
+    stmt = pg_insert(RefreshOutcomePointer).values(
         device_id=device_id,
         family=family,
         attempt_id=attempt_id,

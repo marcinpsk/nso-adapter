@@ -3,9 +3,9 @@
 """Two-phase refresh-outcome store (READSEM §2.4).
 
 Covers the store functions directly (phase 1 / phase 2 / pointer CAS) AND their integration
-through the shared refresh engine (run_family_refresh records both phases). The store commits in
-its OWN session on the caller's engine, so every assertion reads back in a FRESH session — which
-also proves the outcome was committed independently of the caller's transaction.
+through the shared refresh engine (run_family_refresh records both phases). Both phases run on
+the CALLER's session (the C1 contract); every assertion reads back in a FRESH session, which is
+what proves phase 2 committed rather than merely staged.
 """
 
 from __future__ import annotations
@@ -230,6 +230,67 @@ async def test_engine_records_two_phase_outcome_and_pointer(adapter_client):
         True,
         1,
     )
+    ptr = await _pointer(device_id, "static_route")
+    assert ptr is not None and ptr.attempt_id == row.id
+
+
+# Every store entry point the refresh engine can reach. Phase 2 is stage_result on the
+# PUBLISH path and record_result on the keep/error paths, so a spy set narrower than this
+# would pass vacuously on whichever path it happened not to cover.
+_STORE_ENTRY_POINTS = (
+    "record_read_outcome",
+    "stage_result",
+    "record_result",
+    "acquire_family_fence",
+    "publication_is_current",
+)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("section", "phase_two_writer"),
+    [
+        ({"status": "ok", "route": [{"prefix": "10.0.0.0/8", "next-hop": "1.1.1.1"}]}, "stage_result"),
+        ({"status": "error", "error-reason": "export down"}, "record_result"),
+    ],
+    ids=("publish", "keep"),
+)
+async def test_every_outcome_phase_runs_on_the_callers_session(adapter_client, monkeypatch, section, phase_two_writer):
+    """C1: the caller-session contract, asserted through a REAL refresh path.
+
+    Phase 1 only flushes, so an independent session cannot see the attempt row — the publish
+    path's ``db.get(RefreshOutcome, attempt_id)`` then finds nothing and phase 2 degrades to
+    the unknown_attempt no-op — and the 1332 publication invariant needs mirror rows + pointer
+    + payload_revision to commit together, which only the session holding the mirror writes
+    can do. Every other test here reads back through a fresh session, so both failures would
+    be invisible to them; this one pins the session OBJECT itself, on both phase-2 paths.
+    """
+    from nso_adapter.core.static_route import refresh_static_routes_for_device
+
+    # wraps=: the real store functions still run, so this asserts the contract on a genuine
+    # two-phase record rather than on a stubbed-out call graph.
+    spies = {name: AsyncMock(wraps=getattr(outcome_store, name)) for name in _STORE_ENTRY_POINTS}
+    for name, spy in spies.items():
+        monkeypatch.setattr(outcome_store, name, spy)
+
+    device_id = await seed_device(nso_device_name=f"oc-c1-{phase_two_writer}", netbox_device_id=8808)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        client = AsyncMock()
+        client.get_device_state_section.return_value = section
+        await refresh_static_routes_for_device(db, device, client, refresh_source="poll")
+
+        assert spies["record_read_outcome"].await_count == 1, "phase 1 never ran — the guard would prove nothing"
+        assert spies[phase_two_writer].await_count >= 1, f"phase 2 did not go through {phase_two_writer}"
+        for name, spy in spies.items():
+            for call in spy.await_args_list:
+                assert call.args[0] is db, f"outcome_store.{name} ran on a session that is not the caller's"
+
+    # ...and the contract delivered: the attempt terminalized and the pointer advanced, which
+    # is exactly what an independent session would have failed to do.
+    async with session() as db:
+        row = (await db.execute(select(RefreshOutcome).where(RefreshOutcome.device_id == device_id))).scalar_one()
+    assert row.result is not None and row.completed_at is not None
     ptr = await _pointer(device_id, "static_route")
     assert ptr is not None and ptr.attempt_id == row.id
 
