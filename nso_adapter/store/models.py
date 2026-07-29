@@ -27,6 +27,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -1004,12 +1005,43 @@ class StaticRouteIntent(Base):
     """Write-path intent for a static route accepted by the NetBox operator."""
 
     __tablename__ = "static_route_intent"
-    __table_args__ = (UniqueConstraint("device_id", "vrf", "prefix", "next_hop", name="uq_staticrouteintent_identity"),)
+    __table_args__ = (
+        # DEFERRABLE: an identity edit updates the row IN PLACE, so a same-payload swap
+        # (route 7 A->B while route 8 B->A) and a delete-then-reclaim both collide
+        # transiently. Both reach a legal final state; validating at COMMIT is what lets
+        # them through without an ordering trick that cannot fix the swap case anyway.
+        UniqueConstraint(
+            "device_id",
+            "vrf",
+            "prefix",
+            "next_hop",
+            name="uq_staticrouteintent_identity",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        # One intent row per (device, NetBox route pk). Partial so the pre-rollout NULL
+        # rows — the rollout fence's own signal — are not constrained.
+        Index(
+            "uq_sr_intent_device_route_id",
+            "device_id",
+            "route_id",
+            unique=True,
+            postgresql_where=text("route_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     device_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    # The NetBox routing.StaticRoute pk. No FK — a cross-system id. Nullable: the
+    # nullability IS the rollout fence (§3.8), and only the plugin (R3) can fill it.
+    route_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The triple last proven committed into the service, as ["<vrf>", "<prefix>",
+    # "<next_hop>"]. JSONB because PostgreSQL's `json` has no equality operator and R2's
+    # CAS is `IS NOT DISTINCT FROM`; none_as_null so a Python None is SQL NULL and not
+    # 'null'::jsonb, which would silently stop matching `IS NULL`.
+    deployed_key: Mapped[list | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     vrf: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     prefix: Mapped[str] = mapped_column(String(64), nullable=False)
     next_hop: Mapped[str] = mapped_column(String(64), nullable=False, default="")
@@ -1026,6 +1058,52 @@ class StaticRouteIntent(Base):
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     device: Mapped[Device] = relationship("Device", back_populates="static_route_intents")
+
+
+class StaticRouteTombstone(Base):
+    """A deleted/detached static-route intent row whose removal is not yet proven.
+
+    The only surviving carrier of a replacement once the intent row is gone
+    (#1368 Option A). Deleted only on proof of consumption, by snapshotted id —
+    hence no ``consumed_at``: a tombstone created while a job is mid-network-call
+    survives that job by construction.
+
+    No ``Device`` relationship on purpose: a tombstone is not an intent root, and
+    teardown's root enumeration derives from ``Device.__mapper__.relationships``.
+    ``ondelete="CASCADE"`` on ``device_id`` means offboard wipes tombstones with the
+    device — right, because an offboarded device has no service to reconcile against,
+    but note it diverges from ``Job``, which teardown preserves by nulling ``device_id``.
+    """
+
+    __tablename__ = "static_route_tombstone"
+    __table_args__ = (
+        CheckConstraint("marking IN ('delete_origin', 'detach')", name="ck_srt_marking"),
+        # The sweeper's exact predicate, scanned per device and consumed in id order.
+        # Non-unique: one push deleting three routes can orphan three at once.
+        Index("ix_srt_unclaimed", "device_id", "id", postgresql_where=text("job_id IS NULL")),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # NOT NULL: a tombstone is only ever written on a fence-open device (§3.8), and the
+    # fence is open only when every pre-existing intent row of that device carries a
+    # route_id. A NULL here would be an uncorrelatable deletion authority for R2's CAS.
+    route_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    vrf: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    prefix: Mapped[str] = mapped_column(String(64), nullable=False)
+    next_hop: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    deployed_key: Mapped[list | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    # String + CHECK rather than a PG enum: the value set is closed and two-valued, and a
+    # new enum type widens the parity snapshot and needs ALTER TYPE care forever.
+    marking: Mapped[str] = mapped_column(String(16), nullable=False)
+    # The owning removal job. SET NULL, not CASCADE: a deleted job returns the tombstone
+    # to the sweeper rather than destroying the deletion carrier.
+    job_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class DeviceSvi(Base):

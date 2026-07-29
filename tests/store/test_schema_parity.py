@@ -28,31 +28,72 @@ from tests.conftest import _drop_database, _url_for
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+_DEFERRABILITY_SQL = sa.text(
+    """
+    SELECT c.conname, c.condeferrable, c.condeferred
+      FROM pg_constraint c
+      JOIN pg_class t ON t.oid = c.conrelid
+      JOIN pg_namespace n ON n.oid = t.relnamespace
+     WHERE c.contype = 'u' AND n.nspname = 'public'
+       AND t.relname = :table
+    """
+)
+
+
+def _deferrability(conn, table: str) -> dict[str, tuple[bool, str]]:
+    """Unique-constraint deferrability, which SQLAlchemy does not reflect."""
+    return {
+        name: (deferrable, "DEFERRED" if deferred else "IMMEDIATE")
+        for name, deferrable, deferred in conn.execute(_DEFERRABILITY_SQL, {"table": table})
+    }
+
+
 def _snapshot(engine) -> dict:
     insp = inspect(engine)
     snap: dict = {}
-    for table in sorted(insp.get_table_names()):
-        if table == "alembic_version":
-            continue
-        snap[table] = {
-            # (type, nullable, server_default) — the server default is included so a
-            # create_all-vs-alembic DEFAULT divergence is caught, not passed green.
-            "cols": {c["name"]: (str(c["type"]), c["nullable"], c.get("default")) for c in insp.get_columns(table)},
-            "pk": tuple(insp.get_pk_constraint(table)["constrained_columns"]),
-            "fks": sorted(
-                (tuple(f["constrained_columns"]), f["referred_table"], tuple(f["referred_columns"]))
-                for f in insp.get_foreign_keys(table)
-            ),
-            "uqs": sorted(tuple(u["column_names"]) for u in insp.get_unique_constraints(table)),
-            # The partial-index PREDICATE is part of the index: without it a
-            # postgresql_where divergence between the model and the migration passes green.
-            "ixs": sorted(
-                (tuple(i["column_names"]), i["unique"], (i.get("dialect_options") or {}).get("postgresql_where"))
-                for i in insp.get_indexes(table)
-            ),
-            # CHECK constraints compared by their reflected SQL text (names may be generated).
-            "checks": sorted(c["sqltext"] for c in insp.get_check_constraints(table)),
-        }
+    with engine.connect() as conn:
+        for table in sorted(insp.get_table_names()):
+            if table == "alembic_version":
+                continue
+            deferrability = _deferrability(conn, table)
+            snap[table] = {
+                # (type, nullable, server_default) — the server default is included so a
+                # create_all-vs-alembic DEFAULT divergence is caught, not passed green.
+                "cols": {c["name"]: (str(c["type"]), c["nullable"], c.get("default")) for c in insp.get_columns(table)},
+                "pk": tuple(insp.get_pk_constraint(table)["constrained_columns"]),
+                # ondelete normalized (upper-cased, None -> "NO ACTION"): alembic emitting a
+                # restrictive FK where create_all emits CASCADE otherwise passes green, and
+                # offboard then raises instead of removing the child rows.
+                "fks": sorted(
+                    (
+                        tuple(f["constrained_columns"]),
+                        f["referred_table"],
+                        tuple(f["referred_columns"]),
+                        ((f.get("options") or {}).get("ondelete") or "NO ACTION").upper(),
+                    )
+                    for f in insp.get_foreign_keys(table)
+                ),
+                # Deferrability is part of the constraint: an immediate twin of a
+                # DEFERRABLE INITIALLY DEFERRED constraint rejects legal in-transaction swaps.
+                "uqs": sorted(
+                    (tuple(u["column_names"]), *deferrability.get(u["name"], (False, "IMMEDIATE")))
+                    for u in insp.get_unique_constraints(table)
+                ),
+                # The partial-index PREDICATE is part of the index: without it a
+                # postgresql_where divergence between the model and the migration passes green.
+                # An EXPRESSION index reflects column_names as None entries, so a wrong-column
+                # twin is invisible without the reflected expressions.
+                "ixs": sorted(
+                    (
+                        tuple(i.get("expressions") or i["column_names"]),
+                        i["unique"],
+                        (i.get("dialect_options") or {}).get("postgresql_where"),
+                    )
+                    for i in insp.get_indexes(table)
+                ),
+                # CHECK constraints compared by their reflected SQL text (names may be generated).
+                "checks": sorted(c["sqltext"] for c in insp.get_check_constraints(table)),
+            }
     # PostgreSQL ENUM types are schema-level, not per-table: compare their label sets so an
     # enum value-set divergence (a migration adding/renaming a member) is caught too.
     snap["__enums__"] = {e["name"]: tuple(e["labels"]) for e in insp.get_enums()}

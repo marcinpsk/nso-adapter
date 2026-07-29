@@ -261,7 +261,7 @@ def test_migration_declares_all_25_columns_with_an_explicit_utc_using_clause():
 
 
 def test_downgrade_restores_naive_utc_and_re_upgrade_is_idempotent(pg_admin, monkeypatch):
-    _load_migration()  # fail with the same import error as the others when it is missing
+    module = _load_migration()  # fail with the same import error as the others when it is missing
     monkeypatch.setenv("PGOPTIONS", f"-c timezone={_TZ}")
 
     with _private_database(pg_admin, "down") as sync_url:
@@ -271,7 +271,8 @@ def test_downgrade_restores_naive_utc_and_re_upgrade_is_idempotent(pg_admin, mon
             _assert_session_timezone(engine)
             _seed(engine, _AWARE)
 
-        _alembic(sync_url, "downgrade", "-1")
+        # Target the revision by name, not "-1": later migrations chain on top of this one.
+        _alembic(sync_url, "downgrade", module.down_revision)
 
         with _engine_on(sync_url) as engine:
             _assert_session_timezone(engine)
