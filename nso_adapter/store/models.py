@@ -114,13 +114,13 @@ class Device(Base):
     # cache resolve this device's (ned_id, sw_version) key WITHOUT a live probe.
     sw_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     mapping_status: Mapped[MappingStatus] = mapped_column(Enum(MappingStatus), default=MappingStatus.mapped)
-    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_sync_status: Mapped[LastSyncStatus | None] = mapped_column(Enum(LastSyncStatus), nullable=True)
     # When last_sync_status == partial: the routing surfaces that failed to read from NSO on the
     # last sync (e.g. ["bgp", "ospf"]). Their mirror rows may be stale. NULL when nothing degraded.
     degraded_surfaces: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
     # Both identities are enforced in the DATABASE, not just by onboard_device's select-then-
     # insert: two concurrent onboards can both find nothing and both insert, and the duplicates
@@ -294,7 +294,7 @@ class ManagedScope(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     device_id: Mapped[int] = mapped_column(Integer, ForeignKey("devices.id"), index=True)
     attribute: Mapped[str] = mapped_column(String(64))
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
     device: Mapped[Device] = relationship("Device", back_populates="managed_scope")
 
@@ -342,7 +342,7 @@ class InterfaceAttrState(Base):
     # importer to decide Phase 1 vs Phase 2). There is intentionally no intent_value
     # cache here — a second copy is what caused the Phase-2 split-brain.
     sync_state: Mapped[SyncState] = mapped_column(Enum(SyncState), default=SyncState.unknown)
-    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     interface_obj: Mapped[DbInterface] = relationship("DbInterface", back_populates="attr_states")
 
@@ -374,13 +374,13 @@ class Job(Base):
     error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # Phase 2: apply jobs snapshot interface_intent rows here at job start
     context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
     # Layer B (durable worker): set when a worker claims the job; heartbeat_at is
     # refreshed periodically while it runs so a crashed/hung job can be detected
     # and requeued (or failed) on the next startup.
-    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     device: Mapped[Device | None] = relationship("Device", back_populates="jobs")
 
@@ -402,7 +402,7 @@ class DeviceSettings(Base):
     # or partial commit leaves the CDB inconsistent and the next apply is refused). Default
     # on; can be disabled per device for NEDs that already sync-on-connect.
     sync_before_apply: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
     device: Mapped[Device] = relationship("Device", back_populates="settings")
 
@@ -439,16 +439,16 @@ class DeviceFailover(Base):
     oob_healthy: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     oob_health_result: Mapped[str | None] = mapped_column(String(16), nullable=True)
     oob_health_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
-    oob_health_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    last_probe_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    oob_health_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_probe_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_probe_result: Mapped[str | None] = mapped_column(String(16), nullable=True)
     last_probe_target: Mapped[str | None] = mapped_column(String(16), nullable=True)
     last_probe_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
-    last_switch_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_switch_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Staggering bookkeeping — per-address due times so the fleet isn't probed in lockstep.
-    next_primary_probe_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    next_oob_probe_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+    next_primary_probe_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_oob_probe_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
     device: Mapped[Device] = relationship("Device", back_populates="failover")
 
@@ -482,7 +482,7 @@ class FailoverConfig(Base):
     # Safety belt: at most this many disruptive flips (set_address+disconnect+connect) per tick.
     max_flips_per_tick: Mapped[int] = mapped_column(Integer, default=8, server_default=text("8"))
     sync_from_after_switch: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
 
 class InterfaceIntent(Base):
@@ -499,8 +499,8 @@ class InterfaceIntent(Base):
     interface_id: Mapped[int] = mapped_column(Integer, ForeignKey("interfaces.id"), index=True)
     attribute: Mapped[str] = mapped_column(String(64))
     intent_value: Mapped[str | None] = mapped_column(Text, nullable=True)
-    accepted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     interface_obj: Mapped[DbInterface] = relationship("DbInterface", back_populates="intent")
@@ -1836,7 +1836,7 @@ class DeviceRoutePolicyPrefixList(Base):
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     family: Mapped[int] = mapped_column(Integer, nullable=False)  # 4 or 6
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="poll")
 
     device: Mapped[Device] = relationship("Device")
@@ -1881,7 +1881,7 @@ class DeviceRoutePolicyCommunityList(Base):
     # carrying NONE of its members. No native form on Cisco community-lists.
     invert_match: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="poll")
 
     device: Mapped[Device] = relationship("Device")
@@ -1924,7 +1924,7 @@ class DeviceRoutePolicyASPath(Base):
     )
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="poll")
 
     device: Mapped[Device] = relationship("Device")
@@ -1962,7 +1962,7 @@ class DeviceRoutePolicyRouteMap(Base):
     )
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="poll")
 
     device: Mapped[Device] = relationship("Device")
@@ -2010,8 +2010,8 @@ class RoutePolicyObjectIntent(Base):
     entries: Mapped[dict | list] = mapped_column(JSON, nullable=False)
     # community_list only: Junos invert-match / Nokia "expression NOT (…)".
     invert_match: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
-    accepted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     device: Mapped[Device] = relationship("Device", back_populates="route_policy_object_intents")

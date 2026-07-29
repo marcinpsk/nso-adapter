@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
+from nso_adapter.api.timestamps import iso_z
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
@@ -268,7 +269,7 @@ async def get_bgp_config(device_id: int, db: AsyncSession = Depends(get_read_db)
 
     return {
         "device_id": device_id,
-        "last_refreshed_at": latest_ts.isoformat() + "Z" if latest_ts else None,
+        "last_refreshed_at": iso_z(latest_ts),
         "refresh_source": bgp_routers[0].refresh_source,
         "read_state": read_state,
         "routers": routers_out,

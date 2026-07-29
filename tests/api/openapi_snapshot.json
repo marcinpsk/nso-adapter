@@ -5414,7 +5414,6 @@
           "last_refreshed_at": {
             "anyOf": [
               {
-                "format": "date-time",
                 "type": "string"
               },
               {
@@ -5905,7 +5904,6 @@
           "last_refreshed_at": {
             "anyOf": [
               {
-                "format": "date-time",
                 "type": "string"
               },
               {

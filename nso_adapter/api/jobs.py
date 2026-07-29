@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404, RESP_422_VALIDATION, api_error
+from nso_adapter.api.timestamps import iso_z
 from nso_adapter.store.models import Job, JobStatus
 
 router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
@@ -40,10 +41,10 @@ def _job_out(j: Job) -> dict:
         "result": j.result,
         "error": j.error,
         "context": j.context,
-        "created_at": j.created_at.isoformat() + "Z",
-        "updated_at": j.updated_at.isoformat() + "Z",
-        "started_at": j.started_at.isoformat() + "Z" if j.started_at else None,
-        "heartbeat_at": j.heartbeat_at.isoformat() + "Z" if j.heartbeat_at else None,
+        "created_at": iso_z(j.created_at),
+        "updated_at": iso_z(j.updated_at),
+        "started_at": iso_z(j.started_at),
+        "heartbeat_at": iso_z(j.heartbeat_at),
     }
 
 

@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.timestamps import iso_z
 from nso_adapter.store.models import (
     DbInterface,
     Device,
@@ -91,8 +92,8 @@ def _intent_row_out(row: InterfaceIntent, if_name: str) -> dict:
         "interface": if_name,
         "attribute": row.attribute,
         "intent_value": row.intent_value,
-        "accepted_at": row.accepted_at.isoformat() + "Z" if row.accepted_at else None,
-        "last_apply_at": row.last_apply_at.isoformat() + "Z" if row.last_apply_at else None,
+        "accepted_at": iso_z(row.accepted_at),
+        "last_apply_at": iso_z(row.last_apply_at),
         "last_apply_error": row.last_apply_error,
     }
 
@@ -195,7 +196,7 @@ async def put_intent(device_id: int, body: IntentUpdate, db: AsyncSession = Depe
     return {
         "device_id": device_id,
         "attribute_count": count,
-        "updated_at": now.isoformat() + "Z",
+        "updated_at": iso_z(now),
     }
 
 
@@ -228,7 +229,7 @@ async def get_intent(device_id: int, db: AsyncSession = Depends(get_db)):
     return {
         "device_id": device_id,
         "attributes": rows,
-        "updated_at": updated_at.isoformat() + "Z",
+        "updated_at": iso_z(updated_at),
     }
 
 

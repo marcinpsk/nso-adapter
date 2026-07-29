@@ -3,9 +3,8 @@
 """Golden-body test — GET /api/v1/devices/{id}/redistribution.
 
 Deep-equality proof of the exact redistribution JSON. Optional keys (route_map/
-metric/metric_type) are OMITTED when unset. Like OSPF (and unlike static/bgp/isis)
-the reader returns the RAW naive datetime, so ``last_refreshed_at`` serialises with
-NO trailing ``Z`` and the model field must be ``datetime`` (not ``str``).
+metric/metric_type) are OMITTED when unset. ``last_refreshed_at`` goes through
+``iso_z`` like every other family, so it serialises as ``"<iso>Z"``.
 """
 
 from __future__ import annotations
@@ -85,7 +84,7 @@ async def test_redistribution_golden_body(adapter_client):
     # Ordered by (dest_protocol, dest_ref, source_protocol): "isis" < "ospf".
     assert body == {
         "device_id": device_id,
-        "last_refreshed_at": "2026-06-01T10:00:00",  # RAW datetime — no trailing "Z"
+        "last_refreshed_at": "2026-06-01T10:00:00Z",
         "refresh_source": "poll",
         "read_state": _SYNTH_READ_STATE,
         "entries": [

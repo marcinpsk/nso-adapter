@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
+from nso_adapter.api.timestamps import iso_z
 from nso_adapter.core.removal import lost_content
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
@@ -238,7 +239,7 @@ async def get_route_policy(device_id: int, db: AsyncSession = Depends(get_read_d
 
     return {
         "device_id": device_id,
-        "last_refreshed_at": last_refreshed_at.isoformat() + "Z" if last_refreshed_at else None,
+        "last_refreshed_at": iso_z(last_refreshed_at),
         "read_state": read_state,
         "prefix_lists": [_serialize_prefix_list(pl, pl_entries.get(pl.id, [])) for pl in prefix_lists],
         "community_lists": [_serialize_community_list(cl, cl_entries.get(cl.id, [])) for cl in community_lists],
@@ -522,8 +523,8 @@ async def put_route_policy_intent(
                 "family": r.family,
                 "name": r.name,
                 "entries": r.entries,
-                "accepted_at": r.accepted_at.isoformat() + "Z" if r.accepted_at else None,
-                "last_apply_at": r.last_apply_at.isoformat() + "Z" if r.last_apply_at else None,
+                "accepted_at": iso_z(r.accepted_at),
+                "last_apply_at": iso_z(r.last_apply_at),
                 "last_apply_error": r.last_apply_error,
             }
             for r in rows

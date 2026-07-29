@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
+from nso_adapter.api.timestamps import iso_z
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
@@ -34,10 +35,8 @@ router = APIRouter(prefix="/api/v1/devices", tags=["ospf"])
 
 
 # ── Read-mirror response models (GET /ospf) ───────────────────────────────────
-# NB: last_refreshed_at is a `datetime` (the reader passes the raw naive datetime,
-# not an "<iso>Z" string like the other routers) — jsonable_encoder emits it with
-# no trailing Z. `areas` is an opaque JSON list, always present. router_id/enabled
-# and the interface optionals are emitted only when set (response_model_exclude_unset).
+# `areas` is an opaque JSON list, always present. router_id/enabled and the interface
+# optionals are emitted only when set (response_model_exclude_unset).
 
 
 class OspfInstanceOut(BaseModel):
@@ -62,7 +61,7 @@ class OspfInterfaceOut(BaseModel):
 
 class OspfConfigOut(BaseModel):
     device_id: int
-    last_refreshed_at: datetime | None = None  # raw datetime (no "Z"), None when never refreshed
+    last_refreshed_at: str | None = None  # "<iso>Z", None when never refreshed
     refresh_source: str  # legacy freshness (S5 retires it); read_state is the S4 truth
     read_state: FamilyReadState
     instances: list[OspfInstanceOut]
@@ -145,7 +144,7 @@ async def get_ospf(device_id: int, db: AsyncSession = Depends(get_read_db)):
 
     return {
         "device_id": device_id,
-        "last_refreshed_at": latest.last_refreshed_at,
+        "last_refreshed_at": iso_z(latest.last_refreshed_at),
         "refresh_source": latest.refresh_source,
         "read_state": read_state,
         "instances": instances,

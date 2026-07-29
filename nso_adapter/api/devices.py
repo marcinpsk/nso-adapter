@@ -17,6 +17,7 @@ from nso_adapter.api.errors import (
     RESP_422_VALIDATION,
     api_error,
 )
+from nso_adapter.api.timestamps import iso_z
 from nso_adapter.store.models import (
     DbInterface,
     Device,
@@ -79,16 +80,12 @@ def _device_out(d: Device) -> dict:
         "netbox_device_id": d.netbox_device_id,
         "source_epoch": d.source_epoch,
         "mapping_status": d.mapping_status.value,
-        "last_sync_at": d.last_sync_at.isoformat() + "Z" if d.last_sync_at else None,
+        "last_sync_at": iso_z(d.last_sync_at),
         "last_sync_status": d.last_sync_status.value if d.last_sync_status else None,
         # Populated only when last_sync_status == "partial": the routing surfaces whose
         # NSO read failed on the last sync (their mirror rows may be stale).
         "degraded_surfaces": d.degraded_surfaces or None,
     }
-
-
-def _iso(dt) -> str | None:
-    return dt.isoformat() + "Z" if dt else None
 
 
 def _failover_out(fo: DeviceFailover | None) -> dict | None:
@@ -102,12 +99,12 @@ def _failover_out(fo: DeviceFailover | None) -> dict | None:
         "last_probe_result": fo.last_probe_result,
         "last_probe_target": fo.last_probe_target,
         "last_probe_detail": fo.last_probe_detail,
-        "last_probe_at": _iso(fo.last_probe_at),
+        "last_probe_at": iso_z(fo.last_probe_at),
         "oob_healthy": fo.oob_healthy,
         "oob_health_result": fo.oob_health_result,
         "oob_health_detail": fo.oob_health_detail,
-        "oob_health_checked_at": _iso(fo.oob_health_checked_at),
-        "last_switch_at": _iso(fo.last_switch_at),
+        "oob_health_checked_at": iso_z(fo.oob_health_checked_at),
+        "last_switch_at": iso_z(fo.last_switch_at),
         "manual_override": fo.manual_override,
     }
 

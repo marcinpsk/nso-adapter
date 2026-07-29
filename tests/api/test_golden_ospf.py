@@ -2,11 +2,8 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Golden-body test — GET /api/v1/devices/{id}/ospf.
 
-Deep-equality proof of the exact OSPF read-mirror JSON. Unlike static_route/bgp/
-isis (which format ``.isoformat() + "Z"``), the OSPF reader returns the RAW naive
-datetime (``ospf.py``), so jsonable_encoder emits ``"2026-06-01T10:00:00"`` with
-NO trailing ``Z`` — this golden pins that difference so the response model must be
-typed ``datetime`` (not ``str``) to stay neutral.
+Deep-equality proof of the exact OSPF read-mirror JSON. ``last_refreshed_at`` goes
+through ``iso_z`` like every other family, so it serialises as ``"<iso>Z"``.
 
 Covers a maximal instance (router_id + enabled + areas), a minimal instance
 (``areas`` still present as []), a maximal + minimal interface, and the empty
@@ -106,7 +103,7 @@ async def test_ospf_golden_body(adapter_client):
 
     assert body == {
         "device_id": device_id,
-        "last_refreshed_at": "2026-06-01T10:00:00",  # RAW datetime — no trailing "Z"
+        "last_refreshed_at": "2026-06-01T10:00:00Z",
         "refresh_source": "poll",
         "read_state": _SYNTH_READ_STATE,
         "instances": [

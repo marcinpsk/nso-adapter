@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
+from nso_adapter.api.timestamps import iso_z
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import DbInterface, Device, DeviceSettings, InterfaceIpAddress, InterfaceIpIntent
 
@@ -109,7 +110,7 @@ async def get_interface_ips(device_id: int, db: AsyncSession = Depends(get_read_
 
     return {
         "device_id": device_id,
-        "last_refreshed_at": latest.last_refreshed_at.isoformat() + "Z",
+        "last_refreshed_at": iso_z(latest.last_refreshed_at),
         "refresh_source": latest.refresh_source,
         "read_state": read_state,
         "interfaces": [
@@ -313,5 +314,5 @@ async def put_ip_intent(device_id: int, body: IpIntentUpdate, db: AsyncSession =
         "address_count": count,
         "removed_interfaces": len(removed_interfaces),
         "replaced": replaced,
-        "updated_at": now.isoformat() + "Z",
+        "updated_at": iso_z(now),
     }
