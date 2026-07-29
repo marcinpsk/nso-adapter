@@ -562,7 +562,7 @@ async def _seed_redist_rows(db, device_id: int, entries: list[tuple[str, str]]) 
 
     from nso_adapter.store.models import DeviceRedistribution
 
-    ts = datetime.now(UTC).replace(tzinfo=None)
+    ts = datetime.now(UTC)
     for dest, source in entries:
         db.add(
             DeviceRedistribution(

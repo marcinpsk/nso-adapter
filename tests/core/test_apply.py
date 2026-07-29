@@ -249,7 +249,7 @@ async def _seed_interface_with_intent(
             interface_id=iface.id,
             attribute=attribute,
             intent_value=intent_value,
-            accepted_at=datetime.utcnow(),
+            accepted_at=datetime.now(UTC),
         )
         db.add(intent)
         await db.commit()
@@ -390,7 +390,7 @@ async def test_collect_apply_diff_returns_scope_deltas(adapter_client):
     device_id = await _seed_device("rtr-diff", 199)
     async with session() as db:
         db.add(
-            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC))
         )
         await db.commit()
 
@@ -412,7 +412,7 @@ async def test_collect_apply_diff_empty_scope_omitted(adapter_client):
     device_id = await _seed_device("rtr-diff2", 198)
     async with session() as db:
         db.add(
-            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC))
         )
         await db.commit()
 
@@ -435,7 +435,7 @@ async def test_collect_apply_diff_outformat_cli_threads_format(adapter_client):
     device_id = await _seed_device("rtr-diff-cli", 197)
     async with session() as db:
         db.add(
-            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC))
         )
         await db.commit()
 
@@ -459,7 +459,7 @@ async def test_collect_apply_diff_covers_multiple_scopes(adapter_client):
     device_id = await _seed_device("rtr-diff3", 197)
     async with session() as db:
         db.add(
-            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC))
         )
         db.add(
             StaticRouteIntent(
@@ -467,7 +467,7 @@ async def test_collect_apply_diff_covers_multiple_scopes(adapter_client):
                 vrf="",
                 prefix="10.0.0.0/24",
                 next_hop="10.0.0.1",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -511,26 +511,26 @@ async def test_collect_apply_diff_covers_every_scope(adapter_client):
         await db.flush()
         db.add(
             m.InterfaceIntent(
-                interface_id=iface.id, attribute="description", intent_value="uplink", accepted_at=datetime.utcnow()
+                interface_id=iface.id, attribute="description", intent_value="uplink", accepted_at=datetime.now(UTC)
             )
         )
         db.add(
             m.InterfaceIpIntent(
-                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.utcnow()
+                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.now(UTC)
             )
         )
         db.add(
             m.OspfInstanceIntent(
-                device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow()
+                device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC)
             )
         )
         db.add(
-            m.IsisInterfaceIntent(device_id=device_id, interface_name="Gi0/0", af="ipv4", accepted_at=datetime.utcnow())
+            m.IsisInterfaceIntent(device_id=device_id, interface_name="Gi0/0", af="ipv4", accepted_at=datetime.now(UTC))
         )
-        db.add(m.BgpRouterIntent(device_id=device_id, asn="65000", accepted_at=datetime.utcnow()))
+        db.add(m.BgpRouterIntent(device_id=device_id, asn="65000", accepted_at=datetime.now(UTC)))
         db.add(
             m.RoutePolicyObjectIntent(
-                device_id=device_id, family="ipv4", name="RM", entries=[], accepted_at=datetime.utcnow()
+                device_id=device_id, family="ipv4", name="RM", entries=[], accepted_at=datetime.now(UTC)
             )
         )
         db.add(
@@ -539,21 +539,21 @@ async def test_collect_apply_diff_covers_every_scope(adapter_client):
                 label="ro",
                 vault_ref="network/netbox/snmp/community/ro#community",
                 access="ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         db.add(
             m.StaticRouteIntent(
-                device_id=device_id, prefix="10.1.0.0/24", next_hop="10.1.0.1", accepted_at=datetime.utcnow()
+                device_id=device_id, prefix="10.1.0.0/24", next_hop="10.1.0.1", accepted_at=datetime.now(UTC)
             )
         )
-        db.add(m.LoggingHostIntent(device_id=device_id, address="10.0.0.99", accepted_at=datetime.utcnow()))
-        db.add(m.SviIntent(device_id=device_id, interface_name="Vlan10", vlan_id=10, accepted_at=datetime.utcnow()))
-        db.add(m.SubinterfaceIntent(device_id=device_id, interface_name="Gi0/0.10", accepted_at=datetime.utcnow()))
-        db.add(m.VlanIntent(device_id=device_id, vlan_id=20, accepted_at=datetime.utcnow()))
-        db.add(m.BfdIntent(device_id=device_id, interface_name="Gi0/1", accepted_at=datetime.utcnow()))
+        db.add(m.LoggingHostIntent(device_id=device_id, address="10.0.0.99", accepted_at=datetime.now(UTC)))
+        db.add(m.SviIntent(device_id=device_id, interface_name="Vlan10", vlan_id=10, accepted_at=datetime.now(UTC)))
+        db.add(m.SubinterfaceIntent(device_id=device_id, interface_name="Gi0/0.10", accepted_at=datetime.now(UTC)))
+        db.add(m.VlanIntent(device_id=device_id, vlan_id=20, accepted_at=datetime.now(UTC)))
+        db.add(m.BfdIntent(device_id=device_id, interface_name="Gi0/1", accepted_at=datetime.now(UTC)))
         db.add(
-            m.InterfaceMtuIntent(device_id=device_id, interface_name="Gi0/2", mtu=9000, accepted_at=datetime.utcnow())
+            m.InterfaceMtuIntent(device_id=device_id, interface_name="Gi0/2", mtu=9000, accepted_at=datetime.now(UTC))
         )
         db.add(
             m.L2SapIntent(
@@ -561,7 +561,7 @@ async def test_collect_apply_diff_covers_every_scope(adapter_client):
                 service_name="EPIPE-1",
                 service_type="epipe",
                 sap_id="1/1/1",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -624,11 +624,11 @@ async def test_collect_apply_diff_scope_failure_is_isolated(adapter_client):
     device_id = await _seed_device("rtr-diff-iso", 195)
     async with session() as db:
         db.add(
-            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC))
         )
         db.add(
             StaticRouteIntent(
-                device_id=device_id, prefix="10.2.0.0/24", next_hop="10.2.0.1", accepted_at=datetime.utcnow()
+                device_id=device_id, prefix="10.2.0.0/24", next_hop="10.2.0.1", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
@@ -662,19 +662,19 @@ async def test_collect_apply_diff_interface_scope_failures_and_skips(adapter_cli
         # eligible description slice — its dry-run will be made to raise
         db.add(
             InterfaceIntent(
-                interface_id=iface.id, attribute="description", intent_value="up", accepted_at=datetime.utcnow()
+                interface_id=iface.id, attribute="description", intent_value="up", accepted_at=datetime.now(UTC)
             )
         )
         # non-eligible attribute (skipped before any dry-run)
         db.add(
-            InterfaceIntent(interface_id=iface.id, attribute="mtu", intent_value="9000", accepted_at=datetime.utcnow())
+            InterfaceIntent(interface_id=iface.id, attribute="mtu", intent_value="9000", accepted_at=datetime.now(UTC))
         )
         # eligible attribute but not accepted (also skipped)
         db.add(InterfaceIntent(interface_id=iface.id, attribute="enabled", intent_value="true"))
         # IP intent whose dry-run will be made to raise
         db.add(
             InterfaceIpIntent(
-                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.utcnow()
+                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
@@ -712,12 +712,12 @@ async def test_collect_apply_diff_interface_in_sync_yields_no_entry(adapter_clie
         await db.flush()
         db.add(
             InterfaceIntent(
-                interface_id=iface.id, attribute="description", intent_value="up", accepted_at=datetime.utcnow()
+                interface_id=iface.id, attribute="description", intent_value="up", accepted_at=datetime.now(UTC)
             )
         )
         db.add(
             InterfaceIpIntent(
-                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.utcnow()
+                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
@@ -999,7 +999,7 @@ async def _seed_ip_intent(
             vrf=vrf,
             family=family,
             secondary=secondary,
-            accepted_at=datetime.now(UTC).replace(tzinfo=None) if accepted else None,
+            accepted_at=datetime.now(UTC) if accepted else None,
         )
         db.add(row)
         await db.commit()
@@ -1123,7 +1123,7 @@ async def test_run_apply_ip_already_applied_skipped_without_force(adapter_client
             .scalars()
             .all()
         )
-        rows[0].last_apply_at = datetime.now(UTC).replace(tzinfo=None)
+        rows[0].last_apply_at = datetime.now(UTC)
         rows[0].last_apply_error = None
         await db.commit()
 
@@ -1215,7 +1215,7 @@ async def test_run_apply_scope_success(adapter_client, model_name, kwargs, apply
     job_id = await _seed_apply_job(device_id)
     model = getattr(m, model_name)
     async with session() as db:
-        db.add(model(device_id=device_id, accepted_at=datetime.utcnow(), **kwargs))
+        db.add(model(device_id=device_id, accepted_at=datetime.now(UTC), **kwargs))
         await db.commit()
 
     mock_client = AsyncMock()
@@ -1244,8 +1244,8 @@ async def test_run_apply_logging_threads_and_stamps_levels_intent(adapter_client
     device_id = await _seed_device("rtr-logging-lvl", 311)
     job_id = await _seed_apply_job(device_id)
     async with session() as db:
-        db.add(LoggingHostIntent(device_id=device_id, address="10.9.0.98", accepted_at=datetime.utcnow()))
-        db.add(LoggingLevelsIntent(device_id=device_id, console_severity="CRITICAL", accepted_at=datetime.utcnow()))
+        db.add(LoggingHostIntent(device_id=device_id, address="10.9.0.98", accepted_at=datetime.now(UTC)))
+        db.add(LoggingLevelsIntent(device_id=device_id, console_severity="CRITICAL", accepted_at=datetime.now(UTC)))
         await db.commit()
 
     mock_client = AsyncMock()
@@ -1276,7 +1276,7 @@ async def test_run_apply_logging_levels_only_is_eligible(adapter_client):
     device_id = await _seed_device("rtr-logging-lvl2", 312)
     job_id = await _seed_apply_job(device_id)
     async with session() as db:
-        db.add(LoggingLevelsIntent(device_id=device_id, monitor_severity="NOTICE", accepted_at=datetime.utcnow()))
+        db.add(LoggingLevelsIntent(device_id=device_id, monitor_severity="NOTICE", accepted_at=datetime.now(UTC)))
         await db.commit()
 
     mock_client = AsyncMock()
@@ -1303,7 +1303,7 @@ async def test_run_apply_scope_failure_marks_error(adapter_client):
     async with session() as db:
         db.add(
             StaticRouteIntent(
-                device_id=device_id, prefix="10.8.0.0/24", next_hop="10.8.0.1", accepted_at=datetime.utcnow()
+                device_id=device_id, prefix="10.8.0.0/24", next_hop="10.8.0.1", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
@@ -1338,7 +1338,7 @@ async def test_run_apply_scope_unexpected_exception(adapter_client):
     device_id = await _seed_device("rtr-vlan-boom", 311)
     job_id = await _seed_apply_job(device_id)
     async with session() as db:
-        db.add(VlanIntent(device_id=device_id, vlan_id=42, accepted_at=datetime.utcnow()))
+        db.add(VlanIntent(device_id=device_id, vlan_id=42, accepted_at=datetime.now(UTC)))
         await db.commit()
 
     mock_client = AsyncMock()
@@ -1387,7 +1387,7 @@ async def test_run_apply_isis_subscope_failure_fails_the_job(adapter_client, mod
     job_id = await _seed_apply_job(device_id)
     model = getattr(m, model_name)
     async with session() as db:
-        db.add(model(device_id=device_id, accepted_at=datetime.utcnow(), **kwargs))
+        db.add(model(device_id=device_id, accepted_at=datetime.now(UTC), **kwargs))
         await db.commit()
 
     nso_err = NsoApplyError(code="nso_error", message="level rejected", detail={})
@@ -1415,7 +1415,7 @@ async def test_run_apply_isis_subscope_success_is_counted(adapter_client, model_
     job_id = await _seed_apply_job(device_id)
     model = getattr(m, model_name)
     async with session() as db:
-        db.add(model(device_id=device_id, accepted_at=datetime.utcnow(), **kwargs))
+        db.add(model(device_id=device_id, accepted_at=datetime.now(UTC), **kwargs))
         await db.commit()
 
     with (
@@ -1446,16 +1446,16 @@ async def test_run_apply_isis_applies_process_redist_and_flexalgo(adapter_client
     job_id = await _seed_apply_job(device_id)
     async with session() as db:
         db.add(
-            IsisInterfaceIntent(device_id=device_id, interface_name="Gi0/3", af="ipv4", accepted_at=datetime.utcnow())
+            IsisInterfaceIntent(device_id=device_id, interface_name="Gi0/3", af="ipv4", accepted_at=datetime.now(UTC))
         )
-        db.add(IsisProcessIntent(device_id=device_id, accepted_at=datetime.utcnow()))
-        db.add(IsisFlexAlgoIntent(device_id=device_id, algo_id=128, accepted_at=datetime.utcnow()))
+        db.add(IsisProcessIntent(device_id=device_id, accepted_at=datetime.now(UTC)))
+        db.add(IsisFlexAlgoIntent(device_id=device_id, algo_id=128, accepted_at=datetime.now(UTC)))
         db.add(
             RedistributionIntent(
                 device_id=device_id,
                 dest_protocol="isis",
                 source_protocol="connected",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -1488,21 +1488,21 @@ async def test_run_apply_ospf_applies_instance_interface_and_redist(adapter_clie
     job_id = await _seed_apply_job(device_id)
     async with session() as db:
         db.add(
-            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC))
         )
-        db.add(OspfInterfaceIntent(device_id=device_id, interface_name="Gi0/4", accepted_at=datetime.utcnow()))
+        db.add(OspfInterfaceIntent(device_id=device_id, interface_name="Gi0/4", accepted_at=datetime.now(UTC)))
         db.add(
             RedistributionIntent(
                 device_id=device_id,
                 dest_protocol="ospf",
                 source_protocol="static",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         # a bgp-destined redist row must NOT be swept into the ospf pass
         db.add(
             RedistributionIntent(
-                device_id=device_id, dest_protocol="bgp", source_protocol="static", accepted_at=datetime.utcnow()
+                device_id=device_id, dest_protocol="bgp", source_protocol="static", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
@@ -1543,10 +1543,10 @@ async def test_run_apply_snmp_applies_all_row_types(adapter_client):
                 label="ro",
                 vault_ref="network/netbox/snmp/community/ro#community",
                 access="ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
-        db.add(SnmpV3UserIntent(device_id=device_id, username="v3-test-group", accepted_at=datetime.utcnow()))
+        db.add(SnmpV3UserIntent(device_id=device_id, username="v3-test-group", accepted_at=datetime.now(UTC)))
         db.add(
             SnmpHostIntent(
                 device_id=device_id,
@@ -1554,10 +1554,10 @@ async def test_run_apply_snmp_applies_all_row_types(adapter_client):
                 version="v2c",
                 notify_type="traps",
                 community_or_user="ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
-        db.add(SnmpSystemInfoIntent(device_id=device_id, location="rack-7", accepted_at=datetime.utcnow()))
+        db.add(SnmpSystemInfoIntent(device_id=device_id, location="rack-7", accepted_at=datetime.now(UTC)))
         await db.commit()
 
     mock_client = AsyncMock()
@@ -1602,7 +1602,7 @@ async def test_run_apply_route_policy_failure_records_capability(adapter_client)
                 family="ipv4",
                 name="RM-IN",
                 entries=[],
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -1643,7 +1643,7 @@ async def test_run_apply_route_policy_capability_recording_is_best_effort(adapte
     async with session() as db:
         db.add(
             RoutePolicyObjectIntent(
-                device_id=device_id, family="ipv4", name="RM-X", entries=[], accepted_at=datetime.utcnow()
+                device_id=device_id, family="ipv4", name="RM-X", entries=[], accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
@@ -1677,7 +1677,7 @@ async def test_run_apply_route_policy_capability_skips_record_when_unparseable(a
     async with session() as db:
         db.add(
             RoutePolicyObjectIntent(
-                device_id=device_id, family="ipv4", name="RM-Y", entries=[], accepted_at=datetime.utcnow()
+                device_id=device_id, family="ipv4", name="RM-Y", entries=[], accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
@@ -1756,7 +1756,7 @@ async def _seed_subif_and_ip(device_id: int, iface_name: str = "ae99.999") -> in
                 parent_interface="ae99",
                 dot1q_vlan=999,
                 sub_type="subinterface",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         db.add(
@@ -1765,7 +1765,7 @@ async def _seed_subif_and_ip(device_id: int, iface_name: str = "ae99.999") -> in
                 address="198.18.1.1/24",
                 family="ipv4",
                 secondary=False,
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -1791,12 +1791,12 @@ async def _seed_snmp_and_static_route(device_id: int) -> None:
     async with session() as db:
         db.add(
             SnmpCommunityIntent(
-                device_id=device_id, label="public", vault_ref="m/p#k", access="RO", accepted_at=datetime.utcnow()
+                device_id=device_id, label="public", vault_ref="m/p#k", access="RO", accepted_at=datetime.now(UTC)
             )
         )
         db.add(
             StaticRouteIntent(
-                device_id=device_id, vrf="", prefix="10.9.9.0/24", next_hop="1.1.1.1", accepted_at=datetime.utcnow()
+                device_id=device_id, vrf="", prefix="10.9.9.0/24", next_hop="1.1.1.1", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
@@ -1941,7 +1941,7 @@ async def test_run_apply_atomic_merges_attr_and_ip_into_one_interface_entry(adap
                 address="10.0.0.1/30",
                 family="ipv4",
                 secondary=False,
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -2064,7 +2064,7 @@ async def test_run_apply_atomic_iface_rejection_attributed_to_offending_half(ada
                 address="10.0.0.1/30",
                 family="ipv4",
                 secondary=False,
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         dev = await db.get(Device, device_id)
@@ -2125,7 +2125,7 @@ async def test_run_apply_atomic_iface_rejection_unattributable_falls_back_to_bot
                 address="10.0.0.5/30",
                 family="ipv4",
                 secondary=False,
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         dev = await db.get(Device, device_id)
@@ -2236,7 +2236,7 @@ async def _seed_route_map_intent(device_id, ned_id):
                 family="route_map",
                 name="TEST-RM",
                 entries=[{"sequence": 10, "action": "permit"}],
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -2523,7 +2523,7 @@ async def test_run_apply_reader_compare_flags_silent_drop(adapter_client):
                 vrf="",
                 prefix="198.18.26.0/24",
                 next_hop="10.0.0.1",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -2565,7 +2565,7 @@ async def test_run_apply_reader_compare_ok_when_key_lands(adapter_client):
                 vrf="",
                 prefix="198.18.27.0/24",
                 next_hop="10.0.0.1",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -2625,7 +2625,7 @@ async def test_run_apply_reader_compare_does_not_fail_a_landed_community(adapter
                 label="prod-ro",
                 vault_ref="network/netbox/snmp/community/prod-ro#community",
                 access="ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -2671,7 +2671,7 @@ async def test_run_apply_reader_compare_still_catches_a_dropped_snmp_host(adapte
                 version="2c",
                 notify_type="traps",
                 community_or_user="prod-ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -2715,7 +2715,7 @@ async def test_run_apply_reader_compare_absent_reader_surface_is_not_a_drop(adap
                 vrf="",
                 prefix="198.18.29.0/24",
                 next_hop="10.0.0.1",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -2757,7 +2757,7 @@ async def test_run_apply_reader_compare_empty_list_payload_is_still_a_drop(adapt
                 vrf="",
                 prefix="198.18.30.0/24",
                 next_hop="10.0.0.1",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -2815,7 +2815,7 @@ async def test_run_apply_reader_compare_skips_a_fully_unrepresentable_community_
                 family="community_list",
                 name="CL-COLOR-ONLY",
                 entries=[{"community": "bandwidth:64500:100"}],  # unrepresentable on SR OS
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -2859,7 +2859,7 @@ async def test_run_apply_reader_compare_still_fails_a_representable_community_li
                 family="community_list",
                 name="CL-STD",
                 entries=[{"community": "64500:100"}],  # plain asn:val — SR OS takes it verbatim
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -2898,7 +2898,7 @@ async def test_run_apply_reader_compare_reader_error_is_nonfatal(adapter_client)
                 vrf="",
                 prefix="198.18.28.0/24",
                 next_hop="10.0.0.1",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -2926,7 +2926,7 @@ async def test_run_apply_reader_compare_bgp_checks_router_and_peers(adapter_clie
     device_id = await _seed_device("rtr-rc-bgp", 404)
     job_id = await _seed_apply_job(device_id)
     async with session() as db:
-        router = BgpRouterIntent(device_id=device_id, asn="65100", accepted_at=datetime.utcnow())
+        router = BgpRouterIntent(device_id=device_id, asn="65100", accepted_at=datetime.now(UTC))
         db.add(router)
         await db.flush()
         scope = BgpScopeIntent(router_id=router.id, vrf="")
@@ -2970,10 +2970,10 @@ async def test_run_apply_reader_compare_isis_flags_only_missing_model(adapter_cl
     async with session() as db:
         db.add(
             IsisInterfaceIntent(
-                device_id=device_id, interface_name="ge-0/0/0", af="ipv4", accepted_at=datetime.utcnow()
+                device_id=device_id, interface_name="ge-0/0/0", af="ipv4", accepted_at=datetime.now(UTC)
             )
         )
-        db.add(IsisProcessIntent(device_id=device_id, process_tag="CORE", accepted_at=datetime.utcnow()))
+        db.add(IsisProcessIntent(device_id=device_id, process_tag="CORE", accepted_at=datetime.now(UTC)))
         await db.commit()
 
     mock_client = AsyncMock(spec=NsoClient)
@@ -3033,7 +3033,7 @@ async def _seed_community(device_id: int, *, label="prod-ro", vault_ref=SNMP_VAU
                 label=label,
                 vault_ref=vault_ref,
                 access="ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -3149,7 +3149,7 @@ async def test_a_dropped_HOST_is_still_caught_when_the_community_grain_goes_dark
                 version="2c",
                 notify_type="traps",
                 community_or_user="prod-ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -3185,7 +3185,7 @@ async def test_mixed_community_and_host_vault_down_is_PARTIAL_not_ok(adapter_cli
                 version="2c",
                 notify_type="traps",
                 community_or_user="prod-ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -3241,10 +3241,10 @@ async def test_reader_compare_budget_exhaustion_yields_unknown(adapter_client, m
     async with session() as db:
         db.add(
             StaticRouteIntent(
-                device_id=device_id, vrf="", prefix="198.18.40.0/24", next_hop="10.0.0.1", accepted_at=datetime.utcnow()
+                device_id=device_id, vrf="", prefix="198.18.40.0/24", next_hop="10.0.0.1", accepted_at=datetime.now(UTC)
             )
         )
-        db.add(VlanIntent(device_id=device_id, vlan_id=444, name="rc-budget", accepted_at=datetime.utcnow()))
+        db.add(VlanIntent(device_id=device_id, vlan_id=444, name="rc-budget", accepted_at=datetime.now(UTC)))
         await db.commit()
 
     mock_client = AsyncMock(spec=NsoClient)
@@ -3290,7 +3290,7 @@ async def test_atomic_reader_compare_batches_ONE_action_for_all_scopes(adapter_c
     async with session() as db:
         db.add(
             StaticRouteIntent(
-                device_id=device_id, vrf="", prefix="10.9.9.0/24", next_hop="1.1.1.1", accepted_at=datetime.utcnow()
+                device_id=device_id, vrf="", prefix="10.9.9.0/24", next_hop="1.1.1.1", accepted_at=datetime.now(UTC)
             )
         )
         db.add(
@@ -3300,7 +3300,7 @@ async def test_atomic_reader_compare_batches_ONE_action_for_all_scopes(adapter_c
                 version="2c",
                 notify_type="traps",
                 community_or_user="x",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -3345,7 +3345,7 @@ async def test_reader_compare_non_terminal_section_is_error(adapter_client):
     async with session() as db:
         db.add(
             StaticRouteIntent(
-                device_id=device_id, vrf="", prefix="198.18.41.0/24", next_hop="10.0.0.1", accepted_at=datetime.utcnow()
+                device_id=device_id, vrf="", prefix="198.18.41.0/24", next_hop="10.0.0.1", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
@@ -3380,7 +3380,7 @@ async def test_reader_compare_malformed_ok_section_is_error_not_job_crash(adapte
     async with session() as db:
         db.add(
             StaticRouteIntent(
-                device_id=device_id, vrf="", prefix="198.18.42.0/24", next_hop="10.0.0.1", accepted_at=datetime.utcnow()
+                device_id=device_id, vrf="", prefix="198.18.42.0/24", next_hop="10.0.0.1", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
@@ -3419,7 +3419,7 @@ async def test_atomic_reader_compare_malformed_section_is_error_not_job_crash(ad
     async with session() as db:
         db.add(
             StaticRouteIntent(
-                device_id=device_id, vrf="", prefix="10.9.42.0/24", next_hop="1.1.1.1", accepted_at=datetime.utcnow()
+                device_id=device_id, vrf="", prefix="10.9.42.0/24", next_hop="1.1.1.1", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
@@ -3461,7 +3461,7 @@ async def test_action_failure_preserves_unverifiable_labels(adapter_client, vaul
                 version="2c",
                 notify_type="traps",
                 community_or_user="prod-ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -3493,7 +3493,7 @@ async def test_verifier_budget_excludes_commit_latency(adapter_client, monkeypat
     async with session() as db:
         db.add(
             StaticRouteIntent(
-                device_id=device_id, vrf="", prefix="198.18.44.0/24", next_hop="10.0.0.1", accepted_at=datetime.utcnow()
+                device_id=device_id, vrf="", prefix="198.18.44.0/24", next_hop="10.0.0.1", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()

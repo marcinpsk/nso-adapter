@@ -22,6 +22,7 @@ from datetime import datetime
 
 import structlog
 
+from nso_adapter.api.timestamps import to_utc
 from nso_adapter.bindings.netbox.client import NetboxClient
 
 logger = structlog.get_logger(__name__)
@@ -91,7 +92,9 @@ async def fetch_all_intent(client: NetboxClient) -> list[PluginIntentRecord]:
         accepted_at: datetime | None = None
         if accepted_at_raw:
             try:
-                accepted_at = datetime.fromisoformat(accepted_at_raw.replace("Z", "+00:00")).replace(tzinfo=None)
+                # Same inbound rule as the API request models (api.timestamps.UtcInstant):
+                # the store is timestamptz throughout, so keep the zone, never strip it.
+                accepted_at = to_utc(datetime.fromisoformat(accepted_at_raw.replace("Z", "+00:00")))
             except (ValueError, AttributeError):
                 pass
 

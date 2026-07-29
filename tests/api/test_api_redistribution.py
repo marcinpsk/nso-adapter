@@ -18,7 +18,7 @@ async def _seed_redistribution(device_id: int, entries: list[dict], *, refresh_s
     """Seed DeviceRedistribution rows for a device."""
     from nso_adapter.store.models import DeviceRedistribution
 
-    ts = TS.replace(tzinfo=None)
+    ts = TS
     async with session() as db:
         for entry in entries:
             db.add(

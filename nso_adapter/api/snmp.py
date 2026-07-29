@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
-from nso_adapter.api.timestamps import iso_z
+from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
     Device,
@@ -193,7 +193,7 @@ class SnmpCommunityEntry(BaseModel):
     vault_ref: str  # "mount/path#key"
     access: SnmpAccess
     acl: str | None = None
-    accepted_at: datetime | None = None
+    accepted_at: UtcInstant | None = None
 
     _check_vault_ref = field_validator("vault_ref")(_validated_vault_ref)
 
@@ -206,7 +206,7 @@ class SnmpV3UserEntry(BaseModel):
     priv_protocol: Literal["des", "3des", "aes-128", "aes-192", "aes-256"] | None = None
     auth_vault_ref: str | None = None
     priv_vault_ref: str | None = None
-    accepted_at: datetime | None = None
+    accepted_at: UtcInstant | None = None
 
     _check_auth_ref = field_validator("auth_vault_ref")(_validated_vault_ref)
     _check_priv_ref = field_validator("priv_vault_ref")(_validated_vault_ref)
@@ -218,13 +218,13 @@ class SnmpHostEntry(BaseModel):
     notify_type: SnmpNotifyType
     community_or_user: str
     port: int | None = Field(default=None, ge=1, le=65535)  # absent = NED default 162
-    accepted_at: datetime | None = None
+    accepted_at: UtcInstant | None = None
 
 
 class SnmpSystemInfoEntry(BaseModel):
     location: str | None = None
     contact: str | None = None
-    accepted_at: datetime | None = None
+    accepted_at: UtcInstant | None = None
 
 
 class SnmpIntentUpdate(BaseModel):
@@ -235,8 +235,11 @@ class SnmpIntentUpdate(BaseModel):
 
 
 def _accepted_or_now(entry, now: datetime) -> datetime:
-    """Resolve an entry's ``accepted_at`` to a naive UTC datetime, defaulting to now."""
-    return entry.accepted_at.replace(tzinfo=None) if entry.accepted_at else now
+    """Resolve an entry's ``accepted_at``, defaulting to now.
+
+    UTC is the ``UtcInstant`` annotation's guarantee — never re-normalize it here.
+    """
+    return entry.accepted_at or now
 
 
 async def _sync_intent_collection(
@@ -358,7 +361,7 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
     if not device:
         raise api_error(404, "not_found", "Device not found")
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
 
     comm_count, removed_comms, removed_comm_refs = await _sync_intent_collection(
         db,

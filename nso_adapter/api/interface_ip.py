@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
-from nso_adapter.api.timestamps import iso_z
+from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import DbInterface, Device, DeviceSettings, InterfaceIpAddress, InterfaceIpIntent
 
@@ -135,7 +135,7 @@ class IpAddressEntry(BaseModel):
     family: str  # "ipv4" | "ipv6"
     secondary: bool = False
     vrf: str = ""  # "" = global/default routing table
-    accepted_at: datetime | None = None
+    accepted_at: UtcInstant | None = None
     # Greenfield Nokia routed-interface binding: for an operator-created routed
     # sub-interface the adapter never imported, the plugin supplies the SR OS binding so
     # the apply can create `router Base interface <name> port <parent-binding>:<encap-tag>`.
@@ -256,7 +256,7 @@ async def put_ip_intent(device_id: int, body: IpIntentUpdate, db: AsyncSession =
     )
     await db.flush()
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     count = 0
     for item in body.addresses:
         iface = ifaces.get(item.interface)
@@ -264,7 +264,7 @@ async def put_ip_intent(device_id: int, body: IpIntentUpdate, db: AsyncSession =
             logger.warning("ip_intent.put.unknown_interface", device_id=device_id, interface=item.interface)
             continue
         key = (iface.id, item.address, item.vrf)
-        accepted = item.accepted_at.replace(tzinfo=None) if item.accepted_at else now
+        accepted = item.accepted_at if item.accepted_at else now
         if key in existing_rows:
             row = existing_rows[key]
             row.accepted_at = accepted

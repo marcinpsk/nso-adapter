@@ -18,7 +18,7 @@ goldens below are the byte-level arbiter (they pass BEFORE and AFTER typing).
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -26,7 +26,7 @@ from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TS = datetime(2026, 6, 1, 10, 0, 0)
+TS = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
 TS_Z = "2026-06-01T10:00:00Z"
 
 # managed_interfaces + every SyncState value, all zero except the one we seed.

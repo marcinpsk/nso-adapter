@@ -78,7 +78,8 @@ _COLUMNS: list[tuple[str, str]] = [
 ]
 
 # Distinct per column so a cross-column mixup cannot pass green.
-_NAIVE = {pair: datetime(2026, 6, 1, 10, 0, 0) + timedelta(minutes=i) for i, pair in enumerate(_COLUMNS)}
+# Deliberately naive: this seeds the PRE-migration schema shape (noqa: the one legit site).
+_NAIVE = {pair: datetime(2026, 6, 1, 10, 0, 0) + timedelta(minutes=i) for i, pair in enumerate(_COLUMNS)}  # noqa: DTZ001
 _AWARE = {pair: ts.replace(tzinfo=UTC) for pair, ts in _NAIVE.items()}
 
 # One row per affected table, id=1, in FK order. The non-timestamp columns are the NOT NULL

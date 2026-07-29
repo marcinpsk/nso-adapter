@@ -31,7 +31,7 @@ async def test_intent_summary_counts_device_scope(adapter_client):
                 device_id=device_id,
                 process_id="1",
                 router_id="1.1.1.1",
-                accepted_at=datetime.now(UTC).replace(tzinfo=None),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
@@ -61,7 +61,7 @@ async def test_intent_summary_counts_interface_scope(adapter_client):
                 address="10.0.0.1/31",
                 vrf="",
                 family="ipv4",
-                accepted_at=datetime.now(UTC).replace(tzinfo=None),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()

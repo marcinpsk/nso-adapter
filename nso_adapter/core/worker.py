@@ -67,7 +67,7 @@ _stop: asyncio.Event | None = None
 
 
 def _now() -> datetime:
-    return datetime.now(UTC).replace(tzinfo=None)
+    return datetime.now(UTC)
 
 
 async def _claim_next_job() -> tuple[int, int | None, JobType] | None:

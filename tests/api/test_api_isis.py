@@ -31,7 +31,7 @@ async def _seed_isis_iface(
                 af=af,
                 bound_port=bound_port,
                 prefix_sids=prefix_sids,
-                last_refreshed_at=TS.replace(tzinfo=None),
+                last_refreshed_at=TS,
                 refresh_source=refresh_source,
             )
         )

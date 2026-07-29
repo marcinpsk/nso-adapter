@@ -29,7 +29,7 @@ class ScopeOut(BaseModel):
 
 
 def _scope_out(device_id: int, attrs: list[ManagedScope], settings: DeviceSettings | None) -> dict:
-    updated_at = max((s.updated_at for s in attrs), default=datetime.now(UTC).replace(tzinfo=None))
+    updated_at = max((s.updated_at for s in attrs), default=datetime.now(UTC))
     return {
         "device_id": device_id,
         "attributes": [s.attribute for s in attrs],

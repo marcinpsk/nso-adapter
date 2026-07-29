@@ -25,7 +25,7 @@ async def _seed_routes(
     """Seed DeviceStaticRoute rows for a device."""
     from nso_adapter.store.models import DeviceStaticRoute
 
-    ts = last_refreshed_at.replace(tzinfo=None)
+    ts = last_refreshed_at
     async with session() as db:
         for route in routes:
             db.add(

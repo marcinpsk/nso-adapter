@@ -14,11 +14,12 @@ from datetime import UTC, datetime
 
 import pytest
 
+from nso_adapter.api.timestamps import iso_z
 from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TS = datetime(2026, 6, 1, 10, 0, 0)
+TS = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
 TS_Z = "2026-06-01T10:00:00Z"
 FROZEN_Z = "2026-06-01T10:00:00Z"
 
@@ -119,4 +120,4 @@ async def test_get_intent_summary_golden(adapter_client):
 
 
 def test_frozen_now_is_fixed():
-    assert _FrozenDatetime.now(UTC).replace(tzinfo=None).isoformat() + "Z" == FROZEN_Z
+    assert iso_z(_FrozenDatetime.now(UTC)) == FROZEN_Z

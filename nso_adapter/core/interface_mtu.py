@@ -34,7 +34,7 @@ def _int_or_none(value) -> int | None:
 
 async def _upsert_interface_mtu(db: AsyncSession, device: Device, interfaces: list[dict], refresh_source: str) -> None:
     """Full-replace the device's interface-MTU rows (the materializer)."""
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     await db.execute(delete(DeviceInterfaceMtu).where(DeviceInterfaceMtu.device_id == device.id))
     for item in interfaces:
         name = item.get("interface-name")

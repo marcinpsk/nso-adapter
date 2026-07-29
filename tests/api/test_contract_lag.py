@@ -11,7 +11,7 @@ Mirror (consumer side): ``netbox-nso-plugin/.../tests/test_contract_lag.py``.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -31,7 +31,7 @@ async def test_lag_config_contract(adapter_client):
     from nso_adapter.store.models import LagBundleConfig, LagMemberConfig
 
     device_id = await seed_device(nso_device_name="lag-ct", netbox_device_id=7990)
-    ts = datetime(2026, 6, 1, 10, 0, 0)
+    ts = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
     async with session() as db:
         # Maximal bundle (every optional) + minimal bundle (only required).
         b1 = LagBundleConfig(

@@ -54,9 +54,12 @@ def _drop_database(admin, name: str, *, expect_clean: bool) -> None:
     visible. Silently FORCE-ing it away is how that bug stays invisible forever.
     """
     with admin.connect() as conn:
+        # backend_type filter: PG's own autovacuum worker can be inside the clone at DROP
+        # time and is not a leaked test session — only client backends count as stragglers.
         rows = conn.exec_driver_sql(
             "SELECT pid, state, left(query, 120) FROM pg_stat_activity "
-            f"WHERE datname = '{name}' AND pid <> pg_backend_pid()"
+            f"WHERE datname = '{name}' AND pid <> pg_backend_pid() "
+            "AND backend_type = 'client backend'"
         ).fetchall()
         if rows and expect_clean:
             msg = f"{name}: {len(rows)} connection(s) survived teardown: {rows}"
@@ -198,30 +201,73 @@ class count_queries:
         event.remove(self._engine, "before_cursor_execute", self._on)
 
 
-@pytest.fixture
-async def adapter_client(tmp_path, monkeypatch):
-    """FastAPI test client backed by in-memory SQLite.
+# YAML fragment for the single-instance fixture. The leading newline+indent is what turns
+# `nso_instances:` into a block sequence; the default " []" keeps it an inline empty list.
+NSO_DEV_INSTANCE = """
+  - name: nso-dev
+    base_url: http://nso-dev:8080
+    username_ref: NSO_USERNAME
+    password_ref: NSO_PASSWORD"""
 
-    Renamed from the per-file ``test_client`` that used to live in
-    ``tests/api/test_api.py``.  Import this fixture by name in every test
-    module that hits the FastAPI app.
-    """
-    cfg_text = f"""
+
+def _write_config(tmp_path, monkeypatch, *, database_url: str, nso_instances: str = " []") -> Path:
+    """Write the app config file and its secret env refs; return the path."""
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        f"""
 secrets:
   provider: local
-nso_instances: []
+nso_instances:{nso_instances}
 netbox:
   base_url: http://netbox.local
   api_token_ref: "NETBOX_TOKEN"
 api:
   adapter_token_ref: "ADAPTER_TOKEN"
-database_url: sqlite+aiosqlite:///{tmp_path}/test.db
+database_url: {database_url}
 """
-    cfg_file = tmp_path / "config.yaml"
-    cfg_file.write_text(cfg_text)
+    )
     monkeypatch.setenv("CONFIG_FILE", str(cfg_file))
     monkeypatch.setenv("ADAPTER_TOKEN", VALID_TOKEN)
     monkeypatch.setenv("NETBOX_TOKEN", "nb-test-token")
+    return cfg_file
+
+
+@pytest.fixture
+async def store_engine(pg_url):
+    """The SOLE owner AND SOLE disposer of nso_adapter.store.db's globals for this test.
+
+    Both adapter_client and db_session depend on this, so the eight tests taking BOTH
+    (tests/core/test_importer.py) get exactly ONE engine. Without it each caller's
+    init_db() would replace the globals: engine A orphaned with live connections
+    (blocking the clone DROP), engine B disposed twice.
+    """
+    from nso_adapter.store import db as store_db
+
+    store_db.init_db(pg_url)
+    engine = store_db.get_engine()
+    try:
+        yield engine
+    finally:
+        await engine.dispose()  # runs AFTER every dependent fixture has closed
+        store_db._engine = None  # no cross-test global bleed
+        store_db._session_factory = None
+
+
+@pytest.fixture
+async def adapter_client(store_engine, pg_url, tmp_path, monkeypatch):
+    """FastAPI test client on a private PostgreSQL clone.
+
+    Renamed from the per-file ``test_client`` that used to live in
+    ``tests/api/test_api.py``.  Import this fixture by name in every test
+    module that hits the FastAPI app.
+
+    ``main.init_db``/``main._dispose_engine`` are patched out because ``store_engine``
+    owns the process globals: SQLAlchemy's ``Pool.dispose`` leaves checked-out
+    connections open, so a lifespan disposal while a sibling ``db_session`` still holds
+    one would orphan that connection into a dead pool and block the clone DROP.
+    ``test_lifespan_binds_the_configured_database`` covers the un-patched path.
+    """
+    _write_config(tmp_path, monkeypatch, database_url=pg_url)
 
     from nso_adapter.config import reset_config
 
@@ -235,6 +281,8 @@ database_url: sqlite+aiosqlite:///{tmp_path}/test.db
     # exercise NetBox paths set their own. Only true side effects (scheduler/workers/SSE) are
     # stubbed so the in-process app doesn't spawn background tasks or open NSO streams.
     with (
+        patch("nso_adapter.main.init_db"),
+        patch("nso_adapter.main._dispose_engine", new=AsyncMock()),
         patch("nso_adapter.main.set_netbox_client"),
         patch("nso_adapter.main.start_scheduler"),
         patch("nso_adapter.main.stop_scheduler"),
@@ -242,39 +290,20 @@ database_url: sqlite+aiosqlite:///{tmp_path}/test.db
         patch("nso_adapter.main.stop_workers", new=AsyncMock()),
         patch("nso_adapter.main.persistent_subscriber", new=AsyncMock()),
     ):
-        # ASGITransport does not call lifespan — run it manually so init_db() fires.
+        # ASGITransport does not call lifespan — run it manually so ensure_store_meta fires.
         async with app.router.lifespan_context(app):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
                 yield client
 
 
 @pytest.fixture
-async def adapter_client_with_nso(tmp_path, monkeypatch):
+async def adapter_client_with_nso(store_engine, pg_url, tmp_path, monkeypatch):
     """Like adapter_client but with one NSO instance ('nso-dev') declared in config.
 
     Required for tests that call onboard_device / rekey_device, which validate
     that the target NSO instance exists in the adapter config.
     """
-    cfg_text = f"""
-secrets:
-  provider: local
-nso_instances:
-  - name: nso-dev
-    base_url: http://nso-dev:8080
-    username_ref: NSO_USERNAME
-    password_ref: NSO_PASSWORD
-netbox:
-  base_url: http://netbox.local
-  api_token_ref: "NETBOX_TOKEN"
-api:
-  adapter_token_ref: "ADAPTER_TOKEN"
-database_url: sqlite+aiosqlite:///{tmp_path}/test.db
-"""
-    cfg_file = tmp_path / "config.yaml"
-    cfg_file.write_text(cfg_text)
-    monkeypatch.setenv("CONFIG_FILE", str(cfg_file))
-    monkeypatch.setenv("ADAPTER_TOKEN", VALID_TOKEN)
-    monkeypatch.setenv("NETBOX_TOKEN", "nb-test-token")
+    _write_config(tmp_path, monkeypatch, database_url=pg_url, nso_instances=NSO_DEV_INSTANCE)
     monkeypatch.setenv("NSO_USERNAME", "admin")
     monkeypatch.setenv("NSO_PASSWORD", "admin")
 
@@ -288,6 +317,8 @@ database_url: sqlite+aiosqlite:///{tmp_path}/test.db
     # background side effects are stubbed. This fixture additionally has one NSO instance, so
     # the lifespan resolves NSO_USERNAME/NSO_PASSWORD and registers a real NsoClient for it.
     with (
+        patch("nso_adapter.main.init_db"),
+        patch("nso_adapter.main._dispose_engine", new=AsyncMock()),
         patch("nso_adapter.main.set_netbox_client"),
         patch("nso_adapter.main.start_scheduler"),
         patch("nso_adapter.main.stop_scheduler"),
@@ -298,6 +329,24 @@ database_url: sqlite+aiosqlite:///{tmp_path}/test.db
         async with app.router.lifespan_context(app):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
                 yield client
+
+
+@pytest.fixture
+async def db_session(store_engine, pg_url, tmp_path, monkeypatch):
+    """AsyncSession on the SHARED engine, with the process globals primed (N7).
+
+    Primes config explicitly rather than inheriting whatever adapter_client ran last —
+    that coupling is why tests/core/test_importer.py could not run solo. Never calls
+    init_db() and never disposes: store_engine owns both.
+    """
+    from nso_adapter.config import reset_config
+    from nso_adapter.store.meta import ensure_store_meta
+
+    _write_config(tmp_path, monkeypatch, database_url=pg_url)
+    reset_config()
+    await ensure_store_meta()
+    async with session() as db:
+        yield db
 
 
 @pytest.fixture
@@ -360,7 +409,7 @@ GOLDEN_BORN_ISO = "2026-06-01T00:00:00Z"
 async def pin_store_incarnation() -> None:
     """Overwrite the test DB's store_meta pair with the fixed golden values and reload
     the process cache (ensure_store_meta always re-reads)."""
-    from datetime import datetime
+    from datetime import UTC, datetime
 
     from sqlalchemy import update
 
@@ -368,7 +417,9 @@ async def pin_store_incarnation() -> None:
     from nso_adapter.store.models import StoreMeta
 
     async with session() as db:
-        await db.execute(update(StoreMeta).values(incarnation=GOLDEN_INCARNATION, born=datetime(2026, 6, 1, 0, 0, 0)))
+        await db.execute(
+            update(StoreMeta).values(incarnation=GOLDEN_INCARNATION, born=datetime(2026, 6, 1, 0, 0, 0, tzinfo=UTC))
+        )
         await db.commit()
     await ensure_store_meta()
 
@@ -422,7 +473,7 @@ async def seed_l2_saps(device_id: int, services: list[dict]):
 
     from nso_adapter.store.models import DeviceL2Sap
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     async with session() as db:
         for svc in services:
             for sap in svc.get("saps", []):
@@ -563,7 +614,7 @@ async def seed_lag_config(
         bundles = []
 
     async with session() as db:
-        now = datetime.now(UTC).replace(tzinfo=None)
+        now = datetime.now(UTC)
         for b in bundles:
             bundle = LagBundleConfig(
                 device_id=device_id,
@@ -597,7 +648,7 @@ async def seed_vlan_database(device_id: int, vlans: list[dict]):
 
     from nso_adapter.store.models import DeviceVlan
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     async with session() as db:
         for v in vlans:
             db.add(
@@ -619,7 +670,7 @@ async def seed_svi(device_id: int, interfaces: list[dict]):
 
     from nso_adapter.store.models import DeviceSvi
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     async with session() as db:
         for i in interfaces:
             db.add(
@@ -646,7 +697,7 @@ async def seed_subinterface(device_id: int, interfaces: list[dict]):
 
     from nso_adapter.store.models import DeviceSubinterface
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     async with session() as db:
         for i in interfaces:
             db.add(
@@ -680,7 +731,7 @@ async def seed_switchport(device_id: int, interfaces: list[dict]):
         DeviceVlan,
     )
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     async with session() as db:
         existing = {
             r.vlan_id: r

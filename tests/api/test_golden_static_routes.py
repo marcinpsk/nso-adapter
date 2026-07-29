@@ -15,7 +15,7 @@ literally so a switch to a raw datetime would be caught.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -30,7 +30,7 @@ from tests.conftest import (
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TS = datetime(2026, 6, 1, 10, 0, 0)
+TS = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
 
 
 async def _seed_pinned_outcome(device_id: int) -> int:

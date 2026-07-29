@@ -35,7 +35,7 @@ async def _seed_ip(
                 vrf=vrf,
                 family=family,
                 secondary=secondary,
-                last_refreshed_at=last_refreshed_at.replace(tzinfo=None),
+                last_refreshed_at=last_refreshed_at,
                 refresh_source=refresh_source,
             )
         )

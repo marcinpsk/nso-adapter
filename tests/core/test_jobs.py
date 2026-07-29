@@ -335,13 +335,13 @@ async def test_sync_now_timeout_leaves_last_sync_pair_untouched(adapter_client):
     """A2 regression (codex R2-F8, red against the pre-move importer.py:824): a job-budget
     cancel mid-fan-out must NOT leave an ADVANCED last_sync_at under the OLD status — the
     operator would see a fresh timestamp, a stale status, and a failed job."""
-    from datetime import datetime
+    from datetime import UTC, datetime
 
     from nso_adapter.core import importer as imp
     from nso_adapter.core.importer import sync_device
     from nso_adapter.store.models import LastSyncStatus
 
-    prior_ts = datetime(2026, 1, 1, 12, 0, 0)
+    prior_ts = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
     async with session() as db:
         d = Device(
             nso_instance="nso-dev",

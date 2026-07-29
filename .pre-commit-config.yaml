@@ -38,6 +38,14 @@ repos:
         language: system
         pass_filenames: false
         files: ^tests/.*\.py$
+      # Companion to ruff's DTZ rules: DTZ polices naive *construction*; this bans the
+      # zone *strip* (.replace(tzinfo=None)) everywhere but the iso_z wire serializer.
+      - id: tz-discipline
+        name: tz-discipline (no .replace(tzinfo=None) outside iso_z)
+        entry: python3 -m tests.tz_discipline
+        language: system
+        pass_filenames: false
+        files: ^(nso_adapter|tests|scripts|alembic)/.*\.py$
 
   # Conventional commit message validation
   - repo: https://github.com/compilerla/conventional-pre-commit

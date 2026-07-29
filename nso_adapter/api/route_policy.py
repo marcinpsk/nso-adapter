@@ -433,7 +433,7 @@ async def put_route_policy_intent(
         # ``o.get("family")`` on a primitive raises an unhandled AttributeError (500).
         raise api_error(422, "invalid_payload", "Each item in 'objects' must be a JSON object")
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     upserted = 0
 
     # Full-replace: drop objects for this device that are absent from the payload

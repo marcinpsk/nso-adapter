@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -36,7 +36,7 @@ async def _seed_full(nso_device_name: str, netbox_id: int):
             nso_value="nso-val",
             netbox_value="nb-val",
             sync_state=SyncState.imported,
-            last_checked_at=datetime(2025, 1, 1, 12, 0, 0),
+            last_checked_at=datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC),
         )
         db.add(attr)
         db.add(ManagedScope(device_id=d.id, attribute="description"))
@@ -89,7 +89,7 @@ async def test_list_interfaces_with_intent(adapter_client):
             interface_id=iface_id,
             attribute="description",
             intent_value="my-intent",
-            accepted_at=datetime(2025, 6, 1, 0, 0, 0),
+            accepted_at=datetime(2025, 6, 1, 0, 0, 0, tzinfo=UTC),
         )
         db.add(intent)
         await db.commit()

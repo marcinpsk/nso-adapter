@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, IntentApplyResult, api_error
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
-from nso_adapter.api.timestamps import iso_z
+from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
@@ -138,7 +138,7 @@ class LoggingHostEntry(BaseModel):
     transport: str = ""
     vrf: str = ""
     source: str = ""
-    accepted_at: datetime | None = None
+    accepted_at: UtcInstant | None = None
 
 
 #: The closed OC severity vocabulary — the reconciler's log-severity-oc enum verbatim.
@@ -151,7 +151,7 @@ class LocalLevelsEntry(BaseModel):
     console_severity: OcSeverity | None = None
     monitor_severity: OcSeverity | None = None
     module_severity: OcSeverity | None = None
-    accepted_at: datetime | None = None
+    accepted_at: UtcInstant | None = None
 
 
 # Scalars the writer emits only when set — `if row.port is not None:` / `if row.severity:` (nso/apply.py). Most are NOT NULL default='' so the clear is '' rather than None — is_cleared() covers both.
@@ -192,7 +192,7 @@ async def _sync_local_levels(
         db.add(existing)
     for f in _LEVEL_FIELDS:
         setattr(existing, f, values[f])
-    existing.accepted_at = entry.accepted_at.replace(tzinfo=None) if entry.accepted_at else now
+    existing.accepted_at = entry.accepted_at if entry.accepted_at else now
     return cleared, 1
 
 
@@ -223,11 +223,11 @@ async def put_logging_intent(device_id: int, body: LoggingIntentUpdate, db: Asyn
         await db.delete(existing_rows[addr])
     await db.flush()
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     count = 0
     cleared = False
     for item in body.hosts:
-        accepted = item.accepted_at.replace(tzinfo=None) if item.accepted_at else now
+        accepted = item.accepted_at if item.accepted_at else now
         row = existing_rows.get(item.address)
         before = {f: getattr(row, f) for f in _STATE_FIELDS} if row is not None else None
         if row is None:

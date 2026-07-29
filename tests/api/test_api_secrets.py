@@ -34,11 +34,14 @@ def _h(value: str) -> str:
 
 
 @pytest.fixture
-async def vault_client(tmp_path, monkeypatch):
+async def vault_client(store_engine, pg_url, tmp_path, monkeypatch):
     """App with a Vault-backed secrets provider (fake hvac) + one NSO instance.
 
     Yields ``(http_client, store, kv)`` where *store* is the fake Vault KV data
     dict ({path: {field: value}}) and *kv* the fake KV v2 recorder.
+
+    Same engine ownership as ``adapter_client``: ``store_engine`` binds and disposes
+    the store globals, so the lifespan's own init/dispose are patched out.
     """
     cfg_text = f"""
 secrets:
@@ -56,7 +59,7 @@ netbox:
   api_token_ref: "NETBOX_TOKEN"
 api:
   adapter_token_ref: "ADAPTER_TOKEN"
-database_url: sqlite+aiosqlite:///{tmp_path}/test.db
+database_url: {pg_url}
 """
     cfg_file = tmp_path / "config.yaml"
     cfg_file.write_text(cfg_text)
@@ -101,6 +104,8 @@ database_url: sqlite+aiosqlite:///{tmp_path}/test.db
     app = create_app()
 
     with (
+        patch("nso_adapter.main.init_db"),
+        patch("nso_adapter.main._dispose_engine", new=AsyncMock()),
         patch("nso_adapter.main.set_netbox_client"),
         patch("nso_adapter.main.start_scheduler"),
         patch("nso_adapter.main.stop_scheduler"),

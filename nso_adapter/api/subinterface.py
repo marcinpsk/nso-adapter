@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, IntentApplyResult, api_error
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
+from nso_adapter.api.timestamps import UtcInstant
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, DeviceSettings, DeviceSubinterface, SubinterfaceIntent
@@ -93,7 +94,7 @@ class SubinterfaceEntry(BaseModel):
     dot1q_vlan: int | None = None
     type: str = "subinterface"
     vrf: str = ""
-    accepted_at: datetime | None = None
+    accepted_at: UtcInstant | None = None
 
 
 # Scalars the writer emits only when set — `if row.vrf:` (nso/apply.py). parent_interface/dot1q_vlan are ALWAYS emitted, so a merge-PATCH does carry those — only vrf is undroppable.
@@ -131,11 +132,11 @@ async def put_subinterface_intent(device_id: int, body: SubinterfaceIntentUpdate
         await db.delete(existing_rows[name])
     await db.flush()
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     count = 0
     cleared = False
     for item in body.interfaces:
-        accepted = item.accepted_at.replace(tzinfo=None) if item.accepted_at else now
+        accepted = item.accepted_at if item.accepted_at else now
         row = existing_rows.get(item.interface_name)
         before = {f: getattr(row, f) for f in _STATE_FIELDS} if row is not None else None
         if row is None:

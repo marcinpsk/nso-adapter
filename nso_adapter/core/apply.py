@@ -1772,7 +1772,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     redist_bgp = [r for r in redist_eligible if r.dest_protocol == "bgp"]
 
     job.context = {"force": force, "intent_snapshot": intent_snapshot, "ip_snapshot": ip_snapshot}
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
 
     # EVERY collection the scope table below can push must be listed here. The IS-IS
     # sub-collections are eligible on their own (a per-level knob accepted on a device

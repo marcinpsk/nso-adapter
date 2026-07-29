@@ -482,18 +482,13 @@ async def test_dispose_engine_noop_when_unset(monkeypatch):
     await _dispose_engine()  # must not raise
 
 
-async def test_dispose_engine_disposes_real_engine(monkeypatch):
+async def test_dispose_engine_disposes_real_engine(monkeypatch, pg_url):
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    engine = create_async_engine("sqlite+aiosqlite://")
+    engine = create_async_engine(pg_url)
     monkeypatch.setattr("nso_adapter.main.get_engine", lambda: engine)
 
     await _dispose_engine()  # real engine, real dispose
-
-
-# --------------------------------------------------------------------------- #
-# _build_netbox_client — ca_cert wiring (s3-28) + _init_database gate (s3-25)
-# --------------------------------------------------------------------------- #
 
 
 @pytest.fixture
@@ -503,6 +498,50 @@ def clean_netbox_registry():
     snapshot = importer._netbox_client
     yield
     importer._netbox_client = snapshot
+
+
+async def test_lifespan_binds_the_configured_database(clean_netbox_registry, pg_url, tmp_path, monkeypatch):
+    """The one un-patched lifespan run — nothing stubbed, not even init_db/_dispose_engine.
+
+    ``adapter_client`` patches both out (``store_engine`` owns the process globals, and
+    a lifespan disposal there would orphan a sibling session's checked-out connection),
+    so this is the only place proving the real lifespan reads ``database_url`` from the
+    config file, binds THAT database, and disposes the engine on exit.
+    """
+    from sqlalchemy.engine import make_url
+
+    from nso_adapter.config import reset_config
+    from nso_adapter.main import create_app
+    from nso_adapter.store import db as store_db
+    from tests.conftest import _write_config
+
+    _write_config(tmp_path, monkeypatch, database_url=pg_url)
+    reset_config()
+
+    app = create_app()
+    try:
+        async with app.router.lifespan_context(app):
+            engine = store_db.get_engine()
+            # Full normalized URL: host, port, driver and credentials all matter for
+            # "did it read the config file" — a bare database-name match would not.
+            assert make_url(engine.url).render_as_string(hide_password=False) == pg_url
+            pool_before = engine.sync_engine.pool
+            async with engine.connect() as conn:
+                bound = (await conn.exec_driver_sql("SELECT current_database()")).scalar()
+            assert bound == make_url(pg_url).database
+
+        # dispose() empties the old pool and swaps in a fresh one — observable without
+        # patching anything, and it fails if the lifespan stops disposing.
+        assert engine.sync_engine.pool is not pool_before
+        assert engine.sync_engine.pool.checkedin() == 0
+    finally:
+        store_db._engine = None
+        store_db._session_factory = None
+
+
+# --------------------------------------------------------------------------- #
+# _build_netbox_client — ca_cert wiring (s3-28) + _init_database gate (s3-25)
+# --------------------------------------------------------------------------- #
 
 
 def _netbox_cfg(ca_cert):

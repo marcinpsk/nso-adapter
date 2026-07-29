@@ -15,7 +15,7 @@ name to the codec-unrepresentable community members for the device's NED.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -130,8 +130,8 @@ async def test_route_policy_intent_put_preserves_structured_apply_error(adapter_
                 family="route_map",
                 name="RM-FAIL",
                 entries=entries,
-                accepted_at=datetime(2026, 6, 1, 10, 0, 0),
-                last_apply_at=datetime(2026, 6, 1, 10, 0, 0),
+                accepted_at=datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC),
+                last_apply_at=datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC),
                 last_apply_error=apply_error,
             )
         )

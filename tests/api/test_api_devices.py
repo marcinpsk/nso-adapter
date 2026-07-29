@@ -28,7 +28,7 @@ async def test_get_device_includes_failover_block(adapter_client):
                 oob_healthy=None,
                 oob_health_result="timeout",
                 oob_health_detail="cold connect exceeded probe window",
-                last_switch_at=datetime.now(UTC).replace(tzinfo=None),
+                last_switch_at=datetime.now(UTC),
             )
         )
         await db.commit()

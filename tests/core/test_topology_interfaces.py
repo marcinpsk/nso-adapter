@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 from nso_adapter.bindings.netbox.client import NetboxClient
 from tests.conftest import seed_device, session
 
-TS = datetime(2026, 6, 2, 12, 0, 0, tzinfo=UTC).replace(tzinfo=None)
+TS = datetime(2026, 6, 2, 12, 0, 0, tzinfo=UTC)
 
 
 def _nb_client():

@@ -126,7 +126,7 @@ async def test_requeue_orphaned_leaves_live_heartbeating_job(adapter_client):
     sync_id = await _seed_job(device_id, JobType.sync, JobStatus.running)
     apply_device = await _seed_device("wrk-live-apply", 721)
     apply_id = await _seed_job(apply_device, JobType.apply, JobStatus.running)
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     await _set_heartbeat(sync_id, now)
     await _set_heartbeat(apply_id, now)
 
@@ -146,7 +146,7 @@ async def test_requeue_orphaned_recovers_stale_heartbeat(adapter_client):
     sync_id = await _seed_job(device_id, JobType.sync, JobStatus.running)
     apply_device = await _seed_device("wrk-stale-apply", 723)
     apply_id = await _seed_job(apply_device, JobType.apply, JobStatus.running)
-    stale = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=300)
+    stale = datetime.now(UTC) - timedelta(seconds=300)
     await _set_heartbeat(sync_id, stale)
     await _set_heartbeat(apply_id, stale)
 
@@ -176,7 +176,7 @@ async def test_periodic_reap_recovers_stale_orphan_but_spares_live(adapter_clien
     apply_device = await _seed_device("reap-stale-apply", 742)
     apply_id = await _seed_job(apply_device, JobType.apply, JobStatus.running)
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     await _set_heartbeat(live_id, now)  # fresh heartbeat → a live worker owns it
     await _set_heartbeat(stale_id, now - timedelta(seconds=300))  # stale → orphaned
     await _set_heartbeat(apply_id, now - timedelta(seconds=300))

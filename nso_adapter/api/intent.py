@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
-from nso_adapter.api.timestamps import iso_z
+from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.store.models import (
     DbInterface,
     Device,
@@ -38,7 +38,7 @@ class IntentAttribute(BaseModel):
     interface: str
     attribute: str
     intent_value: str | bool | None
-    accepted_at: datetime | None = None
+    accepted_at: UtcInstant | None = None
 
 
 class IntentUpdate(BaseModel):
@@ -138,7 +138,7 @@ async def put_intent(device_id: int, body: IntentUpdate, db: AsyncSession = Depe
         await db.delete(row)
     await db.flush()
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     count = 0
     for item in body.attributes:
         iface = ifaces.get(item.interface)
@@ -159,7 +159,7 @@ async def put_intent(device_id: int, body: IntentUpdate, db: AsyncSession = Depe
             interface_id=iface.id,
             attribute=item.attribute,
             intent_value=value,
-            accepted_at=item.accepted_at.replace(tzinfo=None) if item.accepted_at else now,
+            accepted_at=item.accepted_at if item.accepted_at else now,
         )
         db.add(row)
         count += 1
@@ -225,7 +225,7 @@ async def get_intent(device_id: int, db: AsyncSession = Depends(get_db)):
             if iface is not None:
                 rows.append(_intent_row_out(row, iface.name))
 
-    updated_at = datetime.now(UTC).replace(tzinfo=None)
+    updated_at = datetime.now(UTC)
     return {
         "device_id": device_id,
         "attributes": rows,

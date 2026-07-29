@@ -218,7 +218,7 @@ async def test_upsert_new_oob_rearms_probe_schedule(adapter_client):
     hours of accumulated deferral (sw03: next_oob_probe_at ~7h out while the operator
     added the OOB precisely to restore reachability NOW). The old address's health
     verdict is stale for the new one → reset. The primary schedule is untouched."""
-    from datetime import datetime
+    from datetime import UTC, datetime
 
     from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
 
@@ -227,7 +227,7 @@ async def test_upsert_new_oob_rearms_probe_schedule(adapter_client):
         db.add(dev)
         await db.flush()
         fo = await set_initial_failover_state(db, dev.id, "10.0.0.1", None, ActiveAddress.primary.value)
-        far = datetime(2099, 1, 1)
+        far = datetime(2099, 1, 1, tzinfo=UTC)
         fo.next_oob_probe_at = far
         fo.next_primary_probe_at = far
         fo.oob_healthy = True  # stale claim (about no/old OOB)
@@ -245,7 +245,7 @@ async def test_upsert_new_oob_rearms_probe_schedule(adapter_client):
 
 
 async def test_upsert_new_primary_rearms_primary_probe_only(adapter_client):
-    from datetime import datetime
+    from datetime import UTC, datetime
 
     from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
 
@@ -254,7 +254,7 @@ async def test_upsert_new_primary_rearms_primary_probe_only(adapter_client):
         db.add(dev)
         await db.flush()
         fo = await set_initial_failover_state(db, dev.id, "10.0.0.1", "192.0.2.5", ActiveAddress.primary.value)
-        far = datetime(2099, 1, 1)
+        far = datetime(2099, 1, 1, tzinfo=UTC)
         fo.next_oob_probe_at = far
         fo.next_primary_probe_at = far
         await db.commit()
@@ -308,9 +308,9 @@ async def _load(device_id: int) -> DeviceFailover:
 
 async def _arm(device_id: int, *, primary_due: bool = True, oob_due: bool = False) -> None:
     """Set each address's due-time precisely (None = due now, far-future = not due)."""
-    from datetime import datetime
+    from datetime import UTC, datetime
 
-    far = datetime(2030, 1, 1)
+    far = datetime(2030, 1, 1, tzinfo=UTC)
     async with session() as db:
         row = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device_id))).scalar_one()
         row.next_primary_probe_at = None if primary_due else far

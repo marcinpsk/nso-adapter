@@ -47,7 +47,7 @@ EXPECTED_ATTR_KEYS = {
 async def _seed_iface_with_intent(device_id: int):
     """Seed an interface whose description attr has BOTH a state and an intent row,
     so every attr key (including last_apply_at / last_apply_error) is exercised."""
-    from datetime import datetime
+    from datetime import UTC, datetime
 
     async with session() as db:
         iface = DbInterface(device_id=device_id, name="GE0/0", netbox_interface_id=1000)
@@ -67,7 +67,7 @@ async def _seed_iface_with_intent(device_id: int):
                 interface_id=iface.id,
                 attribute="description",
                 intent_value="uplink",
-                last_apply_at=datetime(2026, 5, 20, 10, 0, 0),
+                last_apply_at=datetime(2026, 5, 20, 10, 0, 0, tzinfo=UTC),
                 last_apply_error={"code": "nso_error", "message": "boom"},
             )
         )

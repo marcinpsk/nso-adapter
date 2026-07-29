@@ -11,7 +11,7 @@ Mirror (consumer side): ``netbox-nso-plugin/.../tests/test_contract_static_route
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -29,7 +29,7 @@ async def test_static_routes_contract(adapter_client):
     from nso_adapter.store.models import DeviceStaticRoute
 
     device_id = await seed_device(nso_device_name="sr-ct", netbox_device_id=7970)
-    ts = datetime(2026, 6, 1, 10, 0, 0)
+    ts = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
     async with session() as db:
         # Maximal route (every optional) + minimal route (only required).
         db.add(

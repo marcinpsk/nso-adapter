@@ -13,7 +13,7 @@ the ``*_KEYS`` sets MUST stay identical across both files.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -29,7 +29,7 @@ OPTIONAL_ENTRY_KEYS = {"route_map", "metric", "metric_type"}
 async def _seed_redistribution(device_id: int, entries: list[dict]) -> None:
     from nso_adapter.store.models import DeviceRedistribution
 
-    ts = datetime(2026, 6, 1, 10, 0, 0)
+    ts = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
     async with session() as db:
         for entry in entries:
             db.add(

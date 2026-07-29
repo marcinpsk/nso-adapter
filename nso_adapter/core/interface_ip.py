@@ -32,7 +32,7 @@ async def _upsert_ip_addresses(
     """Full-replace: delete existing rows for *device*, then insert fresh ones."""
     await db.execute(delete(InterfaceIpAddress).where(InterfaceIpAddress.device_id == device.id))
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     for iface in interfaces_data:
         iface_name = iface.get("interface-name", "")
         bound_port = iface.get("bound-port") or None  # None for non-Nokia or unbound

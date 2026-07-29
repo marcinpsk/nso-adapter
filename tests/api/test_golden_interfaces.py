@@ -12,7 +12,7 @@ pins both so response-model typing cannot drop a key or reshape the attr map.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -20,7 +20,7 @@ from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TS = datetime(2026, 5, 20, 10, 0, 0)
+TS = datetime(2026, 5, 20, 10, 0, 0, tzinfo=UTC)
 
 
 async def _seed_iface_full(device_id: int) -> None:

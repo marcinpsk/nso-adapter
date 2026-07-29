@@ -12,7 +12,7 @@ Mirror (consumer side): ``netbox-nso-plugin/.../tests/test_contract_ospf.py`` â€
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -30,7 +30,7 @@ OPTIONAL_IFACE_KEYS = {"process_id", "area_id", "priority", "cost", "network_typ
 async def _seed_ospf(device_id: int) -> None:
     from nso_adapter.store.models import DeviceOspfInstance, DeviceOspfInterface
 
-    ts = datetime(2026, 6, 1, 10, 0, 0)
+    ts = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
     async with session() as db:
         # Maximal instance (router_id set) + minimal instance (omitted).
         db.add(
@@ -139,7 +139,7 @@ async def test_ospf_instance_enabled_emitted_when_set(adapter_client):
                 vrf="",
                 areas=[],
                 enabled=False,  # explicit admin-state down â†’ must appear (not omitted)
-                last_refreshed_at=datetime(2026, 6, 1, 10, 0, 0),
+                last_refreshed_at=datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC),
                 refresh_source="poll",
             )
         )

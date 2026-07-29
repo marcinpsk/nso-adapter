@@ -211,7 +211,7 @@ async def _upsert_bgp_data(
     """Full-replace: delete existing BGP rows for *device*, then insert fresh ones."""
     await db.execute(delete(DeviceBgpRouter).where(DeviceBgpRouter.device_id == device.id))
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
 
     for router_data in routers:
         asn = str(router_data.get("asn", ""))

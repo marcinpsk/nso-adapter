@@ -9,7 +9,7 @@ metric/metric_type) are OMITTED when unset. ``last_refreshed_at`` goes through
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -38,7 +38,7 @@ _SYNTH_READ_STATE = {
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TS = datetime(2026, 6, 1, 10, 0, 0)
+TS = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
 
 
 async def _seed_redistribution(device_id: int) -> None:

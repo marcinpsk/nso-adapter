@@ -11,19 +11,19 @@ tzinfo on reload, so both pass there for the wrong reason):
   (``/interfaces-doc``: read_state + the interface intent's ``last_apply_at``)
   is ``"<iso>Z"``. Guards the ``iso_z`` routing: a raw ``.isoformat() + "Z"`` on a
   tz-aware value emits ``"...+00:00Z"``, which every plugin consumer rejects.
+* inbound interpretation — a request-model datetime is read as UTC whether or not the
+  plugin sent a zone. A naive value bound to ``timestamptz`` is shifted by the PROCESS
+  zone, so the same instant comes back hours off.
 """
 
 from __future__ import annotations
 
 import re
 import time
-from datetime import UTC, datetime
-from unittest.mock import AsyncMock, patch
+from datetime import UTC, datetime, timedelta
 
 import pytest
-from httpx import ASGITransport, AsyncClient
 
-from nso_adapter.main import create_app
 from tests.conftest import VALID_TOKEN, seed_device, session
 
 _AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -43,64 +43,7 @@ def non_utc_process_tz(monkeypatch):
     time.tzset()
 
 
-@pytest.fixture
-async def pg_store(pg_url):
-    """Bind the store globals to a private PostgreSQL database (schema from the template)."""
-    from nso_adapter.store import db as store_db
-
-    store_db.init_db(pg_url)
-    try:
-        yield pg_url
-    finally:
-        await store_db.get_engine().dispose()
-        store_db._engine = None
-        store_db._session_factory = None
-
-
-@pytest.fixture
-async def pg_adapter_client(pg_url, tmp_path, monkeypatch):
-    """``adapter_client`` on PostgreSQL. Phase 3 makes this the only kind; until then the
-    tz-aware wire shape cannot be observed through the sqlite-backed shared fixture."""
-    cfg_file = tmp_path / "config.yaml"
-    cfg_file.write_text(
-        "secrets:\n"
-        "  provider: local\n"
-        "nso_instances: []\n"
-        "netbox:\n"
-        "  base_url: http://netbox.local\n"
-        '  api_token_ref: "NETBOX_TOKEN"\n'
-        "api:\n"
-        '  adapter_token_ref: "ADAPTER_TOKEN"\n'
-        f"database_url: {pg_url}\n"
-    )
-    monkeypatch.setenv("CONFIG_FILE", str(cfg_file))
-    monkeypatch.setenv("ADAPTER_TOKEN", VALID_TOKEN)
-    monkeypatch.setenv("NETBOX_TOKEN", "nb-test-token")
-
-    from nso_adapter.config import reset_config
-    from nso_adapter.store import db as store_db
-
-    reset_config()
-    app = create_app()
-    try:
-        with (
-            patch("nso_adapter.main.set_netbox_client"),
-            patch("nso_adapter.main.start_scheduler"),
-            patch("nso_adapter.main.stop_scheduler"),
-            patch("nso_adapter.main.start_workers", new=AsyncMock()),
-            patch("nso_adapter.main.stop_workers", new=AsyncMock()),
-            patch("nso_adapter.main.persistent_subscriber", new=AsyncMock()),
-        ):
-            async with app.router.lifespan_context(app):
-                async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-                    yield client
-    finally:
-        store_db._engine = None
-        store_db._session_factory = None
-        reset_config()
-
-
-async def test_normalized_columns_round_trip_an_aware_instant(pg_store, non_utc_process_tz):
+async def test_normalized_columns_round_trip_an_aware_instant(store_engine, non_utc_process_tz):
     """Write aware -> reload -> same instant, on two normalized columns."""
     from nso_adapter.store.models import Device, Job, JobStatus, JobType
 
@@ -139,7 +82,7 @@ def _timestamps(node, path=""):
             yield from _timestamps(value, f"{path}[{index}]")
 
 
-async def test_family_get_serializes_every_timestamp_as_iso_z(pg_adapter_client, non_utc_process_tz):
+async def test_family_get_serializes_every_timestamp_as_iso_z(adapter_client, non_utc_process_tz):
     from nso_adapter.nso.read_outcome import Freshness, Present
     from nso_adapter.store import outcome_store
     from nso_adapter.store.models import DbInterface, InterfaceAttrState, InterfaceIntent, SyncState
@@ -176,7 +119,7 @@ async def test_family_get_serializes_every_timestamp_as_iso_z(pg_adapter_client,
         )
         await outcome_store.record_result(db, attempt_id, result="replaced", succeeded=True, row_count=1)
 
-    resp = await pg_adapter_client.get(f"/api/v1/devices/{device_id}/interfaces-doc", headers=_AUTH)
+    resp = await adapter_client.get(f"/api/v1/devices/{device_id}/interfaces-doc", headers=_AUTH)
     assert resp.status_code == 200, resp.text
 
     found = dict(_timestamps(resp.json()))
@@ -188,3 +131,57 @@ async def test_family_get_serializes_every_timestamp_as_iso_z(pg_adapter_client,
     for path, value in found.items():
         assert value is not None, f"{path} is null — the test would prove nothing"
         assert _ISO_Z.match(value), f"{path} is not '<iso>Z': {value!r}"
+
+
+# ── the INBOUND boundary: every request-model datetime is interpreted as UTC ──────────
+
+_RO_COMMUNITY = {"label": "ro1", "vault_ref": "snmp/ro#community", "access": "RO"}
+
+
+def test_inbound_naive_datetime_is_interpreted_as_utc():
+    """A plugin that omits the zone means UTC — never the adapter process's local zone."""
+    from nso_adapter.api.snmp import SnmpCommunityEntry
+
+    entry = SnmpCommunityEntry.model_validate({**_RO_COMMUNITY, "accepted_at": "2026-06-01T12:00:00"})
+    assert entry.accepted_at == _WRITTEN.replace(hour=12)
+    assert entry.accepted_at.utcoffset() == timedelta(0)
+
+
+def test_inbound_offset_datetime_is_normalized_to_utc():
+    """An offset-carrying value keeps its INSTANT and is canonicalized to UTC.
+
+    The instant alone is not enough: aware==aware compares instants, so a stored
+    ``14:00+02:00`` would satisfy an equality-only assertion while still handing the
+    store a non-UTC clock domain. Pin the offset too."""
+    from nso_adapter.api.snmp import SnmpCommunityEntry
+
+    entry = SnmpCommunityEntry.model_validate({**_RO_COMMUNITY, "accepted_at": "2026-06-01T14:00:00+02:00"})
+    assert entry.accepted_at == _WRITTEN.replace(hour=12)
+    assert entry.accepted_at.utcoffset() == timedelta(0)
+
+
+async def test_intent_put_with_a_zoneless_accepted_at_round_trips_the_same_instant(adapter_client, non_utc_process_tz):
+    """END-TO-END: PUT a zone-less accepted_at, GET the SAME instant back in "<iso>Z".
+
+    Un-normalized, the naive value reaches asyncpg and binds to ``timestamptz`` shifted by
+    the process zone (America/New_York here), so the wire value returns hours off."""
+    device_id = await seed_device(nso_device_name="ts-inbound", netbox_device_id=9702)
+
+    put = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/intent",
+        json={
+            "attributes": [
+                {
+                    "interface": "ge-0/0/1",
+                    "attribute": "description",
+                    "intent_value": "peering",
+                    "accepted_at": "2026-06-01T12:00:00",
+                }
+            ]
+        },
+        headers=_AUTH,
+    )
+    assert put.status_code == 200, put.text
+
+    body = (await adapter_client.get(f"/api/v1/devices/{device_id}/intent", headers=_AUTH)).json()
+    assert [a["accepted_at"] for a in body["attributes"]] == ["2026-06-01T12:00:00Z"]

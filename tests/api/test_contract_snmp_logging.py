@@ -43,12 +43,12 @@ LOGGING_HOST_OPTIONAL_KEYS = {"port", "severity", "facility", "transport", "vrf"
 
 @pytest.mark.anyio
 async def test_snmp_config_contract(adapter_client):
-    from datetime import datetime
+    from datetime import UTC, datetime
 
     from nso_adapter.store.models import SnmpCommunity, SnmpHost, SnmpSystemInfo, SnmpV3User
 
     device_id = await seed_device(nso_device_name="snmp-ct", netbox_device_id=7960)
-    ts = datetime(2026, 6, 1, 10, 0, 0)
+    ts = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
     async with session() as db:
         db.add(
             SnmpCommunity(
@@ -98,12 +98,12 @@ async def test_snmp_config_contract(adapter_client):
 
 @pytest.mark.anyio
 async def test_logging_config_contract(adapter_client):
-    from datetime import datetime
+    from datetime import UTC, datetime
 
     from nso_adapter.store.models import DeviceLoggingHost
 
     device_id = await seed_device(nso_device_name="log-ct", netbox_device_id=7961)
-    ts = datetime(2026, 6, 1, 10, 0, 0)
+    ts = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
     async with session() as db:
         # Maximal host (every optional) + minimal host (only address).
         db.add(

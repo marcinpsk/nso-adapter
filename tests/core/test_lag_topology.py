@@ -100,7 +100,7 @@ async def test_refresh_lag_topology_clears_on_authoritative_empty(adapter_client
                 device_id=device.id,
                 name="Port-channel1",
                 lag_id=1,
-                last_refreshed_at=datetime.now(UTC).replace(tzinfo=None),
+                last_refreshed_at=datetime.now(UTC),
                 refresh_source="poll",
             )
         )

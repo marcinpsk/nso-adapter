@@ -140,8 +140,8 @@ class FlipBudget:
 
 
 def _utcnow() -> datetime:
-    """Naive-UTC now — the DeviceFailover DateTime columns are timezone-naive."""
-    return datetime.now(UTC).replace(tzinfo=None)
+    """Aware-UTC now — every DeviceFailover DateTime column is timestamptz."""
+    return datetime.now(UTC)
 
 
 # ── Pure hysteresis primitives (no I/O — fully unit-testable) ─────────────────

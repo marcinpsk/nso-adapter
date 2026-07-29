@@ -47,7 +47,7 @@ import os
 import statistics
 import tempfile
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -90,7 +90,7 @@ async def seed_interfaces() -> int:
         SyncState,
     )
 
-    ts = datetime(2026, 5, 20, 10, 0, 0)
+    ts = datetime(2026, 5, 20, 10, 0, 0, tzinfo=UTC)
     attr_names = ["description", "mtu", "admin_state", "ipv4", "ipv6", "vrf", "speed", "duplex"][:ATTRS_PER]
     async for db in get_session():
         d = Device(nso_instance="nso-dev", nso_device_name="bench-if", netbox_device_id=1)
@@ -159,7 +159,7 @@ async def seed_route_policy() -> int:
         ManagedScope,
     )
 
-    ts = datetime(2026, 6, 1, 10, 0, 0)
+    ts = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
     async for db in get_session():
         d = Device(nso_instance="nso-dev", nso_device_name="bench-rp", netbox_device_id=2)
         db.add(d)

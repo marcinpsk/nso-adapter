@@ -11,7 +11,7 @@ one test that asserts the on-device revert is attempted.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import pytest
@@ -224,7 +224,7 @@ async def test_put_explicit_accepted_at_is_preserved(adapter_client):
     assert resp.status_code == 200
 
     comms, *_ = await _read_intent(device_id)
-    assert comms[0].accepted_at == datetime(2026, 6, 1, 12, 0, 0)  # stored naive, tz stripped
+    assert comms[0].accepted_at == datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)  # the wire 'Z' is kept as UTC
 
 
 # ── full-replace semantics ───────────────────────────────────────────────────

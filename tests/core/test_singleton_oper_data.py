@@ -383,12 +383,12 @@ async def test_ospf_singleton_bare_objects(adapter_client):
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "instance": {
-                "process-id": 1,
+                "process-id": "1",
                 "router-id": "1.1.1.1",
                 "vrf": "",
                 "area": {"area-id": "0.0.0.0"},
             },
-            "interface": {"interface-name": "GigabitEthernet0/0", "process-id": 1, "area-id": "0.0.0.0"},
+            "interface": {"interface-name": "GigabitEthernet0/0", "process-id": "1", "area-id": "0.0.0.0"},
         }
 
         ok = await refresh_ospf_for_device(db, device, nso_client, refresh_source="poll")

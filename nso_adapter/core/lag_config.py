@@ -31,7 +31,7 @@ async def _upsert_lag_configs(
         await db.execute(delete(LagMemberConfig).where(LagMemberConfig.lag_bundle_id.in_(bundle_ids)))
     await db.execute(delete(LagBundleConfig).where(LagBundleConfig.device_id == device.id))
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     for bundle in bundles_data:
         # name + lag-id are the NOT-NULL identity; a bundle missing either (or a non-numeric
         # lag-id) is malformed — skip it rather than KeyError/ValueError-abort the upsert

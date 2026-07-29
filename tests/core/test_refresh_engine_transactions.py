@@ -86,11 +86,13 @@ async def test_engine_publishes_mirror_and_phase_two_in_one_commit(
                 )
             )
 
+    # A REGISTERED family: acquire_family_fence rejects an unknown name outright, and the
+    # probe's materializer writes DeviceStaticRoute rows, so static_route is the honest one.
     spec = FamilySpec(
-        name="transaction_probe",
+        name="static_route",
         extract=lambda data: data.get("route", []),
         materialize=_stage_routes,
-        wire_name="transaction-probe",
+        wire_name="static-route",
     )
     real_stage_result = outcome_store.stage_result
     visible_during_phase_two: list[list[str]] = []

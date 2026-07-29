@@ -18,7 +18,7 @@ async def _seed_mtu(device_id: int, rows: list[dict]) -> None:
     from nso_adapter.store.models import DeviceInterfaceMtu
 
     async with session() as db:
-        now = datetime.now(UTC).replace(tzinfo=None)
+        now = datetime.now(UTC)
         for r in rows:
             db.add(DeviceInterfaceMtu(device_id=device_id, last_refreshed_at=now, refresh_source="test", **r))
         await db.commit()

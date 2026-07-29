@@ -12,6 +12,7 @@ the cached accessor serving the persisted values.
 from __future__ import annotations
 
 import uuid as uuid_mod
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import select
@@ -31,9 +32,9 @@ async def test_store_meta_row_created_on_startup(adapter_client):
         row = rows[0]
         assert row.id == 1
         uuid_mod.UUID(row.incarnation)  # parses as a UUID or raises
-        # sqlite returns naive datetimes for DateTime(timezone=True) (UTC by convention,
-        # like every other tz column in this store); PG serves tz-aware. Assert presence only.
         assert row.born is not None
+        assert row.born.tzinfo is not None  # every store timestamp is timestamptz
+        assert row.born.utcoffset() == timedelta(0)  # ...and the store's clock domain is UTC
 
 
 @pytest.mark.anyio

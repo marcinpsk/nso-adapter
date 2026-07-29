@@ -19,7 +19,7 @@ Mirror (consumer side): ``netbox-nso-plugin/.../tests/test_contract_isis.py`` â€
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -134,7 +134,7 @@ SRV6_LOCATOR_KEYS = {
 async def _seed_isis(device_id: int) -> None:
     from nso_adapter.store.models import DeviceIsisInterface, DeviceIsisProcess
 
-    ts = datetime(2026, 6, 1, 10, 0, 0)
+    ts = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
     # Nested bags are stored hyphenated (as the extractor writes them); the adapter
     # _snake()s them on output â†’ the snake_case keys the plugin consumes.
     instance_level = {

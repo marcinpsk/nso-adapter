@@ -28,7 +28,7 @@ async def _seed_snmp(
     """Seed SNMP rows for a device."""
     from nso_adapter.store.models import SnmpCommunity, SnmpHost, SnmpSystemInfo, SnmpV3User
 
-    ts = last_refreshed_at.replace(tzinfo=None)
+    ts = last_refreshed_at
     async with session() as db:
         for comm in communities or []:
             db.add(

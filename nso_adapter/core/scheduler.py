@@ -222,7 +222,7 @@ async def _scheduled_intent_reconcile() -> None:
                     await db.delete(row)
                 await db.flush()
 
-                now = datetime.now(UTC).replace(tzinfo=None)
+                now = datetime.now(UTC)
                 count = 0
                 for rec in records:
                     iface = iface_by_name.get(rec.interface_name)
@@ -505,10 +505,10 @@ async def _scheduled_topology_interfaces_refresh() -> None:
 _FAILOVER_JITTER_FRACTION = 0.15
 
 
-def _utcnow_naive():
+def _utcnow_aware():
     from datetime import UTC, datetime
 
-    return datetime.now(UTC).replace(tzinfo=None)
+    return datetime.now(UTC)
 
 
 async def _due_failover_device_ids(db, now) -> list[int]:
@@ -606,7 +606,7 @@ async def _scheduled_failover_probe() -> None:
     from nso_adapter.store.db import get_session
 
     cfg = get_config().scheduler
-    now = _utcnow_naive()
+    now = _utcnow_aware()
     eff = None
     due_ids: list[int] = []
     async for db in get_session():

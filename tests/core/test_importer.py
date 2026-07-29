@@ -7,16 +7,13 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 import pytest
-import pytest_asyncio
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.core.importer import _attrs_to_interface_list, sync_device
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import (
-    Base,
     DbInterface,
     Device,
     InterfaceAttrState,
@@ -45,17 +42,6 @@ _ALL_PROJECTED_WIRES = (
     "switchport",
     "interface-attributes",
 )
-
-
-@pytest_asyncio.fixture
-async def db_session():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with async_session() as session:
-        yield session
-    await engine.dispose()
 
 
 def _make_nso_client(iface_entry=None, sections=None):

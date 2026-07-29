@@ -20,7 +20,7 @@ os.environ["NSO_ADAPTER_ATOMIC_APPLY"] = "1"  # force the atomic path for this r
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 
@@ -93,7 +93,7 @@ async def main() -> None:
                     parent_interface="ae99",
                     dot1q_vlan=999,
                     sub_type="subinterface",
-                    accepted_at=datetime.utcnow(),
+                    accepted_at=datetime.now(UTC),
                 )
             )
             db.add(
@@ -102,7 +102,7 @@ async def main() -> None:
                     address="198.18.1.1/24",
                     family="ipv4",
                     secondary=False,
-                    accepted_at=datetime.utcnow(),
+                    accepted_at=datetime.now(UTC),
                 )
             )
             job = Job(job_type=JobType.apply, device_id=dev.id, status=JobStatus.queued)

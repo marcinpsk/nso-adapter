@@ -147,7 +147,7 @@ async def test_refresh_keeps_rows_on_none_404(adapter_client):
                 vrf="",
                 family="ipv4",
                 secondary=False,
-                last_refreshed_at=datetime.now(UTC).replace(tzinfo=None),
+                last_refreshed_at=datetime.now(UTC),
                 refresh_source="poll",
             )
         )
@@ -183,7 +183,7 @@ async def test_refresh_wipes_on_present_empty(adapter_client):
                 vrf="",
                 family="ipv4",
                 secondary=False,
-                last_refreshed_at=datetime.now(UTC).replace(tzinfo=None),
+                last_refreshed_at=datetime.now(UTC),
                 refresh_source="poll",
             )
         )
@@ -218,7 +218,7 @@ async def test_refresh_transport_error_leaves_existing_rows(adapter_client):
                 vrf="",
                 family="ipv4",
                 secondary=False,
-                last_refreshed_at=datetime.now(UTC).replace(tzinfo=None),
+                last_refreshed_at=datetime.now(UTC),
                 refresh_source="poll",
             )
         )

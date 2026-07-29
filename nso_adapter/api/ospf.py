@@ -358,7 +358,7 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
     if not device:
         raise api_error(404, "not_found", "Device not found")
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
 
     removed_inst, inst_cleared = await _sync_keyed_intent(
         db,

@@ -182,32 +182,31 @@ _FAMILY_GET_PATHS = {
 
 
 @pytest.mark.anyio
-async def test_family_get_serves_snapshot_across_midrequest_commit(adapter_client, tmp_path):
+async def test_family_get_serves_snapshot_across_midrequest_commit(adapter_client):
     """END-TO-END (SA-3): a REAL static-routes GET whose mirror-rows SELECT races a commit.
 
-    A before_cursor_execute hook fires a SYNC sqlite writer (WAL) the moment the handler's
-    device_static_route SELECT begins — i.e. AFTER the snapshot opened and the pointer was
-    read. The response must serve the pre-commit row set; without get_read_db the second
-    row leaks in (sqlite legacy mode has no read transaction — the checked-in control)."""
-    import sqlite3
-
+    A before_cursor_execute hook fires a SYNC psycopg2 writer on a SECOND connection the
+    moment the handler's device_static_route SELECT begins — i.e. AFTER the snapshot opened
+    and the pointer was read. The response must serve the pre-commit row set; without
+    get_read_db the READ COMMITTED session would let the second row leak in."""
+    import sqlalchemy as sa
     from sqlalchemy import event
+    from sqlalchemy.engine import make_url
 
     from nso_adapter.store.db import get_engine
     from tests.conftest import VALID_TOKEN, seed_device
 
     auth = {"Authorization": f"Bearer {VALID_TOKEN}"}
     device_id = await seed_device(nso_device_name="tear-e2e", netbox_device_id=8951)
-    db_path = None
     engine = get_engine()
-    db_path = engine.url.database
-    # WAL so the mid-request writer can commit while the request's read txn is open.
-    sync = sqlite3.connect(db_path, timeout=5)
-    sync.execute("PRAGMA journal_mode=WAL")
-    sync.commit()
+    writer = sa.create_engine(
+        make_url(engine.url).set(drivername="postgresql+psycopg2").render_as_string(hide_password=False),
+        isolation_level="AUTOCOMMIT",
+        poolclass=sa.pool.NullPool,
+    )
 
     async with store_session() as db:
-        from datetime import datetime
+        from datetime import UTC, datetime
 
         from nso_adapter.store.models import DeviceStaticRoute
 
@@ -217,7 +216,7 @@ async def test_family_get_serves_snapshot_across_midrequest_commit(adapter_clien
                 vrf="",
                 prefix="10.0.0.0/8",
                 next_hop="192.0.2.1",
-                last_refreshed_at=datetime(2026, 6, 1, 10, 0, 0),
+                last_refreshed_at=datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC),
                 refresh_source="poll",
             )
         )
@@ -228,20 +227,20 @@ async def test_family_get_serves_snapshot_across_midrequest_commit(adapter_clien
     def _mid_request_write(conn, cursor, statement, parameters, context, executemany):
         if "device_static_route" in statement and statement.lstrip().upper().startswith("SELECT") and not fired:
             fired.append(statement)
-            sync.execute(
-                "INSERT INTO device_static_route "
-                "(device_id, vrf, prefix, next_hop, last_refreshed_at, refresh_source) "
-                "VALUES (?, '', '172.16.0.0/12', '192.0.2.9', '2026-06-01 10:00:00', 'poll')",
-                (device_id,),
-            )
-            sync.commit()
+            with writer.connect() as wconn:
+                wconn.exec_driver_sql(
+                    "INSERT INTO device_static_route "
+                    "(device_id, vrf, prefix, next_hop, last_refreshed_at, refresh_source) "
+                    "VALUES (%s, '', '172.16.0.0/12', '192.0.2.9', '2026-06-01 10:00:00+00', 'poll')",
+                    (device_id,),
+                )
 
     event.listen(engine.sync_engine, "before_cursor_execute", _mid_request_write)
     try:
         resp = await adapter_client.get(f"/api/v1/devices/{device_id}/static-routes", headers=auth)
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", _mid_request_write)
-        sync.close()
+        writer.dispose()
 
     assert resp.status_code == 200
     assert fired, "the hook must have observed the mirror-rows SELECT"
