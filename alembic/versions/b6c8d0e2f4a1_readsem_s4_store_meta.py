@@ -5,9 +5,8 @@
 One row, ``id == 1``: the ``(incarnation, born)`` pair minted when this database was
 first initialised. Rides every S4 ``read_state`` block as the plugin's adoption/reset
 signal (attempt ids restart after a rebuild and numeric device ids can be reissued, so
-neither can carry reset semantics). The migration also INSERTS the row so a migrated
-PostgreSQL store is born here; the sqlite/create_all path backfills via
-``ensure_store_meta()`` at startup.
+neither can carry reset semantics). The migration also INSERTS the row, so the store is
+born here and ``ensure_store_meta()`` takes its idempotent read path at startup.
 
 Revision ID: b6c8d0e2f4a1
 Revises: a7e3c1f9d5b2

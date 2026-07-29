@@ -565,30 +565,53 @@ def test_build_netbox_client_defaults_verify_true(clean_netbox_registry):
     assert client._verify is True
 
 
-async def test_init_database_skips_create_all_on_postgres(monkeypatch):
-    """s3-25: on PostgreSQL the entrypoint already ran `alembic upgrade head`, so the lifespan
-    must NOT run create_all (two schema sources → DuplicateTable). The fake engine has no
-    .begin(); reaching the create_all block would raise, so a clean return proves the gate.
+async def test_init_database_never_materializes_schema(monkeypatch, pg_url):
+    """s3-25, PG-only: alembic is the ONE schema source. The lifespan binds the engine and
+    mints the incarnation; it must never create tables, because a second materialiser in the
+    startup path is exactly the DuplicateTable hazard.
 
-    SA-4: ensure_store_meta (S4) needs a real session this isolated test never primes —
-    patch it AND assert it ran (the incarnation backfill is part of the init contract)."""
-    import nso_adapter.main as main_mod
+    Asserted against a REAL engine on an empty-but-migrated clone: any table the lifespan
+    created would show up as a table the migration did not, so compare the table set before
+    and after. A fake engine could only prove "no .begin() call"; this proves no DDL."""
+    import sqlalchemy as sa
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from nso_adapter.store import db as store_db
     from nso_adapter.store import meta as store_meta
 
-    fake_pg_engine = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
-    monkeypatch.setattr(main_mod, "init_db", lambda url: None)
-    monkeypatch.setattr(main_mod, "get_engine", lambda: fake_pg_engine)
-    ensure_calls = []
+    def _tables(conn):
+        return set(sa.inspect(conn).get_table_names())
 
-    async def _fake_ensure():
-        ensure_calls.append(True)
-        return ("00000000-0000-0000-0000-000000000001", None)
+    engine = create_async_engine(pg_url)
+    try:
+        async with engine.connect() as conn:
+            before = await conn.run_sync(_tables)
 
-    monkeypatch.setattr(store_meta, "ensure_store_meta", _fake_ensure)
+        ensure_calls = []
 
-    await _init_database(SimpleNamespace(database_url="postgresql+asyncpg://u:p@db/adapter"))
-    # no AttributeError on fake_pg_engine.begin → the create_all block was skipped
-    assert ensure_calls, "the store-incarnation backfill must run at init"
+        async def _fake_ensure():
+            # S4's mint needs a primed session this isolated test never sets up; patch it AND
+            # assert it ran, since the incarnation mint is part of the init contract.
+            ensure_calls.append(True)
+            return ("00000000-0000-0000-0000-000000000001", None)
+
+        monkeypatch.setattr(store_meta, "ensure_store_meta", _fake_ensure)
+        try:
+            await _init_database(SimpleNamespace(database_url=pg_url))
+            assert ensure_calls, "the store-incarnation mint must run at init"
+            async with engine.connect() as conn:
+                after = await conn.run_sync(_tables)
+        finally:
+            bound = store_db.get_engine()
+            if bound is not None:
+                await bound.dispose()
+            store_db._engine = None
+            store_db._session_factory = None
+
+        assert after == before, f"the lifespan materialised schema: {sorted(after - before)}"
+        assert "devices" in before, "the clone should already be at head — otherwise this proves nothing"
+    finally:
+        await engine.dispose()
 
 
 # --------------------------------------------------------------------------- #

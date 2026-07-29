@@ -8,7 +8,7 @@ Exercises the real FastAPI wiring the plugin calls at attach time / panel render
   - POST /route-policy/preflight — block-with-override input the plugin uses at attach
 
 The NSO probe action is faked (no live RESTCONF); everything else is real (FastAPI →
-capability core → sqlite store).
+capability core → PostgreSQL store).
 """
 
 from __future__ import annotations

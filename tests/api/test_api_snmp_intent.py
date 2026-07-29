@@ -2,7 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """End-to-end tests for PUT /api/v1/devices/{id}/snmp-intent.
 
-These drive the real FastAPI route through the real SQLite-backed session
+These drive the real FastAPI route through the real PostgreSQL-backed session
 (``adapter_client`` + ``get_db``), exercising the full-replace upsert, the
 auto-apply enqueue, and the removal-propagation re-apply. Only the NSO HTTP
 boundary (``get_nso_client`` / ``apply_snmp_config``) is faked, and only in the

@@ -4,7 +4,7 @@
 
 PUT /isis-interface-intent (interfaces + processes + redistribution full-replace,
 auto-apply) and PUT /isis-flex-algo-intent (flex-algo full-replace + the
-removal -> replace_isis_service path). Real route, real SQLite session; only the
+removal -> replace_isis_service path). Real route, real PostgreSQL session; only the
 NSO HTTP boundary is faked, and only where the on-device service replace is asserted.
 """
 

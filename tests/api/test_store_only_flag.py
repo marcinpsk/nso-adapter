@@ -10,7 +10,7 @@ PUT-replace retracted FASTMAP-owned config from the real device (ra1.lab, remova
 removal (both the ``replace_on_removal`` path and the direct ``enqueue_removal`` path) and
 auto-apply — while the store full-replace still happens.
 
-These drive the real FastAPI routes through the real SQLite-backed session
+These drive the real FastAPI routes through the real PostgreSQL-backed session
 (``adapter_client`` + ``get_db``); nothing NSO-facing is needed because the whole point
 is that NO device-touching job may ever be created.
 """

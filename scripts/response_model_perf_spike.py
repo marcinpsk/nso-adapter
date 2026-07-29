@@ -8,7 +8,7 @@ and should those specific endpoints drop ``response_model`` (keeping the documen
 ``responses={200: {"model": X}}`` schema, skipping runtime validation)?
 
 Method — two independent, corroborating measurements against the REAL app + a real
-SQLite store seeded with maximal payloads (no NSO, no network):
+PostgreSQL store seeded with maximal payloads (no NSO, no network):
 
   * End-to-end HTTP: identical app / DB, flip ONLY ``response_model`` and time real
     requests. The delta is the whole user-facing cost. The "WITHOUT" variant rebuilds
@@ -22,12 +22,13 @@ SQLite store seeded with maximal payloads (no NSO, no network):
 Both are apples-to-apples: ``body-parity`` asserts the two paths emit byte-identical
 JSON, so this measures serialization strategy, not output shape.
 
-Run (host, from the repo root)::
+Run (host, from the repo root, against the throwaway test server)::
 
     uv run --native-tls python scripts/response_model_perf_spike.py
 
-Prints only timings + payload sizes; the only writes are throwaway rows in a temp
-SQLite file that is discarded on exit.
+Prints only timings + payload sizes. The only writes are throwaway rows in a database
+this script DROPs and re-CREATEs on each run (``NSO_ADAPTER_SPIKE_DB_URL`` to override) —
+never point it at a database you care about.
 
 Result (2026-07-20, this host) — the hypothesis is REFUTED: ``response_model`` is not a
 cost, it is a net win. With the default ``JSONResponse``, FastAPI's ``use_dump_json`` fast
@@ -45,11 +46,18 @@ import asyncio
 import json
 import os
 import statistics
+import subprocess
+import sys
 import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+
+#: Throwaway spike database — DROPped and re-CREATEd on every run.
+SPIKE_DB_URL = os.environ.get(
+    "NSO_ADAPTER_SPIKE_DB_URL", "postgresql+asyncpg://postgres:postgres@127.0.0.1:55433/adapter_spike"
+)
 
 # Hermetic: never inherit an ambient dev DATABASE_URL (see tests/conftest.py).
 os.environ.pop("DATABASE_URL", None)
@@ -300,9 +308,33 @@ async def isolated_serialize(app, path: str, out) -> None:
     )
 
 
+def _bootstrap_spike_database() -> None:
+    """Re-create the throwaway database and bring it to head.
+
+    The app materializes no schema (alembic is the only source), so the spike builds its
+    own the same way production does.
+    """
+    import sqlalchemy as sa
+    from sqlalchemy.engine import make_url
+
+    url = make_url(SPIKE_DB_URL)
+    admin = url.set(drivername="postgresql+psycopg2", database="postgres")
+    engine = sa.create_engine(admin.render_as_string(hide_password=False), isolation_level="AUTOCOMMIT")
+    with engine.connect() as conn:
+        conn.exec_driver_sql(f'DROP DATABASE IF EXISTS "{url.database}" WITH (FORCE)')
+        conn.exec_driver_sql(f'CREATE DATABASE "{url.database}"')
+    engine.dispose()
+    subprocess.run(
+        [sys.executable, "-m", "nso_adapter.db_migrate"],
+        check=True,
+        env={**os.environ, "DATABASE_URL": SPIKE_DB_URL},
+    )
+
+
 async def main() -> None:
     from httpx import ASGITransport, AsyncClient
 
+    _bootstrap_spike_database()
     tmp = Path(tempfile.mkdtemp())
     cfg = tmp / "config.yaml"
     cfg.write_text(
@@ -315,7 +347,7 @@ netbox:
   api_token_ref: "NETBOX_TOKEN"
 api:
   adapter_token_ref: "ADAPTER_TOKEN"
-database_url: sqlite+aiosqlite:///{tmp}/spike.db
+database_url: {SPIKE_DB_URL}
 """
     )
     os.environ["CONFIG_FILE"] = str(cfg)

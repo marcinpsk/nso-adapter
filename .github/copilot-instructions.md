@@ -194,7 +194,7 @@ uv run -- pytest tests/api -k onboard    # filter by keyword
 uv run -- pytest --cov-report=html       # HTML coverage report under htmlcov/
 ```
 
-The suite uses `httpx.ASGITransport` against `create_app()` for API tests (in-process, no live server), in-memory SQLite via a `tmp_path` config fixture, and `monkeypatch`-stubbed NSO/NetBox clients. SQLite is the **test engine only** — the runtime is PostgreSQL-only (the dev container runs `alembic upgrade head` at start; see `nso_adapter/db_migrate.py`). The bulk of the unit suite needs no running NSO/Vault/PostgreSQL — those belong to manual / acceptance tests per the milestone plan docs (e.g. `docs/m7-match-api.md` §6). One PostgreSQL-gated lane exists: `tests/store/test_schema_parity.py` asserts the alembic baseline matches `create_all` and runs in CI against a real Postgres (skipped when `ALEMBIC_PARITY_DB_URL` is unset).
+The suite uses `httpx.ASGITransport` against `create_app()` for API tests (in-process, no live server), a `tmp_path` config fixture, and `monkeypatch`-stubbed NSO/NetBox clients. PostgreSQL is the only engine, in tests as in production: every DB-backed test gets a private database cloned from a template built by `alembic upgrade head`, so it needs the throwaway test server (`adapter-test-db`, `NSO_ADAPTER_TEST_DB_URL`) running — there is no skip lane. NSO and Vault are still stubbed; live NSO/Vault checks belong to manual / acceptance tests per the milestone plan docs (e.g. `docs/m7-match-api.md` §6). `tests/store/test_schema_parity.py` asserts `Base.metadata` still equals the alembic head.
 
 If `make test` fails on missing tools, run `uv sync --dev` to install the dev dependency group; if `uv` itself is missing, this is not the expected dev environment.
 

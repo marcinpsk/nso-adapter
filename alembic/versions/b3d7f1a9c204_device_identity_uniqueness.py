@@ -36,7 +36,6 @@ def upgrade() -> None:
         ["netbox_device_id"],
         unique=True,
         postgresql_where="netbox_device_id IS NOT NULL",
-        sqlite_where="netbox_device_id IS NOT NULL",
     )
 
 

@@ -3,7 +3,7 @@
 
 Only the NSO socket is faked (a stateful httpx.MockTransport simulating NSO RESTCONF). The
 scheduler job, the NsoClient request/URL/body construction, the failover state machine and
-the SQLite store are all REAL — this is the whole-flow test the unit tests trust.
+the PostgreSQL store are all REAL — this is the whole-flow test the unit tests trust.
 """
 
 from __future__ import annotations

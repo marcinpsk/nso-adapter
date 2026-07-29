@@ -2,8 +2,7 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """The store's one timestamp convention, end to end on PostgreSQL.
 
-Two guards that only mean something on a real PostgreSQL database (sqlite drops
-tzinfo on reload, so both pass there for the wrong reason):
+Three guards, each meaningful only against a real PostgreSQL database:
 
 * round-trip — an aware instant written to a normalized column reloads as the SAME
   instant, with the process TZ forced off UTC. Guards the writer convention.

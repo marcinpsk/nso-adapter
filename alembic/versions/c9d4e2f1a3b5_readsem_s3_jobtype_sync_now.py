@@ -18,7 +18,6 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # PostgreSQL only: SQLite (tests) renders Enum as VARCHAR+CHECK via create_all.
     if op.get_bind().dialect.name == "postgresql":
         op.execute("ALTER TYPE jobtype ADD VALUE IF NOT EXISTS 'sync_now'")
 

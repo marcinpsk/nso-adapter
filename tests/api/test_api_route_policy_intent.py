@@ -2,7 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """End-to-end tests for PUT /api/v1/devices/{id}/route-policy-intent.
 
-Drive the real route through the real SQLite session (``adapter_client`` +
+Drive the real route through the real PostgreSQL session (``adapter_client`` +
 ``get_db``): full-replace upsert of per-object route-policy intent, the
 validation 422s, and the removal-propagation that enqueues a `removal` job.
 """

@@ -7,10 +7,10 @@ app starts, and usable in CI. Reads ``DATABASE_URL`` from the environment exactl
 like ``alembic/env.py`` does, so no extra plumbing is required in the container
 (where ``DATABASE_URL`` is already set).
 
-This is the real-DB (PostgreSQL) schema source. ``create_all`` (in ``main.py``)
-stays as the test bootstrap (sqlite) and is an idempotent no-op in production once
-migrations have run. Parity between the two is asserted by
-``tests/store/test_schema_parity.py``.
+This is the ONLY schema source: nothing else materializes tables, in production or in
+tests (the test substrate clones a template built by this same module). ``create_all``
+survives with exactly one consumer — ``tests/store/test_schema_parity.py`` — whose job is
+proving ``Base.metadata`` still agrees with the migration head.
 
 The Alembic CLI console-script is not reliably on PATH in the image, so we drive
 Alembic programmatically.

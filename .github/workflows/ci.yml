@@ -53,10 +53,9 @@ jobs:
       - name: Sync dependencies
         run: uv sync --all-groups
 
-      # Full unit suite on sqlite (fast, hermetic) PLUS the PostgreSQL-gated
-      # parity test — ALEMBIC_PARITY_DB_URL makes test_schema_parity.py run
-      # instead of skip, so create_all↔alembic parity is asserted in one pass
-      # and coverage is measured over the whole suite.
+      # The whole suite runs on PostgreSQL: each test gets a private database
+      # cloned from a template built by `alembic upgrade head`, so schema parity
+      # and coverage are both asserted in one pass.
       - name: Test suite (+ Postgres parity lane)
         env:
           ALEMBIC_PARITY_DB_URL: postgresql+psycopg2://nso:nso@localhost:5432/postgres

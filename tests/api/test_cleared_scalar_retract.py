@@ -13,7 +13,7 @@ NOTHING: the operator blanked an MTU / a route metric / a syslog severity, the s
 updated, the tab showed it cleared — and the device kept the old value forever. The next
 reconcile then flipped the overlay to ``changed``, and re-clearing did nothing.
 
-These drive the real FastAPI routes through the real SQLite session. No NSO is needed: the
+These drive the real FastAPI routes through the real PostgreSQL session. No NSO is needed: the
 whole assertion is about which JOB the PUT queues, and with what semantics.
 
     detach absent  → the replace really networks (a clear is not an un-own: the row stays

@@ -11,7 +11,8 @@ Branchy shapes:
 
 refresh probes NSO (external boundary) so its delegate is patched; the other paths run
 with ``refresh=false`` against a seeded ``(ned_id, sw_version)`` key + device_capability
-rows, so no NSO call happens. Rows are read back in insertion order (SQLite rowid).
+rows, so no NSO call happens. Each of these goldens seeds at MOST one capability row, so
+none of them pins a multi-row wire order — get_device_capability has no ORDER BY.
 """
 
 from __future__ import annotations

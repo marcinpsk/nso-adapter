@@ -134,7 +134,6 @@ class Device(Base):
             "netbox_device_id",
             unique=True,
             postgresql_where=text("netbox_device_id IS NOT NULL"),
-            sqlite_where=text("netbox_device_id IS NOT NULL"),
         ),
     )
 
@@ -361,7 +360,6 @@ class Job(Base):
             "uq_job_active_per_device",
             "device_id",
             unique=True,
-            sqlite_where=text("status IN ('queued', 'running') AND job_type <> 'removal'"),
             postgresql_where=text("status IN ('queued', 'running') AND job_type <> 'removal'"),
         ),
     )
