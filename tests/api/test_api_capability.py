@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, adapter_client_with_nso, seed_device  # noqa: F401
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 _NED = "cisco-ios-cli-6.114"
@@ -170,18 +170,15 @@ async def test_apply_preflight_flags_unsupported_scope(adapter_client_with_nso, 
     """The generic apply-preflight flags a scope the matrix recorded unsupported (reactively,
     from a prior apply failure) when the plugin asks about it before a device write."""
     from nso_adapter.core.capability import record_capability_rejection
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device
 
     device_id = await seed_device(nso_device_name="rg03")
-    async for db in get_session():  # known (ned, sw) + a reactively-recorded scope gap
+    async with session() as db:  # known (ned, sw) + a reactively-recorded scope gap
         dev = await db.get(Device, device_id)
         dev.ned_id, dev.sw_version = _NED, "17.15.4c"
         await db.commit()
-        break
-    async for db in get_session():
+    async with session() as db:
         await record_capability_rejection(db, _NED, "17.15.4c", "static_route", "static_route", "NED rejected")
-        break
 
     resp = await adapter_client_with_nso.post(
         f"/api/v1/devices/{device_id}/apply/preflight?refresh=false",
@@ -213,15 +210,13 @@ async def test_apply_preflight_unknown_device_is_fail_open(adapter_client_with_n
 
 
 async def _seed_device_with_key(name: str, ned: str = _NED, sw: str = "17.15.4c") -> int:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device
 
     device_id = await seed_device(nso_device_name=name)
-    async for db in get_session():
+    async with session() as db:
         dev = await db.get(Device, device_id)
         dev.ned_id, dev.sw_version = ned, sw
         await db.commit()
-        break
     return device_id
 
 

@@ -20,9 +20,8 @@ from sqlalchemy import select
 from nso_adapter.core.refresh_engine import run_family_refresh, run_family_refresh_from_section
 from nso_adapter.core.static_route import STATIC_ROUTE_SPEC
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, DeviceStaticRoute, RefreshOutcome
-from tests.conftest import seed_device
+from tests.conftest import seed_device, session
 
 ENV_SPEC = dataclasses.replace(STATIC_ROUTE_SPEC, wire_name="static-route")
 
@@ -35,19 +34,17 @@ OK_SECTION = {
 
 @asynccontextmanager
 async def _device_session(device_id: int):
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         assert device is not None
         yield db, device
         return
-    raise RuntimeError("no session")
 
 
 async def _seed_one_route(device_id: int) -> None:
-    async for db in get_session():
+    async with session() as db:
         db.add(DeviceStaticRoute(device_id=device_id, vrf="", prefix="10.0.0.0/8", next_hop="1.1.1.1"))
         await db.commit()
-        break
 
 
 async def _routes(db, device_id: int) -> list[str]:
@@ -358,13 +355,12 @@ async def test_concurrent_same_family_refreshes_escalate_once(adapter_client):
         client.get_device_state_section.side_effect = _section
         client.run_device_state_read.side_effect = _action
 
-        async for db2 in get_session():
+        async with session() as db2:
             device2 = await db2.get(Device, device_id)
             ok1, ok2 = await asyncio.gather(
                 run_family_refresh(db, device, client, ENV_SPEC),
                 run_family_refresh(db2, device2, client, ENV_SPEC),
             )
-            break
 
         assert (ok1, ok2) == (True, True)
         assert client.run_device_state_read.await_count == 1, "the second refresh must not re-fire the action"
@@ -484,11 +480,10 @@ async def test_phase2_store_poisoning_recovers_the_session(adapter_client, monke
         ok = await run_family_refresh(db, device, _client(section=OK_SECTION), ENV_SPEC)
 
         assert ok is True, "phase-2 telemetry failure must never fail the refresh"
-        async for fresh_db in get_session():
+        async with session() as fresh_db:
             assert await _routes(fresh_db, device_id) == ["172.16.0.0/12"], (
                 "phase-2 recovery must not roll back the committed mirror"
             )
-            break
         # The next family's refresh on the SAME session must work (sync_device fan-out shape).
         monkeypatch.undo()
         ok2 = await run_family_refresh(db, device, _client(section=OK_SECTION), ENV_SPEC)

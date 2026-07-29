@@ -25,6 +25,7 @@ from tests.conftest import (
     VALID_TOKEN,
     pin_store_incarnation,
     seed_device,
+    session,
 )
 
 _SYNTH_READ_STATE = {
@@ -47,10 +48,9 @@ TS = datetime(2026, 6, 1, 10, 0, 0)
 
 
 async def _seed_ospf(device_id: int) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceOspfInstance, DeviceOspfInterface
 
-    async for db in get_session():
+    async with session() as db:
         db.add(
             DeviceOspfInstance(
                 device_id=device_id,
@@ -94,7 +94,6 @@ async def _seed_ospf(device_id: int) -> None:
             )
         )
         await db.commit()
-        break
 
 
 @pytest.mark.anyio

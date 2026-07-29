@@ -15,8 +15,8 @@ from sqlalchemy import select
 
 from nso_adapter.core import scheduler as sched
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import ActiveAddress, Device, DeviceFailover, FailoverConfig
+from tests.conftest import session
 
 
 class _NsoSim:
@@ -80,26 +80,24 @@ def _client_for(sim: _NsoSim) -> NsoClient:
 
 
 async def _seed(primary="10.0.0.1", oob="192.0.2.5", active="primary") -> int:
-    async for db in get_session():
+    async with session() as db:
         dev = Device(nso_instance="nso-dev", nso_device_name="ra1", netbox_device_id=42)
         db.add(dev)
         await db.flush()
         db.add(DeviceFailover(device_id=dev.id, primary_ip=primary, oob_ip=oob, active_address=active))
         await db.commit()
         return dev.id
-    raise AssertionError("no session")
 
 
 async def _arm_and_load(device_id: int) -> DeviceFailover:
     """Force the primary probe due (clear staggering) and return a fresh copy of the row."""
-    async for db in get_session():
+    async with session() as db:
         row = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device_id))).scalar_one()
         row.next_primary_probe_at = None
         await db.commit()
         await db.refresh(row)
         db.expunge(row)
         return row
-    raise AssertionError("no session")
 
 
 async def test_fresh_device_fails_over_to_oob_then_back(adapter_client, monkeypatch):
@@ -142,10 +140,9 @@ async def test_unlinked_device_is_ignored(adapter_client, monkeypatch):
     client = _client_for(sim)
     monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
 
-    async for db in get_session():
+    async with session() as db:
         db.add(Device(nso_instance="nso-dev", nso_device_name="lonely", netbox_device_id=7))
         await db.commit()
-        break
 
     await sched._scheduled_failover_probe()
     assert sim.connects == 0  # no failover row → not in the join → never touched
@@ -159,7 +156,7 @@ async def test_ingestion_helpers_seed_and_upsert_ips(adapter_client):
     """
     from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
 
-    async for db in get_session():
+    async with session() as db:
         dev = Device(nso_instance="nso-dev", nso_device_name="up1", netbox_device_id=55)
         db.add(dev)
         await db.flush()
@@ -183,7 +180,6 @@ async def test_ingestion_helpers_seed_and_upsert_ips(adapter_client):
         # about 10.0.0.2, and counting them toward the failback to it would fail back on a
         # verdict never earned. (This assertion used to read `== 4`.)
         assert reloaded.consecutive_successes == 0
-        break
 
 
 async def test_a_changed_primary_does_not_inherit_the_old_addresss_failure_count(adapter_client):
@@ -197,7 +193,7 @@ async def test_a_changed_primary_does_not_inherit_the_old_addresss_failure_count
     """
     from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
 
-    async for db in get_session():
+    async with session() as db:
         dev = Device(nso_instance="nso-dev", nso_device_name="reset1", netbox_device_id=58)
         db.add(dev)
         await db.flush()
@@ -214,7 +210,6 @@ async def test_a_changed_primary_does_not_inherit_the_old_addresss_failure_count
         assert reloaded.consecutive_failures == 0, "the new address starts with its full hysteresis budget"
         assert reloaded.last_probe_result is None, "and with no verdict about the address it replaced"
         assert reloaded.active_address == "primary"  # still not the upsert's business
-        break
 
 
 async def test_upsert_new_oob_rearms_probe_schedule(adapter_client):
@@ -227,7 +222,7 @@ async def test_upsert_new_oob_rearms_probe_schedule(adapter_client):
 
     from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
 
-    async for db in get_session():
+    async with session() as db:
         dev = Device(nso_instance="nso-dev", nso_device_name="rearm1", netbox_device_id=57)
         db.add(dev)
         await db.flush()
@@ -247,7 +242,6 @@ async def test_upsert_new_oob_rearms_probe_schedule(adapter_client):
         assert reloaded.oob_health_result is None
         assert reloaded.oob_health_detail is None
         assert reloaded.next_primary_probe_at == far  # primary unchanged → schedule untouched
-        break
 
 
 async def test_upsert_new_primary_rearms_primary_probe_only(adapter_client):
@@ -255,7 +249,7 @@ async def test_upsert_new_primary_rearms_primary_probe_only(adapter_client):
 
     from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
 
-    async for db in get_session():
+    async with session() as db:
         dev = Device(nso_instance="nso-dev", nso_device_name="rearm2", netbox_device_id=58)
         db.add(dev)
         await db.flush()
@@ -271,14 +265,13 @@ async def test_upsert_new_primary_rearms_primary_probe_only(adapter_client):
         reloaded = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == dev.id))).scalar_one()
         assert reloaded.next_primary_probe_at < far
         assert reloaded.next_oob_probe_at == far  # OOB unchanged → schedule untouched
-        break
 
 
 async def test_upsert_skips_empty_row_creation(adapter_client):
     """A device reported with no IPs (older plugin) must NOT get an empty failover row."""
     from nso_adapter.core.failover import upsert_failover_ips
 
-    async for db in get_session():
+    async with session() as db:
         dev = Device(nso_instance="nso-dev", nso_device_name="noips", netbox_device_id=56)
         db.add(dev)
         await db.flush()
@@ -286,35 +279,31 @@ async def test_upsert_skips_empty_row_creation(adapter_client):
         await db.commit()
         row = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == dev.id))).scalar_one_or_none()
         assert row is None  # no empty row created
-        break
 
 
 async def _seed_config(**kw) -> None:
     """Insert the FailoverConfig singleton with overrides (the plugin would PUT these)."""
-    async for db in get_session():
+    async with session() as db:
         db.add(FailoverConfig(**kw))
         await db.commit()
         return
-    raise AssertionError("no session")
 
 
 async def _seed_extra(name: str, netbox_id: int, primary: str, oob: str, active: str = "primary") -> int:
-    async for db in get_session():
+    async with session() as db:
         dev = Device(nso_instance="nso-dev", nso_device_name=name, netbox_device_id=netbox_id)
         db.add(dev)
         await db.flush()
         db.add(DeviceFailover(device_id=dev.id, primary_ip=primary, oob_ip=oob, active_address=active))
         await db.commit()
         return dev.id
-    raise AssertionError("no session")
 
 
 async def _load(device_id: int) -> DeviceFailover:
-    async for db in get_session():
+    async with session() as db:
         row = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device_id))).scalar_one()
         db.expunge(row)
         return row
-    raise AssertionError("no session")
 
 
 async def _arm(device_id: int, *, primary_due: bool = True, oob_due: bool = False) -> None:
@@ -322,13 +311,12 @@ async def _arm(device_id: int, *, primary_due: bool = True, oob_due: bool = Fals
     from datetime import datetime
 
     far = datetime(2030, 1, 1)
-    async for db in get_session():
+    async with session() as db:
         row = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device_id))).scalar_one()
         row.next_primary_probe_at = None if primary_due else far
         row.next_oob_probe_at = None if oob_due else far
         await db.commit()
         return
-    raise AssertionError("no session")
 
 
 async def test_effective_config_falls_back_then_reads_db(adapter_client):
@@ -336,20 +324,18 @@ async def test_effective_config_falls_back_then_reads_db(adapter_client):
     from nso_adapter.config import get_config
     from nso_adapter.core.failover import get_effective_failover_config
 
-    async for db in get_session():
+    async with session() as db:
         eff = await get_effective_failover_config(db, get_config().scheduler)
         assert eff.enabled is True
         assert eff.failover_failure_threshold == get_config().scheduler.failover_failure_threshold
-        break
 
     await _seed_config(enabled=False, failure_threshold=2, probe_concurrency=3, max_flips_per_tick=1)
-    async for db in get_session():
+    async with session() as db:
         eff = await get_effective_failover_config(db, get_config().scheduler)
         assert eff.enabled is False
         assert eff.failover_failure_threshold == 2
         assert eff.probe_concurrency == 3
         assert eff.max_flips_per_tick == 1
-        break
 
 
 async def test_disabled_config_makes_tick_a_noop(adapter_client, monkeypatch):
@@ -469,11 +455,10 @@ async def test_manual_override_clears_once_address_restored(adapter_client, monk
     client = _client_for(sim)
     monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
     device_id = await _seed(active="primary")
-    async for db in get_session():
+    async with session() as db:
         row = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device_id))).scalar_one()
         row.manual_override = True  # left over from an earlier foreign-address detection
         await db.commit()
-        break
     await _arm(device_id, primary_due=True, oob_due=False)
 
     await sched._scheduled_failover_probe()

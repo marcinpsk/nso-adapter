@@ -15,19 +15,17 @@ import pytest
 from nso_adapter.core.families import ALL_FAMILY_KEYS, FAMILIES_VERSION
 from nso_adapter.nso.read_outcome import Freshness, Present, Unavailable, UnavailableReason
 from nso_adapter.store import outcome_store
-from nso_adapter.store.db import get_session
 from nso_adapter.store.meta import get_store_incarnation
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 _AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 
 async def _terminalize(device_id: int, family: str, outcome, *, result: str, succeeded: bool, rows: int | None = 0):
-    async for db in get_session():
+    async with session() as db:
         attempt_id = await outcome_store.record_read_outcome(db, device_id, family, outcome, refresh_source="poll")
         await outcome_store.record_result(db, attempt_id, result=result, succeeded=succeeded, row_count=rows)
         return attempt_id
-    raise AssertionError("no session")
 
 
 @pytest.mark.anyio
@@ -179,12 +177,11 @@ async def test_read_at_is_the_read_time_not_completion(adapter_client):
     )
     started = datetime(2026, 6, 1, 10, 0, 0)
     completed = datetime(2026, 6, 1, 10, 5, 0)  # slow materializer: +5 min
-    async for db in get_session():
+    async with session() as db:
         await db.execute(
             update(RefreshOutcome).where(RefreshOutcome.id == a1).values(started_at=started, completed_at=completed)
         )
         await db.commit()
-        break
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/static-routes", headers=_AUTH)
     assert resp.json()["read_state"]["read_at"] == "2026-06-01T10:00:00Z", (
         "read_at must serialize started_at (the read), not completed_at (the materialization)"

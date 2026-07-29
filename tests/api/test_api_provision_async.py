@@ -12,9 +12,8 @@ from unittest.mock import AsyncMock, patch
 from sqlalchemy import select
 
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
-from tests.conftest import VALID_TOKEN
+from tests.conftest import VALID_TOKEN, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -36,7 +35,7 @@ def _ok_nso_client():
 
 
 async def _active_provision_jobs():
-    async for db in get_session():
+    async with session() as db:
         rows = await db.execute(select(Job).where(Job.job_type == JobType.provision))
         return list(rows.scalars().all())
     return []
@@ -111,7 +110,7 @@ async def test_worker_runs_provision_job_creates_device(adapter_client_with_nso)
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
         await _JOB_RUNNERS[JobType.provision](job_id, None)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded, job.error
         assert job.result["ok"] is True
@@ -122,7 +121,6 @@ async def test_worker_runs_provision_job_creates_device(adapter_client_with_nso)
         assert job.device_id == job.result["device_id"]
         dev = (await db.execute(select(Device).where(Device.nso_device_name == "drained-rtr"))).scalar_one_or_none()
         assert dev is not None and dev.netbox_device_id == 555
-        break
 
     # The NSO node was actually created + synced over the faked boundary.
     client.create_device.assert_awaited_once()
@@ -146,9 +144,8 @@ async def test_worker_provision_job_records_blocking_step_failure(adapter_client
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
         await _JOB_RUNNERS[JobType.provision](job_id, None)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["ok"] is False
         assert {s["step"]: s["status"] for s in job.result["steps"]}["create"] == "failed"
-        break

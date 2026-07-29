@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 TS = datetime(2026, 5, 27, 9, 41, 12, 221000, tzinfo=UTC)
@@ -24,10 +24,9 @@ async def _seed_ip(
     last_refreshed_at: datetime = TS,
 ) -> None:
     """Seed a single InterfaceIpAddress row for a device."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import InterfaceIpAddress
 
-    async for db in get_session():
+    async with session() as db:
         db.add(
             InterfaceIpAddress(
                 device_id=device_id,
@@ -41,7 +40,6 @@ async def _seed_ip(
             )
         )
         await db.commit()
-        break
 
 
 # ── GET /api/v1/devices/{id}/interface-ips ──────────────────────────────────
@@ -176,10 +174,9 @@ async def test_interface_ips_requires_auth(adapter_client):
 
 async def _seed_interface(device_id: int, name: str) -> int:
     """Seed a DbInterface row and return its id."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DbInterface
 
-    async for db in get_session():
+    async with session() as db:
         iface = DbInterface(device_id=device_id, name=name)
         db.add(iface)
         await db.flush()
@@ -211,7 +208,6 @@ async def test_put_ip_intent_full_replace(adapter_client):
     """Second PUT replaces all existing rows."""
     from sqlalchemy import select
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import InterfaceIpIntent
 
     device_id = await seed_device(nso_device_name="ip-intent-dev-02", netbox_device_id=901)
@@ -235,10 +231,9 @@ async def test_put_ip_intent_full_replace(adapter_client):
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=payload2)
     assert resp.json()["address_count"] == 1
 
-    async for db in get_session():
+    async with session() as db:
         result = await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface_id))
         rows = result.scalars().all()
-        break
     # Old 10.0.0.2 row should be gone
     assert len(rows) == 1
     assert rows[0].address == "10.0.0.1/24"
@@ -250,7 +245,6 @@ async def test_put_ip_intent_removal_enqueues_interface_config_job(adapter_clien
     never drop it (#5)."""
     from sqlalchemy import select
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
 
     device_id = await seed_device(nso_device_name="ip-rm-dev", netbox_device_id=905)
@@ -269,7 +263,7 @@ async def test_put_ip_intent_removal_enqueues_interface_config_job(adapter_clien
     assert resp.json()["removed_interfaces"] == 1
     assert resp.json()["replaced"] is True
 
-    async for db in get_session():
+    async with session() as db:
         removals = [j for j in (await db.execute(select(Job))).scalars().all() if j.job_type == JobType.removal]
         assert len(removals) == 1
         assert removals[0].context == {
@@ -280,7 +274,6 @@ async def test_put_ip_intent_removal_enqueues_interface_config_job(adapter_clien
             "removed": {"address": [["Gi0/3", "10.0.0.2/24", ""]]},
             "detach": True,
         }
-        break
 
 
 async def test_put_ip_intent_removal_captures_values_per_interface(adapter_client):
@@ -288,7 +281,6 @@ async def test_put_ip_intent_removal_captures_values_per_interface(adapter_clien
     sorted, across interfaces — the #104 phase-3 value-grain residue input."""
     from sqlalchemy import select
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
 
     device_id = await seed_device(nso_device_name="ip-rm-vals-dev", netbox_device_id=906)
@@ -308,14 +300,13 @@ async def test_put_ip_intent_removal_captures_values_per_interface(adapter_clien
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=p2)
     assert resp.json()["removed_interfaces"] == 1
 
-    async for db in get_session():
+    async with session() as db:
         removals = [j for j in (await db.execute(select(Job))).scalars().all() if j.job_type == JobType.removal]
         assert len(removals) == 1
         assert removals[0].context["interfaces"] == ["Gi0/5"]
         assert removals[0].context["removed"] == {
             "address": [["Gi0/5", "10.0.1.1/30", "CUST"], ["Gi0/5", "10.0.2.1/30", ""]]
         }
-        break
 
 
 async def test_put_ip_intent_unknown_interface_lands(adapter_client):
@@ -328,7 +319,6 @@ async def test_put_ip_intent_unknown_interface_lands(adapter_client):
     """
     from sqlalchemy import select
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DbInterface, InterfaceIpIntent
 
     device_id = await seed_device(nso_device_name="ip-intent-dev-03", netbox_device_id=902)
@@ -343,7 +333,7 @@ async def test_put_ip_intent_unknown_interface_lands(adapter_client):
     assert resp.status_code == 200
     assert resp.json()["address_count"] == 1  # landed, not dropped
 
-    async for db in get_session():
+    async with session() as db:
         iface = (
             await db.execute(
                 select(DbInterface).where(
@@ -357,14 +347,12 @@ async def test_put_ip_intent_unknown_interface_lands(adapter_client):
             .all()
         )
         assert len(rows) == 1 and rows[0].address == "192.168.1.1/30"
-        break
 
 
 async def test_put_ip_intent_greenfield_routed_creates_interface(adapter_client):
     """An unknown interface carrying Nokia routed binding → DbInterface is materialised."""
     from sqlalchemy import select
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DbInterface, InterfaceIpIntent
 
     device_id = await seed_device(nso_device_name="ip-intent-gf", netbox_device_id=910)
@@ -384,7 +372,7 @@ async def test_put_ip_intent_greenfield_routed_creates_interface(adapter_client)
     assert resp.status_code == 200
     assert resp.json()["address_count"] == 1
 
-    async for db in get_session():
+    async with session() as db:
         iface = (
             await db.execute(
                 select(DbInterface).where(DbInterface.device_id == device_id, DbInterface.name == "LAG99:99")
@@ -400,14 +388,12 @@ async def test_put_ip_intent_greenfield_routed_creates_interface(adapter_client)
         )
         assert len(rows) == 1
         assert rows[0].address == "198.18.249.160/31"
-        break
 
 
 async def test_put_ip_intent_routed_backfills_binding_only_when_missing(adapter_client):
     """Existing imported interface: routed entry backfills null binding, never clobbers."""
     from sqlalchemy import select
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DbInterface
 
     device_id = await seed_device(nso_device_name="ip-intent-bf", netbox_device_id=911)
@@ -426,7 +412,7 @@ async def test_put_ip_intent_routed_backfills_binding_only_when_missing(adapter_
     }
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=payload)
     assert resp.status_code == 200
-    async for db in get_session():
+    async with session() as db:
         iface = (
             await db.execute(
                 select(DbInterface).where(DbInterface.device_id == device_id, DbInterface.name == "LAG99:10")
@@ -434,7 +420,6 @@ async def test_put_ip_intent_routed_backfills_binding_only_when_missing(adapter_
         ).scalar_one()
         assert iface.parent_binding == "lag-99"
         assert iface.encap_tag == "10"
-        break
 
 
 async def test_put_ip_intent_404_unknown_device(adapter_client):

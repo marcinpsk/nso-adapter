@@ -22,30 +22,28 @@ from nso_adapter.core.jobs import (
     get_active_job,
 )
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
+from tests.conftest import session
 
 
 async def _seed_device(nso_device_name: str = "test-rtr", netbox_id: int = 1) -> int:
     """Insert a device and return its id."""
-    async for db in get_session():
+    async with session() as db:
         d = Device(nso_instance="nso-dev", nso_device_name=nso_device_name, netbox_device_id=netbox_id)
         db.add(d)
         await db.commit()
         await db.refresh(d)
         return d.id
-    raise RuntimeError("no session")
 
 
 async def _seed_job(device_id: int, status: JobStatus = JobStatus.queued) -> int:
     """Insert a job and return its id."""
-    async for db in get_session():
+    async with session() as db:
         j = Job(job_type=JobType.sync, device_id=device_id, status=status)
         db.add(j)
         await db.commit()
         await db.refresh(j)
         return j.id
-    raise RuntimeError("no session")
 
 
 # ── JobType enum invariant ──────────────────────────────────────────────────────
@@ -67,11 +65,10 @@ async def test_get_active_job_returns_queued(adapter_client):
     device_id = await _seed_device("rtr-01", 11)
     job_id = await _seed_job(device_id, JobStatus.queued)
 
-    async for db in get_session():
+    async with session() as db:
         result = await get_active_job(device_id, db)
         assert result is not None
         assert result.id == job_id
-        break
 
 
 async def test_get_active_job_returns_none_when_succeeded(adapter_client):
@@ -79,10 +76,9 @@ async def test_get_active_job_returns_none_when_succeeded(adapter_client):
     device_id = await _seed_device("rtr-02", 12)
     await _seed_job(device_id, JobStatus.succeeded)
 
-    async for db in get_session():
+    async with session() as db:
         result = await get_active_job(device_id, db)
         assert result is None
-        break
 
 
 async def test_get_active_job_returns_running_job(adapter_client):
@@ -90,11 +86,10 @@ async def test_get_active_job_returns_running_job(adapter_client):
     device_id = await _seed_device("rtr-03", 13)
     await _seed_job(device_id, JobStatus.running)
 
-    async for db in get_session():
+    async with session() as db:
         result = await get_active_job(device_id, db)
         assert result is not None
         assert result.status == JobStatus.running
-        break
 
 
 # ── enqueue_job ───────────────────────────────────────────────────────────────
@@ -104,11 +99,10 @@ async def test_enqueue_job_creates_new_job(adapter_client):
     """enqueue_job creates a queued job for the worker pool to drain."""
     device_id = await _seed_device("rtr-04", 14)
 
-    async for db in get_session():
+    async with session() as db:
         job, created = await enqueue_job(device_id, JobType.sync, db)
         assert created is True
         assert job.status == JobStatus.queued
-        break
 
 
 async def test_enqueue_job_returns_existing_when_active(adapter_client):
@@ -116,11 +110,10 @@ async def test_enqueue_job_returns_existing_when_active(adapter_client):
     device_id = await _seed_device("rtr-05", 15)
     existing_id = await _seed_job(device_id, JobStatus.queued)
 
-    async for db in get_session():
+    async with session() as db:
         job, created = await enqueue_job(device_id, JobType.sync, db)
         assert created is False
         assert job.id == existing_id
-        break
 
 
 async def test_active_job_partial_unique_index_rejects_second(adapter_client):
@@ -131,12 +124,11 @@ async def test_active_job_partial_unique_index_rejects_second(adapter_client):
     device_id = await _seed_device("dup-active", 4100)
     await _seed_job(device_id, JobStatus.queued)
 
-    async for db in get_session():
+    async with session() as db:
         db.add(Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.running))
         with pytest.raises(IntegrityError):
             await db.commit()
         await db.rollback()
-        break
 
 
 async def test_active_job_index_exempts_removal(adapter_client):
@@ -145,7 +137,7 @@ async def test_active_job_index_exempts_removal(adapter_client):
     removal for the same device."""
     device_id = await _seed_device("removal-multi", 4103)
 
-    async for db in get_session():
+    async with session() as db:
         db.add(Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued, context={"scope": "bgp"}))
         db.add(Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued, context={"scope": "isis"}))
         await db.commit()  # no IntegrityError — removal is exempt from the active-job index
@@ -155,7 +147,6 @@ async def test_active_job_index_exempts_removal(adapter_client):
             .all()
         )
         assert len(actives) == 2
-        break
 
 
 async def test_active_job_index_allows_new_after_terminal(adapter_client):
@@ -163,7 +154,7 @@ async def test_active_job_index_allows_new_after_terminal(adapter_client):
     device_id = await _seed_device("dup-terminal", 4101)
     await _seed_job(device_id, JobStatus.succeeded)
 
-    async for db in get_session():
+    async with session() as db:
         db.add(Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued))
         await db.commit()  # no IntegrityError — succeeded job is not "active"
         actives = (
@@ -172,7 +163,6 @@ async def test_active_job_index_allows_new_after_terminal(adapter_client):
             .all()
         )
         assert len(actives) == 1
-        break
 
 
 async def test_enqueue_job_recovers_from_lost_race(adapter_client, monkeypatch):
@@ -195,7 +185,7 @@ async def test_enqueue_job_recovers_from_lost_race(adapter_client, monkeypatch):
 
     monkeypatch.setattr(jobs_mod, "get_active_job", flaky)
 
-    async for db in get_session():
+    async with session() as db:
         job, created = await enqueue_job(device_id, JobType.sync, db)
         assert created is False
         assert job.id == existing_id
@@ -212,18 +202,16 @@ async def test_enqueue_job_recovers_from_lost_race(adapter_client, monkeypatch):
             .all()
         )
         assert len(actives) == 1
-        break
 
 
 async def test_enqueue_job_raises_on_unknown_type(adapter_client):
     """enqueue_job raises ValueError for unregistered job type."""
     device_id = await _seed_device("rtr-06", 16)
 
-    async for db in get_session():
+    async with session() as db:
         with patch("nso_adapter.core.jobs._JOB_RUNNERS", {}):
             with pytest.raises(ValueError, match="No runner registered"):
                 await enqueue_job(device_id, JobType.sync, db)
-        break
 
 
 # ── _run_with_db ──────────────────────────────────────────────────────────────
@@ -239,11 +227,10 @@ async def test_run_with_db_success(adapter_client):
 
     await _run_with_db(job_id, device_id, success_factory)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result == {"outcome": "ok"}
-        break
 
 
 async def test_run_with_db_failure(adapter_client):
@@ -256,11 +243,10 @@ async def test_run_with_db_failure(adapter_client):
 
     await _run_with_db(job_id, device_id, fail_factory)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert "something broke" in job.error["message"]
-        break
 
 
 async def test_run_with_db_timeout(adapter_client):
@@ -279,11 +265,10 @@ async def test_run_with_db_timeout(adapter_client):
     with patch("asyncio.wait_for", side_effect=mock_wait_for):
         await _run_with_db(job_id, device_id, slow_factory)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.error["code"] == "timeout"
-        break
 
 
 async def test_run_with_db_job_not_found(adapter_client):
@@ -312,9 +297,8 @@ async def test_run_with_db_marks_failed_even_when_session_poisoned(adapter_clien
 
     await _run_with_db(job_id, device_id, poison_factory)
 
-    async for db in get_session():
+    async with session() as db:
         assert (await db.get(Job, job_id)).status == JobStatus.failed
-        break
 
 
 # ── _run_sync and _run_detect_drift ───────────────────────────────────────
@@ -358,7 +342,7 @@ async def test_sync_now_timeout_leaves_last_sync_pair_untouched(adapter_client):
     from nso_adapter.store.models import LastSyncStatus
 
     prior_ts = datetime(2026, 1, 1, 12, 0, 0)
-    async for db in get_session():
+    async with session() as db:
         d = Device(
             nso_instance="nso-dev",
             nso_device_name="t-rtr",
@@ -371,7 +355,6 @@ async def test_sync_now_timeout_leaves_last_sync_pair_untouched(adapter_client):
         await db.commit()
         await db.refresh(d)
         device_id = d.id
-        break
     job_id = await _seed_job(device_id)
 
     client = AsyncMock(spec=NsoClient)
@@ -402,14 +385,13 @@ async def test_sync_now_timeout_leaves_last_sync_pair_untouched(adapter_client):
     ):
         await _run_with_db(job_id, device_id, _factory, timeout=0.5)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.error["code"] == "timeout"
         device = await db.get(Device, device_id)
         assert device.last_sync_status == LastSyncStatus.succeeded
         assert device.last_sync_at == prior_ts, "timestamp must not advance on a cancelled sync"
-        break
 
 
 async def test_run_sync_from_nso_reads_all_surfaces_without_device_contact(adapter_client):
@@ -442,13 +424,12 @@ async def test_run_sync_from_nso_reads_all_surfaces_without_device_contact(adapt
     assert fanout.await_args.kwargs.get("refresh_source") == "sync_from_nso"
     sf.assert_not_awaited()  # pins the no-device-round-trip contract
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result == {"degraded_surfaces": ["bgp"]}
         device = await db.get(Device, device_id)
         assert device.last_sync_at is None  # grain (b) never claims a device sync
-        break
     nb.notify_sync_complete.assert_awaited_once()
 
 
@@ -495,11 +476,10 @@ async def test_run_sync_from_nso_fails_job_on_total_supplier_failure(adapter_cli
     ):
         await _run_sync_from_nso(job_id, device_id)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert "nothing refreshed" in job.error["message"].lower()
-        break
 
 
 async def test_run_sync_now_requests_comprehensive_atomic(adapter_client):
@@ -560,12 +540,11 @@ async def test_run_connect_success(adapter_client):
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
         await _run_connect(job_id, device_id)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         # The real connect extracts tailf-ncs:output; _run_connect stores it under "output".
         assert job.result == {"output": {"result": "connected"}}
-        break
 
 
 async def test_run_connect_device_not_found(adapter_client):
@@ -576,10 +555,9 @@ async def test_run_connect_device_not_found(adapter_client):
     with patch("nso_adapter.core.importer.get_nso_client", side_effect=KeyError("nso-dev not found")):
         await _run_connect(job_id, device_id)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
-        break
 
 
 async def test_run_connect_device_not_in_db(adapter_client):
@@ -591,11 +569,10 @@ async def test_run_connect_device_not_in_db(adapter_client):
 
     await _run_connect(job_id, non_existent_device_id)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert "not found" in job.error["message"]
-        break
 
 
 async def test_run_connect_job_not_found(adapter_client):
@@ -623,11 +600,10 @@ async def test_run_connect_timeout(adapter_client):
     ):
         await _run_connect(job_id, device_id)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.error["code"] == "timeout"
-        break
 
 
 async def test_run_connect_marks_failed_even_when_session_poisoned(adapter_client):
@@ -659,9 +635,8 @@ async def test_run_connect_marks_failed_even_when_session_poisoned(adapter_clien
     ):
         await _run_connect(job_id, device_id)
 
-    async for db in get_session():
+    async with session() as db:
         assert (await db.get(Job, job_id)).status == JobStatus.failed
-        break
 
 
 # ── _run_apply ────────────────────────────────────────────────────────────────
@@ -684,7 +659,7 @@ async def test_run_provision_marks_failed_even_when_session_poisoned(adapter_cli
     """Same poisoned-session guard for _run_provision (s3-5). provision_nso_device takes the
     runner's db, so a poisoning stub leaves the session needs-rollback; the runner must
     rollback before committing the failed status or the provision job hangs 'running'."""
-    async for db in get_session():
+    async with session() as db:
         j = Job(
             job_type=JobType.provision,
             device_id=None,
@@ -695,7 +670,6 @@ async def test_run_provision_marks_failed_even_when_session_poisoned(adapter_cli
         await db.commit()
         await db.refresh(j)
         job_id = j.id
-        break
 
     async def poison_provision(db, **params):
         db.add(Job(id=job_id, job_type=JobType.provision, status=JobStatus.queued))
@@ -704,9 +678,8 @@ async def test_run_provision_marks_failed_even_when_session_poisoned(adapter_cli
     with patch("nso_adapter.core.onboarding.provision_nso_device", poison_provision):
         await _run_provision(job_id, None)
 
-    async for db in get_session():
+    async with session() as db:
         assert (await db.get(Job, job_id)).status == JobStatus.failed
-        break
 
 
 class _FakeNb:
@@ -720,8 +693,7 @@ class _FakeNb:
 
 
 async def _queue_provision_job(device_name: str) -> int:
-    job_id = 0
-    async for db in get_session():
+    async with session() as db:
         j = Job(
             job_type=JobType.provision,
             device_id=None,
@@ -731,9 +703,7 @@ async def _queue_provision_job(device_name: str) -> int:
         db.add(j)
         await db.commit()
         await db.refresh(j)
-        job_id = j.id
-        break
-    return job_id
+    return j.id
 
 
 async def test_run_provision_notifies_plugin_on_success(adapter_client):
@@ -750,9 +720,8 @@ async def test_run_provision_notifies_plugin_on_success(adapter_client):
     ):
         await _run_provision(job_id, None)
 
-    async for db in get_session():
+    async with session() as db:
         assert (await db.get(Job, job_id)).status == JobStatus.succeeded
-        break
     assert fake.calls == [job_id]
 
 
@@ -770,7 +739,6 @@ async def test_run_provision_notifies_plugin_on_failure(adapter_client):
     ):
         await _run_provision(job_id, None)
 
-    async for db in get_session():
+    async with session() as db:
         assert (await db.get(Job, job_id)).status == JobStatus.failed
-        break
     assert fake.calls == [job_id]

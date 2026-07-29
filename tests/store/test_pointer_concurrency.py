@@ -34,9 +34,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from nso_adapter.nso.read_outcome import Freshness, Present
 from nso_adapter.store import outcome_store
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Base, Device, DeviceStaticRoute, RefreshOutcome, RefreshOutcomePointer
-from tests.conftest import seed_device
+from tests.conftest import seed_device, session
 
 _PARITY_URL = os.environ.get("ALEMBIC_PARITY_DB_URL")
 
@@ -46,7 +45,7 @@ async def test_late_older_terminalization_is_a_noop(adapter_client):
     """Sequential contract, default lane: after a newer attempt advanced the pointer, an
     older attempt terminalizing from a DIFFERENT session must not move it back."""
     device_id = await seed_device(nso_device_name="ptr-seq1", netbox_device_id=8821)
-    async for db in get_session():
+    async with session() as db:
         a_old = await outcome_store.record_read_outcome(
             db, device_id, "static_route", Present({"r": []}, Freshness.fresh), refresh_source="poll"
         )
@@ -54,14 +53,11 @@ async def test_late_older_terminalization_is_a_noop(adapter_client):
             db, device_id, "static_route", Present({"r": []}, Freshness.fresh), refresh_source="poll"
         )
         await db.commit()
-        break
-    async for db in get_session():
+    async with session() as db:
         await outcome_store.record_result(db, a_new, result="replaced", succeeded=True)
-        break
-    async for db in get_session():
+    async with session() as db:
         await outcome_store.record_result(db, a_old, result="kept", succeeded=False)
-        break
-    async for db in get_session():
+    async with session() as db:
         ptr = (
             await db.execute(
                 select(RefreshOutcomePointer).where(
@@ -71,7 +67,6 @@ async def test_late_older_terminalization_is_a_noop(adapter_client):
             )
         ).scalar_one()
         assert ptr.attempt_id == a_new
-        break
 
 
 @pytest.mark.anyio

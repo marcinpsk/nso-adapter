@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -28,16 +28,14 @@ def _obj(family: str, name: str, *, entries=None, accepted=False, invert_match=F
 
 
 async def _read_intent(device_id: int):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import RoutePolicyObjectIntent
 
-    async for db in get_session():
+    async with session() as db:
         return (
             (await db.execute(select(RoutePolicyObjectIntent).where(RoutePolicyObjectIntent.device_id == device_id)))
             .scalars()
             .all()
         )
-    raise RuntimeError("no session")
 
 
 # ── validation ────────────────────────────────────────────────────────────────
@@ -252,7 +250,6 @@ async def test_put_route_policy_intent_updates_in_place(adapter_client):
 
 @pytest.mark.anyio
 async def test_put_route_policy_intent_full_replace_removes_and_enqueues(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
 
     device_id = await seed_device(nso_device_name="rp-replace", netbox_device_id=7956)
@@ -273,11 +270,10 @@ async def test_put_route_policy_intent_full_replace_removes_and_enqueues(adapter
     rows = await _read_intent(device_id)
     assert {r.name for r in rows} == {"PL-1"}
 
-    async for db in get_session():
+    async with session() as db:
         job = (
             await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal))
         ).scalar_one_or_none()
-        break
     assert job is not None
     # as-path AP-1 was just dropped — threaded (per-family list) for the collateral guard
     assert job.context == {"scope": "route_policy", "removed": {"as-path": ["AP-1"]}, "detach": True}
@@ -285,7 +281,6 @@ async def test_put_route_policy_intent_full_replace_removes_and_enqueues(adapter
 
 @pytest.mark.anyio
 async def test_put_route_policy_intent_no_removal_when_nothing_dropped(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
 
     device_id = await seed_device(nso_device_name="rp-noremoval", netbox_device_id=7957)
@@ -302,21 +297,19 @@ async def test_put_route_policy_intent_no_removal_when_nothing_dropped(adapter_c
     )
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         jobs = (
             (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal)))
             .scalars()
             .all()
         )
-        break
     assert jobs == []
 
 
 async def _set_ned(device_id: int, ned_id: str):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device
 
-    async for db in get_session():
+    async with session() as db:
         dev = await db.get(Device, device_id)
         dev.ned_id = ned_id
         await db.commit()
@@ -373,10 +366,9 @@ async def test_put_reports_no_unrepresentable_members_for_identity_ned(adapter_c
 
 
 async def _removal_job(device_id: int):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
 
-    async for db in get_session():
+    async with session() as db:
         return (
             await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal))
         ).scalar_one_or_none()

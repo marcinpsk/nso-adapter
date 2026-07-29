@@ -16,9 +16,8 @@ from nso_adapter.core.importer import (
     _run_surfaces,
     refresh_all_surfaces_for_device,
 )
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device
-from tests.conftest import seed_device
+from tests.conftest import seed_device, session
 
 # The complete read-mirror family set the comprehensive refresh must cover.
 _EXPECTED_18 = {
@@ -48,12 +47,11 @@ _EXPECTED_18 = {
 
 @asynccontextmanager
 async def _device_session(device_id: int):
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         assert device is not None
         yield db, device
         return
-    raise RuntimeError("no session")
 
 
 def test_projected_wrappers_return_shapes():

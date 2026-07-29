@@ -17,7 +17,7 @@ from datetime import datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -27,11 +27,10 @@ OPTIONAL_ENTRY_KEYS = {"route_map", "metric", "metric_type"}
 
 
 async def _seed_redistribution(device_id: int, entries: list[dict]) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceRedistribution
 
     ts = datetime(2026, 6, 1, 10, 0, 0)
-    async for db in get_session():
+    async with session() as db:
         for entry in entries:
             db.add(
                 DeviceRedistribution(
@@ -48,7 +47,6 @@ async def _seed_redistribution(device_id: int, entries: list[dict]) -> None:
                 )
             )
         await db.commit()
-        break
 
 
 @pytest.mark.anyio

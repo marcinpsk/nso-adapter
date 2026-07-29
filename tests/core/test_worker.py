@@ -8,34 +8,31 @@ import asyncio
 from unittest.mock import patch
 
 from nso_adapter.core import worker
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
+from tests.conftest import session
 
 
 async def _seed_device(nso_device_name: str = "wrk-rtr", netbox_id: int = 700) -> int:
-    async for db in get_session():
+    async with session() as db:
         d = Device(nso_instance="nso-dev", nso_device_name=nso_device_name, netbox_device_id=netbox_id)
         db.add(d)
         await db.commit()
         await db.refresh(d)
         return d.id
-    raise RuntimeError("no session")
 
 
 async def _seed_job(device_id: int, job_type: JobType, status: JobStatus) -> int:
-    async for db in get_session():
+    async with session() as db:
         j = Job(job_type=job_type, device_id=device_id, status=status)
         db.add(j)
         await db.commit()
         await db.refresh(j)
         return j.id
-    raise RuntimeError("no session")
 
 
 async def _get_job(job_id: int) -> Job:
-    async for db in get_session():
+    async with session() as db:
         return await db.get(Job, job_id)
-    raise RuntimeError("no session")
 
 
 # ── _claim_next_job ─────────────────────────────────────────────────────────────
@@ -114,11 +111,10 @@ async def test_requeue_orphaned_leaves_terminal_and_queued(adapter_client):
 
 
 async def _set_heartbeat(job_id: int, hb) -> None:
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         job.heartbeat_at = hb
         await db.commit()
-        break
 
 
 async def test_requeue_orphaned_leaves_live_heartbeating_job(adapter_client):
@@ -261,7 +257,7 @@ async def test_worker_loop_drains_queue(adapter_client):
         seen["job_id"] = jid
         seen["device_id"] = did
         # Runner owns the terminal status, mirroring the real runners.
-        async for db in get_session():
+        async with session() as db:
             job = await db.get(Job, jid)
             job.status = JobStatus.succeeded
             await db.commit()
@@ -313,7 +309,7 @@ async def test_start_and_stop_workers(adapter_client):
 
     # No-op runner so nothing actually executes against NSO.
     async def noop_runner(jid: int, did: int) -> None:
-        async for db in get_session():
+        async with session() as db:
             job = await db.get(Job, jid)
             job.status = JobStatus.succeeded
             await db.commit()
@@ -371,7 +367,7 @@ async def test_cancel_after_success_never_requeues(adapter_client):
     done = asyncio.Event()
 
     async def succeed_then_hang(jid: int, did: int) -> None:
-        async for db in get_session():
+        async with session() as db:
             job = await db.get(Job, jid)
             job.status = JobStatus.succeeded
             await db.commit()
@@ -393,7 +389,7 @@ async def test_ensure_workers_respawns_dead_worker(adapter_client):
     the (unsupervised, created-once) pool has no live task — ensure_workers respawns."""
 
     async def noop_runner(jid: int, did: int) -> None:
-        async for db in get_session():
+        async with session() as db:
             job = await db.get(Job, jid)
             job.status = JobStatus.succeeded
             await db.commit()

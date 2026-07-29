@@ -22,7 +22,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from nso_adapter.main import create_app
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 from tests.test_vault_provider import _FakeClient, _FakeForbidden, _FakeInvalidPath, _FakeKvV2
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -361,10 +361,9 @@ class _NsoTransport(httpx.AsyncBaseTransport):
 
 async def _seed_harvest_device(ned_id: str) -> int:
     device_id = await seed_device(nso_device_name="harvest-dev", netbox_device_id=970)
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device
 
-    async for db in get_session():
+    async with session() as db:
         dev = await db.get(Device, device_id)
         dev.ned_id = ned_id
         await db.commit()

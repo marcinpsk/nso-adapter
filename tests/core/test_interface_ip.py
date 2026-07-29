@@ -15,19 +15,17 @@ from nso_adapter.core.interface_ip import (
     INTERFACE_IP_SPEC,
     refresh_interface_ips_for_device,
 )
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, InterfaceIpAddress
-from tests.conftest import seed_device
+from tests.conftest import seed_device, session
 
 
 @asynccontextmanager
 async def _device_session(device_id: int):
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         assert device is not None
         yield db, device
         return
-    raise RuntimeError("no session")
 
 
 @pytest.mark.anyio

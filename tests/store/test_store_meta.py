@@ -17,15 +17,15 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.store import meta as store_meta
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import StoreMeta
+from tests.conftest import session
 
 
 @pytest.mark.anyio
 async def test_store_meta_row_created_on_startup(adapter_client):
     """App startup (lifespan → _init_database) must leave exactly one store_meta row with a
     valid UUID and a tz-aware born timestamp."""
-    async for db in get_session():
+    async with session() as db:
         rows = (await db.execute(select(StoreMeta))).scalars().all()
         assert len(rows) == 1
         row = rows[0]
@@ -34,7 +34,6 @@ async def test_store_meta_row_created_on_startup(adapter_client):
         # sqlite returns naive datetimes for DateTime(timezone=True) (UTC by convention,
         # like every other tz column in this store); PG serves tz-aware. Assert presence only.
         assert row.born is not None
-        break
 
 
 @pytest.mark.anyio
@@ -44,17 +43,15 @@ async def test_ensure_store_meta_idempotent(adapter_client):
     first = await store_meta.ensure_store_meta()
     second = await store_meta.ensure_store_meta()
     assert first == second
-    async for db in get_session():
+    async with session() as db:
         row = (await db.execute(select(StoreMeta))).scalar_one()
         assert (row.incarnation, row.born) == first
-        break
 
 
 @pytest.mark.anyio
 async def test_get_store_incarnation_serves_persisted_pair(adapter_client):
     """The cached accessor returns the persisted (uuid, born) pair for API handlers."""
     incarnation, born = store_meta.get_store_incarnation()
-    async for db in get_session():
+    async with session() as db:
         row = (await db.execute(select(StoreMeta))).scalar_one()
         assert (row.incarnation, row.born) == (incarnation, born)
-        break

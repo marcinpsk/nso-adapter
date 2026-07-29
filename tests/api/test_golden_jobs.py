@@ -14,7 +14,7 @@ from datetime import datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -23,10 +23,9 @@ TS_Z = "2026-06-01T10:00:00Z"
 
 
 async def _seed_job(device_id: int, **overrides) -> int:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobStatus, JobType
 
-    async for db in get_session():
+    async with session() as db:
         job = Job(
             job_type=JobType.apply,
             device_id=device_id,
@@ -71,15 +70,13 @@ async def test_get_job_maximal_golden(adapter_client):
 @pytest.mark.anyio
 async def test_list_jobs_nullable_golden(adapter_client):
     """A queued job with no device / result / started_at → those keys present as null."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobStatus, JobType
 
-    async for db in get_session():
+    async with session() as db:
         job = Job(job_type=JobType.provision, status=JobStatus.queued, created_at=TS, updated_at=TS)
         db.add(job)
         await db.commit()
         job_id = job.id
-        break
 
     body = (await adapter_client.get("/api/v1/jobs", headers=AUTH)).json()
 

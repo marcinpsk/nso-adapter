@@ -10,8 +10,8 @@ import pytest
 from nso_adapter.config import SchedulerConfig
 from nso_adapter.core import scheduler as scheduler_module
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device
+from tests.conftest import session
 
 
 class _FakeScheduler:
@@ -336,10 +336,9 @@ def test_stop_scheduler_is_noop_when_not_started():
 )
 async def test_poll_job_skips_device_without_nso_client(adapter_client, monkeypatch, scheduled_fn, refresh_target):
     """A device whose NSO instance isn't registered is skipped, not refreshed, without raising."""
-    async for db in get_session():
+    async with session() as db:
         db.add(Device(nso_instance="ghost", nso_device_name="d1", netbox_device_id=4001))
         await db.commit()
-        break
 
     def _raise(*_):
         raise RuntimeError("NSO client for 'ghost' not registered")
@@ -355,7 +354,7 @@ async def test_poll_job_skips_device_without_nso_client(adapter_client, monkeypa
 
 @pytest.mark.anyio
 async def test_scheduled_lag_topology_refresh_refreshes_all_devices(adapter_client, monkeypatch):
-    async for db in get_session():
+    async with session() as db:
         db.add_all(
             [
                 Device(nso_instance="nso-dev", nso_device_name="sw01", netbox_device_id=1001),
@@ -363,7 +362,6 @@ async def test_scheduled_lag_topology_refresh_refreshes_all_devices(adapter_clie
             ]
         )
         await db.commit()
-        break
 
     refresh = AsyncMock()
     nso_client = MagicMock(spec=NsoClient)  # boundary stand-in, bound to the real client interface
@@ -382,7 +380,7 @@ async def test_scheduled_lag_topology_refresh_refreshes_all_devices(adapter_clie
 
 @pytest.mark.anyio
 async def test_scheduled_l2_service_refresh_refreshes_all_devices(adapter_client, monkeypatch):
-    async for db in get_session():
+    async with session() as db:
         db.add_all(
             [
                 Device(nso_instance="nso-dev", nso_device_name="ra1", netbox_device_id=2001),
@@ -390,7 +388,6 @@ async def test_scheduled_l2_service_refresh_refreshes_all_devices(adapter_client
             ]
         )
         await db.commit()
-        break
 
     refresh = AsyncMock()
     nso_client = MagicMock(spec=NsoClient)  # boundary stand-in, bound to the real client interface
@@ -417,7 +414,7 @@ async def test_scheduled_l2_service_refresh_refreshes_all_devices(adapter_client
 )
 async def test_l2l3_family_refresh_refreshes_all_devices(adapter_client, monkeypatch, scheduled_fn, refresh_target):
     """//: the L2/L3 interface-family poll jobs refresh every managed device."""
-    async for db in get_session():
+    async with session() as db:
         db.add_all(
             [
                 Device(nso_instance="nso-dev", nso_device_name="d1", netbox_device_id=3001),
@@ -425,7 +422,6 @@ async def test_l2l3_family_refresh_refreshes_all_devices(adapter_client, monkeyp
             ]
         )
         await db.commit()
-        break
 
     refresh = AsyncMock()
     nso_client = MagicMock(spec=NsoClient)  # boundary stand-in, bound to the real client interface

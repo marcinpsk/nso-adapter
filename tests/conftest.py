@@ -3,11 +3,21 @@
 
 from __future__ import annotations
 
+import itertools
 import os
+import subprocess
+import sys
+import uuid
+import warnings
+from contextlib import asynccontextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import sqlalchemy as sa
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.engine import make_url
+from sqlalchemy.orm import Session as SyncSession
 
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.main import create_app
@@ -19,6 +29,144 @@ from nso_adapter.nso.client import NsoClient
 os.environ.pop("DATABASE_URL", None)
 
 VALID_TOKEN = "test-bearer-token"
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+ADMIN_URL = os.environ.get(
+    "NSO_ADAPTER_TEST_DB_URL",
+    "postgresql+psycopg2://postgres:postgres@127.0.0.1:55433/postgres",
+)
+STRICT_TEARDOWN = os.environ.get("NSO_ADAPTER_TEST_STRICT_TEARDOWN") == "1"
+
+# Run-unique prefix: a crashed run's stragglers can never collide with this run's names.
+_RUN = uuid.uuid4().hex[:8]
+_clone_seq = itertools.count()
+
+
+def _url_for(dbname: str, *, driver: str) -> str:
+    # NB: str(URL) masks the password as literal '***' — always render_as_string.
+    return make_url(ADMIN_URL).set(drivername=driver, database=dbname).render_as_string(hide_password=False)
+
+
+def _drop_database(admin, name: str, *, expect_clean: bool) -> None:
+    """Report stragglers BEFORE forcing. FORCE is last-resort cleanup, not the mechanism.
+
+    A surviving connection means a fixture failed to close a session — a test bug we want
+    visible. Silently FORCE-ing it away is how that bug stays invisible forever.
+    """
+    with admin.connect() as conn:
+        rows = conn.exec_driver_sql(
+            "SELECT pid, state, left(query, 120) FROM pg_stat_activity "
+            f"WHERE datname = '{name}' AND pid <> pg_backend_pid()"
+        ).fetchall()
+        if rows and expect_clean:
+            msg = f"{name}: {len(rows)} connection(s) survived teardown: {rows}"
+            if STRICT_TEARDOWN:
+                conn.exec_driver_sql(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+                raise AssertionError(msg)
+            warnings.warn(msg, stacklevel=2)
+        conn.exec_driver_sql(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
+@pytest.fixture(scope="session")
+def pg_admin():
+    """AUTOCOMMIT admin engine for CREATE/DROP DATABASE. Sync + session-scoped on purpose:
+    an asyncpg pool created on a session-scoped loop and used from per-test loops is UB."""
+    engine = sa.create_engine(ADMIN_URL, isolation_level="AUTOCOMMIT", poolclass=sa.pool.NullPool)
+    try:
+        with engine.connect() as conn:
+            conn.exec_driver_sql("SELECT 1")  # FAIL LOUD: no silent skip lane any more
+        yield engine
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture(scope="session")
+def pg_template(pg_admin):
+    """Build the schema ONCE — via alembic, the schema production runs — into a database
+    used only as a clone source. Wrapped so a SETUP failure (broken migration chain, bad
+    ALTER) still drops the half-built template instead of leaking it."""
+    name = f"nsoadp_{_RUN}_tmpl"
+    with pg_admin.connect() as conn:
+        conn.exec_driver_sql(f'CREATE DATABASE "{name}"')
+    try:
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "nso_adapter.db_migrate"],
+                cwd=_REPO_ROOT,
+                check=True,
+                capture_output=True,
+                # alembic/env.py rewrites +asyncpg -> +psycopg2 itself.
+                env={**os.environ, "DATABASE_URL": _url_for(name, driver="postgresql+asyncpg")},
+            )
+        except subprocess.CalledProcessError as exc:  # surface alembic's own output
+            raise RuntimeError(f"template build failed:\n{exc.stderr.decode()}") from exc
+        yield name
+    finally:
+        _drop_database(pg_admin, name, expect_clean=False)  # build connections are ours
+
+
+@pytest.fixture
+def pg_database(pg_admin, pg_template):
+    """A PRIVATE database per test, cloned from the template."""
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "m")  # xdist-ready, xdist-optional
+    name = f"nsoadp_{_RUN}_{worker}_{next(_clone_seq):05d}"  # always << 63 bytes
+    with pg_admin.connect() as conn:
+        conn.exec_driver_sql(f'CREATE DATABASE "{name}" TEMPLATE "{pg_template}"')
+    try:
+        with pg_admin.connect() as conn:
+            # Fail fast instead of wedging: the family fence is real on PG and can block.
+            # CREATE DATABASE ... TEMPLATE does NOT copy pg_db_role_setting — set per clone.
+            for stmt in (
+                "lock_timeout = '5s'",
+                "statement_timeout = '60s'",
+                "idle_in_transaction_session_timeout = '60s'",
+            ):
+                conn.exec_driver_sql(f'ALTER DATABASE "{name}" SET {stmt}')
+        yield name
+    finally:
+        # An ALTER failure above must not leak the clone — hence the try wrapping it.
+        _drop_database(pg_admin, name, expect_clean=True)
+
+
+@pytest.fixture
+def pg_url(pg_database) -> str:
+    return _url_for(pg_database, driver="postgresql+asyncpg")
+
+
+@pytest.fixture
+def pg_sync_session(pg_database):
+    """Sync Session for the ORM-model tests. Schema comes from the template; FK
+    enforcement is native — no PRAGMA."""
+    engine = sa.create_engine(_url_for(pg_database, driver="postgresql+psycopg2"), poolclass=sa.pool.NullPool)
+    try:
+        with SyncSession(engine) as s:
+            yield s
+    finally:
+        engine.dispose()
+
+
+@asynccontextmanager
+async def session():
+    """One store session with deterministic close — replaces the historical
+    ``get_session`` async-for-with-break loops, whose ``break`` left the
+    generator (and its connection) suspended until GC."""
+    from nso_adapter.store.db import get_session
+
+    gen = get_session()
+    db = await anext(gen)
+    try:
+        yield db
+    finally:
+        await gen.aclose()
+
+
+# Enforceable zero-skip gate (pytest's -rs only REPORTS skips; it never fails the run).
+def pytest_sessionfinish(session, exitstatus):
+    if os.environ.get("NSO_ADAPTER_TEST_NO_SKIPS") != "1":
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter and reporter.stats.get("skipped"):
+        session.exitstatus = 1
 
 
 class count_queries:
@@ -216,14 +364,12 @@ async def pin_store_incarnation() -> None:
 
     from sqlalchemy import update
 
-    from nso_adapter.store.db import get_session as _get_session
     from nso_adapter.store.meta import ensure_store_meta
     from nso_adapter.store.models import StoreMeta
 
-    async for db in _get_session():
+    async with session() as db:
         await db.execute(update(StoreMeta).values(incarnation=GOLDEN_INCARNATION, born=datetime(2026, 6, 1, 0, 0, 0)))
         await db.commit()
-        break
     await ensure_store_meta()
 
 
@@ -249,10 +395,9 @@ async def seed_device(
             device_id = await seed_device(nso_device_name="my-router")
             resp = await adapter_client.get(f"/api/v1/devices/{device_id}", ...)
     """
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device, ManagedScope
 
-    async for db in get_session():
+    async with session() as db:
         d = Device(
             nso_instance=nso_instance,
             nso_device_name=nso_device_name,
@@ -265,7 +410,6 @@ async def seed_device(
         await db.commit()
         await db.refresh(d)
         return d.id
-    raise RuntimeError("seed_device: no DB session available")
 
 
 async def seed_l2_saps(device_id: int, services: list[dict]):
@@ -276,11 +420,10 @@ async def seed_l2_saps(device_id: int, services: list[dict]):
     """
     from datetime import UTC, datetime
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceL2Sap
 
     now = datetime.now(UTC).replace(tzinfo=None)
-    async for db in get_session():
+    async with session() as db:
         for svc in services:
             for sap in svc.get("saps", []):
                 db.add(
@@ -299,7 +442,6 @@ async def seed_l2_saps(device_id: int, services: list[dict]):
                 )
         await db.commit()
         return
-    raise RuntimeError("seed_l2_saps: no DB session available")
 
 
 async def seed_bgp_config(
@@ -324,7 +466,6 @@ async def seed_bgp_config(
             device_id = await seed_device()
             router_id = await seed_bgp_config(device_id)
     """
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import (
         DeviceBgpAddressFamily,
         DeviceBgpPeer,
@@ -338,7 +479,7 @@ async def seed_bgp_config(
     if scopes is None:
         scopes = [{"vrf": "", "afs": ["ipv4-unicast"], "peers": []}]
 
-    async for db in get_session():
+    async with session() as db:
         router = DeviceBgpRouter(device_id=device_id, asn=asn, router_id=router_id, refresh_source="test")
         db.add(router)
         await db.flush()
@@ -401,7 +542,6 @@ async def seed_bgp_config(
         await db.commit()
         await db.refresh(router)
         return router.id
-    raise RuntimeError("seed_bgp_config: no DB session available")
 
 
 async def seed_lag_config(
@@ -417,13 +557,12 @@ async def seed_lag_config(
     """
     from datetime import UTC, datetime
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import LagBundleConfig, LagMemberConfig
 
     if bundles is None:
         bundles = []
 
-    async for db in get_session():
+    async with session() as db:
         now = datetime.now(UTC).replace(tzinfo=None)
         for b in bundles:
             bundle = LagBundleConfig(
@@ -456,11 +595,10 @@ async def seed_vlan_database(device_id: int, vlans: list[dict]):
     """Insert DeviceVlan rows. Each dict: vlan_id, name?."""
     from datetime import UTC, datetime
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceVlan
 
     now = datetime.now(UTC).replace(tzinfo=None)
-    async for db in get_session():
+    async with session() as db:
         for v in vlans:
             db.add(
                 DeviceVlan(
@@ -479,11 +617,10 @@ async def seed_svi(device_id: int, interfaces: list[dict]):
     """Insert DeviceSvi rows. Each dict: interface_name, vlan_id, type?, vrf?."""
     from datetime import UTC, datetime
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceSvi
 
     now = datetime.now(UTC).replace(tzinfo=None)
-    async for db in get_session():
+    async with session() as db:
         for i in interfaces:
             db.add(
                 DeviceSvi(
@@ -507,11 +644,10 @@ async def seed_subinterface(device_id: int, interfaces: list[dict]):
     """
     from datetime import UTC, datetime
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceSubinterface
 
     now = datetime.now(UTC).replace(tzinfo=None)
-    async for db in get_session():
+    async with session() as db:
         for i in interfaces:
             db.add(
                 DeviceSubinterface(
@@ -538,7 +674,6 @@ async def seed_switchport(device_id: int, interfaces: list[dict]):
 
     from sqlalchemy import select
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import (
         DeviceSwitchport,
         DeviceSwitchportTaggedVlan,
@@ -546,7 +681,7 @@ async def seed_switchport(device_id: int, interfaces: list[dict]):
     )
 
     now = datetime.now(UTC).replace(tzinfo=None)
-    async for db in get_session():
+    async with session() as db:
         existing = {
             r.vlan_id: r
             for r in (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device_id))).scalars().all()

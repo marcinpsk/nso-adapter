@@ -21,6 +21,7 @@ from tests.conftest import (
     VALID_TOKEN,
     pin_store_incarnation,
     seed_device,
+    session,
 )
 
 _SYNTH_READ_STATE = {
@@ -43,10 +44,9 @@ TS = datetime(2026, 6, 1, 10, 0, 0)
 
 
 async def _seed_lag(device_id: int) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import LagBundleConfig, LagMemberConfig
 
-    async for db in get_session():
+    async with session() as db:
         b1 = LagBundleConfig(
             device_id=device_id,
             name="Bundle-Ether1",
@@ -69,7 +69,6 @@ async def _seed_lag(device_id: int) -> None:
             )
         )
         await db.commit()
-        break
 
 
 @pytest.mark.anyio
@@ -123,12 +122,11 @@ async def test_lag_config_surfaces_vpc_sensitive(adapter_client):
     """NX-P2: a vPC-protected bundle carries vpc_sensitive=True to the plugin (OMIT shape —
     ordinary bundles omit it, reading False via the model default). The plugin gates Accept on
     this so a vPC bundle never enters a writable intent."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import LagBundleConfig
 
     device_id = await seed_device(nso_device_name="lag-vpc", netbox_device_id=7994)
     await pin_store_incarnation()
-    async for db in get_session():
+    async with session() as db:
         db.add(
             LagBundleConfig(
                 device_id=device_id,
@@ -149,7 +147,6 @@ async def test_lag_config_surfaces_vpc_sensitive(adapter_client):
             )
         )
         await db.commit()
-        break
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/lag-config", headers=AUTH)).json()
     by_name = {b["name"]: b for b in body["bundles"]}

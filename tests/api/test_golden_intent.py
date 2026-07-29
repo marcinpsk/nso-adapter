@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -37,11 +37,10 @@ async def test_get_intent_golden(adapter_client, monkeypatch):
 
     monkeypatch.setattr(intent_mod, "datetime", _FrozenDatetime)
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DbInterface, InterfaceIntent
 
     device_id = await seed_device(nso_device_name="intent-get", netbox_device_id=401)
-    async for db in get_session():
+    async with session() as db:
         iface = DbInterface(device_id=device_id, name="GigabitEthernet0/0", kind="physical")
         db.add(iface)
         await db.flush()
@@ -56,7 +55,6 @@ async def test_get_intent_golden(adapter_client, monkeypatch):
             )
         )
         await db.commit()
-        break
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/intent", headers=AUTH)).json()
 
@@ -105,18 +103,16 @@ async def test_put_intent_result_golden(adapter_client, monkeypatch):
 
 @pytest.mark.anyio
 async def test_get_intent_summary_golden(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import VlanIntent
 
     device_id = await seed_device(nso_device_name="intent-sum", netbox_device_id=404)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             VlanIntent(
                 device_id=device_id, vlan_id=10, name="v10", accepted_at=TS, last_apply_at=TS, last_apply_error={"e": 1}
             )
         )
         await db.commit()
-        break
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/intent-summary", headers=AUTH)).json()
     assert body == {"device_id": device_id, "scopes": {"vlan_intent": {"count": 1, "applied": 1, "failed": 1}}}

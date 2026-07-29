@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -33,15 +33,13 @@ class _FrozenDatetime(datetime):
 
 
 async def _seed_scope_rows(device_id: int, attributes: list[str]) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceSettings, ManagedScope
 
-    async for db in get_session():
+    async with session() as db:
         for attr in attributes:
             db.add(ManagedScope(device_id=device_id, attribute=attr, updated_at=TS))
         db.add(DeviceSettings(device_id=device_id, auto_apply=True, sync_before_apply=False))
         await db.commit()
-        break
 
 
 @pytest.mark.anyio

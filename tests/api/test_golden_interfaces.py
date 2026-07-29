@@ -16,7 +16,7 @@ from datetime import datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -25,10 +25,9 @@ TS = datetime(2026, 5, 20, 10, 0, 0)
 
 async def _seed_iface_full(device_id: int) -> None:
     """One logical interface with a with-intent attr and a state-only attr."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DbInterface, InterfaceAttrState, InterfaceIntent, SyncState
 
-    async for db in get_session():
+    async with session() as db:
         iface = DbInterface(
             device_id=device_id,
             name="GE0/0.100",
@@ -71,7 +70,6 @@ async def _seed_iface_full(device_id: int) -> None:
             )
         )
         await db.commit()
-        break
 
 
 @pytest.mark.anyio
@@ -115,14 +113,12 @@ async def test_interfaces_golden_body(adapter_client):
 @pytest.mark.anyio
 async def test_interfaces_golden_physical_nulls(adapter_client):
     """A physical port: netbox_interface_id + all logical-modeling keys are null."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DbInterface
 
     device_id = await seed_device(nso_device_name="if-golden-phys", netbox_device_id=7941)
-    async for db in get_session():
+    async with session() as db:
         db.add(DbInterface(device_id=device_id, name="GE0/1"))
         await db.commit()
-        break
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/interfaces", headers=AUTH)).json()
     assert body == [
@@ -150,10 +146,9 @@ async def test_interfaces_golden_empty(adapter_client):
 
 
 async def _seed_state(device_id: int) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DbInterface, InterfaceAttrState, SyncState
 
-    async for db in get_session():
+    async with session() as db:
         for name, state in (("GE0/1", SyncState.imported), ("GE0/2", SyncState.changed)):
             iface = DbInterface(device_id=device_id, name=name)
             db.add(iface)
@@ -169,7 +164,6 @@ async def _seed_state(device_id: int) -> None:
                 )
             )
         await db.commit()
-        break
 
 
 @pytest.mark.anyio

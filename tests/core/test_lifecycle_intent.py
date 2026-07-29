@@ -20,16 +20,15 @@ from unittest.mock import AsyncMock, patch
 from sqlalchemy import select
 
 from nso_adapter.core import importer as imp
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import DbInterface, InterfaceAttrState, InterfaceIntent, SyncState
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 
 async def _seed(device_id, *, netbox_value, nso_value, status=SyncState.imported):
     """Seed an interface + description attr_state, return (interface_id, attr_id)."""
-    async for db in get_session():
+    async with session() as db:
         iface = DbInterface(device_id=device_id, name="GE0/0", netbox_interface_id=100)
         db.add(iface)
         await db.flush()
@@ -43,20 +42,17 @@ async def _seed(device_id, *, netbox_value, nso_value, status=SyncState.imported
         db.add(attr)
         await db.commit()
         return iface.id, attr.id
-    raise RuntimeError("no session")
 
 
 async def _add_deployed_intent(iface_id, intent_value="op-desc"):
-    async for db in get_session():
+    async with session() as db:
         db.add(InterfaceIntent(interface_id=iface_id, attribute="description", intent_value=intent_value))
         await db.commit()
-        break
 
 
 async def _get_attr(attr_id):
-    async for db in get_session():
+    async with session() as db:
         return await db.get(InterfaceAttrState, attr_id)
-    raise RuntimeError("no session")
 
 
 async def _run_detect_drift(device_id, device_name, device_reports):
@@ -74,9 +70,8 @@ async def _run_detect_drift(device_id, device_name, device_reports):
     imp._nso_clients["nso-dev"] = nso
     imp._netbox_client = None
     with patch("nso_adapter.core.importer.nso_actions.compare_config", new_callable=AsyncMock):
-        async for db in get_session():
+        async with session() as db:
             await imp.detect_drift(device_id, db)
-            break
 
 
 async def test_put_intent_stamps_accepted_and_writes_intent_table(adapter_client):
@@ -94,11 +89,10 @@ async def test_put_intent_stamps_accepted_and_writes_intent_table(adapter_client
     attr = await _get_attr(attr_id)
     assert attr.sync_state == SyncState.accepted
 
-    async for db in get_session():
+    async with session() as db:
         rows = (
             (await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface_id))).scalars().all()
         )
-        break
     assert len(rows) == 1
     assert rows[0].intent_value == "op-desc"
 

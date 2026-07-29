@@ -26,6 +26,7 @@ from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from nso_adapter.store.models import Base, Device
+from tests.conftest import session as store_session
 
 _PARITY_URL = os.environ.get("ALEMBIC_PARITY_DB_URL")
 
@@ -192,7 +193,7 @@ async def test_family_get_serves_snapshot_across_midrequest_commit(adapter_clien
 
     from sqlalchemy import event
 
-    from nso_adapter.store.db import get_engine, get_session
+    from nso_adapter.store.db import get_engine
     from tests.conftest import VALID_TOKEN, seed_device
 
     auth = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -205,7 +206,7 @@ async def test_family_get_serves_snapshot_across_midrequest_commit(adapter_clien
     sync.execute("PRAGMA journal_mode=WAL")
     sync.commit()
 
-    async for db in get_session():
+    async with store_session() as db:
         from datetime import datetime
 
         from nso_adapter.store.models import DeviceStaticRoute
@@ -221,7 +222,6 @@ async def test_family_get_serves_snapshot_across_midrequest_commit(adapter_clien
             )
         )
         await db.commit()
-        break
 
     fired = []
 

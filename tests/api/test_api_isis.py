@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 TS = datetime(2026, 6, 2, 19, 27, 0, tzinfo=UTC)
@@ -21,10 +21,9 @@ async def _seed_isis_iface(
     prefix_sids: list | None = None,
     refresh_source: str = "poll",
 ) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceIsisInterface
 
-    async for db in get_session():
+    async with session() as db:
         db.add(
             DeviceIsisInterface(
                 device_id=device_id,
@@ -37,7 +36,6 @@ async def _seed_isis_iface(
             )
         )
         await db.commit()
-        break
 
 
 async def test_isis_interface_surfaces_bound_port(adapter_client):

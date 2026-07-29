@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -12,11 +12,10 @@ async def test_get_device_includes_failover_block(adapter_client):
     """GET /devices/{id} carries the failover status block the plugin's NSO tab renders."""
     from datetime import UTC, datetime
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import ActiveAddress, DeviceFailover
 
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="fo-rtr", netbox_device_id=70)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             DeviceFailover(
                 device_id=device_id,
@@ -33,7 +32,6 @@ async def test_get_device_includes_failover_block(adapter_client):
             )
         )
         await db.commit()
-        break
 
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}", headers=AUTH)
     assert resp.status_code == 200
@@ -62,16 +60,14 @@ async def test_get_device_failover_null_when_unmanaged(adapter_client):
 async def test_get_device_exposes_partial_sync_and_degraded_surfaces(adapter_client):
     """A partial sync surfaces last_sync_status='partial' + degraded_surfaces so the
     plugin can warn that some routing surfaces are stale (finding s2-2)."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device, LastSyncStatus
 
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="degraded-rtr", netbox_device_id=72)
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         device.last_sync_status = LastSyncStatus.partial
         device.degraded_surfaces = ["bgp", "ospf"]
         await db.commit()
-        break
 
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}", headers=AUTH)
     assert resp.status_code == 200

@@ -17,7 +17,7 @@ doc and the other.
 from __future__ import annotations
 
 from nso_adapter.store.models import DbInterface, InterfaceAttrState, InterfaceIntent, SyncState
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -49,9 +49,7 @@ async def _seed_iface_with_intent(device_id: int):
     so every attr key (including last_apply_at / last_apply_error) is exercised."""
     from datetime import datetime
 
-    from nso_adapter.store.db import get_session
-
-    async for db in get_session():
+    async with session() as db:
         iface = DbInterface(device_id=device_id, name="GE0/0", netbox_interface_id=1000)
         db.add(iface)
         await db.flush()
@@ -74,7 +72,6 @@ async def _seed_iface_with_intent(device_id: int):
             )
         )
         await db.commit()
-        break
 
 
 async def test_interfaces_payload_matches_contract_exactly(adapter_client):

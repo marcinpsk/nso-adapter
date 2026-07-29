@@ -15,7 +15,7 @@ from datetime import datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -28,12 +28,11 @@ MEMBER_OPTIONAL_KEYS = {"mode", "port_priority"}
 
 @pytest.mark.anyio
 async def test_lag_config_contract(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import LagBundleConfig, LagMemberConfig
 
     device_id = await seed_device(nso_device_name="lag-ct", netbox_device_id=7990)
     ts = datetime(2026, 6, 1, 10, 0, 0)
-    async for db in get_session():
+    async with session() as db:
         # Maximal bundle (every optional) + minimal bundle (only required).
         b1 = LagBundleConfig(
             device_id=device_id,
@@ -56,7 +55,6 @@ async def test_lag_config_contract(adapter_client):
         )
         db.add(b2)
         await db.commit()
-        break
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/lag-config", headers=AUTH)).json()
     assert set(body.keys()) == TOP_KEYS

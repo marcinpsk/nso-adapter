@@ -19,6 +19,7 @@ from tests.conftest import (
     VALID_TOKEN,
     pin_store_incarnation,
     seed_device,
+    session,
 )
 
 _SYNTH_READ_STATE = {
@@ -41,10 +42,9 @@ TS = datetime(2026, 6, 1, 10, 0, 0)
 
 
 async def _seed_logging(device_id: int) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceLoggingHost
 
-    async for db in get_session():
+    async with session() as db:
         db.add(
             DeviceLoggingHost(
                 device_id=device_id,
@@ -61,7 +61,6 @@ async def _seed_logging(device_id: int) -> None:
         )
         db.add(DeviceLoggingHost(device_id=device_id, address="10.0.0.6", last_refreshed_at=TS, refresh_source="poll"))
         await db.commit()
-        break
 
 
 @pytest.mark.anyio
@@ -108,13 +107,11 @@ async def test_logging_golden_empty(adapter_client):
 
 
 async def _seed_levels(device_id: int, **severities) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceLoggingLevels
 
-    async for db in get_session():
+    async with session() as db:
         db.add(DeviceLoggingLevels(device_id=device_id, last_refreshed_at=TS, refresh_source="poll", **severities))
         await db.commit()
-        break
 
 
 @pytest.mark.anyio

@@ -15,7 +15,7 @@ from datetime import datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -26,12 +26,11 @@ ADDR_KEYS = {"address", "prefix_length", "family", "secondary", "vrf"}
 
 @pytest.mark.anyio
 async def test_interface_ips_contract(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import InterfaceIpAddress
 
     device_id = await seed_device(nso_device_name="ip-ct", netbox_device_id=7980)
     ts = datetime(2026, 6, 1, 10, 0, 0)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             InterfaceIpAddress(
                 device_id=device_id,
@@ -46,7 +45,6 @@ async def test_interface_ips_contract(adapter_client):
             )
         )
         await db.commit()
-        break
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/interface-ips", headers=AUTH)).json()
     assert set(body.keys()) == TOP_KEYS

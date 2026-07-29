@@ -28,6 +28,7 @@ from nso_adapter.main import (
     _shutdown_sse,
     _start_sse_streams,
 )
+from tests.conftest import session
 
 
 def _scheduler(**flags):
@@ -84,16 +85,14 @@ def _sse_event(*names):
 
 
 async def _seed_sse_device(name="sse-rtr", instance="nso-dev", netbox_id=8801):
-    from nso_adapter.store.db import get_session as _gs
     from nso_adapter.store.models import Device as _Device
 
-    async for db in _gs():
+    async with session() as db:
         d = _Device(nso_instance=instance, nso_device_name=name, netbox_device_id=netbox_id)
         db.add(d)
         await db.commit()
         await db.refresh(d)
         return d.id
-    raise RuntimeError("no session")
 
 
 async def _drain_coalescer(tasks: set[asyncio.Task]) -> None:
@@ -106,7 +105,6 @@ async def test_dispatch_runs_one_comprehensive_refresh_per_changed_device(adapte
     comprehensive projected refresh for the device — every family, one doc GET —
     instead of nine per-family section refreshes."""
     from nso_adapter import main as main_mod
-    from nso_adapter.store.db import get_session as _gs
 
     device_id = await _seed_sse_device("sse-rtr-1", netbox_id=8802)
     calls: list[tuple[int, str, bool]] = []
@@ -120,9 +118,8 @@ async def test_dispatch_runs_one_comprehensive_refresh_per_changed_device(adapte
     tasks: set[asyncio.Task] = set()
     coalescer = main_mod._DeviceRefreshCoalescer({"nso-dev": object()}, tasks, tasks.discard)
     cfg = SimpleNamespace(scheduler=_scheduler())
-    async for db in _gs():
+    async with session() as db:
         await main_mod._dispatch_netconf_change(cfg, _sse_event("sse-rtr-1"), db, {"nso-dev": object()}, coalescer)
-        break
     await _drain_coalescer(tasks)
 
     assert calls == [(device_id, "notification", False)]
@@ -131,7 +128,6 @@ async def test_dispatch_runs_one_comprehensive_refresh_per_changed_device(adapte
 async def test_dispatch_scopes_to_the_handler_instance_map(adapter_client, monkeypatch):
     """codex R1-F8: a same-name device on an UNMAPPED instance is untouched."""
     from nso_adapter import main as main_mod
-    from nso_adapter.store.db import get_session as _gs
 
     await _seed_sse_device("sse-dup", instance="nso-other", netbox_id=8803)
     calls: list[int] = []
@@ -144,11 +140,10 @@ async def test_dispatch_scopes_to_the_handler_instance_map(adapter_client, monke
 
     tasks: set[asyncio.Task] = set()
     coalescer = main_mod._DeviceRefreshCoalescer({"nso-dev": object()}, tasks, tasks.discard)
-    async for db in _gs():
+    async with session() as db:
         await main_mod._dispatch_netconf_change(
             SimpleNamespace(scheduler=_scheduler()), _sse_event("sse-dup"), db, {"nso-dev": object()}, coalescer
         )
-        break
     await _drain_coalescer(tasks)
 
     assert calls == []

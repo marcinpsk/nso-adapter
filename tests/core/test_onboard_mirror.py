@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from nso_adapter.nso.client import NsoClient
+from tests.conftest import session
 
 
 def _mock_client(*, sync=True):
@@ -44,13 +45,11 @@ async def _provision(db, client, refresh_spy, *, name):
 @pytest.mark.anyio
 async def test_provision_fills_mirror_after_successful_sync_from(adapter_client_with_nso):
     """sync-from succeeded → the comprehensive mirror refresh runs for the new device (A2)."""
-    from nso_adapter.store.db import get_session
 
     client = _mock_client(sync=True)
     refresh_spy = AsyncMock(return_value=[])
-    async for db in get_session():
+    async with session() as db:
         res = await _provision(db, client, refresh_spy, name="fresh-ok")
-        break
 
     assert res["ok"] is True
     refresh_spy.assert_awaited_once()
@@ -61,13 +60,11 @@ async def test_provision_fills_mirror_after_successful_sync_from(adapter_client_
 async def test_provision_skips_mirror_when_sync_from_failed(adapter_client_with_nso):
     """sync-from returned False → skip the initial refresh so a not-yet-populated export
     cannot wipe/commit an empty mirror; provisioning still succeeds and the poll heals later."""
-    from nso_adapter.store.db import get_session
 
     client = _mock_client(sync=False)
     refresh_spy = AsyncMock(return_value=[])
-    async for db in get_session():
+    async with session() as db:
         res = await _provision(db, client, refresh_spy, name="fresh-nosync")
-        break
 
     assert res["ok"] is True
     refresh_spy.assert_not_awaited()

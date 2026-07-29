@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -45,12 +45,11 @@ LOGGING_HOST_OPTIONAL_KEYS = {"port", "severity", "facility", "transport", "vrf"
 async def test_snmp_config_contract(adapter_client):
     from datetime import datetime
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import SnmpCommunity, SnmpHost, SnmpSystemInfo, SnmpV3User
 
     device_id = await seed_device(nso_device_name="snmp-ct", netbox_device_id=7960)
     ts = datetime(2026, 6, 1, 10, 0, 0)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             SnmpCommunity(
                 device_id=device_id,
@@ -88,7 +87,6 @@ async def test_snmp_config_contract(adapter_client):
             )
         )
         await db.commit()
-        break
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/snmp-config", headers=AUTH)).json()
     assert set(body.keys()) == SNMP_TOP_KEYS
@@ -102,12 +100,11 @@ async def test_snmp_config_contract(adapter_client):
 async def test_logging_config_contract(adapter_client):
     from datetime import datetime
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceLoggingHost
 
     device_id = await seed_device(nso_device_name="log-ct", netbox_device_id=7961)
     ts = datetime(2026, 6, 1, 10, 0, 0)
-    async for db in get_session():
+    async with session() as db:
         # Maximal host (every optional) + minimal host (only address).
         db.add(
             DeviceLoggingHost(
@@ -125,7 +122,6 @@ async def test_logging_config_contract(adapter_client):
         )
         db.add(DeviceLoggingHost(device_id=device_id, address="10.0.0.6", last_refreshed_at=ts, refresh_source="poll"))
         await db.commit()
-        break
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/logging-config", headers=AUTH)).json()
     assert set(body.keys()) == LOGGING_TOP_KEYS

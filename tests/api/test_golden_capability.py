@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 _NED = "cisco-ios-cli-6.114"
@@ -27,17 +27,15 @@ _SW = "17.15.4c"
 
 async def _set_key_and_rows(device_id: int, ned_id: str, sw_version: str, rows: list[dict]) -> None:
     """Stamp the device's learned (ned_id, sw_version) key and seed device_capability rows."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device, DeviceCapability
 
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         device.ned_id = ned_id
         device.sw_version = sw_version
         for r in rows:
             db.add(DeviceCapability(ned_id=ned_id, sw_version=sw_version, **r))
         await db.commit()
-        break
 
 
 @pytest.mark.anyio

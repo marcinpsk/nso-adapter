@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 TS = datetime(2026, 6, 10, 9, 0, 0, tzinfo=UTC)
@@ -23,11 +23,10 @@ async def _seed_routes(
     last_refreshed_at: datetime = TS,
 ) -> None:
     """Seed DeviceStaticRoute rows for a device."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceStaticRoute
 
     ts = last_refreshed_at.replace(tzinfo=None)
-    async for db in get_session():
+    async with session() as db:
         for route in routes:
             db.add(
                 DeviceStaticRoute(
@@ -45,7 +44,6 @@ async def _seed_routes(
                 )
             )
         await db.commit()
-        break
 
 
 # ── GET /api/v1/devices/{id}/static-routes ──────────────────────────────────
@@ -192,7 +190,6 @@ async def test_read_path_carries_next_hop_vrf(adapter_client):
 
     from nso_adapter.core.static_route import refresh_static_routes_for_device
     from nso_adapter.nso.client import NsoClient
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device
 
     device_id = await seed_device(nso_device_name="sr-leak-dev", netbox_device_id=974)
@@ -205,10 +202,9 @@ async def test_read_path_carries_next_hop_vrf(adapter_client):
             {"vrf": "", "prefix": "10.0.0.0/24", "next-hop": "192.0.2.1"},
         ],
     }
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         assert await refresh_static_routes_for_device(db, device, client) is True
-        break
 
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/static-routes", headers=AUTH)
     assert resp.status_code == 200
@@ -222,7 +218,6 @@ async def test_intent_put_carries_next_hop_vrf_and_interface_next_hop(adapter_cl
     """Accepting a leaked/interface route must not strip its next-hop forms: the intent
     PUT stores them and the apply body emits them (a replace-apply would otherwise
     silently rewrite the route without the leak VRF / egress interface)."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import StaticRouteIntent
 
     device_id = await seed_device(nso_device_name="sr-leak-intent", netbox_device_id=975)
@@ -240,7 +235,7 @@ async def test_intent_put_carries_next_hop_vrf_and_interface_next_hop(adapter_cl
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/static-route-intent", json=body, headers=AUTH)
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         row = (
             (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
             .scalars()
@@ -248,14 +243,13 @@ async def test_intent_put_carries_next_hop_vrf_and_interface_next_hop(adapter_cl
         )
         assert row.next_hop_vrf == "default"
         assert row.interface_next_hop == "MgmtEth0/RSP0/CPU0/0"
-        break
 
     # Re-PUT the same key with the forms cleared → the update branch must clear them too.
     body["routes"][0].pop("next_hop_vrf")
     body["routes"][0].pop("interface_next_hop")
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/static-route-intent", json=body, headers=AUTH)
     assert resp.status_code == 200
-    async for db in get_session():
+    async with session() as db:
         row = (
             (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
             .scalars()
@@ -263,4 +257,3 @@ async def test_intent_put_carries_next_hop_vrf_and_interface_next_hop(adapter_cl
         )
         assert row.next_hop_vrf is None
         assert row.interface_next_hop is None
-        break

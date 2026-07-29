@@ -25,6 +25,7 @@ from tests.conftest import (
     VALID_TOKEN,
     pin_store_incarnation,
     seed_device,
+    session,
 )
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -39,10 +40,9 @@ async def _seed_pinned_outcome(device_id: int) -> int:
 
     from nso_adapter.nso.read_outcome import Freshness, Present
     from nso_adapter.store import outcome_store
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import RefreshOutcome
 
-    async for db in get_session():
+    async with session() as db:
         attempt_id = await outcome_store.record_read_outcome(
             db, device_id, "static_route", Present({"r": []}, Freshness.fresh), refresh_source="poll"
         )
@@ -52,14 +52,12 @@ async def _seed_pinned_outcome(device_id: int) -> int:
         )
         await db.commit()
         return attempt_id
-    raise AssertionError("no session")
 
 
 async def _seed_static_routes(device_id: int) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceStaticRoute
 
-    async for db in get_session():
+    async with session() as db:
         # MAXIMAL route — every optional key set, incl. next_hop_vrf.
         db.add(
             DeviceStaticRoute(
@@ -89,7 +87,6 @@ async def _seed_static_routes(device_id: int) -> None:
             )
         )
         await db.commit()
-        break
 
 
 @pytest.mark.anyio
