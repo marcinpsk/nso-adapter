@@ -565,14 +565,35 @@ def test_build_netbox_client_defaults_verify_true(clean_netbox_registry):
     assert client._verify is True
 
 
-async def test_init_database_never_materializes_schema(monkeypatch, pg_url):
+@pytest.fixture
+def unmigrated_pg_url(pg_admin):
+    """A database with NO schema whatsoever — plain CREATE DATABASE, never TEMPLATE.
+
+    The normal ``pg_url`` clone is already at head, so a reintroduced ``create_all`` there
+    would be an idempotent no-op and a before/after table comparison would pass vacuously.
+    Starting from zero tables is what makes "the lifespan created nothing" falsifiable.
+    """
+    import uuid as uuid_mod
+
+    from tests.conftest import _drop_database, _url_for
+
+    name = f"nsoadp_empty_{uuid_mod.uuid4().hex[:8]}"
+    with pg_admin.connect() as conn:
+        conn.exec_driver_sql(f'CREATE DATABASE "{name}"')
+    try:
+        yield _url_for(name, driver="postgresql+asyncpg")
+    finally:
+        _drop_database(pg_admin, name, expect_clean=True)
+
+
+async def test_init_database_never_materializes_schema(monkeypatch, unmigrated_pg_url):
     """s3-25, PG-only: alembic is the ONE schema source. The lifespan binds the engine and
     mints the incarnation; it must never create tables, because a second materialiser in the
     startup path is exactly the DuplicateTable hazard.
 
-    Asserted against a REAL engine on an empty-but-migrated clone: any table the lifespan
-    created would show up as a table the migration did not, so compare the table set before
-    and after. A fake engine could only prove "no .begin() call"; this proves no DDL."""
+    Runs against a genuinely EMPTY database, so any DDL the lifespan emits shows up as a
+    table that nothing else could have made. A fake engine would only prove "no .begin()
+    call"; a migrated clone would prove nothing at all."""
     import sqlalchemy as sa
     from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -582,10 +603,11 @@ async def test_init_database_never_materializes_schema(monkeypatch, pg_url):
     def _tables(conn):
         return set(sa.inspect(conn).get_table_names())
 
-    engine = create_async_engine(pg_url)
+    engine = create_async_engine(unmigrated_pg_url)
     try:
         async with engine.connect() as conn:
             before = await conn.run_sync(_tables)
+        assert before == set(), f"the fixture must hand over an EMPTY database, got {sorted(before)}"
 
         ensure_calls = []
 
@@ -597,7 +619,7 @@ async def test_init_database_never_materializes_schema(monkeypatch, pg_url):
 
         monkeypatch.setattr(store_meta, "ensure_store_meta", _fake_ensure)
         try:
-            await _init_database(SimpleNamespace(database_url=pg_url))
+            await _init_database(SimpleNamespace(database_url=unmigrated_pg_url))
             assert ensure_calls, "the store-incarnation mint must run at init"
             async with engine.connect() as conn:
                 after = await conn.run_sync(_tables)
@@ -608,8 +630,7 @@ async def test_init_database_never_materializes_schema(monkeypatch, pg_url):
             store_db._engine = None
             store_db._session_factory = None
 
-        assert after == before, f"the lifespan materialised schema: {sorted(after - before)}"
-        assert "devices" in before, "the clone should already be at head — otherwise this proves nothing"
+        assert after == set(), f"the lifespan materialised schema: {sorted(after)}"
     finally:
         await engine.dispose()
 

@@ -10,6 +10,7 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+from nso_adapter.store.db import require_postgresql_url  # noqa: E402
 from nso_adapter.store.models import Base  # noqa: E402
 
 target_metadata = Base.metadata
@@ -18,6 +19,9 @@ target_metadata = Base.metadata
 _db_url = os.environ.get("DATABASE_URL")
 if not _db_url:
     raise RuntimeError("DATABASE_URL must be set for alembic (PostgreSQL). Migrations are never run against sqlite.")
+# Second call site of the shared validator: `alembic upgrade head` from the CLI bypasses
+# nso_adapter.db_migrate entirely, and this runs before any engine is built.
+require_postgresql_url(_db_url, label="DATABASE_URL")
 # Convert the async driver to the sync driver alembic uses.
 _db_url = _db_url.replace("postgresql+asyncpg", "postgresql+psycopg2")
 config.set_main_option("sqlalchemy.url", _db_url)

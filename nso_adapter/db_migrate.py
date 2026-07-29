@@ -18,11 +18,13 @@ Alembic programmatically.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from alembic.config import Config
 
 from alembic import command
+from nso_adapter.store.db import require_postgresql_url
 
 # repo root == parent of the nso_adapter package; alembic.ini + alembic/ live there
 # in both the dev bind-mount (/app) and the prod image (see Dockerfile COPYs).
@@ -36,6 +38,10 @@ def make_config() -> Config:
 
 
 def upgrade_head() -> None:
+    # BEFORE alembic: the entrypoint runs this ahead of the app, so this is the first
+    # thing that would touch the database. Left unchecked, a wrong DATABASE_URL executes
+    # real DDL for several revisions before the chain dies on a dialect difference.
+    require_postgresql_url(os.environ.get("DATABASE_URL", ""), label="DATABASE_URL")
     command.upgrade(make_config(), "head")
 
 
