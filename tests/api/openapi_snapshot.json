@@ -7329,6 +7329,17 @@
             "title": "Prefix",
             "type": "string"
           },
+          "route_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Id"
+          },
           "tag": {
             "anyOf": [
               {
@@ -12252,7 +12263,7 @@
     },
     "/api/v1/devices/{device_id}/static-route-intent": {
       "put": {
-        "description": "Replace the adapter's static-route intent mirror for this device atomically.\n\nFull-replace semantics: rows not present in the request body are deleted.\n``accepted_at`` defaults to now if not supplied.  If ``auto_apply`` is\nenabled on the device, an apply job is enqueued after the upsert.",
+        "description": "Replace the adapter's static-route intent mirror for this device atomically.\n\nFull-replace semantics: rows not present in the request body are deleted.\n``accepted_at`` defaults to now if not supplied.  If ``auto_apply`` is\nenabled on the device, an apply job is enqueued after the upsert.\n\nMatching is ``route_id``-first, falling back to the ``(vrf, prefix, next_hop)``\ntriple: an operator editing a route's prefix or next-hop therefore updates the\nintent row **in place** instead of appearing as an unrelated delete plus insert.\nA deletion on a device whose rows all carry a ``route_id`` also writes a\ntombstone \u2014 the only carrier of that deletion once the row is gone.",
         "operationId": "put_static_route_intent_api_v1_devices__device_id__static_route_intent_put",
         "parameters": [
           {

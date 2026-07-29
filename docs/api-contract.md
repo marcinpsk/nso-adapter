@@ -692,7 +692,7 @@ Field notes:
 - `interface_next_hop`: interface name string; present only when there is no IP next-hop.
 - `metric`, `permanent`, `tag`, `name`: optional; omitted from response when `null`.
 
-### `PUT /api/v1/devices/{id}/static-route-intent` → `200 | 404`
+### `PUT /api/v1/devices/{id}/static-route-intent` → `200 | 404 | 422`
 
 Push (full-replace) the static route intent mirror for this device.
 Only routes with an IP `next_hop` are supported in v1 — interface-only next-hop
@@ -702,6 +702,7 @@ routes must be omitted by the caller.
 {
   "routes": [
     {
+      "route_id": 41,
       "vrf": "",
       "prefix": "0.0.0.0/0",
       "next_hop": "10.0.0.1",
@@ -718,12 +719,43 @@ Response:
 { "device_id": 1, "count": 1 }
 ```
 
-Full-replace semantics: any route key `(vrf, prefix, next_hop)` not present in the
-request body is deleted from the intent mirror.  `accepted_at` defaults to the
-server's current UTC time if not supplied.
+Full-replace semantics: any route the body does not carry is deleted from the intent
+mirror.  `accepted_at` defaults to the server's current UTC time if not supplied.
 
 If `auto_apply` is `true` on the device settings and `count > 0`, an apply job is
 enqueued automatically.
+
+#### Matching: `route_id` first, then the triple
+
+`route_id` is optional and holds the pusher's own identifier for the route (the NetBox
+`routing.StaticRoute` pk). Entries are paired with stored rows by `route_id` where it is
+present, and by `(vrf, prefix, next_hop)` otherwise. Because of that, editing a route's
+prefix or next-hop updates the stored row **in place** — it keeps its identity, its
+`accepted_at` history and its record of what was last applied — instead of reading as an
+unrelated delete plus insert.
+
+An entry carrying a `route_id` the store has not seen adopts the row holding its triple
+**only if that row has no `route_id` of its own**, backfilling the id. If the row already
+belongs to a different `route_id`, the two are different routes that happen to share a
+triple: the stored row is deleted (its deletion is recorded) and a new row is inserted.
+
+A push that omits `route_id` on every entry behaves exactly as it always has: matching
+is by triple, and any route the body drops is treated as no longer governed
+(`detach` — the device is not touched). Deletions only produce a correlated deletion
+record once **every** stored row for that device carries a `route_id`.
+
+#### `422` refusals
+
+All use the standard envelope with `error.code = "validation_error"`; the specific rule
+is in `error.detail.reason`:
+
+| `reason` | meaning |
+|---|---|
+| `duplicate_triple` | two entries carry the same `(vrf, prefix, next_hop)`; `detail.triple` names it |
+| `duplicate_route_id` | two entries claim the same non-null `route_id`; `detail.route_id` names it |
+
+Entries with no `route_id` never collide with each other — a body of routes that all omit
+it is the normal shape and is accepted.
 
 ### `GET /api/v1/devices/{id}/interface-ips` → `200 | 404`
 
