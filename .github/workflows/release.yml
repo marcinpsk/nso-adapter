@@ -1,0 +1,135 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+# Never cancel a run that may already be pushing an image.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  release-please:
+    name: Maintain the release PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      # Every push to main refreshes the pending release PR from the conventional
+      # commits since the last tag; merging that PR is what tags and releases.
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7  # v5.0.0
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  docker:
+    name: Build and push the image
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out the released tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+          persist-credentials: false
+
+      # Attestations need the docker-container driver; the default driver
+      # silently drops them.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The event here is a push to main, not a tag push, so every semver
+      # pattern has to be fed the tag release-please just cut.
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.release-please.outputs.tag_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-please.outputs.tag_name }}
+            type=semver,pattern={{major}},value=${{ needs.release-please.outputs.tag_name }}
+          # auto, not true: a prerelease must never take over the latest tag.
+          flavor: |
+            latest=auto
+
+      # Built locally first so the version check below runs before anything is
+      # published. Attestations are deliberately absent here — they only exist
+      # on a registry push, and this image is thrown away.
+      - name: Build for verification
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: nso-adapter:verify
+
+      # Guards the version chain: release-please has to have bumped
+      # nso_adapter/__init__.py to exactly the tag it cut, and that is the value
+      # the running service reports on /health.
+      - name: Verify the image reports the released version
+        env:
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          expected="${TAG_NAME#v}"
+          reported="$(docker run --rm --entrypoint /app/.venv/bin/python nso-adapter:verify \
+            -c 'import nso_adapter; print(nso_adapter.__version__)')"
+          if [ "$reported" != "$expected" ]; then
+            echo "::error::image reports version '$reported' but tag $TAG_NAME expects '$expected'"
+            exit 1
+          fi
+          echo "image reports $reported"
+
+      # Cache-hits every layer from the verification build, so this only adds
+      # the push, the attestations and the release tags.
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Summarise what was pushed
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### Image pushed"
+            echo
+            echo "Digest: \`$DIGEST\`"
+            echo
+            echo "$TAGS" | sed 's/^/- `/; s/$/`/'
+          } >> "$GITHUB_STEP_SUMMARY"

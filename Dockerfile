@@ -3,10 +3,12 @@ WORKDIR /build
 
 RUN pip install uv --no-cache-dir
 
-COPY pyproject.toml .
+# uv.lock + --frozen: the image ships the exact dependency set the suite tested,
+# instead of re-resolving at build time.
+COPY pyproject.toml uv.lock ./
 COPY nso_adapter/ nso_adapter/
 
-RUN uv sync --no-dev --no-cache
+RUN uv sync --no-dev --no-cache --frozen
 
 FROM python:3.12-slim
 WORKDIR /app
