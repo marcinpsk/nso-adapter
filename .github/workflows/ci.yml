@@ -71,7 +71,9 @@ jobs:
                      -c max_connections=200
           ready=0
           for _ in $(seq 1 40); do
-            if docker exec adapter-test-db pg_isready -U postgres; then ready=1; break; fi
+            # -h 127.0.0.1: probe the TCP listener — the image's temporary init-time
+            # server answers the Unix socket before the real server is reachable.
+            if docker exec adapter-test-db pg_isready -h 127.0.0.1 -U postgres; then ready=1; break; fi
             sleep 1
           done
           if [ "$ready" -ne 1 ]; then
