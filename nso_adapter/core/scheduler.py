@@ -262,7 +262,7 @@ async def _scheduled_orphan_reap() -> None:
     The startup reaper (:func:`core.worker.requeue_orphaned_jobs`) only fires when the process
     (re)starts. This periodic tick closes the gap where a job is stranded ``running`` WITHOUT a
     restart — a worker task killed mid-run in a long-lived process. Left unreaped, the per-device
-    dedup (:func:`core.jobs.get_active_job`) would treat the orphan as in-flight and silently 409
+    dedup (:func:`core.jobs.get_queued_job_of_type`) would treat the orphan as in-flight and 409
     every future job for that device until the next restart — the same 'orphan blocks the device
     forever' failure the plugin's reconcile enqueue once had.
 
@@ -555,7 +555,7 @@ async def _probe_one_failover_device(device_id: int, eff, now, flip_budget, sem)
 
     from nso_adapter.core.failover import run_failover_tick
     from nso_adapter.core.importer import get_nso_client
-    from nso_adapter.core.jobs import get_active_job
+    from nso_adapter.core.jobs import has_any_active_job
     from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device, DeviceFailover
 
@@ -577,14 +577,17 @@ async def _probe_one_failover_device(device_id: int, eff, now, flip_budget, sem)
                 logger.debug("scheduler.failover.skipped", device_id=device_id, reason="no_nso_client")
                 return
             try:
-                active_job = await get_active_job(device.id, db)
+                # Boolean PRE-filter only. The full gate acquires the device claim, which
+                # this tick does not yet do — an apply goes terminal while its claim is still
+                # held through post-refresh, so job status alone reads "idle" while busy.
+                device_busy = await has_any_active_job(device.id, db)
                 await run_failover_tick(
                     device,
                     fo,
                     nso_client,
                     eff,
                     now=now,
-                    job_active=active_job is not None,
+                    job_active=device_busy,
                     flip_budget=flip_budget,
                     jitter_fraction=_FAILOVER_JITTER_FRACTION,
                 )

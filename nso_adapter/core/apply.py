@@ -116,15 +116,17 @@ async def enqueue_apply(db: AsyncSession, device_id: int, force: bool = True) ->
     tracker #103): reconciling the intent store must never trigger a device commit,
     so the auto-apply enqueue is suppressed alongside the shrink-removal one.
     """
-    from nso_adapter.core.jobs import get_active_job
+    from nso_adapter.core.jobs import get_queued_job_of_type
     from nso_adapter.core.request_flags import STORE_ONLY
 
     if STORE_ONLY.get():
         logger.info("apply.skipped_store_only", device_id=device_id)
         return None
 
-    active = await get_active_job(device_id, db)
-    if active:
+    # Same-type QUEUED dedupe only. A removal is enqueued BEFORE its apply by design, so
+    # rejecting on any active job dropped the apply outright; and a running apply must not
+    # refuse its successor, because the successor is what carries the newer intent.
+    if await get_queued_job_of_type(device_id, JobType.apply, db) is not None:
         return None
 
     job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.queued)

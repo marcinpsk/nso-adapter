@@ -271,14 +271,23 @@ async def test_enqueue_apply_creates_job(adapter_client):
         assert job.status == JobStatus.queued
 
 
-async def test_enqueue_apply_blocked_by_active_job(adapter_client):
-    """enqueue_apply returns None when an active job exists."""
+async def test_enqueue_apply_blocked_by_a_queued_apply(adapter_client):
+    """enqueue_apply refuses only when a QUEUED apply already exists."""
     device_id = await _seed_device("rtr-a02", 102)
+    await _seed_apply_job(device_id, JobStatus.queued)
+
+    async with session() as db:
+        assert await enqueue_apply(db, device_id=device_id) is None
+
+
+async def test_enqueue_apply_admitted_while_an_apply_runs(adapter_client):
+    """A running apply does not refuse its successor: the successor carries the newer
+    intent, and the device claim is what serializes their execution."""
+    device_id = await _seed_device("rtr-a02b", 103)
     await _seed_apply_job(device_id, JobStatus.running)
 
     async with session() as db:
-        result = await enqueue_apply(db, device_id=device_id)
-        assert result is None
+        assert await enqueue_apply(db, device_id=device_id) is not None
 
 
 # ── run_apply ─────────────────────────────────────────────────────────────────

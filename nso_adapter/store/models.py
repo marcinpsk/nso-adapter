@@ -350,18 +350,27 @@ class InterfaceAttrState(Base):
 class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
-        # At most one active (queued/running) job per device for the enqueue_job-managed
-        # types. Closes the enqueue_job TOCTOU: the check-then-insert can't materialise two
-        # active rows even under concurrent schedulers/SSE/API. Exclusions:
-        #   * removal jobs are intentionally per-scope (enqueue_removal queues one each for
-        #     bgp/isis/snmp/… on the same device), so they must NOT collide;
-        #   * provision jobs carry device_id=NULL (NULLs are distinct) and dedup by context.
-        # Partial index → terminal (succeeded/failed) jobs never block a fresh enqueue.
+        # At most one QUEUED job per (device, job_type). Closes the enqueue TOCTOU: the
+        # check-then-insert cannot materialise two queued rows of a type even under
+        # concurrent schedulers/SSE/API.
+        #
+        # Scoped to QUEUED, not queued-or-running: a running job must not refuse its own
+        # successor, because the successor is what carries the newer intent. Execution is
+        # serialized by the per-device claim instead, which is the only gate that can span a
+        # job's whole lifetime — an apply goes terminal while its claim is still held through
+        # the post-apply refresh.
+        #
+        # Removals stay EXEMPT, and that is deliberate rather than an oversight:
+        # enqueue_removal queues one job per scope (bgp/isis/snmp/…) on the same device and
+        # every one of them must run. Their FIFO ordering comes from the worker's per-device
+        # head claim, not from uniqueness. Provision rows carry device_id=NULL (NULLs are
+        # distinct) and dedup by context.
         Index(
-            "uq_job_active_per_device",
+            "uq_job_queued_per_device_type",
             "device_id",
+            "job_type",
             unique=True,
-            postgresql_where=text("status IN ('queued', 'running') AND job_type <> 'removal'"),
+            postgresql_where=text("status = 'queued' AND job_type <> 'removal'"),
         ),
     )
 

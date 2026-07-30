@@ -190,3 +190,33 @@ async def test_deleting_the_owning_job_nulls_job_id_and_keeps_the_claim(adapter_
         row = await db.get(DeviceClaim, device_id)
         assert row is not None
         assert row.job_id is None
+
+
+# ── Q4: the queued-dedupe index swap ─────────────────────────────────────────
+
+_Q4_MIGRATION = "f1a3c9e7b204_queued_job_dedupe_index.py"
+
+
+def test_queued_dedupe_index_replaces_the_active_one(pg_admin):
+    from tests.store.migration_harness import index_predicates
+
+    module = load_migration(_Q4_MIGRATION)
+    assert module.down_revision == "c7e4b8a05d19"
+    assert_single_head_containing(module.revision)
+
+    with private_database(pg_admin, "q4idx") as sync_url:
+        alembic(sync_url, "upgrade", module.revision)
+        with engine_on(sync_url) as engine:
+            ixs = index_predicates(engine, "jobs")
+            assert "uq_job_active_per_device" not in ixs
+            assert ixs["uq_job_queued_per_device_type"] == (
+                ("device_id", "job_type"),
+                True,
+                "((status = 'queued'::jobstatus) AND (job_type <> 'removal'::jobtype))",
+            )
+
+        alembic(sync_url, "downgrade", module.down_revision)
+        with engine_on(sync_url) as engine:
+            ixs = index_predicates(engine, "jobs")
+            assert "uq_job_queued_per_device_type" not in ixs
+            assert "uq_job_active_per_device" in ixs

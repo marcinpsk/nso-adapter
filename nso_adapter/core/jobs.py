@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,13 +23,53 @@ from nso_adapter.store.models import Job, JobStatus, JobType
 logger = structlog.get_logger(__name__)
 
 
-async def get_active_job(device_id: int, db: AsyncSession) -> Job | None:
-    """Return the currently queued/running job for *device_id*, or None."""
+async def get_queued_job_of_type(device_id: int, job_type: JobType, db: AsyncSession) -> Job | None:
+    """Return the queued job of *job_type* — the exact cause of a same-type refusal.
+
+    This is the only correct answer for a 409: telling a caller about some unrelated job
+    that happens to be active gives it nothing to wait on or retry against. Ordered so two
+    exempt rows (removals) still yield a deterministic answer rather than raising.
+    """
     result = await db.execute(
-        select(Job).where(
-            Job.device_id == device_id,
-            Job.status.in_([JobStatus.queued, JobStatus.running]),
+        select(Job)
+        .where(Job.device_id == device_id, Job.job_type == job_type, Job.status == JobStatus.queued)
+        .order_by(Job.created_at, Job.id)
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def has_any_active_job(device_id: int, db: AsyncSession) -> bool:
+    """Is anything queued or running for this device? A cheap EXISTS pre-filter.
+
+    Deliberately a boolean and not a row: several rows can legitimately match (removals are
+    exempt from queued uniqueness, one per scope), so anything returning "the" active job is
+    unsound. Note it is only a PRE-filter for serialization decisions — an apply goes
+    terminal while its claim is still held through the post-apply refresh, so a job-status
+    query reads "idle" while the device is genuinely busy. The claim is the real gate.
+    """
+    return bool(
+        await db.scalar(
+            select(
+                exists().where(
+                    Job.device_id == device_id,
+                    Job.status.in_([JobStatus.queued, JobStatus.running]),
+                )
+            )
         )
+    )
+
+
+async def get_head_queued_job(device_id: int, db: AsyncSession) -> Job | None:
+    """Return the oldest queued job for this device: the per-device FIFO head.
+
+    Worker-internal.
+    """
+    result = await db.execute(
+        select(Job)
+        .where(Job.device_id == device_id, Job.status == JobStatus.queued)
+        .order_by(Job.created_at, Job.id)
+        .limit(1)
     )
     return result.scalar_one_or_none()
 
@@ -48,7 +88,9 @@ async def enqueue_job(
     if job_type not in _JOB_RUNNERS:
         raise ValueError(f"No runner registered for job type {job_type!r}")
 
-    active = await get_active_job(device_id, db)
+    # Same-type queued dedupe: a queued removal must not refuse a sync, and a running job
+    # must not refuse its own successor — the device claim serializes execution.
+    active = await get_queued_job_of_type(device_id, job_type, db)
     if active:
         return active, False
 
@@ -57,11 +99,11 @@ async def enqueue_job(
     try:
         await db.commit()
     except IntegrityError:
-        # Lost the check-then-insert race: a concurrent enqueue committed the active
-        # job for this device first, and uq_job_active_per_device rejected ours. Recover
-        # by returning the winner instead of surfacing a 500.
+        # Lost the check-then-insert race: a concurrent enqueue committed the queued job of
+        # this type first and uq_job_queued_per_device_type rejected ours. Recover by
+        # returning the winner instead of surfacing a 500.
         await db.rollback()
-        winner = await get_active_job(device_id, db)
+        winner = await get_queued_job_of_type(device_id, job_type, db)
         if winner is not None:
             logger.debug("job.enqueue.race_lost", device_id=device_id, winner_id=winner.id)
             return winner, False

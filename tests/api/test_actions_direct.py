@@ -39,11 +39,14 @@ async def test_trigger_device_not_found(adapter_client):
 
 
 async def test_trigger_job_conflict_returns_409(adapter_client):
-    """_trigger() raises 409 (surfacing the active job's id) when one already runs."""
+    """_trigger() raises 409 naming the QUEUED job of the requested type.
+
+    Queued, not running: a running job no longer refuses its successor, because the
+    successor carries the newer intent and execution is serialized by the device claim.
+    """
     device_id = await _seed_device("actions-conflict-01", 1300)
     async with session() as db:
-        # A real active job already exists for the device.
-        existing = Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.running)
+        existing = Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued)
         db.add(existing)
         await db.commit()
         await db.refresh(existing)
@@ -52,6 +55,17 @@ async def test_trigger_job_conflict_returns_409(adapter_client):
             await _trigger(device_id, JobType.sync, db)
         assert exc_info.value.status_code == 409
         assert exc_info.value.detail["error"]["detail"] == {"job_id": existing.id}
+
+
+async def test_trigger_is_admitted_while_a_different_type_runs(adapter_client):
+    """The narrowing: an unrelated running job must not 409 an operator action."""
+    device_id = await _seed_device("actions-conflict-02", 1301)
+    async with session() as db:
+        db.add(Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.running, context={"scope": "bgp"}))
+        await db.commit()
+
+        result = await _trigger(device_id, JobType.sync, db)
+        assert result["job_id"]
 
 
 async def test_trigger_success_enqueues_real_job(adapter_client):

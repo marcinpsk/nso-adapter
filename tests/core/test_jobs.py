@@ -19,7 +19,9 @@ from nso_adapter.core.jobs import (
     _run_sync,
     _run_with_db,
     enqueue_job,
-    get_active_job,
+    get_head_queued_job,
+    get_queued_job_of_type,
+    has_any_active_job,
 )
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
@@ -57,39 +59,41 @@ def test_job_type_value_equals_name_for_all_members():
     assert not diverged, f"JobType members whose value != name: {diverged}"
 
 
-# ── get_active_job ────────────────────────────────────────────────────────────
+# ── the multiplicity-safe lookups ─────────────────────────────────────────────
 
 
-async def test_get_active_job_returns_queued(adapter_client):
-    """Returns queued job for device."""
+async def test_queued_job_of_type_returns_queued(adapter_client):
+    """The queued job of that type is what a same-type enqueue must be refused with."""
     device_id = await _seed_device("rtr-01", 11)
     job_id = await _seed_job(device_id, JobStatus.queued)
 
     async with session() as db:
-        result = await get_active_job(device_id, db)
+        result = await get_queued_job_of_type(device_id, JobType.sync, db)
         assert result is not None
         assert result.id == job_id
+        assert (await get_head_queued_job(device_id, db)).id == job_id
 
 
-async def test_get_active_job_returns_none_when_succeeded(adapter_client):
-    """Returns None when all jobs are in terminal states."""
+async def test_lookups_ignore_terminal_jobs(adapter_client):
+    """A terminal job blocks nothing and leaves the device idle."""
     device_id = await _seed_device("rtr-02", 12)
     await _seed_job(device_id, JobStatus.succeeded)
 
     async with session() as db:
-        result = await get_active_job(device_id, db)
-        assert result is None
+        assert await get_queued_job_of_type(device_id, JobType.sync, db) is None
+        assert await has_any_active_job(device_id, db) is False
 
 
-async def test_get_active_job_returns_running_job(adapter_client):
-    """Returns running job (not just queued)."""
+async def test_a_running_job_is_busy_but_does_not_refuse_a_successor(adapter_client):
+    """The semantic split: a running job keeps the device busy, but admission is about
+    QUEUED rows only — the successor is what carries the newer intent, and execution is
+    serialized by the device claim rather than by refusing to enqueue."""
     device_id = await _seed_device("rtr-03", 13)
     await _seed_job(device_id, JobStatus.running)
 
     async with session() as db:
-        result = await get_active_job(device_id, db)
-        assert result is not None
-        assert result.status == JobStatus.running
+        assert await has_any_active_job(device_id, db) is True
+        assert await get_queued_job_of_type(device_id, JobType.sync, db) is None
 
 
 # ── enqueue_job ───────────────────────────────────────────────────────────────
@@ -116,19 +120,35 @@ async def test_enqueue_job_returns_existing_when_active(adapter_client):
         assert job.id == existing_id
 
 
-async def test_active_job_partial_unique_index_rejects_second(adapter_client):
-    """s3-17: the DB enforces at most one active (queued/running) job per device, so a
-    TOCTOU race between the enqueue check and the insert cannot materialise two active jobs."""
+async def test_queued_job_partial_unique_index_rejects_a_second_of_the_same_type(adapter_client):
+    """s3-17, narrowed: the DB enforces at most one QUEUED job per (device, job_type), so a
+    TOCTOU race between the enqueue check and the insert cannot materialise two.
+
+    Scoped to QUEUED rather than queued-or-running: a running job must not refuse its own
+    successor. Execution is serialized by the per-device claim, which is the only gate able
+    to span a whole run — an apply goes terminal while its claim is still held through the
+    post-apply refresh.
+    """
     from sqlalchemy.exc import IntegrityError
 
     device_id = await _seed_device("dup-active", 4100)
     await _seed_job(device_id, JobStatus.queued)
 
     async with session() as db:
-        db.add(Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.running))
+        db.add(Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued))
         with pytest.raises(IntegrityError):
             await db.commit()
         await db.rollback()
+
+
+async def test_queued_index_permits_a_successor_while_one_runs(adapter_client):
+    """The other half of the narrowing, and the behavior change worth pinning."""
+    device_id = await _seed_device("dup-succ", 4101)
+    await _seed_job(device_id, JobStatus.running)
+
+    async with session() as db:
+        db.add(Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued))
+        await db.commit()  # must not raise
 
 
 async def test_active_job_index_exempts_removal(adapter_client):
@@ -174,16 +194,16 @@ async def test_enqueue_job_recovers_from_lost_race(adapter_client, monkeypatch):
     device_id = await _seed_device("race", 4102)
     existing_id = await _seed_job(device_id, JobStatus.queued)
 
-    real = jobs_mod.get_active_job
+    real = jobs_mod.get_queued_job_of_type
     calls = {"n": 0}
 
-    async def flaky(dev_id, db):
+    async def flaky(dev_id, job_type, db):
         calls["n"] += 1
         if calls["n"] == 1:
             return None  # simulate the stale read that lost the TOCTOU race
-        return await real(dev_id, db)
+        return await real(dev_id, job_type, db)
 
-    monkeypatch.setattr(jobs_mod, "get_active_job", flaky)
+    monkeypatch.setattr(jobs_mod, "get_queued_job_of_type", flaky)
 
     async with session() as db:
         job, created = await enqueue_job(device_id, JobType.sync, db)
