@@ -1060,6 +1060,50 @@ class StaticRouteIntent(Base):
     device: Mapped[Device] = relationship("Device", back_populates="static_route_intents")
 
 
+class DeviceClaim(Base):
+    """Exclusive per-device execution claim. One row = one live acquisition.
+
+    ``device_id`` is the primary key, so ``INSERT … ON CONFLICT (device_id) DO NOTHING``
+    is what decides mutual exclusion — at the database, across connections and
+    processes. A lease timestamp alone would not: a holder inside a slow NSO call whose
+    heartbeats are failing can be stolen from and still complete its own write, which is
+    why writes validate a per-acquisition token under a row lock instead.
+
+    No ``Device`` relationship: a claim is not device state, and teardown's intent-root
+    enumeration derives from ``Device.__mapper__.relationships``.
+    """
+
+    __tablename__ = "device_claim"
+    __table_args__ = (
+        # Closed five-value set — every holder acquires the same claim. String + CHECK
+        # rather than a PG enum, matching ck_srt_marking: a new enum type widens the
+        # parity snapshot's type set and needs ALTER TYPE care forever.
+        CheckConstraint(
+            "purpose IN ('job', 'intent_put', 'teardown', 'sweep', 'failover')",
+            name="ck_device_claim_purpose",
+        ),
+        UniqueConstraint("claim_token", name="uq_device_claim_token"),
+    )
+
+    device_id: Mapped[int] = mapped_column(Integer, ForeignKey("devices.id", ondelete="CASCADE"), primary_key=True)
+    # A FRESH uuid4 per acquisition — never a process identity. Two acquisitions by the
+    # same process must not share a token, or a revoked runner's writes validate against
+    # its successor's claim (ABA).
+    claim_token: Mapped[str] = mapped_column(String(64), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(16), nullable=False)
+    # NULL at the worker's queued-head acquisition: this is a real FK, and PostgreSQL
+    # validates an inserted FK by locking the referenced row FOR KEY SHARE, which
+    # conflicts with the FOR UPDATE an endpoint holds on the queued winner — the worker
+    # would block inside the FK check, before its SKIP LOCKED ever runs. It is set later,
+    # in the guarded transaction that also sets Job.status='running'. PROVISION IS THE
+    # EXCEPTION and sets it at acquisition: its job is already running, is its own, and
+    # carries no winner lock, so the FK check contends with nothing — and without it a
+    # revocation would have no job to re-disposition.
+    job_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
+    acquired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class StaticRouteTombstone(Base):
     """A deleted/detached static-route intent row whose removal is not yet proven.
 
