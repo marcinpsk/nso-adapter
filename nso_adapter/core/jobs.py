@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.core.claim import ClaimLostError, ClaimRegistration, lock_claim
 from nso_adapter.store.models import Job, JobStatus, JobType
 
 logger = structlog.get_logger(__name__)
@@ -111,7 +112,12 @@ async def enqueue_provision_job(params: dict, db: AsyncSession) -> tuple[Job, bo
 # ── Job runners ───────────────────────────────────────────────────────────────
 
 
-async def _mark_job_failed(db: AsyncSession, job_id: int, error: dict) -> None:
+async def _mark_job_failed(
+    db: AsyncSession,
+    job_id: int,
+    error: dict,
+    reg: ClaimRegistration | None = None,
+) -> None:
     """Record a terminal ``failed`` status on *job_id*, tolerating a poisoned session.
 
     A DB-origin error inside a runner's ``try`` leaves the AsyncSession in a
@@ -120,8 +126,21 @@ async def _mark_job_failed(db: AsyncSession, job_id: int, error: dict) -> None:
     Roll back, re-fetch the (possibly expired) job, then commit the terminal status.
     Same fix as :func:`core.apply.run_apply` (finding #11); shared so the other
     runners stay consistent.
+
+    This is an effectful transaction on a claimed device, so it takes the claim row lock
+    when *reg* is supplied — after the rollback, before the re-fetch, leaving the
+    rollback-first contract intact. Without the lock the concrete failure is: recovery
+    revokes a stale sync's claim and requeues the job, the old runner raises
+    ``ClaimLostError``, its wrapper converts that into a call here, and this write
+    overwrites recovery's disposition — or a fresh worker's ``running``.
     """
     await db.rollback()
+    if reg is not None:
+        try:
+            await lock_claim(db, reg)
+        except ClaimLostError:
+            logger.warning("job.mark_failed_claim_lost", job_id=job_id, device_id=reg.device_id)
+            return
     job = await db.get(Job, job_id)
     if job is not None:
         job.status = JobStatus.failed
@@ -156,6 +175,9 @@ async def _run_with_db(job_id: int, device_id: int, coro_factory, *, timeout: fl
                 job_id,
                 {"code": "timeout", "message": f"Job exceeded {int(timeout)}s timeout", "detail": {}},
             )
+        except ClaimLostError:
+            # Revocation is not a runner error: recovery already owns the disposition.
+            raise
         except Exception as exc:
             logger.exception("job.failed", job_id=job_id, device_id=device_id, error=repr(exc))
             await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}})
@@ -264,6 +286,9 @@ async def _run_connect(job_id: int, device_id: int) -> None:
                 job_id,
                 {"code": "timeout", "message": f"Connect exceeded {int(_JOB_TIMEOUT)}s timeout", "detail": {}},
             )
+        except ClaimLostError:
+            # Revocation is not a runner error: recovery already owns the disposition.
+            raise
         except Exception as exc:
             logger.exception("job.connect.failed", job_id=job_id, error=repr(exc))
             await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}})
@@ -340,6 +365,9 @@ async def _run_provision(job_id: int, device_id: int | None) -> None:
                 job_id,
                 {"code": "timeout", "message": f"Provision exceeded {int(_JOB_TIMEOUT)}s timeout", "detail": {}},
             )
+        except ClaimLostError:
+            # Revocation is not a runner error: recovery already owns the disposition.
+            raise
         except Exception as exc:
             logger.exception("job.provision.failed", job_id=job_id, error=repr(exc))
             await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}})

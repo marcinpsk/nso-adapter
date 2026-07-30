@@ -28,6 +28,8 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.core.claim import ClaimLostError
+
 logger = structlog.get_logger(__name__)
 
 
@@ -1126,6 +1128,9 @@ async def run_removal(job_id: int, device_id: int) -> None:
                 from nso_adapter.store.models import JobType
 
                 await enqueue_job(device_id, JobType.sync, db)
+            except ClaimLostError:
+                # Revocation is not a runner error: recovery already owns the disposition.
+                raise
             except Exception as exc:  # noqa: BLE001 — never fail a committed removal on this
                 logger.warning(
                     "removal.followup_sync_enqueue_failed", job_id=job_id, device_id=device_id, error=repr(exc)
@@ -1158,6 +1163,9 @@ async def run_removal(job_id: int, device_id: int) -> None:
                     },
                 },
             )
+        except ClaimLostError:
+            # Revocation is not a runner error: recovery already owns the disposition.
+            raise
         except Exception as exc:  # noqa: BLE001 — record on the job, never crash the worker
             from nso_adapter.core.jobs import _mark_job_failed
 

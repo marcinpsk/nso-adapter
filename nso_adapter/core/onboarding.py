@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.config import get_config
+from nso_adapter.core.claim import ClaimLostError
 from nso_adapter.core.families import ALL_FAMILY_KEYS
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
@@ -358,6 +359,9 @@ async def _initial_mirror_refresh(db: AsyncSession, device_id: int, client) -> N
             logger.warning("device.onboard_mirror.partial", device_id=device_id, degraded_surfaces=sorted(degraded))
         else:
             logger.info("device.onboard_mirror.done", device_id=device_id)
+    except ClaimLostError:
+        # Revocation is not a runner error: recovery already owns the disposition.
+        raise
     except Exception as exc:  # noqa: BLE001 — never fail provisioning on a mirror-read hiccup
         await db.rollback()
         logger.warning("device.onboard_mirror.failed", device_id=device_id, error=repr(exc))
@@ -405,6 +409,9 @@ async def _seed_onboarding_failover(
         await set_initial_failover_state(db, device_id, primary, oob_ip, active_address)
         await db.commit()
         return {"step": "failover_seed", "status": "ok", "detail": active_address}
+    except ClaimLostError:
+        # Revocation is not a runner error: recovery already owns the disposition.
+        raise
     except Exception as exc:
         return {"step": "failover_seed", "status": "failed", "detail": repr(exc)}
 

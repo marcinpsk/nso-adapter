@@ -23,6 +23,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.core.claim import ClaimLostError
 from nso_adapter.nso.apply import NsoApplyError
 from nso_adapter.store.models import (
     BfdIntent,
@@ -622,6 +623,10 @@ async def _apply_attributes(eligible, apply_fn, *, client, device_name, job_id, 
             intent_row.last_apply_error = {"code": exc.code, "message": exc.message, "detail": exc.detail}
             failed += 1
             failures.append({"interface": iface.name, "attribute": intent_row.attribute, "error": exc.message})
+        except ClaimLostError:
+            # Revocation is not a per-row failure: continuing the loop would push
+            # further scopes under ownership this run has lost.
+            raise
         except Exception as exc:
             logger.exception(
                 "apply.attribute_unexpected_error",
@@ -670,6 +675,10 @@ async def _apply_ips(by_iface, ifaces, apply_fn, *, client, device_name, job_id,
                 row.last_apply_error = {"code": exc.code, "message": exc.message, "detail": exc.detail}
             failed += len(ip_rows)
             failures.append({"interface": iface.name, "error": exc.message})
+        except ClaimLostError:
+            # Revocation is not a per-row failure: continuing the loop would push
+            # further scopes under ownership this run has lost.
+            raise
         except Exception as exc:
             logger.exception("apply.ip_unexpected_error", job_id=job_id, interface=iface.name)
             for row in ip_rows:
@@ -1586,6 +1595,9 @@ async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_
         if on_nso_error is not None:
             await on_nso_error(exc)
         return 0, len(rows), [{"error": exc.message}]
+    except ClaimLostError:
+        # Revocation is not a runner error: recovery already owns the disposition.
+        raise
     except Exception as exc:
         logger.exception(f"apply.{log_label}_unexpected_error", job_id=job_id)
         err = {"code": "internal", "message": repr(exc), "detail": {}}
@@ -1877,6 +1889,10 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
                 await record_capability_rejection(
                     db, info["ned_id"], info["sw_version"], scope, name, exc.message[:256]
                 )
+        except ClaimLostError:
+            # A nested suppressor is as load-bearing as the runner boundary: swallowing
+            # a revocation here lets the run continue under ownership it has lost.
+            raise
         except Exception:
             logger.debug("apply.capability_record_skipped", job_id=job_id)
 
@@ -2101,6 +2117,9 @@ async def _post_apply_refresh_and_notify(db: AsyncSession, device_id: int) -> No
         nb_client = get_netbox_client()
         if nb_client and device.netbox_device_id:
             await nb_client.notify_sync_complete(device.netbox_device_id)
+    except ClaimLostError:
+        # Revocation is not a runner error: recovery already owns the disposition.
+        raise
     except Exception as exc:  # noqa: BLE001 — best-effort; never fail an already-finalized Apply
         logger.warning("apply.post_refresh_failed", device_id=device_id, error=repr(exc))
 
@@ -2119,6 +2138,9 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
 
         try:
             await _execute_apply(db, job, job_id, device_id, force)
+        except ClaimLostError:
+            # Revocation is not a runner error: recovery already owns the disposition.
+            raise
         except Exception as exc:
             logger.exception("apply.unexpected_error", job_id=job_id, device_id=device_id)
             # Roll back first: if the failure came from a DB error the session is in a
