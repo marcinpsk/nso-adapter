@@ -33,7 +33,7 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import structlog
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy import update as sa_update
 
 from nso_adapter.core.claim import (
@@ -44,6 +44,7 @@ from nso_adapter.core.claim import (
     ClaimOutcome,
     ClaimRegistration,
     abandon_claim_to_staleness,
+    acquire_claim,
     dispose_cancelled,
     lock_claim,
     mark_failed_and_release,
@@ -90,38 +91,170 @@ _drains: dict[asyncio.Task, asyncio.Task] = {}
 # ordinary crash.
 _FAILSTOP_EXIT_CODE = 70
 
+# How many candidate devices one poll may consider. More than one is the cross-device
+# progress guarantee: a device whose head cannot be locked is skipped in favour of the next
+# candidate within the SAME poll, so sustained traffic on one busy device cannot starve the
+# rest. Re-polling from the global oldest row would rediscover the busy device forever.
+_CANDIDATE_BATCH = 10
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
 
 
-async def _claim_next_job() -> tuple[int, int | None, JobType] | None:
-    """Atomically claim the oldest queued job.
+async def _discover_candidates() -> list[int | None]:
+    """Devices with queued work and no live claim, oldest work first. NON-LOCKING.
 
-    Returns ``(job_id, device_id, job_type)`` or ``None`` if the queue is empty.
-    ``SELECT ... FOR UPDATE SKIP LOCKED`` ensures two workers never claim the
-    same row.
+    A BATCH, not a single row, and that is the cross-device progress guarantee: a device
+    whose head cannot be locked must be skipped in favour of the next candidate within the
+    same poll. Re-polling from the global oldest row instead would rediscover the same busy
+    device every time, and sustained traffic on it would starve every other device.
+
+    No ``FOR UPDATE`` here on purpose — this only picks a device. Taking a job row before the
+    claim would invert the lock order against recovery, which holds the claim and reaches for
+    the job.
     """
     async for db in get_session():
-        result = await db.execute(
-            select(Job)
-            .where(Job.status == JobStatus.queued)
+        rows = (
+            await db.execute(
+                select(Job.device_id, func.min(Job.created_at).label("oldest"))
+                .outerjoin(DeviceClaim, DeviceClaim.device_id == Job.device_id)
+                .where(Job.status == JobStatus.queued, DeviceClaim.device_id.is_(None))
+                .group_by(Job.device_id)
+                .order_by(func.min(Job.created_at))
+                .limit(_CANDIDATE_BATCH)
+            )
+        ).all()
+        return [row[0] for row in rows]
+    return []
+
+
+async def _start_claimless_head(device_id_is_null_head: Job, db) -> tuple[int, None, JobType] | None:
+    """Start a claimless (provision) job that has already been locked."""
+    job = device_id_is_null_head
+    claimed = (job.id, None, job.job_type)
+    now = _now()
+    job.status = JobStatus.running
+    job.started_at = now
+    job.heartbeat_at = now
+    await db.commit()
+    return claimed
+
+
+async def _claim_next_job() -> tuple[int, int | None, JobType, ClaimRegistration] | None:
+    """Claim a device, then its exact queued head. CLAIM FIRST, never job first.
+
+    Returns ``(job_id, device_id, job_type, registration)`` or ``None``.
+
+    The order is the whole point. Taking the head job row and then acquiring the claim
+    inverts against recovery — which holds the claim and reaches for the job — and the two
+    deadlock under exactly the barriers the claim tests install. So: pick a device without
+    locking anything, acquire its claim, and only then lock the head *under* that claim.
+
+    Three further rules that are not obvious:
+
+    * the claim is inserted with ``job_id = NULL``. It is a real FK, and PostgreSQL validates
+      an inserted FK by locking the referenced row ``FOR KEY SHARE`` — which conflicts with the
+      ``FOR UPDATE`` an endpoint holds on a queued winner. The worker would block inside the FK
+      check before its ``SKIP LOCKED`` ever ran, stalling on one busy device;
+    * the head is re-derived under the claim and then locked BY EXACT ID. An
+      ``ORDER BY … LIMIT 1 FOR UPDATE SKIP LOCKED`` would skip a locked head and hand back a
+      LATER job on the same device, breaking the per-device FIFO the removal-before-apply
+      ordering depends on;
+    * zero rows means the head is locked or gone: release the claim and move to the next
+      candidate device. Never inspect a later job on that device.
+    """
+    for device_id in await _discover_candidates():
+        if device_id is None:
+            claimed = await _claim_next_claimless_job()
+            if claimed is not None:
+                return (*claimed, ClaimRegistration())
+            continue
+
+        reg = await acquire_claim(device_id, "job")
+        if reg is None:
+            continue  # someone acquired it between discovery and now
+
+        started = await _start_head_under_claim(device_id, reg)
+        if started is not None:
+            return (*started, reg)
+
+        # Nothing runnable here: give the device back so it is not skipped next poll.
+        await release_claim(reg)
+    return None
+
+
+async def _start_head_under_claim(device_id: int, reg: ClaimRegistration) -> tuple[int, int, JobType] | None:
+    """Lock this device's exact queued head under the claim and start it. One transaction."""
+    async for db in get_session():
+        await lock_claim(db, reg)  # claim -> jobs, per the global lock order
+
+        head = await db.scalar(
+            select(Job.id)
+            .where(Job.device_id == device_id, Job.status == JobStatus.queued)
             .order_by(Job.created_at, Job.id)
             .limit(1)
-            .with_for_update(skip_locked=True)
         )
-        job = result.scalar_one_or_none()
-        if job is None:
+        if head is None:
+            await db.rollback()
             return None
-        # Capture identity before commit so an expire-on-commit refresh can't
-        # trigger a lazy load outside the greenlet context.
-        claimed = (job.id, job.device_id, job.job_type)
+
+        # By EXACT id, so a locked head is never silently replaced by a later job.
+        job = await db.scalar(
+            select(Job).where(Job.id == head, Job.status == JobStatus.queued).with_for_update(skip_locked=True)
+        )
+        if job is None:
+            await db.rollback()
+            return None
+
+        claimed = (job.id, device_id, job.job_type)
         now = _now()
         job.status = JobStatus.running
         job.started_at = now
         job.heartbeat_at = now
+        # Association and the running transition in the SAME guarded transaction: a crash
+        # between them would leave a queued job plus a job-less claim, which recovery handles,
+        # but a released claim with a running job would be unrecoverable.
+        await db.execute(
+            sa_update(DeviceClaim)
+            .where(DeviceClaim.device_id == device_id, DeviceClaim.claim_token == reg.token)
+            .values(job_id=job.id)
+        )
         await db.commit()
         return claimed
+    return None
+
+
+async def _claim_next_claimless_job() -> tuple[int, None, JobType] | None:
+    """Start the oldest queued ``device_id IS NULL`` job. Provision only.
+
+    Any OTHER type with no device is a corrupt row: the worker would dispatch it with
+    ``device_id=None`` against a device that no longer exists, and it is invisible to both the
+    claim machinery and the per-device FIFO. Teardown is specified never to create one, so
+    this is a belt against a bug, not a routine path.
+    """
+    async for db in get_session():
+        job = await db.scalar(
+            select(Job)
+            .where(Job.device_id.is_(None), Job.status == JobStatus.queued)
+            .order_by(Job.created_at, Job.id)
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        )
+        if job is None:
+            await db.rollback()
+            return None
+        if job.job_type is not JobType.provision:
+            logger.error("worker.orphaned_claimless", job_id=job.id, job_type=str(job.job_type))
+            job.status = JobStatus.failed
+            job.error = {
+                "code": "orphaned_claimless",
+                "message": f"{job.job_type} job has no device_id; only provision may be claimless",
+                "detail": {},
+            }
+            await db.commit()
+            return None
+        return await _start_claimless_head(job, db)
     return None
 
 
@@ -372,14 +505,16 @@ async def _worker_loop(worker_id: int, stop: asyncio.Event) -> None:
                 await asyncio.wait_for(stop.wait(), timeout=_EMPTY_POLL_INTERVAL)
             continue
 
-        job_id, device_id, job_type = claimed
+        job_id, device_id, job_type, reg = claimed
         runner = _JOB_RUNNERS.get(job_type)
         if runner is None:
             logger.error("worker.no_runner", job_id=job_id, job_type=str(job_type))
-            await _mark_failed(job_id, "no_runner", f"No runner for job type {job_type}")
+            await _mark_failed(job_id, "no_runner", f"No runner for job type {job_type}", reg)
+            # Give the device back: we claimed it and are not going to run anything.
+            await release_claim(reg)
             continue
 
-        await _run_one_job(worker_id, job_id, device_id, job_type, runner)
+        await _run_one_job(worker_id, job_id, device_id, job_type, runner, reg)
 
     logger.info("worker.stopped", worker_id=worker_id)
 

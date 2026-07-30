@@ -48,7 +48,7 @@ async def test_claim_next_job_claims_oldest_queued(adapter_client):
 
     claimed = await worker._claim_next_job()
     assert claimed is not None
-    job_id, claimed_device, job_type = claimed
+    job_id, claimed_device, job_type, reg = claimed
     assert job_id == first  # oldest first
     assert claimed_device == device_id
     assert job_type == JobType.sync
@@ -57,6 +57,18 @@ async def test_claim_next_job_claims_oldest_queued(adapter_client):
     assert job.status == JobStatus.running
     assert job.started_at is not None
     assert job.heartbeat_at is not None
+
+    # The device is now CLAIMED, and the claim is associated with the job it started — in
+    # the same transaction as the running transition, so no window exists where a running
+    # job has an unassociated claim.
+    assert reg.registered
+    async with session() as db:
+        from nso_adapter.store.models import DeviceClaim
+
+        claim = await db.get(DeviceClaim, device_id)
+        assert claim is not None
+        assert claim.claim_token == reg.token
+        assert claim.job_id == first
 
 
 async def test_claim_next_job_returns_none_when_empty(adapter_client):
