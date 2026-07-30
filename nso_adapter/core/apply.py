@@ -116,23 +116,27 @@ async def enqueue_apply(db: AsyncSession, device_id: int, force: bool = True) ->
     tracker #103): reconciling the intent store must never trigger a device commit,
     so the auto-apply enqueue is suppressed alongside the shrink-removal one.
     """
-    from nso_adapter.core.jobs import get_queued_job_of_type
+    from nso_adapter.core.jobs import admit_queued_job
     from nso_adapter.core.request_flags import STORE_ONLY
 
     if STORE_ONLY.get():
         logger.info("apply.skipped_store_only", device_id=device_id)
         return None
 
-    # Same-type QUEUED dedupe only. A removal is enqueued BEFORE its apply by design, so
-    # rejecting on any active job dropped the apply outright; and a running apply must not
-    # refuse its successor, because the successor is what carries the newer intent.
-    if await get_queued_job_of_type(device_id, JobType.apply, db) is not None:
+    # Atomic same-type QUEUED dedupe, inside a savepoint. Two properties matter to the
+    # fifteen callers, all of which reach here with intent rows already mutated and
+    # uncommitted: a conflict must not poison their transaction, and on a conflict the
+    # queued winner is row-locked until they commit, so the worker cannot start it against a
+    # snapshot older than the request that admitted it.
+    #
+    # A removal is enqueued BEFORE its apply by design, so rejecting on any active job
+    # dropped the apply outright; and a running apply must not refuse its successor, because
+    # the successor is what carries the newer intent.
+    created, _winner = await admit_queued_job(db, device_id, JobType.apply)
+    if created is None:
         return None
-
-    job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.queued)
-    db.add(job)
     await db.flush()
-    return job
+    return created
 
 
 async def _diff_interface_attributes(db, nso_apply, client, device_name: str, ifaces: dict, fmt=True) -> str:

@@ -13,8 +13,8 @@ from __future__ import annotations
 import asyncio
 
 import structlog
-from sqlalchemy import exists, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import exists, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import ClaimLostError, ClaimRegistration, lock_claim
@@ -74,6 +74,95 @@ async def get_head_queued_job(device_id: int, db: AsyncSession) -> Job | None:
     return result.scalar_one_or_none()
 
 
+# The dedupe index's predicate, verbatim. ON CONFLICT infers the arbiter from the index
+# columns PLUS this predicate; PostgreSQL requires it to imply the index's own. The index
+# is not a constraint, so `ON CONFLICT ON CONSTRAINT <name>` raises InvalidObjectDefinition
+# rather than returning empty — which is the 500 atomic admission exists to prevent.
+_QUEUED_DEDUPE_PREDICATE = text("status = 'queued' AND job_type <> 'removal'")
+
+# Bounds applied ONLY to a transaction that ends up holding the queued-winner row lock.
+# Production declares no statement or transaction timeout on the engine, so a hung request
+# holding that row would starve the job indefinitely. SET LOCAL scopes both to this
+# transaction and needs no reset before the connection returns to the pool — a session-level
+# value would, and a short idle-transaction bound set session-wide would also kill the
+# capability refresh, which legitimately holds one transaction across a 120s NSO action.
+_WINNER_LOCK_STATEMENT_TIMEOUT_MS = 60_000
+_WINNER_LOCK_IDLE_TX_TIMEOUT_MS = 120_000
+
+_ADMISSION_RETRIES = 3
+
+
+async def _lock_queued_winner(db: AsyncSession, device_id: int, job_type: JobType) -> Job | None:
+    """Row-lock the queued job that won admission, and hold it to the caller's commit.
+
+    That lock is the handoff guarantee (F6): the worker cannot start the winner until the
+    caller's own intent mutation is visible, so the job it runs can never carry a snapshot
+    older than the request that admitted it.
+
+    Zero rows means the winner is no longer queued — it went running or terminal between the
+    failed insert and this lookup — and the caller should retry admission to create a
+    successor. ``FOR UPDATE`` re-checks the predicate after acquiring the lock, so this
+    cannot return a row that has since changed status.
+    """
+    return await db.scalar(
+        select(Job)
+        .where(Job.device_id == device_id, Job.job_type == job_type, Job.status == JobStatus.queued)
+        .order_by(Job.created_at, Job.id)
+        .limit(1)
+        .with_for_update()
+    )
+
+
+async def admit_queued_job(
+    db: AsyncSession,
+    device_id: int | None,
+    job_type: JobType,
+    *,
+    context: dict | None = None,
+) -> tuple[Job | None, Job | None]:
+    """Atomically admit a queued job of *job_type*, or hand back the queued winner.
+
+    Returns ``(created, winner)`` with exactly one of them set. The insert runs inside a
+    SAVEPOINT so a conflict cannot poison the caller's transaction — every auto-apply
+    endpoint calls this with intent rows already mutated and uncommitted, and losing those
+    is a silent data loss, not a retryable error.
+
+    Does NOT commit: the caller owns its transaction boundary.
+    """
+    for _attempt in range(_ADMISSION_RETRIES):
+        values: dict = {"job_type": job_type, "device_id": device_id, "status": JobStatus.queued}
+        if context is not None:
+            values["context"] = context
+
+        async with db.begin_nested():
+            job_id = await db.scalar(
+                pg_insert(Job)
+                .values(**values)
+                .on_conflict_do_nothing(
+                    index_elements=[Job.device_id, Job.job_type],
+                    index_where=_QUEUED_DEDUPE_PREDICATE,
+                )
+                .returning(Job.id)
+            )
+
+        if job_id is not None:
+            created = await db.get(Job, job_id)
+            return created, None
+
+        # Lost to an existing queued row. Bound this transaction before parking on its lock.
+        await db.execute(text(f"SET LOCAL statement_timeout = '{_WINNER_LOCK_STATEMENT_TIMEOUT_MS}ms'"))
+        await db.execute(text(f"SET LOCAL idle_in_transaction_session_timeout = '{_WINNER_LOCK_IDLE_TX_TIMEOUT_MS}ms'"))
+        winner = await _lock_queued_winner(db, device_id, job_type)
+        if winner is not None:
+            return None, winner
+        # The winner started running: our caller's intent is newer than its snapshot, so a
+        # successor is the correct answer — never "blocked".
+        logger.debug("job.admission.winner_started", device_id=device_id, job_type=str(job_type))
+
+    logger.warning("job.admission.retries_exhausted", device_id=device_id, job_type=str(job_type))
+    return None, None
+
+
 async def enqueue_job(
     device_id: int,
     job_type: JobType,
@@ -88,28 +177,23 @@ async def enqueue_job(
     if job_type not in _JOB_RUNNERS:
         raise ValueError(f"No runner registered for job type {job_type!r}")
 
-    # Same-type queued dedupe: a queued removal must not refuse a sync, and a running job
-    # must not refuse its own successor — the device claim serializes execution.
-    active = await get_queued_job_of_type(device_id, job_type, db)
-    if active:
-        return active, False
+    # Atomic same-type queued dedupe. No check-then-insert: the DB decides, so no TOCTOU
+    # window exists and a conflict never surfaces as an IntegrityError the caller must
+    # recover from. A queued removal does not refuse a sync, and a running job does not
+    # refuse its own successor — the device claim serializes execution.
+    created, winner = await admit_queued_job(db, device_id, job_type)
+    if winner is not None:
+        logger.debug("job.enqueue.race_lost", device_id=device_id, winner_id=winner.id)
+        await db.commit()  # release the winner lock; this helper owns its transaction
+        return winner, False
+    if created is None:  # pragma: no cover - retries exhausted under sustained contention
+        raise RuntimeError(f"could not admit a {job_type} job for device {device_id}")
 
-    job = Job(job_type=job_type, device_id=device_id, status=JobStatus.queued)
-    db.add(job)
-    try:
-        await db.commit()
-    except IntegrityError:
-        # Lost the check-then-insert race: a concurrent enqueue committed the queued job of
-        # this type first and uq_job_queued_per_device_type rejected ours. Recover by
-        # returning the winner instead of surfacing a 500.
-        await db.rollback()
-        winner = await get_queued_job_of_type(device_id, job_type, db)
-        if winner is not None:
-            logger.debug("job.enqueue.race_lost", device_id=device_id, winner_id=winner.id)
-            return winner, False
-        raise
-    await db.refresh(job)
-    return job, True
+    # This helper owns the outer commit and its API/scheduler callers depend on that:
+    # get_db does not auto-commit.
+    await db.commit()
+    await db.refresh(created)
+    return created, True
 
 
 async def get_active_provision_job(nso_instance: str, device_name: str, db: AsyncSession) -> Job | None:
