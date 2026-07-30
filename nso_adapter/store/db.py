@@ -10,6 +10,33 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
+# Server-enforced bounds for a transaction running inside a cancellation-absorbing span.
+#
+# Those spans are the reason the worker's cancel-drain can be bounded at all. Being
+# "DB-only" does NOT make one bounded: the family fence takes
+# ``SELECT pg_advisory_xact_lock(...)``, and PostgreSQL waits for a conflicting lock
+# indefinitely by default. A client-side ``wait_for`` around it only reproduces the
+# cancellation-completion problem one level down, so the bound has to come from the server.
+#
+# Sized BELOW the span's own child bound (absorb 5s + drain 2s = 7s), so the server always
+# wins inside the span and the outer drain never waits on something the server would not
+# have ended. Applied with SET LOCAL: scoped to the transaction, needing no reset before the
+# connection returns to the pool.
+ABSORBED_SPAN_LOCK_TIMEOUT_MS = 3_000
+ABSORBED_SPAN_STATEMENT_TIMEOUT_MS = 4_000
+
+
+async def apply_absorbed_span_bounds(db: AsyncSession) -> None:
+    """Bound every lock wait and statement in this transaction, at the server.
+
+    Call at the entry of any transaction reachable inside a cancellation-absorbing span.
+    Idempotent and cheap — two SET LOCAL statements.
+    """
+    from sqlalchemy import text
+
+    await db.execute(text(f"SET LOCAL lock_timeout = '{ABSORBED_SPAN_LOCK_TIMEOUT_MS}ms'"))
+    await db.execute(text(f"SET LOCAL statement_timeout = '{ABSORBED_SPAN_STATEMENT_TIMEOUT_MS}ms'"))
+
 
 def require_postgresql_url(database_url: str, *, label: str = "database_url") -> str:
     """Return *database_url* unchanged, or raise ``ValueError`` naming the rejected scheme.

@@ -26,13 +26,29 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+import os
+import sys
+import time
 from datetime import UTC, datetime, timedelta
 
 import structlog
 from sqlalchemy import or_, select
 from sqlalchemy import update as sa_update
 
-from nso_adapter.core.claim import ClaimLostError, ClaimRegistration, lock_claim
+from nso_adapter.core.claim import (
+    JOB_CANCEL_DRAIN,
+    JOB_CLEANUP_BOUND,
+    JOB_EXECUTION_BUDGET,
+    ClaimLostError,
+    ClaimOutcome,
+    ClaimRegistration,
+    abandon_claim_to_staleness,
+    dispose_cancelled,
+    lock_claim,
+    mark_failed_and_release,
+    release_claim,
+)
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import DeviceClaim, Job, JobStatus, JobType
 
@@ -65,6 +81,14 @@ _REQUEUE_ON_RESTART = {
 
 _workers: list[asyncio.Task] = []
 _stop: asyncio.Event | None = None
+
+# Exactly ONE drain task per runner task. Both entry points — execution-budget expiry and
+# worker cancellation — go through _drain_handle, so the runner is cancelled once.
+_drains: dict[asyncio.Task, asyncio.Task] = {}
+
+# Distinct from 1 so a supervisor's logs separate "the adapter fail-stopped" from an
+# ordinary crash.
+_FAILSTOP_EXIT_CODE = 70
 
 
 def _now() -> datetime:
@@ -185,6 +209,133 @@ async def _heartbeat(job_id: int, reg: ClaimRegistration | None = None) -> None:
             logger.warning("worker.heartbeat_error", job_id=job_id, error=repr(exc))
 
 
+def _failstop(event: str, **fields) -> None:
+    """Log, flush, and kill the process. Does NOT return.
+
+    Reached only when a cancellation drain or a terminal-write cleanup exceeded a bound that
+    the server-enforced statement and lock timeouts, plus the absorb/drain margin, say is
+    impossible. That means a bound is missing or wrong — a bug, not load — and the process is
+    already in a state its own invariants forbid. Continuing risks a device write under
+    ownership the adapter can no longer prove it holds, which is the single failure the claim
+    design exists to prevent.
+
+    ``os._exit`` deliberately skips atexit hooks and finalizers: a graceful shutdown path
+    could block on the very thing that refused to drain. Process exit closes every DB
+    connection, which ABORTS the in-flight transaction — uncommitted work is discarded
+    cleanly, nothing is left half-written — and kills any in-flight RESTCONF socket, so the
+    device write cannot continue behind the adapter's back.
+
+    Recovery is NOT immediate: the exit leaves a claim whose heartbeat was just refreshed, and
+    the reaper revokes only claims older than the stale cutoff. Both adapter compose services
+    carry ``restart: unless-stopped`` for exactly this reason — without a supervisor this exit
+    leaves the adapter down for good.
+    """
+    logger.error(event, **fields)
+    for handler in logging.getLogger().handlers:
+        with contextlib.suppress(Exception):
+            handler.flush()
+    sys.stderr.flush()
+    os._exit(_FAILSTOP_EXIT_CODE)
+
+
+class _CancelSeen:
+    """Shared flag: a parent cancellation was absorbed and still owes a re-raise.
+
+    Shared rather than returned, because the cancel can land in any of several awaits and the
+    re-raise must happen once, at the very end, after all cleanup.
+    """
+
+    __slots__ = ("hit",)
+
+    def __init__(self) -> None:
+        self.hit = False
+
+
+async def _absorb(awaitable, seen: _CancelSeen):
+    """Await *awaitable*, absorbing EVERY parent cancellation until it resolves.
+
+    Never re-raises the parent cancel — not even when the inner awaitable has already
+    finished. It records the cancel on *seen*, which the worker body re-raises from only after
+    every cleanup step has run. Re-raising here would skip the disposition, the release and
+    the drain bookkeeping, which is how a shutdown mid-cleanup used to strand a job.
+    """
+    fut = asyncio.ensure_future(awaitable)
+    while True:
+        try:
+            return await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            seen.hit = True
+
+
+async def _cancel_and_drain(task: asyncio.Task, *, job_id: int, device_id: int | None, job_type: str) -> str:
+    """Cancel the runner once and wait a separately-timed drain. Fail-stops on expiry.
+
+    ``asyncio.wait`` neither cancels on timeout nor waits for a cancellation to finish, which
+    is why the two phases can be bounded independently. ``asyncio.wait_for`` cannot do this:
+    at its timeout it cancels the child and then waits for that cancellation to complete,
+    which is unbounded against a span that absorbs cancels — and this repository deliberately
+    contains such spans.
+    """
+    started = time.monotonic()
+    task.cancel()  # idempotent by construction: only ever called here, once per runner
+    _done, pending = await asyncio.wait({task}, timeout=JOB_CANCEL_DRAIN)
+    if pending:
+        _failstop(
+            "worker.drain_expired_failstop",
+            job_id=job_id,
+            device_id=device_id,
+            job_type=job_type,
+            elapsed=round(time.monotonic() - started, 3),
+            drain_bound=JOB_CANCEL_DRAIN,
+        )
+    return "drained"
+
+
+def _drain_handle(task: asyncio.Task, *, job_id: int, device_id: int | None, job_type: str) -> asyncio.Task:
+    """Exactly ONE drain per runner, whichever entry point asks for it.
+
+    Budget expiry and worker cancellation both arrive here. Without the shared handle the
+    second entry point issues a second ``task.cancel()``, and a repeated cancel turns
+    ``await_uncancellable``'s bounded drain into an abandoned live task — its drain phase
+    treats a second cancel as "still pending" and abandons the child immediately.
+    """
+    existing = _drains.get(task)
+    if existing is None:
+        existing = asyncio.create_task(_cancel_and_drain(task, job_id=job_id, device_id=device_id, job_type=job_type))
+        _drains[task] = existing
+    return existing
+
+
+async def _bounded_cleanup(awaitable, seen: _CancelSeen, *, job_id: int, device_id: int | None):
+    """``_absorb`` plus a hard wall-clock bound on the whole cleanup future.
+
+    Server statement and lock timeouts bound individual SQL statements. They do NOT bound
+    connection checkout, a stalled client socket, a rollback, or waiting for a COMMIT
+    acknowledgement that never arrives — and without a bound on those, a cleanup future can
+    stay pending forever while ``_absorb`` dutifully swallows every shutdown cancel.
+
+    The watchdog is its own TASK with a FIXED deadline, awaited THROUGH ``_absorb``. Awaiting
+    ``asyncio.wait`` directly would put the watchdog on the cancellable path: a second
+    shutdown cancel would raise out of that wait, destroy the watchdog, and leave the
+    disposition running detached with no expiry at all. Creating the task once means a cancel
+    is absorbed by the shield while the deadline keeps running on its original clock.
+    """
+    fut = asyncio.ensure_future(awaitable)
+
+    async def _watchdog():
+        _done, pending = await asyncio.wait({fut}, timeout=JOB_CLEANUP_BOUND)
+        if pending:
+            _failstop(
+                "worker.cleanup_expired_failstop",
+                job_id=job_id,
+                device_id=device_id,
+                cleanup_bound=JOB_CLEANUP_BOUND,
+            )
+        return fut.result()
+
+    return await _absorb(asyncio.create_task(_watchdog()), seen)
+
+
 async def reap_stale_claims() -> None:
     """Revoke every claim whose heartbeat has gone silent (Q7).
 
@@ -228,33 +379,129 @@ async def _worker_loop(worker_id: int, stop: asyncio.Event) -> None:
             await _mark_failed(job_id, "no_runner", f"No runner for job type {job_type}")
             continue
 
-        hb = asyncio.create_task(_heartbeat(job_id))
-        try:
-            logger.info(
-                "worker.job_start",
-                worker_id=worker_id,
-                job_id=job_id,
-                job_type=str(job_type),
-                device_id=device_id,
-            )
-            await runner(job_id, device_id)
-        except asyncio.CancelledError:
-            # Graceful shutdown cancelled a mid-run claim (S5a A2, codex R2-F7): return it
-            # to the queue now instead of leaving the device 409-blocked until the periodic
-            # reap's staleness window passes on the next restart/tick.
-            await _requeue_own_claim(job_id, job_type)
-            raise
-        except Exception as exc:
-            # Runners normally catch their own errors; this is a last resort so a
-            # runner bug can't strand the job in ``running``.
-            logger.exception("worker.job_crashed", worker_id=worker_id, job_id=job_id, error=repr(exc))
-            await _mark_failed(job_id, "internal", repr(exc))
-        finally:
-            hb.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await hb
+        await _run_one_job(worker_id, job_id, device_id, job_type, runner)
 
     logger.info("worker.stopped", worker_id=worker_id)
+
+
+async def _run_one_job(
+    worker_id: int,
+    job_id: int,
+    device_id: int | None,
+    job_type: JobType,
+    runner,
+    reg: ClaimRegistration | None = None,
+) -> None:
+    """Drive one runner as an explicit task, with execution and drain bounded separately.
+
+    The runner is a task, not an await, because the two phases have different deadlines and
+    ``asyncio.wait_for`` cannot express that: at its timeout it cancels the child and then
+    waits for the cancellation to COMPLETE, which is unbounded against a span that absorbs
+    cancels. ``asyncio.wait`` neither cancels nor waits for cancellation, so each phase gets
+    its own bound.
+
+    Both ways out — the execution budget expiring, and the worker task itself being cancelled
+    by shutdown — go through the SAME drain handle. Cancelling a task that is awaiting
+    ``asyncio.wait({runner})`` does not cancel the runner: the waiter raises while the runner
+    keeps going. Without the except arm, shutdown would bypass every branch below and release
+    ownership while the runner was still writing.
+    """
+    # The claim identity for this run. The caller supplies it once the worker acquires
+    # claims; an unregistered one is the claimless lane, which behaves exactly as before.
+    # It is an OBJECT, not a token: a run that acquires its claim mid-run registers into this
+    # same instance, and the heartbeat and the terminal writers read it live.
+    if reg is None:
+        reg = ClaimRegistration(device_id, None)
+    task = asyncio.create_task(runner(job_id, device_id))
+    hb = asyncio.create_task(_heartbeat(job_id, reg))
+    seen = _CancelSeen()
+    ownership = "drained"
+    outcome = ClaimOutcome.ABORT_KNOWN
+    drain_kwargs = {"job_id": job_id, "device_id": device_id, "job_type": str(job_type)}
+
+    logger.info(
+        "worker.job_start",
+        worker_id=worker_id,
+        job_id=job_id,
+        job_type=str(job_type),
+        device_id=device_id,
+    )
+    try:
+        try:
+            _done, pending = await asyncio.wait({task}, timeout=JOB_EXECUTION_BUDGET)
+            if pending:
+                logger.error("worker.execution_budget_expired", budget=JOB_EXECUTION_BUDGET, **drain_kwargs)
+                ownership = await _absorb(_drain_handle(task, **drain_kwargs), seen)
+        except asyncio.CancelledError:
+            seen.hit = True
+            ownership = await _absorb(_drain_handle(task, **drain_kwargs), seen)
+
+        # ALWAYS observe the finished runner: asyncio.wait returns tasks in `done` WITHOUT
+        # propagating their exceptions, so a runner that raised before writing a terminal
+        # status used to look like clean completion — claim released, job stranded `running`,
+        # and invisible to a reaper that scans claims.
+        #
+        # The lane is read from the registration HERE, at terminal time, never from a value
+        # captured at task creation: a run that acquired a claim mid-run must take the claimed
+        # branch, or it leaks the claim or writes unguarded.
+        try:
+            task.result()
+        except ClaimLostError:
+            # Recovery already owns this job's disposition; writing anything would clobber it.
+            logger.warning("worker.claim_lost", worker_id=worker_id, **drain_kwargs)
+            raise
+        except asyncio.CancelledError:
+            outcome = await _bounded_cleanup(_dispose(job_id, job_type, reg), seen, job_id=job_id, device_id=device_id)
+        except Exception as exc:
+            logger.exception("worker.job_crashed", worker_id=worker_id, job_id=job_id, error=repr(exc))
+            outcome = await _bounded_cleanup(
+                _fail_and_release(job_id, repr(exc), reg), seen, job_id=job_id, device_id=device_id
+            )
+        else:
+            outcome = await _bounded_cleanup(_release(reg), seen, job_id=job_id, device_id=device_id)
+    finally:
+        # NEVER a standalone release after a disposition that did not commit: a rolled-back
+        # status write with a deleted claim is invisible to the reaper forever. This branch
+        # only logs and leaves the row — the result-specific branches above own release.
+        if outcome is not ClaimOutcome.COMMIT_ACKNOWLEDGED and ownership != "transferred":
+            abandon_claim_to_staleness(reg, outcome)
+        # UNCONDITIONAL: every exit stops the heartbeat. A run that simply SUCCEEDS would
+        # otherwise leave its heartbeat looping forever, and a heartbeated claim never goes
+        # stale, so the reaper would never see it.
+        hb.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await hb
+        _drains.pop(task, None)
+
+    if seen.hit:
+        # Re-raised only now, after every cleanup step. Recorded rather than propagated at the
+        # point of the cancel, because propagating there skipped the disposition and release.
+        raise asyncio.CancelledError()
+
+
+async def _dispose(job_id: int, job_type: JobType, reg: ClaimRegistration) -> ClaimOutcome:
+    """Disposition a cancelled run, claimed or claimless depending on the live registration."""
+    if reg.registered:
+        return await dispose_cancelled(job_id, job_type, reg)
+    # The claimless lane: status only, nothing to release.
+    if job_type in _REQUEUE_ON_RESTART:
+        await _requeue_own_claim(job_id, job_type)
+    else:
+        await _mark_failed(job_id, "cancelled", "Worker cancelled the run")
+    return ClaimOutcome.COMMIT_ACKNOWLEDGED
+
+
+async def _fail_and_release(job_id: int, message: str, reg: ClaimRegistration) -> ClaimOutcome:
+    """Terminal failure: status AND release in one transaction when a claim is held."""
+    if reg.registered:
+        return await mark_failed_and_release(job_id, "internal", message, reg)
+    await _mark_failed(job_id, "internal", message)
+    return ClaimOutcome.COMMIT_ACKNOWLEDGED
+
+
+async def _release(reg: ClaimRegistration) -> ClaimOutcome:
+    """Normal-success release. A no-op on the claimless lane."""
+    return await release_claim(reg)
 
 
 async def _requeue_own_claim(job_id: int, job_type: JobType) -> None:
@@ -353,8 +600,21 @@ async def start_workers(concurrency: int = 1) -> None:
     logger.info("worker.pool_started", concurrency=len(_workers))
 
 
+# Shutdown must outlast a full cancellation drain plus the terminal-write cleanup that
+# follows it. The old 5s was BELOW await_uncancellable's own absorb (5s) + drain (2s), so a
+# graceful shutdown could return while a span was still draining — and returning is what
+# releases ownership, so it could leave a live child behind a released claim.
+_SHUTDOWN_TASK_WAIT = JOB_CANCEL_DRAIN + JOB_CLEANUP_BOUND + 10.0
+
+
 async def stop_workers() -> None:
-    """Signal all workers to stop and await their exit."""
+    """Signal all workers to stop and await their exit.
+
+    The wait per task must exceed the drain plus cleanup bounds; anything shorter means
+    shutdown can return with a runner still writing. Note this issues the SECOND cancel each
+    worker sees — ``task.cancel()`` here, then the ``wait_for`` expiry would cancel again —
+    which is why the drain handle is idempotent.
+    """
     global _workers
     if _stop is not None:
         _stop.set()
@@ -362,5 +622,5 @@ async def stop_workers() -> None:
         task.cancel()
     for task in _workers:
         with contextlib.suppress(asyncio.CancelledError, TimeoutError):
-            await asyncio.wait_for(task, timeout=5.0)
+            await asyncio.wait_for(task, timeout=_SHUTDOWN_TASK_WAIT)
     _workers = []

@@ -133,6 +133,12 @@ async def acquire_family_fence(db: AsyncSession, device_id: int, family: str) ->
         ordinal = _FAMILY_ORDINAL[family]
     except KeyError as exc:
         raise ValueError(f"unknown read family {family!r}") from exc
+    # The one genuinely unbounded wait on a claimed path: PostgreSQL blocks on a conflicting
+    # advisory lock forever by default, and this runs inside a cancellation-absorbing span
+    # whose drain the worker has to bound. The bound must therefore be the server's.
+    from nso_adapter.store.db import apply_absorbed_span_bounds
+
+    await apply_absorbed_span_bounds(db)
     await db.execute(
         text("SELECT pg_advisory_xact_lock(:device_id, :family_ordinal)"),
         {"device_id": device_id, "family_ordinal": ordinal},
