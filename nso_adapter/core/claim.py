@@ -68,16 +68,28 @@ JOB_CANCEL_DRAIN = 30.0
 # individual statements; they do NOT bound connection checkout, a stalled socket, a
 # rollback, or waiting for a lost COMMIT ack.
 JOB_CLEANUP_BOUND = 60.0
-# Room for the reaper's own scheduling interval on top of the lifecycle.
-REAPER_MARGIN = 120.0
+# The reaper's scheduling margin. In a live process the periodic tick is the ONLY thing
+# that looks at staleness, and it cannot fire more often than its configured interval
+# (SchedulerConfig.orphan_reap_interval, 5 minutes by default). The margin therefore has to
+# clear a whole tick plus slack: sized below the interval, a claim becomes revocable before
+# anything has scanned for it, so the first scan after the cutoff can revoke a holder that
+# is still inside its own lifecycle. A test pins this against the configured default, so
+# raising that default fails loudly here instead of silently shrinking the margin.
+_REAP_INTERVAL_DEFAULT_S = 5 * 60.0
+REAPER_MARGIN = _REAP_INTERVAL_DEFAULT_S + 120.0
 
-# DERIVED, never a literal: the inequality is then true by construction. The test asserts
-# the relation so that replacing this with a hand-picked number fails loudly.
-CLAIM_STALE_AFTER = JOB_EXECUTION_BUDGET + JOB_CANCEL_DRAIN + JOB_CLEANUP_BOUND + REAPER_MARGIN
+# The four terms the cutoff must clear.
+_LIFECYCLE_TOTAL = JOB_EXECUTION_BUDGET + JOB_CANCEL_DRAIN + JOB_CLEANUP_BOUND + REAPER_MARGIN
+# STRICTLY greater, never equal. At equality a runner that used every last second of its
+# budget, drain and cleanup is revocable at the exact instant it may still be committing —
+# which is the one state the whole token/row-lock design exists to make impossible.
+STALE_SLACK = 60.0
+
+CLAIM_STALE_AFTER = _LIFECYCLE_TOTAL + STALE_SLACK
 # The claimless lane's cutoff. Sized against the OUTER lifecycle, not provision's inner
 # 600s timeout: a heartbeat that stopped would otherwise let the reaper requeue a still
 # running onboarding and run it twice.
-PROVISION_STALE_AFTER = CLAIM_STALE_AFTER
+PROVISION_STALE_AFTER = _LIFECYCLE_TOTAL + STALE_SLACK
 
 
 def claim_stale_cutoff() -> float:
@@ -426,6 +438,7 @@ async def revoke_stale_claims(
     *,
     db: AsyncSession | None = None,
     cutoff_seconds: float | None = None,
+    lock_timeout_ms: int | None = None,
 ) -> list[RevokedClaim]:
     """Revoke every claim whose heartbeat has gone silent, and re-disposition its job.
 
@@ -440,12 +453,16 @@ async def revoke_stale_claims(
 
     Each DELETE blocks on any in-flight effectful transaction holding that row, so
     re-disposition can never race a runner that is still committing.
+
+    *lock_timeout_ms* bounds that wait. A reaper that blocks indefinitely behind a wedged
+    holder stops reaping every other device too, and the next tick will retry anyway.
     """
     cutoff_at = datetime.now(UTC) - timedelta(
         seconds=cutoff_seconds if cutoff_seconds is not None else CLAIM_STALE_AFTER
     )
     revoked: list[RevokedClaim] = []
     async with _session(db) as conn:
+        await _set_lock_timeout(conn, lock_timeout_ms)
         rows = (
             await conn.execute(
                 delete(DeviceClaim)

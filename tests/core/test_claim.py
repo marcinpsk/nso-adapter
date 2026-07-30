@@ -104,8 +104,16 @@ async def test_second_acquisition_loses_at_the_database(adapter_client, rival_en
     assert (await _claim_row(device_id)).claim_token == first.token
 
 
-async def test_concurrent_acquisitions_produce_exactly_one_holder(adapter_client, rival_engine):
-    """Both INSERTs in flight at once against real PostgreSQL."""
+async def test_rival_blocks_on_an_uncommitted_acquisition_then_loses(adapter_client, rival_engine):
+    """Forced contention, not `asyncio.gather`.
+
+    An unsynchronized gather can serialize by scheduling and prove nothing. Here the first
+    INSERT is deliberately left UNCOMMITTED: PostgreSQL makes the rival's
+    `ON CONFLICT DO NOTHING` wait on the speculative insertion until the first transaction
+    resolves, so the rival genuinely contends and is then told it lost.
+    """
+    from nso_adapter.store.models import DeviceClaim
+
     device_id = await seed_device(nso_device_name="cl-race", netbox_device_id=9902)
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
 
@@ -113,10 +121,23 @@ async def test_concurrent_acquisitions_produce_exactly_one_holder(adapter_client
         async with rival() as db:
             return await acquire_claim(device_id, "sweep", db=db)
 
-    mine, theirs = await asyncio.gather(acquire_claim(device_id, "job"), _rival_attempt())
-    winners = [r for r in (mine, theirs) if r is not None]
-    assert len(winners) == 1
-    assert (await _claim_row(device_id)).claim_token == winners[0].token
+    async with session() as holder:
+        # Visible as contention, not yet durable.
+        await holder.execute(
+            sa.insert(DeviceClaim).values(
+                device_id=device_id, claim_token="uncommitted-token", purpose="job", job_id=None
+            )
+        )
+        await holder.flush()
+
+        attempt = asyncio.create_task(_rival_attempt())
+        await asyncio.sleep(0.3)
+        assert not attempt.done(), "the rival did not block on the uncommitted insert"
+
+        await holder.commit()
+
+    assert await asyncio.wait_for(attempt, timeout=10) is None
+    assert (await _claim_row(device_id)).claim_token == "uncommitted-token"
 
 
 async def test_provision_acquisition_sets_job_id(adapter_client):
@@ -206,21 +227,21 @@ async def test_write_before_takeover_cannot_commit_after(adapter_client, rival_e
     physically blocks on A's row lock. Exactly one order may be observable: A commits and
     then revocation lands, or revocation wins and A's commit fails. What must never
     happen is "revocation committed, then A's write committed".
+
+    The blocking is proven POSITIVELY, by PostgreSQL: the rival revoke runs with a short
+    ``lock_timeout`` and must fail waiting on the claim row. Timing alone cannot prove it —
+    an unfinished task is equally consistent with a slow connection checkout, so a
+    predicate-guarded build would pass a "not done yet" assertion.
     """
+    from sqlalchemy.exc import DBAPIError
+
     from nso_adapter.store.models import Device
 
     device_id = await seed_device(nso_device_name="cl-linear", netbox_device_id=9908)
     reg = await acquire_claim(device_id, "job")
     await _backdate_heartbeat(device_id, seconds=claim_stale_cutoff() + 60)
 
-    revoke_started = asyncio.Event()
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
-    revoked: list = []
-
-    async def _revoke():
-        revoke_started.set()
-        async with rival() as db:
-            revoked.extend(await revoke_stale_claims(db=db))
 
     async with session() as db:
         await lock_claim(db, reg)
@@ -228,18 +249,21 @@ async def test_write_before_takeover_cannot_commit_after(adapter_client, rival_e
         device.nso_device_name = "written-by-a"
         await db.flush()
 
-        revoker = asyncio.create_task(_revoke())
-        await revoke_started.wait()
-        # The revoke's DELETE must be blocked on A's row lock, not already done.
-        await asyncio.sleep(0.3)
-        assert not revoker.done(), "the revoke did not block on the holder's row lock"
+        # The revoke's DELETE must WAIT on A's row lock — proven by the wait expiring.
+        with pytest.raises(DBAPIError) as blocked:
+            async with rival() as rival_db:
+                await revoke_stale_claims(db=rival_db, lock_timeout_ms=400)
+        assert "lock timeout" in str(blocked.value).lower() or "canceling statement" in str(blocked.value).lower()
 
+        assert (await _claim_row(device_id)).claim_token == reg.token, "the claim was revoked mid-write"
         await db.commit()
 
-    await asyncio.wait_for(revoker, timeout=10)
+    # Only now can the revoke proceed.
+    async with rival() as rival_db:
+        revoked = await revoke_stale_claims(db=rival_db)
 
     async with session() as db:
-        # A committed first, so its write stands and the claim is gone afterwards.
+        # A committed first, so its write stands and the claim went afterwards.
         assert (await db.get(Device, device_id)).nso_device_name == "written-by-a"
     assert await _claim_row(device_id) is None
     assert [r.device_id for r in revoked] == [device_id]
@@ -424,48 +448,146 @@ async def test_lock_contention_reports_abort_known(adapter_client, rival_engine)
     assert (await _claim_row(device_id)).claim_token == reg.token
 
 
-async def test_killed_connection_around_commit_reports_outcome_unknown(adapter_client, rival_engine):
-    """M6.9i/M6.9k(c) — a genuinely lost COMMIT ack must classify as UNKNOWN, not as a
-    known abort: the server may have applied it and the client cannot tell.
+class _LostAckSession:
+    """A REAL session whose COMMIT lands and whose acknowledgement is then lost.
 
-    The backend is terminated from a SECOND connection while the claim-bearing transaction
-    is open, so the failure surfaces on the COMMIT itself — which is the only way to reach
-    this branch honestly. Killing it from inside the same session makes an earlier
-    statement raise instead, and that is an ABORT_KNOWN, a different contract.
+    This is the one failure the three-state contract exists for and the one that cannot be
+    reproduced from SQL: the server applied the transaction, the client never learned it.
+    Terminating the backend does not reproduce it — PostgreSQL aborts the open transaction,
+    which is an ABORT_KNOWN and a different contract. So the loss is injected at the driver
+    boundary, after a genuine commit, by delegation rather than by a mock: every other
+    attribute is the real session's.
     """
-    from nso_adapter.core.claim import _commit_outcome
-    from nso_adapter.store.models import DeviceClaim
 
-    device_id = await seed_device(nso_device_name="cl-unknown", netbox_device_id=9971)
-    reg = await acquire_claim(device_id, "job")
+    def __init__(self, inner) -> None:
+        self._inner = inner
 
-    async with session() as db:
-        await lock_claim(db, reg)
-        await db.execute(sa.delete(DeviceClaim).where(DeviceClaim.device_id == device_id))
-        pid = await db.scalar(sa.text("SELECT pg_backend_pid()"))
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
-        async with rival_engine.connect() as killer:
-            await killer.execute(sa.text("SELECT pg_terminate_backend(:pid)"), {"pid": pid})
-            await killer.commit()
+    async def commit(self) -> None:
+        await self._inner.commit()  # really commits
+        raise ConnectionResetError("acknowledgement lost after COMMIT")
 
-        assert await _commit_outcome(db) is ClaimOutcome.OUTCOME_UNKNOWN
 
+async def _assert_two_atomic_end_states(device_id: int, job_id: int, original, token: str) -> None:
+    """The job status and the claim must agree. A torn pair is the only forbidden result."""
+    from nso_adapter.store.models import JobStatus
+
+    status = await _job_status(job_id)
     row = await _claim_row(device_id)
-    # Either end state is legal here; the contract forbids only a TORN one.
-    assert row is None or row.claim_token == reg.token
+    terminal = status in {JobStatus.failed, JobStatus.queued, JobStatus.succeeded} and status is not original
+    if terminal:
+        assert row is None, f"TORN: job moved to {status} but the claim was retained"
+    else:
+        assert status is original, f"job moved to {status} without the transition being intended"
+        assert row is not None and row.claim_token == token, "TORN: job unchanged but the claim is gone"
+
+
+@pytest.mark.parametrize("helper", ["dispose_cancelled", "mark_failed_and_release"])
+async def test_terminal_helper_aborting_before_commit_leaves_the_pair_intact(adapter_client, rival_engine, helper):
+    """M6.9i(i) — a deterministic pre-COMMIT abort: (original status, retained claim).
+
+    Catches the two-transaction shape: an implementation that commits the job transition
+    and releases the claim separately reaches (terminal, retained claim) here, which the
+    end-state assertion rejects.
+    """
+    from nso_adapter.store.models import DeviceClaim, JobStatus, JobType
+
+    device_id = await seed_device(nso_device_name=f"cl-abort-{helper}", netbox_device_id=9972)
+    job_id = await _seed_job(device_id, JobType.sync, JobStatus.running)
+    reg = await acquire_claim(device_id, "job", job_id=job_id)
+
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+    async with rival() as blocker:
+        # Hold the claim row so the helper's own FOR UPDATE cannot get it.
+        await blocker.execute(sa.select(DeviceClaim).where(DeviceClaim.device_id == device_id).with_for_update())
+
+        if helper == "dispose_cancelled":
+            outcome = await dispose_cancelled(job_id, JobType.sync, reg, lock_timeout_ms=250)
+        else:
+            outcome = await mark_failed_and_release(job_id, "internal", "boom", reg, lock_timeout_ms=250)
+        assert outcome is ClaimOutcome.ABORT_KNOWN
+        await blocker.rollback()
+
+    await _assert_two_atomic_end_states(device_id, job_id, JobStatus.running, reg.token)
+
+
+@pytest.mark.parametrize("helper", ["dispose_cancelled", "mark_failed_and_release"])
+async def test_terminal_helper_losing_the_ack_leaves_the_pair_intact(adapter_client, helper):
+    """M6.9i(ii) — a genuine acknowledgement loss after a real commit.
+
+    The safe outcome here is (terminal, no claim): both halves were in the SAME
+    transaction, so the commit that landed carried both. An implementation using two
+    transactions would land only the first and be caught by the torn-pair assertion.
+    """
+    from nso_adapter.store.models import JobStatus, JobType
+
+    device_id = await seed_device(nso_device_name=f"cl-lostack-{helper}", netbox_device_id=9973)
+    job_id = await _seed_job(device_id, JobType.sync, JobStatus.running)
+    reg = await acquire_claim(device_id, "job", job_id=job_id)
+
+    async with session() as real:
+        wrapped = _LostAckSession(real)
+        if helper == "dispose_cancelled":
+            outcome = await dispose_cancelled(job_id, JobType.sync, reg, db=wrapped)
+        else:
+            outcome = await mark_failed_and_release(job_id, "internal", "boom", reg, db=wrapped)
+        assert outcome is ClaimOutcome.OUTCOME_UNKNOWN
+
+    await _assert_two_atomic_end_states(device_id, job_id, JobStatus.running, reg.token)
 
 
 # ── constants ────────────────────────────────────────────────────────────────
 
 
-def test_claim_cutoff_exceeds_the_whole_job_lifecycle():
-    """The relation, never the literals: a cutoff shorter than the lifecycle can revoke a
-    live runner, and then its own writes race the successor's."""
+def test_both_cutoffs_strictly_exceed_all_four_lifecycle_terms():
+    """The relation, never the literals — and STRICTLY, with the margin included.
+
+    An earlier version omitted REAPER_MARGIN from the right-hand side, which is exactly why
+    it could not see that the cutoff had been set EQUAL to the four-term total. At equality
+    a runner that used every last second of budget, drain and cleanup is revocable at the
+    instant it may still be committing.
+    """
     from nso_adapter.core import claim
 
-    lifecycle = claim.JOB_EXECUTION_BUDGET + claim.JOB_CANCEL_DRAIN + claim.JOB_CLEANUP_BOUND
-    assert claim.CLAIM_STALE_AFTER > lifecycle
-    assert claim.PROVISION_STALE_AFTER > lifecycle
+    four_terms = claim.JOB_EXECUTION_BUDGET + claim.JOB_CANCEL_DRAIN + claim.JOB_CLEANUP_BOUND + claim.REAPER_MARGIN
+    assert claim.CLAIM_STALE_AFTER > four_terms
+    assert claim.PROVISION_STALE_AFTER > four_terms
     # The 60s orphan window recovers nothing once claims exist — it would re-disposition a
     # job whose holder's token is still valid.
     assert claim.CLAIM_STALE_AFTER > 60.0
+
+
+def test_reaper_margin_clears_the_configured_reap_interval():
+    """The periodic tick is the only thing that scans staleness in a live process.
+
+    Sized below its interval, a claim becomes revocable before anything has looked, so the
+    first scan past the cutoff can revoke a holder still inside its own lifecycle. Pinned
+    against the configured default so raising that default fails here rather than silently
+    shrinking the margin.
+    """
+    from nso_adapter.config import SchedulerConfig
+    from nso_adapter.core import claim
+
+    interval_seconds = SchedulerConfig().orphan_reap_interval * 60.0
+    assert interval_seconds > 0
+    assert claim.REAPER_MARGIN > interval_seconds
+
+
+def test_requeue_policy_and_disposition_cannot_diverge():
+    """One rule, two expressions of it — tied so a new job type cannot split them.
+
+    ``_REQUEUE_ON_RESTART`` lives in the worker (the legacy job-status reaper still uses
+    it) while ``disposition_for`` lives here, because importing the worker from this module
+    would be circular. A job type added to ``JobType`` and forgotten in one of the two is
+    exactly the silent divergence this pins.
+    """
+    from nso_adapter.core import worker as worker_mod
+    from nso_adapter.core.claim import disposition_for
+    from nso_adapter.store.models import JobStatus, JobType
+
+    assert worker_mod._REQUEUE_ON_RESTART == set(JobType) - {JobType.apply}
+    for job_type in JobType:
+        expected = JobStatus.queued if job_type in worker_mod._REQUEUE_ON_RESTART else JobStatus.failed
+        assert disposition_for(job_type) is expected, job_type

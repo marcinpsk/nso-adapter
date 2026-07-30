@@ -153,22 +153,34 @@ async def test_revoked_claim_stops_the_heartbeat_without_resurrecting_it(adapter
 # ── the reaper's entry points ────────────────────────────────────────────────
 
 
-async def test_start_workers_reaps_stale_claims_before_starting(adapter_client):
+async def test_start_workers_reaps_stale_claims_before_starting(adapter_client, monkeypatch):
     """Revocation must happen before any worker exists, or the requeued job is stranded
-    behind the worker's live-claim skip."""
-    from nso_adapter.store.models import DeviceClaim, JobStatus, JobType
+    behind the worker's live-claim skip.
+
+    The spawned workers are stubbed inert: a real one would claim the just-requeued job and
+    set it ``running`` before the assertion could read it, so the test would be racing the
+    very wiring it is checking.
+    """
+    from nso_adapter.store.models import DeviceClaim, Job, JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="hb-startup", netbox_device_id=9984)
     job_id = await _seed_running_job(device_id, JobType.sync)
     await acquire_claim(device_id, "job", job_id=job_id)
     await _backdate_both(device_id, job_id, seconds=claim_stale_cutoff() + 60)
 
+    started = asyncio.Event()
+
+    async def _inert_loop(_worker_id, stop):
+        started.set()
+        await stop.wait()
+
+    monkeypatch.setattr(worker_mod, "_worker_loop", _inert_loop)
+
     await worker_mod.start_workers(concurrency=1)
     try:
+        await asyncio.wait_for(started.wait(), timeout=5)
         async with session() as db:
             assert await db.get(DeviceClaim, device_id) is None
-            from nso_adapter.store.models import Job
-
             assert (await db.get(Job, job_id)).status is JobStatus.queued
     finally:
         await worker_mod.stop_workers()
