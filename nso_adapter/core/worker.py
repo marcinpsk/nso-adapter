@@ -32,8 +32,9 @@ import structlog
 from sqlalchemy import or_, select
 from sqlalchemy import update as sa_update
 
+from nso_adapter.core.claim import ClaimLostError, ClaimRegistration, lock_claim
 from nso_adapter.store.db import get_session
-from nso_adapter.store.models import Job, JobStatus, JobType
+from nso_adapter.store.models import DeviceClaim, Job, JobStatus, JobType
 
 logger = structlog.get_logger(__name__)
 
@@ -100,9 +101,25 @@ async def _claim_next_job() -> tuple[int, int | None, JobType] | None:
     return None
 
 
-async def _mark_failed(job_id: int, code: str, message: str) -> None:
-    """Fallback terminal failure when a runner raises (runners normally self-manage)."""
+async def _mark_failed(job_id: int, code: str, message: str, reg: ClaimRegistration | None = None) -> None:
+    """Last-resort terminal failure for a WORKER-MACHINERY fault.
+
+    Not the runner's error path: an ordinary runner exception is consumed by the
+    result-specific branch and routed to the claim-bearing terminal writer. What reaches
+    here is a fault outside result-specific handling — the drain plumbing raising, the
+    claim-token plumbing raising before a branch is chosen — plus direct invocation.
+
+    It still writes a terminal status on a claimed device, so it takes the claim row lock
+    first when *reg* is supplied: otherwise it can overwrite the disposition recovery
+    already made, or a fresh worker's ``running``.
+    """
     async for db in get_session():
+        if reg is not None:
+            try:
+                await lock_claim(db, reg)
+            except ClaimLostError:
+                logger.warning("worker.mark_failed_claim_lost", job_id=job_id, device_id=reg.device_id)
+                return
         job = await db.get(Job, job_id)
         if job is None:
             return
@@ -111,24 +128,81 @@ async def _mark_failed(job_id: int, code: str, message: str) -> None:
         await db.commit()
 
 
-async def _heartbeat(job_id: int) -> None:
+async def _heartbeat(job_id: int, reg: ClaimRegistration | None = None) -> None:
     """Refresh ``heartbeat_at`` every interval until cancelled.
 
+    Two lanes, chosen LIVE on every tick from *reg* — never from a value captured when the
+    task was created. A provision acquires its claim mid-run and has to switch lanes on the
+    very next tick; reading a stale ``None`` would leave its claim un-heartbeated and let
+    the reaper revoke a healthy run.
+
+    * registered: lock the claim row FIRST, then refresh both ``device_claim`` and ``jobs``.
+      Claim-before-job is the §3.9 order and is not cosmetic — recovery holds the claim and
+      reaches for the job, so appending the claim update after the job write would invert
+      the two and deadlock. The lock doubles as the guard: zero rows means the claim was
+      revoked, so stop heartbeating and let the runner's next guard raise ``ClaimLostError``.
+      Never re-insert the row — resurrecting a revoked claim would hand the device back to a
+      holder recovery has already replaced.
+    * unregistered: refresh ``jobs`` only, exactly as before.
+
     A transient DB error on one tick must NOT kill the heartbeat: if it did, the heartbeat
-    would go stale under a still-running job and the startup reaper (which only recovers jobs
-    with a stale heartbeat) would eventually steal it. Log and keep looping; only cancellation
-    stops the heartbeat.
+    would go stale under a still-running job and the reaper would eventually steal it. Log
+    and keep looping; only cancellation or a revoked claim stops it.
     """
     while True:
         try:
             await asyncio.sleep(_HEARTBEAT_INTERVAL)
+            live = reg if (reg is not None and reg.registered) else None
+            revoked = False
             async for db in get_session():
-                await db.execute(sa_update(Job).where(Job.id == job_id).values(heartbeat_at=_now()))
-                await db.commit()
+                now = _now()
+                if live is not None:
+                    held = await db.scalar(
+                        select(DeviceClaim.claim_token)
+                        .where(
+                            DeviceClaim.device_id == live.device_id,
+                            DeviceClaim.claim_token == live.token,
+                        )
+                        .with_for_update()
+                    )
+                    if held is None:
+                        revoked = True
+                    else:
+                        await db.execute(
+                            sa_update(DeviceClaim)
+                            .where(DeviceClaim.device_id == live.device_id, DeviceClaim.claim_token == live.token)
+                            .values(heartbeat_at=now)
+                        )
+                if not revoked:
+                    await db.execute(sa_update(Job).where(Job.id == job_id).values(heartbeat_at=now))
+                    await db.commit()
+            if revoked:
+                logger.warning("worker.heartbeat_claim_revoked", job_id=job_id, device_id=reg.device_id)
+                return
         except asyncio.CancelledError:
             return
         except Exception as exc:
             logger.warning("worker.heartbeat_error", job_id=job_id, error=repr(exc))
+
+
+async def reap_stale_claims() -> None:
+    """Revoke every claim whose heartbeat has gone silent (Q7).
+
+    Purpose- and job-independent by design: an ``intent_put`` or ``teardown`` claim has no
+    job at all, and an apply's claim deliberately outlives its terminal job through the
+    post-apply refresh, so a reaper keyed on ``Job.status = 'running'`` would miss all of
+    them. Revocation leaves NO claim — reissuing one at startup, before any worker exists,
+    would strand the requeued job behind the worker's live-claim skip.
+    """
+    from nso_adapter.core.claim import revoke_stale_claims
+
+    revoked = await revoke_stale_claims()
+    if revoked:
+        logger.warning(
+            "worker.claims_revoked",
+            count=len(revoked),
+            devices=[entry.device_id for entry in revoked],
+        )
 
 
 async def _worker_loop(worker_id: int, stop: asyncio.Event) -> None:
@@ -272,6 +346,8 @@ async def start_workers(concurrency: int = 1) -> None:
     """Reconcile orphaned jobs, then start the worker pool."""
     global _stop, _workers
     await requeue_orphaned_jobs()
+    # Before any worker exists, so a revoked device is immediately claimable again.
+    await reap_stale_claims()
     _stop = asyncio.Event()
     _workers = [asyncio.create_task(_worker_loop(i, _stop)) for i in range(max(1, concurrency))]
     logger.info("worker.pool_started", concurrency=len(_workers))

@@ -17,6 +17,7 @@ import pytest
 import sqlalchemy as sa
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.orm import Session as SyncSession
 
 from nso_adapter.bindings.netbox.client import NetboxClient
@@ -251,6 +252,27 @@ async def store_engine(pg_url):
         await engine.dispose()  # runs AFTER every dependent fixture has closed
         store_db._engine = None  # no cross-test global bleed
         store_db._session_factory = None
+
+
+@pytest.fixture
+async def rival_engine(store_engine, pg_url):
+    """A second, independent AsyncEngine on the SAME clone database.
+
+    Stands in for another worker or process in the claim tests. Two AsyncSessions on two
+    connections running ``INSERT … ON CONFLICT DO NOTHING`` in separate committed
+    transactions is a genuine database-level race, so exclusivity is proven against real
+    PostgreSQL rather than against an asyncio lock.
+
+    Never touches ``nso_adapter.store.db``'s process globals — ``store_engine`` owns
+    those. Depending on it means this engine is finalized FIRST, so its connections are
+    gone before the clone is dropped (``_drop_database(..., expect_clean=True)`` fails the
+    test otherwise, which is the point).
+    """
+    engine = create_async_engine(pg_url, poolclass=sa.pool.NullPool)
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
 
 
 @pytest.fixture

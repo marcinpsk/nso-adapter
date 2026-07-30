@@ -274,6 +274,9 @@ async def _scheduled_orphan_reap() -> None:
     from nso_adapter.core import worker as _worker
 
     await _worker.requeue_orphaned_jobs()
+    # Claims are reaped on their own clock and their own scan (over device_claim, not over
+    # job status): a claim can be stale with no running job at all.
+    await _worker.reap_stale_claims()
     # S5a A2 (codex R3-6): the reap is also the pool's liveness driver — a requeued job
     # is only useful if a live worker exists to drain it.
     _worker.ensure_workers()
