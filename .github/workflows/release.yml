@@ -17,6 +17,7 @@ jobs:
   release:
     name: Create the release
     runs-on: ubuntu-latest
+    # semantic-release needs to push its version commit and tag, then create the GitHub release.
     permissions:
       contents: write
     outputs:
@@ -38,6 +39,11 @@ jobs:
         env:
           RELEASE_SHA: ${{ github.sha }}
         run: git reset --hard "$RELEASE_SHA"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
+        with:
+          python-version: "3.12"
 
       # release-please never created a tag in this repository. Establish the
       # version declared immediately before this push as the baseline; otherwise
@@ -75,6 +81,7 @@ jobs:
     needs: release
     if: needs.release.outputs.released == 'true'
     runs-on: ubuntu-latest
+    # The release job reads the tag while the Docker client pushes the versioned image to GHCR.
     permissions:
       contents: read
       packages: write

@@ -5,14 +5,25 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
 
       - name: Sync dependencies
         run: uv sync --all-groups
@@ -23,11 +34,34 @@ jobs:
       - name: Ruff format check
         run: uv run --native-tls -- ruff format --check .
 
+  container-smoke:
+    name: Container runtime smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
+
+      # Run a console script from the copied runtime virtualenv. This catches a
+      # builder-only shebang even when importing with Python would still work.
+      - name: Build and exercise the runtime image
+        run: |
+          docker build --tag nso-adapter:ci .
+          docker run --rm --entrypoint uvicorn nso-adapter:ci --version
+
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
 
       # The retired engine must not creep back in. `git grep` scans TRACKED content
       # only: several working docs are deliberately local-only and do not exist on a
@@ -52,7 +86,7 @@ jobs:
           fi
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
 
       - name: Sync dependencies
         run: uv sync --all-groups
@@ -65,7 +99,8 @@ jobs:
           set -euo pipefail
           docker run -d --name adapter-test-db -p 127.0.0.1:55433:5432 \
             -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
-            --tmpfs /var/lib/postgresql/data postgres:16-alpine \
+            --tmpfs /var/lib/postgresql/data \
+            postgres:16-alpine@sha256:16bc17c64a573ef34162af9298258d1aec548232985b33ed7b1eac33ba35c229 \
             postgres -c fsync=off -c full_page_writes=off -c synchronous_commit=off \
                      -c wal_level=minimal -c max_wal_senders=0 -c shared_buffers=256MB \
                      -c max_connections=200
