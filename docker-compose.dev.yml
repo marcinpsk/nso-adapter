@@ -36,6 +36,7 @@ services:
   adapter-db:
     image: postgres:16-alpine
     container_name: nso-adapter-postgres-dev
+    restart: unless-stopped
     environment:
       - POSTGRES_USER=nso
       - POSTGRES_PASSWORD=nso
