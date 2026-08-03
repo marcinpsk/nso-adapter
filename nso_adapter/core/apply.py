@@ -15,6 +15,8 @@ Concurrency: relies on the existing one-job-per-device rule in core/jobs.py.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import NamedTuple
@@ -23,7 +25,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.claim import ClaimLostError
+from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError
 from nso_adapter.core.static_route_plan import authorized_clear_fields, build_plan
 from nso_adapter.nso.apply import NsoApplyError
 from nso_adapter.store.models import (
@@ -275,7 +277,7 @@ async def _static_route_snapshot(client, device, plan) -> tuple[dict | None, lis
     return current, retained
 
 
-async def _put_static_routes(client, device, plan, *, dry_run=False):
+async def _put_static_routes(client, device, plan, *, dry_run=False, outbox: dict | None = None):
     """Send the guarded PUT-replace of the whole static-route service instance (§4.1).
 
     The guard sees the same snapshot the retained entries came from, and ``plan.allowed``
@@ -283,7 +285,8 @@ async def _put_static_routes(client, device, plan, *, dry_run=False):
     delivering, plus (X4 belt) the tombstone keys the retention already re-asserts.
     """
     from nso_adapter.core.removal import _guarded_apply
-    from nso_adapter.nso.apply import apply_static_routes
+    from nso_adapter.core.static_route_plan import triple_of
+    from nso_adapter.nso.apply import apply_static_routes, static_route_entry_key
 
     current, retained = await _static_route_snapshot(client, device, plan)
 
@@ -303,7 +306,16 @@ async def _put_static_routes(client, device, plan, *, dry_run=False):
         # with method="put".
         return await _apply(replace=True, dry_run=dry_run)
     context = {"removed": {"route": [list(key) for key in sorted(plan.allowed)]}}
-    return await _guarded_apply(client, device, "static_route", context, _apply, current=current)
+    verdict = await _guarded_apply(client, device, "static_route", context, _apply, current=current)
+    if outbox is not None:
+        outbox["verify"] = verdict
+        # Exactly what the body carried: the rendered rows plus the tombstone entries kept
+        # verbatim. The residue check subtracts these — a key still on the device because
+        # this very PUT re-asserted it is intent, not a survivor (C3.8).
+        outbox["sent_keys"] = {triple_of(row) for row in plan.rows} | {
+            static_route_entry_key(entry) for entry in retained
+        }
+    return verdict
 
 
 async def _enqueue_pending_clear_retract(db: AsyncSession, device, plan, *, reg=None) -> None:
@@ -363,15 +375,398 @@ async def _enqueue_pending_clear_retract(db: AsyncSession, device, plan, *, reg=
     )
 
 
-def _static_route_coro(client, device, plan, *, dry_run=False):
-    """Build the static-route scope's coroutine for this plan — PUT-replace or today's merge."""
+def _static_route_coro(client, device, plan, *, dry_run=False, outbox: dict | None = None):
+    """Build the static-route scope's coroutine for this plan — PUT-replace or today's merge.
+
+    *outbox* collects what the send learned and the caller's bookkeeping needs: the §4.4
+    proof ``verify`` verdict, and ``sent_keys`` — every route key the body actually carried,
+    rendered rows plus verbatim tombstone retention. The residue check subtracts those: a
+    predecessor key this apply deliberately re-asserted (a sibling row reclaimed it, or a
+    tombstone still owns its entry) is not residue, it is intent (C3.8).
+    """
+    from nso_adapter.core.static_route_plan import triple_of
     from nso_adapter.nso.apply import apply_static_routes
 
-    if plan.mode == "PUT":
-        return _put_static_routes(client, device, plan, dry_run=dry_run)
-    return apply_static_routes(
-        client=client, device_name=device.nso_device_name, route_intent_rows=plan.rows, dry_run=dry_run
+    async def _run():
+        if plan.mode == "PUT":
+            return await _put_static_routes(client, device, plan, dry_run=dry_run, outbox=outbox)
+        verdict = await apply_static_routes(
+            client=client, device_name=device.nso_device_name, route_intent_rows=plan.rows, dry_run=dry_run
+        )
+        if outbox is not None:
+            outbox["verify"] = verdict
+            outbox["sent_keys"] = {triple_of(row) for row in plan.rows}
+        return verdict
+
+    return _run()
+
+
+# ── #1396 R2 §4.4-§4.6 — proof, residue enforcement, CAS, per-route results ──
+
+#: Store field → the wire leaf :func:`static_route_entry` renders it as. §4.11's clear
+#: vocabulary on the READ side: a carrier entry is consumable only once this leaf is gone or
+#: neutral in the post-write device-state view. ``name`` is absent by design (no wire leaf).
+_CLEAR_WIRE_LEAF: dict[str, str] = {
+    "interface_next_hop": "interface-next-hop",
+    "next_hop_vrf": "next-hop-vrf",
+    "metric": "metric",
+    "permanent": "permanent",
+    "tag": "tag",
+}
+
+#: The scope failure a surviving predecessor key raises. Distinct from the writer-drop code:
+#: the intent DID land, and what failed is the retraction of what it replaced.
+RESIDUE_FOUND_CODE = "static_route_residue_found"
+
+#: Per-route outcomes (§4.5). ``unproven`` is the honest third state R2 adds — the write was
+#: accepted and nothing proves it, so nothing may be consumed and no green may be reported.
+SR_IN_SYNC = "in_sync"
+SR_APPLY_FAILED = "apply_failed"
+SR_UNPROVEN = "unproven"
+
+
+class SrProof(NamedTuple):
+    """Everything the post-write reads established, before any of it is acted on."""
+
+    #: The commit's native-verify verdict, or ``None`` when the send returned none at all.
+    verify: str | None
+    #: Per-row reader-compare evidence, ``{row pk: present|missing}``. Absent ⇒ unverifiable.
+    evidence: dict[int, str]
+    #: ``clean|found|unsupported|error`` over the consumed predecessor keys; ``None`` when no
+    #: key was consumed, so no residue read was owed. Only ``clean`` may consume anything;
+    #: ``found`` fails the scope, and the other two are inconclusive (§6/OQ-R2-1).
+    residue: str | None
+    #: The consumed predecessor keys still present on the device.
+    survivors: list[tuple[str, str, str]]
+    #: The device-state ``static-route`` entries by key — §4.11's per-field evidence plane.
+    entries: dict[tuple[str, str, str], dict]
+
+
+def static_route_fingerprint(row) -> str:
+    """SHA-256 over the EXACT wire entry sent for *row*.
+
+    Hashes the renderer's output, not a hand-picked field list, so the fingerprint cannot
+    drift from the payload: every leaf the body carries moves it, and a store field with no
+    wire form (``name``) does not.
+    """
+    from nso_adapter.nso.apply import static_route_entry
+
+    encoded = json.dumps(static_route_entry(row), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _leaf_is_neutral(field: str, entry: dict) -> bool:
+    """Whether *entry* proves *field* is no longer set on the device (§4.11's table).
+
+    Never falsiness. ``metric: 0`` and ``tag: 0`` are real values the renderer emits, so a
+    generic truthiness check would empty the carrier while the old value is still live —
+    the same false green the carrier exists to prevent. ``permanent`` is the one field where
+    ``false`` IS neutral, because the renderer never emits it (G27).
+    """
+    leaf = _CLEAR_WIRE_LEAF[field]
+    if leaf not in entry:
+        return True
+    value = entry[leaf]
+    if value is None:  # an explicit null is the export's spelling of "absent"
+        return True
+    if field == "permanent":
+        return value is False or str(value).strip().lower() == "false"
+    if field in ("interface_next_hop", "next_hop_vrf"):
+        return str(value) == ""
+    return False
+
+
+async def _static_route_device_state(client, device) -> tuple[str, dict]:
+    """Read the certified ``static-route`` device-state section ONCE → ``(status, entries)``.
+
+    One read serves both post-write consumers: the residue check over the consumed
+    predecessor keys, and §4.11's per-field evidence for the clear carrier. ``status`` is
+    ``ok`` / ``unsupported`` (the NED exports no such section — absence proves nothing) /
+    ``error``; only ``ok`` yields entries, and only entries can consume anything.
+    """
+    from nso_adapter.core.removal import _VERIFY_BATCH_TIMEOUT, _live_family_sections, _verifier_section_status
+
+    try:
+        sections = await _live_family_sections(
+            client, device.nso_device_name, ["static-route"], timeout=_VERIFY_BATCH_TIMEOUT
+        )
+        section = sections["static-route"]
+        status = _verifier_section_status(section)
+        if status != "ok":
+            return ("unsupported" if status == "unknown" else "error"), {}
+        entries: dict[tuple[str, str, str], dict] = {}
+        for entry in section.get("route") or []:
+            if isinstance(entry, dict):
+                key = tuple(str(entry.get(leaf) or "") for leaf in ("vrf", "prefix", "next-hop"))
+                entries[key] = entry
+        return "ok", entries
+    except ClaimLostError:
+        # Revocation is not a read failure: swallowing it here would let a revoked holder
+        # carry on to the bookkeeping under ownership it no longer has.
+        raise
+    except Exception as exc:  # noqa: BLE001 — a read-side failure is inconclusive, never a green
+        logger.warning("static_route.device_state_read_failed", device_id=device.id, error=repr(exc))
+        return "error", {}
+
+
+async def _static_route_proof(client, device, plan, *, verify, evidence, consumed_keys, want_fields) -> SrProof:
+    """Gather §4.4's evidence for this apply. Reads only — nothing is consumed here.
+
+    The device-state read runs only when something depends on it: a consumed predecessor key
+    to look for, or a clear carrier to prove empty. A plain merge-PATCH apply of never-edited
+    rows therefore costs exactly what it costs today.
+    """
+    if not consumed_keys and not want_fields:
+        return SrProof(verify, evidence, None, [], {})
+    status, entries = await _static_route_device_state(client, device)
+    residue: str | None = None
+    survivors: list[tuple[str, str, str]] = []
+    if consumed_keys:
+        if status != "ok":
+            residue = status
+        else:
+            survivors = sorted(key for key in consumed_keys if key in entries)
+            residue = "found" if survivors else "clean"
+            if survivors:
+                logger.error(
+                    "static_route.residue_found",
+                    device_id=device.id,
+                    survivors=[list(k) for k in survivors],
+                )
+    return SrProof(verify, evidence, residue, survivors, entries)
+
+
+def _sr_row_proven(row, proof: SrProof, *, conclusive: bool) -> bool:
+    """Whether *row*'s own key is proven landed — the CAS precondition (§4.4's table)."""
+    return conclusive and proof.evidence.get(row.id) == "present"
+
+
+async def _static_route_bookkeeping(
+    db: AsyncSession,
+    device,
+    plan,
+    proof: SrProof,
+    *,
+    put_delivered: bool,
+    job_id: int,
+    reg=None,
+    send_failed: bool,
+) -> tuple[list[dict], tuple[int, int] | None, list[dict]]:
+    """Consume, CAS and record — the ONE transaction §4.6 requires, minus its commit.
+
+    Everything written here rides the caller's terminal transaction (row stamps, per-route
+    results, job status), because a split leaves a closed replacement under a failed apply.
+    The claim lock is taken FIRST and held to that commit: a revoked holder must not close a
+    replacement or empty a carrier on behalf of a claim it no longer owns.
+
+    *put_delivered* says whether a networked PUT actually carried the store-rendered body.
+    Only then does the body omit a cleared leaf, so only then may a clear carrier be
+    consumed — and only then can a replacement close at all. A merge-PATCH adds the new
+    triple and leaves the predecessor live, so CASing over it would close the replacement
+    while the old route is still on the device, permanently (C2.7).
+
+    Returns ``(results, adjusted_scope_outcome | None, extra_failures)``.
+    """
+    from nso_adapter.core.claim import ClaimRegistration, lock_claim
+    from nso_adapter.core.static_route_plan import pending_clear_fields, triple_of
+    from nso_adapter.nso.apply import VERIFY_CONCLUSIVE
+
+    # An unregistered registration is the documented claimless lane and lock_claim no-ops on
+    # it — the same reading C1 shipped for the follow-on enqueue. A REGISTERED one that has
+    # been revoked raises, and that propagates: recovery owns the disposition from there.
+    await lock_claim(db, reg if reg is not None else ClaimRegistration())
+
+    conclusive = proof.verify == VERIFY_CONCLUSIVE
+    residue_blocks = proof.residue is not None and proof.residue != "clean"
+    residue_found = proof.residue == "found"
+    cas_by_row = {c.row_id: c for c in plan.cas}
+
+    results: list[dict] = []
+    for row in plan.rows:
+        outcome = SR_UNPROVEN
+        if send_failed or residue_found:
+            outcome = SR_APPLY_FAILED
+        elif proof.evidence.get(row.id) == "missing":
+            outcome = SR_APPLY_FAILED
+        elif _sr_row_proven(row, proof, conclusive=conclusive) and not residue_blocks:
+            outcome = await _settle_proven_row(
+                db, device, plan, proof, row, put_delivered=put_delivered, cas=cas_by_row.get(row.id)
+            )
+        if outcome is SR_UNPROVEN:
+            logger.warning(
+                "static_route.route_unproven",
+                job_id=job_id,
+                device_id=device.id,
+                row_id=row.id,
+                route_id=row.route_id,
+                verify=proof.verify,
+                residue=proof.residue,
+                evidence=proof.evidence.get(row.id, "unverifiable"),
+                pending_clear=sorted(pending_clear_fields(row.pending_clear)),
+            )
+        results.append(
+            {
+                "route_id": row.route_id,
+                "row_id": row.id,
+                "key": list(triple_of(row)),
+                "fingerprint": static_route_fingerprint(row),
+                "outcome": outcome,
+            }
+        )
+
+    if not residue_found:
+        return results, None, []
+    # A predecessor this apply was supposed to retract is still on the device. The intent
+    # landed; what failed is the retraction — so the scope fails and NOTHING is consumed.
+    message = (
+        "static_route: the replaced route(s) "
+        f"{[list(k) for k in proof.survivors]} are still on the device after the replace — "
+        "the predecessor was not retracted, so the replacement stays open"
     )
+    err = {"code": RESIDUE_FOUND_CODE, "message": message, "detail": {"residue": [list(k) for k in proof.survivors]}}
+    for row in plan.rows:
+        row.last_apply_error = err
+    return results, (0, len(plan.rows)), [{"error": message, "code": RESIDUE_FOUND_CODE}]
+
+
+async def _settle_proven_row(db, device, plan, proof: SrProof, row, *, put_delivered: bool, cas) -> str:
+    """CAS and consume for one row whose own key is proven present → its outcome.
+
+    Two things can still block ``in_sync`` after the key proof: an undelivered replacement
+    (a merge-PATCH left the predecessor live) and a clear carrier the per-field evidence
+    cannot empty. Both mean the device holds something the store says it should not.
+    """
+    from nso_adapter.core.static_route_plan import (
+        AUTHORIZED,
+        STORE_ONLY,
+        pending_clear_fields,
+        replacement_open,
+        triple_of,
+    )
+    from nso_adapter.store.static_route_store import CAS_ROW, CAS_TOMBSTONE, cas_deployed_key
+
+    if replacement_open(row) and not put_delivered:
+        # The merge added the new triple and left the predecessor. Recording the new triple
+        # as deployed would destroy the only pointer to what is still on the device.
+        return SR_UNPROVEN
+
+    if cas is not None:
+        verdict = await cas_deployed_key(
+            db,
+            device_id=device.id,
+            row_id=cas.row_id,
+            route_id=cas.route_id,
+            sent_triple=cas.sent_triple,
+            expected_old=cas.expected_old,
+            tombstone_id_watermark=plan.tombstone_id_watermark,
+        )
+        if verdict not in (CAS_ROW, CAS_TOMBSTONE):
+            # Another session moved the row (or its carrier is ambiguous): no authority was
+            # granted, so this apply proved nothing it may report as settled.
+            return SR_UNPROVEN
+
+    pending = pending_clear_fields(row.pending_clear)
+    if not pending:
+        return SR_IN_SYNC
+    if not put_delivered:
+        # Only the PUT path delivers a clear: the merge body omits the leaf but the merge
+        # never drops one. Promotion is by DELIVERY (A1), so a PATCH consumes nothing.
+        return SR_UNPROVEN
+    entry = proof.entries.get(triple_of(row))
+    proven = {field for field in pending if entry is not None and _leaf_is_neutral(field, entry)}
+    if proven:
+        carrier = row.pending_clear or {}
+        remaining_auth = sorted({*(carrier.get(AUTHORIZED) or ())} - proven)
+        remaining_store = sorted({*(carrier.get(STORE_ONLY) or ())} - proven)
+        row.pending_clear = (
+            {AUTHORIZED: remaining_auth, STORE_ONLY: remaining_store} if (remaining_auth or remaining_store) else None
+        )
+        logger.info(
+            "static_route.pending_clear_consumed",
+            device_id=device.id,
+            row_id=row.id,
+            fields=sorted(proven),
+        )
+    return SR_IN_SYNC if pending == proven else SR_UNPROVEN
+
+
+async def _settle_static_routes(
+    db: AsyncSession,
+    device,
+    client,
+    plan,
+    *,
+    job_id: int,
+    outbox: dict,
+    evidence: dict[int, str],
+    put_delivered: bool,
+    send_failed: bool,
+    scope_outcomes: dict,
+    scope_failures: dict,
+    reg=None,
+) -> list[dict] | None:
+    """Run §4.4's proof and §4.5/§4.6's bookkeeping for the static-route scope.
+
+    Shared by both apply implementations, because the atomic path is a separate early return
+    with its own finalization — wiring this into the per-scope loop alone would leave every
+    atomic apply CASing nothing and reporting no per-route outcome at all.
+
+    *put_delivered* is False on the atomic path even for a ``PUT`` plan: atomic staging is
+    merge-PATCH only and explicitly ignores ``replace`` (G4), so no store-rendered body was
+    ever PUT and nothing may close a replacement or consume a clear. Returns ``None`` when
+    the device has no static-route rows in this pass, so ``job.result`` gains no empty key.
+
+    *send_failed* is the SEND's own verdict, captured before reader-compare folds its
+    per-row findings into the same counter. The two are different facts: a failed send means
+    nothing landed for anyone, while a reader-compare miss is per row — and reading the
+    merged counter would make one silently-dropped route block its proven sibling's CAS,
+    which is exactly the aggregate-instead-of-evidence mistake §4.4 rules out.
+    """
+    if not plan.rows:
+        return None
+    consumed = set() if send_failed or not put_delivered else _static_route_consumed_keys(plan, outbox.get("sent_keys"))
+    want_fields = bool(put_delivered and not send_failed and any(_static_route_pending(row) for row in plan.rows))
+    proof = await _static_route_proof(
+        client,
+        device,
+        plan,
+        verify=outbox.get("verify"),
+        evidence=evidence,
+        consumed_keys=consumed,
+        want_fields=want_fields,
+    )
+    results, adjusted, extra_fails = await _static_route_bookkeeping(
+        db, device, plan, proof, put_delivered=put_delivered, job_id=job_id, reg=reg, send_failed=send_failed
+    )
+    if adjusted is not None:
+        scope_outcomes["static_route"] = adjusted
+        scope_failures.setdefault("static_route", []).extend(extra_fails)
+    return results
+
+
+def _static_route_pending(row) -> bool:
+    """Whether *row* still owes a clear — either carrier half blocks a proven ``in_sync``."""
+    from nso_adapter.core.static_route_plan import pending_clear_fields
+
+    return bool(pending_clear_fields(row.pending_clear))
+
+
+def _static_route_consumed_keys(plan, sent_keys) -> set:
+    """Return the predecessor keys this apply claims to have retracted — the residue set (§4.4).
+
+    A key the body re-asserted is excluded: another live row reclaimed it, or a tombstone
+    still owns its entry verbatim. Finding it on the device afterwards is then the intended
+    outcome, not residue (C3.8).
+    """
+    from nso_adapter.core.static_route_plan import as_triple, replacement_open
+
+    consumed = set()
+    for row in plan.rows:
+        if replacement_open(row):
+            old = as_triple(row.deployed_key)
+            if old is not None:
+                consumed.add(old)
+    return consumed - set(sent_keys or ())
 
 
 async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = "native") -> dict[str, str]:
@@ -1214,7 +1609,7 @@ def _stamp_ip_atomic(ip_rows_flat, commit_error, iface_failed, err, msg, now) ->
 
 async def _atomic_reader_compare(
     client, device, scope_rows, scope_outcomes, scope_failures, *, job_id, device_name
-) -> tuple[dict[str, str], dict[str, list[str]]]:
+) -> tuple[dict[str, str], dict[str, list[str]], dict[str, dict[int, str]]]:
     """#108 presence check per staged scope after a clean atomic commit.
 
     Every scope committed in ONE transaction → ONE post-commit point → ONE batched
@@ -1223,7 +1618,9 @@ async def _atomic_reader_compare(
     the sections whose translated set is non-empty in a single action, then classifies each
     scope independently. A batched-action raise → every checkable scope records ``error``
     (non-fatal). Mutates scope_outcomes/scope_failures for scopes with silently-dropped keys
-    and returns ``(reader_compare, reader_compare_unverifiable)`` for job.result.
+    and returns ``(reader_compare, reader_compare_unverifiable, evidence_by_scope)`` — the
+    last being R2 §4.4's per-row map, which the static-route bookkeeping reads instead of the
+    aggregate.
     """
     from nso_adapter.core.removal import _VERIFY_BATCH_TIMEOUT, _live_family_sections
 
@@ -1251,6 +1648,7 @@ async def _atomic_reader_compare(
 
     reader_compare: dict[str, str] = {}
     reader_compare_unverifiable: dict[str, list[str]] = {}
+    evidence_by_scope: dict[str, dict[int, str]] = {}
     for key, prep in preps.items():
         s_ok, _s_failed = scope_outcomes.get(key, (0, 0))
         if prep is None:
@@ -1259,6 +1657,7 @@ async def _atomic_reader_compare(
             reader_compare[key] = "error"
             continue
         translated, unverifiable, spec, wire = prep
+        evidence: dict[int, str] = {}
         if not translated:  # every key Vault-unverifiable → nothing to look for
             n_ok, n_failed, fails, status = s_ok, 0, [], "unknown"
         elif action_error is not None:
@@ -1267,21 +1666,22 @@ async def _atomic_reader_compare(
             try:
                 # guarded (codex P2): a malformed 'ok' section must not let the walker's exception
                 # escape and fail the whole atomic job — classify "error" for just this scope.
-                n_ok, n_failed, fails, status = _classify_fetched_section(
+                n_ok, n_failed, fails, status, evidence = _classify_fetched_section(
                     key, translated, unverifiable, spec, sections[wire], s_ok, job_id=job_id, device_name=device_name
                 )
             except Exception as exc:  # noqa: BLE001 — a read-side glitch never fails a good commit
                 logger.warning(
                     "apply.reader_compare_error", job_id=job_id, device=device_name, scope=key, error=repr(exc)
                 )
-                n_ok, n_failed, fails, status = s_ok, 0, [], "error"
+                n_ok, n_failed, fails, status, evidence = s_ok, 0, [], "error", {}
         reader_compare[key] = status
+        evidence_by_scope[key] = evidence
         if unverifiable:
             reader_compare_unverifiable[key] = unverifiable
         if n_failed:
             scope_outcomes[key] = (n_ok, n_failed)
             scope_failures.setdefault(key, []).extend(fails)
-    return reader_compare, reader_compare_unverifiable
+    return reader_compare, reader_compare_unverifiable, evidence_by_scope
 
 
 def _stamp_batch_scopes_atomic(scope_rows, offenders, commit_error, err, msg, now) -> tuple[dict, dict]:
@@ -1308,12 +1708,18 @@ def _stamp_batch_scopes_atomic(scope_rows, offenders, commit_error, err, msg, no
     return scope_outcomes, scope_failures
 
 
-async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, elig) -> None:
+async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, elig, *, sr_plan=None, reg=None) -> None:
     """I3b atomic apply: stage every scope into one transaction and commit once.
 
     On success, stamp every row in_sync; on failure the whole transaction rolled back —
     localise the offending scope(s), fail those rows (+ record capability), and leave
     non-offending scopes pending (untouched → retried next apply).
+
+    R2 §4.4: the combined commit's verify verdict is threaded out of ``apply_combined``
+    rather than discarded, and the static-route bookkeeping runs here too. Staging is
+    merge-PATCH only and ignores ``replace`` (G4), so nothing here delivers a replacement
+    or a clear — ``put_delivered=False``, which is what keeps an atomic apply from closing
+    a replacement the device never received.
     """
     from nso_adapter.nso.apply import apply_combined
 
@@ -1346,8 +1752,9 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
     staged_rows = {k: v for k, v in scope_rows.items() if k not in stage_errors}
 
     commit_error: NsoApplyError | None = None
+    combined_verify: str | None = None
     try:
-        await apply_combined(client, device_name, modules)
+        combined_verify = await apply_combined(client, device_name, modules)
     except NsoApplyError as exc:
         commit_error = exc
     except Exception as exc:  # noqa: BLE001 — surface as a job-level failure
@@ -1404,9 +1811,29 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
     # scopes are excluded: they were never pushed, so "not on the device" is not a drop.
     reader_compare: dict[str, str] = {}
     reader_compare_unverifiable: dict[str, list[str]] = {}
+    evidence_by_scope: dict[str, dict[int, str]] = {}
+    # Captured BEFORE reader-compare folds its per-row findings into the same counter.
+    sr_send_failed = bool(scope_outcomes.get("static_route", (0, 0))[1])
     if commit_error is None:
-        reader_compare, reader_compare_unverifiable = await _atomic_reader_compare(
+        reader_compare, reader_compare_unverifiable, evidence_by_scope = await _atomic_reader_compare(
             client, device, staged_rows, scope_outcomes, scope_failures, job_id=job_id, device_name=device_name
+        )
+
+    sr_results = None
+    if sr_plan is not None:
+        sr_results = await _settle_static_routes(
+            db,
+            device,
+            client,
+            sr_plan,
+            job_id=job_id,
+            outbox={"verify": combined_verify, "sent_keys": None},
+            evidence=evidence_by_scope.get("static_route", {}),
+            put_delivered=False,
+            send_failed=sr_send_failed,
+            scope_outcomes=scope_outcomes,
+            scope_failures=scope_failures,
+            reg=reg,
         )
 
     await _finalize_job(
@@ -1421,6 +1848,7 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
         scope_failures,
         reader_compare=reader_compare,
         reader_compare_unverifiable=reader_compare_unverifiable,
+        static_route_results=sr_results,
     )
 
 
@@ -1603,20 +2031,35 @@ def _reader_compare_walk(scope, translated, unverifiable, section, spec, ok, *, 
     Present-all → ``ok``, unless some grain was ``unverifiable`` (never checked) → ``partial``
     (the r3-M2 fix for the mixed community+host false-green — ``partial`` beats ``ok`` but
     ``missing`` still beats ``partial``). A missing key stamps its rows ``reader_compare_missing``
-    and fails the scope. Returns ``(ok, failed, fails, status)``.
+    and fails the scope. Returns ``(ok, failed, fails, status, evidence)``.
+
+    *evidence* is the R2 §4.4 PER-ROW map ``{row pk: "present" | "missing"}``, returned
+    alongside the unchanged aggregate. The aggregate collapses a two-row walk with one
+    missing key into ``missing`` for BOTH, so a consumer that reads it CASes neither row —
+    while the rule that a proven sibling must still CAS demands the opposite. A row absent
+    from the map was never checked and its consumer must treat it as unverifiable.
     """
     from nso_adapter.core.removal import _norm_key, _reader_keys
 
     present = {gl.label: _reader_keys(scope, section, gl) for gl in spec.lists}
     row_by_id: dict[int, object] = {}
     missing: dict[int, list[str]] = {}
+    evidence: dict[int, str] = {}
     for row, label, key in translated:
+        pk = getattr(row, "id", None)
         if _norm_key(key) in present.get(label, set()):
+            # setdefault, never a plain assignment: a row can contribute several grains
+            # (an IS-IS interface per address family), and one present grain must not
+            # overwrite a sibling grain already found missing.
+            if pk is not None:
+                evidence.setdefault(pk, "present")
             continue
+        if pk is not None:
+            evidence[pk] = "missing"
         row_by_id[id(row)] = row
         missing.setdefault(id(row), []).append(f"{label} {list(key)}")
     if not missing:
-        return ok, 0, [], ("partial" if unverifiable else "ok")
+        return ok, 0, [], ("partial" if unverifiable else "ok"), evidence
     fails = []
     for rid, keys in missing.items():
         msg = (
@@ -1630,15 +2073,17 @@ def _reader_compare_walk(scope, translated, unverifiable, section, spec, ok, *, 
         }
         fails.append({"error": msg})
     logger.error("apply.reader_compare_missing", job_id=job_id, device=device_name, scope=scope, missing=len(missing))
-    return ok - len(missing), len(missing), fails, "missing"
+    return ok - len(missing), len(missing), fails, "missing", evidence
 
 
 def _classify_fetched_section(scope, translated, unverifiable, spec, section, ok, *, job_id, device_name):
-    """Classify a CERTIFIED device-state *section* (status ok|unsupported|error) → (ok, failed, fails, status).
+    """Classify a CERTIFIED device-state *section* → (ok, failed, fails, status, evidence).
 
     ``error`` (the family read errored) → ``error``; ``unsupported`` (no export surface — absence
     proves nothing) → ``unknown``; ``ok`` → walk. Shared by the default per-scope path and the
     batched atomic path; the section is already status-terminal thanks to client certification.
+    An un-walked section yields an EMPTY per-row evidence map: nothing was checked, so no row
+    may be reported present (R2 §4.4).
     """
     from nso_adapter.core.removal import _verifier_section_status
 
@@ -1647,17 +2092,17 @@ def _classify_fetched_section(scope, translated, unverifiable, spec, section, ok
         logger.warning(
             "apply.reader_compare_error", job_id=job_id, device=device_name, scope=scope, error="section status=error"
         )
-        return ok, 0, [], "error"
+        return ok, 0, [], "error", {}
     if status == "unknown":  # the NED does not export this family
         logger.info("apply.reader_compare_unknown", job_id=job_id, device=device_name, scope=scope)
-        return ok, 0, [], "unknown"
+        return ok, 0, [], "unknown", {}
     return _reader_compare_walk(
         scope, translated, unverifiable, section, spec, ok, job_id=job_id, device_name=device_name
     )
 
 
 async def _reader_compare_scope(client, device, scope, rows, *, ok, job_id, device_name, timeout):
-    """Post-apply presence check (#108, the #26 silent-drop class) → (ok, failed, fails, status, unverifiable).
+    """Post-apply presence check (#108) → (ok, failed, fails, status, unverifiable, evidence).
 
     ``_verify_native_or_raise`` re-diffs the committed payload against the CDB SERVICE
     tree — both sides sit behind the same FASTMAP writer, so a writer that silently
@@ -1684,25 +2129,25 @@ async def _reader_compare_scope(client, device, scope, rows, *, ok, job_id, devi
     try:
         prep = await _reader_compare_prepare(scope, rows, getattr(device, "ned_id", None))
         if prep is None:
-            return ok, 0, [], None, []
+            return ok, 0, [], None, [], {}
         translated, unverifiable, spec, wire = prep
         if not translated:  # every key Vault-unverifiable → nothing to look for, run NO action
-            return ok, 0, [], "unknown", unverifiable
+            return ok, 0, [], "unknown", unverifiable, {}
         section = (await _live_family_sections(client, device.nso_device_name, [wire], timeout=timeout))[wire]
         # The walk stays INSIDE the try (codex P2): a malformed 'ok' section (a non-dict where a
         # keyed entry belongs) makes _reader_keys raise — that must classify "error", never escape
         # and turn a successful commit into an internal job failure.
-        n_ok, n_failed, fails, status = _classify_fetched_section(
+        n_ok, n_failed, fails, status, evidence = _classify_fetched_section(
             scope, translated, unverifiable, spec, section, ok, job_id=job_id, device_name=device_name
         )
-        return n_ok, n_failed, fails, status, unverifiable
+        return n_ok, n_failed, fails, status, unverifiable, evidence
     except Exception as exc:  # noqa: BLE001 — the check must never fail a good apply
         logger.warning("apply.reader_compare_error", job_id=job_id, device=device_name, scope=scope, error=repr(exc))
-        return ok, 0, [], "error", unverifiable
+        return ok, 0, [], "error", unverifiable, {}
 
 
 async def _reader_compare_default_path(client, device, sc, scope_ok, *, remaining, ned_id, job_id, device_name):
-    """Default-path per-scope verify under the HARD verify-time budget → (ok, failed, fails, status, unverifiable).
+    """Default-path per-scope verify under the HARD budget → (ok, failed, fails, status, unverifiable, evidence).
 
     ``remaining`` is the VERIFY budget still unspent (``_VERIFY_TOTAL_BUDGET`` minus the time already
     spent verifying earlier scopes — device COMMIT latency deliberately does NOT count, codex P1, so
@@ -1718,7 +2163,7 @@ async def _reader_compare_default_path(client, device, sc, scope_ok, *, remainin
 
     if remaining <= 0:
         status = "unknown" if _reader_compare_checkable(sc.key, sc.rows, ned_id) else None
-        return scope_ok, 0, [], status, []
+        return scope_ok, 0, [], status, [], {}
     try:
         return await asyncio.wait_for(
             _reader_compare_scope(
@@ -1736,7 +2181,7 @@ async def _reader_compare_default_path(client, device, sc, scope_ok, *, remainin
     except TimeoutError:  # asyncio.TimeoutError is TimeoutError on 3.11+
         # The whole per-scope verify (translate + semaphore + HTTP) blew the budget; only a
         # checkable scope ever reaches the action, so a cut verify is always "unknown".
-        return scope_ok, 0, [], "unknown", []
+        return scope_ok, 0, [], "unknown", [], {}
 
 
 async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_error=None) -> tuple[int, int, list]:
@@ -1808,6 +2253,23 @@ async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_
     return len(rows), 0, []
 
 
+async def _commit_terminal(db: AsyncSession, job_id: int) -> None:
+    """Commit the apply's terminal transaction under the three-state contract (R2 §4.6).
+
+    ``_commit_outcome`` classifies a raising COMMIT as UNKNOWN by construction — PostgreSQL
+    may or may not have applied it and the client cannot tell. Writing a second terminal
+    status on that reading is the bug, not the recovery: if the commit landed, the job is
+    already terminal with its CAS and per-route results intact. Raising instead hands the
+    decision to claim recovery, which re-dispositions only a job still ``running`` (G38).
+    """
+    from nso_adapter.core.claim import ClaimOutcome, _commit_outcome
+
+    outcome = await _commit_outcome(db)
+    if outcome is not ClaimOutcome.COMMIT_ACKNOWLEDGED:
+        logger.error("apply.terminal_commit_outcome_unknown", job_id=job_id, outcome=outcome.value)
+        raise BookkeepingOutcomeUnknown(f"apply job {job_id}: terminal commit outcome is {outcome.value}")
+
+
 async def _finalize_job(
     db: AsyncSession,
     job: Job,
@@ -1820,6 +2282,7 @@ async def _finalize_job(
     scope_failures: dict,
     reader_compare: dict | None = None,
     reader_compare_unverifiable: dict | None = None,
+    static_route_results: list | None = None,
 ) -> None:
     """Assemble job.result/status from the pass outcomes and commit.
 
@@ -1828,6 +2291,16 @@ async def _finalize_job(
     reader_compare statuses, #108, and any reader_compare_unverifiable labels — the keys a
     scope's presence check could not verify, mirroring the residue path); any failure flips
     the job to failed and collects the per-item errors.
+
+    *static_route_results* is R2 §4.5's per-route record. It rides here rather than in a
+    commit of its own because this IS the terminal transaction: the CAS, the row stamps, the
+    results and the status must land together or not at all (§4.6).
+
+    The commit goes through the three-state contract. A COMMIT that raises may still have
+    been applied, and the caller's fallback — roll back, write ``failed`` in a SECOND
+    transaction — would then produce exactly the torn state the atomicity rule exists to
+    prevent: a consumed carrier or a closed replacement under a failed job. So an unknown
+    outcome raises :class:`BookkeepingOutcomeUnknown` instead, and recovery decides.
     """
     if not any_eligible:
         logger.info("apply.nothing_eligible", job_id=job_id, device_id=device_id)
@@ -1847,7 +2320,7 @@ async def _finalize_job(
             "route_policy_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
             "ospf_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
         }
-        await db.commit()
+        await _commit_terminal(db, job_id)
         return
 
     attr_ok, attr_failed, attr_failures = attr_outcome
@@ -1864,6 +2337,8 @@ async def _finalize_job(
         result["reader_compare"] = reader_compare
     if reader_compare_unverifiable:
         result["reader_compare_unverifiable"] = reader_compare_unverifiable
+    if static_route_results is not None:
+        result["static_route_results"] = static_route_results
     job.result = result
 
     total_failed = attr_failed + ip_failed + sum(failed for _ok, failed in scope_outcomes.values())
@@ -1879,7 +2354,7 @@ async def _finalize_job(
             "message": f"{total_failed} item(s) failed to apply",
             "detail": {"items": all_failed},
         }
-    await db.commit()
+    await _commit_terminal(db, job_id)
     logger.info(
         "apply.done",
         job_id=job_id,
@@ -1958,6 +2433,9 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     # body is built from, the rows this pass stamps, the keys the guard may see disappear
     # and the tombstones the body must retain.
     sr_plan = await build_plan(db, device, eligible_rows=sr_eligible)
+    # What the static-route send learned, for §4.4's proof: the verify verdict and the exact
+    # route keys the body carried. Filled by the scope coroutine, read after it returns.
+    sr_outbox: dict = {}
     logging_eligible = await _collect_eligible(db, LoggingHostIntent, device_id, force)
     logging_levels_rows = await _collect_eligible(db, LoggingLevelsIntent, device_id, force)
     logging_levels = logging_levels_rows[0] if logging_levels_rows else None
@@ -2057,7 +2535,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             "redist_isis": redist_isis,
             "redist_bgp": redist_bgp,
         }
-        await _run_atomic_apply(db, device, client, device_name, job, job_id, now, elig)
+        await _run_atomic_apply(db, device, client, device_name, job, job_id, now, elig, sr_plan=sr_plan, reg=reg)
         # §4.11 retry path, on BOTH apply implementations: the atomic path is a separate
         # early return with its own finalization, so wiring this only into the per-scope
         # loop below would leave atomic-mode applies enqueueing nothing.
@@ -2128,7 +2606,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             # (an eligible-only body retracts every accepted-and-clean route), so those are
             # exactly the rows this pass stamps. In PATCH mode the two are the same list.
             sr_plan.rows,
-            lambda: _static_route_coro(client, device, sr_plan),
+            lambda: _static_route_coro(client, device, sr_plan, outbox=sr_outbox),
         ),
         _Scope(
             "logging",
@@ -2243,6 +2721,8 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     scope_failures: dict[str, list] = {}
     reader_compare: dict[str, str] = {}
     reader_compare_unverifiable: dict[str, list[str]] = {}
+    evidence_by_scope: dict[str, dict[int, str]] = {}
+    send_failed_by_scope: dict[str, bool] = {}
     for sc in scopes:
         if not sc.rows:
             scope_outcomes[sc.key] = (0, 0)
@@ -2256,11 +2736,14 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             now=now,
             on_nso_error=sc.on_nso_error,
         )
+        # The SEND's own verdict, before reader-compare folds per-row findings into the same
+        # counter: "nothing landed" and "one row of several is missing" are different facts.
+        send_failed_by_scope[sc.key] = scope_failed != 0
         if scope_failed == 0:
             # #108: the commit reported success — require every intended key to be
             # present in the scope's device-state section (the #26 silent-drop class).
             verify_started = loop.time()
-            scope_ok, scope_failed, fails, rc_status, rc_unver = await _reader_compare_default_path(
+            scope_ok, scope_failed, fails, rc_status, rc_unver, rc_evidence = await _reader_compare_default_path(
                 client,
                 device,
                 sc,
@@ -2275,9 +2758,26 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
                 reader_compare[sc.key] = rc_status
             if rc_unver:
                 reader_compare_unverifiable[sc.key] = rc_unver
+            evidence_by_scope[sc.key] = rc_evidence
         scope_outcomes[sc.key] = (scope_ok, scope_failed)
         if fails:
             scope_failures[sc.key] = fails
+
+    # ── Step 6h: R2 §4.4-§4.6 — prove, CAS, consume, record (per-scope path) ──
+    sr_results = await _settle_static_routes(
+        db,
+        device,
+        client,
+        sr_plan,
+        job_id=job_id,
+        outbox=sr_outbox,
+        evidence=evidence_by_scope.get("static_route", {}),
+        put_delivered=sr_plan.mode == "PUT",
+        send_failed=send_failed_by_scope.get("static_route", False),
+        scope_outcomes=scope_outcomes,
+        scope_failures=scope_failures,
+        reg=reg,
+    )
 
     # ── Step 7: finalize ── (any_eligible computed up front, before the atomic branch)
     await _finalize_job(
@@ -2292,6 +2792,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         scope_failures,
         reader_compare=reader_compare,
         reader_compare_unverifiable=reader_compare_unverifiable,
+        static_route_results=sr_results,
     )
     await _enqueue_pending_clear_retract(db, device, sr_plan, reg=reg)
 
@@ -2359,6 +2860,12 @@ async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -
             await _execute_apply(db, job, job_id, device_id, force, reg=reg)
         except ClaimLostError:
             # Revocation is not a runner error: recovery already owns the disposition.
+            raise
+        except BookkeepingOutcomeUnknown:
+            # The terminal commit may have landed. Writing `failed` here would flip a job
+            # whose CAS and per-route results are already committed — the exact torn state
+            # §4.6's single transaction exists to prevent. Nothing further is written, the
+            # post-apply refresh is skipped, and claim recovery decides (G38).
             raise
         except Exception as exc:
             logger.exception("apply.unexpected_error", job_id=job_id, device_id=device_id)

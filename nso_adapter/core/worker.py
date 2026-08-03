@@ -41,6 +41,7 @@ from nso_adapter.core.claim import (
     JOB_CLEANUP_BOUND,
     JOB_EXECUTION_BUDGET,
     PROVISION_STALE_AFTER,
+    BookkeepingOutcomeUnknown,
     ClaimLostError,
     ClaimOutcome,
     ClaimRegistration,
@@ -571,6 +572,15 @@ async def _run_one_job(
             # Recovery already owns this job's disposition; writing anything would clobber it.
             logger.warning("worker.claim_lost", worker_id=worker_id, **drain_kwargs)
             raise
+        except BookkeepingOutcomeUnknown:
+            # R2 §4.6: the runner's terminal COMMIT was neither acknowledged nor provably
+            # aborted. Same shape as a lost claim and for the same reason — a second
+            # terminal write could flip a job whose CAS and results already landed. Write
+            # nothing, release nothing; `outcome` stays non-acknowledged so the finally
+            # abandons the claim to staleness and stops the heartbeat, and recovery
+            # re-dispositions only if the job is still `running`. NOT re-raised: the worker
+            # loop has more jobs to run and this run's disposition is now recovery's.
+            logger.error("worker.bookkeeping_outcome_unknown", worker_id=worker_id, **drain_kwargs)
         except asyncio.CancelledError:
             outcome = await _bounded_cleanup(_dispose(job_id, job_type, reg), seen, job_id=job_id, device_id=device_id)
         except Exception as exc:

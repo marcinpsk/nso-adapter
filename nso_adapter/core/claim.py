@@ -120,6 +120,18 @@ class ClaimLostError(Exception):
     """
 
 
+class BookkeepingOutcomeUnknown(Exception):
+    """A terminal bookkeeping COMMIT was neither acknowledged nor provably aborted (R2 §4.6).
+
+    Raised INSTEAD of letting the caller fall back to a second terminal write. That fallback
+    is the bug: if PostgreSQL applied the commit, the job is already terminal with its CAS,
+    per-route results and status intact, and a second write would flip it to ``failed`` over
+    a landed consumption. The runner therefore stops here, the worker skips the terminal
+    write AND the release, the heartbeat stops, and claim recovery re-dispositions only a job
+    still ``running`` — which is exactly the distinction that tells the two cases apart (G38).
+    """
+
+
 class ClaimUnavailableError(Exception):
     """The claim was held by someone else for the whole wait budget.
 

@@ -623,9 +623,7 @@ async def _record_residue(job, client, device, scope: str, context: dict, *, job
         job.result["residue_check"] = "clean"
 
 
-async def _guarded_apply(
-    client, device, scope: str, context: dict | None, apply_thunk, *, current=_NO_SNAPSHOT
-) -> None:
+async def _guarded_apply(client, device, scope: str, context: dict | None, apply_thunk, *, current=_NO_SNAPSHOT):
     """Run *scope*'s PUT-replace behind the collateral guard (the ra1 lo0 incident).
 
     ``apply_thunk(**kwargs)`` must call the scope's apply function with its full row
@@ -642,19 +640,21 @@ async def _guarded_apply(
     meaning "no service instance", so ``if current is None: GET`` would issue a second
     read on exactly the absent-service case. Anything supplied — ``None`` included —
     suppresses the internal GET.
+
+    Returns whatever the committing thunk returned — R2's proof verdict where there is one.
+    A guard that swallowed it would leave the apply unable to tell a proven commit from an
+    unverified one, which is exactly what §4.4 exists to stop.
     """
     context = context or {}
     if context.get("force"):
         logger.warning("removal.force", device_id=device.id, scope=scope)
-        await apply_thunk(replace=True)
-        return
+        return await apply_thunk(replace=True)
     if context.get("detach"):
         # Detach (#106): the replace commits with no-networking, so nothing can be
         # flushed from the device — the orphan guard (which protects device config
         # from a real PUT-replace) must stand down, or every un-own on an instance
         # holding un-adopted siblings blocks forever.
-        await apply_thunk(replace=True)
-        return
+        return await apply_thunk(replace=True)
     spec = _guard_specs().get(scope)
     if current is _NO_SNAPSHOT:
         current = None
@@ -675,7 +675,7 @@ async def _guarded_apply(
         if orphans:
             preview = await apply_thunk(replace=True, dry_run=True)
             raise RemovalBlockedError(orphans, preview)
-    await apply_thunk(replace=True)
+    return await apply_thunk(replace=True)
 
 
 async def _replace_simple(db: AsyncSession, device, client, scope: str, context: dict | None = None) -> None:

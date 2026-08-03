@@ -17,6 +17,7 @@ import pytest
 
 from nso_adapter.config import NsoInstanceConfig
 from nso_adapter.nso.apply import (
+    VERIFY_CONCLUSIVE,
     NsoApplyError,
     _send_service_config,
     _verify_native_or_raise,
@@ -125,7 +126,9 @@ async def test_send_service_config_patches_then_verifies_clean():
         client, "/restconf/data/svc:cfg", "svc:cfg", "sw03", {"device": "sw03", "x": 1}, scope="snmp"
     )
 
-    assert result is None
+    # R2 §4.4: a committing send returns its PROOF VERDICT, not None — a consumer that is
+    # about to record deletion authority has to tell "proven" from "we did not look".
+    assert result == VERIFY_CONCLUSIVE
     patch_req = transport.requests[0]
     assert patch_req.method == "PATCH"
     assert json.loads(patch_req.content) == {"svc:cfg": [{"device": "sw03", "x": 1}]}
@@ -633,7 +636,7 @@ async def test_apply_ospf_config_commits_then_verifies():
 
     result = await apply_ospf_config(client, "sw03", [proc], [iface])
 
-    assert result is None
+    assert result == VERIFY_CONCLUSIVE  # the verdict rides out of every committing send
     patch_req = transport.requests[0]
     assert patch_req.method == "PATCH"
     assert "dry-run=native" not in str(patch_req.url)
