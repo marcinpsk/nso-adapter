@@ -30,7 +30,9 @@ must take them in that sequence.
 
 from __future__ import annotations
 
+import asyncio
 import enum
+import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -91,6 +93,12 @@ CLAIM_STALE_AFTER = _LIFECYCLE_TOTAL + STALE_SLACK
 # running onboarding and run it twice.
 PROVISION_STALE_AFTER = _LIFECYCLE_TOTAL + STALE_SLACK
 
+# How often a waiter re-attempts acquisition. Short enough that the handoff from a
+# releasing holder costs the next waiter almost nothing, long enough not to spin.
+CLAIM_WAIT_POLL_INTERVAL_S = 0.05
+# Monotonic: a wall-clock budget would stretch or collapse if the host clock steps.
+_monotonic = time.monotonic
+
 
 def claim_stale_cutoff() -> float:
     """Seconds of heartbeat silence after which a claim may be revoked."""
@@ -104,6 +112,14 @@ class ClaimLostError(Exception):
     it, and re-raised explicitly through every broad ``except Exception`` on a claimed
     path: swallowing it turns a revocation into a benign-looking outcome and lets the
     revoked holder carry on writing under ownership it no longer has.
+    """
+
+
+class ClaimUnavailableError(Exception):
+    """The claim was held by someone else for the whole wait budget.
+
+    Raised by :func:`held_claim` so a caller that has an answer for "busy" — the intent
+    PUT's 409 — can give it instead of blocking indefinitely.
     """
 
 
@@ -251,6 +267,55 @@ async def acquire_claim(
         return None
     logger.info("claim.acquired", device_id=device_id, purpose=purpose, job_id=job_id)
     return ClaimRegistration(device_id, granted)
+
+
+async def acquire_claim_waiting(
+    device_id: int,
+    purpose: str,
+    *,
+    timeout_s: float,
+    job_id: int | None = None,
+    poll_interval_s: float = CLAIM_WAIT_POLL_INTERVAL_S,
+) -> ClaimRegistration | None:
+    """Retry :func:`acquire_claim` until *timeout_s* elapses; None if it never won.
+
+    Polling, deliberately NOT a blocking database lock: the wait budget is an application
+    policy that has to hold across processes and outlive any one transaction, and a lock
+    wait would additionally be capped by whatever ``lock_timeout`` the deployment sets.
+    Each attempt is its own committed transaction, so a waiter holds nothing while it waits.
+    """
+    deadline = _monotonic() + timeout_s
+    while True:
+        reg = await acquire_claim(device_id, purpose, job_id=job_id)
+        if reg is not None:
+            return reg
+        if _monotonic() >= deadline:
+            return None
+        await asyncio.sleep(min(poll_interval_s, max(0.0, deadline - _monotonic())))
+
+
+@asynccontextmanager
+async def held_claim(
+    device_id: int,
+    purpose: str,
+    *,
+    timeout_s: float,
+    job_id: int | None = None,
+) -> AsyncIterator[ClaimRegistration]:
+    """Hold the device claim for the body, and release it on EVERY exit.
+
+    A refusal raised after acquisition — a store-dependent 422, a fence read, a DB error —
+    must not leave the device claimed until the reaper notices; the release lives here so
+    no call site can forget it.
+    """
+    reg = await acquire_claim_waiting(device_id, purpose, timeout_s=timeout_s, job_id=job_id)
+    if reg is None:
+        logger.warning("claim.wait_timeout", device_id=device_id, purpose=purpose, waited_s=timeout_s)
+        raise ClaimUnavailableError(f"device {device_id} is claimed by another operation")
+    try:
+        yield reg
+    finally:
+        await release_claim(reg)
 
 
 async def lock_claim(db: AsyncSession, reg: ClaimRegistration) -> None:

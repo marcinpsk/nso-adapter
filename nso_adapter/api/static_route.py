@@ -13,9 +13,18 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, IntentApplyResult, api_error
+from nso_adapter.api.errors import (
+    RESP_401,
+    RESP_404_DEVICE,
+    RESP_409_ACTIVE_JOB,
+    RESP_422_VALIDATION,
+    IntentApplyResult,
+    api_error,
+)
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z
+from nso_adapter.config import get_config
+from nso_adapter.core.claim import ClaimUnavailableError, held_claim, lock_claim
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.core.request_flags import DELETE_ORIGIN, STORE_ONLY
 from nso_adapter.store import outcome_store
@@ -260,7 +269,7 @@ def _match_payload_to_rows(
     "/{device_id}/static-route-intent",
     dependencies=[Depends(verify_token)],
     response_model=IntentApplyResult,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_ACTIVE_JOB, **RESP_422_VALIDATION},
 )
 async def put_static_route_intent(device_id: int, body: StaticRouteIntentUpdate, db: AsyncSession = Depends(get_db)):
     """Replace the adapter's static-route intent mirror for this device atomically.
@@ -274,12 +283,44 @@ async def put_static_route_intent(device_id: int, body: StaticRouteIntentUpdate,
     intent row **in place** instead of appearing as an unrelated delete plus insert.
     A deletion on a device whose rows all carry a ``route_id`` also writes a
     tombstone — the only carrier of that deletion once the row is gone.
+
+    Everything the plan depends on is read **under the device claim** (Q8): payload-internal
+    refusals first because they need no store read, then acquisition, then the reload. Read
+    before claiming and two concurrent pushes both plan against the same snapshot — the
+    second then applies a plan whose premise is gone, and the deferred identity constraint
+    surfaces it as a 500 instead of the sequentially correct answer.
     """
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
 
     _reject_payload_duplicates(body.routes)
+
+    # Nothing of ours is pending, and the wait must not sit inside an open transaction.
+    await db.rollback()
+    try:
+        async with held_claim(device_id, "intent_put", timeout_s=get_config().intent_claim_wait_seconds) as claim_reg:
+            # The guard, before the first effectful statement and held to COMMIT: it is
+            # what makes a concurrent revoke serialize against this transaction instead of
+            # racing it.
+            await lock_claim(db, claim_reg)
+            return await _apply_static_route_intent(device_id, body, db)
+    except ClaimUnavailableError:
+        logger.warning("static_route.intent_claim_timeout", device_id=device_id)
+        raise api_error(
+            409,
+            "conflict",
+            "The device is busy with another operation; retry",
+            {"reason": "device_claimed"},
+        ) from None
+
+
+async def _apply_static_route_intent(device_id: int, body: StaticRouteIntentUpdate, db: AsyncSession) -> dict:
+    """Run steps 3-9 of Q8, all under the claim the caller acquired and guard-locked."""
+    device = await db.get(Device, device_id)
+    if not device:
+        # Offboarded between the 404 check and the claim: nothing left to write intent for.
+        raise api_error(404, "not_found", "Device not found")
 
     existing_result = await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id))
     existing = list(existing_result.scalars().all())

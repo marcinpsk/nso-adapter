@@ -12263,7 +12263,7 @@
     },
     "/api/v1/devices/{device_id}/static-route-intent": {
       "put": {
-        "description": "Replace the adapter's static-route intent mirror for this device atomically.\n\nFull-replace semantics: rows not present in the request body are deleted.\n``accepted_at`` defaults to now if not supplied.  If ``auto_apply`` is\nenabled on the device, an apply job is enqueued after the upsert.\n\nMatching is ``route_id``-first, falling back to the ``(vrf, prefix, next_hop)``\ntriple: an operator editing a route's prefix or next-hop therefore updates the\nintent row **in place** instead of appearing as an unrelated delete plus insert.\nA deletion on a device whose rows all carry a ``route_id`` also writes a\ntombstone \u2014 the only carrier of that deletion once the row is gone.",
+        "description": "Replace the adapter's static-route intent mirror for this device atomically.\n\nFull-replace semantics: rows not present in the request body are deleted.\n``accepted_at`` defaults to now if not supplied.  If ``auto_apply`` is\nenabled on the device, an apply job is enqueued after the upsert.\n\nMatching is ``route_id``-first, falling back to the ``(vrf, prefix, next_hop)``\ntriple: an operator editing a route's prefix or next-hop therefore updates the\nintent row **in place** instead of appearing as an unrelated delete plus insert.\nA deletion on a device whose rows all carry a ``route_id`` also writes a\ntombstone \u2014 the only carrier of that deletion once the row is gone.\n\nEverything the plan depends on is read **under the device claim** (Q8): payload-internal\nrefusals first because they need no store read, then acquisition, then the reload. Read\nbefore claiming and two concurrent pushes both plan against the same snapshot \u2014 the\nsecond then applies a plan whose premise is gone, and the deferred identity constraint\nsurfaces it as a 500 instead of the sequentially correct answer.",
         "operationId": "put_static_route_intent_api_v1_devices__device_id__static_route_intent_put",
         "parameters": [
           {
@@ -12316,6 +12316,16 @@
               }
             },
             "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A job is already running for this device"
           },
           "422": {
             "content": {

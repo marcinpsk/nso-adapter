@@ -692,7 +692,7 @@ Field notes:
 - `interface_next_hop`: interface name string; present only when there is no IP next-hop.
 - `metric`, `permanent`, `tag`, `name`: optional; omitted from response when `null`.
 
-### `PUT /api/v1/devices/{id}/static-route-intent` → `200 | 404 | 422`
+### `PUT /api/v1/devices/{id}/static-route-intent` → `200 | 404 | 409 | 422`
 
 Push (full-replace) the static route intent mirror for this device.
 Only routes with an IP `next_hop` are supported in v1 — interface-only next-hop
@@ -756,6 +756,17 @@ is in `error.detail.reason`:
 
 Entries with no `route_id` never collide with each other — a body of routes that all omit
 it is the normal shape and is accepted.
+
+#### `409` while the device is busy
+
+This endpoint reads the state it plans against **under an exclusive per-device claim**, so
+two concurrent pushes cannot both plan from the same snapshot and then apply plans whose
+premise is gone. If another operation (a running job, a teardown, another intent push)
+holds the device, the request waits **5 seconds by default** — `intent_claim_wait_seconds`
+in the adapter config — and then answers `409 conflict` with
+`error.detail.reason = "device_claimed"`. The wait sits well below the plugin's 30s request
+timeout, so it can never turn a would-be success into a client-side timeout. Retry is safe:
+the push is a full replace.
 
 ### `GET /api/v1/devices/{id}/interface-ips` → `200 | 404`
 

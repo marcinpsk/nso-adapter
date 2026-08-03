@@ -151,6 +151,10 @@ class AppConfig(BaseModel):
     database_url: str
     log_level: str = "INFO"
     log_format: str = "json"
+    # How long an intent PUT waits for the device claim before answering 409. Sits well
+    # under the plugin's 30s request timeout, so the wait can never turn a would-be success
+    # into a client-side timeout the adapter cannot report.
+    intent_claim_wait_seconds: float = 5.0
 
 
 # ── Env-only bootstrap settings ──────────────────────────────────────────────
