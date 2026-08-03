@@ -311,11 +311,18 @@ class NsoClient:
             entries = data.get(root)
             if entries is None:
                 entries = data.get(root.split(":", 1)[-1])
-            if not isinstance(entries, list) or not entries:
-                return _inconclusive(service_path, device_name, "no recognized non-empty root")
+            if not isinstance(entries, list) or len(entries) != 1:
+                # A keyed GET answers with exactly its one instance. Zero is the empty-root
+                # case; more than one means we are not reading what we asked for, and
+                # picking [0] would compute retention and collateral from another device's
+                # instance — a PUT that omits this device's real rows.
+                got = len(entries) if isinstance(entries, list) else "no recognized root"
+                return _inconclusive(service_path, device_name, f"expected one instance, got {got}")
             entry = entries[0]
             if not isinstance(entry, dict) or not entry:
                 return _inconclusive(service_path, device_name, "empty instance entry")
+            if entry.get("device") != device_name:
+                return _inconclusive(service_path, device_name, f"instance echoes device {entry.get('device')!r}")
             return ServiceInstanceState("present", entry)
 
     # ── device-state envelope (READSEM S3) — status-declared per-family reads ─────────

@@ -558,3 +558,25 @@ async def test_service_instance_state_raises_on_a_server_error(patch_client):
     with patch_client(client, 500, {"error": "boom"}):
         with pytest.raises(httpx.HTTPStatusError):
             await client.service_instance_state(_SR_PATH, "rtr")
+
+
+@pytest.mark.parametrize(
+    ("body", "label"),
+    [
+        ({_SR_ROOT: [_ENTRY, {"device": "other-rtr", "route": []}]}, "two instances"),
+        ({_SR_ROOT: [{"device": "other-rtr", "route": []}]}, "another device's instance"),
+        ({_SR_ROOT: [{"route": []}]}, "an instance with no device key"),
+    ],
+)
+async def test_service_instance_state_refuses_an_instance_it_did_not_ask_for(patch_client, body, label):
+    """A keyed GET answers with exactly ITS instance — anything else is not what we asked for.
+
+    Taking ``entries[0]`` regardless would compute the retained entries and the collateral
+    guard's view from another device's instance, so the PUT would omit this device's real
+    rows and the verify would still pass.
+    """
+    client = _make_client()
+    with patch_client(client, 200, body):
+        state = await client.service_instance_state(_SR_PATH, "rtr")
+    assert state.status == "inconclusive", label
+    assert state.entry is None

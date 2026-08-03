@@ -306,7 +306,7 @@ async def _put_static_routes(client, device, plan, *, dry_run=False):
     return await _guarded_apply(client, device, "static_route", context, _apply, current=current)
 
 
-async def _enqueue_pending_clear_retract(db: AsyncSession, device, plan) -> None:
+async def _enqueue_pending_clear_retract(db: AsyncSession, device, plan, *, reg=None) -> None:
     """Queue the networked retract a merge-PATCH apply structurally cannot deliver (§4.11).
 
     A cleared leaf only leaves the device on a networked PUT. In ``PUT`` mode this apply's
@@ -320,25 +320,36 @@ async def _enqueue_pending_clear_retract(db: AsyncSession, device, plan) -> None
     only purpose is to remove a leaf observed under ``?store_only=true``. Such an entry
     parks — the row stays unproven — until a later authorized push re-records the clear.
 
-    Runs AFTER the apply's terminal transaction, so a failure here is logged, never raised:
-    a second terminal write flipping a committed ``succeeded`` to ``failed`` would misreport
-    rows the device really did accept. Nothing is lost either way — the carrier is store
-    state, so the next apply re-derives exactly this decision.
+    Runs AFTER the apply's terminal transaction, so a plain failure here is logged, never
+    raised: a second terminal write flipping a committed ``succeeded`` to ``failed`` would
+    misreport rows the device really did accept. Nothing is lost either way — the carrier is
+    store state, so the next apply re-derives exactly this decision.
+
+    A LOST CLAIM is not that kind of failure and does propagate. The job this queues is a
+    networked PUT; if the claim was revoked and reacquired while this apply was running, the
+    successor may since have un-owned a route, and a stale retract queued behind its back
+    would retract that deliberately detached config from the device. So the insert takes the
+    claim lock first and holds it to COMMIT. An UNREGISTERED registration is the documented
+    claimless lane and ``lock_claim`` no-ops on it — this transaction consumes no carrier and
+    deletes no tombstone, so a claimless caller is not the programming error it would be there.
     """
     if plan.mode != "PATCH":
         return
     fields = sorted({f for row in plan.rows for f in authorized_clear_fields(row.pending_clear)})
     if not fields:
         return
+    from nso_adapter.core.claim import ClaimRegistration, lock_claim
     from nso_adapter.core.removal import enqueue_removal
 
     try:
+        await lock_claim(db, reg if reg is not None else ClaimRegistration())
         # retract=True, no removed/shrank: an un-own would make this a no-networking detach,
         # which can never deliver a clear. Ordinary admission, ordinary FIFO — no immediate
         # device write, so auto_apply pacing is untouched.
         job = await enqueue_removal(db, device_id=device.id, scope="static_route", retract=True)
         await db.commit()
     except ClaimLostError:
+        await db.rollback()
         raise
     except Exception as exc:  # noqa: BLE001 — the apply is already finalized
         await db.rollback()
@@ -1765,7 +1776,26 @@ async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_
         }
         for row in rows:
             row.last_apply_error = err
-        return 0, len(rows), [{"error": str(exc), "code": "removal_blocked_collateral", "orphans": exc.orphans}]
+        # The preview rides the JOB failure too, not just the rows: it is the would-be device
+        # delta the operator has to review before deciding to force the replacement, and
+        # GET /jobs/{id} is where they read it (the removal path already reports it there).
+        return (
+            0,
+            len(rows),
+            [
+                {
+                    "error": str(exc),
+                    "code": "removal_blocked_collateral",
+                    "orphans": exc.orphans,
+                    "preview": exc.preview,
+                    "hint": (
+                        "These service rows are not in the accepted intent this apply would "
+                        "PUT-replace. Accept them into intent to keep them, or flush them "
+                        "deliberately via POST /devices/{id}/actions/force-removal."
+                    ),
+                }
+            ],
+        )
     except Exception as exc:
         logger.exception(f"apply.{log_label}_unexpected_error", job_id=job_id)
         err = {"code": "internal", "message": repr(exc), "detail": {}}
@@ -2031,7 +2061,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         # §4.11 retry path, on BOTH apply implementations: the atomic path is a separate
         # early return with its own finalization, so wiring this only into the per-scope
         # loop below would leave atomic-mode applies enqueueing nothing.
-        await _enqueue_pending_clear_retract(db, device, sr_plan)
+        await _enqueue_pending_clear_retract(db, device, sr_plan, reg=reg)
         return
 
     # ── Step 2: mark attribute states deploying ──
@@ -2263,7 +2293,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         reader_compare=reader_compare,
         reader_compare_unverifiable=reader_compare_unverifiable,
     )
-    await _enqueue_pending_clear_retract(db, device, sr_plan)
+    await _enqueue_pending_clear_retract(db, device, sr_plan, reg=reg)
 
 
 async def _post_apply_refresh_and_notify(db: AsyncSession, device_id: int) -> None:

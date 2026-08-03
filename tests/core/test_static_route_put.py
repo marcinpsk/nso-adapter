@@ -153,8 +153,9 @@ async def tombstone_ids(device_id: int) -> list[int]:
 class _Recorder:
     """Every request the apply/preview hands to the RESTCONF pool, in order."""
 
-    def __init__(self, device_name: str):
+    def __init__(self, device_name: str, dry_run_delta: str = ""):
         self.device_name = device_name
+        self.dry_run_delta = dry_run_delta
         self.calls: list[dict] = []
 
     async def _handle(self, method: str, url: str, content=None, headers=None):
@@ -163,11 +164,14 @@ class _Recorder:
         self.calls.append({"method": method, "url": url, "body": body, "dry_run": dry})
         request = httpx.Request(method.upper(), url)
         if dry:
-            # A conclusive, empty native delta: the post-apply verify passes.
+            # An empty native delta is a conclusive "nothing left to push" — the post-apply
+            # verify passes. A non-empty one is what the collateral guard reports back.
             return httpx.Response(
                 200,
                 request=request,
-                json={"dry-run-result": {"native": {"device": [{"name": self.device_name, "data": ""}]}}},
+                json={
+                    "dry-run-result": {"native": {"device": [{"name": self.device_name, "data": self.dry_run_delta}]}}
+                },
             )
         return httpx.Response(204, request=request, text="")
 
@@ -188,7 +192,7 @@ class _Recorder:
         return call["body"][_SR_ROOT][0]["route"]
 
 
-def sr_client(device_name: str, *, state, service_config=None):
+def sr_client(device_name: str, *, state, service_config=None, dry_run_delta: str = ""):
     """A spec'd NsoClient whose RESTCONF boundary is recorded.
 
     *state* is what the certified tri-state reader returns for the static-route service.
@@ -197,7 +201,7 @@ def sr_client(device_name: str, *, state, service_config=None):
     """
     from nso_adapter.nso.client import NsoClient
 
-    rec = _Recorder(device_name)
+    rec = _Recorder(device_name, dry_run_delta)
     http = AsyncMock()
     for method in ("get", "put", "patch", "post"):
 
@@ -707,3 +711,94 @@ async def test_the_follow_on_enqueue_never_rewrites_the_finalized_apply(adapter_
     assert job.status == JobStatus.succeeded, job.error
     assert job.result["static_route_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
     assert await removal_contexts(device_id) == []
+
+
+# ── codex chunk review — the three accepted findings ─────────────────────────
+
+
+async def test_the_follow_on_enqueue_takes_the_claim_lock(adapter_client):
+    """A revoked claim must not let a stale apply queue a networked retract.
+
+    The job this queues is a device write. If the claim was revoked and reacquired while
+    the apply ran, the successor may have un-owned a route since — and a retract queued
+    behind its back would strip that deliberately detached config off the device. The
+    insert therefore takes the claim lock first; a lost claim propagates, and recovery
+    already owns the disposition (the apply's own terminal commit already landed).
+    """
+    import sqlalchemy as sa
+
+    from nso_adapter.core.claim import ClaimLostError, acquire_claim
+    from nso_adapter.store.models import DeviceClaim
+
+    device_id = await seed_device(nso_device_name="sr-put", netbox_device_id=7221)
+    await seed_rows(
+        device_id,
+        [{"triple": B, "route_id": 7, "deployed_key": list(B), "pending_clear": {"authorized": ["metric"]}}],
+    )
+    reg = await acquire_claim(device_id, "job")
+    assert reg.registered
+
+    client, _rec = sr_client("sr-put", state=present(wire(B), device_name="sr-put"))
+    job_id = await seed_apply_job(device_id)
+
+    from nso_adapter.core import apply as apply_mod
+
+    real_finalize = apply_mod._finalize_job
+
+    async def _finalize_then_revoke(*args, **kwargs):
+        # the apply's own terminal commit LANDS; the claim is lost only afterwards
+        await real_finalize(*args, **kwargs)
+        async with session() as db:
+            await db.execute(sa.delete(DeviceClaim).where(DeviceClaim.device_id == device_id))
+            await db.commit()
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=client),
+        patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
+        patch.object(apply_mod, "_finalize_job", _finalize_then_revoke),
+        pytest.raises(ClaimLostError),
+    ):
+        await apply_mod.run_apply(job_id=job_id, device_id=device_id, force=True, reg=reg)
+
+    assert await removal_contexts(device_id) == [], "nothing may be queued under a lost claim"
+    # the apply itself is untouched: its terminal commit already landed, and recovery owns
+    # an already-terminal job (it deletes the stale claim and leaves the job alone)
+    assert (await read_job(job_id)).status == JobStatus.succeeded
+
+
+async def test_a_claimless_caller_still_queues_the_retract(adapter_client):
+    """The discriminating half: an UNREGISTERED registration is the claimless lane.
+
+    This transaction consumes no carrier and deletes no tombstone, so refusing here would
+    only break direct callers without buying any ownership guarantee.
+    """
+    device_id = await seed_device(nso_device_name="sr-put", netbox_device_id=7222)
+    await seed_rows(
+        device_id,
+        [{"triple": B, "route_id": 7, "deployed_key": list(B), "pending_clear": {"authorized": ["metric"]}}],
+    )
+    client, _rec = sr_client("sr-put", state=present(wire(B), device_name="sr-put"))
+
+    job = await run_the_apply(device_id, client)  # run_apply(reg=None)
+
+    assert job.status == JobStatus.succeeded, job.error
+    assert len(await removal_contexts(device_id)) == 1
+
+
+async def test_a_blocked_replace_reports_the_preview_on_the_job(adapter_client):
+    """The native delta is what the operator reviews before forcing the replacement.
+
+    Reporting the orphan keys alone tells them WHICH rows would go, not WHAT would be
+    pushed — and GET /jobs/{id} is where they read it.
+    """
+    device_id = await seed_device(nso_device_name="sr-put", netbox_device_id=7223)
+    await seed_rows(device_id, [{"triple": B, "route_id": 7, "deployed_key": list(A)}])
+    delta = "no ip route 10.0.2.0 255.255.255.0 192.0.2.3"
+    client, _rec = sr_client("sr-put", state=present(wire(A), wire(C), device_name="sr-put"), dry_run_delta=delta)
+
+    job = await run_the_apply(device_id, client)
+
+    assert job.status == JobStatus.failed
+    item = next(i for i in job.error["detail"]["items"] if i["type"] == "static_route")
+    assert item["preview"] == delta, "the would-be device delta, not just the orphan keys"
+    assert "force-removal" in item["hint"]
