@@ -1272,6 +1272,7 @@ def _build_interface_config_entries(attr_eligible, ip_by_iface, ifaces, device_n
 
 
 _RP_ROOT = "route-policy-reconciler:route-policy-config"
+_SR_ROOT = "static-route-reconciler:static-route-config"
 
 
 def _device_error_message(exc) -> str | None:
@@ -1330,7 +1331,7 @@ async def _localize_atomic_failure(client, device_name, modules, device_err) -> 
 _ATOMIC_SCOPE_ROOTS: dict[str, str] = {
     "subinterface-reconciler:subif-config": "subinterface",
     "snmp-reconciler:snmp-config": "snmp",
-    "static-route-reconciler:static-route-config": "static_route",
+    _SR_ROOT: "static_route",
     "logging-reconciler:logging-config": "logging",
     "svi-reconciler:svi-config": "svi",
     "vlan-reconciler:vlan-config": "vlan",
@@ -1946,6 +1947,18 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
         reader_compare_unverifiable=reader_compare_unverifiable,
         static_route_results=sr_results,
     )
+
+    if sr_put_delivered and not sr_send_failed:
+        # The scope that LEFT the combined body still owes its capability bookkeeping:
+        # `_clear_atomic_capability` only sees the roots that rode the commit, so without this
+        # a stale apply-sourced `unsupported` for static_route would stick forever (a probe
+        # cannot downgrade one) and /apply/preflight would keep warning about a scope that now
+        # applies cleanly. Deferred past the terminal transaction because the clear COMMITS —
+        # inline it would split the one transaction §4.6 requires.
+        try:
+            await _clear_atomic_capability(db, device, [_SR_ROOT])
+        except Exception:  # noqa: BLE001 — capability bookkeeping is best-effort
+            logger.debug("apply.atomic.capability_clear_skipped", job_id=job_id)
 
 
 # Scope → (store model name, residue YANG-list label, row → key tuple), guard grain.

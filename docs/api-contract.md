@@ -874,8 +874,8 @@ accepted store rows:
   `static_route.removal_retained_orphans`, naming exactly the retained keys no live route
   claims — that log is the operator's signal. The apply-side guard above still refuses, which
   is where a store-assertive body really can flush something.
-- if every authorized key has meanwhile been re-claimed by another live route, the job issues
-  no device write at all and succeeds.
+- if every authorized key has meanwhile been re-claimed by another live route and there is no
+  cleared leaf still to deliver, the job issues no device write at all and succeeds.
 - the proof is **enforcing**. A key still on the device after the PUT, an unreadable device
   view, or a failed `sync-from` on an un-own fails the job and keeps the deletion record, so it
   is retried. Removals get no "succeed while unproven" treatment: a succeeded removal is what

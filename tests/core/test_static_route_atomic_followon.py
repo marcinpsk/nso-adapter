@@ -377,3 +377,62 @@ async def test_a_reader_compare_miss_on_the_follow_on_fails_only_the_missing_row
     assert job.result["reader_compare"]["static_route"] == "missing"
     assert outcomes(job) == {B: "apply_failed"}
     assert await deployed_keys(device_id) == {B: list(A)}, "a dropped route closes no replacement"
+
+
+# ── the excluded scope keeps its capability bookkeeping (codex P2) ───────────
+
+
+async def seed_capability_gap(device_id: int) -> None:
+    """A stale apply-sourced ``unsupported`` for static_route, as a failed apply records it."""
+    from nso_adapter.store.models import Device, DeviceCapability
+
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        device.ned_id = "vendor-cli-1.0"
+        device.sw_version = "1.0.0"
+        db.add(
+            DeviceCapability(
+                ned_id="vendor-cli-1.0",
+                sw_version="1.0.0",
+                scope="static_route",
+                name="static_route",
+                status="unsupported",
+                detail="an earlier apply was rejected",
+                source="apply",
+            )
+        )
+        await db.commit()
+
+
+async def capability_scopes(device_id: int) -> list[str]:
+    from nso_adapter.store.models import DeviceCapability
+
+    async with session() as db:
+        rows = (await db.execute(select(DeviceCapability))).scalars().all()
+        return [r.scope for r in rows if r.status in ("unsupported", "skipped")]
+
+
+@pytest.mark.parametrize("put_fails", [False, True], ids=["clean_follow_on", "rejected_follow_on"])
+async def test_a_clean_follow_on_clears_the_stale_capability_the_exclusion_skipped(adapter_client, put_fails):
+    """A scope that leaves the combined body must not leave its capability record behind.
+
+    ``_clear_atomic_capability`` only sees the roots that rode the combined commit, so once a
+    PUT-mode pass is excluded from it, a stale apply-sourced ``unsupported`` for static_route
+    would stick forever — a probe cannot downgrade an apply-sourced row, so
+    ``/apply/preflight`` would keep warning about a scope that now applies cleanly. The clear
+    runs AFTER the terminal transaction, because it commits and would otherwise split §4.6's
+    single transaction; a REJECTED follow-on proves nothing and clears nothing.
+    """
+    device_id = await seed_device(nso_device_name="sr-atomic", netbox_device_id=7509 + int(put_fails))
+    await seed_replacement(device_id)
+    await seed_vlan(device_id)
+    await seed_capability_gap(device_id)
+    client, rec = atomic_client(
+        "sr-atomic", state=present(wire(A), device_name="sr-atomic"), section=dev_state(wire(B))
+    )
+    rec.fail_static_put = put_fails
+
+    job = await run_the_apply(device_id, client)
+
+    assert job.status == (JobStatus.failed if put_fails else JobStatus.succeeded), job.error
+    assert await capability_scopes(device_id) == (["static_route"] if put_fails else [])
