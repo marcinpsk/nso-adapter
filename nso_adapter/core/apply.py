@@ -1426,7 +1426,7 @@ async def _clear_atomic_capability(db, device, modules) -> None:
     await clear_capability_rejections(db, ned_id, sw, scopes)
 
 
-async def _stage_atomic_modules(elig, client, device, device_name) -> tuple[dict, list, dict, dict]:
+async def _stage_atomic_modules(elig, client, device, device_name, *, sr_plan=None) -> tuple[dict, list, dict, dict]:
     """Build the combined ``/restconf/data`` body across every scope.
 
     Returns ``(modules, iface_entries, scope_rows, stage_errors)``. Each scope stages its
@@ -1436,6 +1436,12 @@ async def _stage_atomic_modules(elig, client, device, device_name) -> tuple[dict
     A scope whose body cannot be BUILT (a malformed vault_ref, an unmappable enum) is
     isolated into *stage_errors* rather than raising: the fault is deterministic and local
     to that scope, so the rest of the apply still commits.
+
+    R2 §4.9: a ``PUT``-mode static-route plan is EXCLUDED from the combined body — staging
+    is merge-PATCH only and explicitly ignores ``replace`` (G4), so staging it would send
+    the new triple and leave the predecessor live while reporting success. The scope leaves
+    ``scope_rows`` too, so nothing downstream stamps or reader-compares rows this
+    transaction never carried; a follow-on PUT delivers them after the commit.
     """
     from nso_adapter.nso.apply import (
         apply_bfd_config,
@@ -1526,6 +1532,8 @@ async def _stage_atomic_modules(elig, client, device, device_name) -> tuple[dict
             ),
         ),
     ]
+    if sr_plan is not None and sr_plan.mode == "PUT":
+        stagers = [entry for entry in stagers if entry[0] != "static_route"]
     scope_rows = {key: rows for key, rows, _fn in stagers}
     stage_errors: dict[str, NsoApplyError] = {}
     for key, rows, stage_fn in stagers:
@@ -1660,6 +1668,127 @@ async def _atomic_reader_compare(
     return reader_compare, reader_compare_unverifiable, evidence_by_scope
 
 
+async def _atomic_commit(
+    db, client, device, device_name, modules, *, job_id: int
+) -> tuple[NsoApplyError | None, str | None, dict, dict | None, str]:
+    """Commit the combined transaction and localise its failure → the stamping inputs.
+
+    Returns ``(commit_error, combined_verify, offenders, err, msg)``. *combined_verify* is
+    the commit's §4.4 proof verdict, shared by every scope staged into it (G39).
+    """
+    from nso_adapter.nso.apply import apply_combined
+
+    commit_error: NsoApplyError | None = None
+    combined_verify: str | None = None
+    if modules:
+        try:
+            combined_verify = await apply_combined(client, device_name, modules)
+        except NsoApplyError as exc:
+            commit_error = exc
+        except Exception as exc:  # noqa: BLE001 — surface as a job-level failure
+            commit_error = NsoApplyError("internal", repr(exc))
+    else:
+        # Nothing reached the combined body: every eligible scope either failed to stage or
+        # left the transaction (a PUT-mode static-route plan, §4.9). An empty PATCH is a
+        # pointless round trip whose verify verdict would then be attributed to a scope the
+        # transaction never carried. C2 handed this case over: with atomic on, PUT mode and
+        # force=False, `any_eligible` comes from plan.rows and the eligible list can be
+        # empty — unreachable while the worker passes force=True, and it must stay so.
+        logger.info("apply.atomic_nothing_staged", job_id=job_id, device=device_name)
+
+    if commit_error is None:
+        # Positive signal (I2): a clean commit clears any stale reactive 'unsupported' for the
+        # applied scopes — a probe cannot downgrade an apply-rejection, so without this the gap
+        # would stick forever even after the device is fixed / upgraded and the intent lands.
+        try:
+            await _clear_atomic_capability(db, device, modules)
+        except Exception:  # noqa: BLE001 — capability bookkeeping is best-effort
+            logger.debug("apply.atomic.capability_clear_skipped", job_id=job_id)
+        return None, combined_verify, {}, None, ""
+
+    logger.error("apply.atomic_failed", job_id=job_id, device=device_name, error=commit_error.message)
+    device_err = _device_error_message(commit_error)
+    offenders, rp = await _localize_atomic_failure(client, device_name, modules, device_err)
+    # Capability (I2): record ONLY reliably-localised offenders — a per-scope dry-run the NED
+    # cannot compile, or a parse_rejected_construct match (a known-unsupported construct named
+    # in the device error). A generic device rejection is NOT a capability signal: it may be a
+    # MISCONFIGURATION (e.g. a route-map referencing a prefix-list not included in the push),
+    # not a NED limit — recording it would be a false "unsupported" verdict. Such failures
+    # still fail the job + stamp last_apply_error (the operator sees the real device error).
+    if offenders:
+        try:
+            await _record_atomic_capability(db, client, device, device_name, offenders, commit_error, rp, device_err)
+        except Exception:  # noqa: BLE001 — capability recording is best-effort
+            logger.debug("apply.atomic.capability_record_skipped", job_id=job_id)
+    if not offenders:  # could not localise → the whole rolled-back commit is the failure
+        offenders = dict.fromkeys(modules.keys(), "")
+    err = {"code": commit_error.code, "message": commit_error.message, "detail": commit_error.detail}
+    return commit_error, combined_verify, offenders, err, commit_error.message
+
+
+async def _static_route_followon_put(
+    client,
+    device,
+    device_name,
+    plan,
+    *,
+    job_id: int,
+    now,
+    outbox: dict,
+    scope_outcomes: dict,
+    scope_failures: dict,
+    reader_compare: dict,
+    reader_compare_unverifiable: dict,
+) -> tuple[bool, dict[int, str]]:
+    """Deliver the ``PUT``-mode replacement the combined transaction cannot (§4.9).
+
+    Runs only after ``apply_combined`` committed cleanly, and is the whole reason a
+    ``PUT``-mode plan is excluded from that commit: staging ignores ``replace`` (G4), so
+    without this the atomic path would merge the new triple, leave the predecessor on the
+    device and close nothing — an honest ``unproven`` at best, a false green at worst.
+
+    The scope's outcome, failures, reader-compare status and per-row evidence are produced
+    exactly as the per-scope loop produces them, so the bookkeeping that follows cannot tell
+    the two implementations apart. Returns ``(send_failed, evidence)`` — the send's OWN
+    verdict, captured before reader-compare folds its per-row findings into the same counter.
+
+    **Documented loss**: the replacement is NOT transactional with the other scopes. The
+    combined commit has already landed when this PUT runs, so a failure here fails the job
+    and stamps the static rows while every other scope stays applied.
+    """
+    from nso_adapter.core.removal import _VERIFY_PER_CALL_TIMEOUT
+
+    scope_ok, scope_failed, fails = await _run_scope(
+        "static_route",
+        _static_route_coro(client, device, plan, outbox=outbox),
+        plan.rows,
+        job_id=job_id,
+        device_name=device_name,
+        now=now,
+    )
+    send_failed = scope_failed != 0
+    evidence: dict[int, str] = {}
+    if not send_failed:
+        scope_ok, scope_failed, fails, status, unverifiable, evidence = await _reader_compare_scope(
+            client,
+            device,
+            "static_route",
+            plan.rows,
+            ok=scope_ok,
+            job_id=job_id,
+            device_name=device_name,
+            timeout=_VERIFY_PER_CALL_TIMEOUT,
+        )
+        if status is not None:
+            reader_compare["static_route"] = status
+        if unverifiable:
+            reader_compare_unverifiable["static_route"] = unverifiable
+    scope_outcomes["static_route"] = (scope_ok, scope_failed)
+    if fails:
+        scope_failures.setdefault("static_route", []).extend(fails)
+    return send_failed, evidence
+
+
 def _stamp_batch_scopes_atomic(scope_rows, offenders, commit_error, err, msg, now) -> tuple[dict, dict]:
     """Stamp every batch scope from the single atomic outcome → (scope_outcomes, scope_failures).
 
@@ -1693,12 +1822,14 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
 
     R2 §4.4: the combined commit's verify verdict is threaded out of ``apply_combined``
     rather than discarded, and the static-route bookkeeping runs here too. Staging is
-    merge-PATCH only and ignores ``replace`` (G4), so nothing here delivers a replacement
-    or a clear — ``put_delivered=False``, which is what keeps an atomic apply from closing
-    a replacement the device never received.
-    """
-    from nso_adapter.nso.apply import apply_combined
+    merge-PATCH only and ignores ``replace`` (G4), so a ``PATCH``-mode plan delivers no
+    replacement and no clear — ``put_delivered=False``, which is what keeps such an apply
+    from closing a replacement the device never received.
 
+    R2 §4.9: a ``PUT``-mode plan is instead excluded from the combined transaction and
+    delivered by a follow-on PUT once that transaction has committed. The replacement is
+    therefore NOT atomic with the other scopes — a deliberate, tested loss.
+    """
     attr_eligible = elig["attr"]
     ip_rows_flat = [r for rows in elig["ip_by_iface"].values() for r in rows]
 
@@ -1709,9 +1840,11 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
         attr_state.sync_state = SyncState.deploying
     await db.commit()
 
+    sr_put_mode = sr_plan is not None and sr_plan.mode == "PUT"
+
     try:
         modules, iface_entries, scope_rows, stage_errors = await _stage_atomic_modules(
-            elig, client, device, device_name
+            elig, client, device, device_name, sr_plan=sr_plan
         )
     except Exception:
         # An UNEXPECTED error while building the combined body (before any commit) — a real
@@ -1727,45 +1860,9 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
     # commit. Keep them out of every stage that assumes a scope was pushed.
     staged_rows = {k: v for k, v in scope_rows.items() if k not in stage_errors}
 
-    commit_error: NsoApplyError | None = None
-    combined_verify: str | None = None
-    try:
-        combined_verify = await apply_combined(client, device_name, modules)
-    except NsoApplyError as exc:
-        commit_error = exc
-    except Exception as exc:  # noqa: BLE001 — surface as a job-level failure
-        commit_error = NsoApplyError("internal", repr(exc))
-
-    if commit_error is not None:
-        logger.error("apply.atomic_failed", job_id=job_id, device=device_name, error=commit_error.message)
-        device_err = _device_error_message(commit_error)
-        offenders, rp = await _localize_atomic_failure(client, device_name, modules, device_err)
-        # Capability (I2): record ONLY reliably-localised offenders — a per-scope dry-run the NED
-        # cannot compile, or a parse_rejected_construct match (a known-unsupported construct named
-        # in the device error). A generic device rejection is NOT a capability signal: it may be a
-        # MISCONFIGURATION (e.g. a route-map referencing a prefix-list not included in the push),
-        # not a NED limit — recording it would be a false "unsupported" verdict. Such failures
-        # still fail the job + stamp last_apply_error (the operator sees the real device error).
-        if offenders:
-            try:
-                await _record_atomic_capability(
-                    db, client, device, device_name, offenders, commit_error, rp, device_err
-                )
-            except Exception:  # noqa: BLE001 — capability recording is best-effort
-                logger.debug("apply.atomic.capability_record_skipped", job_id=job_id)
-        if not offenders:  # could not localise → the whole rolled-back commit is the failure
-            offenders = dict.fromkeys(modules.keys(), "")
-        err = {"code": commit_error.code, "message": commit_error.message, "detail": commit_error.detail}
-        msg = commit_error.message
-    else:
-        offenders, err, msg = {}, None, ""
-        # Positive signal (I2): a clean commit clears any stale reactive 'unsupported' for the
-        # applied scopes — a probe cannot downgrade an apply-rejection, so without this the gap
-        # would stick forever even after the device is fixed / upgraded and the intent lands.
-        try:
-            await _clear_atomic_capability(db, device, modules)
-        except Exception:  # noqa: BLE001 — capability bookkeeping is best-effort
-            logger.debug("apply.atomic.capability_clear_skipped", job_id=job_id)
+    commit_error, combined_verify, offenders, err, msg = await _atomic_commit(
+        db, client, device, device_name, modules, job_id=job_id
+    )
 
     iface_failed = (_IFACE_CONFIG_ROOT in offenders) if iface_entries else False
     attr_outcome = _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot)
@@ -1795,6 +1892,29 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
             client, device, staged_rows, scope_outcomes, scope_failures, job_id=job_id, device_name=device_name
         )
 
+    # §4.9's follow-on: the PUT-mode replacement the combined transaction could not carry.
+    # Only after a CLEAN commit — a rolled-back transaction leaves every non-offending scope
+    # pending, and the static rows are no different for having been excluded from it.
+    sr_outbox: dict = {"verify": combined_verify, "sent_keys": None}
+    sr_evidence = evidence_by_scope.get("static_route", {})
+    sr_put_delivered = False
+    if sr_put_mode and commit_error is None:
+        sr_outbox = {}
+        sr_send_failed, sr_evidence = await _static_route_followon_put(
+            client,
+            device,
+            device_name,
+            sr_plan,
+            job_id=job_id,
+            now=now,
+            outbox=sr_outbox,
+            scope_outcomes=scope_outcomes,
+            scope_failures=scope_failures,
+            reader_compare=reader_compare,
+            reader_compare_unverifiable=reader_compare_unverifiable,
+        )
+        sr_put_delivered = True
+
     sr_results = None
     if sr_plan is not None:
         sr_results = await _settle_static_routes(
@@ -1803,9 +1923,9 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
             client,
             sr_plan,
             job_id=job_id,
-            outbox={"verify": combined_verify, "sent_keys": None},
-            evidence=evidence_by_scope.get("static_route", {}),
-            put_delivered=False,
+            outbox=sr_outbox,
+            evidence=sr_evidence,
+            put_delivered=sr_put_delivered,
             send_failed=sr_send_failed,
             scope_outcomes=scope_outcomes,
             scope_failures=scope_failures,
