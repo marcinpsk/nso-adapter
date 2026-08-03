@@ -1065,6 +1065,11 @@ class StaticRouteIntent(Base):
     # CAS is `IS NOT DISTINCT FROM`; none_as_null so a Python None is SQL NULL and not
     # 'null'::jsonb, which would silently stop matching `IS NULL`.
     deployed_key: Mapped[list | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    # R2 §4.11: store field names cleared by an intent PUT and not yet proven gone from the
+    # device, split by whether the clearing push may authorize a device write —
+    # ``{"authorized": [...], "store_only": [...]}``. NULL = nothing pending. A networked
+    # removal delivers only the ``authorized`` half; either half blocks a proven ``in_sync``.
+    pending_clear: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     vrf: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     prefix: Mapped[str] = mapped_column(String(64), nullable=False)
     next_hop: Mapped[str] = mapped_column(String(64), nullable=False, default="")

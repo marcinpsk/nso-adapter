@@ -25,8 +25,15 @@ from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.config import get_config
 from nso_adapter.core.claim import ClaimUnavailableError, held_claim, lock_claim
-from nso_adapter.core.removal import is_cleared
 from nso_adapter.core.request_flags import DELETE_ORIGIN, STORE_ONLY
+from nso_adapter.core.static_route_plan import (
+    SR_CLEAR_FIELDS,
+    null_route_id_count,
+    sr_is_cleared,
+    update_pending_clear,
+    wire_set,
+)
+from nso_adapter.core.static_route_plan import fence_open as sr_fence_open
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
     Device,
@@ -158,7 +165,8 @@ class StaticRouteEntry(BaseModel):
 
 # Scalars the writer emits only when set — `if row.metric is not None:` / `if getattr(row, 'interface_next_hop', None):` (nso/apply.py)
 # A merge-PATCH apply can never drop one that goes back to unset, so clearing any of
-# them must enqueue a PUT-replace retract. See core.removal.is_cleared.
+# them must enqueue a PUT-replace retract. Clear DETECTION runs over the subset that has a
+# wire leaf (``SR_CLEAR_FIELDS``); ``name`` stays here for the before-image and nothing else.
 _STATE_FIELDS = ("interface_next_hop", "next_hop_vrf", "metric", "permanent", "tag", "name")
 
 
@@ -367,8 +375,8 @@ async def _apply_static_route_intent(device_id: int, body: StaticRouteIntentUpda
     # The fence is evaluated on the PRE-mutation row set. Post-payload evaluation would
     # read "open" on the very request that fills the last NULL route_id, and then claim
     # deletion authority for a triple nothing ever correlated with a NetBox route pk.
-    null_route_ids = sum(1 for r in existing if r.route_id is None)
-    fence_open = null_route_ids == 0
+    null_route_ids = null_route_id_count(existing)
+    fence_open = sr_fence_open(existing)
     if not fence_open:
         logger.warning(_FALLBACK_EVENT, device_id=device_id, null_route_id_count=null_route_ids)
 
@@ -418,7 +426,24 @@ async def _apply_static_route_intent(device_id: int, body: StaticRouteIntentUpda
             row.permanent = item.permanent
             row.tag = item.tag
             row.name = item.name
-            if any(is_cleared(before[f], getattr(row, f)) for f in _STATE_FIELDS):
+            # Clear detection is static-route-specific, not the shared `is_cleared`:
+            # `permanent True -> False` IS a clear here because the renderer never emits
+            # `permanent: false` (the other twelve scopes' writers do emit False, which is
+            # why the shared predicate is right for them), and `name` is excluded outright
+            # because it has no wire leaf.
+            cleared_fields = {f for f in SR_CLEAR_FIELDS if sr_is_cleared(f, before[f], getattr(row, f))}
+            # The carrier is written for EVERY detected clear, before job classification and
+            # unconditionally — a pure clear and a delete-origin+clear both enqueue a
+            # networked job, and neither `retract` nor the cleared fields survive into its
+            # context, so a carrier written only on the detach path leaves those jobs with
+            # no clear to find.
+            update_pending_clear(
+                row,
+                cleared=cleared_fields,
+                reset={f for f in SR_CLEAR_FIELDS if wire_set(f, getattr(row, f))},
+                store_only=STORE_ONLY.get(),
+            )
+            if cleared_fields:
                 cleared = True
         else:
             # deployed_key stays NULL: R1 never writes it at runtime — nothing is proven

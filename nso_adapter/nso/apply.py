@@ -968,11 +968,43 @@ async def apply_snmp_config(
     )
 
 
+def static_route_entry(row) -> dict:
+    """Render ONE static-route intent row as the wire entry the reconciler expects.
+
+    The single renderer: the body builder below, the preview and R2's per-route
+    fingerprint all call it, so a fingerprint cannot drift from what was sent.
+    """
+    entry: dict = {
+        "vrf": row.vrf,
+        "prefix": row.prefix,
+        "next-hop": row.next_hop,
+    }
+    # Optional next-hop forms (IOS-XR): an egress/discard interface and an inter-VRF
+    # (leaked) next-hop VRF. Absent on a plain IP next-hop.
+    if getattr(row, "interface_next_hop", None):
+        entry["interface-next-hop"] = row.interface_next_hop
+    if getattr(row, "next_hop_vrf", None):
+        entry["next-hop-vrf"] = row.next_hop_vrf
+    if row.metric is not None:
+        entry["metric"] = row.metric
+    if row.permanent is not None and row.permanent:
+        entry["permanent"] = row.permanent
+    if row.tag is not None:
+        entry["tag"] = row.tag
+    return entry
+
+
+def static_route_entry_key(entry: dict) -> tuple[str, str, str]:
+    """Return the list key of a rendered or verbatim wire entry."""
+    return (entry.get("vrf") or "", entry.get("prefix") or "", entry.get("next-hop") or "")
+
+
 async def apply_static_routes(
     client: NsoClient,
     device_name: str,
     route_intent_rows: list,
     *,
+    extra_entries: list[dict] | None = None,
     replace: bool = False,
     dry_run: bool = False,
     stage: dict[str, list] | None = None,
@@ -983,27 +1015,21 @@ async def apply_static_routes(
     reconcile mode so pre-existing routes are adopted. ``replace=True`` PUT-replaces
     the keyed instance (full desired state) so removed routes are reverted on the
     device. Raises NsoApplyError on failure.
+
+    *extra_entries* are raw wire entries appended verbatim after the rendered ones — R2's
+    tombstone retention, where the live copy carries metric/tag and NED-specific leaves the
+    store has no column for. A rendered row always WINS on a key collision: the store is
+    the authority for a route it still owns.
     """
-    routes = []
-    for row in route_intent_rows:
-        entry: dict = {
-            "vrf": row.vrf,
-            "prefix": row.prefix,
-            "next-hop": row.next_hop,
-        }
-        # Optional next-hop forms (IOS-XR): an egress/discard interface and an inter-VRF
-        # (leaked) next-hop VRF. Absent on a plain IP next-hop.
-        if getattr(row, "interface_next_hop", None):
-            entry["interface-next-hop"] = row.interface_next_hop
-        if getattr(row, "next_hop_vrf", None):
-            entry["next-hop-vrf"] = row.next_hop_vrf
-        if row.metric is not None:
-            entry["metric"] = row.metric
-        if row.permanent is not None and row.permanent:
-            entry["permanent"] = row.permanent
-        if row.tag is not None:
-            entry["tag"] = row.tag
-        routes.append(entry)
+    routes = [static_route_entry(row) for row in route_intent_rows]
+    if extra_entries:
+        seen = {static_route_entry_key(entry) for entry in routes}
+        for entry in extra_entries:
+            key = static_route_entry_key(entry)
+            if key in seen:
+                continue
+            seen.add(key)
+            routes.append(entry)
 
     return await _send_service_config(
         client,

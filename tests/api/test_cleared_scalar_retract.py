@@ -153,10 +153,20 @@ async def test_setting_a_value_from_blank_is_not_a_retraction(adapter_client):
 
 
 @pytest.mark.anyio
-async def test_toggling_a_boolean_off_is_not_a_retraction(adapter_client):
-    """True -> False is not a clear: the writers emit False explicitly, so the merge-PATCH
-    carries it. Treating it as a clear would fire a real device PUT-replace on every
-    toggle-off (see core.removal.is_cleared)."""
+async def test_toggling_a_boolean_off_IS_a_retraction_for_static_routes(adapter_client):
+    """RETARGETED by #1396 R2 (C1.11): ``permanent True -> False`` IS a clear here.
+
+    The general rule still holds — ``is_cleared`` keeps returning False for a bool toggle,
+    because the other scopes' writers emit ``False`` explicitly and their merge-PATCH
+    carries it. The static-route renderer does NOT: it emits ``permanent`` only when
+    truthy, so a merge-PATCH leaves the device permanent forever while the apply reports
+    success. The shared predicate is asserted unchanged in
+    ``tests/api/test_static_route_pending_clear.py::test_c1_11b_the_shared_predicate_is_untouched``.
+    """
+    from nso_adapter.core.removal import is_cleared
+
+    assert is_cleared(True, False) is False, "the SHARED predicate must not change"
+
     device_id = await seed_device(nso_device_name="clr-bool", netbox_device_id=9912)
     route = {"vrf": "", "prefix": "10.9.5.0/24", "next_hop": "10.9.5.1"}
 
@@ -165,9 +175,13 @@ async def test_toggling_a_boolean_off_is_not_a_retraction(adapter_client):
         json={"routes": [{**route, "permanent": True}]},
         headers=AUTH,
     )
+    assert await _removal_jobs(device_id, "static_route") == []
+
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/static-route-intent",
         json={"routes": [{**route, "permanent": False}]},
         headers=AUTH,
     )
-    assert await _removal_jobs(device_id, "static_route") == []
+    jobs = await _removal_jobs(device_id, "static_route")
+    assert len(jobs) == 1
+    assert "detach" not in jobs[0].context, "a clear is not an un-own — the replace must network"

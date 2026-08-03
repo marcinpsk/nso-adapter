@@ -1710,11 +1710,13 @@ async def _finalize_job(
     )
 
 
-async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int, force: bool) -> None:
+async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int, force: bool, *, reg=None) -> None:
     """Run the apply body: sync-from, snapshot intent, push each scope, finalize the job.
 
     Raises on a missing device / NSO-client error so ``run_apply``'s outer handler can
     mark the job failed with an ``internal`` error.
+
+    *reg* is the live claim registration, threaded down for the transactions R2 adds here.
     """
     from nso_adapter.core.importer import get_nso_client
     from nso_adapter.nso.apply import (
@@ -2130,8 +2132,13 @@ async def _post_apply_refresh_and_notify(db: AsyncSession, device_id: int) -> No
         logger.warning("apply.post_refresh_failed", device_id=device_id, error=repr(exc))
 
 
-async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
-    """Background task: execute the apply for *device_id* (see module docstring §7a)."""
+async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -> None:
+    """Background task: execute the apply for *device_id* (see module docstring §7a).
+
+    *reg* is the worker's live ``ClaimRegistration``. R1 stopped it at the job runner, so
+    nothing the apply wrote could be claim-scoped; R2's CAS and carrier transactions guard
+    themselves with it.
+    """
     from nso_adapter.store.db import get_session
 
     async for db in get_session():
@@ -2143,7 +2150,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True) -> None:
         await db.commit()
 
         try:
-            await _execute_apply(db, job, job_id, device_id, force)
+            await _execute_apply(db, job, job_id, device_id, force, reg=reg)
         except ClaimLostError:
             # Revocation is not a runner error: recovery already owns the disposition.
             raise

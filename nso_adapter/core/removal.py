@@ -44,6 +44,10 @@ _VERIFY_PER_CALL_TIMEOUT = 60.0  # single-family action ceiling (default reader-
 _VERIFY_TOTAL_BUDGET = 120.0  # per-apply default-path reader-compare wall-clock budget
 _VERIFY_BATCH_TIMEOUT = 360.0  # atomic reader-compare batch + single-scope residue action
 
+#: "the caller supplied no snapshot" for :func:`_guarded_apply`. A sentinel, because ``None``
+#: is a legitimate snapshot value (no service instance) and must not re-trigger the GET.
+_NO_SNAPSHOT = object()
+
 
 async def _live_family_sections(client, device_name: str, wire_names: list[str], *, timeout: float) -> dict[str, dict]:
     """Fetch each family's section via the device-state-read ACTION, behind the action semaphore.
@@ -619,7 +623,9 @@ async def _record_residue(job, client, device, scope: str, context: dict, *, job
         job.result["residue_check"] = "clean"
 
 
-async def _guarded_apply(client, device, scope: str, context: dict | None, apply_thunk) -> None:
+async def _guarded_apply(
+    client, device, scope: str, context: dict | None, apply_thunk, *, current=_NO_SNAPSHOT
+) -> None:
     """Run *scope*'s PUT-replace behind the collateral guard (the ra1 lo0 incident).
 
     ``apply_thunk(**kwargs)`` must call the scope's apply function with its full row
@@ -629,6 +635,13 @@ async def _guarded_apply(client, device, scope: str, context: dict | None, apply
     current key that is neither re-asserted nor in the trigger's just-removed set
     is an ORPHAN — block with a native dry-run preview instead of committing.
     ``context["force"]`` (the actions/force-removal override) skips the guard.
+
+    *current* lets a caller that already read the live instance hand it in, so the
+    one-snapshot contract holds (R2 §4.1: the retained entries and the guard must see the
+    SAME read). The default is a sentinel, not ``None``: ``None`` is a valid snapshot
+    meaning "no service instance", so ``if current is None: GET`` would issue a second
+    read on exactly the absent-service case. Anything supplied — ``None`` included —
+    suppresses the internal GET.
     """
     context = context or {}
     if context.get("force"):
@@ -643,9 +656,10 @@ async def _guarded_apply(client, device, scope: str, context: dict | None, apply
         await apply_thunk(replace=True)
         return
     spec = _guard_specs().get(scope)
-    current = None
-    if spec is not None:
-        current = await client.get_service_config(spec.service_path, device.nso_device_name)
+    if current is _NO_SNAPSHOT:
+        current = None
+        if spec is not None:
+            current = await client.get_service_config(spec.service_path, device.nso_device_name)
     if current:
         stage: dict[str, list] = {}
         await apply_thunk(replace=True, stage=stage)
@@ -947,7 +961,24 @@ async def _replace_snmp(db: AsyncSession, device, client, context: dict | None =
     await _guarded_apply(client, device, "snmp", context, _apply)
 
 
-async def _dispatch_scope(db: AsyncSession, device, client, scope: str, context: dict | None = None) -> None:
+async def _dispatch_scope(
+    db: AsyncSession,
+    device,
+    client,
+    scope: str,
+    context: dict | None = None,
+    *,
+    job_id: int | None = None,
+    reg=None,
+) -> None:
+    """Route a removal to its scope handler.
+
+    *job_id* and *reg* are the running job's identity and its live claim registration:
+    a scope whose removal owns durable carriers (R2's static-route branches) needs the
+    job id to tell its OWN tombstones from a sibling's, and a real registered claim to
+    guard the transaction that consumes them. The twelve scopes that own no carrier
+    ignore both.
+    """
     if scope == "ospf":
         await _replace_ospf(db, device, client, context)
     elif scope == "bgp":
@@ -1058,11 +1089,16 @@ async def enqueue_removal(
     return job
 
 
-async def run_removal(job_id: int, device_id: int) -> None:
+async def run_removal(job_id: int, device_id: int, reg=None) -> None:
     """Execute a queued ``removal`` job: PUT-replace the scope's reconciler service.
 
     Idempotent — reads the CURRENT accepted rows at run time, so a requeue after a
     restart re-asserts whatever the present desired state is.
+
+    *reg* is the worker's live ``ClaimRegistration`` for this device. Physical continuity
+    already existed (the worker holds the claim for the runner's whole lifetime); the
+    token is what was missing, and R2's carrier-consuming writes need it to guard their
+    own transactions and to authorize ``delete_tombstones``.
     """
     from nso_adapter.core.importer import get_nso_client
     from nso_adapter.store.db import get_session
@@ -1086,7 +1122,7 @@ async def run_removal(job_id: int, device_id: int) -> None:
             detach = bool(context.get("detach"))
             detach_token = nso_apply_mod.DETACH_REPLACE.set(detach)
             try:
-                await _dispatch_scope(db, device, client, scope, context)
+                await _dispatch_scope(db, device, client, scope, context, job_id=job_id, reg=reg)
             finally:
                 nso_apply_mod.DETACH_REPLACE.reset(detach_token)
             job.status = JobStatus.succeeded
