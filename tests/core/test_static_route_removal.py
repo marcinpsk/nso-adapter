@@ -1118,3 +1118,30 @@ async def test_a2_iii_the_duplicate_retract_is_a_no_op_via_supersession(adapter_
     assert job2.status == JobStatus.succeeded
     assert job2.result["superseded"] is True
     assert len(fake.writes) == writes_after_first, "the duplicate must issue no PUT"
+
+
+# ── codex C4-F1 — a body with nothing left to deliver must not be PUT ────────
+
+
+async def test_a_clear_that_live_validation_rejects_issues_no_put(adapter_client):
+    """codex C4-F1 — the store-side clear passes, the LIVE entry is gone, nothing is authorized.
+
+    ``candidate_clears`` is what gets us past the pre-read no-op branch, but the live entry
+    for that row is absent, so the body delivers nothing. PUT-replacing the whole instance
+    anyway is a device commit with no authority behind it — and it would retract any service
+    change made between the snapshot and the write.
+    """
+    device_id = await seed_device(nso_device_name="sr-f1", netbox_device_id=7996)
+    # The row's identity moved to D; the service still holds only A and B.
+    await seed_rows(
+        device_id, [{"triple": D, "route_id": 2, "pending_clear": {"authorized": ["metric"], "store_only": []}}]
+    )
+    fake = SrFake("sr-f1", service=[wire(A), wire(B, metric=10)])
+    job_id = await seed_removal_job(device_id, {})
+
+    job = await run_removal_job(device_id, job_id, sr_client(fake))
+
+    assert fake.writes == [], "nothing authorized and nothing deliverable ⇒ no device commit"
+    assert job.status == JobStatus.succeeded
+    assert job.result["superseded"] is True
+    assert (await carriers(device_id))[D] == {"authorized": ["metric"], "store_only": []}

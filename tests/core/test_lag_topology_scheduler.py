@@ -111,7 +111,6 @@ def test_start_scheduler_registers_lag_refresh_job(monkeypatch: pytest.MonkeyPat
         "intent_reconcile",
         "orphan_reap",
         "static_route_reclaim",
-        "static_route_reclaim_kick",
         "lag_topology_refresh",
         "lag_config_refresh",
         "bfd_refresh",
@@ -194,7 +193,6 @@ def test_start_scheduler_skips_lag_refresh_when_disabled(monkeypatch: pytest.Mon
         "intent_reconcile",
         "orphan_reap",
         "static_route_reclaim",
-        "static_route_reclaim_kick",
         "startup_sync_kick",  # A4: one-shot restart repopulation (always registered)
     }
     scheduler_module.stop_scheduler()
@@ -460,7 +458,7 @@ def test_start_scheduler_kicks_startup_sync(monkeypatch: pytest.MonkeyPatch):
     assert kick[0]["func"] is scheduler_module._scheduled_sync_all
     assert kick[0]["trigger"] == "date"
     # It must NOT schedule the per-family poll wrappers as startup one-shots (no 17-read burst):
-    # R2 §4.10 kicks the activation reclaimer once at startup too — it is not a per-family
-    # poll wrapper, and it is fire-and-forget rather than anything readiness awaits.
-    oneshots = {j.get("id") for j in fake_scheduler.jobs if j["trigger"] == "date"}
-    assert oneshots == {"startup_sync_kick", "static_route_reclaim_kick"}
+    # R2 §4.10's activation pass rides its own INTERVAL job with an immediate first run —
+    # one job id, so max_instances also serializes the startup pass against the first tick.
+    family_oneshots = [j for j in fake_scheduler.jobs if j["trigger"] == "date" and j.get("id") != "startup_sync_kick"]
+    assert family_oneshots == []

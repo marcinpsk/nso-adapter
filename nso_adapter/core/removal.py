@@ -935,7 +935,8 @@ async def _replace_static_route(
     candidate_clears = {} if detach else _sr_candidate_clears(rows)
 
     tombstone_ids = tuple(t.id for t in tombstones)
-    if not authorized and not candidate_clears:
+
+    def _nothing_to_do() -> SrRemoval:
         logger.info(
             SR_SUPERSEDED_EVENT,
             device_id=device.id,
@@ -944,6 +945,9 @@ async def _replace_static_route(
             reclaimed=[list(k) for k in reclaimed],
         )
         return SrRemoval("superseded", frozenset(), tombstone_ids, frozenset(), False, False, None, {}, ())
+
+    if not authorized and not candidate_clears:
+        return _nothing_to_do()
 
     state = await client.service_instance_state(_STATIC_ROUTE_SERVICE_PATH, device.nso_device_name)
     if state.inconclusive:
@@ -964,6 +968,12 @@ async def _replace_static_route(
         return SrRemoval(branch, frozenset(authorized), tombstone_ids, frozenset(), False, True, None, {}, ())
 
     body_entries, delivered = _sr_body(current, rows, authorized, candidate_clears)
+    if not authorized and not delivered:
+        # The store-side clear check got us past the pre-read branch, but the live entry it
+        # named is gone (the row's identity moved, or the key was never on the service). The
+        # body would be the snapshot verbatim: a device commit with no authority behind it,
+        # which would also retract anything the service gained since the read.
+        return _nothing_to_do()
     sent_keys = {static_route_entry_key(entry) for entry in body_entries}
     retained_orphans = tuple(sorted(sent_keys - claimed))
     if retained_orphans:

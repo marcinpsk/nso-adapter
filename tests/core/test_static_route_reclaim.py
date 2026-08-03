@@ -252,7 +252,7 @@ async def test_c4_23_the_reclaimer_is_its_own_bounded_scheduled_job(adapter_clie
             captured["jobs"] = []
 
         def add_job(self, fn, trigger, **kwargs):
-            captured["jobs"].append((fn, trigger, kwargs.get("id")))
+            captured["jobs"].append((fn, trigger, kwargs.get("id"), kwargs))
 
         def start(self):
             captured["started"] = True
@@ -262,9 +262,13 @@ async def test_c4_23_the_reclaimer_is_its_own_bounded_scheduled_job(adapter_clie
     scheduler._scheduler = None
 
     assert captured["defaults"]["max_instances"] == 1
-    assert ("static_route_reclaim") in {job_id for _fn, _t, job_id in captured["jobs"]}
-    kick = [job for job in captured["jobs"] if job[2] == "static_route_reclaim_kick"]
-    assert kick and kick[0][1] == "date"
+    # ONE registration, not an interval job plus a separate startup "date" job: APScheduler
+    # enforces max_instances per job ID, so two ids let a slow startup pass overlap the first
+    # recurring tick and race the drain cursor. The immediate first run rides the same id.
+    ours = [job for job in captured["jobs"] if job[2].startswith("static_route_reclaim")]
+    assert [job[2] for job in ours] == ["static_route_reclaim"]
+    assert ours[0][1] == "interval"
+    assert ours[0][3].get("next_run_time") is not None, "the activation pass must still fire at startup"
 
 
 async def test_c4_23_the_per_tick_budget_bounds_the_drain(adapter_client):

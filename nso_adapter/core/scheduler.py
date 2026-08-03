@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import NamedTuple
 
 import structlog
@@ -699,6 +700,11 @@ class _JobSpec(NamedTuple):
     interval_attr: str
     enable_attr: str | None
     gate_on_interval: bool
+    #: Fire the first run immediately instead of one interval from now, on the SAME job id.
+    #: A separate one-shot "date" job would have a different id, and APScheduler enforces
+    #: ``max_instances`` per id — so a startup pass slower than the interval would run
+    #: concurrently with the first recurring tick.
+    run_immediately: bool = False
 
 
 # Declarative registry of every periodic job. Order = registration order.
@@ -710,7 +716,11 @@ _JOB_SPECS: tuple[_JobSpec, ...] = (
     # gate_on_interval so an interval of 0 is the only way to disable it.
     _JobSpec(_scheduled_orphan_reap, "orphan_reap", "orphan_reap_interval", None, True),
     # R2 §4.10: separate from orphan_reap on purpose — see _scheduled_static_route_reclaim.
-    _JobSpec(_scheduled_static_route_reclaim, "static_route_reclaim", "static_route_reclaim_interval", None, True),
+    # R1 mandates the activation pass run on activation (G18), hence the immediate first run;
+    # it is scheduled, never awaited, so readiness never waits on per-device NSO reads.
+    _JobSpec(
+        _scheduled_static_route_reclaim, "static_route_reclaim", "static_route_reclaim_interval", None, True, True
+    ),
     _JobSpec(_scheduled_lag_topology_refresh, "lag_topology_refresh", "lag_topology_poll_interval", None, True),
     _JobSpec(_scheduled_lag_config_refresh, "lag_config_refresh", "lag_config_poll_interval", None, True),
     _JobSpec(
@@ -799,7 +809,8 @@ def start_scheduler() -> None:
         interval = getattr(cfg.scheduler, spec.interval_attr)
         enabled = spec.enable_attr is None or getattr(cfg.scheduler, spec.enable_attr)
         if enabled and (not spec.gate_on_interval or interval > 0):
-            _scheduler.add_job(spec.fn, "interval", minutes=interval, id=spec.job_id)
+            extra = {"next_run_time": datetime.now(UTC)} if spec.run_immediately else {}
+            _scheduler.add_job(spec.fn, "interval", minutes=interval, id=spec.job_id, **extra)
     _scheduler.start()
     # A4: one immediate sync sweep so a process restart repopulates the operator-visible mirror
     # (routing + interface_ip, via sync_device) within seconds instead of waiting a full poll
@@ -807,14 +818,6 @@ def start_scheduler() -> None:
     # per-device startup burst). _scheduled_sync_all enqueues one deduped sync job per scoped
     # device; the durable worker pool drains them. "date" with no run_date fires once, now.
     _scheduler.add_job(_scheduled_sync_all, "date", id="startup_sync_kick", replace_existing=True)
-    # R1 mandates the activation reclaimer run on activation (G18) — KICKED OFF, never awaited.
-    # start_workers awaits its recovery before any worker exists (G30), so blocking readiness
-    # behind per-device NSO reads would be a self-inflicted outage. The recurring job above is
-    # what makes it a drain rather than a one-shot.
-    if cfg.scheduler.static_route_reclaim_interval > 0:
-        _scheduler.add_job(
-            _scheduled_static_route_reclaim, "date", id="static_route_reclaim_kick", replace_existing=True
-        )
     logger.info("scheduler.started")
 
 
