@@ -286,6 +286,21 @@ async def _scheduled_orphan_reap() -> None:
     _worker.ensure_workers()
 
 
+async def _scheduled_static_route_reclaim() -> None:
+    """Bounded drain over the succeeded-owner tombstones R1 handed to R2 (§4.10).
+
+    Its OWN job, never appended to :func:`_scheduled_orphan_reap`: that tick is sequential and
+    ends in ``ensure_workers()`` (G30), so a slow reclaim inside it would delay stale-claim
+    reaping, the R1 tombstone sweep and worker repair alike. ``max_instances=1`` comes from the
+    scheduler's job defaults, so two drains can never overlap.
+    """
+    from nso_adapter.core.static_route_reclaim import reclaim_succeeded_tombstones
+
+    consumed, reissued = await reclaim_succeeded_tombstones()
+    if consumed or reissued:
+        logger.info("scheduler.static_route_reclaim.done", consumed=consumed, reissued=reissued)
+
+
 async def _scheduled_lag_topology_refresh() -> None:
     """Periodic fallback: refresh LAG topology for all managed devices."""
     from nso_adapter.core.lag_topology import refresh_lag_topology_for_device
@@ -694,6 +709,8 @@ _JOB_SPECS: tuple[_JobSpec, ...] = (
     # Safety-net: no enable flag (self-healing must not be switchable off by a feature toggle);
     # gate_on_interval so an interval of 0 is the only way to disable it.
     _JobSpec(_scheduled_orphan_reap, "orphan_reap", "orphan_reap_interval", None, True),
+    # R2 §4.10: separate from orphan_reap on purpose — see _scheduled_static_route_reclaim.
+    _JobSpec(_scheduled_static_route_reclaim, "static_route_reclaim", "static_route_reclaim_interval", None, True),
     _JobSpec(_scheduled_lag_topology_refresh, "lag_topology_refresh", "lag_topology_poll_interval", None, True),
     _JobSpec(_scheduled_lag_config_refresh, "lag_config_refresh", "lag_config_poll_interval", None, True),
     _JobSpec(
@@ -790,6 +807,14 @@ def start_scheduler() -> None:
     # per-device startup burst). _scheduled_sync_all enqueues one deduped sync job per scoped
     # device; the durable worker pool drains them. "date" with no run_date fires once, now.
     _scheduler.add_job(_scheduled_sync_all, "date", id="startup_sync_kick", replace_existing=True)
+    # R1 mandates the activation reclaimer run on activation (G18) — KICKED OFF, never awaited.
+    # start_workers awaits its recovery before any worker exists (G30), so blocking readiness
+    # behind per-device NSO reads would be a self-inflicted outage. The recurring job above is
+    # what makes it a drain rather than a one-shot.
+    if cfg.scheduler.static_route_reclaim_interval > 0:
+        _scheduler.add_job(
+            _scheduled_static_route_reclaim, "date", id="static_route_reclaim_kick", replace_existing=True
+        )
     logger.info("scheduler.started")
 
 

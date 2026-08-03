@@ -775,36 +775,37 @@ async def test_bgp_removal_passes_with_removed_peer_threaded(adapter_client):
         assert job.status == JobStatus.succeeded
 
 
-async def test_static_route_removal_compound_key(adapter_client):
-    """static routes are keyed (vrf, prefix, next-hop); the compound key must round-trip
-    through the removed context (JSON arrays) and match the YANG entry fields."""
-    device_id = await _seed_device(nso_device_name="sw-sr-guard")
-    service = {
-        "device": "sw-sr-guard",
-        "route": [
-            {"vrf": "", "prefix": "10.0.0.0/24", "next-hop": "192.0.2.1"},
-            {"vrf": "", "prefix": "10.9.0.0/24", "next-hop": "192.0.2.9"},
-        ],
-    }
-    staged = {"device": "sw-sr-guard", "route": [{"vrf": "", "prefix": "10.0.0.0/24", "next-hop": "192.0.2.1"}]}
-    client = _guard_client(service)
-    job_id = await _seed_removal_job(
-        device_id, scope="static_route", context_extra={"removed": {"route": [["", "10.9.0.0/24", "192.0.2.9"]]}}
-    )
-    apply_fn = _staging_apply(staged)
-    await _run_removal_with("static_route", "apply_static_routes", device_id, job_id, client, apply_fn)
-    async with session() as db:
-        job = await db.get(Job, job_id)
-        assert job.status == JobStatus.succeeded
+async def test_static_route_removal_no_longer_blocks_on_collateral(adapter_client):
+    """#1396 R2 §4.3/OQ-R2-3 — the DOCUMENTED behavior change, asserted rather than assumed.
 
-    # same setup WITHOUT the removed context → the dropped route is collateral
-    job2 = await _seed_removal_job(device_id, scope="static_route")
-    apply_fn2 = _staging_apply(staged)
-    await _run_removal_with("static_route", "apply_static_routes", device_id, job2, client, apply_fn2)
-    async with session() as db:
-        job = await db.get(Job, job2)
-        assert job.status == JobStatus.failed
-        assert job.error["detail"]["orphans"] == {"route": [["", "10.9.0.0/24", "192.0.2.9"]]}
+    Until R2 this scope built a store-assertive PUT and blocked (``removal_blocked_collateral``)
+    on any service row the store no longer asserts. R2 makes static-route removal bodies
+    live-service-relative, so such a body cannot flush anything and the guard degenerates to
+    "we dropped exactly what we authorized": the unrelated row is RETAINED and named on the job
+    instead. The full branch matrix lives in ``tests/core/test_static_route_removal.py``; this
+    pin exists so the change cannot happen silently for the other twelve scopes' neighbours.
+    """
+    from tests.core.test_static_route_removal import SrFake, run_removal_job, seed_removal_job, sr_client, wire
+
+    survivor = ("", "10.0.0.0/24", "192.0.2.1")
+    dropped = ("", "10.9.0.0/24", "192.0.2.9")
+    device_id = await _seed_device(nso_device_name="sw-sr-guard")
+    fake = SrFake("sw-sr-guard", service=[wire(survivor), wire(dropped)])
+
+    # No `removed` context at all — pre-R2 this was the collateral case that BLOCKED.
+    job_id = await seed_removal_job(device_id, {})
+    job = await run_removal_job(device_id, job_id, sr_client(fake))
+    assert job.status == JobStatus.succeeded
+    assert job.result["superseded"] is True, "nothing authorized and no clear ⇒ no PUT at all"
+    assert fake.service_keys == {survivor, dropped}
+
+    # With the compound key threaded through the context, exactly that key is dropped and the
+    # unrelated one is retained and reported.
+    job2 = await seed_removal_job(device_id, {"removed": {"route": [list(dropped)]}})
+    job = await run_removal_job(device_id, job2, sr_client(fake))
+    assert job.status == JobStatus.succeeded
+    assert fake.service_keys == {survivor}
+    assert job.result["retained_orphans"] == [list(survivor)]
 
 
 async def test_generic_force_skips_guard_and_service_get(adapter_client):

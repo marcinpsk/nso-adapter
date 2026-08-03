@@ -142,9 +142,8 @@ async def test_the_reissued_job_runs_with_the_marking_the_tombstone_recorded(ada
     """
     from unittest.mock import AsyncMock
 
-    from nso_adapter.nso import apply as nso_apply_mod
     from nso_adapter.store.models import Job, JobStatus
-    from tests.core.test_removal import _guard_client, _run_removal_with, _staging_apply
+    from tests.core.test_static_route_removal import SrFake, run_removal_job, sr_client, wire
 
     device_name = f"sw-m5-2-{marking}"
     device_id = await seed_device(nso_device_name=device_name, netbox_device_id=9630)
@@ -154,35 +153,27 @@ async def test_the_reissued_job_runs_with_the_marking_the_tombstone_recorded(ada
     assert await sweep_tombstones() == 1
     reissued = next(j["id"] for j in await _removal_jobs(device_id) if j["id"] != failed_id)
 
-    survivor = {"vrf": "", "prefix": A[1], "next-hop": A[2]}
-    dropped = {"vrf": "", "prefix": B[1], "next-hop": B[2]}
-    client = _guard_client({"device": device_name, "route": [survivor, dropped]})
-    detach_at_apply: list[bool] = []
-    staging = _staging_apply({"device": device_name, "route": [survivor]})
+    fake = SrFake(device_name, service=[wire(A), wire(B)])
+    sync_from = AsyncMock(return_value={})
+    job = await run_removal_job(device_id, reissued, sr_client(fake), sync_from=sync_from)
 
-    async def _apply(*args, **kwargs):
-        detach_at_apply.append(nso_apply_mod.DETACH_REPLACE.get())
-        return await staging(*args, **kwargs)
-
-    sync_from = AsyncMock()
-    monkeypatch.setattr("nso_adapter.nso.actions.sync_from", sync_from)
-    await _run_removal_with("static_route", "apply_static_routes", device_id, reissued, client, _apply)
-
+    assert job.status == JobStatus.succeeded
+    assert fake.writes[-1]["no_networking"] is (marking == "detach")
+    assert fake.service_keys == {A}, "the un-owned/deleted key leaves the SERVICE either way"
+    if marking == "detach":
+        # No networking, and CDB is re-aligned with device truth afterwards.
+        assert job.result["detach"] is True
+        assert job.result["residue_check"] == "skipped_detach"
+        assert fake.device_keys == {A, B}, "the device keeps it — that is what an un-own means"
+        sync_from.assert_awaited()
+    else:
+        assert "detach" not in job.result
+        # R2 now ENFORCES this rather than merely recording it (§4.4).
+        assert job.result["residue_check"] == "clean"
+        assert fake.device_keys == {A}
+        sync_from.assert_not_awaited()
     async with session() as db:
-        job = await db.get(Job, reissued)
-        assert job.status == JobStatus.succeeded
-        if marking == "detach":
-            # No networking, and CDB is re-aligned with device truth afterwards.
-            assert detach_at_apply and all(detach_at_apply)
-            assert job.result["detach"] is True
-            assert job.result["residue_check"] == "skipped_detach"
-            sync_from.assert_awaited()
-        else:
-            assert detach_at_apply and not any(detach_at_apply)
-            assert "detach" not in job.result
-            # Recorded, NOT enforced: residue enforcement is R2's.
-            assert "residue_check" in job.result
-            sync_from.assert_not_awaited()
+        assert await db.get(Job, reissued) is not None
 
 
 @pytest.mark.parametrize("status_name", ["queued", "running", "succeeded"])

@@ -28,7 +28,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.claim import ClaimLostError
+from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError
 
 logger = structlog.get_logger(__name__)
 
@@ -701,6 +701,562 @@ async def _replace_simple(db: AsyncSession, device, client, scope: str, context:
     await _guarded_apply(client, device, scope, context, _apply)
 
 
+# ── #1396 R2 §4.3/§4.4 — the three static-route removal branches ─────────────
+#
+# Static routes are the one scope whose removal is LIVE-SERVICE-RELATIVE: the body is what
+# the service currently holds minus exactly what this job is authorized to drop, never the
+# store's remaining rows. A store-assertive body forward-deploys every co-edited field of
+# every surviving row, which the ratified policy forbids — and it is also what made a removal
+# block on unrelated service orphans, since a body it never asserted looks like collateral.
+
+#: Consumption by supersession: a live intent row reclaimed every key this job was going to
+#: drop, so there is nothing to retract and nothing to fail.
+SR_SUPERSEDED_EVENT = "static_route.removal_superseded"
+
+#: The keys a live-relative body PRESERVES that no live intent row claims (§6/OQ-R2-3). With
+#: the guard unreachable on this path, this event is the operator's only remaining signal —
+#: a spec obligation, not a nicety.
+SR_RETAINED_ORPHANS_EVENT = "static_route.removal_retained_orphans"
+
+
+class SrRemoval(NamedTuple):
+    """What :func:`_replace_static_route` did, for the proof and bookkeeping that follow.
+
+    Returned rather than acted on in place: §4.6 requires the consumption, the carrier
+    updates and the terminal job status to land in ONE transaction, and that transaction
+    cannot open until every post-write read has happened.
+    """
+
+    #: ``force`` | ``detach`` | ``networked`` | ``superseded``.
+    branch: str
+    #: The keys this job may drop from the device — tombstone triples ∪ ``deployed_key``s,
+    #: minus everything a live intent row still claims.
+    authorized: frozenset
+    #: The tombstone ids snapshotted BEFORE the network call; only these may be deleted.
+    tombstone_ids: tuple[int, ...]
+    #: Every route key the PUT body carried.
+    sent_keys: frozenset
+    #: Whether a PUT was actually issued (a 2xx, since a non-2xx raises).
+    put_issued: bool
+    #: Whether the pre-PUT read CERTIFIED the service instance absent (a keyed 404).
+    service_absent: bool
+    #: The commit's native-verify verdict, or ``None`` when no PUT was sent.
+    verify: str | None
+    #: ``{intent row id: [store field names]}`` whose wire leaves this body deleted.
+    clears: dict[int, tuple[str, ...]]
+    #: The retained keys no live row claims — what ``SR_RETAINED_ORPHANS_EVENT`` reported.
+    retained_orphans: tuple
+
+
+def _sr_triple(key) -> tuple[str, str, str]:
+    """Normalize a job-context / tombstone key to the wire triple the renderer emits."""
+    parts = list(key) if isinstance(key, (list, tuple)) else [key]
+    parts = (parts + ["", "", ""])[:3]
+    return tuple("" if p is None else str(p) for p in parts)  # type: ignore[return-value]
+
+
+async def _sr_authorization(db: AsyncSession, device, context: dict, *, job_id: int | None):
+    """Return ``(tombstones, authorized, claimed, rows, reclaimed)`` — §4.3's steps 1 and 2.
+
+    ``authorized`` is what this job may drop: its OWN tombstones' ``{triple} ∪ {deployed_key}``
+    (X6; a NULL ``deployed_key`` contributes nothing), or ``context["removed"]["route"]`` when
+    it owns none — minus every key a live intent row still claims. That subtraction is
+    ownership, not eligibility: another route reclaiming the key means the key is no longer
+    this deletion's to drop.
+    """
+    from nso_adapter.core.static_route_plan import as_triple, triple_of
+    from nso_adapter.store.models import StaticRouteIntent, StaticRouteTombstone
+
+    tombstones = []
+    if job_id is not None:
+        tombstones = list(
+            (
+                await db.execute(
+                    select(StaticRouteTombstone)
+                    .where(StaticRouteTombstone.device_id == device.id, StaticRouteTombstone.job_id == job_id)
+                    .order_by(StaticRouteTombstone.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    authorized: set[tuple[str, str, str]] = set()
+    for tomb in tombstones:
+        authorized.add((tomb.vrf or "", tomb.prefix or "", tomb.next_hop or ""))
+        deployed = as_triple(tomb.deployed_key)
+        if deployed is not None:
+            authorized.add(deployed)
+    if not tombstones:
+        for key in (context.get("removed") or {}).get("route") or []:
+            authorized.add(_sr_triple(key))
+
+    rows = list(
+        (
+            await db.execute(
+                select(StaticRouteIntent).where(StaticRouteIntent.device_id == device.id).order_by(StaticRouteIntent.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    claimed: set[tuple[str, str, str]] = set()
+    for row in rows:
+        claimed.add(triple_of(row))
+        deployed = as_triple(row.deployed_key)
+        if deployed is not None:
+            claimed.add(deployed)
+    reclaimed = sorted(authorized & claimed)
+    if reclaimed:
+        logger.warning(
+            "static_route.removal_key_reclaimed",
+            device_id=device.id,
+            job_id=job_id,
+            keys=[list(k) for k in reclaimed],
+        )
+    return tombstones, authorized - claimed, claimed, rows, reclaimed
+
+
+def _sr_candidate_clears(rows) -> dict[int, tuple[str, ...]]:
+    """Which rows' cleared leaves this networked removal may deliver — §4.3's validity rules.
+
+    Evaluated at execution under the claim, never from a job-context snapshot: a clear queued
+    minutes ago can have been re-set, deleted, moved or had its key reclaimed since. A
+    replacement-open row is skipped — it waits for the Apply PUT, whose store-rendered body
+    omits the leaf anyway. Only the ``authorized`` carrier half is visible.
+    """
+    from nso_adapter.core.static_route_plan import authorized_clear_fields, replacement_open, wire_set
+
+    candidates: dict[int, tuple[str, ...]] = {}
+    for row in rows:
+        fields = authorized_clear_fields(row.pending_clear)
+        if not fields or replacement_open(row):
+            continue
+        still_unset = tuple(sorted(f for f in fields if not wire_set(f, getattr(row, f, None))))
+        if still_unset:
+            candidates[row.id] = still_unset
+    return candidates
+
+
+def _sr_body(current: dict, rows, authorized: set, clears: dict[int, tuple[str, ...]]):
+    """Build the live-relative body → ``(entries, delivered)``.
+
+    ``current − authorized``, then the leaf-level clear overlay: for a surviving entry whose
+    row carries a pending clear, delete exactly the named wire leaves and keep every other
+    leaf at its LIVE value. An absent live entry is a no-op — never synthesize one.
+    """
+    from nso_adapter.core.static_route_plan import CLEAR_WIRE_LEAF, triple_of
+    from nso_adapter.nso.apply import static_route_entry_key
+
+    rows_by_key = {triple_of(row): row for row in rows}
+    entries: list[dict] = []
+    delivered: dict[int, tuple[str, ...]] = {}
+    for entry in current.get("route") or []:
+        key = static_route_entry_key(entry)
+        if key in authorized:
+            continue
+        kept = dict(entry)
+        row = rows_by_key.get(key)
+        fields = clears.get(row.id) if row is not None else None
+        if fields:
+            for field in fields:
+                kept.pop(CLEAR_WIRE_LEAF[field], None)
+            delivered[row.id] = fields
+        entries.append(kept)
+    return entries, delivered
+
+
+async def _replace_static_route(
+    db: AsyncSession,
+    device,
+    client,
+    context: dict | None = None,
+    *,
+    job_id: int | None = None,
+    reg=None,
+) -> SrRemoval:
+    """Retract static routes with a LIVE-SERVICE-RELATIVE body (§4.3). Three branches.
+
+    **(a) force** — the operator's deliberate flush. Unchanged: the store-assertive
+    :func:`_replace_simple` body with the guard bypassed. Anything else turns a
+    force-removal into a successful no-op, since it carries neither tombstone nor
+    ``removed`` keys (G15).
+
+    **(b) detach** — the ``no-networking`` un-own. Body = ``current − authorized``. A
+    no-networking PUT can never reach the device, so a detach never delivers a clear; the
+    ``pending_clear`` carrier holds it for a later networked retract instead.
+
+    **(c) everything else** — networked. ONE branch, not two: a single push can delete rows
+    AND clear leaves on surviving rows, and neither ``retract`` nor ``delete_origin``
+    survives into the job context (G26), so the resulting job is indistinguishable from a
+    plain delete-origin one. The body is compositional — ``current − authorized``, then, for
+    each surviving entry whose row carries a pending clear, delete exactly the named wire
+    leaves. LEAF-level, never a whole-row store overlay: re-rendering a cleared row from the
+    store would forward-deploy every co-edited field on it (``metric 10→NULL`` **and**
+    ``tag 100→200`` in one push would immediately deploy tag 200).
+
+    Authorization is evaluated here, under the claim the worker holds:
+
+    1. every tombstone owned by THIS job contributes ``{triple} ∪ {deployed_key}`` (X6);
+       a job that owns none falls back to ``context["removed"]["route"]`` (fence-shut and
+       legacy jobs);
+    2. supersession subtracts every key a live intent row still claims as its ``triple`` or
+       its ``deployed_key`` — ownership, not eligibility;
+    3. nothing left to drop and no clear to deliver ⇒ **no HTTP at all**: the tombstones are
+       consumed by supersession, not by failure.
+
+    The clear set comes from the durable carrier, read here rather than from a job-context
+    snapshot: a snapshot goes stale between enqueue and execution and does not survive a job
+    failure or a sweeper re-issue, which rebuilds the context from the tombstone alone (G37).
+    Only the ``authorized`` half is visible — a ``?store_only=true`` push may mutate the store
+    but must never cause a device write.
+
+    *reg* is threaded but unused HERE on purpose: this function only reads and writes to the
+    device. Every store write this job makes — the tombstone delete, the carrier update and the
+    terminal status — lands in :func:`_finalize_static_route_removal`'s single claim-guarded
+    transaction, which is where §4.7's lock belongs.
+    """
+    from nso_adapter.nso.apply import (
+        _STATIC_ROUTE_SERVICE_PATH,
+        NsoApplyError,
+        apply_static_routes,
+        static_route_entry_key,
+    )
+
+    context = context or {}
+    if context.get("force"):
+        await _replace_simple(db, device, client, "static_route", context)
+        return SrRemoval("force", frozenset(), (), frozenset(), True, False, None, {}, ())
+
+    tombstones, authorized, claimed, rows, reclaimed = await _sr_authorization(db, device, context, job_id=job_id)
+    detach = bool(context.get("detach"))
+    # A no-networking PUT can never remove a leaf from the device, so a detach delivers no
+    # clear at all — the carrier keeps it for the next networked retract.
+    candidate_clears = {} if detach else _sr_candidate_clears(rows)
+
+    tombstone_ids = tuple(t.id for t in tombstones)
+    if not authorized and not candidate_clears:
+        logger.info(
+            SR_SUPERSEDED_EVENT,
+            device_id=device.id,
+            job_id=job_id,
+            tombstones=list(tombstone_ids),
+            reclaimed=[list(k) for k in reclaimed],
+        )
+        return SrRemoval("superseded", frozenset(), tombstone_ids, frozenset(), False, False, None, {}, ())
+
+    state = await client.service_instance_state(_STATIC_ROUTE_SERVICE_PATH, device.nso_device_name)
+    if state.inconclusive:
+        # A body built from "looks empty" would drop every entry it was supposed to retain and
+        # every orphan the guard was supposed to see, and then verify cleanly (G31).
+        raise NsoApplyError(
+            "static_route_snapshot_inconclusive",
+            f"static_route: could not certify the live service instance on {device.nso_device_name!r} "
+            "— refusing to build a removal PUT from an uncertified read",
+            detail={"device": device.nso_device_name},
+        )
+    current = state.entry
+    branch = "detach" if detach else "networked"
+    if not current:
+        # `absent` proves the SERVICE has no instance, never that the device is clean (G9):
+        # a previously detached route can sit unowned on the device. So no PUT — and the
+        # proof still runs, which is also what keeps a retried detach provable at all.
+        return SrRemoval(branch, frozenset(authorized), tombstone_ids, frozenset(), False, True, None, {}, ())
+
+    body_entries, delivered = _sr_body(current, rows, authorized, candidate_clears)
+    sent_keys = {static_route_entry_key(entry) for entry in body_entries}
+    retained_orphans = tuple(sorted(sent_keys - claimed))
+    if retained_orphans:
+        logger.warning(
+            SR_RETAINED_ORPHANS_EVENT,
+            device_id=device.id,
+            job_id=job_id,
+            keys=[list(k) for k in retained_orphans],
+        )
+
+    async def _apply(**kwargs):
+        # rows=[] with verbatim extras: the body IS the live service minus what we authorized,
+        # so every surviving leaf keeps its live value — including the ones the store has no
+        # column for.
+        return await apply_static_routes(
+            client=client,
+            device_name=device.nso_device_name,
+            route_intent_rows=[],
+            extra_entries=body_entries,
+            **kwargs,
+        )
+
+    # Under a live-relative body `current − body ≡ authorized`, so the guard degenerates into
+    # an equality assertion that we drop exactly what we authorized — which is why
+    # RemovalBlockedError is unreachable here by construction (§6/OQ-R2-3).
+    guard_context = {**context, "removed": {"route": [list(key) for key in sorted(authorized)]}}
+    verdict = await _guarded_apply(client, device, "static_route", guard_context, _apply, current=current)
+    return SrRemoval(
+        branch,
+        frozenset(authorized),
+        tombstone_ids,
+        frozenset(sent_keys),
+        True,
+        False,
+        verdict,
+        delivered,
+        retained_orphans,
+    )
+
+
+# ── #1396 R2 §4.4/§4.6 — the removal's proof and its ONE terminal transaction ─
+
+
+def _sr_verify_ok(out: SrRemoval) -> bool:
+    """Whether the commit's own verdict permits consumption.
+
+    A carrier-owning removal is NOT governed by OQ-R2-1's apply-side "succeed on an
+    inconclusive proof": a succeeded job makes its tombstone permanently un-sweepable (G17),
+    so an unproven verdict has to fail and retry. With no PUT issued there is no commit to
+    have a verdict about, and the branch's other evidence carries the proof instead.
+    """
+    from nso_adapter.nso.apply import VERIFY_CONCLUSIVE
+
+    return not out.put_issued or out.verify == VERIFY_CONCLUSIVE
+
+
+async def _sr_detach_service_clean(client, device, out: SrRemoval) -> bool:
+    """Post-commit: whether every authorized key is gone from the SERVICE instance (§4.4).
+
+    Certified, never inferred: ``get_service_config`` answers ``None`` both for a keyed 404
+    and for any 2xx it could not parse (G31), and consuming a carrier on that reading throws
+    the deletion record away while the service may still own the key.
+    """
+    from nso_adapter.nso.apply import _STATIC_ROUTE_SERVICE_PATH, static_route_entry_key
+
+    state = await client.service_instance_state(_STATIC_ROUTE_SERVICE_PATH, device.nso_device_name)
+    if state.inconclusive:
+        logger.warning("static_route.detach_proof_inconclusive", device_id=device.id)
+        return False
+    if not state.entry:
+        return True
+    live = {static_route_entry_key(entry) for entry in (state.entry.get("route") or [])}
+    return not (live & set(out.authorized))
+
+
+async def _sr_sync_from(client, device, result: dict, *, job_id: int) -> bool:
+    """Re-align CDB with device truth after a ``no-networking`` commit. Two attempts.
+
+    Unlike G11's unconditional success, a failure now FAILS the job: CDB keeps the locally
+    applied reverse diff, so the detach is not proven and its tombstone must survive to be
+    retried.
+    """
+    from nso_adapter.nso import actions
+
+    for attempt in (1, 2):  # one retry — slow-session flake (sw03 read eof)
+        try:
+            await actions.sync_from(client, device.nso_device_name)
+            return True
+        except ClaimLostError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — surfaced on the job below
+            logger.warning(
+                "removal.detach_sync_from_failed",
+                job_id=job_id,
+                device_id=device.id,
+                attempt=attempt,
+                error=repr(exc),
+            )
+    result["sync_from"] = "failed"
+    return False
+
+
+async def _sr_networked_proof(db: AsyncSession, client, device, out: SrRemoval, result: dict):
+    """Gather §4.4's evidence for a networked removal → ``(proven, residue_found, per_field)``.
+
+    ONE certified device-state read serves both consumers: the residue check over the keys
+    this job authorized, and §4.11's per-FIELD evidence for the clears it delivered. Key-grain
+    proof does not imply field-grain proof — a route whose old ``metric 10`` is still live
+    satisfies the key check completely — so a cleared field is only consumable once its own
+    wire leaf is absent or neutral in that read.
+    """
+    from nso_adapter.core.apply import _static_route_device_state
+    from nso_adapter.core.static_route_plan import leaf_is_neutral, triple_of
+    from nso_adapter.store.models import StaticRouteIntent
+
+    status, entries = await _static_route_device_state(client, device)
+    # §4.4's set literally: `authorized − keys in the sent body`. The subtraction is empty by
+    # construction today (the body IS current minus authorized), and it is written out anyway
+    # so a future body that re-asserts an authorized key cannot report it as residue.
+    consumed = set(out.authorized) - set(out.sent_keys)
+    survivors = sorted(key for key in consumed if key in entries) if status == "ok" else []
+    residue = None
+    if consumed:
+        residue = status if status != "ok" else ("found" if survivors else "clean")
+        result["residue_check"] = residue
+        if survivors:
+            result["residue"] = {"route": [list(key) for key in survivors]}
+            logger.error("removal.residue_found", device_id=device.id, scope="static_route", residue=result["residue"])
+    else:
+        # A pure-clear removal authorizes no key at all: nothing to look for, so say so
+        # rather than reporting a clean bill nothing was checked against.
+        result["residue_check"] = "unsupported"
+
+    per_field: dict[int, tuple[str, ...]] = {}
+    clears_ok = True
+    for row_id, fields in out.clears.items():
+        row = await db.get(StaticRouteIntent, row_id)
+        entry = entries.get(triple_of(row)) if (row is not None and status == "ok") else None
+        proven = tuple(f for f in fields if entry is not None and leaf_is_neutral(f, entry))
+        per_field[row_id] = proven
+        if len(proven) != len(fields):
+            clears_ok = False
+    if out.clears:
+        result["pending_clear_proven"] = {str(row_id): list(fields) for row_id, fields in sorted(per_field.items())}
+    keys_ok = residue is None or residue == "clean"
+    return (keys_ok and clears_ok and _sr_verify_ok(out)), residue == "found", per_field
+
+
+async def _sr_consume(db: AsyncSession, device, out: SrRemoval, per_field: dict, result: dict, *, reg) -> None:
+    """Delete the snapshotted tombstones and empty the proven carrier fields. Nothing else."""
+    from nso_adapter.core.static_route_plan import AUTHORIZED, STORE_ONLY
+    from nso_adapter.store.models import StaticRouteIntent
+    from nso_adapter.store.tombstone_store import delete_tombstones
+
+    if out.tombstone_ids:
+        if reg is None or not reg.registered:
+            # G19: the delete is claim-token-scoped. Making it unguarded to keep a caller
+            # convenient is exactly the shortcut §4.7 forbids.
+            raise RuntimeError("static_route removal: consuming tombstones needs a REGISTERED claim registration")
+        # Snapshotted ids only — a tombstone written during the network call survives,
+        # because nothing has proven anything about it.
+        await delete_tombstones(db, out.tombstone_ids, device_id=device.id, claim_token=reg.token)
+        result["consumed_tombstones"] = list(out.tombstone_ids)
+
+    for row_id, fields in per_field.items():
+        if not fields:
+            continue
+        row = await db.get(StaticRouteIntent, row_id)
+        if row is None:
+            continue
+        carrier = row.pending_clear or {}
+        # Both halves: they are disjoint by construction (an authorized clear promotes out of
+        # store_only), so this only ever removes what this PUT actually delivered.
+        remaining_auth = sorted({*(carrier.get(AUTHORIZED) or ())} - set(fields))
+        remaining_store = sorted({*(carrier.get(STORE_ONLY) or ())} - set(fields))
+        row.pending_clear = (
+            {AUTHORIZED: remaining_auth, STORE_ONLY: remaining_store} if (remaining_auth or remaining_store) else None
+        )
+        logger.info("static_route.pending_clear_consumed", device_id=device.id, row_id=row_id, fields=list(fields))
+
+
+async def _commit_terminal_removal(db: AsyncSession, job_id: int) -> None:
+    """Commit the removal's terminal transaction under the three-state contract (§4.6).
+
+    A COMMIT that raises may still have been applied, and the ordinary fallback — roll back,
+    write ``failed`` in a second transaction — would then leave a consumed carrier under a
+    failed job. Raising instead hands the decision to claim recovery, which re-dispositions
+    only a job still ``running`` (G38).
+    """
+    from nso_adapter.core.claim import ClaimOutcome, _commit_outcome
+
+    outcome = await _commit_outcome(db)
+    if outcome is not ClaimOutcome.COMMIT_ACKNOWLEDGED:
+        logger.error("removal.terminal_commit_outcome_unknown", job_id=job_id, outcome=outcome.value)
+        raise BookkeepingOutcomeUnknown(f"removal job {job_id}: terminal commit outcome is {outcome.value}")
+
+
+async def _finalize_static_route_removal(db, job, job_id: int, device, client, out: SrRemoval, *, reg) -> bool:
+    """Prove the write, then consume and finalize in ONE claim-guarded transaction (§4.4/§4.6).
+
+    The status-coupling rule is the most breakable invariant in R2: R1's sweeper only re-issues
+    a tombstone whose owner is NULL or ``failed`` (G17), so a job that leaves a tombstone
+    unconsumed must NOT end ``succeeded`` — the carrier would be stranded with no retry path.
+    A removal that owns no carrier keeps OQ-R2-1's leniency and succeeds while recording that
+    it proved nothing.
+
+    Returns whether the job ended ``succeeded``.
+    """
+    from nso_adapter.core.claim import ClaimRegistration, lock_claim
+    from nso_adapter.store.models import JobStatus
+
+    result: dict = {"scope": "static_route", "removal_branch": out.branch}
+    if out.authorized:
+        result["authorized"] = [list(key) for key in sorted(out.authorized)]
+    if out.retained_orphans:
+        result["retained_orphans"] = [list(key) for key in out.retained_orphans]
+
+    per_field: dict[int, tuple[str, ...]] = {}
+    residue_found = False
+    if out.branch == "superseded":
+        # Consumption by supersession, not by failure: a live intent row reclaimed every key,
+        # so there is nothing left to retract and nothing to prove.
+        result["residue_check"] = "skipped_superseded"
+        result["superseded"] = True
+        proven = True
+    elif out.branch == "detach":
+        result["detach"] = True
+        result["residue_check"] = "skipped_detach"
+        service_clean = await _sr_detach_service_clean(client, device, out)
+        sync_ok = await _sr_sync_from(client, device, result, job_id=job_id)
+        # "PUT 2xx OR the instance is absent": demanding a literal 2xx makes a crash between a
+        # committed detach PUT and its bookkeeping commit permanently unprovable — every retry
+        # sees no instance and could never satisfy the predicate.
+        proven = service_clean and sync_ok and (out.put_issued or out.service_absent) and _sr_verify_ok(out)
+    else:
+        proven, residue_found, per_field = await _sr_networked_proof(db, client, device, out, result)
+
+    owns_carrier = bool(out.tombstone_ids) or bool(out.clears)
+    consume = proven and not residue_found
+
+    # The lock FIRST and held to COMMIT. no_autoflush is the lock ORDER: an ORM SELECT that
+    # autoflushed a dirtied intent row would take row locks before the claim lock, the reverse
+    # of the order every claimed writer uses.
+    with db.no_autoflush:
+        await lock_claim(db, reg if reg is not None else ClaimRegistration())
+    if consume:
+        await _sr_consume(db, device, out, per_field, result, reg=reg)
+
+    if residue_found:
+        job.status = JobStatus.failed
+        job.error = {
+            "code": "static_route_removal_residue_found",
+            "message": f"static_route: removed route(s) {result['residue']['route']} are still on the device",
+            "detail": {"scope": "static_route", "residue": result["residue"]},
+        }
+    elif proven or not owns_carrier:
+        job.status = JobStatus.succeeded
+        if not proven:
+            result["unproven"] = True
+            logger.warning(
+                "static_route.removal_unproven",
+                job_id=job_id,
+                device_id=device.id,
+                branch=out.branch,
+                verify=out.verify,
+                residue=result.get("residue_check"),
+            )
+    else:
+        # Inconclusive, and this job owns a carrier. Succeeding would strand it forever.
+        job.status = JobStatus.failed
+        job.error = {
+            "code": "static_route_removal_unproven",
+            "message": "static_route: the removal could not be proven, so its carrier is retained for retry",
+            "detail": {
+                "scope": "static_route",
+                "branch": out.branch,
+                "verify": out.verify,
+                "residue_check": result.get("residue_check"),
+            },
+        }
+        logger.error(
+            "static_route.removal_unproven_carrier_retained",
+            job_id=job_id,
+            device_id=device.id,
+            branch=out.branch,
+            verify=out.verify,
+            residue=result.get("residue_check"),
+        )
+    job.result = result
+    await _commit_terminal_removal(db, job_id)
+    return job.status is JobStatus.succeeded
+
+
 async def _replace_logging(db: AsyncSession, device, client, context: dict | None = None) -> None:
     """PUT-replace the logging-reconciler with hosts AND the local-levels singleton.
 
@@ -970,7 +1526,7 @@ async def _dispatch_scope(
     *,
     job_id: int | None = None,
     reg=None,
-) -> None:
+):
     """Route a removal to its scope handler.
 
     *job_id* and *reg* are the running job's identity and its live claim registration:
@@ -978,7 +1534,12 @@ async def _dispatch_scope(
     job id to tell its OWN tombstones from a sibling's, and a real registered claim to
     guard the transaction that consumes them. The twelve scopes that own no carrier
     ignore both.
+
+    Returns :class:`SrRemoval` for ``static_route`` — what the write did, so the caller can
+    prove it before consuming anything — and ``None`` for every other scope.
     """
+    if scope == "static_route":
+        return await _replace_static_route(db, device, client, context, job_id=job_id, reg=reg)
     if scope == "ospf":
         await _replace_ospf(db, device, client, context)
     elif scope == "bgp":
@@ -995,6 +1556,7 @@ async def _dispatch_scope(
         await _replace_simple(db, device, client, scope, context)
     else:
         raise ValueError(f"Unknown removal scope {scope!r}")
+    return None
 
 
 async def enqueue_removal(
@@ -1122,9 +1684,17 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
             detach = bool(context.get("detach"))
             detach_token = nso_apply_mod.DETACH_REPLACE.set(detach)
             try:
-                await _dispatch_scope(db, device, client, scope, context, job_id=job_id, reg=reg)
+                outcome = await _dispatch_scope(db, device, client, scope, context, job_id=job_id, reg=reg)
             finally:
                 nso_apply_mod.DETACH_REPLACE.reset(detach_token)
+            if isinstance(outcome, SrRemoval) and outcome.branch != "force":
+                # R2 §4.4/§4.6: this write owns durable carriers, so its proof, its
+                # consumption and its terminal status are one transaction of their own.
+                # A `force` removal owns nothing and keeps the generic tail below.
+                succeeded = await _finalize_static_route_removal(db, job, job_id, device, client, outcome, reg=reg)
+                if succeeded:
+                    await _enqueue_followup_sync(db, job_id, device_id)
+                return
             job.status = JobStatus.succeeded
             job.result = {"scope": scope}
             if detach:
@@ -1155,22 +1725,7 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
             else:
                 await _record_residue(job, client, device, scope, context, job_id=job_id, device_id=device_id)
             await db.commit()
-            # Option A follow-up: sync now so any residue re-imports as an unowned
-            # mirror immediately instead of at the next poll cycle. After the commit
-            # above this job is no longer active, so the per-device dedup admits the
-            # sync; best-effort — the scheduler covers it if this loses a race.
-            try:
-                from nso_adapter.core.jobs import enqueue_job
-                from nso_adapter.store.models import JobType
-
-                await enqueue_job(device_id, JobType.sync, db)
-            except ClaimLostError:
-                # Revocation is not a runner error: recovery already owns the disposition.
-                raise
-            except Exception as exc:  # noqa: BLE001 — never fail a committed removal on this
-                logger.warning(
-                    "removal.followup_sync_enqueue_failed", job_id=job_id, device_id=device_id, error=repr(exc)
-                )
+            await _enqueue_followup_sync(db, job_id, device_id)
         except RemovalBlockedError as blocked:
             from nso_adapter.core.jobs import _mark_job_failed
 
@@ -1202,6 +1757,12 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
         except ClaimLostError:
             # Revocation is not a runner error: recovery already owns the disposition.
             raise
+        except BookkeepingOutcomeUnknown:
+            # R2 §4.6: the terminal COMMIT may have landed. Writing `failed` here would flip a
+            # job whose tombstone consumption and carrier updates are already committed —
+            # exactly the torn state the single transaction exists to prevent. Recovery
+            # re-dispositions only a job still `running` (G38).
+            raise
         except Exception as exc:  # noqa: BLE001 — record on the job, never crash the worker
             from nso_adapter.core.jobs import _mark_job_failed
 
@@ -1209,6 +1770,24 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
             await _mark_job_failed(
                 db, job_id, {"code": "removal_failed", "message": repr(exc), "detail": {"scope": scope}}
             )
+
+
+async def _enqueue_followup_sync(db: AsyncSession, job_id: int, device_id: int) -> None:
+    """Option A follow-up: re-import any residue as an unowned mirror right away.
+
+    After the terminal commit this job is no longer active, so the per-device dedup admits
+    the sync; best-effort — the scheduler covers it if this loses a race.
+    """
+    try:
+        from nso_adapter.core.jobs import enqueue_job
+        from nso_adapter.store.models import JobType
+
+        await enqueue_job(device_id, JobType.sync, db)
+    except ClaimLostError:
+        # Revocation is not a runner error: recovery already owns the disposition.
+        raise
+    except Exception as exc:  # noqa: BLE001 — never fail a committed removal on this
+        logger.warning("removal.followup_sync_enqueue_failed", job_id=job_id, device_id=device_id, error=repr(exc))
 
 
 # store family → the YANG list that carries the object in the route-policy service

@@ -403,17 +403,6 @@ def _static_route_coro(client, device, plan, *, dry_run=False, outbox: dict | No
 
 # ── #1396 R2 §4.4-§4.6 — proof, residue enforcement, CAS, per-route results ──
 
-#: Store field → the wire leaf :func:`static_route_entry` renders it as. §4.11's clear
-#: vocabulary on the READ side: a carrier entry is consumable only once this leaf is gone or
-#: neutral in the post-write device-state view. ``name`` is absent by design (no wire leaf).
-_CLEAR_WIRE_LEAF: dict[str, str] = {
-    "interface_next_hop": "interface-next-hop",
-    "next_hop_vrf": "next-hop-vrf",
-    "metric": "metric",
-    "permanent": "permanent",
-    "tag": "tag",
-}
-
 #: The scope failure a surviving predecessor key raises. Distinct from the writer-drop code:
 #: the intent DID land, and what failed is the retraction of what it replaced.
 RESIDUE_FOUND_CODE = "static_route_residue_found"
@@ -453,27 +442,6 @@ def static_route_fingerprint(row) -> str:
 
     encoded = json.dumps(static_route_entry(row), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode()).hexdigest()
-
-
-def _leaf_is_neutral(field: str, entry: dict) -> bool:
-    """Whether *entry* proves *field* is no longer set on the device (§4.11's table).
-
-    Never falsiness. ``metric: 0`` and ``tag: 0`` are real values the renderer emits, so a
-    generic truthiness check would empty the carrier while the old value is still live —
-    the same false green the carrier exists to prevent. ``permanent`` is the one field where
-    ``false`` IS neutral, because the renderer never emits it (G27).
-    """
-    leaf = _CLEAR_WIRE_LEAF[field]
-    if leaf not in entry:
-        return True
-    value = entry[leaf]
-    if value is None:  # an explicit null is the export's spelling of "absent"
-        return True
-    if field == "permanent":
-        return value is False or str(value).strip().lower() == "false"
-    if field in ("interface_next_hop", "next_hop_vrf"):
-        return str(value) == ""
-    return False
 
 
 async def _static_route_device_state(client, device) -> tuple[str, dict]:
@@ -646,6 +614,7 @@ async def _settle_proven_row(db, device, plan, proof: SrProof, row, *, put_deliv
     from nso_adapter.core.static_route_plan import (
         AUTHORIZED,
         STORE_ONLY,
+        leaf_is_neutral,
         pending_clear_fields,
         replacement_open,
         triple_of,
@@ -680,7 +649,7 @@ async def _settle_proven_row(db, device, plan, proof: SrProof, row, *, put_deliv
         # never drops one. Promotion is by DELIVERY (A1), so a PATCH consumes nothing.
         return SR_UNPROVEN
     entry = proof.entries.get(triple_of(row))
-    proven = {field for field in pending if entry is not None and _leaf_is_neutral(field, entry)}
+    proven = {field for field in pending if entry is not None and leaf_is_neutral(field, entry)}
     if proven:
         carrier = row.pending_clear or {}
         remaining_auth = sorted({*(carrier.get(AUTHORIZED) or ())} - proven)

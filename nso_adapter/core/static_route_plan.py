@@ -41,6 +41,18 @@ SR_CLEAR_FIELDS: tuple[str, ...] = ("interface_next_hop", "next_hop_vrf", "metri
 AUTHORIZED = "authorized"
 STORE_ONLY = "store_only"
 
+#: Store field → the wire leaf :func:`nso_adapter.nso.apply.static_route_entry` renders it as.
+#: The WRITE side (a removal's leaf-level clear overlay) deletes exactly these leaves; the READ
+#: side (proof) consumes a carrier entry only once the same leaf is gone or neutral. ``name`` is
+#: absent by design — no wire leaf, so nothing to delete and nothing to prove.
+CLEAR_WIRE_LEAF: dict[str, str] = {
+    "interface_next_hop": "interface-next-hop",
+    "next_hop_vrf": "next-hop-vrf",
+    "metric": "metric",
+    "permanent": "permanent",
+    "tag": "tag",
+}
+
 Triple = tuple[str, str, str]
 
 
@@ -123,6 +135,31 @@ def authorized_clear_fields(carrier: dict | None) -> set[str]:
     if not carrier:
         return set()
     return {*(carrier.get(AUTHORIZED) or ())}
+
+
+def leaf_is_neutral(field: str, entry: dict) -> bool:
+    """Whether *entry* proves *field* is no longer set on the device (§4.11's table).
+
+    Never falsiness. ``metric: 0`` and ``tag: 0`` are real values the renderer emits, so a
+    generic truthiness check would empty the carrier while the old value is still live —
+    the same false green the carrier exists to prevent. ``permanent`` is the one field where
+    ``false`` IS neutral, because the renderer never emits it (G27).
+
+    Shared by both proof planes on purpose: the apply's post-write evidence and the networked
+    removal's (C2.11 / C4.32 are the same rule seen from two paths), so a per-path copy could
+    not drift into treating ``0`` as neutral on one of them.
+    """
+    leaf = CLEAR_WIRE_LEAF[field]
+    if leaf not in entry:
+        return True
+    value = entry[leaf]
+    if value is None:  # an explicit null is the export's spelling of "absent"
+        return True
+    if field == "permanent":
+        return value is False or str(value).strip().lower() == "false"
+    if field in ("interface_next_hop", "next_hop_vrf"):
+        return str(value) == ""
+    return False
 
 
 def update_pending_clear(row, *, cleared: set[str], reset: set[str], store_only: bool) -> None:
@@ -260,6 +297,7 @@ async def build_plan(db: AsyncSession, device, *, eligible_rows: list) -> SrPlan
 
 __all__: list[str] = [
     "AUTHORIZED",
+    "CLEAR_WIRE_LEAF",
     "SR_CLEAR_FIELDS",
     "STORE_ONLY",
     "SrCas",
@@ -268,6 +306,7 @@ __all__: list[str] = [
     "authorized_clear_fields",
     "build_plan",
     "fence_open",
+    "leaf_is_neutral",
     "null_route_id_count",
     "pending_clear_fields",
     "replacement_open",
