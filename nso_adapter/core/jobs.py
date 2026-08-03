@@ -526,6 +526,12 @@ async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistrat
             result = await asyncio.wait_for(
                 provision_nso_device(db, **params, reg=reg, job_id=job_id), timeout=_JOB_TIMEOUT
             )
+            # The terminal write is an effect performed on behalf of the claim once the run
+            # has one, so it takes the row lock like every other guarded write. Without it a
+            # run whose stale claim was revoked, and whose job recovery already
+            # re-dispositioned, still commits `succeeded` over that disposition.
+            if reg is not None:
+                await lock_claim(db, reg)
             job.status = JobStatus.succeeded
             job.result = result
             # Link the job to the device it created so history/lookup works post-onboard.
@@ -535,7 +541,8 @@ async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistrat
         except ClaimUnavailableError as exc:
             # The device stayed claimed for the whole OQ6 budget, so the mapping was refused
             # and NOTHING was written. Honestly retryable — and terminal, so the pair's
-            # admission slot frees for the retry.
+            # admission slot frees for the retry. Necessarily still claimless: this is
+            # raised by the acquisition itself.
             logger.warning("job.provision.device_busy", job_id=job_id, error=repr(exc))
             await _mark_job_failed(
                 db,
@@ -552,13 +559,14 @@ async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistrat
                 db,
                 job_id,
                 {"code": "timeout", "message": f"Provision exceeded {int(_JOB_TIMEOUT)}s timeout", "detail": {}},
+                reg,
             )
         except ClaimLostError:
             # Revocation is not a runner error: recovery already owns the disposition.
             raise
         except Exception as exc:
             logger.exception("job.provision.failed", job_id=job_id, error=repr(exc))
-            await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}})
+            await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}}, reg)
 
     # Tell the plugin the provision job reached a terminal state (any branch above) so it advances
     # the gated onboarding row off the dashboard-poll path. Best-effort — the plugin's device-tab

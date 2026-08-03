@@ -170,21 +170,52 @@ async def test_each_acquisition_mints_a_fresh_token(adapter_client):
 
 
 async def test_a_committed_acquisition_is_resolvable_by_its_token(adapter_client):
-    """Provision mints the token BEFORE the attempt so a lost COMMIT ack is answerable.
-
-    Without a caller-supplied token there is nothing to look the durable outcome up by, and
-    a run that cannot tell whether it owns the device has to guess.
-    """
-    from nso_adapter.core.claim import resolve_claim_by_token
+    """The resolving acquisition knows its token BEFORE the attempt, so a lost COMMIT ack is
+    answerable — and still mints a fresh one per acquisition, so nothing reuses a token."""
+    from nso_adapter.core.claim import acquire_claim_resolving, resolve_claim_by_token
 
     device_id = await seed_device(nso_device_name="cl-indoubt", netbox_device_id=9908)
 
-    reg = await acquire_claim(device_id, "job", token="minted-by-the-caller")
-    assert reg is not None and reg.token == "minted-by-the-caller"
+    reg = await acquire_claim_resolving(device_id, "job")
+    assert reg is not None
 
-    resolved = await resolve_claim_by_token("minted-by-the-caller")
+    resolved = await resolve_claim_by_token(reg.token)
     assert resolved is not None
-    assert (resolved.device_id, resolved.token) == (device_id, "minted-by-the-caller")
+    assert (resolved.device_id, resolved.token) == (device_id, reg.token)
+
+    tokens = {reg.token}
+    for _ in range(2):
+        assert await release_claim(reg) is ClaimOutcome.COMMIT_ACKNOWLEDGED
+        reg = await acquire_claim_resolving(device_id, "job")
+        tokens.add(reg.token)
+    assert len(tokens) == 3, "a token was reused across acquisitions"
+
+
+async def test_a_resolving_acquisition_bounds_its_own_conflict_wait(adapter_client, rival_engine):
+    """``ON CONFLICT DO NOTHING`` waits on an UNCOMMITTED rival insertion, and no
+    application-side budget bounds that wait — only a server-side lock timeout does.
+
+    Without the bound this blocks until the rival's transaction ends, however long that is.
+    """
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from nso_adapter.core.claim import acquire_claim_resolving
+    from nso_adapter.store.models import DeviceClaim
+
+    device_id = await seed_device(nso_device_name="cl-stalled", netbox_device_id=9909)
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+
+    async with rival() as stalled:
+        # Visible as contention and deliberately never resolved while the contender runs.
+        await stalled.execute(
+            sa.insert(DeviceClaim).values(device_id=device_id, claim_token="stalled", purpose="job", job_id=None)
+        )
+        await stalled.flush()
+
+        contender = asyncio.create_task(acquire_claim_resolving(device_id, "job", lock_timeout_ms=400))
+        assert await asyncio.wait_for(contender, timeout=10) is None, "it waited past its bound"
+
+        await stalled.rollback()
 
 
 async def test_an_uncommitted_acquisition_resolves_to_nothing(adapter_client):

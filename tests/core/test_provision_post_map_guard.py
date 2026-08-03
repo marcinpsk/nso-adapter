@@ -370,18 +370,18 @@ async def test_a_device_that_vanishes_before_the_claim_is_retried_as_fresh(adapt
     monkeypatch.setattr(get_config(), "intent_claim_wait_seconds", 5.0)
     original_id = await seed_device(nso_device_name="pg-vanish", netbox_device_id=7210, attributes=[])
 
-    original = onboarding_mod._acquire_mapping_claim
+    original = onboarding_mod.acquire_claim_resolving
     fired = {"n": 0}
 
-    async def _tear_down_then_acquire(device_id, job_id):
+    async def _tear_down_then_acquire(device_id, purpose, **kwargs):
         # Exactly once, between the non-locking discovery and the acquisition.
         fired["n"] += 1
         if fired["n"] == 1:
             async with session() as other:
                 await offboard_device(other, await other.get(Device, device_id))
-        return await original(device_id, job_id)
+        return await original(device_id, purpose, **kwargs)
 
-    monkeypatch.setattr(onboarding_mod, "_acquire_mapping_claim", _tear_down_then_acquire)
+    monkeypatch.setattr(onboarding_mod, "acquire_claim_resolving", _tear_down_then_acquire)
 
     reg = ClaimRegistration()
     job_id = await _seed_provision_job()
@@ -416,6 +416,110 @@ async def test_a_taken_netbox_id_is_refused_and_leaks_no_claim(adapter_client_wi
     assert await _device_by_name("pg-taken") is None
     async with session() as db:
         assert (await db.execute(sa.select(DeviceClaim))).first() is None
+
+
+async def test_a_pair_mapped_elsewhere_is_reported_and_leaks_no_claim(adapter_client_with_nso):
+    """The node is already linked to a DIFFERENT NetBox device: report it, never repoint it.
+
+    The conflict is detected under the claim, after the read transaction ends, so the
+    message must be built from values snapshotted while the instance was still live — an
+    implicit lazy load on an expired one raises MissingGreenlet and turns a clean
+    ``adapter_mapping: exists`` into an internal failure.
+    """
+    from nso_adapter.store.models import DeviceClaim
+
+    await seed_device(nso_device_name="pg-elsewhere", netbox_device_id=7250, attributes=[])
+
+    reg = ClaimRegistration()
+    job_id = await _seed_provision_job()
+    refresh = _BarrierRefresh()
+    refresh.release.set()
+
+    async with session() as db:
+        result = await _provision(
+            db, name="pg-elsewhere", netbox_device_id=7251, reg=reg, job_id=job_id, refresh=refresh
+        )
+
+    mapping = next(step for step in result["steps"] if step["step"] == "adapter_mapping")
+    assert mapping["status"] == "exists"
+    assert "7250" in mapping["detail"]
+    assert not reg.registered
+    async with session() as db:
+        assert (await db.execute(sa.select(DeviceClaim))).first() is None
+
+
+async def test_a_failure_right_after_the_claim_commits_still_registers_it(adapter_client_with_nso):
+    """Registration must follow the durable COMMIT immediately, not the bookkeeping after it.
+
+    Anything that can raise in between leaves a claim in the table that the worker still
+    reads as claimless: no guard, no release, and no recovery until the reaper.
+    """
+    reg = ClaimRegistration()
+    job_id = await _seed_provision_job()
+    refresh = _BarrierRefresh()
+    refresh.release.set()
+
+    async with session() as db:
+        real_refresh = db.refresh
+
+        async def _fail_once(instance, *args, **kwargs):
+            db.refresh = real_refresh
+            raise RuntimeError("the connection dropped after the mapping committed")
+
+        db.refresh = _fail_once
+        with pytest.raises(RuntimeError):
+            await _provision(db, name="pg-late", netbox_device_id=7270, reg=reg, job_id=job_id, refresh=refresh)
+
+    assert reg.registered, "the claim is durable but the run still looks claimless"
+    assert (await _claim_row(reg.device_id)) is not None, "the release is the worker's, not the mapping's"
+
+
+async def test_the_terminal_write_is_guarded_once_the_run_is_claimed(adapter_client_with_nso):
+    """A revoked provision must not commit `succeeded` over recovery's disposition.
+
+    The runner's terminal transaction writes status, result and the device_id link on behalf
+    of the claim, so it takes the row lock like every other guarded write.
+    """
+    from nso_adapter.core.jobs import _JOB_RUNNERS
+    from nso_adapter.store.models import DeviceClaim, Job, JobStatus, JobType
+
+    async with session() as db:
+        job = Job(
+            job_type=JobType.provision,
+            device_id=None,
+            status=JobStatus.queued,
+            context={
+                "nso_instance": _INSTANCE,
+                "device_name": "pg-terminal",
+                "address": "10.0.0.9",
+                "ned_id": _NED,
+                "authgroup": "network",
+                "netbox_device_id": 7260,
+            },
+        )
+        db.add(job)
+        await db.commit()
+        job_id = job.id
+
+    reg = ClaimRegistration()
+
+    async def _revoke_after_the_refresh(db, device_id, client, *, reg=None):
+        # The last step before the runner writes its terminal status: a stale claim revoked
+        # here, with the job already re-dispositioned, is exactly what the guard must catch.
+        async with session() as other:
+            await other.execute(sa.delete(DeviceClaim).where(DeviceClaim.device_id == device_id))
+            await other.execute(sa.update(Job).where(Job.id == job_id).values(status=JobStatus.queued))
+            await other.commit()
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_client()),
+        patch("nso_adapter.core.onboarding._initial_mirror_refresh", _revoke_after_the_refresh),
+        pytest.raises(ClaimLostError),
+    ):
+        await _JOB_RUNNERS[JobType.provision](job_id, None, reg)
+
+    async with session() as db:
+        assert (await db.get(Job, job_id)).status is JobStatus.queued, "the revoked run overwrote the disposition"
 
 
 async def test_a_lost_insert_acquires_on_the_winner(adapter_client_with_nso, monkeypatch):

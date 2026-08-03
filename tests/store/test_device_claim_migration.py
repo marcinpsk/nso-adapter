@@ -272,3 +272,45 @@ def test_provision_pair_index_is_on_the_two_context_expressions(pg_admin):
         alembic(sync_url, "downgrade", module.down_revision)
         with engine_on(sync_url) as engine:
             assert "uq_job_active_provision_pair" not in index_predicates(engine, "jobs")
+
+
+def test_upgrade_reconciles_duplicates_the_missing_index_allowed(pg_admin):
+    """The exact legacy state the old check-then-insert could produce must still upgrade.
+
+    A migration that cannot install leaves the adapter unable to start, so the duplicates
+    are terminalized — oldest kept — instead of colliding with CREATE UNIQUE INDEX. Rows
+    with a NULL context key were never in conflict (NULLs are distinct) and must be left
+    exactly as they are.
+    """
+    module = load_migration(_PROVISION_INDEX_MIGRATION)
+    with private_database(pg_admin, "provdup") as sync_url:
+        alembic(sync_url, "upgrade", module.down_revision)
+        with engine_on(sync_url) as engine, engine.begin() as conn:
+            for token, status, context in (
+                ("winner", "queued", '{"nso_instance": "nso-dev", "device_name": "dup"}'),
+                ("loser", "queued", '{"nso_instance": "nso-dev", "device_name": "dup"}'),
+                ("running-loser", "running", '{"nso_instance": "nso-dev", "device_name": "dup"}'),
+                ("other-node", "queued", '{"nso_instance": "nso-dev", "device_name": "solo"}'),
+                ("no-context", "queued", "{}"),
+                ("no-context-2", "queued", "{}"),
+            ):
+                conn.exec_driver_sql(
+                    "INSERT INTO jobs (job_type, status, context, created_at, updated_at, result)"
+                    " VALUES ('provision', %(status)s, %(context)s, now(), now(), %(token)s)",
+                    {"status": status, "context": context, "token": f'"{token}"'},
+                )
+
+        alembic(sync_url, "upgrade", module.revision)
+
+        with engine_on(sync_url) as engine, engine.connect() as conn:
+            landed = {
+                row[0]: (row[1], row[2])
+                for row in conn.exec_driver_sql("SELECT result #>> '{}', status, error #>> '{}' FROM jobs")
+            }
+        assert landed["winner"][0] == "queued", "the oldest active provision was not kept"
+        assert landed["loser"][0] == "failed" and "superseded" in landed["loser"][1]
+        assert landed["running-loser"][0] == "failed"
+        assert landed["other-node"][0] == "queued"
+        # NULL context keys are distinct to the index: never in conflict, never touched.
+        assert landed["no-context"][0] == "queued"
+        assert landed["no-context-2"][0] == "queued"

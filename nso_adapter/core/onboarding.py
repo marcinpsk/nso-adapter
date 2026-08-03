@@ -23,7 +23,7 @@ from nso_adapter.core.claim import (
     ClaimLostError,
     ClaimRegistration,
     ClaimUnavailableError,
-    acquire_claim,
+    acquire_claim_resolving,
     lock_claim,
     release_claim,
     resolve_claim_by_token,
@@ -301,15 +301,23 @@ async def _onboard_under_claim(
             lost_insert = True
             continue
 
-        acquired = await _acquire_mapping_claim(existing_id, job_id)
+        acquired = await acquire_claim_resolving(
+            existing_id, "job", job_id=job_id, lock_timeout_ms=_remaining_ms(deadline)
+        )
         if acquired is not None:
             try:
-                device = await _link_existing_under_claim(db, acquired, existing_id, netbox_device_id)
+                device = await _link_existing_under_claim(db, acquired, existing_id, netbox_device_id, reg)
             except BaseException:
-                await release_claim(acquired)
+                # Only while UNREGISTERED: once the run owns the claim the worker's outer
+                # path owns the release, and releasing here would strand the job. Roll the
+                # caller's transaction back first — a body that died after `lock_claim` left
+                # a FOR UPDATE pending in it, and the release would wait on our own lock.
+                if not reg.registered:
+                    with suppress(Exception):
+                        await db.rollback()
+                    await release_claim(acquired)
                 raise
             if device is not None:
-                reg.register(acquired.device_id, acquired.token)
                 return device
             # Torn down between discovery and the claim (M6.9s i): the operator issued both
             # operations, and a genuinely fresh onboarding is the correct outcome.
@@ -325,16 +333,14 @@ async def _onboard_under_claim(
         await asyncio.sleep(CLAIM_WAIT_POLL_INTERVAL_S)
 
 
-async def _acquire_mapping_claim(device_id: int, job_id: int | None) -> ClaimRegistration | None:
-    """One acquisition attempt whose in-doubt COMMIT is RESOLVED, never guessed."""
-    token = uuid.uuid4().hex
-    try:
-        return await acquire_claim(device_id, "job", job_id=job_id, token=token)
-    except Exception:
-        resolved = await resolve_claim_by_token(token)
-        if resolved is None:
-            raise
-        return resolved
+def _remaining_ms(deadline: float) -> int:
+    """Return what is left of the OQ6 budget, as a server-side lock bound.
+
+    Without it the budget bounds only the polling, not the one wait the acquisition itself
+    can make: ``ON CONFLICT DO NOTHING`` blocks on a rival's uncommitted insertion. Floored
+    so a nearly-expired budget still makes one honest attempt rather than a zero-wait one.
+    """
+    return max(250, int((deadline - time.monotonic()) * 1000))
 
 
 async def _insert_device_with_claim(
@@ -352,6 +358,10 @@ async def _insert_device_with_claim(
     requires is not a §3.9 inversion — §3.9 orders locks taken on rows that ALREADY exist.
     Splitting them would reopen, on the one branch that can avoid it entirely, the window
     this whole guard exists to close.
+
+    Registration follows the COMMIT with no await in between, deliberately: anything that
+    can raise or be cancelled there would leave a durable claim that the worker still reads
+    as claimless — no guard, no release, no recovery until the reaper.
     """
     dup_nb = await db.scalar(select(Device.id).where(Device.netbox_device_id == netbox_device_id))
     if dup_nb is not None:
@@ -380,13 +390,12 @@ async def _insert_device_with_claim(
         resolved = await resolve_claim_by_token(token)
         if resolved is None:
             raise
-        # The claim is durably there, so the Device is too — its FK cascades the claim away.
-        device = await db.scalar(select(Device).where(Device.id == resolved.device_id))
         reg.register(resolved.device_id, token)
-        return device
+        # The claim is durably there, so the Device is too — its FK cascades the claim away.
+        return await db.scalar(select(Device).where(Device.id == resolved.device_id))
 
-    await db.refresh(device)
     reg.register(device.id, token)
+    await db.refresh(device)
     logger.info("device.onboarded", device_id=device.id, nso_device=nso_device_name, claimed=True)
     return device
 
@@ -396,34 +405,44 @@ async def _link_existing_under_claim(
     acquired: ClaimRegistration,
     device_id: int,
     netbox_device_id: int,
+    reg: ClaimRegistration,
 ) -> Device | None:
     """Re-read and revalidate the existing Device under the claim. None if it vanished.
 
     The adoption branch is the only one that writes, and it writes HERE rather than during
     discovery: a mapping committed before the claim existed would be a device write the
     acquisition timeout is supposed to have prevented.
+
+    Registers *reg* — with no await between the decision and the registration — on every
+    path that keeps the claim, so the run and the worker never disagree about ownership.
+    Every path that gives the claim back leaves *reg* unregistered.
     """
     await lock_claim(db, acquired)  # claim -> devices, per §3.9
     existing = await db.scalar(select(Device).where(Device.id == device_id).with_for_update())
     if existing is None:
         await db.rollback()
         return None
+    # Snapshotted: ending the transaction below expires the instance, and an implicit lazy
+    # load on an async session raises MissingGreenlet instead of the intended error.
+    linked_to, nso_device_name, nso_instance = (
+        existing.netbox_device_id,
+        existing.nso_device_name,
+        existing.nso_instance,
+    )
 
     # Already linked to THIS NetBox device → idempotent no-op; nothing to write.
-    if existing.netbox_device_id == netbox_device_id:
-        # Ending the read transaction expires the instance, and the caller reads its id from
-        # a plain attribute — an implicit lazy load there raises MissingGreenlet.
+    if linked_to == netbox_device_id:
+        reg.register(acquired.device_id, acquired.token)
         await db.rollback()
         return await db.get(Device, device_id)
     # Linked to a DIFFERENT NetBox device → genuine conflict; never silently repoint it.
-    if existing.netbox_device_id is not None:
+    if linked_to is not None:
         await db.rollback()
         raise LookupError(
-            f"NSO device {existing.nso_device_name!r} on {existing.nso_instance!r} is already "
-            f"onboarded to NetBox device {existing.netbox_device_id}"
+            f"NSO device {nso_device_name!r} on {nso_instance!r} is already onboarded to NetBox device {linked_to}"
         )
     dup_nb = await db.scalar(
-        select(Device.id).where(Device.netbox_device_id == netbox_device_id, Device.id != existing.id)
+        select(Device.id).where(Device.netbox_device_id == netbox_device_id, Device.id != device_id)
     )
     if dup_nb is not None:
         await db.rollback()
@@ -432,11 +451,12 @@ async def _link_existing_under_claim(
     existing.netbox_device_id = netbox_device_id
     existing.mapping_status = MappingStatus.mapped
     await db.commit()
+    reg.register(acquired.device_id, acquired.token)
     await db.refresh(existing)
     logger.info(
         "device.adopted",
-        device_id=existing.id,
-        nso_device=existing.nso_device_name,
+        device_id=device_id,
+        nso_device=nso_device_name,
         netbox_device_id=netbox_device_id,
         claimed=True,
     )
@@ -700,6 +720,10 @@ async def _seed_onboarding_failover(
         # Revocation is not a runner error: recovery already owns the disposition.
         raise
     except Exception as exc:
+        # Best-effort means the STEP is reported and provisioning continues — but the failed
+        # transaction has to go, or the mirror refresh and the runner's terminal write both
+        # die of PendingRollbackError on a device that mapped perfectly well.
+        await db.rollback()
         return {"step": "failover_seed", "status": "failed", "detail": repr(exc)}
 
 

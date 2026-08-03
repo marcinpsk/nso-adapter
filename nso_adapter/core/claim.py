@@ -43,7 +43,7 @@ import structlog
 from sqlalchemy import delete, select, text
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.store.models import DeviceClaim, Job, JobStatus, JobType
@@ -52,6 +52,10 @@ logger = structlog.get_logger(__name__)
 
 # The five holders. A closed set, mirrored by ck_device_claim_purpose.
 PURPOSES = frozenset({"job", "intent_put", "teardown", "sweep", "failover"})
+
+# PostgreSQL's lock_not_available. Read from the SQLSTATE rather than matched in the
+# message, which is locale- and version-dependent.
+_LOCK_NOT_AVAILABLE = "55P03"
 
 # ── timing (the derivation the claim cutoff depends on) ──────────────────────
 #
@@ -238,6 +242,7 @@ async def acquire_claim(
     job_id: int | None = None,
     db: AsyncSession | None = None,
     token: str | None = None,
+    lock_timeout_ms: int | None = None,
 ) -> ClaimRegistration | None:
     """Take the device's claim, or return None if someone else holds it.
 
@@ -253,9 +258,14 @@ async def acquire_claim(
     carries no winner lock, so the check contends with nothing — and a revocation with no
     job recorded could not re-disposition it.
 
-    *token* lets a caller that has to survive an in-doubt COMMIT mint the token BEFORE the
-    attempt, so it can resolve the outcome by re-reading it
-    (:func:`resolve_claim_by_token`). Every other caller gets a fresh uuid4 here.
+    *token* is for :func:`acquire_claim_resolving` alone, which has to know the token BEFORE
+    the attempt so it can read the durable outcome of an in-doubt COMMIT. It must be freshly
+    minted and never reused: a token that outlives its acquisition lets a revoked holder's
+    write validate against its successor's claim (ABA). Every other caller lets this mint.
+
+    *lock_timeout_ms* bounds the one wait this statement can genuinely make: ``ON CONFLICT
+    DO NOTHING`` blocks on a rival's UNCOMMITTED speculative insertion until that
+    transaction resolves, which is not bounded by any application-side budget.
     """
     if purpose not in PURPOSES:
         raise ValueError(f"unknown claim purpose {purpose!r}")
@@ -268,6 +278,7 @@ async def acquire_claim(
             .returning(DeviceClaim.claim_token)
         )
         try:
+            await _set_lock_timeout(conn, lock_timeout_ms)
             granted = await conn.scalar(stmt)
             await conn.commit()
         except IntegrityError as exc:
@@ -280,6 +291,14 @@ async def acquire_claim(
                 logger.info("claim.device_vanished", device_id=device_id, purpose=purpose)
                 return None
             raise
+        except DBAPIError as exc:
+            await conn.rollback()
+            # A lock timeout resolved BEFORE the commit, so nothing of ours landed and the
+            # holder we waited on still has it: that is a conflict, not a failure.
+            if getattr(exc, "orig", None) is not None and getattr(exc.orig, "sqlstate", None) == _LOCK_NOT_AVAILABLE:
+                logger.debug("claim.acquire_lock_timeout", device_id=device_id, purpose=purpose)
+                return None
+            raise
     if granted is None:
         logger.debug("claim.acquire_conflict", device_id=device_id, purpose=purpose)
         return None
@@ -287,17 +306,45 @@ async def acquire_claim(
     return ClaimRegistration(device_id, granted)
 
 
-async def resolve_claim_by_token(token: str, *, timeout_s: float = JOB_CLEANUP_BOUND) -> ClaimRegistration | None:
-    """Did an in-doubt acquisition COMMIT actually land? Read the durable answer.
+async def acquire_claim_resolving(
+    device_id: int,
+    purpose: str,
+    *,
+    job_id: int | None = None,
+    lock_timeout_ms: int | None = None,
+) -> ClaimRegistration | None:
+    """One acquisition attempt whose in-doubt COMMIT is RESOLVED, never guessed.
 
     §3.4's three-state contract covers disposition and release; acquisition needs it too. A
-    connection lost AROUND the acquisition COMMIT can leave the claim row (and, on the
-    fresh-insert branch, the ``Device`` with it) durably committed while the caller sees an
-    exception and has registered nothing. The token is unique, so the durable answer is
-    unambiguous if it can be read at all — never guess it from the exception.
+    definite conflict, a vanished device or a lock timeout are all unambiguous "not ours".
+    But a connection lost AROUND the COMMIT can leave the row (and, for a caller that
+    inserts a ``Device`` in the same transaction, that too) durably committed while this
+    call sees an exception. The token is minted here so the durable answer can be read back.
 
-    Fail-stops when the re-read cannot itself be resolved within the cleanup bound: a run
-    that cannot determine whether it owns a device must not continue AND must not release.
+    Used by the provision mapping, which must not proceed unserialized and must not release
+    a device it may still hold.
+    """
+    token = uuid.uuid4().hex
+    try:
+        return await acquire_claim(device_id, purpose, job_id=job_id, token=token, lock_timeout_ms=lock_timeout_ms)
+    except Exception:
+        resolved = await resolve_claim_by_token(token)
+        if resolved is None:
+            raise
+        return resolved
+
+
+async def resolve_claim_by_token(token: str, *, timeout_s: float = JOB_CLEANUP_BOUND) -> ClaimRegistration | None:
+    """Read the durable outcome of an in-doubt acquisition, by its unique token.
+
+    The token is unique, so the answer is unambiguous if it can be read at all.
+
+    Fail-stops when it cannot be read within the cleanup bound: a run that cannot determine
+    whether it owns a device must not continue AND must not release. The bound is observed
+    with a NON-cancelling ``asyncio.wait`` for the same reason the worker's cleanup is —
+    ``wait_for`` cancels at expiry and then waits for that cancellation to complete, which
+    is exactly what a stalled socket will not do. A parent cancellation arriving here is the
+    same condition: ownership is still unknown, so it fail-stops rather than unwinding.
     """
 
     async def _read() -> int | None:
@@ -307,12 +354,23 @@ async def resolve_claim_by_token(token: str, *, timeout_s: float = JOB_CLEANUP_B
             finally:
                 await conn.rollback()
 
-    try:
-        device_id = await asyncio.wait_for(_read(), timeout=timeout_s)
-    except Exception as exc:  # noqa: BLE001 - unresolvable ownership is the fail-stop condition
+    def _unresolvable(reason: str) -> None:
         from nso_adapter.core.worker import _failstop
 
-        _failstop("claim.acquisition_unresolvable_failstop", error=repr(exc), cleanup_bound=timeout_s)
+        _failstop("claim.acquisition_unresolvable_failstop", error=reason, cleanup_bound=timeout_s)
+
+    fut = asyncio.ensure_future(_read())
+    try:
+        done, _pending = await asyncio.wait({fut}, timeout=timeout_s)
+    except asyncio.CancelledError:
+        _unresolvable("cancelled while resolving")
+        raise
+    if not done:
+        _unresolvable("timed out")
+    try:
+        device_id = fut.result()
+    except Exception as exc:  # noqa: BLE001 - unresolvable ownership is the fail-stop condition
+        _unresolvable(repr(exc))
         raise  # unreachable: _failstop does not return
     if device_id is None:
         return None
