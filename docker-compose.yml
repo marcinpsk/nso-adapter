@@ -17,6 +17,9 @@ services:
     # would risk device writes under an ownership the adapter can no longer prove it holds.
     # Without a restart policy that exit leaves the adapter permanently down.
     restart: unless-stopped
+    # Must exceed worker._SHUTDOWN_TASK_WAIT (100s): Docker's default 10s SIGKILL would
+    # cut off the cancellation drain and claim release mid-write. A test pins this.
+    stop_grace_period: 130s
     networks:
       - docker_frontend
 

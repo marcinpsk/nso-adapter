@@ -176,6 +176,27 @@ async def test_requeue_orphaned_recovers_stale_heartbeat(adapter_client):
     assert apply_job.error["code"] == "orphaned"
 
 
+async def test_requeue_orphaned_supersedes_behind_a_queued_successor(adapter_client):
+    """The claimless reaper hits the same uniqueness slot: a queued same-type successor
+    already occupies (device, type), so requeueing the stale row would raise and abort
+    startup recovery wholesale. It must land failed/superseded instead."""
+    from datetime import UTC, datetime, timedelta
+
+    from nso_adapter.core.claim import PROVISION_STALE_AFTER
+
+    device_id = await _seed_device("wrk-succ-sync", 724)
+    job_id = await _seed_job(device_id, JobType.sync, JobStatus.running)
+    successor_id = await _seed_job(device_id, JobType.sync, JobStatus.queued)
+    await _set_heartbeat(job_id, datetime.now(UTC) - timedelta(seconds=PROVISION_STALE_AFTER + 60))
+
+    await worker.requeue_orphaned_jobs()
+
+    superseded = await _get_job(job_id)
+    assert superseded.status == JobStatus.failed
+    assert superseded.error["code"] == "superseded"
+    assert (await _get_job(successor_id)).status == JobStatus.queued
+
+
 async def test_periodic_reap_recovers_stale_orphan_but_spares_live(adapter_client):
     """The PERIODIC scheduler tick (not just startup) reaps a stale orphan while leaving a live
     heartbeating job untouched — proving the reaper is safe to run concurrently with the worker

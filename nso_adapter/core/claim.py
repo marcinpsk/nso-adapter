@@ -328,25 +328,56 @@ def abandon_claim_to_staleness(reg: ClaimRegistration, outcome: ClaimOutcome) ->
     )
 
 
-async def _terminalize(
+async def terminalize_running(
     db: AsyncSession,
     job_id: int,
     *,
     status: JobStatus,
     error: dict | None = None,
-) -> None:
-    """Move a still-running job to *status*. Terminal jobs are left alone.
+) -> JobStatus | None:
+    """Move a still-running job to *status*; return what was written, None if not running.
 
     The status guard matters: a runner can commit its own terminal status and be cancelled
     at the very next await, and rewriting that would re-run finished work.
+
+    A requeue coalesces with a queued same-type successor: admission deliberately lets a
+    running job's successor queue up, so the (device, type) uniqueness slot may already be
+    occupied — writing ``queued`` would violate ``uq_job_queued_per_device_type``. The job
+    lands ``failed``/``superseded`` instead; the successor re-runs the same idempotent
+    work. Removals are exempt from the index (one job per scope, all must run) and always
+    requeue.
     """
+    if status == JobStatus.queued:
+        row = (
+            await db.execute(
+                select(Job.device_id, Job.job_type).where(Job.id == job_id, Job.status == JobStatus.running)
+            )
+        ).one_or_none()
+        if row is not None and row.device_id is not None and row.job_type != JobType.removal:
+            successor_id = await db.scalar(
+                select(Job.id)
+                .where(
+                    Job.device_id == row.device_id,
+                    Job.job_type == row.job_type,
+                    Job.status == JobStatus.queued,
+                )
+                .limit(1)
+            )
+            if successor_id is not None:
+                status = JobStatus.failed
+                error = {
+                    "code": "superseded",
+                    "message": "Interrupted; an equivalent queued job covers the re-run",
+                    "detail": {"queued_successor_id": successor_id},
+                }
     values: dict = {"status": status}
     if error is not None:
         values["error"] = error
     if status == JobStatus.queued:
         values["started_at"] = None
         values["heartbeat_at"] = None
-    await db.execute(sa_update(Job).where(Job.id == job_id, Job.status == JobStatus.running).values(**values))
+    result = await db.execute(sa_update(Job).where(Job.id == job_id, Job.status == JobStatus.running).values(**values))
+    return status if result.rowcount else None
 
 
 async def mark_failed_and_release(
@@ -368,7 +399,7 @@ async def mark_failed_and_release(
         try:
             await _set_lock_timeout(conn, lock_timeout_ms)
             await lock_claim(conn, reg)  # claim -> jobs, per §3.9
-            await _terminalize(
+            await terminalize_running(
                 conn,
                 job_id,
                 status=JobStatus.failed,
@@ -410,7 +441,7 @@ async def dispose_cancelled(
                 if status == JobStatus.failed
                 else None
             )
-            await _terminalize(conn, job_id, status=status, error=error)
+            await terminalize_running(conn, job_id, status=status, error=error)
             await _delete_own_claim(conn, reg)
         except ClaimLostError:
             logger.warning("claim.dispose_claim_lost", job_id=job_id, device_id=reg.device_id)
@@ -482,7 +513,7 @@ async def revoke_stale_claims(
             job_type = await conn.scalar(select(Job.job_type).where(Job.id == job_id))
             if job_type is None:
                 continue
-            await _terminalize(
+            await terminalize_running(
                 conn,
                 job_id,
                 status=disposition_for(job_type),

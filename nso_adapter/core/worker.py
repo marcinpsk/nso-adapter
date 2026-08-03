@@ -51,6 +51,7 @@ from nso_adapter.core.claim import (
     lock_claim,
     mark_failed_and_release,
     release_claim,
+    terminalize_running,
 )
 from nso_adapter.store.db import get_session
 from nso_adapter.store.models import DeviceClaim, Job, JobStatus, JobType
@@ -634,14 +635,10 @@ async def _requeue_own_claim(job_id: int, job_type: JobType) -> None:
         return
     try:
         async for db in get_session():
-            res = await db.execute(
-                sa_update(Job)
-                .where(Job.id == job_id, Job.status == JobStatus.running)
-                .values(status=JobStatus.queued, started_at=None, heartbeat_at=None)
-            )
+            landed = await terminalize_running(db, job_id, status=JobStatus.queued)
             await db.commit()
-            if res.rowcount:
-                logger.warning("worker.requeued_cancelled_claim", job_id=job_id)
+            if landed is not None:
+                logger.warning("worker.requeued_cancelled_claim", job_id=job_id, landed=landed.value)
     except Exception as exc:
         logger.warning("worker.cancel_requeue_failed", job_id=job_id, error=repr(exc))
 
@@ -699,18 +696,18 @@ async def requeue_orphaned_jobs() -> None:
         requeued = failed = 0
         for job_id, job_type in rows:
             target = disposition_for(job_type)
-            values: dict = {"status": target}
-            if target is JobStatus.queued:
-                values |= {"started_at": None, "heartbeat_at": None}
-                requeued += 1
-            else:
-                values["error"] = {
+            error = None
+            if target is JobStatus.failed:
+                error = {
                     "code": "orphaned",
                     "message": "Adapter restarted while the job was running",
                     "detail": {},
                 }
+            landed = await terminalize_running(db, job_id, status=target, error=error)
+            if landed is JobStatus.queued:
+                requeued += 1
+            elif landed is not None:
                 failed += 1
-            await db.execute(sa_update(Job).where(Job.id == job_id, Job.status == JobStatus.running).values(**values))
         await db.commit()
         if requeued:
             logger.warning("worker.requeued_orphaned", count=requeued)

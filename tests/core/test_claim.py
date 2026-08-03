@@ -398,6 +398,73 @@ async def test_dispose_cancelled_dispositions_per_job_type(adapter_client, job_t
     assert await _claim_row(device_id) is None
 
 
+async def _job_error(job_id: int):
+    from nso_adapter.store.models import Job
+
+    async with session() as db:
+        return (await db.get(Job, job_id)).error
+
+
+async def test_revoke_supersedes_instead_of_colliding_with_a_queued_successor(adapter_client):
+    """Admission deliberately lets a running job's same-type successor queue up, so the
+    (device, type) uniqueness slot may already be taken when recovery wants to requeue.
+    An unguarded requeue violates uq_job_queued_per_device_type — and aborts the reaper's
+    whole single-transaction batch, every tick, blocking the device lane forever. The
+    interrupted job must land failed/superseded instead: the successor re-runs the same
+    idempotent read."""
+    from nso_adapter.store.models import JobStatus, JobType
+
+    device_id = await seed_device(nso_device_name="cl-succ-revoke", netbox_device_id=9960)
+    job_id = await _seed_job(device_id, JobType.sync, JobStatus.running)
+    successor_id = await _seed_job(device_id, JobType.sync, JobStatus.queued)
+    await acquire_claim(device_id, "job", job_id=job_id)
+    await _backdate_heartbeat(device_id, seconds=claim_stale_cutoff() + 60)
+
+    revoked = await revoke_stale_claims()
+
+    assert [r.job_id for r in revoked] == [job_id]
+    assert await _claim_row(device_id) is None
+    assert await _job_status(job_id) is JobStatus.failed
+    assert (await _job_error(job_id))["code"] == "superseded"
+    assert await _job_status(successor_id) is JobStatus.queued
+
+
+async def test_dispose_cancelled_supersedes_instead_of_colliding(adapter_client):
+    """Same collision through graceful cancellation: dispose must still commit (claim
+    deleted, job terminal) rather than abort and abandon the claim to staleness."""
+    from nso_adapter.store.models import JobStatus, JobType
+
+    device_id = await seed_device(nso_device_name="cl-succ-dispose", netbox_device_id=9961)
+    job_id = await _seed_job(device_id, JobType.sync, JobStatus.running)
+    successor_id = await _seed_job(device_id, JobType.sync, JobStatus.queued)
+    reg = await acquire_claim(device_id, "job", job_id=job_id)
+
+    outcome = await dispose_cancelled(job_id, JobType.sync, reg)
+
+    assert outcome is ClaimOutcome.COMMIT_ACKNOWLEDGED
+    assert await _claim_row(device_id) is None
+    assert await _job_status(job_id) is JobStatus.failed
+    assert (await _job_error(job_id))["code"] == "superseded"
+    assert await _job_status(successor_id) is JobStatus.queued
+
+
+async def test_removal_requeue_is_exempt_from_supersession(adapter_client):
+    """Removals are exempt from the uniqueness index (one job per scope, all must run),
+    so their requeue can never collide and must NOT be coalesced away."""
+    from nso_adapter.store.models import JobStatus, JobType
+
+    device_id = await seed_device(nso_device_name="cl-succ-removal", netbox_device_id=9962)
+    job_id = await _seed_job(device_id, JobType.removal, JobStatus.running)
+    other_id = await _seed_job(device_id, JobType.removal, JobStatus.queued)
+    await acquire_claim(device_id, "job", job_id=job_id)
+    await _backdate_heartbeat(device_id, seconds=claim_stale_cutoff() + 60)
+
+    await revoke_stale_claims()
+
+    assert await _job_status(job_id) is JobStatus.queued
+    assert await _job_status(other_id) is JobStatus.queued
+
+
 async def test_dispose_cancelled_leaves_a_terminal_job_alone(adapter_client):
     """The runner may have committed a terminal status and been cancelled at the very
     next await — the status guard means a finished job is never re-run."""
