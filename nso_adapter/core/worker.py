@@ -718,9 +718,14 @@ async def requeue_orphaned_jobs() -> None:
 async def start_workers(concurrency: int = 1) -> None:
     """Reconcile orphaned jobs, then start the worker pool."""
     global _stop, _workers
+    from nso_adapter.core.tombstone_sweep import sweep_tombstones
+
     await requeue_orphaned_jobs()
     # Before any worker exists, so a revoked device is immediately claimable again.
     await reap_stale_claims()
+    # And before the pool drains anything: a deletion whose removal job was lost with the
+    # process has no other carrier, and the sweep needs the device unclaimed to act.
+    await sweep_tombstones()
     _stop = asyncio.Event()
     _workers = [asyncio.create_task(_worker_loop(i, _stop)) for i in range(max(1, concurrency))]
     logger.info("worker.pool_started", concurrency=len(_workers))

@@ -183,7 +183,7 @@ def disposition_for(job_type: JobType) -> JobStatus:
 
 
 @asynccontextmanager
-async def _session(db: AsyncSession | None) -> AsyncIterator[AsyncSession]:
+async def claim_session(db: AsyncSession | None) -> AsyncIterator[AsyncSession]:
     """Use the caller's session, or open one that closes deterministically.
 
     Every primitive here owns its own transaction by default — acquisition, release and
@@ -253,7 +253,7 @@ async def acquire_claim(
     if purpose not in PURPOSES:
         raise ValueError(f"unknown claim purpose {purpose!r}")
     token = uuid.uuid4().hex
-    async with _session(db) as conn:
+    async with claim_session(db) as conn:
         stmt = (
             pg_insert(DeviceClaim)
             .values(device_id=device_id, claim_token=token, purpose=purpose, job_id=job_id)
@@ -368,7 +368,7 @@ async def release_claim(
     """
     if not reg.registered:
         return ClaimOutcome.COMMIT_ACKNOWLEDGED
-    async with _session(db) as conn:
+    async with claim_session(db) as conn:
         try:
             await _set_lock_timeout(conn, lock_timeout_ms)
             # Row lock first: the delete is itself an effect on behalf of this claim, and
@@ -476,7 +476,7 @@ async def mark_failed_and_release(
     status with a live claim, or a released claim with the job stranded ``running`` and
     therefore invisible to the reaper, which scans claims.
     """
-    async with _session(db) as conn:
+    async with claim_session(db) as conn:
         try:
             await _set_lock_timeout(conn, lock_timeout_ms)
             await lock_claim(conn, reg)  # claim -> jobs, per §3.9
@@ -512,7 +512,7 @@ async def dispose_cancelled(
     Replaces the older best-effort requeue, which swallowed every failure and released
     ownership independently of the status write.
     """
-    async with _session(db) as conn:
+    async with claim_session(db) as conn:
         try:
             await _set_lock_timeout(conn, lock_timeout_ms)
             await lock_claim(conn, reg)
@@ -573,7 +573,7 @@ async def revoke_stale_claims(
         seconds=cutoff_seconds if cutoff_seconds is not None else CLAIM_STALE_AFTER
     )
     revoked: list[RevokedClaim] = []
-    async with _session(db) as conn:
+    async with claim_session(db) as conn:
         await _set_lock_timeout(conn, lock_timeout_ms)
         rows = (
             await conn.execute(

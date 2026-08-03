@@ -272,11 +272,15 @@ async def _scheduled_orphan_reap() -> None:
     re-pushed). APScheduler ``max_instances=1`` keeps two reaps from overlapping.
     """
     from nso_adapter.core import worker as _worker
+    from nso_adapter.core.tombstone_sweep import sweep_tombstones
 
     await _worker.requeue_orphaned_jobs()
     # Claims are reaped on their own clock and their own scan (over device_claim, not over
     # job status): a claim can be stale with no running job at all.
     await _worker.reap_stale_claims()
+    # Same tick, same reason: a deletion whose removal job never got created (or whose job
+    # failed) has no other recovery path — the intent row it described is already gone.
+    await sweep_tombstones()
     # S5a A2 (codex R3-6): the reap is also the pool's liveness driver — a requeued job
     # is only useful if a live worker exists to drain it.
     _worker.ensure_workers()
