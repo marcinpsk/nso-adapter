@@ -554,52 +554,91 @@ async def _probe_one_failover_device(device_id: int, eff, now, flip_budget, sem)
 
     Each task owns its AsyncSession + commit so the gather'd probes don't share session state;
     the shared *flip_budget* caps disruptive flips across the whole tick.
+
+    Acquisition lives HERE, not inside ``run_failover_tick``, because the scheduler owns
+    both the snapshot and the commit: a claim taken inside the tick would leave the
+    ``select`` at the top and the ``commit`` at the bottom outside it, which is exactly the
+    window two schedulers need to act on one pre-switch snapshot. A conflict defers the
+    device to the next tick — the probe is periodic, so waiting buys nothing.
+
+    The whole tick runs under an enforced wall-clock bound, NOT a heartbeat: the tick holds
+    its own ``device_claim`` row FOR UPDATE for its whole duration, so an independent
+    heartbeat task would block on that lock. The bound is what keeps the claim's lifetime
+    shorter than the reaper's cutoff.
     """
+    import asyncio
+
+    from nso_adapter.core.claim import acquire_claim, release_claim
+    from nso_adapter.core.failover import FAILOVER_TICK_BOUND_S
+
+    async with sem:
+        reg = await acquire_claim(device_id, "failover")
+        if reg is None:
+            logger.debug("scheduler.failover.skipped", device_id=device_id, reason="device_claimed")
+            return
+        try:
+            await asyncio.wait_for(
+                _failover_tick_under_claim(device_id, reg, eff, now, flip_budget),
+                timeout=FAILOVER_TICK_BOUND_S,
+            )
+        except TimeoutError:
+            logger.error("scheduler.failover.tick_bound_exceeded", device_id=device_id, bound=FAILOVER_TICK_BOUND_S)
+        finally:
+            await release_claim(reg)
+
+
+async def _failover_tick_under_claim(device_id: int, reg, eff, now, flip_budget) -> None:
+    """Run the tick body — guard-lock, RE-SELECT, probe, commit — under the caller's claim."""
     from sqlalchemy import select
 
+    from nso_adapter.core.claim import lock_claim
     from nso_adapter.core.failover import run_failover_tick
     from nso_adapter.core.importer import get_nso_client
     from nso_adapter.core.jobs import has_any_active_job
     from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device, DeviceFailover
 
-    async with sem:
-        async for db in get_session():
-            pair = (
-                await db.execute(
-                    select(Device, DeviceFailover)
-                    .join(DeviceFailover, DeviceFailover.device_id == Device.id)
-                    .where(Device.id == device_id)
-                )
-            ).first()
-            if pair is None:
-                return
-            device, fo = pair
-            try:
-                nso_client = get_nso_client(device.nso_instance)
-            except RuntimeError:
-                logger.debug("scheduler.failover.skipped", device_id=device_id, reason="no_nso_client")
-                return
-            try:
-                # Boolean PRE-filter only. The full gate acquires the device claim, which
-                # this tick does not yet do — an apply goes terminal while its claim is still
-                # held through post-refresh, so job status alone reads "idle" while busy.
-                device_busy = await has_any_active_job(device.id, db)
-                await run_failover_tick(
-                    device,
-                    fo,
-                    nso_client,
-                    eff,
-                    now=now,
-                    job_active=device_busy,
-                    flip_budget=flip_budget,
-                    jitter_fraction=_FAILOVER_JITTER_FRACTION,
-                )
-                await db.commit()
-            except Exception as exc:
-                await db.rollback()
-                logger.warning("scheduler.failover.error", device_id=device_id, error=repr(exc))
+    async for db in get_session():
+        # The guard, held to commit. Any preliminary state a caller loaded before
+        # acquisition is discarded: the select below runs AFTER the claim, so a transition
+        # another scheduler committed in between is observed rather than overwritten.
+        await lock_claim(db, reg)
+        pair = (
+            await db.execute(
+                select(Device, DeviceFailover)
+                .join(DeviceFailover, DeviceFailover.device_id == Device.id)
+                .where(Device.id == device_id)
+            )
+        ).first()
+        if pair is None:
             return
+        device, fo = pair
+        try:
+            nso_client = get_nso_client(device.nso_instance)
+        except RuntimeError:
+            logger.debug("scheduler.failover.skipped", device_id=device_id, reason="no_nso_client")
+            return
+        try:
+            # Boolean PRE-filter only — cheap, and it never reads "busy" when the claim
+            # already told us the device is free. The claim above is the real gate: an
+            # apply goes terminal while its claim is still held through post-refresh, so
+            # job status alone reads "idle" while the device is very much busy.
+            device_busy = await has_any_active_job(device.id, db)
+            await run_failover_tick(
+                device,
+                fo,
+                nso_client,
+                eff,
+                now=now,
+                job_active=device_busy,
+                flip_budget=flip_budget,
+                jitter_fraction=_FAILOVER_JITTER_FRACTION,
+            )
+            await db.commit()
+        except Exception as exc:
+            await db.rollback()
+            logger.warning("scheduler.failover.error", device_id=device_id, error=repr(exc))
+        return
 
 
 async def _scheduled_failover_probe() -> None:
