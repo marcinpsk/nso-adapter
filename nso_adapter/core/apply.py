@@ -574,7 +574,14 @@ async def _static_route_bookkeeping(
     # An unregistered registration is the documented claimless lane and lock_claim no-ops on
     # it — the same reading C1 shipped for the follow-on enqueue. A REGISTERED one that has
     # been revoked raises, and that propagates: recovery owns the disposition from there.
-    await lock_claim(db, reg if reg is not None else ClaimRegistration())
+    #
+    # no_autoflush is the lock ORDER, not tidiness: the scope pass has already dirtied intent
+    # rows, and lock_claim's ORM SELECT would autoflush them first — taking intent-row locks
+    # before the claim lock, the exact reverse of the order every claimed writer uses, which
+    # is a deadlock against a successor holding the claim and waiting on those rows. The
+    # stamps flush at COMMIT instead, behind the lock.
+    with db.no_autoflush:
+        await lock_claim(db, reg if reg is not None else ClaimRegistration())
 
     conclusive = proof.verify == VERIFY_CONCLUSIVE
     residue_blocks = proof.residue is not None and proof.residue != "clean"
@@ -2253,6 +2260,38 @@ async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_
     return len(rows), 0, []
 
 
+async def _record_rp_capability_now(db, client, device, device_name, errors, *, job_id: int) -> None:
+    """Record the route-policy scope's device-parser rejections — AFTER the terminal commit.
+
+    The device parser only rejects an unsupported construct on a real commit (a dry-run
+    renders it), so this is the only place the fact can be learned. It commits on the apply's
+    own session, which is why it must not run mid-loop: route-policy is pushed after static
+    routes, so a commit there would land an earlier scope's row stamps without the CAS,
+    per-route results and terminal status §4.6 requires to be one transaction. Nothing is
+    lost by waiting — it records a ``(ned, sw)`` fact, not this job's outcome.
+    """
+    from nso_adapter.core.capability import (
+        parse_rejected_construct,
+        record_capability_rejection,
+        refresh_device_capability,
+    )
+
+    for exc in errors:
+        try:
+            info = await refresh_device_capability(db, client, device_name, device)
+            scope, name = parse_rejected_construct(exc.message)
+            if info and name:
+                await record_capability_rejection(
+                    db, info["ned_id"], info["sw_version"], scope, name, exc.message[:256]
+                )
+        except ClaimLostError:
+            # A nested suppressor is as load-bearing as the runner boundary: swallowing a
+            # revocation here lets the run continue under ownership it has lost.
+            raise
+        except Exception:  # noqa: BLE001 — capability recording is best-effort
+            logger.debug("apply.capability_record_skipped", job_id=job_id)
+
+
 async def _commit_terminal(db: AsyncSession, job_id: int) -> None:
     """Commit the apply's terminal transaction under the three-state contract (R2 §4.6).
 
@@ -2561,28 +2600,15 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         now=now,
     )
 
-    async def _record_rp_capability(exc: NsoApplyError) -> None:
-        # The device parser only rejects an unsupported construct on a real commit
-        # (dry-run renders it). Record it so every box on this (ned, sw) is flagged.
-        try:
-            from nso_adapter.core.capability import (
-                parse_rejected_construct,
-                record_capability_rejection,
-                refresh_device_capability,
-            )
+    deferred_rp_capability: list[NsoApplyError] = []
 
-            info = await refresh_device_capability(db, client, device_name, device)
-            scope, name = parse_rejected_construct(exc.message)
-            if info and name:
-                await record_capability_rejection(
-                    db, info["ned_id"], info["sw_version"], scope, name, exc.message[:256]
-                )
-        except ClaimLostError:
-            # A nested suppressor is as load-bearing as the runner boundary: swallowing
-            # a revocation here lets the run continue under ownership it has lost.
-            raise
-        except Exception:
-            logger.debug("apply.capability_record_skipped", job_id=job_id)
+    async def _record_rp_capability(exc: NsoApplyError) -> None:
+        # DEFERRED past the terminal transaction, not skipped. Capability recording commits
+        # on THIS session, and route-policy runs after static routes — so a commit here would
+        # land an earlier scope's row stamps without the CAS, per-route results and status
+        # that §4.6 requires to be one transaction. It records a (ned, sw) fact, not this
+        # job's outcome, so its timing is free.
+        deferred_rp_capability.append(exc)
 
     # ── Step 6b–6g: one batch commit per remaining scope ──
     scopes = [
@@ -2795,6 +2821,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         static_route_results=sr_results,
     )
     await _enqueue_pending_clear_retract(db, device, sr_plan, reg=reg)
+    await _record_rp_capability_now(db, client, device, device_name, deferred_rp_capability, job_id=job_id)
 
 
 async def _post_apply_refresh_and_notify(db: AsyncSession, device_id: int) -> None:

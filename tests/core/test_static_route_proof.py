@@ -66,8 +66,35 @@ class _ProofRecorder(_Recorder):
     def __init__(self, device_name: str, dry_run_delta: str = "", dry_run_status: int = 200):
         super().__init__(device_name, dry_run_delta)
         self.dry_run_status = dry_run_status
+        #: Make the route-policy commit fail the way a device parser rejects a construct.
+        self.reject_route_policy = False
 
     async def _handle(self, method: str, url: str, content=None, headers=None):
+        if "route-policy-capability/probe" in url:
+            # Answer the capability probe for real: without a ned-id the recording returns
+            # before it ever commits, and the pin that this commit must not split the
+            # terminal transaction would pass against a broken implementation.
+            self.calls.append({"method": method, "url": url, "body": None, "dry_run": False})
+            return httpx.Response(
+                200,
+                request=httpx.Request(method.upper(), url),
+                json={
+                    "route-policy-reconciler:output": {
+                        "ned-id": "vendor-cli-1.0",
+                        "sw-version": "1.0.0",
+                        "element": [],
+                    }
+                },
+            )
+        if self.reject_route_policy and "route-policy-config" in url and "dry-run=" not in url:
+            self.calls.append(
+                {"method": method, "url": url, "body": json.loads(content) if content else None, "dry_run": False}
+            )
+            return httpx.Response(
+                400,
+                request=httpx.Request(method.upper(), url),
+                json={"errors": {"error": [{"error-message": "invalid input detected"}]}},
+            )
         if "dry-run=" in url and self.dry_run_status != 200:
             self.calls.append(
                 {"method": method, "url": url, "body": json.loads(content) if content else None, "dry_run": True}
@@ -470,6 +497,21 @@ async def test_c3_9_the_tombstone_fallback_needs_exactly_one_post_watermark_cand
         CAS_ABSTAINED
     )
     assert await tombstone_keys(other_id) == [list(A)] * 3, "an ambiguous fallback touches nothing"
+
+
+async def test_a_fence_shut_row_has_no_tombstone_to_fall_back_to(adapter_client):
+    """A ``route_id``-NULL row cannot correlate a carrier, and its device has none anyway.
+
+    Tombstones are written only with the fence open (G16), and the fallback keys on
+    ``route_id`` — so guessing one here would grant deletion authority from nothing.
+    """
+    from nso_adapter.store.static_route_store import CAS_ABSTAINED
+
+    device_id = await seed_device(nso_device_name="sr-cas", netbox_device_id=7340)
+    ids = await seed_rows(device_id, [{"triple": B, "route_id": None, "deployed_key": list(A)}])
+    await _delete_row(ids[B])
+
+    assert await _cas(device_id, row_id=ids[B], route_id=None, sent=B, expected_old=list(A)) == CAS_ABSTAINED
 
 
 # ── C3.8 — a key the body re-asserts is intent, not residue ──────────────────
@@ -953,6 +995,82 @@ async def test_a1_a_store_only_clear_is_consumed_by_the_put_that_delivers_it(ada
     assert await carriers(device_id) == {B: None}
     assert outcomes(job) == {B: "in_sync"}
     assert await removal_contexts(device_id) == [], "a store_only clear still enqueues no deletion job"
+
+
+# ── codex C3 review — lock order and the single terminal transaction ─────────
+
+
+async def test_the_claim_lock_is_taken_before_any_intent_row_lock(adapter_client):
+    """The bookkeeping transaction must lock the CLAIM first, not the intent rows.
+
+    The scope pass has already dirtied ``last_apply_at``, so an ORM ``SELECT … FOR UPDATE``
+    on the claim autoflushes those UPDATEs first — taking intent-row locks before the claim
+    lock. That is the reverse of the order every claimed writer uses (the intent endpoint
+    locks the claim, then mutates), so a stale runner and its successor deadlock. Asserted on
+    the SQL the engine actually issued, not on a call graph.
+    """
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        text_ = " ".join(statement.split())
+        if "device_claim" in text_ and "FOR UPDATE" in text_:
+            statements.append("claim-lock")
+        elif "UPDATE static_route_intent" in text_:
+            statements.append("intent-write")
+
+    device_id = await seed_device(nso_device_name="sr-proof", netbox_device_id=7327)
+    await seed_rows(device_id, [{"triple": B, "route_id": 7, "deployed_key": list(A)}])
+    client, _rec = proof_client("sr-proof", state=present(wire(A), device_name="sr-proof"), section=dev_state(wire(B)))
+    from nso_adapter.core.claim import acquire_claim
+
+    reg = await acquire_claim(device_id, "job")  # a REGISTERED claim: lock_claim really runs
+
+    event.listen(Engine, "before_cursor_execute", _record)
+    try:
+        await run_the_apply(device_id, client, reg=reg)
+    finally:
+        event.remove(Engine, "before_cursor_execute", _record)
+
+    assert statements[0] == "claim-lock", f"the claim must be locked first, got {statements}"
+    assert "intent-write" in statements, "the pass really did write intent rows"
+
+
+async def test_a_later_scope_failure_cannot_commit_the_static_stamps_early(adapter_client):
+    """Nothing may commit this session between a scope's row stamps and the terminal write.
+
+    Route-policy is pushed AFTER static routes, and its device-parser-rejection recording
+    commits on the same session. That commit would land the static rows' ``last_apply_at``
+    without the CAS, per-route results and status §4.6 requires to be one transaction — so
+    the recording is deferred past the terminal commit instead. Driven with the terminal
+    commit failing: everything the pass wrote must roll back together.
+    """
+    from nso_adapter.store.models import RoutePolicyObjectIntent, StaticRouteIntent
+
+    device_id = await seed_device(nso_device_name="sr-proof", netbox_device_id=7328)
+    await seed_rows(device_id, [{"triple": B, "route_id": 7, "deployed_key": list(A)}])
+    async with session() as db:
+        db.add(
+            RoutePolicyObjectIntent(
+                device_id=device_id, family="prefix_list", name="RP-DENY", entries=[], accepted_at=_NOW
+            )
+        )
+        await db.commit()
+    client, rec = proof_client("sr-proof", state=present(wire(A), device_name="sr-proof"), section=dev_state(wire(B)))
+    rec.reject_route_policy = True
+
+    with patch(
+        "nso_adapter.core.apply._commit_terminal", new=AsyncMock(side_effect=RuntimeError("connection reset by peer"))
+    ):
+        job = await run_the_apply(device_id, client)
+
+    assert job.status == JobStatus.failed
+    async with session() as db:
+        row = (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id))).scalar_one()
+        assert row.last_apply_at is None, "a capability commit must not persist another scope's stamps"
+        assert row.deployed_key == list(A)
 
 
 # ── the no-static-route case keeps job.result exactly as it was ──────────────
