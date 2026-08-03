@@ -312,26 +312,35 @@ async def acquire_claim_resolving(
     *,
     job_id: int | None = None,
     lock_timeout_ms: int | None = None,
+    adopt: ClaimRegistration | None = None,
 ) -> ClaimRegistration | None:
     """One acquisition attempt whose in-doubt COMMIT is RESOLVED, never guessed.
 
     §3.4's three-state contract covers disposition and release; acquisition needs it too. A
     definite conflict, a vanished device or a lock timeout are all unambiguous "not ours".
-    But a connection lost AROUND the COMMIT can leave the row (and, for a caller that
-    inserts a ``Device`` in the same transaction, that too) durably committed while this
-    call sees an exception. The token is minted here so the durable answer can be read back.
+    But a connection lost AROUND the COMMIT — or a CANCELLATION delivered at that await —
+    can leave the row (and, for a caller that inserts a ``Device`` in the same transaction,
+    that too) durably committed while this call sees an exception. The token is minted here
+    so the durable answer can be read back.
 
-    Used by the provision mapping, which must not proceed unserialized and must not release
-    a device it may still hold.
+    *adopt* is the caller's live registration, and it exists for the cancellation case
+    alone: the cancel MUST propagate (swallowing one breaks the worker's drain), so a claim
+    resolved as ours cannot be handed back through the return value. Registering it there
+    instead is what makes the worker's claimed terminal path own the release, rather than
+    the run dying while a durable claim looks unowned.
     """
     token = uuid.uuid4().hex
     try:
         return await acquire_claim(device_id, purpose, job_id=job_id, token=token, lock_timeout_ms=lock_timeout_ms)
-    except Exception:
+    except BaseException as exc:
         resolved = await resolve_claim_by_token(token)
         if resolved is None:
             raise
-        return resolved
+        if isinstance(exc, Exception):
+            return resolved
+        if adopt is not None and not adopt.registered:
+            adopt.register(resolved.device_id, resolved.token)
+        raise
 
 
 async def resolve_claim_by_token(token: str, *, timeout_s: float = JOB_CLEANUP_BOUND) -> ClaimRegistration | None:

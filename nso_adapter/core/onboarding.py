@@ -302,7 +302,7 @@ async def _onboard_under_claim(
             continue
 
         acquired = await acquire_claim_resolving(
-            existing_id, "job", job_id=job_id, lock_timeout_ms=_remaining_ms(deadline)
+            existing_id, "job", job_id=job_id, lock_timeout_ms=_remaining_ms(deadline), adopt=reg
         )
         if acquired is not None:
             try:
@@ -330,7 +330,8 @@ async def _onboard_under_claim(
                 waited_s=get_config().intent_claim_wait_seconds,
             )
             raise ClaimUnavailableError(f"NSO device {nso_device_name!r} is claimed by another operation")
-        await asyncio.sleep(CLAIM_WAIT_POLL_INTERVAL_S)
+        # Never past the deadline: the budget is the whole wait, polling included.
+        await asyncio.sleep(min(CLAIM_WAIT_POLL_INTERVAL_S, max(0.0, deadline - time.monotonic())))
 
 
 def _remaining_ms(deadline: float) -> int:
@@ -338,9 +339,10 @@ def _remaining_ms(deadline: float) -> int:
 
     Without it the budget bounds only the polling, not the one wait the acquisition itself
     can make: ``ON CONFLICT DO NOTHING`` blocks on a rival's uncommitted insertion. Floored
-    so a nearly-expired budget still makes one honest attempt rather than a zero-wait one.
+    at 1ms rather than 0, which PostgreSQL reads as "no timeout at all" — an expired budget
+    must still make an uncontended attempt, just never a waiting one.
     """
-    return max(250, int((deadline - time.monotonic()) * 1000))
+    return max(1, int((deadline - time.monotonic()) * 1000))
 
 
 async def _insert_device_with_claim(
@@ -384,13 +386,19 @@ async def _insert_device_with_claim(
         # Provably before COMMIT: a concurrent onboard of the same node or netbox id won.
         await db.rollback()
         return None
-    except Exception:
-        # In doubt: the COMMIT may have landed with both rows. Read the durable answer.
-        await db.rollback()
+    except BaseException as exc:
+        # In doubt: the COMMIT may have landed with both rows, and a CANCELLATION delivered
+        # at that await is the same state as a lost ack. Read the durable answer.
+        with suppress(Exception):
+            await db.rollback()
         resolved = await resolve_claim_by_token(token)
         if resolved is None:
             raise
         reg.register(resolved.device_id, token)
+        if not isinstance(exc, Exception):
+            # A cancellation still has to propagate — the ownership was just handed to the
+            # registration, so the worker's claimed terminal path releases it.
+            raise
         # The claim is durably there, so the Device is too — its FK cascades the claim away.
         return await db.scalar(select(Device).where(Device.id == resolved.device_id))
 

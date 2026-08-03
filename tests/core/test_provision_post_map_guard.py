@@ -474,6 +474,94 @@ async def test_a_failure_right_after_the_claim_commits_still_registers_it(adapte
     assert (await _claim_row(reg.device_id)) is not None, "the release is the worker's, not the mapping's"
 
 
+async def test_a_cancellation_at_the_fresh_commit_hands_over_the_claim(adapter_client_with_nso):
+    """A cancel delivered AT the claim-producing COMMIT is the same in-doubt state as a lost
+    acknowledgement: the rows may be durable. It must be resolved and handed to the
+    registration — and the cancel must still propagate, or the worker's drain breaks.
+    """
+    from nso_adapter.store.models import DeviceClaim
+
+    reg = ClaimRegistration()
+    job_id = await _seed_provision_job()
+    refresh = _BarrierRefresh()
+    refresh.release.set()
+
+    async with session() as db:
+        real_commit = db.commit
+        fired = {"n": 0}
+
+        async def _commit_then_cancel() -> None:
+            fired["n"] += 1
+            await real_commit()
+            if fired["n"] == 1:
+                raise asyncio.CancelledError()
+
+        db.commit = _commit_then_cancel
+        with pytest.raises(asyncio.CancelledError):
+            await _provision(db, name="pg-cancel", netbox_device_id=7280, reg=reg, job_id=job_id, refresh=refresh)
+
+    device = await _device_by_name("pg-cancel")
+    assert device is not None, "the mapping committed, so both rows are durable"
+    assert reg.registered and reg.device_id == device.id, "a durable claim was left looking unowned"
+    async with session() as db:
+        claim = await db.get(DeviceClaim, device.id)
+    assert claim is not None and claim.claim_token == reg.token
+
+
+async def test_a_cancellation_at_the_existing_device_acquisition_hands_over_the_claim(adapter_client_with_nso):
+    """Same seam on the branch that acquires in a transaction of its own."""
+    from nso_adapter.core import claim as claim_mod
+    from nso_adapter.store.models import Device, DeviceClaim
+
+    device_id = await _seed_unlinked_device("pg-cancel2")
+    reg = ClaimRegistration()
+    job_id = await _seed_provision_job()
+    refresh = _BarrierRefresh()
+    refresh.release.set()
+
+    original = claim_mod.acquire_claim
+
+    async def _acquire_then_cancel(*args, **kwargs):
+        await original(*args, **kwargs)
+        raise asyncio.CancelledError()
+
+    with patch.object(claim_mod, "acquire_claim", _acquire_then_cancel):
+        async with session() as db:
+            with pytest.raises(asyncio.CancelledError):
+                await _provision(db, name="pg-cancel2", netbox_device_id=7290, reg=reg, job_id=job_id, refresh=refresh)
+
+    assert reg.registered and reg.device_id == device_id
+    async with session() as db:
+        claim = await db.get(DeviceClaim, device_id)
+        assert claim is not None and claim.claim_token == reg.token
+        # The adoption never ran: the cancel landed at the acquisition.
+        assert (await db.get(Device, device_id)).netbox_device_id is None
+
+
+async def test_a_failed_failover_seed_does_not_poison_the_rest_of_the_run(adapter_client_with_nso, monkeypatch):
+    """Best-effort means the STEP fails, not the run: a failed transaction left behind kills
+    the mirror refresh and the runner's terminal write on a device that mapped fine."""
+    monkeypatch.setattr(get_config().scheduler, "enable_failover", True)
+
+    async def _poison(db, *args, **kwargs):
+        await db.execute(sa.text("SELECT 1 / 0"))  # a real error, leaving a real failed txn
+
+    monkeypatch.setattr("nso_adapter.core.failover.set_initial_failover_state", _poison)
+
+    reg = ClaimRegistration()
+    job_id = await _seed_provision_job()
+    refresh = _BarrierRefresh()
+    refresh.release.set()
+
+    async with session() as db:
+        result = await _provision(db, name="pg-poison", netbox_device_id=7300, reg=reg, job_id=job_id, refresh=refresh)
+
+    seed = next(step for step in result["steps"] if step["step"] == "failover_seed")
+    assert seed["status"] == "failed"
+    assert result["ok"] is True
+    assert refresh.calls == 1, "the poisoned session took the mirror refresh down with it"
+
+
 async def test_the_terminal_write_is_guarded_once_the_run_is_claimed(adapter_client_with_nso):
     """A revoked provision must not commit `succeeded` over recovery's disposition.
 
