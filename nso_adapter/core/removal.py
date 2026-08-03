@@ -1184,7 +1184,7 @@ _ROUTE_POLICY_FAMILY_LISTS: dict[str, str] = {
 }
 
 
-def _removed_map(scope: str, removed) -> dict[str, list]:
+def removed_map(scope: str, removed) -> dict[str, list]:
     """Map a simple scope's just-removed store keys onto its guarded YANG list(s).
 
     For every _SIMPLE_TARGET the intent PUT already computes the removed keys and
@@ -1240,7 +1240,7 @@ async def replace_on_removal(
         db,
         device.id,
         scope,
-        removed=_removed_map(scope, removed) if removed else None,
+        removed=removed_map(scope, removed) if removed else None,
         retract=retract,
         shrank=bool(removed),
     )

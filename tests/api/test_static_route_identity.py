@@ -156,6 +156,16 @@ async def read_tombstones(device_id: int) -> list[dict]:
         ]
 
 
+async def removal_job_id(device_id: int) -> int | None:
+    """The removal job the same transaction created — what its tombstones point at."""
+    from nso_adapter.store.models import Job, JobType
+
+    async with session() as db:
+        return await db.scalar(
+            select(Job.id).where(Job.device_id == device_id, Job.job_type == JobType.removal).order_by(Job.id)
+        )
+
+
 async def read_jobs(device_id: int) -> list[dict]:
     from nso_adapter.store.models import Job
 
@@ -305,7 +315,13 @@ async def test_disappearing_route_id_writes_a_tombstone(adapter_client):
 
     assert await read_intent(device_id) == []
     assert await read_tombstones(device_id) == [
-        {"route_id": 7, "triple": A, "deployed_key": list(A), "marking": "detach", "job_id": None}
+        {
+            "route_id": 7,
+            "triple": A,
+            "deployed_key": list(A),
+            "marking": "detach",
+            "job_id": await removal_job_id(device_id),
+        }
     ]
 
 
@@ -405,7 +421,13 @@ async def test_delete_then_reclaim_moves_one_row_and_tombstones_the_other(adapte
     rows = await read_intent(device_id)
     assert [(r["id"], r["triple"], r["route_id"]) for r in rows] == [(ids[A], B, 7)]
     assert await read_tombstones(device_id) == [
-        {"route_id": 8, "triple": B, "deployed_key": list(B), "marking": "detach", "job_id": None}
+        {
+            "route_id": 8,
+            "triple": B,
+            "deployed_key": list(B),
+            "marking": "detach",
+            "job_id": await removal_job_id(device_id),
+        }
     ]
 
 
@@ -418,7 +440,13 @@ async def test_never_applied_row_gets_a_detach_tombstone(adapter_client):
     assert resp.status_code == 200
 
     assert await read_tombstones(device_id) == [
-        {"route_id": 7, "triple": A, "deployed_key": None, "marking": "detach", "job_id": None}
+        {
+            "route_id": 7,
+            "triple": A,
+            "deployed_key": None,
+            "marking": "detach",
+            "job_id": await removal_job_id(device_id),
+        }
     ]
     # SQL NULL on the carrier too — the tombstone is what R2's CAS reads.
     assert await count_sql_null_deployed_key("static_route_tombstone", device_id) == 1
@@ -437,7 +465,15 @@ async def test_never_applied_delete_origin_authorizes_the_triple_only(adapter_cl
     assert resp.status_code == 200
 
     tombs = await read_tombstones(device_id)
-    assert tombs == [{"route_id": 7, "triple": A, "deployed_key": None, "marking": "delete_origin", "job_id": None}]
+    assert tombs == [
+        {
+            "route_id": 7,
+            "triple": A,
+            "deployed_key": None,
+            "marking": "delete_origin",
+            "job_id": await removal_job_id(device_id),
+        }
+    ]
     # The authorized set is exactly {triple}: the tombstone carries no second key.
     assert tombs[0]["deployed_key"] is None
     removals = [j for j in await read_jobs(device_id) if j["job_type"] == "removal"]
@@ -454,7 +490,13 @@ async def test_applied_delete_origin_tombstone_carries_the_deployed_key(adapter_
     assert resp.status_code == 200
 
     assert await read_tombstones(device_id) == [
-        {"route_id": 7, "triple": B, "deployed_key": list(A), "marking": "delete_origin", "job_id": None}
+        {
+            "route_id": 7,
+            "triple": B,
+            "deployed_key": list(A),
+            "marking": "delete_origin",
+            "job_id": await removal_job_id(device_id),
+        }
     ]
 
 
@@ -549,7 +591,13 @@ async def test_a_new_route_id_does_not_steal_another_routes_row(adapter_client):
     assert [(r["triple"], r["route_id"], r["deployed_key"]) for r in rows] == [(A, 7, None)]
     assert rows[0]["id"] != ids[A], "route 7 adopted route 8's row instead of replacing it"
     assert await read_tombstones(device_id) == [
-        {"route_id": 8, "triple": A, "deployed_key": list(A), "marking": "detach", "job_id": None}
+        {
+            "route_id": 8,
+            "triple": A,
+            "deployed_key": list(A),
+            "marking": "detach",
+            "job_id": await removal_job_id(device_id),
+        }
     ]
 
 

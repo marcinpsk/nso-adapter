@@ -315,6 +315,43 @@ async def put_static_route_intent(device_id: int, body: StaticRouteIntentUpdate,
         ) from None
 
 
+def _write_tombstones(
+    db: AsyncSession,
+    device_id: int,
+    removed_rows: list[StaticRouteIntent],
+    *,
+    fence_open: bool,
+) -> list[StaticRouteTombstone]:
+    """Add a carrier for every row this push deletes; the caller stamps the job id.
+
+    Written BEFORE the delete, because the delete expires the attributes they copy, and
+    gated on the same ``STORE_ONLY`` check the job enqueue is — a tombstone with no job
+    would be swept into one, which is exactly the device write store-only prevents.
+    """
+    if not removed_rows or not fence_open or STORE_ONLY.get():
+        return []
+    marking = "delete_origin" if DELETE_ORIGIN.get() else "detach"
+    tombstones = [
+        StaticRouteTombstone(
+            device_id=device_id,
+            route_id=row.route_id,
+            vrf=row.vrf,
+            prefix=row.prefix,
+            next_hop=row.next_hop,
+            deployed_key=row.deployed_key,
+            marking=marking,
+            # Stamped by the caller with the removal job enqueued in THIS transaction. A
+            # tombstone left NULL here is, to the sweeper, a deletion whose job never got
+            # created.
+            job_id=None,
+        )
+        for row in removed_rows
+    ]
+    for tombstone in tombstones:
+        db.add(tombstone)
+    return tombstones
+
+
 async def _apply_static_route_intent(device_id: int, body: StaticRouteIntentUpdate, db: AsyncSession) -> dict:
     """Run steps 3-9 of Q8, all under the claim the caller acquired and guard-locked."""
     device = await db.get(Device, device_id)
@@ -352,26 +389,7 @@ async def _apply_static_route_intent(device_id: int, body: StaticRouteIntentUpda
         )
 
     removed = [(r.vrf, r.prefix, r.next_hop) for r in removed_rows]
-    # Tombstone before delete: the row's attributes are read here, and the delete expires
-    # them. Gated on the same STORE_ONLY check the job enqueue is — a tombstone with no
-    # job would be swept into one, which is exactly the device write store-only prevents.
-    if removed_rows and fence_open and not STORE_ONLY.get():
-        marking = "delete_origin" if DELETE_ORIGIN.get() else "detach"
-        for row in removed_rows:
-            db.add(
-                StaticRouteTombstone(
-                    device_id=device_id,
-                    route_id=row.route_id,
-                    vrf=row.vrf,
-                    prefix=row.prefix,
-                    next_hop=row.next_hop,
-                    deployed_key=row.deployed_key,
-                    marking=marking,
-                    # R1b links the owning removal job here, in this same transaction.
-                    # Until then the sweeper's `job_id IS NULL` predicate owns them.
-                    job_id=None,
-                )
-            )
+    tombstones = _write_tombstones(db, device_id, removed_rows, fence_open=fence_open)
     for row in removed_rows:
         await db.delete(row)
 
@@ -421,7 +439,32 @@ async def _apply_static_route_intent(device_id: int, body: StaticRouteIntentUpda
             )
         count += 1
 
+    # Flushes the tombstone INSERTs and the row DELETEs, so this transaction holds those
+    # rows before it touches `jobs` — the §3.9 order, `intent + tombstone -> jobs`.
     await db.flush()
+
+    # Removal BEFORE apply, and both inside this transaction. The order is the contract:
+    # the removal must carry the lower (created_at, id) so the worker's per-device head
+    # claim runs it first — a retract that lands after the re-apply undoes the apply.
+    replaced = False
+    if removed or cleared:
+        from nso_adapter.core.removal import enqueue_removal, removed_map
+
+        # Direct, not via `replace_on_removal`: that shim commits first and enqueues
+        # afterwards, which is what put the apply ahead of the removal and left the
+        # tombstone with no job to point at.
+        removal_job = await enqueue_removal(
+            db,
+            device_id,
+            "static_route",
+            removed=removed_map("static_route", removed) if removed else None,
+            retract=cleared,
+            shrank=bool(removed),
+        )
+        if removal_job is not None:
+            replaced = True
+            for tombstone in tombstones:
+                tombstone.job_id = removal_job.id
 
     settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
     settings = settings_result.scalar_one_or_none()
@@ -431,16 +474,5 @@ async def _apply_static_route_intent(device_id: int, body: StaticRouteIntentUpda
         await enqueue_apply(db, device_id, force=True)
 
     await db.commit()
-
-    replaced = False
-    if removed or cleared:
-        # R1b moves this inside the transaction above (via enqueue_removal) so the job is
-        # created atomically with the delete and stamped onto the tombstone.
-        from nso_adapter.core.removal import replace_on_removal
-        from nso_adapter.nso.apply import apply_static_routes
-
-        replaced = await replace_on_removal(
-            db, device, removed, StaticRouteIntent, apply_static_routes, retract=cleared
-        )
 
     return {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}
