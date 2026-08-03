@@ -150,15 +150,21 @@ async def test_requeue_orphaned_leaves_live_heartbeating_job(adapter_client):
 
 
 async def test_requeue_orphaned_recovers_stale_heartbeat(adapter_client):
-    """A running job whose heartbeat went stale (worker died) is recovered: idempotent
-    types requeued, apply failed (s3-4)."""
+    """A running job that NO claim covers, stale past the claimless cutoff, is recovered.
+
+    The cutoff is the claimless one now, not 60s: a claimed job recovers through the claim
+    scan instead, on one clock. Two clocks would let a still-valid holder overwrite the
+    disposition a shorter clock had just written.
+    """
     from datetime import UTC, datetime, timedelta
+
+    from nso_adapter.core.claim import PROVISION_STALE_AFTER
 
     device_id = await _seed_device("wrk-stale-sync", 722)
     sync_id = await _seed_job(device_id, JobType.sync, JobStatus.running)
     apply_device = await _seed_device("wrk-stale-apply", 723)
     apply_id = await _seed_job(apply_device, JobType.apply, JobStatus.running)
-    stale = datetime.now(UTC) - timedelta(seconds=300)
+    stale = datetime.now(UTC) - timedelta(seconds=PROVISION_STALE_AFTER + 60)
     await _set_heartbeat(sync_id, stale)
     await _set_heartbeat(apply_id, stale)
 
@@ -175,7 +181,7 @@ async def test_periodic_reap_recovers_stale_orphan_but_spares_live(adapter_clien
     heartbeating job untouched — proving the reaper is safe to run concurrently with the worker
     pool. This closes the 'orphan blocks the device forever' gap: without a periodic tick, a job
     stranded 'running' in a long-lived process (worker task killed mid-run, no restart) would make
-    get_active_job treat it as in-flight and 409 every future job for that device until the next
+    the queued-type dedupe treat it as in-flight and 409 every future job of that type until the next
     restart — the same failure the plugin's reconcile enqueue once had."""
     from datetime import UTC, datetime, timedelta
 
@@ -189,9 +195,12 @@ async def test_periodic_reap_recovers_stale_orphan_but_spares_live(adapter_clien
     apply_id = await _seed_job(apply_device, JobType.apply, JobStatus.running)
 
     now = datetime.now(UTC)
+    from nso_adapter.core.claim import PROVISION_STALE_AFTER
+
+    old = now - timedelta(seconds=PROVISION_STALE_AFTER + 60)
     await _set_heartbeat(live_id, now)  # fresh heartbeat → a live worker owns it
-    await _set_heartbeat(stale_id, now - timedelta(seconds=300))  # stale → orphaned
-    await _set_heartbeat(apply_id, now - timedelta(seconds=300))
+    await _set_heartbeat(stale_id, old)  # stale past the claimless cutoff → orphaned
+    await _set_heartbeat(apply_id, old)
 
     await scheduler._scheduled_orphan_reap()
 
@@ -459,15 +468,18 @@ async def test_orphan_reap_tick_ensures_workers(adapter_client):
 
 
 def test_sync_now_is_requeue_safe_and_runnable():
-    """READSEM S3 B7 (codex R1-F10): a process death mid-sync_now must not 409-block the
-    device forever — the grain-c refresh is an idempotent read, so the orphan reaper
-    requeues it; and the runner registry knows the type (enqueue_job rejects unknowns)."""
-    from nso_adapter.core.jobs import _JOB_RUNNERS
-    from nso_adapter.core.worker import _REQUEUE_ON_RESTART
-    from nso_adapter.store.models import JobType
+    """READSEM S3 B7 (codex R1-F10): a process death mid-sync_now must not block the device
+    forever — the grain-c refresh is an idempotent read, so recovery requeues it; and the
+    runner registry knows the type (enqueue_job rejects unknowns).
 
-    assert JobType.sync_now in _REQUEUE_ON_RESTART
+    The policy now has ONE expression, ``disposition_for``; the worker's duplicate set is gone.
+    """
+    from nso_adapter.core.claim import disposition_for
+    from nso_adapter.core.jobs import _JOB_RUNNERS
+    from nso_adapter.store.models import JobStatus, JobType
+
+    assert disposition_for(JobType.sync_now) is JobStatus.queued
     assert JobType.sync_now in _JOB_RUNNERS
     # S5a B: same guarantees for the comprehensive CDB-only read (idempotent mirror job).
-    assert JobType.sync_from_nso in _REQUEUE_ON_RESTART
+    assert disposition_for(JobType.sync_from_nso) is JobStatus.queued
     assert JobType.sync_from_nso in _JOB_RUNNERS

@@ -575,19 +575,24 @@ def test_reaper_margin_clears_the_configured_reap_interval():
     assert claim.REAPER_MARGIN > interval_seconds
 
 
-def test_requeue_policy_and_disposition_cannot_diverge():
-    """One rule, two expressions of it — tied so a new job type cannot split them.
+def test_disposition_for_is_the_only_requeue_policy():
+    """The record of a completed transition.
 
-    ``_REQUEUE_ON_RESTART`` lives in the worker (the legacy job-status reaper still uses
-    it) while ``disposition_for`` lives here, because importing the worker from this module
-    would be circular. A job type added to ``JobType`` and forgotten in one of the two is
-    exactly the silent divergence this pins.
+    There were two expressions of one rule: ``_REQUEUE_ON_RESTART`` in the worker, used by the
+    legacy job-status reaper, and ``disposition_for`` here. They agreed, but a job type added
+    to one and forgotten in the other would have diverged silently.
+
+    The legacy reaper is gone — every claimed job now recovers through the claim scan, on one
+    clock — so the set went with it and this is the surviving definition. Pinned both ways: the
+    rule still holds for every member of ``JobType``, and the duplicate must not come back.
     """
     from nso_adapter.core import worker as worker_mod
     from nso_adapter.core.claim import disposition_for
     from nso_adapter.store.models import JobStatus, JobType
 
-    assert worker_mod._REQUEUE_ON_RESTART == set(JobType) - {JobType.apply}
+    assert not hasattr(worker_mod, "_REQUEUE_ON_RESTART"), "the duplicate requeue policy came back"
+    assert not hasattr(worker_mod, "_ORPHAN_STALE_AFTER"), "the second recovery clock came back"
+
     for job_type in JobType:
-        expected = JobStatus.queued if job_type in worker_mod._REQUEUE_ON_RESTART else JobStatus.failed
+        expected = JobStatus.failed if job_type is JobType.apply else JobStatus.queued
         assert disposition_for(job_type) is expected, job_type

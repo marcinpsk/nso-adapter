@@ -706,7 +706,7 @@ class InterfaceIpIntent(Base):
 
     Structured, NOT string-valued — unlike InterfaceIntent which stores generic
     attribute string values.  Apply pass runs separately from the attribute
-    apply pass but shares the same per-device job lane (core/jobs.py:get_active_job).
+    apply pass but shares the same per-device execution lane (the device claim).
     Keyed (interface_id, address, vrf).
     """
 

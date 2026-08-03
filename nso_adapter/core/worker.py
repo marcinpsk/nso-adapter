@@ -12,9 +12,9 @@ That model never drained apply jobs created by :func:`core.apply.enqueue_apply`
 queue drainer fixes both: every ``queued`` job is executed regardless of how it
 was created, and orphaned jobs are reconciled at startup.
 
-Concurrency defaults to 1 (serial).  Per-device dedup (``get_active_job``) means
-a higher count only adds *cross-device* parallelism, at the cost of more
-concurrent NSO/NetBox load.
+Concurrency defaults to 1 (serial). A higher count only adds *cross-device*
+parallelism: the per-device claim serializes execution on any one device, whatever
+the worker count, at the cost of more concurrent NSO/NetBox load.
 
 Note: the runners themselves own the terminal status transition (they set
 ``running`` on entry and ``succeeded``/``failed`` on exit, each wrapped in a
@@ -40,12 +40,14 @@ from nso_adapter.core.claim import (
     JOB_CANCEL_DRAIN,
     JOB_CLEANUP_BOUND,
     JOB_EXECUTION_BUDGET,
+    PROVISION_STALE_AFTER,
     ClaimLostError,
     ClaimOutcome,
     ClaimRegistration,
     abandon_claim_to_staleness,
     acquire_claim,
     dispose_cancelled,
+    disposition_for,
     lock_claim,
     mark_failed_and_release,
     release_claim,
@@ -57,28 +59,8 @@ logger = structlog.get_logger(__name__)
 
 # Seconds between heartbeat refreshes while a job runs.
 _HEARTBEAT_INTERVAL = 15.0
-# A running job is only "orphaned" (recoverable at startup) once its heartbeat has gone
-# stale by this many seconds — several heartbeat intervals of margin. A job heartbeating
-# more recently than this belongs to a LIVE worker (rolling restart / two-process overlap)
-# and must not be stolen out from under it.
-_ORPHAN_STALE_AFTER = 60.0
 # Seconds a worker sleeps when the queue is empty before polling again.
 _EMPTY_POLL_INTERVAL = 2.0
-# Job types safe to auto-requeue after an orphaning restart: read-only or
-# idempotent.  An interrupted ``apply`` is *not* requeued — never silently
-# re-push operator intent that may have changed.  A ``removal`` IS requeued: it
-# re-reads the CURRENT accepted rows and PUT-replaces, so re-running only
-# re-asserts the already-decided desired state (idempotent), and dropping it
-# would leave orphaned device config behind.
-_REQUEUE_ON_RESTART = {
-    JobType.sync,
-    JobType.sync_now,  # idempotent read (grain-c atomic mirror refresh)
-    JobType.sync_from_nso,  # idempotent read (S5a comprehensive CDB-only mirror refresh)
-    JobType.detect_drift,
-    JobType.connect,
-    JobType.removal,
-    JobType.provision,
-}
 
 _workers: list[asyncio.Task] = []
 _stop: asyncio.Event | None = None
@@ -619,7 +601,7 @@ async def _dispose(job_id: int, job_type: JobType, reg: ClaimRegistration) -> Cl
     if reg.registered:
         return await dispose_cancelled(job_id, job_type, reg)
     # The claimless lane: status only, nothing to release.
-    if job_type in _REQUEUE_ON_RESTART:
+    if disposition_for(job_type) is JobStatus.queued:
         await _requeue_own_claim(job_id, job_type)
     else:
         await _mark_failed(job_id, "cancelled", "Worker cancelled the run")
@@ -648,7 +630,7 @@ async def _requeue_own_claim(job_id: int, job_type: JobType) -> None:
     keeps its existing never-requeue semantics. Best-effort: a second cancel landing
     mid-requeue leaves recovery to the periodic reap instead.
     """
-    if job_type not in _REQUEUE_ON_RESTART:
+    if disposition_for(job_type) is not JobStatus.queued:
         return
     try:
         async for db in get_session():
@@ -669,7 +651,7 @@ def ensure_workers() -> None:
 
     The periodic reap can requeue a stale job, but the pool is created once and
     unsupervised — a dead sole worker would leave requeued jobs queued forever while
-    ``get_active_job`` 409s every new job for those devices. Called from the periodic
+    the queued-type dedupe 409s every new job of that type. Called from the periodic
     orphan-reap tick. No-ops once shutdown has set the stop event (it is set before the
     event loop yields to teardown, so a mid-shutdown tick cannot respawn a stray worker).
     """
@@ -685,43 +667,55 @@ def ensure_workers() -> None:
 
 
 async def requeue_orphaned_jobs() -> None:
-    """Recover jobs left non-terminal by a previous process.
+    """Recover running jobs that NO claim covers — the claimless lane only.
 
-    Run once at startup, before workers begin draining. Only jobs whose heartbeat has
-    gone STALE (or was never stamped) are recovered — a job heartbeating within
-    ``_ORPHAN_STALE_AFTER`` is being actively run by a live worker (e.g. during a rolling
-    restart or an accidental two-process overlap) and is left untouched, so we never
-    double-run a sync/removal or falsely fail a live apply:
-      * stale ``running`` idempotent jobs (sync/detect_drift/connect/removal/provision) → ``queued``.
-      * stale ``running`` ``apply`` jobs → ``failed`` (never silently re-push config).
-      * ``queued`` jobs are left as-is; a worker will pick them up.
+    Every claimed job now has exactly ONE recovery clock: the claim scan
+    (:func:`reap_stale_claims`), which revokes the stale claim and re-dispositions its job in
+    the same transaction. Keeping a second, shorter job-status clock alongside it was the
+    contradiction the single clock removes — re-dispositioning a job while its holder's token
+    is still valid lets the old runner overwrite the disposition, and the row lock the holder
+    takes is what makes revocation safe in the first place.
+
+    What remains is the lane with no claim to scan: a provision that has not registered a
+    token, plus any job left ``running`` by a process that predates the claim table. Their
+    cutoff is the claimless one, sized against the OUTER job lifecycle rather than provision's
+    own inner timeout — a heartbeat that merely stopped must not let this requeue a still
+    running onboarding and run it twice.
+
+    ``apply`` still ends ``failed`` rather than requeued: never silently re-push operator
+    intent that may have changed since.
     """
     async for db in get_session():
-        cutoff = _now() - timedelta(seconds=_ORPHAN_STALE_AFTER)
-        # NULL heartbeat = claimed by a prior process that never stamped one → treat as stale.
+        cutoff = _now() - timedelta(seconds=PROVISION_STALE_AFTER)
+        # NULL heartbeat = started by a prior process that never stamped one → treat as stale.
         stale = or_(Job.heartbeat_at.is_(None), Job.heartbeat_at < cutoff)
-        requeued = await db.execute(
-            sa_update(Job)
-            .where(Job.status == JobStatus.running, Job.job_type.in_(_REQUEUE_ON_RESTART), stale)
-            .values(status=JobStatus.queued, started_at=None, heartbeat_at=None)
-        )
-        failed = await db.execute(
-            sa_update(Job)
-            .where(Job.status == JobStatus.running, Job.job_type == JobType.apply, stale)
-            .values(
-                status=JobStatus.failed,
-                error={
+        # "No claim covers it": a claimed job is the claim scan's business, not ours.
+        uncovered = ~select(DeviceClaim.device_id).where(DeviceClaim.job_id == Job.id).exists()
+
+        rows = (
+            await db.execute(select(Job.id, Job.job_type).where(Job.status == JobStatus.running, stale, uncovered))
+        ).all()
+
+        requeued = failed = 0
+        for job_id, job_type in rows:
+            target = disposition_for(job_type)
+            values: dict = {"status": target}
+            if target is JobStatus.queued:
+                values |= {"started_at": None, "heartbeat_at": None}
+                requeued += 1
+            else:
+                values["error"] = {
                     "code": "orphaned",
-                    "message": "Adapter restarted while apply was running",
+                    "message": "Adapter restarted while the job was running",
                     "detail": {},
-                },
-            )
-        )
+                }
+                failed += 1
+            await db.execute(sa_update(Job).where(Job.id == job_id, Job.status == JobStatus.running).values(**values))
         await db.commit()
-        if requeued.rowcount:
-            logger.warning("worker.requeued_orphaned", count=requeued.rowcount)
-        if failed.rowcount:
-            logger.warning("worker.failed_orphaned_apply", count=failed.rowcount)
+        if requeued:
+            logger.warning("worker.requeued_orphaned", count=requeued)
+        if failed:
+            logger.warning("worker.failed_orphaned_apply", count=failed)
 
 
 async def start_workers(concurrency: int = 1) -> None:

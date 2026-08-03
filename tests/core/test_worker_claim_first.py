@@ -271,3 +271,36 @@ async def test_a_revoked_run_keeps_recoverys_disposition(adapter_client):
     await asyncio.wait_for(task, timeout=20)
 
     assert await _status(job_id) is JobStatus.queued, "the revoked run overwrote recovery"
+
+
+async def test_a_claim_covered_job_is_left_to_the_claim_scan(adapter_client):
+    """ONE recovery clock per job. The claimless reaper must not touch a claimed job.
+
+    Two clocks was the contradiction: re-dispositioning a job on a shorter job-status clock
+    while its holder's token is still valid lets the old runner overwrite that disposition.
+    Recovery for a claimed job goes through revoke-and-disposition, which blocks on the
+    holder's row lock and so cannot race it.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from nso_adapter.core.claim import PROVISION_STALE_AFTER
+    from nso_adapter.store.models import Job, JobStatus, JobType
+
+    device_id = await seed_device(nso_device_name="q5-onefold", netbox_device_id=9870)
+    job_id = await _queue(device_id, JobType.sync)
+
+    claimed = await worker_mod._claim_next_job()
+    assert claimed is not None
+
+    # Age the JOB well past the claimless cutoff, but leave its claim fresh.
+    async with session() as db:
+        await db.execute(
+            sa.update(Job)
+            .where(Job.id == job_id)
+            .values(heartbeat_at=datetime.now(UTC) - timedelta(seconds=PROVISION_STALE_AFTER + 600))
+        )
+        await db.commit()
+
+    await worker_mod.requeue_orphaned_jobs()
+
+    assert await _status(job_id) is JobStatus.running, "the claimless reaper stole a claimed job"
