@@ -178,6 +178,34 @@ async def test_the_put_waits_for_the_claim_instead_of_reading_around_it(adapter_
     assert await _triples_by_route_id(device_id) == {7: C, 8: B}
 
 
+async def test_a_failure_after_the_guard_lock_neither_hangs_nor_leaks_the_claim(adapter_client, monkeypatch):
+    """The body dies AFTER ``lock_claim`` took the claim row FOR UPDATE in the request
+    session. Releasing through a second session then waits on our own uncommitted lock:
+    the request hangs forever and the 500 never leaves. The guarded transaction must be
+    rolled back before the standalone release."""
+    from nso_adapter.api import static_route as sr_mod
+
+    device_id = await seed_device(nso_device_name="sr-claim-lockfail", netbox_device_id=9405)
+
+    async def _boom(device_id, body, db):
+        raise RuntimeError("forced post-lock failure")
+
+    monkeypatch.setattr(sr_mod, "_apply_static_route_intent", _boom)
+
+    # The transport re-raises the unhandled body error; the contract under test is that
+    # the request UNWINDS (no hang on our own lock) and the claim is gone afterwards.
+    with pytest.raises(RuntimeError, match="forced post-lock failure"):
+        await asyncio.wait_for(
+            adapter_client.put(
+                f"/api/v1/devices/{device_id}/static-route-intent",
+                json={"routes": [entry(A)]},
+                headers=AUTH,
+            ),
+            timeout=15,
+        )
+    assert await _claim_row(device_id) is None
+
+
 async def test_a_failure_after_acquisition_still_releases_the_claim(adapter_client):
     """M2.7 — drive the endpoint's claim context manager directly and raise inside it."""
     from nso_adapter.core.claim import held_claim

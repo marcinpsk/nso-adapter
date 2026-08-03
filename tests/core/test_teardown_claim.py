@@ -154,6 +154,29 @@ async def test_teardown_terminalizes_queued_jobs_instead_of_orphaning_them(adapt
         assert claimless_and_live == [], "a non-provision claimless job survives; the worker would dispatch it"
 
 
+async def test_a_teardown_failure_after_the_guard_lock_neither_hangs_nor_leaks(adapter_client, monkeypatch):
+    """The body dies AFTER ``lock_claim`` took the claim row FOR UPDATE in the caller's
+    session. Releasing through a second session then waits on our own uncommitted lock and
+    the offboard hangs forever. The guarded transaction must be rolled back first."""
+    from nso_adapter.core import onboarding as onboarding_mod
+    from nso_adapter.store.models import Device, DeviceClaim
+
+    device_id = await seed_device(nso_device_name="td-claim-lockfail", netbox_device_id=9505)
+
+    def _boom():
+        raise RuntimeError("forced post-lock failure")
+
+    monkeypatch.setattr(onboarding_mod, "intent_root_models", _boom)
+
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with pytest.raises(RuntimeError):
+            await asyncio.wait_for(onboarding_mod.offboard_device(db, device), timeout=15)
+
+    async with session() as db:
+        assert await db.get(DeviceClaim, device_id) is None, "the claim leaked"
+
+
 async def test_teardown_waits_for_a_held_claim_and_then_refuses(adapter_client, monkeypatch):
     """M6.5 — teardown is a claim holder like any other; it never tears down under a runner."""
     from nso_adapter.config import get_config

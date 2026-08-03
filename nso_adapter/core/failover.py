@@ -41,11 +41,13 @@ if TYPE_CHECKING:
 # The enforced wall-clock lifetime of one device's tick, and the reason it exists: the tick
 # holds its own device_claim row FOR UPDATE from its guard to its commit, so an independent
 # heartbeat task would block on that very lock — a bound is the only option, not merely the
-# preferred one. It must stay well under CLAIM_STALE_AFTER (a test pins the relation), or a
-# legitimately slow tick becomes revocable while it is still writing. Sized far above a real
-# tick: probe_timeout (10s) + active_probe_timeout (45s) + a disruptive flip's set-address /
-# connect / flip-back / sync-from round trips.
-FAILOVER_TICK_BOUND_S = 300.0
+# preferred one. It must clear a LEGITIMATE worst-case disruptive flip — active re-probe
+# (45s default) + address read (30s client default) + up to three 120s NSO actions
+# (set-address, re-connect, sync-from) ≈ 435s — or it cancels a valid tick after NSO's
+# address changed but before the DB commit, rolling stored state back while NSO stays
+# flipped. And it must stay well under CLAIM_STALE_AFTER, or a legitimately slow tick
+# becomes revocable while it is still writing. A test pins both relations.
+FAILOVER_TICK_BOUND_S = 600.0
 
 logger = structlog.get_logger(__name__)
 

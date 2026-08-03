@@ -143,6 +143,15 @@ def test_the_tick_bound_is_shorter_than_the_claim_cutoff():
     assert FAILOVER_TICK_BOUND_S < CLAIM_STALE_AFTER
 
 
+def test_the_tick_bound_clears_a_legitimate_worst_case_flip():
+    """A real primary→OOB flip chains the active re-probe (45s default), an address read
+    (30s client default) and up to three 120s NSO actions — set-address, re-connect,
+    sync-from — ≈435s. A bound below that cancels a LEGITIMATE tick after NSO's address
+    changed but before the DB commit: stored state rolls back while NSO stays flipped."""
+    worst_case_flip = 45.0 + 30.0 + 3 * 120.0
+    assert FAILOVER_TICK_BOUND_S > worst_case_flip
+
+
 async def test_a_tick_that_overruns_is_cut_short(adapter_client, monkeypatch):
     """The bound is enforced, not documented."""
     from nso_adapter.store.models import DeviceClaim

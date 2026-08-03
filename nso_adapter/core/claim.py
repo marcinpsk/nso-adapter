@@ -35,7 +35,7 @@ import enum
 import time
 import uuid
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -43,6 +43,7 @@ import structlog
 from sqlalchemy import delete, select, text
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.store.models import DeviceClaim, Job, JobStatus, JobType
@@ -261,8 +262,19 @@ async def acquire_claim(
             .on_conflict_do_nothing(index_elements=["device_id"])
             .returning(DeviceClaim.claim_token)
         )
-        granted = await conn.scalar(stmt)
-        await conn.commit()
+        try:
+            granted = await conn.scalar(stmt)
+            await conn.commit()
+        except IntegrityError as exc:
+            await conn.rollback()
+            # The device vanished between discovery and acquisition (teardown won the
+            # race). "Cannot claim" is the honest answer; raising would abort a whole
+            # sweep — at startup, the whole lifespan. Scoped to THIS constraint so a
+            # bad job_id still surfaces.
+            if getattr(getattr(exc.orig, "__cause__", None), "constraint_name", None) == "device_claim_device_id_fkey":
+                logger.info("claim.device_vanished", device_id=device_id, purpose=purpose)
+                return None
+            raise
     if granted is None:
         logger.debug("claim.acquire_conflict", device_id=device_id, purpose=purpose)
         return None
@@ -321,17 +333,27 @@ async def held_claim(
     *,
     timeout_s: float,
     job_id: int | None = None,
+    guard_db: AsyncSession | None = None,
 ) -> AsyncIterator[ClaimRegistration]:
     """Hold the device claim for the body, and release it on EVERY exit.
 
     A refusal raised after acquisition — a store-dependent 422, a fence read, a DB error —
     must not leave the device claimed until the reaper notices; the release lives here so
     no call site can forget it.
+
+    *guard_db* is the session the body guard-locks the claim in, and it MUST be passed
+    when there is one: a body that dies after ``lock_claim`` leaves its FOR UPDATE pending
+    in that session, and the standalone release would wait on our own lock — forever where
+    no lock timeout is set, or abort and leave the claim to the reaper where one is. It is
+    rolled back before the release (a no-op after the body's own commit).
     """
     reg = await acquire_claim_or_refuse(device_id, purpose, timeout_s=timeout_s, job_id=job_id)
     try:
         yield reg
     finally:
+        if guard_db is not None:
+            with suppress(Exception):
+                await guard_db.rollback()
         await release_claim(reg)
 
 

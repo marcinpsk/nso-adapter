@@ -169,6 +169,13 @@ async def test_each_acquisition_mints_a_fresh_token(adapter_client):
 # ── the row-lock guard ───────────────────────────────────────────────────────
 
 
+async def test_acquire_claim_skips_a_device_deleted_between_discovery_and_now(adapter_client):
+    """Teardown can delete the device after a sweeper/worker discovery listed it. The FK
+    violation must read as "cannot claim" (None), not an exception — at startup that
+    exception would propagate through the sweep and fail the whole lifespan."""
+    assert await acquire_claim(986000, "sweep") is None
+
+
 async def test_lock_claim_passes_for_the_holder(adapter_client):
     device_id = await seed_device(nso_device_name="cl-lock-ok", netbox_device_id=9905)
     reg = await acquire_claim(device_id, "job")

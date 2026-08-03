@@ -299,7 +299,9 @@ async def put_static_route_intent(device_id: int, body: StaticRouteIntentUpdate,
     # Nothing of ours is pending, and the wait must not sit inside an open transaction.
     await db.rollback()
     try:
-        async with held_claim(device_id, "intent_put", timeout_s=get_config().intent_claim_wait_seconds) as claim_reg:
+        async with held_claim(
+            device_id, "intent_put", timeout_s=get_config().intent_claim_wait_seconds, guard_db=db
+        ) as claim_reg:
             # The guard, before the first effectful statement and held to COMMIT: it is
             # what makes a concurrent revoke serialize against this transaction instead of
             # racing it.

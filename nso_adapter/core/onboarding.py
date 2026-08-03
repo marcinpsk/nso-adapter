@@ -8,6 +8,7 @@ sets mapping_status = unmatched_device.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 
 import structlog
 from sqlalchemy import select
@@ -609,6 +610,10 @@ async def offboard_device(db: AsyncSession, device: Device) -> None:
         claim_survives = False
     finally:
         if claim_survives:
+            # The body may have died with the guard's FOR UPDATE still pending in *db*;
+            # a release through a fresh session would wait on our own lock.
+            with suppress(Exception):
+                await db.rollback()
             await release_claim(reg)
     logger.info("device.offboarded", device_id=device_id)
 
