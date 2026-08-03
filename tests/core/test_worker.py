@@ -295,7 +295,7 @@ async def test_worker_loop_drains_queue(adapter_client):
     ran = asyncio.Event()
     seen: dict = {}
 
-    async def fake_runner(jid: int, did: int) -> None:
+    async def fake_runner(jid: int, did: int, _reg=None) -> None:
         seen["job_id"] = jid
         seen["device_id"] = did
         # Runner owns the terminal status, mirroring the real runners.
@@ -323,7 +323,7 @@ async def test_worker_loop_marks_failed_when_runner_raises(adapter_client):
 
     raised = asyncio.Event()
 
-    async def boom_runner(jid: int, did: int) -> None:
+    async def boom_runner(jid: int, did: int, _reg=None) -> None:
         raised.set()
         raise RuntimeError("kaboom")
 
@@ -350,7 +350,7 @@ async def test_start_and_stop_workers(adapter_client):
     orphan = await _seed_job(device_id, JobType.detect_drift, JobStatus.running)
 
     # No-op runner so nothing actually executes against NSO.
-    async def noop_runner(jid: int, did: int) -> None:
+    async def noop_runner(jid: int, did: int, _reg=None) -> None:
         async with session() as db:
             job = await db.get(Job, jid)
             job.status = JobStatus.succeeded
@@ -382,7 +382,7 @@ async def test_cancelled_worker_requeues_its_running_claim(adapter_client):
 
     started = asyncio.Event()
 
-    async def hanging_runner(jid: int, did: int) -> None:
+    async def hanging_runner(jid: int, did: int, _reg=None) -> None:
         started.set()
         await asyncio.sleep(60)
 
@@ -408,7 +408,7 @@ async def test_cancel_after_success_never_requeues(adapter_client):
 
     done = asyncio.Event()
 
-    async def succeed_then_hang(jid: int, did: int) -> None:
+    async def succeed_then_hang(jid: int, did: int, _reg=None) -> None:
         async with session() as db:
             job = await db.get(Job, jid)
             job.status = JobStatus.succeeded
@@ -430,7 +430,7 @@ async def test_ensure_workers_respawns_dead_worker(adapter_client):
     """A2 (codex R3-6): the periodic reap requeues stale jobs, but nothing drains them if
     the (unsupervised, created-once) pool has no live task — ensure_workers respawns."""
 
-    async def noop_runner(jid: int, did: int) -> None:
+    async def noop_runner(jid: int, did: int, _reg=None) -> None:
         async with session() as db:
             job = await db.get(Job, jid)
             job.status = JobStatus.succeeded

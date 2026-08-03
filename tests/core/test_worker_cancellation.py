@@ -65,7 +65,7 @@ class _CountingRunner:
         self.linger = linger
         self.started = asyncio.Event()
 
-    async def __call__(self, _job_id, _device_id):
+    async def __call__(self, _job_id, _device_id, _reg=None):
         self.started.set()
         while True:
             try:
@@ -102,7 +102,7 @@ async def test_runner_exception_reaches_the_claim_bearing_terminal_writer(adapte
     job_id = await _seed_running(device_id, JobType.sync)
     reg = await acquire_claim(device_id, "job", job_id=job_id)
 
-    async def _boom(_job_id, _device_id):
+    async def _boom(_job_id, _device_id, _reg=None):
         raise RuntimeError("runner blew up before writing a status")
 
     task = await _drive(job_id, device_id, JobType.sync, _boom, reg=reg)
@@ -118,7 +118,7 @@ async def test_runner_exception_on_the_claimless_lane_still_fails_the_job(adapte
 
     job_id = await _seed_running(None, JobType.provision)
 
-    async def _boom(_job_id, _device_id):
+    async def _boom(_job_id, _device_id, _reg=None):
         raise RuntimeError("boom")
 
     task = await _drive(job_id, None, JobType.provision, _boom)
@@ -134,7 +134,7 @@ async def test_successful_run_releases_the_claim(adapter_client):
     job_id = await _seed_running(device_id, JobType.sync)
     reg = await acquire_claim(device_id, "job", job_id=job_id)
 
-    async def _fine(_job_id, _device_id):
+    async def _fine(_job_id, _device_id, _reg=None):
         return None
 
     task = await _drive(job_id, device_id, JobType.sync, _fine, reg=reg)
@@ -161,7 +161,7 @@ async def test_budget_expiry_dispositions_the_job(adapter_client, monkeypatch, t
     job_id = await _seed_running(device_id, job_type)
     reg = await acquire_claim(device_id, "job", job_id=job_id)
 
-    async def _slow(_job_id, _device_id):
+    async def _slow(_job_id, _device_id, _reg=None):
         await asyncio.sleep(30)
 
     task = await _drive(job_id, device_id, job_type, _slow, reg=reg)
@@ -261,7 +261,7 @@ async def test_cancel_landing_during_cleanup_does_not_truncate_it(adapter_client
     job_id = await _seed_running(device_id, JobType.sync)
     reg = await acquire_claim(device_id, "job", job_id=job_id)
 
-    async def _boom(_job_id, _device_id):
+    async def _boom(_job_id, _device_id, _reg=None):
         raise RuntimeError("boom")
 
     task = await _drive(job_id, device_id, JobType.sync, _boom, reg=reg)
@@ -286,7 +286,7 @@ async def test_drain_registry_is_cleared_after_every_run(adapter_client):
     device_id = await seed_device(nso_device_name="w-drains", netbox_device_id=9855)
     job_id = await _seed_running(device_id, JobType.sync)
 
-    async def _quick(_job_id, _device_id):
+    async def _quick(_job_id, _device_id, _reg=None):
         return None
 
     task = await _drive(job_id, device_id, JobType.sync, _quick)

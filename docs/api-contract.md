@@ -279,6 +279,14 @@ Step `status` ∈ `ok | exists | failed`; a `failed` blocking step (create /
 fetch_host_keys / admin_state) sets `ok=false` and stops. `422` if `nso_instance`
 is unknown.
 
+At most one provision is active per `(nso_instance, device_name)` — enforced by a unique
+index over queued and running rows, not by a lookup — so a double-submit returns the
+in-flight job. From the mapping step onwards the job holds the device's execution claim, so
+a sync, a failover tick or an offboard on that device waits or is refused while it runs. If
+the device is already held when the mapping is reached, the job ends `failed` with
+`error.code = "device_busy"` and `error.detail.reason = "claim_unavailable"`; nothing was
+written, and re-submitting is the retry.
+
 ### `GET /api/v1/devices/{id}` → `200`
 Device object plus `scope` (see below) and `last_job_id`.
 

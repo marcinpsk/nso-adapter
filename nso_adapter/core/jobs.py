@@ -17,7 +17,7 @@ from sqlalchemy import exists, literal_column, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.claim import ClaimLostError, ClaimRegistration, lock_claim
+from nso_adapter.core.claim import ClaimLostError, ClaimRegistration, ClaimUnavailableError, lock_claim
 from nso_adapter.store.models import Job, JobStatus, JobType
 
 logger = structlog.get_logger(__name__)
@@ -273,6 +273,10 @@ async def enqueue_provision_job(params: dict, db: AsyncSession) -> tuple[Job, bo
 
 
 # ── Job runners ───────────────────────────────────────────────────────────────
+#
+# Every runner takes the worker's live ClaimRegistration, uniformly, so the worker never
+# has to decide by job type which runners want one. Only provision reads it today: it is
+# the one runner that starts claimless and acquires its claim mid-run.
 
 
 async def _mark_job_failed(
@@ -346,14 +350,14 @@ async def _run_with_db(job_id: int, device_id: int, coro_factory, *, timeout: fl
             await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}})
 
 
-async def _run_sync(job_id: int, device_id: int) -> None:
+async def _run_sync(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
     from nso_adapter.core.importer import sync_device
 
     logger.info("job.sync.start", job_id=job_id, device_id=device_id)
     await _run_with_db(job_id, device_id, sync_device)
 
 
-async def _run_sync_now(job_id: int, device_id: int) -> None:
+async def _run_sync_now(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
     """Operator Sync-Now: grain-c atomic AND comprehensive (S5a).
 
     One atomic ``device-state-read`` covering ALL surfaces, not just the lean routing
@@ -369,7 +373,7 @@ async def _run_sync_now(job_id: int, device_id: int) -> None:
     await _run_with_db(job_id, device_id, _atomic_sync, timeout=900.0)
 
 
-async def _run_sync_from_nso(job_id: int, device_id: int) -> None:
+async def _run_sync_from_nso(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
     """Operator "Sync from NSO" (S5a B): comprehensive CDB-only mirror read.
 
     All surfaces from ONE atomic ``device-state-read`` — NO device ``sync-from``, no
@@ -405,14 +409,14 @@ async def _run_sync_from_nso(job_id: int, device_id: int) -> None:
     await _run_with_db(job_id, device_id, _mirror_read, timeout=900.0)
 
 
-async def _run_detect_drift(job_id: int, device_id: int) -> None:
+async def _run_detect_drift(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
     from nso_adapter.core.importer import detect_drift
 
     logger.info("job.detect_drift.start", job_id=job_id, device_id=device_id)
     await _run_with_db(job_id, device_id, detect_drift)
 
 
-async def _run_connect(job_id: int, device_id: int) -> None:
+async def _run_connect(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
     from nso_adapter.core.importer import get_nso_client
     from nso_adapter.nso.actions import connect
     from nso_adapter.store.db import get_session
@@ -457,14 +461,14 @@ async def _run_connect(job_id: int, device_id: int) -> None:
             await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}})
 
 
-async def _run_apply(job_id: int, device_id: int) -> None:
+async def _run_apply(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
     from nso_adapter.core.apply import run_apply
 
     logger.info("job.apply.start", job_id=job_id, device_id=device_id)
     await run_apply(job_id, device_id, force=True)
 
 
-async def _run_removal(job_id: int, device_id: int) -> None:
+async def _run_removal(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
     from nso_adapter.core.removal import run_removal
 
     logger.info("job.removal.start", job_id=job_id, device_id=device_id)
@@ -489,7 +493,7 @@ async def _notify_provision_complete(job_id: int) -> None:
         logger.warning("netbox.provision_complete_notify_failed", job_id=job_id, error=str(exc) or type(exc).__name__)
 
 
-async def _run_provision(job_id: int, device_id: int | None) -> None:
+async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistration | None = None) -> None:
     """Run a queued device-onboarding job from its stored ``context`` parameters.
 
     Provision has no ``device_id`` (the adapter Device row may be created mid-job);
@@ -499,6 +503,11 @@ async def _run_provision(job_id: int, device_id: int | None) -> None:
     raises for a blocking step — it returns ``{ok: False, steps: [...]}`` — so the job
     *succeeds* (the work ran) and the caller inspects ``result.ok``; only an unexpected
     crash or the timeout marks the job failed.
+
+    The only runner that starts CLAIMLESS and acquires mid-run, which is why it is handed
+    the worker's live ``ClaimRegistration``: everything from the mapping onwards runs under
+    the device claim, and the heartbeat and terminal writer read that same object live.
+    Contention on the device is one such honest failure — see ``device_busy`` below.
     """
     from nso_adapter.core.onboarding import provision_nso_device
     from nso_adapter.store.db import get_session
@@ -514,13 +523,29 @@ async def _run_provision(job_id: int, device_id: int | None) -> None:
         job.status = JobStatus.running
         await db.commit()
         try:
-            result = await asyncio.wait_for(provision_nso_device(db, **params), timeout=_JOB_TIMEOUT)
+            result = await asyncio.wait_for(
+                provision_nso_device(db, **params, reg=reg, job_id=job_id), timeout=_JOB_TIMEOUT
+            )
             job.status = JobStatus.succeeded
             job.result = result
             # Link the job to the device it created so history/lookup works post-onboard.
             if result.get("device_id") is not None:
                 job.device_id = result["device_id"]
             await db.commit()
+        except ClaimUnavailableError as exc:
+            # The device stayed claimed for the whole OQ6 budget, so the mapping was refused
+            # and NOTHING was written. Honestly retryable — and terminal, so the pair's
+            # admission slot frees for the retry.
+            logger.warning("job.provision.device_busy", job_id=job_id, error=repr(exc))
+            await _mark_job_failed(
+                db,
+                job_id,
+                {
+                    "code": "device_busy",
+                    "message": "The device is busy — another operation holds it",
+                    "detail": {"reason": "claim_unavailable", "retryable": True},
+                },
+            )
         except TimeoutError:
             logger.error("job.provision.timeout", job_id=job_id, timeout=_JOB_TIMEOUT)
             await _mark_job_failed(

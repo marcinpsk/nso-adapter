@@ -237,6 +237,7 @@ async def acquire_claim(
     *,
     job_id: int | None = None,
     db: AsyncSession | None = None,
+    token: str | None = None,
 ) -> ClaimRegistration | None:
     """Take the device's claim, or return None if someone else holds it.
 
@@ -251,10 +252,14 @@ async def acquire_claim(
     Provision is the exception and passes it: its job is already running, is its own, and
     carries no winner lock, so the check contends with nothing — and a revocation with no
     job recorded could not re-disposition it.
+
+    *token* lets a caller that has to survive an in-doubt COMMIT mint the token BEFORE the
+    attempt, so it can resolve the outcome by re-reading it
+    (:func:`resolve_claim_by_token`). Every other caller gets a fresh uuid4 here.
     """
     if purpose not in PURPOSES:
         raise ValueError(f"unknown claim purpose {purpose!r}")
-    token = uuid.uuid4().hex
+    token = token or uuid.uuid4().hex
     async with claim_session(db) as conn:
         stmt = (
             pg_insert(DeviceClaim)
@@ -280,6 +285,39 @@ async def acquire_claim(
         return None
     logger.info("claim.acquired", device_id=device_id, purpose=purpose, job_id=job_id)
     return ClaimRegistration(device_id, granted)
+
+
+async def resolve_claim_by_token(token: str, *, timeout_s: float = JOB_CLEANUP_BOUND) -> ClaimRegistration | None:
+    """Did an in-doubt acquisition COMMIT actually land? Read the durable answer.
+
+    §3.4's three-state contract covers disposition and release; acquisition needs it too. A
+    connection lost AROUND the acquisition COMMIT can leave the claim row (and, on the
+    fresh-insert branch, the ``Device`` with it) durably committed while the caller sees an
+    exception and has registered nothing. The token is unique, so the durable answer is
+    unambiguous if it can be read at all — never guess it from the exception.
+
+    Fail-stops when the re-read cannot itself be resolved within the cleanup bound: a run
+    that cannot determine whether it owns a device must not continue AND must not release.
+    """
+
+    async def _read() -> int | None:
+        async with claim_session(None) as conn:
+            try:
+                return await conn.scalar(select(DeviceClaim.device_id).where(DeviceClaim.claim_token == token))
+            finally:
+                await conn.rollback()
+
+    try:
+        device_id = await asyncio.wait_for(_read(), timeout=timeout_s)
+    except Exception as exc:  # noqa: BLE001 - unresolvable ownership is the fail-stop condition
+        from nso_adapter.core.worker import _failstop
+
+        _failstop("claim.acquisition_unresolvable_failstop", error=repr(exc), cleanup_bound=timeout_s)
+        raise  # unreachable: _failstop does not return
+    if device_id is None:
+        return None
+    logger.warning("claim.acquisition_resolved_committed", device_id=device_id)
+    return ClaimRegistration(device_id, token)
 
 
 async def acquire_claim_waiting(

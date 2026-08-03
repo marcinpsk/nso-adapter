@@ -530,7 +530,10 @@ async def _run_one_job(
     # same instance, and the heartbeat and the terminal writers read it live.
     if reg is None:
         reg = ClaimRegistration(device_id, None)
-    task = asyncio.create_task(runner(job_id, device_id))
+    # The SAME object reaches the runner and the heartbeat. A run that acquires its claim
+    # mid-run — provision, at its mapping — registers into it, and both readers see that
+    # immediately; a token captured here would still be None for the rest of the run.
+    task = asyncio.create_task(runner(job_id, device_id, reg))
     hb = asyncio.create_task(_heartbeat(job_id, reg))
     seen = _CancelSeen()
     ownership = "drained"

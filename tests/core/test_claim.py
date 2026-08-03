@@ -166,6 +166,59 @@ async def test_each_acquisition_mints_a_fresh_token(adapter_client):
     assert len(tokens) == 3
 
 
+# ── the in-doubt acquisition COMMIT ──────────────────────────────────────────
+
+
+async def test_a_committed_acquisition_is_resolvable_by_its_token(adapter_client):
+    """Provision mints the token BEFORE the attempt so a lost COMMIT ack is answerable.
+
+    Without a caller-supplied token there is nothing to look the durable outcome up by, and
+    a run that cannot tell whether it owns the device has to guess.
+    """
+    from nso_adapter.core.claim import resolve_claim_by_token
+
+    device_id = await seed_device(nso_device_name="cl-indoubt", netbox_device_id=9908)
+
+    reg = await acquire_claim(device_id, "job", token="minted-by-the-caller")
+    assert reg is not None and reg.token == "minted-by-the-caller"
+
+    resolved = await resolve_claim_by_token("minted-by-the-caller")
+    assert resolved is not None
+    assert (resolved.device_id, resolved.token) == (device_id, "minted-by-the-caller")
+
+
+async def test_an_uncommitted_acquisition_resolves_to_nothing(adapter_client):
+    from nso_adapter.core.claim import resolve_claim_by_token
+
+    assert await resolve_claim_by_token("never-written") is None
+
+
+async def test_an_unresolvable_acquisition_fail_stops(adapter_client, monkeypatch):
+    """A run that cannot determine whether it owns a device must not continue OR release.
+
+    Both alternatives are corruption: continuing writes under ownership it cannot prove,
+    and releasing frees a device it may still hold.
+    """
+    from nso_adapter.core import claim as claim_mod
+    from nso_adapter.core import worker as worker_mod
+
+    killed: dict = {}
+
+    def _record(event, **fields):
+        killed["event"] = event
+        raise SystemExit(70)
+
+    def _unreadable(_db):
+        raise ConnectionError("the store is unreachable")
+
+    monkeypatch.setattr(worker_mod, "_failstop", _record)
+    monkeypatch.setattr(claim_mod, "claim_session", _unreadable)
+
+    with pytest.raises(SystemExit):
+        await claim_mod.resolve_claim_by_token("whatever")
+    assert killed["event"] == "claim.acquisition_unresolvable_failstop"
+
+
 # ── the row-lock guard ───────────────────────────────────────────────────────
 
 

@@ -264,7 +264,7 @@ async def test_a_revoked_run_keeps_recoverys_disposition(adapter_client):
     assert [r.device_id for r in await revoke_stale_claims()] == [device_id]
     assert await _status(job_id) is JobStatus.queued  # recovery's disposition
 
-    async def _boom(_job_id, _device_id):
+    async def _boom(_job_id, _device_id, _reg=None):
         raise RuntimeError("finished under a revoked claim")
 
     task = asyncio.create_task(worker_mod._run_one_job(0, job_id, device_id, job_type, _boom, reg))
