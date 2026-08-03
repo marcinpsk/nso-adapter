@@ -24,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import ClaimLostError
+from nso_adapter.core.static_route_plan import authorized_clear_fields, build_plan
 from nso_adapter.nso.apply import NsoApplyError
 from nso_adapter.store.models import (
     BfdIntent,
@@ -223,6 +224,145 @@ async def _diff_interface_ips(db, nso_apply, client, device_name: str, ifaces: d
     return ip_delta
 
 
+# ── #1396 R2 §4.1/§4.2/§4.8 — the guarded static-route PUT-replace ───────────
+#
+# One snapshot feeds BOTH the retained-entry computation and the collateral guard, and one
+# body builder feeds both the real apply and the preview — that shared derivation is what
+# makes the previewed payload byte-identical to the applied one (C2.6).
+
+#: The scope fails with this code when the pre-PUT service read cannot be certified. A
+#: destructive replace must never be built on a read that may be hiding both the tombstoned
+#: entries it has to preserve and the collateral the guard has to see (§4.4).
+SNAPSHOT_INCONCLUSIVE = "static_route_snapshot_inconclusive"
+
+
+async def _static_route_snapshot(client, device, plan) -> tuple[dict | None, list[dict]]:
+    """Read the live static-route service ONCE and derive the entries the PUT must retain.
+
+    Returns ``(snapshot, retained)``. ``snapshot`` is the live instance body, or ``None``
+    when the service is certifiably absent — nothing to retain and no orphan possible, so
+    the PUT proceeds. Raises :class:`NsoApplyError` on an inconclusive read.
+
+    *retained* are the live entries a tombstone still claims (by its own triple or by its
+    ``deployed_key``) and that no body-rendered row re-asserts, kept **verbatim**: metric,
+    tag and NED-specific leaves live only in the live copy, so reconstructing such an entry
+    from the store triple would silently rewrite it.
+    """
+    from nso_adapter.core.static_route_plan import as_triple, triple_of
+    from nso_adapter.nso.apply import _STATIC_ROUTE_SERVICE_PATH, static_route_entry_key
+
+    state = await client.service_instance_state(_STATIC_ROUTE_SERVICE_PATH, device.nso_device_name)
+    if state.inconclusive:
+        raise NsoApplyError(
+            SNAPSHOT_INCONCLUSIVE,
+            f"static_route: could not certify the live service instance on {device.nso_device_name!r} "
+            "— refusing to build a PUT-replace from an uncertified read",
+            detail={"device": device.nso_device_name},
+        )
+    current = state.entry
+    if not current:
+        return current, []
+
+    claimed: set[tuple[str, str, str]] = set()
+    for tomb in plan.tombstones:
+        claimed.add((tomb.vrf or "", tomb.prefix or "", tomb.next_hop or ""))
+        deployed = as_triple(tomb.deployed_key)
+        if deployed is not None:
+            claimed.add(deployed)
+    reasserted = {triple_of(row) for row in plan.rows}
+    keep = claimed - reasserted  # a key a live row still renders needs no retention
+    retained = [entry for entry in (current.get("route") or []) if static_route_entry_key(entry) in keep]
+    return current, retained
+
+
+async def _put_static_routes(client, device, plan, *, dry_run=False):
+    """Send the guarded PUT-replace of the whole static-route service instance (§4.1).
+
+    The guard sees the same snapshot the retained entries came from, and ``plan.allowed``
+    names the keys it may watch disappear — the replacement predecessors this apply is
+    delivering, plus (X4 belt) the tombstone keys the retention already re-asserts.
+    """
+    from nso_adapter.core.removal import _guarded_apply
+    from nso_adapter.nso.apply import apply_static_routes
+
+    current, retained = await _static_route_snapshot(client, device, plan)
+
+    async def _apply(**kwargs):
+        return await apply_static_routes(
+            client=client,
+            device_name=device.nso_device_name,
+            route_intent_rows=plan.rows,
+            extra_entries=retained,
+            **kwargs,
+        )
+
+    if dry_run:
+        # Preview parity (§4.8): the same body, rendered as a native PUT dry-run. No guard
+        # (the delta NSO returns already shows what would be retracted), no writes, nothing
+        # consumed — _send_service_config routes replace+dry_run through native_dry_run
+        # with method="put".
+        return await _apply(replace=True, dry_run=dry_run)
+    context = {"removed": {"route": [list(key) for key in sorted(plan.allowed)]}}
+    return await _guarded_apply(client, device, "static_route", context, _apply, current=current)
+
+
+async def _enqueue_pending_clear_retract(db: AsyncSession, device, plan) -> None:
+    """Queue the networked retract a merge-PATCH apply structurally cannot deliver (§4.11).
+
+    A cleared leaf only leaves the device on a networked PUT. In ``PUT`` mode this apply's
+    own store-rendered body already omits it, so nothing is owed. In ``PATCH`` mode the
+    renderer omits the leaf while the merge leaves it live — and reader-compare only checks
+    the route KEY, so the row would otherwise be certified in sync over a stale value.
+
+    Only the ``authorized`` half is deliverable (A1). A ``store_only`` clear was recorded by
+    a request that may mutate the intent store but must never cause a device write; the
+    apply's separate authorization covers the apply's OWN body, not a deletion job whose
+    only purpose is to remove a leaf observed under ``?store_only=true``. Such an entry
+    parks — the row stays unproven — until a later authorized push re-records the clear.
+
+    Runs AFTER the apply's terminal transaction, so a failure here is logged, never raised:
+    a second terminal write flipping a committed ``succeeded`` to ``failed`` would misreport
+    rows the device really did accept. Nothing is lost either way — the carrier is store
+    state, so the next apply re-derives exactly this decision.
+    """
+    if plan.mode != "PATCH":
+        return
+    fields = sorted({f for row in plan.rows for f in authorized_clear_fields(row.pending_clear)})
+    if not fields:
+        return
+    from nso_adapter.core.removal import enqueue_removal
+
+    try:
+        # retract=True, no removed/shrank: an un-own would make this a no-networking detach,
+        # which can never deliver a clear. Ordinary admission, ordinary FIFO — no immediate
+        # device write, so auto_apply pacing is untouched.
+        job = await enqueue_removal(db, device_id=device.id, scope="static_route", retract=True)
+        await db.commit()
+    except ClaimLostError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — the apply is already finalized
+        await db.rollback()
+        logger.warning("static_route.pending_clear_retract_enqueue_failed", device_id=device.id, error=repr(exc))
+        return
+    logger.info(
+        "static_route.pending_clear_retract_enqueued",
+        device_id=device.id,
+        job_id=getattr(job, "id", None),
+        fields=fields,
+    )
+
+
+def _static_route_coro(client, device, plan, *, dry_run=False):
+    """Build the static-route scope's coroutine for this plan — PUT-replace or today's merge."""
+    from nso_adapter.nso.apply import apply_static_routes
+
+    if plan.mode == "PUT":
+        return _put_static_routes(client, device, plan, dry_run=dry_run)
+    return apply_static_routes(
+        client=client, device_name=device.nso_device_name, route_intent_rows=plan.rows, dry_run=dry_run
+    )
+
+
 async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = "native") -> dict[str, str]:
     """Read-only preview: the per-scope native device diff the next Apply would push.
 
@@ -313,6 +453,10 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
     snmp_sysinfo_rows = await _accepted(SnmpSystemInfoIntent)
     snmp_sysinfo = snmp_sysinfo_rows[0] if snmp_sysinfo_rows else None
     sr = await _accepted(StaticRouteIntent)
+    # The preview has always previewed ACCEPTED rows (the real apply pushes the eligible
+    # subset) — passing them as the eligible list keeps PATCH-mode previews byte-identical
+    # to today's, while PUT mode derives its rows from the store regardless.
+    sr_plan = await build_plan(db, device, eligible_rows=sr)
     lg = await _accepted(LoggingHostIntent)
     lgl_rows = await _accepted(LoggingLevelsIntent)
     lgl = lgl_rows[0] if lgl_rows else None
@@ -391,9 +535,10 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
         (
             "static_route",
             [sr],
-            lambda: nso_apply.apply_static_routes(
-                client=client, device_name=device_name, route_intent_rows=sr, dry_run=fmt
-            ),
+            # Preview parity (§4.8): the same classifier, the same rows, the same retained
+            # tombstone entries — so a replacement-open device previews the very PUT the
+            # apply would send. Read-only: build_plan writes nothing and consumes nothing.
+            lambda: _static_route_coro(client, device, sr_plan, dry_run=fmt),
         ),
         (
             "logging",
@@ -1590,7 +1735,14 @@ async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_
     the error on every row; an NsoApplyError or any other exception records the error
     payload on every row and reports a single failure. ``on_nso_error`` is a best-effort
     side-effect (route-policy uses it to record a device-parser capability rejection).
+
+    A collateral block (the static-route PUT-replace, §4.1) gets its own clause ahead of
+    the broad one: it is a REFUSAL with a machine-readable orphan report and a preview of
+    the would-be device delta, and ``repr(exc)`` under ``code: "internal"`` would throw
+    both away.
     """
+    from nso_adapter.core.removal import RemovalBlockedError
+
     try:
         await coro
     except NsoApplyError as exc:
@@ -1604,6 +1756,16 @@ async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_
     except ClaimLostError:
         # Revocation is not a runner error: recovery already owns the disposition.
         raise
+    except RemovalBlockedError as exc:
+        logger.error(f"apply.{log_label}_blocked_collateral", job_id=job_id, device=device_name, orphans=exc.orphans)
+        err = {
+            "code": "removal_blocked_collateral",
+            "message": str(exc),
+            "detail": {"orphans": exc.orphans, "preview": exc.preview},
+        }
+        for row in rows:
+            row.last_apply_error = err
+        return 0, len(rows), [{"error": str(exc), "code": "removal_blocked_collateral", "orphans": exc.orphans}]
     except Exception as exc:
         logger.exception(f"apply.{log_label}_unexpected_error", job_id=job_id)
         err = {"code": "internal", "message": repr(exc), "detail": {}}
@@ -1731,7 +1893,6 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         apply_ospf_config,
         apply_route_policy_config,
         apply_snmp_config,
-        apply_static_routes,
         apply_subinterface_config,
         apply_svi_config,
         apply_vlan_config,
@@ -1763,6 +1924,10 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     snmp_rows = [*snmp_comm, *snmp_user, *snmp_host, *([snmp_sysinfo] if snmp_sysinfo else [])]
 
     sr_eligible = await _collect_eligible(db, StaticRouteIntent, device_id, force)
+    # #1396 R2 §3: ONE classifier decides the static-route mode and snapshots the rows the
+    # body is built from, the rows this pass stamps, the keys the guard may see disappear
+    # and the tombstones the body must retain.
+    sr_plan = await build_plan(db, device, eligible_rows=sr_eligible)
     logging_eligible = await _collect_eligible(db, LoggingHostIntent, device_id, force)
     logging_levels_rows = await _collect_eligible(db, LoggingLevelsIntent, device_id, force)
     logging_levels = logging_levels_rows[0] if logging_levels_rows else None
@@ -1805,7 +1970,10 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             attr_eligible,
             ip_eligible_by_iface,
             snmp_rows,
-            sr_eligible,
+            # From the PLAN, never the eligible list: in PUT mode a force=False apply can
+            # have an empty eligible list and a non-empty body, and _finalize_job's
+            # all-zero early success would then report a clean no-op AFTER a real PUT.
+            sr_plan.rows,
             logging_rows,
             svi_eligible,
             subif_eligible,
@@ -1860,6 +2028,10 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             "redist_bgp": redist_bgp,
         }
         await _run_atomic_apply(db, device, client, device_name, job, job_id, now, elig)
+        # §4.11 retry path, on BOTH apply implementations: the atomic path is a separate
+        # early return with its own finalization, so wiring this only into the per-scope
+        # loop below would leave atomic-mode applies enqueueing nothing.
+        await _enqueue_pending_clear_retract(db, device, sr_plan)
         return
 
     # ── Step 2: mark attribute states deploying ──
@@ -1922,8 +2094,11 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         _Scope(
             "static_route",
             "static_route",
-            sr_eligible,
-            lambda: apply_static_routes(client=client, device_name=device_name, route_intent_rows=sr_eligible),
+            # plan.rows, not the eligible list: in PUT mode the body is every ACCEPTED row
+            # (an eligible-only body retracts every accepted-and-clean route), so those are
+            # exactly the rows this pass stamps. In PATCH mode the two are the same list.
+            sr_plan.rows,
+            lambda: _static_route_coro(client, device, sr_plan),
         ),
         _Scope(
             "logging",
@@ -2088,6 +2263,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         reader_compare=reader_compare,
         reader_compare_unverifiable=reader_compare_unverifiable,
     )
+    await _enqueue_pending_clear_retract(db, device, sr_plan)
 
 
 async def _post_apply_refresh_and_notify(db: AsyncSession, device_id: int) -> None:

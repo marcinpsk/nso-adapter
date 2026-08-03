@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from typing import NamedTuple
 from urllib.parse import quote
 
 import httpx
@@ -40,6 +41,32 @@ class NsoReadContractError(RuntimeError):
 # The only statuses a device-state-read action section may carry: the build is a terminal
 # extraction (never the record-served facade's stale/not-ready). See _certify_device_state_output.
 _TERMINAL_SECTION_STATUSES = frozenset({"ok", "unsupported", "error"})
+
+
+class ServiceInstanceState(NamedTuple):
+    """A CERTIFIED read of one reconciler service instance (#1396 R2 §4.4).
+
+    ``status`` is ``present`` (``entry`` is the instance body), ``absent`` (a conclusive
+    keyed 404 — the service really has no instance for this device) or ``inconclusive``
+    (a 2xx the reader could not certify either way). ``inconclusive`` is never a proof and
+    never an "absent": no destructive PUT may be built on it and nothing may be consumed.
+    """
+
+    status: str
+    entry: dict | None
+
+    @property
+    def present(self) -> bool:
+        return self.status == "present"
+
+    @property
+    def inconclusive(self) -> bool:
+        return self.status == "inconclusive"
+
+
+def _inconclusive(service_path: str, device_name: str, reason: str) -> ServiceInstanceState:
+    logger.warning("nso.service_instance_inconclusive", service=service_path, device=device_name, reason=reason)
+    return ServiceInstanceState("inconclusive", None)
 
 
 def _certify_device_state_output(output: object, device_name: str, wire_families: list[str]) -> None:
@@ -253,6 +280,43 @@ class NsoClient:
             root = service_path.rsplit("/", 1)[-1]
             entries = data.get(root) or data.get(root.split(":", 1)[-1], [])
             return entries[0] if entries else None
+
+    async def service_instance_state(self, service_path: str, device_name: str) -> ServiceInstanceState:
+        """Read the service instance and CERTIFY the verdict — ``present``/``absent``/``inconclusive``.
+
+        :meth:`get_service_config` cannot certify an absence (#1396 R2 §4.4): it returns ``None``
+        both for a keyed 404 and for any 2xx whose parsed body lacks a recognized non-empty root —
+        a malformed answer, a renamed root, an empty list. That conflation is safe where the read
+        can only OMIT work, but a live-service-relative PUT body built from "looks empty" silently
+        drops both the entries it had to retain and the collateral the guard had to see, and then
+        verifies cleanly. So every pre-PUT static-route read takes this reader instead, and
+        ``inconclusive`` means: no PUT, no consumption, no CAS.
+
+        ``absent`` is ONLY a conclusive keyed 404. A transport error or a non-404 error status
+        raises, as it does for every other read here.
+        """
+        url = f"{self._base}{service_path}={_url_key(device_name)}"
+        async with self._client() as c:
+            resp = await c.get(url)
+            if resp.status_code == 404:
+                return ServiceInstanceState("absent", None)
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+            except Exception:
+                data = None
+            if not isinstance(data, dict):
+                return _inconclusive(service_path, device_name, "unparseable body")
+            root = service_path.rsplit("/", 1)[-1]
+            entries = data.get(root)
+            if entries is None:
+                entries = data.get(root.split(":", 1)[-1])
+            if not isinstance(entries, list) or not entries:
+                return _inconclusive(service_path, device_name, "no recognized non-empty root")
+            entry = entries[0]
+            if not isinstance(entry, dict) or not entry:
+                return _inconclusive(service_path, device_name, "empty instance entry")
+            return ServiceInstanceState("present", entry)
 
     # ── device-state envelope (READSEM S3) — status-declared per-family reads ─────────
 
