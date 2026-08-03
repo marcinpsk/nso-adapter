@@ -294,6 +294,25 @@ async def acquire_claim_waiting(
         await asyncio.sleep(min(poll_interval_s, max(0.0, deadline - _monotonic())))
 
 
+async def acquire_claim_or_refuse(
+    device_id: int,
+    purpose: str,
+    *,
+    timeout_s: float,
+    job_id: int | None = None,
+) -> ClaimRegistration:
+    """Wait for the claim, or raise :class:`ClaimUnavailableError`.
+
+    Every timeout is logged: on the plugin's push path the 409 is swallowed by
+    ``_push_changed``, so this log line is the only signal the contention happened.
+    """
+    reg = await acquire_claim_waiting(device_id, purpose, timeout_s=timeout_s, job_id=job_id)
+    if reg is None:
+        logger.warning("claim.wait_timeout", device_id=device_id, purpose=purpose, waited_s=timeout_s)
+        raise ClaimUnavailableError(f"device {device_id} is claimed by another operation")
+    return reg
+
+
 @asynccontextmanager
 async def held_claim(
     device_id: int,
@@ -308,10 +327,7 @@ async def held_claim(
     must not leave the device claimed until the reaper notices; the release lives here so
     no call site can forget it.
     """
-    reg = await acquire_claim_waiting(device_id, purpose, timeout_s=timeout_s, job_id=job_id)
-    if reg is None:
-        logger.warning("claim.wait_timeout", device_id=device_id, purpose=purpose, waited_s=timeout_s)
-        raise ClaimUnavailableError(f"device {device_id} is claimed by another operation")
+    reg = await acquire_claim_or_refuse(device_id, purpose, timeout_s=timeout_s, job_id=job_id)
     try:
         yield reg
     finally:

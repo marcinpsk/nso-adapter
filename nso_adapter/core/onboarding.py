@@ -519,24 +519,98 @@ async def rekey_device(
     return device
 
 
+def intent_root_models() -> list[type]:
+    """Return the direct intent roots on ``Device``, derived from the mapper.
+
+    Never hard-coded: a family added later joins this list automatically instead of
+    silently reintroducing a cascade that fires after the job null-out. The mapper alone
+    is provably incomplete, though — ``InterfaceIntent`` and ``InterfaceIpIntent`` hang off
+    ``DbInterface``, and teardown handles those separately.
+    """
+    return [
+        rel.mapper.class_
+        for rel in Device.__mapper__.relationships
+        if rel.mapper.class_.__tablename__.endswith("_intent")
+    ]
+
+
 async def offboard_device(db: AsyncSession, device: Device) -> None:
-    """Remove all adapter state for a device. Does not modify NetBox."""
+    """Remove all adapter state for a device. Does not modify NetBox.
+
+    Holds the device claim for the whole teardown, so it can never dismantle a device a
+    runner (or the tombstone sweeper) is working on, and takes its locks in §3.9's order:
+    ``device_claim -> devices -> intent/children -> jobs``. Deleting the intent roots
+    explicitly, BEFORE ``jobs``, is what removes the deadlock against an intent endpoint
+    that holds an intent row and reaches for the queued apply winner — leaving them to
+    ``db.delete(device)``'s cascade puts them after the job null-out.
+
+    Raises :class:`ClaimUnavailableError` when the device stays claimed for the whole
+    wait budget.
+    """
     from sqlalchemy import delete, update
 
-    from nso_adapter.store.models import InterfaceAttrState, Job
+    from nso_adapter.core.claim import acquire_claim_or_refuse, lock_claim, release_claim
+    from nso_adapter.store.models import (
+        InterfaceAttrState,
+        InterfaceIntent,
+        InterfaceIpIntent,
+        Job,
+        JobStatus,
+    )
 
-    # Delete in FK dependency order to avoid cascade-load on lazy="raise" relationships
-    iface_ids_result = await db.execute(select(DbInterface.id).where(DbInterface.device_id == device.id))
-    iface_ids = list(iface_ids_result.scalars().all())
-    if iface_ids:
-        await db.execute(delete(InterfaceAttrState).where(InterfaceAttrState.interface_id.in_(iface_ids)))
-    await db.execute(delete(DbInterface).where(DbInterface.device_id == device.id))
-    await db.execute(delete(ManagedScope).where(ManagedScope.device_id == device.id))
-    # Null-out device_id on jobs so history is preserved (device_id is nullable by design)
-    await db.execute(update(Job).where(Job.device_id == device.id).values(device_id=None))
-    await db.delete(device)
-    await db.commit()
-    logger.info("device.offboarded", device_id=device.id)
+    device_id = device.id
+    reg = await acquire_claim_or_refuse(device_id, "teardown", timeout_s=get_config().intent_claim_wait_seconds)
+    # The device delete cascades the claim row away with it, so a release afterwards would
+    # find nothing and report a lost claim. Released here only when the teardown did NOT
+    # get that far.
+    claim_survives = True
+    try:
+        await lock_claim(db, reg)  # the guard, held to commit
+        await db.execute(select(Device.id).where(Device.id == device_id).with_for_update())
+
+        for model in intent_root_models():
+            await db.execute(delete(model).where(model.device_id == device_id))
+
+        # Delete in FK dependency order to avoid cascade-load on lazy="raise" relationships
+        iface_ids_result = await db.execute(select(DbInterface.id).where(DbInterface.device_id == device_id))
+        iface_ids = list(iface_ids_result.scalars().all())
+        if iface_ids:
+            await db.execute(delete(InterfaceAttrState).where(InterfaceAttrState.interface_id.in_(iface_ids)))
+            # Restrictive FK (no ondelete) and the interface delete below is bulk SQL, which
+            # bypasses the ORM relationship cascade — without this the delete raises.
+            await db.execute(delete(InterfaceIntent).where(InterfaceIntent.interface_id.in_(iface_ids)))
+            # This one's FK does carry ON DELETE CASCADE; deleted explicitly anyway so the
+            # asymmetry with InterfaceIntent above is not read as an oversight.
+            await db.execute(delete(InterfaceIpIntent).where(InterfaceIpIntent.interface_id.in_(iface_ids)))
+        await db.execute(delete(DbInterface).where(DbInterface.device_id == device_id))
+        await db.execute(delete(ManagedScope).where(ManagedScope.device_id == device_id))
+        await db.flush()
+
+        # Jobs last, and QUEUED rows are terminalized before the null-out: nulling a queued
+        # job manufactures a non-provision claimless job, which breaks the worker's
+        # claimless bypass — it would dispatch it with device_id=None against a device that
+        # no longer exists.
+        await db.execute(
+            update(Job)
+            .where(Job.device_id == device_id, Job.status == JobStatus.queued)
+            .values(
+                status=JobStatus.failed,
+                error={
+                    "code": "device_offboarded",
+                    "message": "The device was offboarded before this job ran",
+                    "detail": {},
+                },
+            )
+        )
+        # Null-out device_id on jobs so history is preserved (device_id is nullable by design)
+        await db.execute(update(Job).where(Job.device_id == device_id).values(device_id=None))
+        await db.delete(device)
+        await db.commit()
+        claim_survives = False
+    finally:
+        if claim_survives:
+            await release_claim(reg)
+    logger.info("device.offboarded", device_id=device_id)
 
 
 async def set_scope(db: AsyncSession, device: Device, attributes: list[str]) -> list[ManagedScope]:

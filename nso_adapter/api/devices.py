@@ -353,12 +353,23 @@ async def rekey_device(device_id: int, body: DevicePatch, db: AsyncSession = Dep
     "/{device_id}",
     status_code=204,
     dependencies=[Depends(verify_token)],
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409, **RESP_422_VALIDATION},
 )
 async def offboard_device(device_id: int, db: AsyncSession = Depends(get_db)):
+    from nso_adapter.core.claim import ClaimUnavailableError
     from nso_adapter.core.onboarding import offboard_device as _offboard
 
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
-    await _offboard(db, device)
+    try:
+        await _offboard(db, device)
+    except ClaimUnavailableError:
+        # Something is working on this device. Tearing it down from under a runner is the
+        # one thing the claim exists to prevent; the operator retries.
+        raise api_error(
+            409,
+            "conflict",
+            "The device is busy with another operation; retry",
+            {"reason": "device_claimed"},
+        ) from None

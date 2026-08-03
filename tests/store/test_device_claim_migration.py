@@ -157,12 +157,31 @@ async def test_claim_token_is_unique_across_devices(adapter_client):
     raise AssertionError("one token was reused across two devices")
 
 
-async def test_offboard_cascades_the_claim(adapter_client):
+async def test_deleting_the_device_cascades_the_claim(adapter_client):
+    """The FK action itself, asserted at the database.
+
+    Not driven through ``offboard_device`` any more: teardown is a claim holder, so it
+    refuses to run while a rival claim exists and could never reach the delete.
+    """
+    from nso_adapter.store.models import Device, DeviceClaim
+
+    # No managed scope: its FK is restrictive, and this test is about the claim's FK.
+    device_id = await seed_device(nso_device_name="dc-cascade", netbox_device_id=9814, attributes=[])
+    await _insert_claim(device_id, token="tok-cascade")
+
+    async with session() as db:
+        await db.execute(sa.delete(Device).where(Device.id == device_id))
+        await db.commit()
+    async with session() as db:
+        assert await db.get(DeviceClaim, device_id) is None
+
+
+async def test_offboard_leaves_no_claim_of_its_own(adapter_client):
+    """Teardown's own claim goes with the device — it is never released separately."""
     from nso_adapter.core.onboarding import offboard_device
     from nso_adapter.store.models import Device, DeviceClaim
 
-    device_id = await seed_device(nso_device_name="dc-cascade", netbox_device_id=9814)
-    await _insert_claim(device_id, token="tok-cascade")
+    device_id = await seed_device(nso_device_name="dc-cascade-own", netbox_device_id=9824)
 
     async with session() as db:
         await offboard_device(db, await db.get(Device, device_id))
