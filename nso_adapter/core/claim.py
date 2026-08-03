@@ -118,8 +118,9 @@ class ClaimLostError(Exception):
 class ClaimUnavailableError(Exception):
     """The claim was held by someone else for the whole wait budget.
 
-    Raised by :func:`held_claim` so a caller that has an answer for "busy" — the intent
-    PUT's 409 — can give it instead of blocking indefinitely.
+    Raised by :func:`acquire_claim_or_refuse` (and so by :func:`held_claim`) rather than
+    returned, so a caller with an answer for "busy" — the intent PUT's and the offboard's
+    409 — gives it instead of blocking indefinitely.
     """
 
 
