@@ -372,6 +372,20 @@ class Job(Base):
             unique=True,
             postgresql_where=text("status = 'queued' AND job_type <> 'removal'"),
         ),
+        # At most one ACTIVE provision per (nso_instance, device_name) — the dedupe key for
+        # rows the index above cannot reach, because a provision runs before the adapter
+        # Device exists and so carries device_id NULL.
+        #
+        # Covers RUNNING as well as queued, unlike the per-device index: a provision has no
+        # successor semantics. Re-admitting one mid-flight repeats the NSO node creation,
+        # the host-key fetch and the sync-from against a device already being onboarded.
+        Index(
+            "uq_job_active_provision_pair",
+            text("(context ->> 'nso_instance')"),
+            text("(context ->> 'device_name')"),
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'running') AND job_type = 'provision'"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

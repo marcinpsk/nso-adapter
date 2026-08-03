@@ -351,6 +351,147 @@ async def test_enqueue_job_conflict_returns_the_winner_not_none(adapter_client):
         assert job is not None and job.id == existing
 
 
+# ── M6.9t: provision admission is atomic per (nso_instance, device_name) ─────
+
+_PROVISION = {
+    "nso_instance": "nso-dev",
+    "device_name": "adm-rtr",
+    "ned_id": "cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+    "authgroup": "network",
+}
+
+
+async def _active_provisions(device_name: str) -> list[int]:
+    from nso_adapter.core.jobs import _PROVISION_DEDUPE_PREDICATE, _PROVISION_PAIR_ELEMENTS
+    from nso_adapter.store.models import Job
+
+    async with session() as db:
+        rows = (
+            (
+                await db.execute(
+                    sa.select(Job.id)
+                    .where(_PROVISION_DEDUPE_PREDICATE, _PROVISION_PAIR_ELEMENTS[1] == device_name)
+                    .order_by(Job.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return list(rows)
+
+
+async def test_two_concurrent_provisions_admit_exactly_one(adapter_client, rival_engine):
+    """M6.9t — the loser must lose at the INDEX, not at a lookup it can race.
+
+    The two requests differ in ``address``, so an index inferred on the wrong column would
+    admit both and this test would still fail. The contention is forced rather than
+    scheduled: the winner's INSERT is left uncommitted while the rival runs, so PostgreSQL
+    makes the rival wait on the speculative insertion — which is exactly the window where
+    check-then-insert let both callers find nothing and both admit.
+    """
+    from nso_adapter.core.jobs import enqueue_provision_job
+
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+    winner_inserted = asyncio.Event()
+    loser: dict = {}
+
+    async def _rival() -> None:
+        await winner_inserted.wait()
+        async with rival() as db:
+            loser["job"], loser["created"] = await enqueue_provision_job({**_PROVISION, "address": "10.0.0.2"}, db)
+
+    task = asyncio.create_task(_rival())
+    async with session() as db:
+        real_commit = db.commit
+
+        async def _commit_after_the_rival_contends() -> None:
+            # Fires between the speculative INSERT and its COMMIT — the whole window.
+            winner_inserted.set()
+            await asyncio.sleep(0.4)
+            assert not task.done(), "the rival never contended: it finished before the winner committed"
+            await real_commit()
+
+        db.commit = _commit_after_the_rival_contends
+        winner, created = await enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
+
+    await asyncio.wait_for(task, timeout=20)
+
+    assert created is True
+    assert loser["created"] is False, "both callers admitted a provision for the same node"
+    assert loser["job"].id == winner.id
+    assert await _active_provisions("adm-rtr") == [winner.id]
+
+
+async def test_a_terminal_provision_does_not_block_a_new_one(adapter_client):
+    """The index covers queued and running only — a finished onboarding must be repeatable."""
+    from nso_adapter.core.jobs import enqueue_provision_job
+    from nso_adapter.store.models import Job, JobStatus
+
+    async with session() as db:
+        first, created = await enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
+        assert created is True
+
+    async with session() as db:
+        await db.execute(sa.update(Job).where(Job.id == first.id).values(status=JobStatus.succeeded))
+        await db.commit()
+
+    async with session() as db:
+        second, created = await enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
+    assert created is True and second.id != first.id
+
+
+async def test_a_running_provision_still_refuses_a_second_one(adapter_client):
+    """Unlike the per-device queued dedupe: a provision has no successor semantics.
+
+    Re-admitting one mid-flight repeats the NSO node creation and the sync-from against a
+    node another runner is already onboarding.
+    """
+    from nso_adapter.core.jobs import enqueue_provision_job
+    from nso_adapter.store.models import Job, JobStatus
+
+    async with session() as db:
+        first, _ = await enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
+
+    async with session() as db:
+        await db.execute(sa.update(Job).where(Job.id == first.id).values(status=JobStatus.running))
+        await db.commit()
+
+    async with session() as db:
+        second, created = await enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
+    assert created is False and second.id == first.id
+
+
+async def test_provision_admission_retries_when_the_winner_finishes(adapter_client, rival_engine):
+    """Zero rows plus no active job is a finished winner, not "blocked" — admit a fresh one."""
+    from nso_adapter.core import jobs as jobs_mod
+    from nso_adapter.store.models import Job, JobStatus
+
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+    async with session() as db:
+        first, _ = await jobs_mod.enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
+
+    original = jobs_mod.get_active_provision_job
+    fired = {"n": 0}
+
+    async def _finish_then_look(instance, name, db):
+        # Exactly once, between the conflicting insert and the lookup, the winner completes.
+        fired["n"] += 1
+        if fired["n"] == 1:
+            async with rival() as other:
+                await other.execute(sa.update(Job).where(Job.id == first.id).values(status=JobStatus.succeeded))
+                await other.commit()
+        return await original(instance, name, db)
+
+    jobs_mod.get_active_provision_job = _finish_then_look
+    try:
+        async with session() as db:
+            second, created = await jobs_mod.enqueue_provision_job({**_PROVISION, "address": "10.0.0.1"}, db)
+    finally:
+        jobs_mod.get_active_provision_job = original
+
+    assert created is True and second.id != first.id
+
+
 async def test_a_failing_insert_does_not_poison_the_caller(adapter_client):
     """What the SAVEPOINT is actually for.
 

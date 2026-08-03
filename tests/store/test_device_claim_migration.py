@@ -239,3 +239,36 @@ def test_queued_dedupe_index_replaces_the_active_one(pg_admin):
             ixs = index_predicates(engine, "jobs")
             assert "uq_job_queued_per_device_type" not in ixs
             assert "uq_job_active_per_device" in ixs
+
+
+# ── the provision-pair admission index ───────────────────────────────────────
+
+_PROVISION_INDEX_MIGRATION = "b8d4f1c2e7a3_provision_admission_index.py"
+
+
+def test_provision_pair_index_is_on_the_two_context_expressions(pg_admin):
+    """Parity proves model ≡ migration; this proves either one is RIGHT.
+
+    Both expressions asserted verbatim: an index on a different context key — ``address``,
+    say — deduplicates nothing while passing every parity and conflict-inference check.
+    """
+    from tests.store.migration_harness import index_predicates
+
+    module = load_migration(_PROVISION_INDEX_MIGRATION)
+    assert module.down_revision == "f1a3c9e7b204"
+    assert_single_head_containing(module.revision)
+
+    with private_database(pg_admin, "provix") as sync_url:
+        alembic(sync_url, "upgrade", module.revision)
+        with engine_on(sync_url) as engine:
+            assert index_predicates(engine, "jobs")["uq_job_active_provision_pair"] == (
+                ("(context ->> 'nso_instance'::text)", "(context ->> 'device_name'::text)"),
+                True,
+                # queued AND running: a provision has no successor semantics.
+                "((status = ANY (ARRAY['queued'::jobstatus, 'running'::jobstatus]))"
+                " AND (job_type = 'provision'::jobtype))",
+            )
+
+        alembic(sync_url, "downgrade", module.down_revision)
+        with engine_on(sync_url) as engine:
+            assert "uq_job_active_provision_pair" not in index_predicates(engine, "jobs")

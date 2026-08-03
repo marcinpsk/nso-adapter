@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 
 import structlog
-from sqlalchemy import exists, select, text
+from sqlalchemy import exists, literal_column, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -196,43 +196,80 @@ async def enqueue_job(
     return created, True
 
 
+# The provision dedupe index's expressions and predicate, verbatim and defined ONCE: the
+# same two constants are the ON CONFLICT inference target and the lookup's filter, so the
+# lookup can never drift from what the database actually enforces. literal_column, not text:
+# ON CONFLICT infers from column EXPRESSIONS, and a TextClause is not one.
+_PROVISION_PAIR_ELEMENTS = (
+    literal_column("(context ->> 'nso_instance')"),
+    literal_column("(context ->> 'device_name')"),
+)
+_PROVISION_DEDUPE_PREDICATE = text("status IN ('queued', 'running') AND job_type = 'provision'")
+
+
 async def get_active_provision_job(nso_instance: str, device_name: str, db: AsyncSession) -> Job | None:
     """Return the queued/running provision job for (instance, device_name), or None.
 
     Provision jobs run *before* the adapter ``Device`` row exists, so they carry no
     ``device_id`` — the de-dup key lives in ``Job.context`` instead. Scoped to the
     two context fields that uniquely identify the in-flight onboarding.
+
+    Ordered and limited rather than ``scalar_one_or_none``: rows admitted before
+    ``uq_job_active_provision_pair`` existed can still be duplicated, and a lookup that
+    raises on them would take out every subsequent onboarding of that node.
     """
-    result = await db.execute(
-        select(Job).where(
-            Job.job_type == JobType.provision,
-            Job.status.in_([JobStatus.queued, JobStatus.running]),
+    return await db.scalar(
+        select(Job)
+        .where(
+            _PROVISION_DEDUPE_PREDICATE,
+            _PROVISION_PAIR_ELEMENTS[0] == nso_instance,
+            _PROVISION_PAIR_ELEMENTS[1] == device_name,
         )
+        .order_by(Job.created_at, Job.id)
+        .limit(1)
     )
-    for job in result.scalars().all():
-        ctx = job.context or {}
-        if ctx.get("nso_instance") == nso_instance and ctx.get("device_name") == device_name:
-            return job
-    return None
 
 
 async def enqueue_provision_job(params: dict, db: AsyncSession) -> tuple[Job, bool]:
     """Create a queued provision (device-onboarding) job.  Returns (job, created).
 
-    Unlike :func:`enqueue_job`, a provision runs before the device exists, so the job
-    has ``device_id=None`` and carries its parameters in ``context``; de-dup is on
-    (nso_instance, device_name) via :func:`get_active_provision_job` so a double-click
-    returns the in-flight job (created=False) instead of provisioning twice.
-    """
-    active = await get_active_provision_job(params["nso_instance"], params["device_name"], db)
-    if active:
-        return active, False
+    Unlike :func:`enqueue_job`, a provision runs before the device exists, so the job has
+    ``device_id=None`` and carries its parameters in ``context``; de-dup is on
+    (nso_instance, device_name) so a double-click returns the in-flight job
+    (created=False) instead of provisioning twice.
 
-    job = Job(job_type=JobType.provision, device_id=None, status=JobStatus.queued, context=params)
-    db.add(job)
-    await db.commit()
-    await db.refresh(job)
-    return job, True
+    The DB decides, not a preceding lookup. A check-then-insert let two concurrent requests
+    for the same node both find nothing and both admit — and nothing downstream would have
+    stopped them, because the two runners onboard the same NSO node with no claim between
+    them until each reaches its own mapping. The loser now loses on the index conflict and
+    is handed the winner's job.
+
+    Zero rows with no active job means the winner reached a terminal status between the two
+    statements; a fresh admission is then the correct answer, not "blocked".
+    """
+    for _attempt in range(_ADMISSION_RETRIES):
+        async with db.begin_nested():
+            job_id = await db.scalar(
+                pg_insert(Job)
+                .values(job_type=JobType.provision, device_id=None, status=JobStatus.queued, context=params)
+                .on_conflict_do_nothing(
+                    index_elements=_PROVISION_PAIR_ELEMENTS,
+                    index_where=_PROVISION_DEDUPE_PREDICATE,
+                )
+                .returning(Job.id)
+            )
+        if job_id is not None:
+            await db.commit()
+            job = await db.get(Job, job_id)
+            return job, True
+
+        active = await get_active_provision_job(params["nso_instance"], params["device_name"], db)
+        if active is not None:
+            return active, False
+        logger.debug("job.provision_admission.winner_finished", device_name=params.get("device_name"))
+
+    logger.warning("job.provision_admission.retries_exhausted", device_name=params.get("device_name"))
+    raise RuntimeError(f"could not admit a provision job for {params.get('device_name')!r}")
 
 
 # ── Job runners ───────────────────────────────────────────────────────────────
