@@ -11,18 +11,17 @@ from __future__ import annotations
 
 from sqlalchemy import select
 
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, DeviceOspfInstance, DeviceOspfInterface
+from tests.conftest import session
 
 
 async def _seed_device(nso_device_name: str = "rtr", netbox_device_id: int = 500) -> int:
-    async for db in get_session():
+    async with session() as db:
         d = Device(nso_instance="nso-dev", nso_device_name=nso_device_name, netbox_device_id=netbox_device_id)
         db.add(d)
         await db.commit()
         await db.refresh(d)
         return d.id
-    raise RuntimeError("no session")
 
 
 async def test_ospf_interface_in_two_processes_does_not_abort_refresh(adapter_client):
@@ -36,7 +35,7 @@ async def test_ospf_interface_in_two_processes_does_not_abort_refresh(adapter_cl
         {"interface-name": "GigabitEthernet0/0", "process-id": "1", "area-id": "0"},
         {"interface-name": "GigabitEthernet0/0", "process-id": "2", "area-id": "0"},
     ]
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         await _upsert_ospf_data(db, device, instances, interfaces, "test")
         rows = (
@@ -45,7 +44,6 @@ async def test_ospf_interface_in_two_processes_does_not_abort_refresh(adapter_cl
             .all()
         )
         assert sorted(r.process_id for r in rows) == ["1", "2"]
-        break
 
 
 async def test_ospf_two_instances_same_process_across_vrfs(adapter_client):
@@ -58,7 +56,7 @@ async def test_ospf_two_instances_same_process_across_vrfs(adapter_client):
         {"process-id": "1", "vrf": ""},
         {"process-id": "1", "vrf": "BLUE"},
     ]
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         await _upsert_ospf_data(db, device, instances, [], "test")
         rows = (
@@ -67,7 +65,6 @@ async def test_ospf_two_instances_same_process_across_vrfs(adapter_client):
             .all()
         )
         assert sorted((r.process_id, r.vrf) for r in rows) == [("1", ""), ("1", "BLUE")]
-        break
 
 
 async def test_ospf_instance_without_process_id_is_skipped_not_crash(adapter_client):
@@ -77,7 +74,7 @@ async def test_ospf_instance_without_process_id_is_skipped_not_crash(adapter_cli
 
     device_id = await _seed_device(nso_device_name="ospf-noproc", netbox_device_id=502)
     instances = [{"router-id": "1.1.1.1"}, {"process-id": "1"}]  # first is malformed
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         await _upsert_ospf_data(db, device, instances, [], "test")
         rows = (
@@ -86,4 +83,3 @@ async def test_ospf_instance_without_process_id_is_skipped_not_crash(adapter_cli
             .all()
         )
         assert [r.process_id for r in rows] == ["1"]  # malformed skipped, valid kept
-        break

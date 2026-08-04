@@ -52,7 +52,6 @@ from nso_adapter.notifications.sse_subscriber import SSESubscriber
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.secrets import make_provider
 from nso_adapter.store.db import get_engine, get_session, init_db
-from nso_adapter.store.models import Base
 
 logger = structlog.get_logger(__name__)
 
@@ -73,17 +72,15 @@ def _init_secrets(app: FastAPI, cfg, env):
 
 
 async def _init_database(cfg) -> None:
-    """Initialise the engine/sessionmaker and ensure the schema exists."""
+    """Bind the engine/sessionmaker. The schema is NEVER materialised here.
+
+    Alembic is the only schema source: the entrypoint runs `alembic upgrade head` before
+    the app starts. A second materialiser in the startup path is the DuplicateTable hazard
+    that `alembic stamp head` used to exist to recover from.
+    """
     init_db(cfg.database_url)
-    engine = get_engine()
-    # create_all only on the sqlite/test path. Production runs on PostgreSQL where the
-    # entrypoint has already applied `alembic upgrade head`; running create_all there is the
-    # documented DuplicateTable hazard (two schema sources materialising the schema).
-    if engine.dialect.name == "sqlite":
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-    # Mint/load the store incarnation (READSEM S4 D3) — idempotent; on PostgreSQL the
-    # migration inserted the row, on sqlite/create_all this backfills it.
+    # Mint/load the store incarnation (READSEM S4 D3) — idempotent; the migration inserted
+    # the row, so this takes its read path.
     from nso_adapter.store.meta import ensure_store_meta
 
     await ensure_store_meta()

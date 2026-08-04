@@ -17,9 +17,8 @@ import asyncio
 import pytest
 from sqlalchemy import select
 
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device
-from tests.conftest import seed_device
+from tests.conftest import seed_device, session
 
 
 async def _fresh_outcome(device_id: int, family: str):
@@ -28,28 +27,26 @@ async def _fresh_outcome(device_id: int, family: str):
     not depend on the cancelled context anyway."""
     from nso_adapter.store import outcome_store
 
-    async for db in get_session():
+    async with session() as db:
         return await outcome_store.get_current_outcome(db, device_id, family)
-    raise RuntimeError("no session")
 
 
 async def _fresh_static_route_prefixes(device_id: int) -> list[str]:
     from nso_adapter.store.models import DeviceStaticRoute
 
-    async for db in get_session():
+    async with session() as db:
         rows = (
             (await db.execute(select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device_id)))
             .scalars()
             .all()
         )
         return [r.prefix for r in rows]
-    raise RuntimeError("no session")
 
 
 @pytest.fixture
 async def device_db(adapter_client):
     device_id = await seed_device(nso_device_name="cancel-rtr", netbox_device_id=9301)
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         yield db, device
         return

@@ -28,13 +28,13 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "aiosqlite>=0.21",
     "httpx>=0.28.1",
     "pre-commit>=4.0",
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "pytest-cov>=7.1.0",
     "pytest-httpx>=0.35",
+    "pytest-xdist>=3.8",
     "respx>=0.21",
     "ruff>=0.9",
     "watchfiles>=1.0",
@@ -43,6 +43,27 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nso_adapter*"]
+
+[tool.semantic_release]
+allow_zero_version = true
+commit_message = "chore(release): {version} [skip ci]"
+commit_parser = "conventional"
+tag_format = "v{version}"
+version_toml = ["pyproject.toml:project.version"]
+version_variables = ["nso_adapter/__init__.py:__version__"]
+
+[tool.semantic_release.branches.main]
+match = "^main$"
+prerelease = false
+
+[tool.semantic_release.changelog]
+mode = "update"
+
+[tool.semantic_release.commit_parser_options]
+allowed_tags = ["feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore", "revert"]
+minor_tags = ["feat"]
+patch_tags = ["fix", "perf", "revert"]
+parse_squash_commits = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -77,7 +98,7 @@ exclude_also = [
 line-length = 120
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "D", "C901", "I", "RET", "UP"]
+select = ["E", "F", "W", "D", "C901", "I", "RET", "UP", "DTZ"]
 ignore = [
     "E501",
     "F403",

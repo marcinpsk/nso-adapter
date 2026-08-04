@@ -62,6 +62,14 @@ class SchedulerConfig(BaseModel):
     # device until the next restart. 0 disables it. Only touches jobs with a stale heartbeat, so it
     # never disturbs a live worker.
     orphan_reap_interval: int = 5
+    # #1396 R2 §4.10 — the activation reclaimer's own clock, deliberately NOT the orphan-reap
+    # tick: that one is sequential and ends in ensure_workers(), so a slow reclaim there would
+    # delay stale-claim reaping, the tombstone sweep and worker repair. 0 disables it.
+    static_route_reclaim_interval: int = 10
+    # Devices proved per tick, resuming after the last one. Bounded because the proof is a
+    # device read per device and the succeeded-owner predicate has no supporting index, so one
+    # wedged device must not be able to monopolize the drain.
+    static_route_reclaim_devices_per_tick: int = 20
     # Layer B durable worker: number of in-process worker tasks draining the Job
     # table.  Default 1 (serial) — per-device dedup means cross-device parallelism
     # is the only thing >1 buys, at the cost of more concurrent NSO/NetBox load.
@@ -151,6 +159,10 @@ class AppConfig(BaseModel):
     database_url: str
     log_level: str = "INFO"
     log_format: str = "json"
+    # How long an intent PUT waits for the device claim before answering 409. Sits well
+    # under the plugin's 30s request timeout, so the wait can never turn a would-be success
+    # into a client-side timeout the adapter cannot report.
+    intent_claim_wait_seconds: float = 5.0
 
 
 # ── Env-only bootstrap settings ──────────────────────────────────────────────

@@ -11,8 +11,8 @@ from fastapi import HTTPException
 
 from nso_adapter.api.nso_instances import list_instance_devices, list_nso_instances
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device
+from tests.conftest import session
 
 
 def _nso_client(*, devices=None, error: Exception | None = None) -> MagicMock:
@@ -58,22 +58,20 @@ async def test_list_nso_instances_with_instance_unreachable(adapter_client_with_
 
 async def test_list_instance_devices_unknown_instance(adapter_client_with_nso):
     """list_instance_devices() raises 404 for unknown instance_id."""
-    async for db in get_session():
+    async with session() as db:
         with pytest.raises(HTTPException) as exc_info:
             await list_instance_devices(instance_id="nonexistent", db=db)
         assert exc_info.value.status_code == 404
-        break
 
 
 async def test_list_instance_devices_nso_connection_error(adapter_client_with_nso):
     """list_instance_devices() raises 502 when NSO is unreachable."""
     nso = _nso_client(error=ConnectionError("NSO down"))
-    async for db in get_session():
+    async with session() as db:
         with patch("nso_adapter.api.nso_instances.get_nso_client", return_value=nso):
             with pytest.raises(HTTPException) as exc_info:
                 await list_instance_devices(instance_id="nso-dev", db=db)
         assert exc_info.value.status_code == 502
-        break
 
 
 async def test_list_instance_devices_returns_sorted_list(adapter_client_with_nso):
@@ -96,19 +94,18 @@ async def test_list_instance_devices_returns_sorted_list(adapter_client_with_nso
             },
         ]
     )
-    async for db in get_session():
+    async with session() as db:
         with patch("nso_adapter.api.nso_instances.get_nso_client", return_value=nso):
             result = await list_instance_devices(instance_id="nso-dev", db=db)
 
         assert result[0]["name"] == "aaa-router"
         assert result[1]["name"] == "zzz-router"
         assert result[0]["onboarded"] is False
-        break
 
 
 async def test_list_instance_devices_marks_onboarded(adapter_client_with_nso):
     """list_instance_devices() sets onboarded=True for known devices."""
-    async for db in get_session():
+    async with session() as db:
         d = Device(nso_instance="nso-dev", nso_device_name="known-router", netbox_device_id=500)
         db.add(d)
         await db.commit()
@@ -126,13 +123,12 @@ async def test_list_instance_devices_marks_onboarded(adapter_client_with_nso):
             },
         ]
     )
-    async for db in get_session():
+    async with session() as db:
         with patch("nso_adapter.api.nso_instances.get_nso_client", return_value=nso):
             result = await list_instance_devices(instance_id="nso-dev", db=db)
 
         assert result[0]["onboarded"] is True
         assert result[0]["onboarded_device_id"] == device_id
-        break
 
 
 async def test_list_instance_devices_skips_invalid_entries(adapter_client_with_nso):
@@ -144,7 +140,7 @@ async def test_list_instance_devices_skips_invalid_entries(adapter_client_with_n
             {"name": ""},  # falsy name
         ]
     )
-    async for db in get_session():
+    async with session() as db:
         with patch("nso_adapter.api.nso_instances.get_nso_client", return_value=nso):
             result = await list_instance_devices(instance_id="nso-dev", db=db)
 

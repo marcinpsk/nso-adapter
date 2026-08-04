@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import NamedTuple
 
 import structlog
@@ -222,7 +223,7 @@ async def _scheduled_intent_reconcile() -> None:
                     await db.delete(row)
                 await db.flush()
 
-                now = datetime.now(UTC).replace(tzinfo=None)
+                now = datetime.now(UTC)
                 count = 0
                 for rec in records:
                     iface = iface_by_name.get(rec.interface_name)
@@ -262,7 +263,7 @@ async def _scheduled_orphan_reap() -> None:
     The startup reaper (:func:`core.worker.requeue_orphaned_jobs`) only fires when the process
     (re)starts. This periodic tick closes the gap where a job is stranded ``running`` WITHOUT a
     restart — a worker task killed mid-run in a long-lived process. Left unreaped, the per-device
-    dedup (:func:`core.jobs.get_active_job`) would treat the orphan as in-flight and silently 409
+    dedup (:func:`core.jobs.get_queued_job_of_type`) would treat the orphan as in-flight and 409
     every future job for that device until the next restart — the same 'orphan blocks the device
     forever' failure the plugin's reconcile enqueue once had.
 
@@ -272,11 +273,33 @@ async def _scheduled_orphan_reap() -> None:
     re-pushed). APScheduler ``max_instances=1`` keeps two reaps from overlapping.
     """
     from nso_adapter.core import worker as _worker
+    from nso_adapter.core.tombstone_sweep import sweep_tombstones
 
     await _worker.requeue_orphaned_jobs()
+    # Claims are reaped on their own clock and their own scan (over device_claim, not over
+    # job status): a claim can be stale with no running job at all.
+    await _worker.reap_stale_claims()
+    # Same tick, same reason: a deletion whose removal job never got created (or whose job
+    # failed) has no other recovery path — the intent row it described is already gone.
+    await sweep_tombstones()
     # S5a A2 (codex R3-6): the reap is also the pool's liveness driver — a requeued job
     # is only useful if a live worker exists to drain it.
     _worker.ensure_workers()
+
+
+async def _scheduled_static_route_reclaim() -> None:
+    """Bounded drain over the succeeded-owner tombstones R1 handed to R2 (§4.10).
+
+    Its OWN job, never appended to :func:`_scheduled_orphan_reap`: that tick is sequential and
+    ends in ``ensure_workers()`` (G30), so a slow reclaim inside it would delay stale-claim
+    reaping, the R1 tombstone sweep and worker repair alike. ``max_instances=1`` comes from the
+    scheduler's job defaults, so two drains can never overlap.
+    """
+    from nso_adapter.core.static_route_reclaim import reclaim_succeeded_tombstones
+
+    consumed, reissued = await reclaim_succeeded_tombstones()
+    if consumed or reissued:
+        logger.info("scheduler.static_route_reclaim.done", consumed=consumed, reissued=reissued)
 
 
 async def _scheduled_lag_topology_refresh() -> None:
@@ -505,10 +528,10 @@ async def _scheduled_topology_interfaces_refresh() -> None:
 _FAILOVER_JITTER_FRACTION = 0.15
 
 
-def _utcnow_naive():
+def _utcnow_aware():
     from datetime import UTC, datetime
 
-    return datetime.now(UTC).replace(tzinfo=None)
+    return datetime.now(UTC)
 
 
 async def _due_failover_device_ids(db, now) -> list[int]:
@@ -547,49 +570,91 @@ async def _probe_one_failover_device(device_id: int, eff, now, flip_budget, sem)
 
     Each task owns its AsyncSession + commit so the gather'd probes don't share session state;
     the shared *flip_budget* caps disruptive flips across the whole tick.
+
+    Acquisition lives HERE, not inside ``run_failover_tick``, because the scheduler owns
+    both the snapshot and the commit: a claim taken inside the tick would leave the
+    ``select`` at the top and the ``commit`` at the bottom outside it, which is exactly the
+    window two schedulers need to act on one pre-switch snapshot. A conflict defers the
+    device to the next tick — the probe is periodic, so waiting buys nothing.
+
+    The whole tick runs under an enforced wall-clock bound, NOT a heartbeat: the tick holds
+    its own ``device_claim`` row FOR UPDATE for its whole duration, so an independent
+    heartbeat task would block on that lock. The bound is what keeps the claim's lifetime
+    shorter than the reaper's cutoff.
     """
+    import asyncio
+
+    from nso_adapter.core.claim import acquire_claim, release_claim
+    from nso_adapter.core.failover import FAILOVER_TICK_BOUND_S
+
+    async with sem:
+        reg = await acquire_claim(device_id, "failover")
+        if reg is None:
+            logger.debug("scheduler.failover.skipped", device_id=device_id, reason="device_claimed")
+            return
+        try:
+            await asyncio.wait_for(
+                _failover_tick_under_claim(device_id, reg, eff, now, flip_budget),
+                timeout=FAILOVER_TICK_BOUND_S,
+            )
+        except TimeoutError:
+            logger.error("scheduler.failover.tick_bound_exceeded", device_id=device_id, bound=FAILOVER_TICK_BOUND_S)
+        finally:
+            await release_claim(reg)
+
+
+async def _failover_tick_under_claim(device_id: int, reg, eff, now, flip_budget) -> None:
+    """Run the tick body — guard-lock, RE-SELECT, probe, commit — under the caller's claim."""
     from sqlalchemy import select
 
+    from nso_adapter.core.claim import lock_claim
     from nso_adapter.core.failover import run_failover_tick
     from nso_adapter.core.importer import get_nso_client
-    from nso_adapter.core.jobs import get_active_job
+    from nso_adapter.core.jobs import has_any_active_job
     from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device, DeviceFailover
 
-    async with sem:
-        async for db in get_session():
-            pair = (
-                await db.execute(
-                    select(Device, DeviceFailover)
-                    .join(DeviceFailover, DeviceFailover.device_id == Device.id)
-                    .where(Device.id == device_id)
-                )
-            ).first()
-            if pair is None:
-                return
-            device, fo = pair
-            try:
-                nso_client = get_nso_client(device.nso_instance)
-            except RuntimeError:
-                logger.debug("scheduler.failover.skipped", device_id=device_id, reason="no_nso_client")
-                return
-            try:
-                active_job = await get_active_job(device.id, db)
-                await run_failover_tick(
-                    device,
-                    fo,
-                    nso_client,
-                    eff,
-                    now=now,
-                    job_active=active_job is not None,
-                    flip_budget=flip_budget,
-                    jitter_fraction=_FAILOVER_JITTER_FRACTION,
-                )
-                await db.commit()
-            except Exception as exc:
-                await db.rollback()
-                logger.warning("scheduler.failover.error", device_id=device_id, error=repr(exc))
+    async for db in get_session():
+        # The guard, held to commit. Any preliminary state a caller loaded before
+        # acquisition is discarded: the select below runs AFTER the claim, so a transition
+        # another scheduler committed in between is observed rather than overwritten.
+        await lock_claim(db, reg)
+        pair = (
+            await db.execute(
+                select(Device, DeviceFailover)
+                .join(DeviceFailover, DeviceFailover.device_id == Device.id)
+                .where(Device.id == device_id)
+            )
+        ).first()
+        if pair is None:
             return
+        device, fo = pair
+        try:
+            nso_client = get_nso_client(device.nso_instance)
+        except RuntimeError:
+            logger.debug("scheduler.failover.skipped", device_id=device_id, reason="no_nso_client")
+            return
+        try:
+            # Boolean PRE-filter only — cheap, and it never reads "busy" when the claim
+            # already told us the device is free. The claim above is the real gate: an
+            # apply goes terminal while its claim is still held through post-refresh, so
+            # job status alone reads "idle" while the device is very much busy.
+            device_busy = await has_any_active_job(device.id, db)
+            await run_failover_tick(
+                device,
+                fo,
+                nso_client,
+                eff,
+                now=now,
+                job_active=device_busy,
+                flip_budget=flip_budget,
+                jitter_fraction=_FAILOVER_JITTER_FRACTION,
+            )
+            await db.commit()
+        except Exception as exc:
+            await db.rollback()
+            logger.warning("scheduler.failover.error", device_id=device_id, error=repr(exc))
+        return
 
 
 async def _scheduled_failover_probe() -> None:
@@ -606,7 +671,7 @@ async def _scheduled_failover_probe() -> None:
     from nso_adapter.store.db import get_session
 
     cfg = get_config().scheduler
-    now = _utcnow_naive()
+    now = _utcnow_aware()
     eff = None
     due_ids: list[int] = []
     async for db in get_session():
@@ -635,6 +700,11 @@ class _JobSpec(NamedTuple):
     interval_attr: str
     enable_attr: str | None
     gate_on_interval: bool
+    #: Fire the first run immediately instead of one interval from now, on the SAME job id.
+    #: A separate one-shot "date" job would have a different id, and APScheduler enforces
+    #: ``max_instances`` per id — so a startup pass slower than the interval would run
+    #: concurrently with the first recurring tick.
+    run_immediately: bool = False
 
 
 # Declarative registry of every periodic job. Order = registration order.
@@ -645,6 +715,12 @@ _JOB_SPECS: tuple[_JobSpec, ...] = (
     # Safety-net: no enable flag (self-healing must not be switchable off by a feature toggle);
     # gate_on_interval so an interval of 0 is the only way to disable it.
     _JobSpec(_scheduled_orphan_reap, "orphan_reap", "orphan_reap_interval", None, True),
+    # R2 §4.10: separate from orphan_reap on purpose — see _scheduled_static_route_reclaim.
+    # R1 mandates the activation pass run on activation (G18), hence the immediate first run;
+    # it is scheduled, never awaited, so readiness never waits on per-device NSO reads.
+    _JobSpec(
+        _scheduled_static_route_reclaim, "static_route_reclaim", "static_route_reclaim_interval", None, True, True
+    ),
     _JobSpec(_scheduled_lag_topology_refresh, "lag_topology_refresh", "lag_topology_poll_interval", None, True),
     _JobSpec(_scheduled_lag_config_refresh, "lag_config_refresh", "lag_config_poll_interval", None, True),
     _JobSpec(
@@ -733,7 +809,8 @@ def start_scheduler() -> None:
         interval = getattr(cfg.scheduler, spec.interval_attr)
         enabled = spec.enable_attr is None or getattr(cfg.scheduler, spec.enable_attr)
         if enabled and (not spec.gate_on_interval or interval > 0):
-            _scheduler.add_job(spec.fn, "interval", minutes=interval, id=spec.job_id)
+            extra = {"next_run_time": datetime.now(UTC)} if spec.run_immediately else {}
+            _scheduler.add_job(spec.fn, "interval", minutes=interval, id=spec.job_id, **extra)
     _scheduler.start()
     # A4: one immediate sync sweep so a process restart repopulates the operator-visible mirror
     # (routing + interface_ip, via sync_device) within seconds instead of waiting a full poll

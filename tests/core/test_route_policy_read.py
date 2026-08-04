@@ -7,13 +7,12 @@ import pytest
 from sqlalchemy import select
 
 # adapter_client inits the DB (runs app lifespan -> init_db -> create_all).
-from tests.conftest import adapter_client  # noqa: F401
+from tests.conftest import session
 
 
 @pytest.mark.asyncio
 async def test_read_carries_invert_match_and_canonicalizes_amp_large(adapter_client):  # noqa: F811
     from nso_adapter.core.route_policy import _upsert_route_policy_data
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import (
         Device,
         DeviceRoutePolicyCommunityList,
@@ -37,7 +36,7 @@ async def test_read_carries_invert_match_and_canonicalizes_amp_large(adapter_cli
         ]
     }
 
-    async for db in get_session():
+    async with session() as db:
         device = Device(
             nso_instance="default",
             nso_device_name="ra1",
@@ -84,7 +83,6 @@ async def test_duplicate_object_names_are_deduped_not_crashing(adapter_client): 
     prefix-list read) must not abort the WHOLE full-replace refresh on the (device, name) key
     — dedup keeps the first and the refresh still lands every other object."""
     from nso_adapter.core.route_policy import _upsert_route_policy_data
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device, DeviceRoutePolicyASPath, DeviceRoutePolicyPrefixList
 
     nso_data = {
@@ -98,7 +96,7 @@ async def test_duplicate_object_names_are_deduped_not_crashing(adapter_client): 
         ],
     }
 
-    async for db in get_session():
+    async with session() as db:
         device = Device(nso_instance="default", nso_device_name="ra1", netbox_device_id=9992, ned_id="timos-nc-23.10")
         db.add(device)
         await db.flush()
@@ -130,7 +128,6 @@ async def test_read_skips_malformed_entries_without_wiping_mirror(adapter_client
     that would crash the dialect (None.strip()) — must be skipped, not KeyError/AttributeError-
     abort the 4-family full-replace and wipe the whole mirror (s2-4)."""
     from nso_adapter.core.route_policy import _upsert_route_policy_data
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import (
         Device,
         DeviceRoutePolicyCommunityListEntry,
@@ -161,7 +158,7 @@ async def test_read_skips_malformed_entries_without_wiping_mirror(adapter_client
         ],
     }
 
-    async for db in get_session():
+    async with session() as db:
         device = Device(
             nso_instance="default", nso_device_name="ra-malformed", netbox_device_id=9993, ned_id="timos-nc-23.10"
         )

@@ -1,12 +1,14 @@
 FROM python:3.12-slim AS builder
-WORKDIR /build
+WORKDIR /app
 
 RUN pip install uv --no-cache-dir
 
-COPY pyproject.toml .
+# uv.lock + --frozen: the image ships the exact dependency set the suite tested,
+# instead of re-resolving at build time.
+COPY pyproject.toml uv.lock ./
 COPY nso_adapter/ nso_adapter/
 
-RUN uv sync --no-dev --no-cache
+RUN uv sync --no-dev --no-cache --frozen
 
 FROM python:3.12-slim
 WORKDIR /app
@@ -16,8 +18,8 @@ ENV PYTHONUNBUFFERED=1 \
     NO_PROXY="localhost,127.0.0.1" \
     no_proxy="localhost,127.0.0.1"
 
-COPY --from=builder /build/.venv /app/.venv
-COPY --from=builder /build/nso_adapter /app/nso_adapter
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /app/nso_adapter /app/nso_adapter
 
 # Migrations run at container start (entrypoint) — ship the alembic tree + ini.
 COPY alembic/ /app/alembic/

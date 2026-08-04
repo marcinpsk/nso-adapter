@@ -17,38 +17,34 @@ from nso_adapter.core.refresh_engine import FamilySpec, run_family_refresh_from_
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.nso.read_outcome import AbsentAuthoritative, Freshness, Present
 from nso_adapter.store import outcome_store
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, DeviceStaticRoute
-from tests.conftest import seed_device
+from tests.conftest import seed_device, session
 
 
 @asynccontextmanager
 async def _device_session(device_id: int):
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         assert device is not None
         yield db, device
         return
-    raise RuntimeError("no session")
 
 
 async def _fresh_prefixes(device_id: int) -> list[str]:
-    async for db in get_session():
+    async with session() as db:
         rows = (
             (await db.execute(select(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device_id)))
             .scalars()
             .all()
         )
         return [row.prefix for row in rows]
-    raise RuntimeError("no session")
 
 
 async def _seed_route(device_id: int, prefix: str) -> None:
-    async for db in get_session():
+    async with session() as db:
         db.add(DeviceStaticRoute(device_id=device_id, vrf="", prefix=prefix, next_hop="198.18.0.1"))
         await db.commit()
         return
-    raise RuntimeError("no session")
 
 
 @pytest.mark.parametrize(
@@ -90,11 +86,13 @@ async def test_engine_publishes_mirror_and_phase_two_in_one_commit(
                 )
             )
 
+    # A REGISTERED family: acquire_family_fence rejects an unknown name outright, and the
+    # probe's materializer writes DeviceStaticRoute rows, so static_route is the honest one.
     spec = FamilySpec(
-        name="transaction_probe",
+        name="static_route",
         extract=lambda data: data.get("route", []),
         materialize=_stage_routes,
-        wire_name="transaction-probe",
+        wire_name="static-route",
     )
     real_stage_result = outcome_store.stage_result
     visible_during_phase_two: list[list[str]] = []
@@ -119,11 +117,10 @@ async def test_engine_publishes_mirror_and_phase_two_in_one_commit(
     assert visible_during_phase_two == [["198.18.9.0/24"]]
     assert await _fresh_prefixes(device_id) == expected_before_phase_two
     assert await _fresh_prefixes(device_id) == expected_before_phase_two
-    async for db in get_session():
+    async with session() as db:
         current = await outcome_store.get_current_outcome(db, device_id, spec.name)
         assert current is not None
         assert (current.result, current.succeeded) == (expected_result, True)
-        break
 
 
 class _CommitForbiddenSession:
@@ -268,11 +265,10 @@ async def test_projected_fanout_keeps_an_earlier_family_durable_after_later_fail
 
     assert "isis" in failed
     assert await _fresh_prefixes(device_id) == ["198.18.30.0/24"]
-    async for fresh_db in get_session():
+    async with session() as fresh_db:
         static_outcome = await outcome_store.get_current_outcome(fresh_db, device_id, "static_route")
         isis_outcome = await outcome_store.get_current_outcome(fresh_db, device_id, "isis")
         assert static_outcome is not None
         assert (static_outcome.result, static_outcome.succeeded) == ("replaced", True)
         assert isis_outcome is not None
         assert (isis_outcome.result, isis_outcome.succeeded) == ("error", False)
-        break

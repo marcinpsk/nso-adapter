@@ -33,7 +33,7 @@ async def _upsert_ospf_data(
     await db.execute(delete(DeviceOspfInstance).where(DeviceOspfInstance.device_id == device.id))
     await db.execute(delete(DeviceOspfInterface).where(DeviceOspfInterface.device_id == device.id))
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
 
     for inst in instances:
         process_id = inst.get("process-id")

@@ -9,17 +9,16 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 
 async def _seed_mtu(device_id: int, rows: list[dict]) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceInterfaceMtu
 
-    async for db in get_session():
-        now = datetime.now(UTC).replace(tzinfo=None)
+    async with session() as db:
+        now = datetime.now(UTC)
         for r in rows:
             db.add(DeviceInterfaceMtu(device_id=device_id, last_refreshed_at=now, refresh_source="test", **r))
         await db.commit()
@@ -66,10 +65,9 @@ async def test_interface_mtu_requires_auth(adapter_client):
 
 
 async def _count_mtu_intent(device_id: int) -> int:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import InterfaceMtuIntent
 
-    async for db in get_session():
+    async with session() as db:
         rows = (
             (await db.execute(select(InterfaceMtuIntent).where(InterfaceMtuIntent.device_id == device_id)))
             .scalars()

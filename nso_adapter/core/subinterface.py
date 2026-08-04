@@ -25,7 +25,7 @@ logger = structlog.get_logger(__name__)
 
 async def _upsert_subinterface(db: AsyncSession, device: Device, interfaces: list[dict], refresh_source: str) -> None:
     """Full-replace the device's dot1q subinterface rows (the materializer)."""
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     await db.execute(delete(DeviceSubinterface).where(DeviceSubinterface.device_id == device.id))
     for item in interfaces:
         name = item.get("interface-name")

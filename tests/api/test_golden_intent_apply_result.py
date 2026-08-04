@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Golden-body test — the eight intent PUTs that share IntentApplyResult.
+"""Golden-body test — the intent PUTs that share IntentApplyResult.
 
 S1b write path. Each of these full-replace PUTs returns exactly
 ``{device_id, count, removed, replaced}``. A fresh device + a one-item body
 gives a deterministic ``{count: 1, removed: 0, replaced: False}`` (no existing
-rows to drop, no auto_apply configured). Deep-equality across all eight pins the
+rows to drop, no auto_apply configured). Deep-equality across all seven pins the
 shared shape; run before AND after wiring response_model=IntentApplyResult.
+
+Static routes have their own case below: #1396 R3 P0 EXTENDS the shared summary with a
+per-route ``routes`` echo, and the deep-equality assertion is what keeps that from silently
+spreading to the other seven.
 """
 
 from __future__ import annotations
@@ -19,7 +23,6 @@ AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 # (url-suffix, minimal valid request body) — one item each.
 CASES = [
-    ("static-route-intent", {"routes": [{"prefix": "10.0.0.0/8", "next_hop": "192.0.2.1"}]}),
     ("vlan-intent", {"vlans": [{"vlan_id": 100, "name": "DATA"}]}),
     ("svi-intent", {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100}]}),
     ("subinterface-intent", {"interfaces": [{"interface_name": "GE0/0.100"}]}),
@@ -37,3 +40,22 @@ async def test_intent_apply_result_golden(adapter_client, suffix, body):
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/{suffix}", json=body, headers=AUTH)
     assert resp.status_code == 200
     assert resp.json() == {"device_id": device_id, "count": 1, "removed": 0, "replaced": False}
+
+
+@pytest.mark.anyio
+async def test_static_route_intent_result_golden(adapter_client):
+    """The static-route PUT is the shared summary PLUS the settlement echo (#1396 R3 P0).
+
+    Deep equality, not a subset check: the echo is what the pusher records as its
+    expectation, so a key that quietly disappears from it is a settlement that silently
+    stops correlating.
+    """
+    device_id = await seed_device(nso_device_name="wr-static-route-intent", netbox_device_id=8001)
+    body = {"routes": [{"route_id": 41, "generation": 7, "prefix": "10.0.0.0/8", "next_hop": "192.0.2.1"}]}
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/static-route-intent", json=body, headers=AUTH)
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert set(payload) == {"device_id", "count", "removed", "replaced", "routes"}
+    assert (payload["device_id"], payload["count"], payload["removed"], payload["replaced"]) == (device_id, 1, 0, False)
+    assert [(r["route_id"], r["generation"]) for r in payload["routes"]] == [(41, 7)]
+    assert set(payload["routes"][0]) == {"route_id", "generation", "fingerprint"}

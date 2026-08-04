@@ -17,6 +17,7 @@ from tests.conftest import (
     VALID_TOKEN,
     pin_store_incarnation,
     seed_device,
+    session,
 )
 
 _SYNTH_READ_STATE = {
@@ -37,10 +38,9 @@ AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 
 async def _seed_mtu(device_id: int) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceInterfaceMtu
 
-    async for db in get_session():
+    async with session() as db:
         db.add(
             DeviceInterfaceMtu(
                 device_id=device_id,
@@ -55,7 +55,6 @@ async def _seed_mtu(device_id: int) -> None:
         # Minimal: all MTU values null, bound_port unset -> "".
         db.add(DeviceInterfaceMtu(device_id=device_id, interface_name="GE0/1", refresh_source="poll"))
         await db.commit()
-        break
 
 
 @pytest.mark.anyio

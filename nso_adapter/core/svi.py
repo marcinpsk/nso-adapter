@@ -25,7 +25,7 @@ logger = structlog.get_logger(__name__)
 
 async def _upsert_svi(db: AsyncSession, device: Device, interfaces: list[dict], refresh_source: str) -> None:
     """Full-replace the device's SVI/IRB rows (the materializer)."""
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     await db.execute(delete(DeviceSvi).where(DeviceSvi.device_id == device.id))
     for item in interfaces:
         name = item.get("interface-name")

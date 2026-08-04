@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from tests.conftest import VALID_TOKEN, seed_device, seed_l2_saps
+from tests.conftest import VALID_TOKEN, seed_device, seed_l2_saps, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -70,10 +70,9 @@ async def test_l2_services_unknown_device_is_404(adapter_client):
 async def _get_intents(device_id: int):
     from sqlalchemy import select
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import L2SapIntent
 
-    async for db in get_session():
+    async with session() as db:
         rows = (await db.execute(select(L2SapIntent).where(L2SapIntent.device_id == device_id))).scalars().all()
         return {(r.service_name, r.sap_id): r for r in rows}
     return {}

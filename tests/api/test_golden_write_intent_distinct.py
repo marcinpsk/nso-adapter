@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from nso_adapter.api.timestamps import iso_z
 from tests.conftest import VALID_TOKEN, seed_device
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -94,4 +95,4 @@ async def test_ip_intent_result_golden(adapter_client, monkeypatch):
 
 def test_frozen_datetime_is_fixed():
     """Guard the freeze helper itself (used by the two clock-stamped goldens)."""
-    assert _FrozenDatetime.now(UTC).replace(tzinfo=None).isoformat() + "Z" == FROZEN_ISO_Z
+    assert iso_z(_FrozenDatetime.now(UTC)) == FROZEN_ISO_Z

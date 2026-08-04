@@ -4,7 +4,7 @@
 
 PUT /isis-interface-intent (interfaces + processes + redistribution full-replace,
 auto-apply) and PUT /isis-flex-algo-intent (flex-algo full-replace + the
-removal -> replace_isis_service path). Real route, real SQLite session; only the
+removal -> replace_isis_service path). Real route, real PostgreSQL session; only the
 NSO HTTP boundary is faked, and only where the on-device service replace is asserted.
 """
 
@@ -13,16 +13,15 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 
 async def _seed_settings(device_id: int, *, auto_apply: bool):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceSettings
 
-    async for db in get_session():
+    async with session() as db:
         db.add(DeviceSettings(device_id=device_id, auto_apply=auto_apply))
         await db.commit()
         return
@@ -42,7 +41,6 @@ async def test_put_isis_intent_device_not_found(adapter_client):
 
 @pytest.mark.anyio
 async def test_put_isis_intent_creates_interfaces_and_processes(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import IsisInterfaceIntent, IsisProcessIntent
 
     device_id = await seed_device(nso_device_name="isis-create", netbox_device_id=980)
@@ -57,7 +55,7 @@ async def test_put_isis_intent_creates_interfaces_and_processes(adapter_client):
     assert resp.status_code == 200
     assert resp.json() == {"device_id": device_id, "interface_count": 2, "process_count": 1}
 
-    async for db in get_session():
+    async with session() as db:
         ifaces = (
             (await db.execute(select(IsisInterfaceIntent).where(IsisInterfaceIntent.device_id == device_id)))
             .scalars()
@@ -68,7 +66,6 @@ async def test_put_isis_intent_creates_interfaces_and_processes(adapter_client):
             .scalars()
             .all()
         )
-        break
     assert {(i.interface_name, i.af) for i in ifaces} == {("Gi0/0", "ipv4"), ("Gi0/0", "ipv6")}
     assert all(i.accepted_at is not None for i in ifaces)  # defaulted to now
     assert [p.process_tag for p in procs] == ["1"]
@@ -77,7 +74,6 @@ async def test_put_isis_intent_creates_interfaces_and_processes(adapter_client):
 
 @pytest.mark.anyio
 async def test_put_isis_intent_full_replace_and_update(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import IsisInterfaceIntent, IsisProcessIntent
 
     device_id = await seed_device(nso_device_name="isis-replace", netbox_device_id=981)
@@ -104,7 +100,7 @@ async def test_put_isis_intent_full_replace_and_update(adapter_client):
     assert resp.status_code == 200
     assert resp.json()["interface_count"] == 1 and resp.json()["process_count"] == 1
 
-    async for db in get_session():
+    async with session() as db:
         ifaces = (
             (await db.execute(select(IsisInterfaceIntent).where(IsisInterfaceIntent.device_id == device_id)))
             .scalars()
@@ -115,17 +111,15 @@ async def test_put_isis_intent_full_replace_and_update(adapter_client):
             .scalars()
             .all()
         )
-        break
     assert {(i.interface_name, i.af): i.metric for i in ifaces} == {("Gi0/0", "ipv4"): 99}  # Gi0/1 dropped, updated
     assert {p.process_tag: p.is_type for p in procs} == {"1": "level-2"}  # process 2 dropped, updated
 
 
 async def _isis_removal_jobs(device_id: int):
     """All queued IS-IS ``removal`` jobs for this device (real Job rows)."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
 
-    async for db in get_session():
+    async with session() as db:
         jobs = (
             (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal)))
             .scalars()
@@ -238,7 +232,6 @@ async def test_put_isis_intent_levels_create_and_full_replace(adapter_client):
     """Per-level process tuning rides the process entries ('levels') and lands in
     IsisLevelIntent rows keyed (device, process_tag, level) with full-replace
     semantics — a second PUT without a level deletes its row."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import IsisLevelIntent
 
     device_id = await seed_device(nso_device_name="isis-levels", netbox_device_id=982)
@@ -270,9 +263,8 @@ async def test_put_isis_intent_levels_create_and_full_replace(adapter_client):
     )
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         rows = (await db.execute(select(IsisLevelIntent).where(IsisLevelIntent.device_id == device_id))).scalars().all()
-        break
     assert {(r.process_tag, r.level): (r.wide_metrics_only, r.labeled_preference, r.disabled) for r in rows} == {
         ("", 2): (None, 9, None)  # level 1 dropped; level 2 updated
     }
@@ -280,7 +272,6 @@ async def test_put_isis_intent_levels_create_and_full_replace(adapter_client):
 
 @pytest.mark.anyio
 async def test_put_isis_intent_redistribution_create_and_replace(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import RedistributionIntent
 
     device_id = await seed_device(nso_device_name="isis-redist", netbox_device_id=982)
@@ -314,13 +305,12 @@ async def test_put_isis_intent_redistribution_create_and_replace(adapter_client)
     )
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         rows = (
             (await db.execute(select(RedistributionIntent).where(RedistributionIntent.device_id == device_id)))
             .scalars()
             .all()
         )
-        break
     assert len(rows) == 1  # static dropped
     assert rows[0].dest_protocol == "isis" and rows[0].dest_ref == "1"
     assert (rows[0].source_protocol, rows[0].route_map, rows[0].metric) == ("bgp", "RM-B", 50)  # updated in place
@@ -328,7 +318,6 @@ async def test_put_isis_intent_redistribution_create_and_replace(adapter_client)
 
 @pytest.mark.anyio
 async def test_put_isis_intent_auto_apply_enqueues_job(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
 
     device_id = await seed_device(nso_device_name="isis-auto", netbox_device_id=983)
@@ -341,11 +330,10 @@ async def test_put_isis_intent_auto_apply_enqueues_job(adapter_client):
     )
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         job = (
             await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.apply))
         ).scalar_one_or_none()
-        break
     assert job is not None
 
 
@@ -362,7 +350,6 @@ async def test_put_flex_algo_device_not_found(adapter_client):
 
 @pytest.mark.anyio
 async def test_put_flex_algo_creates_and_updates_in_place(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import IsisFlexAlgoIntent
 
     device_id = await seed_device(nso_device_name="isis-flex", netbox_device_id=984)
@@ -382,20 +369,18 @@ async def test_put_flex_algo_creates_and_updates_in_place(adapter_client):
     )
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         rows = (
             (await db.execute(select(IsisFlexAlgoIntent).where(IsisFlexAlgoIntent.device_id == device_id)))
             .scalars()
             .all()
         )
-        break
     assert len(rows) == 1  # not duplicated
     assert rows[0].priority == 200
 
 
 @pytest.mark.anyio
 async def test_put_flex_algo_auto_apply_enqueues_job(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
 
     device_id = await seed_device(nso_device_name="isis-flex-auto", netbox_device_id=985)
@@ -408,11 +393,10 @@ async def test_put_flex_algo_auto_apply_enqueues_job(adapter_client):
     )
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         job = (
             await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.apply))
         ).scalar_one_or_none()
-        break
     assert job is not None
 
 
@@ -424,7 +408,6 @@ async def test_put_flex_algo_removal_queues_the_guarded_removal_job(adapter_clie
     choke point that enforces STORE_ONLY (#103), the un-own detach (#106) and the collateral
     orphan guard (#90). The device must not be touched from the request path at all.
     """
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
 
     touched: list = []
@@ -450,13 +433,12 @@ async def test_put_flex_algo_removal_queues_the_guarded_removal_job(adapter_clie
     assert resp.json() == {"device_id": device_id, "flex_algo_count": 0, "removal_queued": True}
     assert touched == []  # the request path never reached NSO
 
-    async for db in get_session():
+    async with session() as db:
         jobs = (
             (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal)))
             .scalars()
             .all()
         )
-        break
     assert len(jobs) == 1
     assert jobs[0].context["scope"] == "isis"
 
@@ -469,7 +451,6 @@ async def test_put_flex_algo_unmarked_shrink_detaches(adapter_client):
     retract config from the live device. Routing through enqueue_removal is what gives the
     flex-algo scope these semantics — the old inline replace always hard-retracted.
     """
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
 
     device_id = await seed_device(nso_device_name="isis-flex-detach", netbox_device_id=987)
@@ -485,18 +466,16 @@ async def test_put_flex_algo_unmarked_shrink_detaches(adapter_client):
     )
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         job = (
             await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal))
         ).scalar_one()
-        break
     assert job.context.get("detach") is True
 
 
 @pytest.mark.anyio
 async def test_put_flex_algo_delete_origin_shrink_retracts(adapter_client):
     """A ?delete_origin=true flex-algo shrink is a real deletion → a retracting job (no detach)."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
 
     device_id = await seed_device(nso_device_name="isis-flex-del", netbox_device_id=988)
@@ -512,17 +491,15 @@ async def test_put_flex_algo_delete_origin_shrink_retracts(adapter_client):
     )
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         job = (
             await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal))
         ).scalar_one()
-        break
     assert job.context.get("detach") is None  # a deletion retracts for real
 
 
 @pytest.mark.anyio
 async def test_put_isis_intent_stores_bfd_enabled(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import IsisInterfaceIntent
 
     device_id = await seed_device(nso_device_name="isis-bfd", netbox_device_id=990)
@@ -532,13 +509,12 @@ async def test_put_isis_intent_stores_bfd_enabled(adapter_client):
         json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "bfd_enabled": True, "passive": False}]},
     )
     assert resp.status_code == 200
-    async for db in get_session():
+    async with session() as db:
         row = (
             (await db.execute(select(IsisInterfaceIntent).where(IsisInterfaceIntent.device_id == device_id)))
             .scalars()
             .one()
         )
-        break
     assert row.bfd_enabled is True
 
 
@@ -676,7 +652,6 @@ async def test_clearing_a_scalar_under_store_only_touches_nothing(adapter_client
 async def test_put_isis_intent_stores_frr(adapter_client):
     """#83: interface frr_enabled/frr_protection and process fast_reroute/
     microloop_avoidance persist on the intent rows."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import IsisInterfaceIntent, IsisProcessIntent
 
     device_id = await seed_device(nso_device_name="isis-frr-int", netbox_device_id=992)
@@ -697,7 +672,7 @@ async def test_put_isis_intent_stores_frr(adapter_client):
         },
     )
     assert resp.status_code == 200
-    async for db in get_session():
+    async with session() as db:
         irow = (
             (await db.execute(select(IsisInterfaceIntent).where(IsisInterfaceIntent.device_id == device_id)))
             .scalars()
@@ -708,7 +683,6 @@ async def test_put_isis_intent_stores_frr(adapter_client):
             .scalars()
             .one()
         )
-        break
     assert irow.frr_enabled is True
     assert irow.frr_protection == "node"
     assert prow.fast_reroute == "ti-lfa"

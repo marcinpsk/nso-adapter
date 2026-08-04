@@ -3,9 +3,9 @@
 """Two-phase refresh-outcome store (READSEM §2.4).
 
 Covers the store functions directly (phase 1 / phase 2 / pointer CAS) AND their integration
-through the shared refresh engine (run_family_refresh records both phases). The store commits in
-its OWN session on the caller's engine, so every assertion reads back in a FRESH session — which
-also proves the outcome was committed independently of the caller's transaction.
+through the shared refresh engine (run_family_refresh records both phases). Both phases run on
+the CALLER's session (the C1 contract); every assertion reads back in a FRESH session, which is
+what proves phase 2 committed rather than merely staged.
 """
 
 from __future__ import annotations
@@ -23,13 +23,12 @@ from nso_adapter.nso.read_outcome import (
     UnavailableReason,
 )
 from nso_adapter.store import outcome_store
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, RefreshOutcome, RefreshOutcomePointer
-from tests.conftest import seed_device
+from tests.conftest import seed_device, session
 
 
 async def _pointer(device_id: int, family: str) -> RefreshOutcomePointer | None:
-    async for db in get_session():
+    async with session() as db:
         return (
             await db.execute(
                 select(RefreshOutcomePointer).where(
@@ -49,7 +48,7 @@ async def test_record_read_outcome_phase1_flushed_in_session(adapter_client):
     """Phase 1 flushes the classified read outcome onto the caller's session — visible in-session
     with its attempt id assigned, no result/pointer yet (it rides the caller's transaction)."""
     device_id = await seed_device(nso_device_name="oc-p1", netbox_device_id=8801)
-    async for db in get_session():
+    async with session() as db:
         attempt_id = await outcome_store.record_read_outcome(
             db, device_id, "static_route", Present({"route": []}, Freshness.fresh), refresh_source="poll"
         )
@@ -70,22 +69,19 @@ async def test_record_read_outcome_phase1_flushed_in_session(adapter_client):
             )
         ).scalar_one_or_none()
         assert ptr is None
-        break
 
 
 @pytest.mark.anyio
 async def test_unavailable_read_reason_recorded(adapter_client):
     """An unavailable read records its reason; record_result commits it so a fresh session sees it."""
     device_id = await seed_device(nso_device_name="oc-unavail", netbox_device_id=8802)
-    async for db in get_session():
+    async with session() as db:
         attempt_id = await outcome_store.record_read_outcome(
             db, device_id, "bgp", Unavailable(UnavailableReason.export_down), refresh_source="sse"
         )
         await outcome_store.record_result(db, attempt_id, result="kept", succeeded=False, row_count=None)
-        break
-    async for db in get_session():
+    async with session() as db:
         row = await db.get(RefreshOutcome, attempt_id)
-        break
     assert row.read_outcome == "unavailable"
     assert row.read_reason == "export_down"
     assert row.freshness is None
@@ -94,15 +90,13 @@ async def test_unavailable_read_reason_recorded(adapter_client):
 @pytest.mark.anyio
 async def test_record_result_terminalizes_and_creates_pointer(adapter_client):
     device_id = await seed_device(nso_device_name="oc-p2", netbox_device_id=8803)
-    async for db in get_session():
+    async with session() as db:
         attempt_id = await outcome_store.record_read_outcome(
             db, device_id, "isis", AbsentAuthoritative(), refresh_source="poll"
         )
         await outcome_store.record_result(db, attempt_id, result="cleared", succeeded=True, row_count=0)
-        break
-    async for db in get_session():
+    async with session() as db:
         row = await db.get(RefreshOutcome, attempt_id)
-        break
     assert row.read_outcome == "absent_authoritative"
     assert row.result == "cleared"
     assert row.succeeded is True
@@ -119,7 +113,7 @@ async def test_pointer_does_not_regress_when_older_attempt_finishes_late(adapter
     terminalizes LATER — its id is older, so it must NOT regress the pointer onto its stale result.
     """
     device_id = await seed_device(nso_device_name="oc-race", netbox_device_id=8804)
-    async for db in get_session():
+    async with session() as db:
         a = await outcome_store.record_read_outcome(
             db, device_id, "ospf", Unavailable(UnavailableReason.read_error), refresh_source="poll"
         )
@@ -130,7 +124,6 @@ async def test_pointer_does_not_regress_when_older_attempt_finishes_late(adapter
         # B (newer) terminalizes first, then A (older) terminalizes late.
         await outcome_store.record_result(db, b, result="replaced", succeeded=True, row_count=2)
         await outcome_store.record_result(db, a, result="kept", succeeded=False, row_count=None)
-        break
 
     ptr = await _pointer(device_id, "ospf")
     assert ptr.attempt_id == b  # newest by start order, NOT the later-finishing older A
@@ -141,7 +134,7 @@ async def test_pointer_shows_newest_failure(adapter_client):
     """A newest attempt that FAILED must become the current pointer — a failure is never hidden
     behind an older success."""
     device_id = await seed_device(nso_device_name="oc-fail", netbox_device_id=8805)
-    async for db in get_session():
+    async with session() as db:
         a = await outcome_store.record_read_outcome(
             db, device_id, "snmp", Present({}, Freshness.fresh), refresh_source="poll"
         )
@@ -150,13 +143,11 @@ async def test_pointer_shows_newest_failure(adapter_client):
             db, device_id, "snmp", Unavailable(UnavailableReason.export_down), refresh_source="poll"
         )
         await outcome_store.record_result(db, b, result="kept", succeeded=False, row_count=None)
-        break
 
     ptr = await _pointer(device_id, "snmp")
     assert ptr.attempt_id == b
-    async for db in get_session():
+    async with session() as db:
         current = await db.get(RefreshOutcome, ptr.attempt_id)
-        break
     assert current.succeeded is False  # newest failure is the current, visible outcome
 
 
@@ -164,7 +155,7 @@ async def test_pointer_shows_newest_failure(adapter_client):
 async def test_kept_outcome_advances_attempt_but_preserves_payload_revision(adapter_client):
     """#1332: a failed/unavailable read changes declared truth but not the mirror body."""
     device_id = await seed_device(nso_device_name="oc-revision-keep", netbox_device_id=8891)
-    async for db in get_session():
+    async with session() as db:
         published = await outcome_store.record_read_outcome(
             db, device_id, "static_route", Present({}, Freshness.fresh), refresh_source="poll"
         )
@@ -179,7 +170,6 @@ async def test_kept_outcome_advances_attempt_but_preserves_payload_revision(adap
             refresh_source="poll",
         )
         await outcome_store.record_result(db, kept, result="kept", succeeded=False)
-        break
 
     ptr = await _pointer(device_id, "static_route")
     assert ptr.attempt_id == kept
@@ -189,7 +179,7 @@ async def test_kept_outcome_advances_attempt_but_preserves_payload_revision(adap
 @pytest.mark.anyio
 async def test_attempt_captures_device_source_epoch(adapter_client):
     device_id = await seed_device(nso_device_name="oc-source-epoch", netbox_device_id=8892)
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         assert device.source_epoch == 1
         attempt_id = await outcome_store.record_read_outcome(
@@ -202,15 +192,13 @@ async def test_attempt_captures_device_source_epoch(adapter_client):
         )
         row = await db.get(RefreshOutcome, attempt_id)
         assert row.source_epoch == 1
-        break
 
 
 @pytest.mark.anyio
 async def test_record_result_unknown_attempt_is_noop(adapter_client):
     """A result for a nonexistent attempt id is a logged no-op, not a crash (best-effort store)."""
-    async for db in get_session():
+    async with session() as db:
         await outcome_store.record_result(db, 999999, result="replaced", succeeded=True, row_count=0)
-        break  # must not raise
 
 
 # ── engine integration ───────────────────────────────────────────────────────────────────
@@ -222,7 +210,7 @@ async def test_engine_records_two_phase_outcome_and_pointer(adapter_client):
     from nso_adapter.core.static_route import refresh_static_routes_for_device
 
     device_id = await seed_device(nso_device_name="oc-eng-ok", netbox_device_id=8806)
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         client = AsyncMock()
         client.get_device_state_section.return_value = {
@@ -230,11 +218,9 @@ async def test_engine_records_two_phase_outcome_and_pointer(adapter_client):
             "route": [{"prefix": "10.0.0.0/8", "next-hop": "1.1.1.1"}],
         }
         await refresh_static_routes_for_device(db, device, client, refresh_source="poll")
-        break
 
-    async for db in get_session():
+    async with session() as db:
         rows = (await db.execute(select(RefreshOutcome).where(RefreshOutcome.device_id == device_id))).scalars().all()
-        break
     assert len(rows) == 1
     row = rows[0]
     assert (row.family, row.read_outcome, row.result, row.succeeded, row.row_count) == (
@@ -248,6 +234,67 @@ async def test_engine_records_two_phase_outcome_and_pointer(adapter_client):
     assert ptr is not None and ptr.attempt_id == row.id
 
 
+# Every store entry point the refresh engine can reach. Phase 2 is stage_result on the
+# PUBLISH path and record_result on the keep/error paths, so a spy set narrower than this
+# would pass vacuously on whichever path it happened not to cover.
+_STORE_ENTRY_POINTS = (
+    "record_read_outcome",
+    "stage_result",
+    "record_result",
+    "acquire_family_fence",
+    "publication_is_current",
+)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("section", "phase_two_writer"),
+    [
+        ({"status": "ok", "route": [{"prefix": "10.0.0.0/8", "next-hop": "1.1.1.1"}]}, "stage_result"),
+        ({"status": "error", "error-reason": "export down"}, "record_result"),
+    ],
+    ids=("publish", "keep"),
+)
+async def test_every_outcome_phase_runs_on_the_callers_session(adapter_client, monkeypatch, section, phase_two_writer):
+    """C1: the caller-session contract, asserted through a REAL refresh path.
+
+    Phase 1 only flushes, so an independent session cannot see the attempt row — the publish
+    path's ``db.get(RefreshOutcome, attempt_id)`` then finds nothing and phase 2 degrades to
+    the unknown_attempt no-op — and the 1332 publication invariant needs mirror rows + pointer
+    + payload_revision to commit together, which only the session holding the mirror writes
+    can do. Every other test here reads back through a fresh session, so both failures would
+    be invisible to them; this one pins the session OBJECT itself, on both phase-2 paths.
+    """
+    from nso_adapter.core.static_route import refresh_static_routes_for_device
+
+    # wraps=: the real store functions still run, so this asserts the contract on a genuine
+    # two-phase record rather than on a stubbed-out call graph.
+    spies = {name: AsyncMock(wraps=getattr(outcome_store, name)) for name in _STORE_ENTRY_POINTS}
+    for name, spy in spies.items():
+        monkeypatch.setattr(outcome_store, name, spy)
+
+    device_id = await seed_device(nso_device_name=f"oc-c1-{phase_two_writer}", netbox_device_id=8808)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        client = AsyncMock()
+        client.get_device_state_section.return_value = section
+        await refresh_static_routes_for_device(db, device, client, refresh_source="poll")
+
+        assert spies["record_read_outcome"].await_count == 1, "phase 1 never ran — the guard would prove nothing"
+        assert spies[phase_two_writer].await_count >= 1, f"phase 2 did not go through {phase_two_writer}"
+        for name, spy in spies.items():
+            for call in spy.await_args_list:
+                assert call.args[0] is db, f"outcome_store.{name} ran on a session that is not the caller's"
+
+    # ...and the contract delivered: the attempt terminalized and the pointer advanced, which
+    # is exactly what an independent session would have failed to do.
+    async with session() as db:
+        row = (await db.execute(select(RefreshOutcome).where(RefreshOutcome.device_id == device_id))).scalar_one()
+    assert row.result is not None and row.completed_at is not None
+    ptr = await _pointer(device_id, "static_route")
+    assert ptr is not None and ptr.attempt_id == row.id
+
+
 @pytest.mark.anyio
 async def test_engine_records_unavailable_outcome(adapter_client):
     """A degraded read records read_outcome=unavailable + result=kept + succeeded=False."""
@@ -255,17 +302,15 @@ async def test_engine_records_unavailable_outcome(adapter_client):
     from nso_adapter.nso.client import NsoExportUnavailableError
 
     device_id = await seed_device(nso_device_name="oc-eng-down", netbox_device_id=8807)
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         client = AsyncMock()
         client.get_device_state_section.side_effect = NsoExportUnavailableError("export down")
         ok = await refresh_static_routes_for_device(db, device, client)
         assert ok is False
-        break
 
-    async for db in get_session():
+    async with session() as db:
         row = (await db.execute(select(RefreshOutcome).where(RefreshOutcome.device_id == device_id))).scalars().one()
-        break
     assert row.read_outcome == "unavailable"
     assert row.read_reason == "export_down"
     assert row.result == "kept"
@@ -279,7 +324,7 @@ async def test_engine_records_unavailable_outcome(adapter_client):
 async def test_get_current_outcome_returns_newest_terminal(adapter_client):
     """The accessor resolves the pointer to the newest TERMINAL attempt's full row."""
     device_id = await seed_device(nso_device_name="oc-acc1", netbox_device_id=8811)
-    async for db in get_session():
+    async with session() as db:
         a1 = await outcome_store.record_read_outcome(
             db, device_id, "static_route", Present({"r": []}, Freshness.fresh), refresh_source="poll"
         )
@@ -292,8 +337,7 @@ async def test_get_current_outcome_returns_newest_terminal(adapter_client):
             refresh_source="poll",
         )
         await outcome_store.record_result(db, a2, result="kept", succeeded=False)
-        break
-    async for db in get_session():
+    async with session() as db:
         row = await outcome_store.get_current_outcome(db, device_id, "static_route")
         assert row is not None
         assert row.id == a2  # the newest terminal — a failure stays visible
@@ -303,38 +347,34 @@ async def test_get_current_outcome_returns_newest_terminal(adapter_client):
             "kept",
             False,
         )
-        break
 
 
 @pytest.mark.anyio
 async def test_get_current_outcome_none_without_pointer(adapter_client):
     """No pointer (family never terminalized) → None; the API synthesizes not_ready from it."""
     device_id = await seed_device(nso_device_name="oc-acc2", netbox_device_id=8812)
-    async for db in get_session():
+    async with session() as db:
         # a phase-1-only attempt must NOT surface (not terminal, no pointer)
         await outcome_store.record_read_outcome(
             db, device_id, "bgp", Present({"routers": []}, Freshness.fresh), refresh_source="poll"
         )
         assert await outcome_store.get_current_outcome(db, device_id, "bgp") is None
-        break
 
 
 @pytest.mark.anyio
 async def test_get_current_outcomes_maps_families_in_one_query(adapter_client):
     """The bulk accessor returns {family: newest-terminal-row} for every pointed family."""
     device_id = await seed_device(nso_device_name="oc-acc3", netbox_device_id=8813)
-    async for db in get_session():
+    async with session() as db:
         a1 = await outcome_store.record_read_outcome(
             db, device_id, "svi", Present({"svis": []}, Freshness.fresh), refresh_source="poll"
         )
         await outcome_store.record_result(db, a1, result="replaced", succeeded=True, row_count=1)
         a2 = await outcome_store.record_read_outcome(db, device_id, "bfd", AbsentAuthoritative(), refresh_source="poll")
         await outcome_store.record_result(db, a2, result="cleared", succeeded=True, row_count=0)
-        break
-    async for db in get_session():
+    async with session() as db:
         by_family = await outcome_store.get_current_outcomes(db, device_id)
         assert set(by_family) == {"svi", "bfd"}
         assert by_family["svi"].id == a1
         assert by_family["bfd"].id == a2
         assert by_family["bfd"].read_outcome == "absent_authoritative"
-        break

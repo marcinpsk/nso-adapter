@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -33,14 +33,12 @@ SUBIF_IFACE_KEYS = {"interface_name", "parent_interface", "dot1q_vlan", "type", 
 
 @pytest.mark.anyio
 async def test_vlan_database_contract(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceVlan
 
     device_id = await seed_device(nso_device_name="l2-vlan", netbox_device_id=7950)
-    async for db in get_session():
+    async with session() as db:
         db.add(DeviceVlan(device_id=device_id, vlan_id=100, name="DATA", refresh_source="poll"))
         await db.commit()
-        break
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/vlan-database", headers=AUTH)).json()
     assert set(body.keys()) == VLAN_TOP_KEYS
@@ -50,14 +48,12 @@ async def test_vlan_database_contract(adapter_client):
 
 @pytest.mark.anyio
 async def test_switchport_contract(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceSwitchport
 
     device_id = await seed_device(nso_device_name="l2-sw", netbox_device_id=7951)
-    async for db in get_session():
+    async with session() as db:
         db.add(DeviceSwitchport(device_id=device_id, interface_name="GE0/1", mode="access", refresh_source="poll"))
         await db.commit()
-        break
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/switchport", headers=AUTH)).json()
     assert set(body.keys()) == SWITCHPORT_TOP_KEYS
@@ -68,11 +64,10 @@ async def test_switchport_contract(adapter_client):
 
 @pytest.mark.anyio
 async def test_svi_contract(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceSvi
 
     device_id = await seed_device(nso_device_name="l2-svi", netbox_device_id=7952)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             DeviceSvi(
                 device_id=device_id,
@@ -84,7 +79,6 @@ async def test_svi_contract(adapter_client):
             )
         )
         await db.commit()
-        break
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/svi", headers=AUTH)).json()
     assert set(body.keys()) == SVI_TOP_KEYS
@@ -95,11 +89,10 @@ async def test_svi_contract(adapter_client):
 
 @pytest.mark.anyio
 async def test_subinterface_contract(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceSubinterface
 
     device_id = await seed_device(nso_device_name="l2-subif", netbox_device_id=7953)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             DeviceSubinterface(
                 device_id=device_id,
@@ -112,7 +105,6 @@ async def test_subinterface_contract(adapter_client):
             )
         )
         await db.commit()
-        break
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/subinterface", headers=AUTH)).json()
     assert set(body.keys()) == SUBIF_TOP_KEYS

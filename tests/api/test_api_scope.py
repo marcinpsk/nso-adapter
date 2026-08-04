@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -193,10 +193,9 @@ async def test_put_scope_requires_auth(adapter_client):
 async def _load_failover(device_id: int):
     from sqlalchemy import select
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceFailover
 
-    async for db in get_session():
+    async with session() as db:
         return (
             await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device_id))
         ).scalar_one_or_none()
@@ -222,10 +221,9 @@ async def test_put_scope_without_ips_leaves_failover_state_untouched(adapter_cli
     """A scope PUT that omits the IP fields must NOT clear IPs or reset failover state."""
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="scope-failover-keep", netbox_device_id=702)
     # Seed a failed-over row with live state.
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceFailover
 
-    async for db in get_session():
+    async with session() as db:
         db.add(
             DeviceFailover(
                 device_id=device_id,
@@ -236,7 +234,6 @@ async def test_put_scope_without_ips_leaves_failover_state_untouched(adapter_cli
             )
         )
         await db.commit()
-        break
 
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/scope",

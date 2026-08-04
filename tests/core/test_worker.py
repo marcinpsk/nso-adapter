@@ -8,34 +8,31 @@ import asyncio
 from unittest.mock import patch
 
 from nso_adapter.core import worker
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
+from tests.conftest import session
 
 
 async def _seed_device(nso_device_name: str = "wrk-rtr", netbox_id: int = 700) -> int:
-    async for db in get_session():
+    async with session() as db:
         d = Device(nso_instance="nso-dev", nso_device_name=nso_device_name, netbox_device_id=netbox_id)
         db.add(d)
         await db.commit()
         await db.refresh(d)
         return d.id
-    raise RuntimeError("no session")
 
 
 async def _seed_job(device_id: int, job_type: JobType, status: JobStatus) -> int:
-    async for db in get_session():
+    async with session() as db:
         j = Job(job_type=job_type, device_id=device_id, status=status)
         db.add(j)
         await db.commit()
         await db.refresh(j)
         return j.id
-    raise RuntimeError("no session")
 
 
 async def _get_job(job_id: int) -> Job:
-    async for db in get_session():
+    async with session() as db:
         return await db.get(Job, job_id)
-    raise RuntimeError("no session")
 
 
 # ── _claim_next_job ─────────────────────────────────────────────────────────────
@@ -51,7 +48,7 @@ async def test_claim_next_job_claims_oldest_queued(adapter_client):
 
     claimed = await worker._claim_next_job()
     assert claimed is not None
-    job_id, claimed_device, job_type = claimed
+    job_id, claimed_device, job_type, reg = claimed
     assert job_id == first  # oldest first
     assert claimed_device == device_id
     assert job_type == JobType.sync
@@ -60,6 +57,18 @@ async def test_claim_next_job_claims_oldest_queued(adapter_client):
     assert job.status == JobStatus.running
     assert job.started_at is not None
     assert job.heartbeat_at is not None
+
+    # The device is now CLAIMED, and the claim is associated with the job it started — in
+    # the same transaction as the running transition, so no window exists where a running
+    # job has an unassociated claim.
+    assert reg.registered
+    async with session() as db:
+        from nso_adapter.store.models import DeviceClaim
+
+        claim = await db.get(DeviceClaim, device_id)
+        assert claim is not None
+        assert claim.claim_token == reg.token
+        assert claim.job_id == first
 
 
 async def test_claim_next_job_returns_none_when_empty(adapter_client):
@@ -114,11 +123,10 @@ async def test_requeue_orphaned_leaves_terminal_and_queued(adapter_client):
 
 
 async def _set_heartbeat(job_id: int, hb) -> None:
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         job.heartbeat_at = hb
         await db.commit()
-        break
 
 
 async def test_requeue_orphaned_leaves_live_heartbeating_job(adapter_client):
@@ -130,7 +138,7 @@ async def test_requeue_orphaned_leaves_live_heartbeating_job(adapter_client):
     sync_id = await _seed_job(device_id, JobType.sync, JobStatus.running)
     apply_device = await _seed_device("wrk-live-apply", 721)
     apply_id = await _seed_job(apply_device, JobType.apply, JobStatus.running)
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     await _set_heartbeat(sync_id, now)
     await _set_heartbeat(apply_id, now)
 
@@ -142,15 +150,21 @@ async def test_requeue_orphaned_leaves_live_heartbeating_job(adapter_client):
 
 
 async def test_requeue_orphaned_recovers_stale_heartbeat(adapter_client):
-    """A running job whose heartbeat went stale (worker died) is recovered: idempotent
-    types requeued, apply failed (s3-4)."""
+    """A running job that NO claim covers, stale past the claimless cutoff, is recovered.
+
+    The cutoff is the claimless one now, not 60s: a claimed job recovers through the claim
+    scan instead, on one clock. Two clocks would let a still-valid holder overwrite the
+    disposition a shorter clock had just written.
+    """
     from datetime import UTC, datetime, timedelta
+
+    from nso_adapter.core.claim import PROVISION_STALE_AFTER
 
     device_id = await _seed_device("wrk-stale-sync", 722)
     sync_id = await _seed_job(device_id, JobType.sync, JobStatus.running)
     apply_device = await _seed_device("wrk-stale-apply", 723)
     apply_id = await _seed_job(apply_device, JobType.apply, JobStatus.running)
-    stale = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=300)
+    stale = datetime.now(UTC) - timedelta(seconds=PROVISION_STALE_AFTER + 60)
     await _set_heartbeat(sync_id, stale)
     await _set_heartbeat(apply_id, stale)
 
@@ -162,12 +176,33 @@ async def test_requeue_orphaned_recovers_stale_heartbeat(adapter_client):
     assert apply_job.error["code"] == "orphaned"
 
 
+async def test_requeue_orphaned_supersedes_behind_a_queued_successor(adapter_client):
+    """The claimless reaper hits the same uniqueness slot: a queued same-type successor
+    already occupies (device, type), so requeueing the stale row would raise and abort
+    startup recovery wholesale. It must land failed/superseded instead."""
+    from datetime import UTC, datetime, timedelta
+
+    from nso_adapter.core.claim import PROVISION_STALE_AFTER
+
+    device_id = await _seed_device("wrk-succ-sync", 724)
+    job_id = await _seed_job(device_id, JobType.sync, JobStatus.running)
+    successor_id = await _seed_job(device_id, JobType.sync, JobStatus.queued)
+    await _set_heartbeat(job_id, datetime.now(UTC) - timedelta(seconds=PROVISION_STALE_AFTER + 60))
+
+    await worker.requeue_orphaned_jobs()
+
+    superseded = await _get_job(job_id)
+    assert superseded.status == JobStatus.failed
+    assert superseded.error["code"] == "superseded"
+    assert (await _get_job(successor_id)).status == JobStatus.queued
+
+
 async def test_periodic_reap_recovers_stale_orphan_but_spares_live(adapter_client):
     """The PERIODIC scheduler tick (not just startup) reaps a stale orphan while leaving a live
     heartbeating job untouched — proving the reaper is safe to run concurrently with the worker
     pool. This closes the 'orphan blocks the device forever' gap: without a periodic tick, a job
     stranded 'running' in a long-lived process (worker task killed mid-run, no restart) would make
-    get_active_job treat it as in-flight and 409 every future job for that device until the next
+    the queued-type dedupe treat it as in-flight and 409 every future job of that type until the next
     restart — the same failure the plugin's reconcile enqueue once had."""
     from datetime import UTC, datetime, timedelta
 
@@ -180,10 +215,13 @@ async def test_periodic_reap_recovers_stale_orphan_but_spares_live(adapter_clien
     apply_device = await _seed_device("reap-stale-apply", 742)
     apply_id = await _seed_job(apply_device, JobType.apply, JobStatus.running)
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
+    from nso_adapter.core.claim import PROVISION_STALE_AFTER
+
+    old = now - timedelta(seconds=PROVISION_STALE_AFTER + 60)
     await _set_heartbeat(live_id, now)  # fresh heartbeat → a live worker owns it
-    await _set_heartbeat(stale_id, now - timedelta(seconds=300))  # stale → orphaned
-    await _set_heartbeat(apply_id, now - timedelta(seconds=300))
+    await _set_heartbeat(stale_id, old)  # stale past the claimless cutoff → orphaned
+    await _set_heartbeat(apply_id, old)
 
     await scheduler._scheduled_orphan_reap()
 
@@ -257,11 +295,11 @@ async def test_worker_loop_drains_queue(adapter_client):
     ran = asyncio.Event()
     seen: dict = {}
 
-    async def fake_runner(jid: int, did: int) -> None:
+    async def fake_runner(jid: int, did: int, _reg=None) -> None:
         seen["job_id"] = jid
         seen["device_id"] = did
         # Runner owns the terminal status, mirroring the real runners.
-        async for db in get_session():
+        async with session() as db:
             job = await db.get(Job, jid)
             job.status = JobStatus.succeeded
             await db.commit()
@@ -285,7 +323,7 @@ async def test_worker_loop_marks_failed_when_runner_raises(adapter_client):
 
     raised = asyncio.Event()
 
-    async def boom_runner(jid: int, did: int) -> None:
+    async def boom_runner(jid: int, did: int, _reg=None) -> None:
         raised.set()
         raise RuntimeError("kaboom")
 
@@ -312,8 +350,8 @@ async def test_start_and_stop_workers(adapter_client):
     orphan = await _seed_job(device_id, JobType.detect_drift, JobStatus.running)
 
     # No-op runner so nothing actually executes against NSO.
-    async def noop_runner(jid: int, did: int) -> None:
-        async for db in get_session():
+    async def noop_runner(jid: int, did: int, _reg=None) -> None:
+        async with session() as db:
             job = await db.get(Job, jid)
             job.status = JobStatus.succeeded
             await db.commit()
@@ -344,7 +382,7 @@ async def test_cancelled_worker_requeues_its_running_claim(adapter_client):
 
     started = asyncio.Event()
 
-    async def hanging_runner(jid: int, did: int) -> None:
+    async def hanging_runner(jid: int, did: int, _reg=None) -> None:
         started.set()
         await asyncio.sleep(60)
 
@@ -370,8 +408,8 @@ async def test_cancel_after_success_never_requeues(adapter_client):
 
     done = asyncio.Event()
 
-    async def succeed_then_hang(jid: int, did: int) -> None:
-        async for db in get_session():
+    async def succeed_then_hang(jid: int, did: int, _reg=None) -> None:
+        async with session() as db:
             job = await db.get(Job, jid)
             job.status = JobStatus.succeeded
             await db.commit()
@@ -392,8 +430,8 @@ async def test_ensure_workers_respawns_dead_worker(adapter_client):
     """A2 (codex R3-6): the periodic reap requeues stale jobs, but nothing drains them if
     the (unsupervised, created-once) pool has no live task — ensure_workers respawns."""
 
-    async def noop_runner(jid: int, did: int) -> None:
-        async for db in get_session():
+    async def noop_runner(jid: int, did: int, _reg=None) -> None:
+        async with session() as db:
             job = await db.get(Job, jid)
             job.status = JobStatus.succeeded
             await db.commit()
@@ -451,15 +489,18 @@ async def test_orphan_reap_tick_ensures_workers(adapter_client):
 
 
 def test_sync_now_is_requeue_safe_and_runnable():
-    """READSEM S3 B7 (codex R1-F10): a process death mid-sync_now must not 409-block the
-    device forever — the grain-c refresh is an idempotent read, so the orphan reaper
-    requeues it; and the runner registry knows the type (enqueue_job rejects unknowns)."""
-    from nso_adapter.core.jobs import _JOB_RUNNERS
-    from nso_adapter.core.worker import _REQUEUE_ON_RESTART
-    from nso_adapter.store.models import JobType
+    """READSEM S3 B7 (codex R1-F10): a process death mid-sync_now must not block the device
+    forever — the grain-c refresh is an idempotent read, so recovery requeues it; and the
+    runner registry knows the type (enqueue_job rejects unknowns).
 
-    assert JobType.sync_now in _REQUEUE_ON_RESTART
+    The policy now has ONE expression, ``disposition_for``; the worker's duplicate set is gone.
+    """
+    from nso_adapter.core.claim import disposition_for
+    from nso_adapter.core.jobs import _JOB_RUNNERS
+    from nso_adapter.store.models import JobStatus, JobType
+
+    assert disposition_for(JobType.sync_now) is JobStatus.queued
     assert JobType.sync_now in _JOB_RUNNERS
     # S5a B: same guarantees for the comprehensive CDB-only read (idempotent mirror job).
-    assert JobType.sync_from_nso in _REQUEUE_ON_RESTART
+    assert disposition_for(JobType.sync_from_nso) is JobStatus.queued
     assert JobType.sync_from_nso in _JOB_RUNNERS

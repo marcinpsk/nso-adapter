@@ -18,15 +18,15 @@ goldens below are the byte-level arbiter (they pass BEFORE and AFTER typing).
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TS = datetime(2026, 6, 1, 10, 0, 0)
+TS = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
 TS_Z = "2026-06-01T10:00:00Z"
 
 # managed_interfaces + every SyncState value, all zero except the one we seed.
@@ -45,10 +45,9 @@ _ZERO_SUMMARY = {
 
 
 async def _seed_failover(device_id: int) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceFailover
 
-    async for db in get_session():
+    async with session() as db:
         db.add(
             DeviceFailover(
                 device_id=device_id,
@@ -68,14 +67,12 @@ async def _seed_failover(device_id: int) -> None:
             )
         )
         await db.commit()
-        break
 
 
 async def _seed_job(device_id: int) -> int:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
 
-    async for db in get_session():
+    async with session() as db:
         job = Job(job_type=JobType.sync, device_id=device_id, created_at=TS, updated_at=TS)
         db.add(job)
         await db.commit()
@@ -85,16 +82,14 @@ async def _seed_job(device_id: int) -> int:
 
 async def _seed_managed_interface(device_id: int) -> None:
     """One interface carrying one accepted attr-state → summary managed_interfaces=1, accepted=1."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DbInterface, InterfaceAttrState, SyncState
 
-    async for db in get_session():
+    async with session() as db:
         iface = DbInterface(device_id=device_id, name="GigabitEthernet0/0", kind="physical")
         db.add(iface)
         await db.flush()
         db.add(InterfaceAttrState(interface_id=iface.id, attribute="description", sync_state=SyncState.accepted))
         await db.commit()
-        break
 
 
 @pytest.mark.anyio

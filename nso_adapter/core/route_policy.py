@@ -200,7 +200,7 @@ async def _upsert_route_policy_data(
     await db.execute(delete(DeviceRoutePolicyASPath).where(DeviceRoutePolicyASPath.device_id == device.id))
     await db.execute(delete(DeviceRoutePolicyRouteMap).where(DeviceRoutePolicyRouteMap.device_id == device.id))
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
 
     # as_list guards the RESTCONF singleton-rendered-as-bare-dict case for each top-level list;
     # an empty ``data`` dict (the AbsentAuthoritative clear) yields four empty lists → clear.

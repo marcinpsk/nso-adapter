@@ -27,7 +27,7 @@ async def _upsert_logging_config(db: AsyncSession, device: Device, entry: dict, 
     # as_list guards the singleton-rendered-as-bare-dict case (was a raw .get → crash).
     hosts = as_list(entry.get("host"))
     await db.execute(delete(DeviceLoggingHost).where(DeviceLoggingHost.device_id == device.id))
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     for h in hosts:
         addr = h.get("address")
         if not addr:

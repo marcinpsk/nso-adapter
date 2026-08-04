@@ -24,7 +24,7 @@ os.environ["NSO_ADAPTER_ATOMIC_APPLY"] = "1"
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import delete, select
 
@@ -82,7 +82,7 @@ async def main() -> None:
                     family="route_map",
                     name=rm["name"],
                     entries=rm["entry"],
-                    accepted_at=datetime.utcnow(),
+                    accepted_at=datetime.now(UTC),
                 )
             )
             j = Job(job_type=JobType.apply, device_id=d.id, status=JobStatus.queued)

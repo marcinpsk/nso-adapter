@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 TS = datetime(2026, 7, 25, 10, 0, 0, tzinfo=UTC)
@@ -16,11 +16,10 @@ TS = datetime(2026, 7, 25, 10, 0, 0, tzinfo=UTC)
 
 async def _seed_redistribution(device_id: int, entries: list[dict], *, refresh_source: str = "poll") -> None:
     """Seed DeviceRedistribution rows for a device."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceRedistribution
 
-    ts = TS.replace(tzinfo=None)
-    async for db in get_session():
+    ts = TS
+    async with session() as db:
         for entry in entries:
             db.add(
                 DeviceRedistribution(
@@ -37,7 +36,6 @@ async def _seed_redistribution(device_id: int, entries: list[dict], *, refresh_s
                 )
             )
         await db.commit()
-        break
 
 
 @pytest.mark.anyio

@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -168,13 +168,12 @@ async def test_rekey_device_to_claimed_name_returns_409(adapter_client_with_nso)
 
 async def test_rekey_device_clears_interface_state_retains_jobs(adapter_client_with_nso):
     """PATCH clears DbInterface rows but keeps Job rows (job history preserved)."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DbInterface, Job, JobStatus, JobType
 
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="rk-device", netbox_device_id=305)
 
     # Seed an interface and a completed job for this device
-    async for db in get_session():
+    async with session() as db:
         db.add(DbInterface(device_id=device_id, name="Gi0/0"))
         db.add(Job(device_id=device_id, job_type=JobType.sync, status=JobStatus.succeeded))
         await db.commit()
@@ -187,7 +186,7 @@ async def test_rekey_device_clears_interface_state_retains_jobs(adapter_client_w
     assert resp.status_code == 200
 
     # Interface rows must be gone; job must still exist
-    async for db in get_session():
+    async with session() as db:
         ifaces = (await db.execute(DbInterface.__table__.select().where(DbInterface.device_id == device_id))).all()
         jobs = (await db.execute(Job.__table__.select().where(Job.device_id == device_id))).all()
         assert len(ifaces) == 0, "interface state must be cleared on rekey"
@@ -213,13 +212,12 @@ async def test_offboard_device_happy_path(adapter_client_with_nso):
 
 async def test_offboard_device_with_active_job_succeeds_and_nullifies_job(adapter_client_with_nso):
     """DELETE a device that has a running job → 204; job row survives with device_id=None."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobStatus, JobType
 
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="active-job-dev", netbox_device_id=401)
 
     job_id = None
-    async for db in get_session():
+    async with session() as db:
         job = Job(device_id=device_id, job_type=JobType.sync, status=JobStatus.running)
         db.add(job)
         await db.commit()
@@ -230,7 +228,7 @@ async def test_offboard_device_with_active_job_succeeds_and_nullifies_job(adapte
     assert resp.status_code == 204
 
     # Job must still exist but device_id must be NULL
-    async for db in get_session():
+    async with session() as db:
         surviving_job = await db.get(Job, job_id)
         assert surviving_job is not None, "job row must survive offboard"
         assert surviving_job.device_id is None, "job device_id must be nullified on offboard"

@@ -10,7 +10,7 @@ from nso_adapter.store.models import (
     InterfaceAttrState,
     SyncState,
 )
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -44,13 +44,11 @@ async def test_put_intent_happy_path(adapter_client):
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="intent-router", netbox_device_id=500)
 
     # Seed an interface with attr_state so intent can be stamped
-    from nso_adapter.store.db import get_session
 
-    async for db in get_session():
+    async with session() as db:
         iface_id = await _seed_interface(db, device_id, "GigabitEthernet0/0")
         await _seed_attr_state(db, iface_id, "description", SyncState.imported)
         await db.commit()
-        break
 
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
@@ -72,13 +70,10 @@ async def test_put_intent_replaces_existing(adapter_client):
     """Second PUT fully replaces the previous intent (idempotent full-replace)."""
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="intent-replace", netbox_device_id=501)
 
-    from nso_adapter.store.db import get_session
-
-    async for db in get_session():
+    async with session() as db:
         iface_id = await _seed_interface(db, device_id, "Loopback0")
         await _seed_attr_state(db, iface_id, "description", SyncState.imported)
         await db.commit()
-        break
 
     # First PUT
     await adapter_client.put(
@@ -127,9 +122,7 @@ async def test_put_intent_unknown_interface_lands(adapter_client):
     # the materialised interface carries an accepted attr_state (apply-eligible, not inert)
     from sqlalchemy import select
 
-    from nso_adapter.store.db import get_session
-
-    async for db in get_session():
+    async with session() as db:
         iface = (
             await db.execute(
                 select(DbInterface).where(DbInterface.device_id == device_id, DbInterface.name == "ae99.999")
@@ -139,20 +132,16 @@ async def test_put_intent_unknown_interface_lands(adapter_client):
             await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id == iface.id))
         ).scalar_one()
         assert state.sync_state == SyncState.accepted
-        break
 
 
 async def test_put_intent_stamps_accepted_on_imported(adapter_client):
     """PUT intent transitions an 'imported' attr_state to 'accepted'."""
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="intent-stamp", netbox_device_id=503)
 
-    from nso_adapter.store.db import get_session
-
-    async for db in get_session():
+    async with session() as db:
         iface_id = await _seed_interface(db, device_id, "eth0")
         await _seed_attr_state(db, iface_id, "description", SyncState.imported)
         await db.commit()
-        break
 
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
@@ -162,26 +151,20 @@ async def test_put_intent_stamps_accepted_on_imported(adapter_client):
 
     from sqlalchemy import select
 
-    from nso_adapter.store.db import get_session
-
-    async for db in get_session():
+    async with session() as db:
         result = await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.attribute == "description"))
         state = result.scalar_one()
         assert state.sync_state == SyncState.accepted
-        break
 
 
 async def test_put_intent_does_not_override_in_sync(adapter_client):
     """PUT intent does NOT downgrade an already in_sync attr_state to accepted."""
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="intent-insync", netbox_device_id=504)
 
-    from nso_adapter.store.db import get_session
-
-    async for db in get_session():
+    async with session() as db:
         iface_id = await _seed_interface(db, device_id, "eth1")
         await _seed_attr_state(db, iface_id, "description", SyncState.in_sync)
         await db.commit()
-        break
 
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
@@ -191,30 +174,24 @@ async def test_put_intent_does_not_override_in_sync(adapter_client):
 
     from sqlalchemy import select
 
-    from nso_adapter.store.db import get_session
-
-    async for db in get_session():
+    async with session() as db:
         result = await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.attribute == "description"))
         state = result.scalar_one()
         # Must remain in_sync, not downgraded to accepted
         assert state.sync_state == SyncState.in_sync
-        break
 
 
 async def test_put_intent_auto_apply_enqueues_job(adapter_client):
     """PUT intent with auto_apply enabled enqueues an apply job."""
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="intent-autoapply", netbox_device_id=505)
 
-    from nso_adapter.store.db import get_session
-
-    async for db in get_session():
+    async with session() as db:
         iface_id = await _seed_interface(db, device_id, "eth2")
         await _seed_attr_state(db, iface_id, "description", SyncState.accepted)
         # Enable auto_apply
         settings = DeviceSettings(device_id=device_id, auto_apply=True)
         db.add(settings)
         await db.commit()
-        break
 
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
@@ -226,14 +203,12 @@ async def test_put_intent_auto_apply_enqueues_job(adapter_client):
     # Verify an apply job was created
     from sqlalchemy import select
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
 
-    async for db in get_session():
+    async with session() as db:
         result = await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.apply))
         job = result.scalar_one_or_none()
         assert job is not None
-        break
 
 
 async def test_put_intent_unknown_device_returns_404(adapter_client):
@@ -288,13 +263,10 @@ async def test_get_intent_returns_set_attributes(adapter_client):
     """GET intent after PUT returns the stored intent rows."""
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="get-intent-full", netbox_device_id=511)
 
-    from nso_adapter.store.db import get_session
-
-    async for db in get_session():
+    async with session() as db:
         iface_id = await _seed_interface(db, device_id, "GE0/1")
         await _seed_attr_state(db, iface_id, "description", SyncState.imported)
         await db.commit()
-        break
 
     # PUT intent first
     await adapter_client.put(

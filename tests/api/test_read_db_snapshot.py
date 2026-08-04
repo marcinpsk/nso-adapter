@@ -5,49 +5,39 @@
 A family GET assembles multi-SELECT payloads (BGP = router + six graph queries); without
 a snapshot, a full-replace commit landing between two of those SELECTs produces a TORN
 payload (old parents + new/empty children) that an old authoritative pointer would wave
-through the plugin gate. ``get_read_db`` pins ONE read snapshot per request: PostgreSQL
-via a REPEATABLE READ execution option applied before the first statement; SQLite via an
-EXPLICIT ``BEGIN`` (sqlite3 legacy mode opens NO transaction for a bare SELECT — proven
-by codex's two-connection probe, R3-1).
+through the plugin gate. ``get_read_db`` pins ONE read snapshot per request, via a
+REPEATABLE READ execution option applied before the first statement.
 
 The control test documents the tear on a PLAIN session (why the dedicated dependency
-exists); the guarantee tests prove both dialects serve wholly-old data mid-write.
-WAL journaling is enabled on the sqlite scratch DB so the writer can commit while the
-reader holds its snapshot (DELETE-mode journaling would block the writer instead).
+exists): PostgreSQL's default READ COMMITTED takes a NEW snapshot per statement, so a
+commit landing between two SELECTs of the same session is visible to the second. The
+guarantee tests prove the dependency serves wholly-old data across that same commit.
 """
 
 from __future__ import annotations
 
-import os
-import uuid as uuid_mod
-
 import pytest
-from sqlalchemy import event, select, text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from nso_adapter.store.models import Base, Device
-
-_PARITY_URL = os.environ.get("ALEMBIC_PARITY_DB_URL")
-
-
-def _wal_sqlite_engine(tmp_path):
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/snap.db")
-
-    @event.listens_for(engine.sync_engine, "connect")
-    def _wal(dbapi_connection, connection_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.close()
-
-    return engine
+from nso_adapter.store.models import Device
+from tests.conftest import session as store_session
 
 
-async def _seed_schema(engine):
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+@pytest.fixture
+async def snapshot_engine(pg_url):
+    """An engine on this test's private clone. The schema is already there (the template
+    is built by ``alembic upgrade head``), so there is nothing to create."""
+    engine = create_async_engine(pg_url)
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
 
 
 async def _insert_device(engine, name: str) -> None:
+    """Commit a row from an INDEPENDENT session — i.e. a second connection, which is what
+    makes the commit concurrent with (and invisible to) the reader's open snapshot."""
     factory = async_sessionmaker(engine, expire_on_commit=False)
     async with factory() as db:
         db.add(Device(nso_device_name=name, netbox_device_id=1, nso_instance="default"))
@@ -55,102 +45,53 @@ async def _insert_device(engine, name: str) -> None:
 
 
 @pytest.mark.anyio
-async def test_plain_session_tears_mid_read(tmp_path):
+async def test_plain_session_tears_mid_read(snapshot_engine):
     """CONTROL (documents the hazard): a plain session's second SELECT sees a commit that
-    landed after its first SELECT — sqlite legacy mode has no read transaction."""
-    engine = _wal_sqlite_engine(tmp_path)
-    try:
-        await _seed_schema(engine)
-        factory = async_sessionmaker(engine, expire_on_commit=False)
-        async with factory() as reader:
-            first = (await reader.execute(select(Device))).scalars().all()
-            assert first == []
-            await _insert_device(engine, "torn")
-            second = (await reader.execute(select(Device))).scalars().all()
-            assert len(second) == 1, "plain session torn-read expected — the control premise"
-    finally:
-        await engine.dispose()
+    landed after its first SELECT — READ COMMITTED re-snapshots per statement."""
+    factory = async_sessionmaker(snapshot_engine, expire_on_commit=False)
+    async with factory() as reader:
+        first = (await reader.execute(select(Device))).scalars().all()
+        assert first == []
+        await _insert_device(snapshot_engine, "torn")
+        second = (await reader.execute(select(Device))).scalars().all()
+        assert len(second) == 1, "plain session torn-read expected — the control premise"
 
 
 @pytest.mark.anyio
-async def test_get_read_db_snapshot_sqlite(tmp_path):
-    """The dependency's session must serve wholly-old data across a mid-read commit."""
+async def test_get_read_db_pins_a_snapshot(snapshot_engine):
+    """The dependency's session must serve wholly-old data across a mid-read commit:
+    REPEATABLE READ pins the snapshot at the first statement."""
     from nso_adapter.api.deps import get_read_db
 
-    engine = _wal_sqlite_engine(tmp_path)
-    try:
-        await _seed_schema(engine)
-        factory = async_sessionmaker(engine, expire_on_commit=False)
-        async with factory() as session:
-            gen = get_read_db(session)
-            reader = await anext(gen)
-            first = (await reader.execute(select(Device))).scalars().all()
-            assert first == []
-            await _insert_device(engine, "hidden")
-            second = (await reader.execute(select(Device))).scalars().all()
-            assert second == [], "get_read_db must pin a snapshot — mid-read commit visible"
-            await gen.aclose()
-        # outside the dependency the commit is visible (the snapshot was per-request)
-        async with factory() as later:
-            assert len((await later.execute(select(Device))).scalars().all()) == 1
-    finally:
-        await engine.dispose()
+    factory = async_sessionmaker(snapshot_engine, expire_on_commit=False)
+    async with factory() as session:
+        gen = get_read_db(session)
+        reader = await anext(gen)
+        assert (await reader.execute(select(Device))).scalars().all() == []
+        await _insert_device(snapshot_engine, "hidden")
+        assert (await reader.execute(select(Device))).scalars().all() == [], (
+            "REPEATABLE READ snapshot must hide the mid-read commit"
+        )
+        await gen.aclose()
+    # outside the dependency the commit is visible (the snapshot was per-request)
+    async with factory() as later:
+        assert len((await later.execute(select(Device))).scalars().all()) == 1
 
 
 @pytest.mark.anyio
-@pytest.mark.skipif(not _PARITY_URL, reason="ALEMBIC_PARITY_DB_URL not set — PostgreSQL lane (CI only)")
-async def test_get_read_db_snapshot_postgresql():
-    """Same guarantee on PostgreSQL: REPEATABLE READ pins the snapshot at the first
-    statement; a mid-read commit from another connection stays invisible."""
-    from sqlalchemy.engine import make_url
-
-    from nso_adapter.api.deps import get_read_db
-
-    scratch = f"snap_{uuid_mod.uuid4().hex[:10]}"
-    admin = create_async_engine(_PARITY_URL.replace("+psycopg2", "+asyncpg"), isolation_level="AUTOCOMMIT")
-    async with admin.connect() as conn:
-        await conn.exec_driver_sql(f'CREATE DATABASE "{scratch}"')
-    engine = create_async_engine(make_url(_PARITY_URL.replace("+psycopg2", "+asyncpg")).set(database=scratch))
-    try:
-        await _seed_schema(engine)
-        factory = async_sessionmaker(engine, expire_on_commit=False)
-        async with factory() as session:
-            gen = get_read_db(session)
-            reader = await anext(gen)
-            assert (await reader.execute(select(Device))).scalars().all() == []
-            await _insert_device(engine, "hidden-pg")
-            assert (await reader.execute(select(Device))).scalars().all() == [], (
-                "REPEATABLE READ snapshot must hide the mid-read commit"
-            )
-            await gen.aclose()
-        async with factory() as later:
-            assert len((await later.execute(select(Device))).scalars().all()) == 1
-    finally:
-        await engine.dispose()
-        async with admin.connect() as conn:
-            await conn.exec_driver_sql(f'DROP DATABASE "{scratch}" WITH (FORCE)')
-        await admin.dispose()
-
-
-@pytest.mark.anyio
-async def test_get_read_db_is_read_only_scoped(tmp_path):
+async def test_get_read_db_is_read_only_scoped(snapshot_engine):
     """The dependency ends its transaction on exit (rollback) — it never leaves a
     lingering read transaction on the pooled connection."""
     from nso_adapter.api.deps import get_read_db
 
-    engine = _wal_sqlite_engine(tmp_path)
-    try:
-        await _seed_schema(engine)
-        factory = async_sessionmaker(engine, expire_on_commit=False)
-        async with factory() as session:
-            gen = get_read_db(session)
-            reader = await anext(gen)
-            await reader.execute(select(Device))
-            await gen.aclose()
-            # the same session must be usable normally afterwards
-            await session.execute(text("SELECT 1"))
-    finally:
-        await engine.dispose()
+    factory = async_sessionmaker(snapshot_engine, expire_on_commit=False)
+    async with factory() as session:
+        gen = get_read_db(session)
+        reader = await anext(gen)
+        await reader.execute(select(Device))
+        await gen.aclose()
+        # the same session must be usable normally afterwards
+        await session.execute(text("SELECT 1"))
 
 
 # ── SA-3: END-TO-END coverage — real HTTP family GETs, not just the dependency ─────────
@@ -181,32 +122,31 @@ _FAMILY_GET_PATHS = {
 
 
 @pytest.mark.anyio
-async def test_family_get_serves_snapshot_across_midrequest_commit(adapter_client, tmp_path):
+async def test_family_get_serves_snapshot_across_midrequest_commit(adapter_client):
     """END-TO-END (SA-3): a REAL static-routes GET whose mirror-rows SELECT races a commit.
 
-    A before_cursor_execute hook fires a SYNC sqlite writer (WAL) the moment the handler's
-    device_static_route SELECT begins — i.e. AFTER the snapshot opened and the pointer was
-    read. The response must serve the pre-commit row set; without get_read_db the second
-    row leaks in (sqlite legacy mode has no read transaction — the checked-in control)."""
-    import sqlite3
-
+    A before_cursor_execute hook fires a SYNC psycopg2 writer on a SECOND connection the
+    moment the handler's device_static_route SELECT begins — i.e. AFTER the snapshot opened
+    and the pointer was read. The response must serve the pre-commit row set; without
+    get_read_db the READ COMMITTED session would let the second row leak in."""
+    import sqlalchemy as sa
     from sqlalchemy import event
+    from sqlalchemy.engine import make_url
 
-    from nso_adapter.store.db import get_engine, get_session
+    from nso_adapter.store.db import get_engine
     from tests.conftest import VALID_TOKEN, seed_device
 
     auth = {"Authorization": f"Bearer {VALID_TOKEN}"}
     device_id = await seed_device(nso_device_name="tear-e2e", netbox_device_id=8951)
-    db_path = None
     engine = get_engine()
-    db_path = engine.url.database
-    # WAL so the mid-request writer can commit while the request's read txn is open.
-    sync = sqlite3.connect(db_path, timeout=5)
-    sync.execute("PRAGMA journal_mode=WAL")
-    sync.commit()
+    writer = sa.create_engine(
+        make_url(engine.url).set(drivername="postgresql+psycopg2").render_as_string(hide_password=False),
+        isolation_level="AUTOCOMMIT",
+        poolclass=sa.pool.NullPool,
+    )
 
-    async for db in get_session():
-        from datetime import datetime
+    async with store_session() as db:
+        from datetime import UTC, datetime
 
         from nso_adapter.store.models import DeviceStaticRoute
 
@@ -216,32 +156,31 @@ async def test_family_get_serves_snapshot_across_midrequest_commit(adapter_clien
                 vrf="",
                 prefix="10.0.0.0/8",
                 next_hop="192.0.2.1",
-                last_refreshed_at=datetime(2026, 6, 1, 10, 0, 0),
+                last_refreshed_at=datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC),
                 refresh_source="poll",
             )
         )
         await db.commit()
-        break
 
     fired = []
 
     def _mid_request_write(conn, cursor, statement, parameters, context, executemany):
         if "device_static_route" in statement and statement.lstrip().upper().startswith("SELECT") and not fired:
             fired.append(statement)
-            sync.execute(
-                "INSERT INTO device_static_route "
-                "(device_id, vrf, prefix, next_hop, last_refreshed_at, refresh_source) "
-                "VALUES (?, '', '172.16.0.0/12', '192.0.2.9', '2026-06-01 10:00:00', 'poll')",
-                (device_id,),
-            )
-            sync.commit()
+            with writer.connect() as wconn:
+                wconn.exec_driver_sql(
+                    "INSERT INTO device_static_route "
+                    "(device_id, vrf, prefix, next_hop, last_refreshed_at, refresh_source) "
+                    "VALUES (%s, '', '172.16.0.0/12', '192.0.2.9', '2026-06-01 10:00:00+00', 'poll')",
+                    (device_id,),
+                )
 
     event.listen(engine.sync_engine, "before_cursor_execute", _mid_request_write)
     try:
         resp = await adapter_client.get(f"/api/v1/devices/{device_id}/static-routes", headers=auth)
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", _mid_request_write)
-        sync.close()
+        writer.dispose()
 
     assert resp.status_code == 200
     assert fired, "the hook must have observed the mirror-rows SELECT"

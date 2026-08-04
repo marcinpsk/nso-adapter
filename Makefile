@@ -7,12 +7,14 @@
 #   make logs      tail container logs
 #   make shell     exec into running container
 #   make test      run pytest
+#   make test PYTEST_WORKERS=1  run pytest serially
 #   make lint      ruff check
 #   make validate  run validate_pipe.py (NSO + Vault smoke test)
 
 COMPOSE     = docker compose -f docker-compose.dev.yml
 SERVICE     = nso-adapter
-PYTHON      = uv run --
+PYTHON      = uv run --native-tls --
+PYTEST_WORKERS ?= 8
 
 .PHONY: dev up down build rebuild restart logs shell ps \
         test lint format validate migrate clean
@@ -54,7 +56,7 @@ ps:
 # ── Local dev (without Docker) ───────────────────────────────────────────────
 
 test:
-	$(PYTHON) pytest tests/ -v
+	$(PYTHON) pytest tests/ -q -n $(PYTEST_WORKERS) --maxschedchunk=1
 
 lint:
 	$(PYTHON) ruff check nso_adapter/ tests/

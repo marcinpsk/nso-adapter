@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 TS = datetime(2026, 6, 10, 9, 0, 0, tzinfo=UTC)
@@ -26,11 +26,10 @@ async def _seed_snmp(
     last_refreshed_at: datetime = TS,
 ) -> None:
     """Seed SNMP rows for a device."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import SnmpCommunity, SnmpHost, SnmpSystemInfo, SnmpV3User
 
-    ts = last_refreshed_at.replace(tzinfo=None)
-    async for db in get_session():
+    ts = last_refreshed_at
+    async with session() as db:
         for comm in communities or []:
             db.add(
                 SnmpCommunity(
@@ -77,7 +76,6 @@ async def _seed_snmp(
                 )
             )
         await db.commit()
-        break
 
 
 # ── GET /api/v1/devices/{id}/snmp-config ────────────────────────────────────

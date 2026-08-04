@@ -30,6 +30,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.cancelsafe import await_uncancellable
+from nso_adapter.core.claim import ClaimLostError
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
@@ -98,6 +99,10 @@ async def _record_read(
             refresh_source=refresh_source,
             source_epoch=device.source_epoch,
         )
+    except ClaimLostError:
+        # A nested suppressor is as load-bearing as the runner boundary: swallowing
+        # a revocation here lets the run continue under ownership it has lost.
+        raise
     except Exception as exc:  # noqa: BLE001 — telemetry write; the mirror is the source of truth
         logger.warning(f"{spec.name}.outcome.read_record_failed", device_id=device_id, error=repr(exc))
         await _recover_session(db, device, spec.name, device_id)
@@ -138,6 +143,10 @@ async def _record_result(
         return await outcome_store.record_result(
             db, attempt_id, result=result, succeeded=succeeded, row_count=row_count
         )
+    except ClaimLostError:
+        # A nested suppressor is as load-bearing as the runner boundary: swallowing
+        # a revocation here lets the run continue under ownership it has lost.
+        raise
     except Exception as exc:  # noqa: BLE001 — telemetry write; never fail the refresh over it
         logger.warning(f"{spec.name}.outcome.result_record_failed", attempt_id=attempt_id, error=repr(exc))
         await _recover_session(db, device, spec.name, device_id)
@@ -413,7 +422,7 @@ async def _apply_outcome(
     refresh_source: str,
 ) -> bool:
     """Drive the mirror action + two-phase outcome record for a classified read."""
-    # Phase 1: record the read outcome before the materializer runs (independent session).
+    # Phase 1: record the read outcome before the materializer runs, on the CALLER's session.
     attempt_id = await _record_read(db, device, spec, outcome, refresh_source)
 
     if isinstance(outcome, Present):

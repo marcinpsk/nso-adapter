@@ -15,7 +15,6 @@ from sqlalchemy import select
 
 from nso_adapter.core.apply import _nokia_routed_kind, enqueue_apply, run_apply
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import (
     DbInterface,
     Device,
@@ -27,6 +26,7 @@ from nso_adapter.store.models import (
     JobType,
     SyncState,
 )
+from tests.conftest import session
 
 # ── _nokia_routed_kind (pure: derives SR OS router context from kind/service/vrf) ──
 
@@ -203,23 +203,21 @@ async def test_apply_attributes_ios_interface_omits_routed_context():
 
 
 async def _seed_device(name: str = "test-rtr", netbox_id: int = 1) -> int:
-    async for db in get_session():
+    async with session() as db:
         d = Device(nso_instance="nso-dev", nso_device_name=name, netbox_device_id=netbox_id)
         db.add(d)
         await db.commit()
         await db.refresh(d)
         return d.id
-    raise RuntimeError("no session")
 
 
 async def _seed_apply_job(device_id: int, status: JobStatus = JobStatus.queued) -> int:
-    async for db in get_session():
+    async with session() as db:
         j = Job(job_type=JobType.apply, device_id=device_id, status=status)
         db.add(j)
         await db.commit()
         await db.refresh(j)
         return j.id
-    raise RuntimeError("no session")
 
 
 async def _seed_interface_with_intent(
@@ -231,7 +229,7 @@ async def _seed_interface_with_intent(
     netbox_id: int = 100,
 ) -> tuple[int, int]:
     """Create DbInterface + InterfaceAttrState + InterfaceIntent, return (iface_id, attr_id)."""
-    async for db in get_session():
+    async with session() as db:
         iface = DbInterface(
             device_id=device_id,
             netbox_interface_id=netbox_id,
@@ -251,14 +249,13 @@ async def _seed_interface_with_intent(
             interface_id=iface.id,
             attribute=attribute,
             intent_value=intent_value,
-            accepted_at=datetime.utcnow(),
+            accepted_at=datetime.now(UTC),
         )
         db.add(intent)
         await db.commit()
         await db.refresh(iface)
         await db.refresh(attr_state)
         return iface.id, attr_state.id
-    raise RuntimeError("no session")
 
 
 # ── enqueue_apply ─────────────────────────────────────────────────────────────
@@ -267,23 +264,30 @@ async def _seed_interface_with_intent(
 async def test_enqueue_apply_creates_job(adapter_client):
     """enqueue_apply creates an apply job when no active job exists."""
     device_id = await _seed_device("rtr-a01", 101)
-    async for db in get_session():
+    async with session() as db:
         job = await enqueue_apply(db, device_id=device_id)
         assert job is not None
         assert job.job_type == JobType.apply
         assert job.status == JobStatus.queued
-        break
 
 
-async def test_enqueue_apply_blocked_by_active_job(adapter_client):
-    """enqueue_apply returns None when an active job exists."""
+async def test_enqueue_apply_blocked_by_a_queued_apply(adapter_client):
+    """enqueue_apply refuses only when a QUEUED apply already exists."""
     device_id = await _seed_device("rtr-a02", 102)
+    await _seed_apply_job(device_id, JobStatus.queued)
+
+    async with session() as db:
+        assert await enqueue_apply(db, device_id=device_id) is None
+
+
+async def test_enqueue_apply_admitted_while_an_apply_runs(adapter_client):
+    """A running apply does not refuse its successor: the successor carries the newer
+    intent, and the device claim is what serializes their execution."""
+    device_id = await _seed_device("rtr-a02b", 103)
     await _seed_apply_job(device_id, JobStatus.running)
 
-    async for db in get_session():
-        result = await enqueue_apply(db, device_id=device_id)
-        assert result is None
-        break
+    async with session() as db:
+        assert await enqueue_apply(db, device_id=device_id) is not None
 
 
 # ── run_apply ─────────────────────────────────────────────────────────────────
@@ -304,10 +308,9 @@ async def test_run_apply_device_not_found(adapter_client):
     with patch("nso_adapter.core.importer.get_nso_client", side_effect=KeyError("nso-dev")):
         await run_apply(job_id=job_id, device_id=99998)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
-        break
 
 
 async def test_run_apply_nothing_eligible(adapter_client):
@@ -319,7 +322,7 @@ async def test_run_apply_nothing_eligible(adapter_client):
     with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result == {
@@ -337,15 +340,13 @@ async def test_run_apply_nothing_eligible(adapter_client):
             "route_policy_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
             "ospf_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
         }
-        break
 
 
 async def _set_sync_before_apply(device_id: int, value: bool) -> None:
-    async for db in get_session():
+    async with session() as db:
         db.add(DeviceSettings(device_id=device_id, auto_apply=False, sync_before_apply=value))
         await db.commit()
         return
-    raise RuntimeError("no session")
 
 
 async def test_run_apply_syncs_from_device_by_default(adapter_client):
@@ -385,10 +386,9 @@ async def test_run_apply_survives_sync_from_failure(adapter_client):
     with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded  # nothing eligible, sync error swallowed
-        break
 
 
 async def test_collect_apply_diff_returns_scope_deltas(adapter_client):
@@ -397,21 +397,19 @@ async def test_collect_apply_diff_returns_scope_deltas(adapter_client):
     from nso_adapter.store.models import OspfInstanceIntent
 
     device_id = await _seed_device("rtr-diff", 199)
-    async for db in get_session():
+    async with session() as db:
         db.add(
-            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC))
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_ospf_config", new_callable=AsyncMock, return_value="OSPF NATIVE DELTA"),
     ):
-        async for db in get_session():
+        async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
-            break
     assert diffs == {"ospf": "OSPF NATIVE DELTA"}
 
 
@@ -421,21 +419,19 @@ async def test_collect_apply_diff_empty_scope_omitted(adapter_client):
     from nso_adapter.store.models import OspfInstanceIntent
 
     device_id = await _seed_device("rtr-diff2", 198)
-    async for db in get_session():
+    async with session() as db:
         db.add(
-            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC))
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_ospf_config", new_callable=AsyncMock, return_value="   "),
     ):
-        async for db in get_session():
+        async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
-            break
     assert diffs == {}
 
 
@@ -446,12 +442,11 @@ async def test_collect_apply_diff_outformat_cli_threads_format(adapter_client):
     from nso_adapter.store.models import OspfInstanceIntent
 
     device_id = await _seed_device("rtr-diff-cli", 197)
-    async for db in get_session():
+    async with session() as db:
         db.add(
-            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC))
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     ospf = AsyncMock(return_value="+ router ospf 1")
@@ -459,9 +454,8 @@ async def test_collect_apply_diff_outformat_cli_threads_format(adapter_client):
         patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
         patch("nso_adapter.nso.apply.apply_ospf_config", ospf),
     ):
-        async for db in get_session():
+        async with session() as db:
             diffs = await collect_apply_diff(db, device_id, outformat="cli")
-            break
     assert diffs == {"ospf": "+ router ospf 1"}
     assert ospf.await_args.kwargs["dry_run"] == "cli"
 
@@ -472,9 +466,9 @@ async def test_collect_apply_diff_covers_multiple_scopes(adapter_client):
     from nso_adapter.store.models import OspfInstanceIntent, StaticRouteIntent
 
     device_id = await _seed_device("rtr-diff3", 197)
-    async for db in get_session():
+    async with session() as db:
         db.add(
-            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC))
         )
         db.add(
             StaticRouteIntent(
@@ -482,11 +476,10 @@ async def test_collect_apply_diff_covers_multiple_scopes(adapter_client):
                 vrf="",
                 prefix="10.0.0.0/24",
                 next_hop="10.0.0.1",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     with (
@@ -494,9 +487,8 @@ async def test_collect_apply_diff_covers_multiple_scopes(adapter_client):
         patch("nso_adapter.nso.apply.apply_ospf_config", new_callable=AsyncMock, return_value="OSPF DELTA"),
         patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock, return_value="STATIC DELTA"),
     ):
-        async for db in get_session():
+        async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
-            break
     assert diffs == {"ospf": "OSPF DELTA", "static_route": "STATIC DELTA"}
 
 
@@ -504,9 +496,8 @@ async def test_collect_apply_diff_device_not_found(adapter_client):
     """A dry-run preview for an unknown device returns an empty mapping (no NSO call)."""
     from nso_adapter.core.apply import collect_apply_diff
 
-    async for db in get_session():
+    async with session() as db:
         diffs = await collect_apply_diff(db, 999999)
-        break
     assert diffs == {}
 
 
@@ -521,7 +512,7 @@ async def test_collect_apply_diff_covers_every_scope(adapter_client):
     from nso_adapter.store import models as m
 
     device_id = await _seed_device("rtr-diff-all", 196)
-    async for db in get_session():
+    async with session() as db:
         dev = await db.get(Device, device_id)
         dev.ned_id = "cisco-ios-cli-6.95"
         iface = DbInterface(device_id=device_id, name="GigabitEthernet0/0", netbox_interface_id=900)
@@ -529,26 +520,26 @@ async def test_collect_apply_diff_covers_every_scope(adapter_client):
         await db.flush()
         db.add(
             m.InterfaceIntent(
-                interface_id=iface.id, attribute="description", intent_value="uplink", accepted_at=datetime.utcnow()
+                interface_id=iface.id, attribute="description", intent_value="uplink", accepted_at=datetime.now(UTC)
             )
         )
         db.add(
             m.InterfaceIpIntent(
-                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.utcnow()
+                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.now(UTC)
             )
         )
         db.add(
             m.OspfInstanceIntent(
-                device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow()
+                device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC)
             )
         )
         db.add(
-            m.IsisInterfaceIntent(device_id=device_id, interface_name="Gi0/0", af="ipv4", accepted_at=datetime.utcnow())
+            m.IsisInterfaceIntent(device_id=device_id, interface_name="Gi0/0", af="ipv4", accepted_at=datetime.now(UTC))
         )
-        db.add(m.BgpRouterIntent(device_id=device_id, asn="65000", accepted_at=datetime.utcnow()))
+        db.add(m.BgpRouterIntent(device_id=device_id, asn="65000", accepted_at=datetime.now(UTC)))
         db.add(
             m.RoutePolicyObjectIntent(
-                device_id=device_id, family="ipv4", name="RM", entries=[], accepted_at=datetime.utcnow()
+                device_id=device_id, family="ipv4", name="RM", entries=[], accepted_at=datetime.now(UTC)
             )
         )
         db.add(
@@ -557,21 +548,21 @@ async def test_collect_apply_diff_covers_every_scope(adapter_client):
                 label="ro",
                 vault_ref="network/netbox/snmp/community/ro#community",
                 access="ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         db.add(
             m.StaticRouteIntent(
-                device_id=device_id, prefix="10.1.0.0/24", next_hop="10.1.0.1", accepted_at=datetime.utcnow()
+                device_id=device_id, prefix="10.1.0.0/24", next_hop="10.1.0.1", accepted_at=datetime.now(UTC)
             )
         )
-        db.add(m.LoggingHostIntent(device_id=device_id, address="10.0.0.99", accepted_at=datetime.utcnow()))
-        db.add(m.SviIntent(device_id=device_id, interface_name="Vlan10", vlan_id=10, accepted_at=datetime.utcnow()))
-        db.add(m.SubinterfaceIntent(device_id=device_id, interface_name="Gi0/0.10", accepted_at=datetime.utcnow()))
-        db.add(m.VlanIntent(device_id=device_id, vlan_id=20, accepted_at=datetime.utcnow()))
-        db.add(m.BfdIntent(device_id=device_id, interface_name="Gi0/1", accepted_at=datetime.utcnow()))
+        db.add(m.LoggingHostIntent(device_id=device_id, address="10.0.0.99", accepted_at=datetime.now(UTC)))
+        db.add(m.SviIntent(device_id=device_id, interface_name="Vlan10", vlan_id=10, accepted_at=datetime.now(UTC)))
+        db.add(m.SubinterfaceIntent(device_id=device_id, interface_name="Gi0/0.10", accepted_at=datetime.now(UTC)))
+        db.add(m.VlanIntent(device_id=device_id, vlan_id=20, accepted_at=datetime.now(UTC)))
+        db.add(m.BfdIntent(device_id=device_id, interface_name="Gi0/1", accepted_at=datetime.now(UTC)))
         db.add(
-            m.InterfaceMtuIntent(device_id=device_id, interface_name="Gi0/2", mtu=9000, accepted_at=datetime.utcnow())
+            m.InterfaceMtuIntent(device_id=device_id, interface_name="Gi0/2", mtu=9000, accepted_at=datetime.now(UTC))
         )
         db.add(
             m.L2SapIntent(
@@ -579,11 +570,10 @@ async def test_collect_apply_diff_covers_every_scope(adapter_client):
                 service_name="EPIPE-1",
                 service_type="epipe",
                 sap_id="1/1/1",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     # Each dry-run returns a distinct, non-empty native delta keyed off its scope.
@@ -608,9 +598,8 @@ async def test_collect_apply_diff_covers_every_scope(adapter_client):
         with ExitStack() as stack:
             for fn, delta in patches.items():
                 stack.enter_context(patch(f"nso_adapter.nso.apply.{fn}", new_callable=AsyncMock, return_value=delta))
-            async for db in get_session():
+            async with session() as db:
                 diffs = await collect_apply_diff(db, device_id)
-                break
 
     assert diffs == {
         "interface_attribute": "ATTR",
@@ -642,17 +631,16 @@ async def test_collect_apply_diff_scope_failure_is_isolated(adapter_client):
     from nso_adapter.store.models import OspfInstanceIntent, StaticRouteIntent
 
     device_id = await _seed_device("rtr-diff-iso", 195)
-    async for db in get_session():
+    async with session() as db:
         db.add(
-            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC))
         )
         db.add(
             StaticRouteIntent(
-                device_id=device_id, prefix="10.2.0.0/24", next_hop="10.2.0.1", accepted_at=datetime.utcnow()
+                device_id=device_id, prefix="10.2.0.0/24", next_hop="10.2.0.1", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     with (
@@ -662,9 +650,8 @@ async def test_collect_apply_diff_scope_failure_is_isolated(adapter_client):
         ),
         patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock, return_value="STATIC DELTA"),
     ):
-        async for db in get_session():
+        async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
-            break
     # static_route still previews normally; ospf's failure is REPORTED, not swallowed
     assert diffs["static_route"] == "STATIC DELTA"
     assert "dry-run boom" in diffs["ospf"]
@@ -677,30 +664,29 @@ async def test_collect_apply_diff_interface_scope_failures_and_skips(adapter_cli
     from nso_adapter.store.models import InterfaceIpIntent
 
     device_id = await _seed_device("rtr-diff-ifaceerr", 194)
-    async for db in get_session():
+    async with session() as db:
         iface = DbInterface(device_id=device_id, name="GigabitEthernet0/0", netbox_interface_id=910)
         db.add(iface)
         await db.flush()
         # eligible description slice — its dry-run will be made to raise
         db.add(
             InterfaceIntent(
-                interface_id=iface.id, attribute="description", intent_value="up", accepted_at=datetime.utcnow()
+                interface_id=iface.id, attribute="description", intent_value="up", accepted_at=datetime.now(UTC)
             )
         )
         # non-eligible attribute (skipped before any dry-run)
         db.add(
-            InterfaceIntent(interface_id=iface.id, attribute="mtu", intent_value="9000", accepted_at=datetime.utcnow())
+            InterfaceIntent(interface_id=iface.id, attribute="mtu", intent_value="9000", accepted_at=datetime.now(UTC))
         )
         # eligible attribute but not accepted (also skipped)
         db.add(InterfaceIntent(interface_id=iface.id, attribute="enabled", intent_value="true"))
         # IP intent whose dry-run will be made to raise
         db.add(
             InterfaceIpIntent(
-                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.utcnow()
+                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     with (
@@ -716,9 +702,8 @@ async def test_collect_apply_diff_interface_scope_failures_and_skips(adapter_cli
             side_effect=RuntimeError("ip dry-run boom"),
         ),
     ):
-        async for db in get_session():
+        async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
-            break
 
     # both interface scopes failed → omitted; preview never raised
     assert diffs == {}
@@ -730,22 +715,21 @@ async def test_collect_apply_diff_interface_in_sync_yields_no_entry(adapter_clie
     from nso_adapter.store.models import InterfaceIpIntent
 
     device_id = await _seed_device("rtr-diff-insync", 193)
-    async for db in get_session():
+    async with session() as db:
         iface = DbInterface(device_id=device_id, name="GigabitEthernet0/0", netbox_interface_id=911)
         db.add(iface)
         await db.flush()
         db.add(
             InterfaceIntent(
-                interface_id=iface.id, attribute="description", intent_value="up", accepted_at=datetime.utcnow()
+                interface_id=iface.id, attribute="description", intent_value="up", accepted_at=datetime.now(UTC)
             )
         )
         db.add(
             InterfaceIpIntent(
-                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.utcnow()
+                interface_id=iface.id, address="10.0.0.1/24", family="ipv4", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     with (
@@ -753,9 +737,8 @@ async def test_collect_apply_diff_interface_in_sync_yields_no_entry(adapter_clie
         patch("nso_adapter.nso.apply.apply_interface_attribute", new_callable=AsyncMock, return_value=""),
         patch("nso_adapter.nso.apply.apply_interface_ips", new_callable=AsyncMock, return_value=None),
     ):
-        async for db in get_session():
+        async with session() as db:
             diffs = await collect_apply_diff(db, device_id)
-            break
 
     assert diffs == {}
 
@@ -780,12 +763,11 @@ async def test_run_apply_all_succeed(adapter_client):
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["attribute_count_by_outcome"]["in_sync"] == 1
         assert job.result["attribute_count_by_outcome"]["apply_failed"] == 0
-        break
 
 
 async def test_run_apply_refreshes_mirror_and_notifies_plugin(adapter_client):
@@ -834,7 +816,7 @@ async def test_run_apply_refreshes_mirror_and_notifies_plugin(adapter_client):
     # each (codex S3-R2 F5's two-fan-out proof under grain b) ...
     assert mock_client.get_device_state_doc.await_count == 2, mock_client.get_device_state_doc.await_count
     # ... their sections actually materialized (the families that back a 'deploying' row) ...
-    async for db in get_session():
+    async with session() as db:
         from nso_adapter.store.models import DeviceRoutePolicyPrefixList, DeviceSvi
 
         pls = (
@@ -849,7 +831,6 @@ async def test_run_apply_refreshes_mirror_and_notifies_plugin(adapter_client):
         svis = (await db.execute(select(DeviceSvi).where(DeviceSvi.device_id == device_id))).scalars().all()
         assert [x.name for x in pls] == ["PL-SETTLE"]
         assert [x.interface_name for x in svis] == ["Vlan77"]
-        break
     # ... and the plugin was notified so its post-apply reconcile settles the deploying row.
     nb.notify_sync_complete.assert_awaited_once_with(321)
 
@@ -884,10 +865,9 @@ async def test_run_apply_post_refresh_failure_does_not_fail_job(adapter_client):
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)  # must not raise
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded  # unchanged by the best-effort post-refresh
-        break
 
 
 async def test_run_apply_partial_failure(adapter_client):
@@ -913,12 +893,11 @@ async def test_run_apply_partial_failure(adapter_client):
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.error["code"] == "nso_commit_failed"
         assert job.result["attribute_count_by_outcome"]["apply_failed"] == 1
-        break
 
 
 async def test_run_apply_unexpected_exception_on_attribute(adapter_client):
@@ -945,14 +924,13 @@ async def test_run_apply_unexpected_exception_on_attribute(adapter_client):
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert (
             "unexpected internal error" in str(job.result)
             or job.result["attribute_count_by_outcome"]["apply_failed"] == 1
         )
-        break
 
 
 async def test_run_apply_no_force_filters_eligible(adapter_client):
@@ -973,12 +951,11 @@ async def test_run_apply_no_force_filters_eligible(adapter_client):
     with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
         await run_apply(job_id=job_id, device_id=device_id, force=False)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         # in_sync is not in _NO_FORCE_ELIGIBLE, so nothing was applied
         assert job.status == JobStatus.succeeded
         assert job.result["attribute_count_by_outcome"]["in_sync"] == 0
-        break
 
 
 async def test_run_apply_outer_exception(adapter_client):
@@ -989,11 +966,10 @@ async def test_run_apply_outer_exception(adapter_client):
     with patch("nso_adapter.core.importer.get_nso_client", side_effect=RuntimeError("DB boom")):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.error["code"] == "internal"
-        break
 
 
 # ── IP intent apply pass ───────────────────────────────────────────────────
@@ -1001,7 +977,7 @@ async def test_run_apply_outer_exception(adapter_client):
 
 async def _seed_iface(device_id: int, iface_name: str) -> int:
     """Create a bare DbInterface row and return its id."""
-    async for db in get_session():
+    async with session() as db:
         iface = DbInterface(device_id=device_id, name=iface_name)
         db.add(iface)
         await db.flush()
@@ -1025,18 +1001,17 @@ async def _seed_ip_intent(
 
     from nso_adapter.store.models import InterfaceIpIntent
 
-    async for db in get_session():
+    async with session() as db:
         row = InterfaceIpIntent(
             interface_id=interface_id,
             address=address,
             vrf=vrf,
             family=family,
             secondary=secondary,
-            accepted_at=datetime.now(UTC).replace(tzinfo=None) if accepted else None,
+            accepted_at=datetime.now(UTC) if accepted else None,
         )
         db.add(row)
         await db.commit()
-        break
 
 
 @pytest.mark.anyio
@@ -1061,7 +1036,7 @@ async def test_run_apply_ip_intent_success(adapter_client):
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         result = job.result
@@ -1075,7 +1050,6 @@ async def test_run_apply_ip_intent_success(adapter_client):
         )
         assert ip_rows[0].last_apply_at is not None
         assert ip_rows[0].last_apply_error is None
-        break
 
     mock_ip_apply.assert_awaited_once()
 
@@ -1105,7 +1079,7 @@ async def test_run_apply_ip_intent_failure_marks_error(adapter_client):
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.result["ip_count_by_outcome"]["apply_failed"] == 1
@@ -1116,7 +1090,6 @@ async def test_run_apply_ip_intent_failure_marks_error(adapter_client):
         )
         assert ip_rows[0].last_apply_error is not None
         assert ip_rows[0].last_apply_error["code"] == "nso_patch_failed"
-        break
 
 
 @pytest.mark.anyio
@@ -1153,16 +1126,15 @@ async def test_run_apply_ip_already_applied_skipped_without_force(adapter_client
     await _seed_ip_intent(iface_id, address="10.0.3.1/24", family="ipv4", accepted=True)
 
     # Stamp last_apply_at to simulate already-applied
-    async for db in get_session():
+    async with session() as db:
         rows = (
             (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface_id)))
             .scalars()
             .all()
         )
-        rows[0].last_apply_at = datetime.now(UTC).replace(tzinfo=None)
+        rows[0].last_apply_at = datetime.now(UTC)
         rows[0].last_apply_error = None
         await db.commit()
-        break
 
     mock_nso = AsyncMock()
 
@@ -1189,10 +1161,9 @@ async def test_run_apply_bgp_intent_does_not_crash_on_commit(adapter_client):
 
     device_id = await _seed_device("rtr-bgp-crash", 555)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(BgpRouterIntent(device_id=device_id, asn="65100", accepted_at=datetime.now(UTC)))
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     with (
@@ -1201,11 +1172,10 @@ async def test_run_apply_bgp_intent_does_not_crash_on_commit(adapter_client):
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)  # must not raise
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["bgp_count_by_outcome"]["in_sync"] == 1
-        break
 
 
 # ── Per-scope apply passes (SNMP / static-route / logging / SVI / subif / VLAN /
@@ -1253,10 +1223,9 @@ async def test_run_apply_scope_success(adapter_client, model_name, kwargs, apply
     device_id = await _seed_device(f"rtr-{result_key}", 300)
     job_id = await _seed_apply_job(device_id)
     model = getattr(m, model_name)
-    async for db in get_session():
-        db.add(model(device_id=device_id, accepted_at=datetime.utcnow(), **kwargs))
+    async with session() as db:
+        db.add(model(device_id=device_id, accepted_at=datetime.now(UTC), **kwargs))
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     with (
@@ -1266,7 +1235,7 @@ async def test_run_apply_scope_success(adapter_client, model_name, kwargs, apply
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     mock_apply.assert_awaited_once()
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result[f"{result_key}_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
@@ -1274,7 +1243,6 @@ async def test_run_apply_scope_success(adapter_client, model_name, kwargs, apply
         rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
         assert rows[0].last_apply_at is not None
         assert rows[0].last_apply_error is None
-        break
 
 
 async def test_run_apply_logging_threads_and_stamps_levels_intent(adapter_client):
@@ -1284,11 +1252,10 @@ async def test_run_apply_logging_threads_and_stamps_levels_intent(adapter_client
 
     device_id = await _seed_device("rtr-logging-lvl", 311)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
-        db.add(LoggingHostIntent(device_id=device_id, address="10.9.0.98", accepted_at=datetime.utcnow()))
-        db.add(LoggingLevelsIntent(device_id=device_id, console_severity="CRITICAL", accepted_at=datetime.utcnow()))
+    async with session() as db:
+        db.add(LoggingHostIntent(device_id=device_id, address="10.9.0.98", accepted_at=datetime.now(UTC)))
+        db.add(LoggingLevelsIntent(device_id=device_id, console_severity="CRITICAL", accepted_at=datetime.now(UTC)))
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     with (
@@ -1299,7 +1266,7 @@ async def test_run_apply_logging_threads_and_stamps_levels_intent(adapter_client
 
     mock_apply.assert_awaited_once()
     assert mock_apply.await_args.kwargs["levels_intent_row"] is not None
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         # both the host row and the levels singleton count and get stamped
@@ -1309,7 +1276,6 @@ async def test_run_apply_logging_threads_and_stamps_levels_intent(adapter_client
         ).scalar_one()
         assert row.last_apply_at is not None
         assert row.last_apply_error is None
-        break
 
 
 async def test_run_apply_logging_levels_only_is_eligible(adapter_client):
@@ -1318,10 +1284,9 @@ async def test_run_apply_logging_levels_only_is_eligible(adapter_client):
 
     device_id = await _seed_device("rtr-logging-lvl2", 312)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
-        db.add(LoggingLevelsIntent(device_id=device_id, monitor_severity="NOTICE", accepted_at=datetime.utcnow()))
+    async with session() as db:
+        db.add(LoggingLevelsIntent(device_id=device_id, monitor_severity="NOTICE", accepted_at=datetime.now(UTC)))
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     with (
@@ -1331,11 +1296,10 @@ async def test_run_apply_logging_levels_only_is_eligible(adapter_client):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     mock_apply.assert_awaited_once()
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["logging_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
-        break
 
 
 async def test_run_apply_scope_failure_marks_error(adapter_client):
@@ -1345,14 +1309,13 @@ async def test_run_apply_scope_failure_marks_error(adapter_client):
 
     device_id = await _seed_device("rtr-sr-fail", 310)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             StaticRouteIntent(
-                device_id=device_id, prefix="10.8.0.0/24", next_hop="10.8.0.1", accepted_at=datetime.utcnow()
+                device_id=device_id, prefix="10.8.0.0/24", next_hop="10.8.0.1", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     nso_err = NsoApplyError(code="nso_error", message="route rejected", detail={"x": 1})
@@ -1362,7 +1325,7 @@ async def test_run_apply_scope_failure_marks_error(adapter_client):
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.result["static_route_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
@@ -1375,7 +1338,6 @@ async def test_run_apply_scope_failure_marks_error(adapter_client):
             .all()
         )
         assert rows[0].last_apply_error == {"code": "nso_error", "message": "route rejected", "detail": {"x": 1}}
-        break
 
 
 async def test_run_apply_scope_unexpected_exception(adapter_client):
@@ -1384,10 +1346,9 @@ async def test_run_apply_scope_unexpected_exception(adapter_client):
 
     device_id = await _seed_device("rtr-vlan-boom", 311)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
-        db.add(VlanIntent(device_id=device_id, vlan_id=42, accepted_at=datetime.utcnow()))
+    async with session() as db:
+        db.add(VlanIntent(device_id=device_id, vlan_id=42, accepted_at=datetime.now(UTC)))
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     with (
@@ -1400,14 +1361,13 @@ async def test_run_apply_scope_unexpected_exception(adapter_client):
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.result["vlan_count_by_outcome"]["apply_failed"] == 1
         rows = (await db.execute(select(VlanIntent).where(VlanIntent.device_id == device_id))).scalars().all()
         assert rows[0].last_apply_error["code"] == "internal"
         assert "kaboom" in rows[0].last_apply_error["message"]
-        break
 
 
 # The IS-IS sub-collections (process/level/flex) are eligible on their OWN — a per-level
@@ -1435,10 +1395,9 @@ async def test_run_apply_isis_subscope_failure_fails_the_job(adapter_client, mod
     device_id = await _seed_device(f"rtr-isis-sub-{model_name.lower()}", 330)
     job_id = await _seed_apply_job(device_id)
     model = getattr(m, model_name)
-    async for db in get_session():
-        db.add(model(device_id=device_id, accepted_at=datetime.utcnow(), **kwargs))
+    async with session() as db:
+        db.add(model(device_id=device_id, accepted_at=datetime.now(UTC), **kwargs))
         await db.commit()
-        break
 
     nso_err = NsoApplyError(code="nso_error", message="level rejected", detail={})
     with (
@@ -1447,14 +1406,13 @@ async def test_run_apply_isis_subscope_failure_fails_the_job(adapter_client, mod
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.result["isis_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
         assert job.error["code"] == "nso_commit_failed"
         rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
         assert rows[0].last_apply_error["message"] == "level rejected"
-        break
 
 
 @pytest.mark.parametrize("model_name, kwargs", _ISIS_SUBSCOPE_CASES)
@@ -1465,10 +1423,9 @@ async def test_run_apply_isis_subscope_success_is_counted(adapter_client, model_
     device_id = await _seed_device(f"rtr-isis-sub-ok-{model_name.lower()}", 331)
     job_id = await _seed_apply_job(device_id)
     model = getattr(m, model_name)
-    async for db in get_session():
-        db.add(model(device_id=device_id, accepted_at=datetime.utcnow(), **kwargs))
+    async with session() as db:
+        db.add(model(device_id=device_id, accepted_at=datetime.now(UTC), **kwargs))
         await db.commit()
-        break
 
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=AsyncMock()),
@@ -1477,13 +1434,12 @@ async def test_run_apply_isis_subscope_success_is_counted(adapter_client, model_
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     mock_apply.assert_awaited_once()
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["isis_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
         rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
         assert rows[0].last_apply_at is not None
-        break
 
 
 async def test_run_apply_isis_applies_process_redist_and_flexalgo(adapter_client):
@@ -1497,22 +1453,21 @@ async def test_run_apply_isis_applies_process_redist_and_flexalgo(adapter_client
 
     device_id = await _seed_device("rtr-isis-combo", 320)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
-            IsisInterfaceIntent(device_id=device_id, interface_name="Gi0/3", af="ipv4", accepted_at=datetime.utcnow())
+            IsisInterfaceIntent(device_id=device_id, interface_name="Gi0/3", af="ipv4", accepted_at=datetime.now(UTC))
         )
-        db.add(IsisProcessIntent(device_id=device_id, accepted_at=datetime.utcnow()))
-        db.add(IsisFlexAlgoIntent(device_id=device_id, algo_id=128, accepted_at=datetime.utcnow()))
+        db.add(IsisProcessIntent(device_id=device_id, accepted_at=datetime.now(UTC)))
+        db.add(IsisFlexAlgoIntent(device_id=device_id, algo_id=128, accepted_at=datetime.now(UTC)))
         db.add(
             RedistributionIntent(
                 device_id=device_id,
                 dest_protocol="isis",
                 source_protocol="connected",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     with (
@@ -1527,12 +1482,11 @@ async def test_run_apply_isis_applies_process_redist_and_flexalgo(adapter_client
     assert len(call["isis_process_rows"]) == 1
     assert len(call["redistribution_rows"]) == 1
     assert len(call["flex_algo_rows"]) == 1
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         # in_sync counts every row across the four lists
         assert job.result["isis_count_by_outcome"] == {"in_sync": 4, "apply_failed": 0}
-        break
 
 
 async def test_run_apply_ospf_applies_instance_interface_and_redist(adapter_client):
@@ -1541,27 +1495,26 @@ async def test_run_apply_ospf_applies_instance_interface_and_redist(adapter_clie
 
     device_id = await _seed_device("rtr-ospf-combo", 321)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
-            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.utcnow())
+            OspfInstanceIntent(device_id=device_id, process_id="1", router_id="1.1.1.1", accepted_at=datetime.now(UTC))
         )
-        db.add(OspfInterfaceIntent(device_id=device_id, interface_name="Gi0/4", accepted_at=datetime.utcnow()))
+        db.add(OspfInterfaceIntent(device_id=device_id, interface_name="Gi0/4", accepted_at=datetime.now(UTC)))
         db.add(
             RedistributionIntent(
                 device_id=device_id,
                 dest_protocol="ospf",
                 source_protocol="static",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         # a bgp-destined redist row must NOT be swept into the ospf pass
         db.add(
             RedistributionIntent(
-                device_id=device_id, dest_protocol="bgp", source_protocol="static", accepted_at=datetime.utcnow()
+                device_id=device_id, dest_protocol="bgp", source_protocol="static", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     with (
@@ -1576,10 +1529,9 @@ async def test_run_apply_ospf_applies_instance_interface_and_redist(adapter_clie
     assert len(call["process_intent_rows"]) == 1
     assert len(call["interface_intent_rows"]) == 1
     assert len(call["redistribution_rows"]) == 1  # only the ospf-destined row
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.result["ospf_count_by_outcome"] == {"in_sync": 3, "apply_failed": 0}
-        break
 
 
 async def test_run_apply_snmp_applies_all_row_types(adapter_client):
@@ -1593,17 +1545,17 @@ async def test_run_apply_snmp_applies_all_row_types(adapter_client):
 
     device_id = await _seed_device("rtr-snmp-all", 322)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             SnmpCommunityIntent(
                 device_id=device_id,
                 label="ro",
                 vault_ref="network/netbox/snmp/community/ro#community",
                 access="ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
-        db.add(SnmpV3UserIntent(device_id=device_id, username="v3-test-group", accepted_at=datetime.utcnow()))
+        db.add(SnmpV3UserIntent(device_id=device_id, username="v3-test-group", accepted_at=datetime.now(UTC)))
         db.add(
             SnmpHostIntent(
                 device_id=device_id,
@@ -1611,12 +1563,11 @@ async def test_run_apply_snmp_applies_all_row_types(adapter_client):
                 version="v2c",
                 notify_type="traps",
                 community_or_user="ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
-        db.add(SnmpSystemInfoIntent(device_id=device_id, location="rack-7", accepted_at=datetime.utcnow()))
+        db.add(SnmpSystemInfoIntent(device_id=device_id, location="rack-7", accepted_at=datetime.now(UTC)))
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     with (
@@ -1631,11 +1582,10 @@ async def test_run_apply_snmp_applies_all_row_types(adapter_client):
     assert len(call["v3_user_intents"]) == 1
     assert len(call["host_intents"]) == 1
     assert call["system_info_intent"] is not None
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         # 3 list rows + 1 system-info row
         assert job.result["snmp_count_by_outcome"] == {"in_sync": 4, "apply_failed": 0}
-        break
 
 
 async def test_run_apply_route_policy_failure_records_capability(adapter_client):
@@ -1649,24 +1599,22 @@ async def test_run_apply_route_policy_failure_records_capability(adapter_client)
 
     device_id = await _seed_device("rtr-rp-fail", 323)
     # give the device a ned_id so apply_route_policy_config gets one
-    async for db in get_session():
+    async with session() as db:
         dev = await db.get(Device, device_id)
         dev.ned_id = "cisco-ios-cli-6.95"
         await db.commit()
-        break
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             RoutePolicyObjectIntent(
                 device_id=device_id,
                 family="ipv4",
                 name="RM-IN",
                 entries=[],
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     nso_err = NsoApplyError(code="nso_error", message="unsupported set community RM-IN", detail={})
@@ -1688,11 +1636,10 @@ async def test_run_apply_route_policy_failure_records_capability(adapter_client)
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     rec.assert_awaited_once()
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.result["route_policy_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
-        break
 
 
 async def test_run_apply_route_policy_capability_recording_is_best_effort(adapter_client):
@@ -1702,14 +1649,13 @@ async def test_run_apply_route_policy_capability_recording_is_best_effort(adapte
 
     device_id = await _seed_device("rtr-rp-cap-err", 324)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             RoutePolicyObjectIntent(
-                device_id=device_id, family="ipv4", name="RM-X", entries=[], accepted_at=datetime.utcnow()
+                device_id=device_id, family="ipv4", name="RM-X", entries=[], accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     nso_err = NsoApplyError(code="nso_error", message="boom", detail={})
@@ -1724,11 +1670,10 @@ async def test_run_apply_route_policy_capability_recording_is_best_effort(adapte
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)  # must not raise
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.result["route_policy_count_by_outcome"]["apply_failed"] == 1
-        break
 
 
 async def test_run_apply_route_policy_capability_skips_record_when_unparseable(adapter_client):
@@ -1738,14 +1683,13 @@ async def test_run_apply_route_policy_capability_skips_record_when_unparseable(a
 
     device_id = await _seed_device("rtr-rp-cap-skip", 325)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             RoutePolicyObjectIntent(
-                device_id=device_id, family="ipv4", name="RM-Y", entries=[], accepted_at=datetime.utcnow()
+                device_id=device_id, family="ipv4", name="RM-Y", entries=[], accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock()
     nso_err = NsoApplyError(code="nso_error", message="opaque error", detail={})
@@ -1764,10 +1708,9 @@ async def test_run_apply_route_policy_capability_skips_record_when_unparseable(a
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     rec.assert_not_awaited()
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
-        break
 
 
 async def test_run_apply_ip_unexpected_exception(adapter_client):
@@ -1790,7 +1733,7 @@ async def test_run_apply_ip_unexpected_exception(adapter_client):
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.result["ip_count_by_outcome"]["apply_failed"] == 1
@@ -1801,7 +1744,6 @@ async def test_run_apply_ip_unexpected_exception(adapter_client):
         )
         assert rows[0].last_apply_error["code"] == "internal"
         assert "transport exploded" in rows[0].last_apply_error["message"]
-        break
 
 
 # ── Atomic apply (NSO_ADAPTER_ATOMIC_APPLY): subif + IP in one transaction ─────
@@ -1812,7 +1754,7 @@ async def _seed_subif_and_ip(device_id: int, iface_name: str = "ae99.999") -> in
     InterfaceIpIntent (interface-keyed) — the greenfield subif+IP pair. Returns iface_id."""
     from nso_adapter.store.models import InterfaceIpIntent, SubinterfaceIntent
 
-    async for db in get_session():
+    async with session() as db:
         iface = DbInterface(device_id=device_id, netbox_interface_id=999, name=iface_name, kind="logical")
         db.add(iface)
         await db.flush()
@@ -1823,7 +1765,7 @@ async def _seed_subif_and_ip(device_id: int, iface_name: str = "ae99.999") -> in
                 parent_interface="ae99",
                 dot1q_vlan=999,
                 sub_type="subinterface",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         db.add(
@@ -1832,18 +1774,17 @@ async def _seed_subif_and_ip(device_id: int, iface_name: str = "ae99.999") -> in
                 address="198.18.1.1/24",
                 family="ipv4",
                 secondary=False,
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
         return iface.id
-    raise RuntimeError("no session")
 
 
 async def _ip_and_subif_rows(device_id: int):
     from nso_adapter.store.models import InterfaceIpIntent, SubinterfaceIntent
 
-    async for db in get_session():
+    async with session() as db:
         subif = (
             (await db.execute(select(SubinterfaceIntent).where(SubinterfaceIntent.device_id == device_id)))
             .scalars()
@@ -1851,26 +1792,24 @@ async def _ip_and_subif_rows(device_id: int):
         )
         ip = (await db.execute(select(InterfaceIpIntent))).scalars().all()
         return subif, ip
-    raise RuntimeError("no session")
 
 
 async def _seed_snmp_and_static_route(device_id: int) -> None:
     from nso_adapter.store.models import SnmpCommunityIntent, StaticRouteIntent
 
-    async for db in get_session():
+    async with session() as db:
         db.add(
             SnmpCommunityIntent(
-                device_id=device_id, label="public", vault_ref="m/p#k", access="RO", accepted_at=datetime.utcnow()
+                device_id=device_id, label="public", vault_ref="m/p#k", access="RO", accepted_at=datetime.now(UTC)
             )
         )
         db.add(
             StaticRouteIntent(
-                device_id=device_id, vrf="", prefix="10.9.9.0/24", next_hop="1.1.1.1", accepted_at=datetime.utcnow()
+                device_id=device_id, vrf="", prefix="10.9.9.0/24", next_hop="1.1.1.1", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
         return
-    raise RuntimeError("no session")
 
 
 @pytest.mark.asyncio
@@ -1902,10 +1841,9 @@ async def test_run_apply_atomic_stages_subif_and_ip_in_one_commit(adapter_client
 
     subif_rows, ip_rows = await _ip_and_subif_rows(device_id)
     assert all(r.last_apply_at is not None and r.last_apply_error is None for r in subif_rows + ip_rows)
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
-        break
 
 
 @pytest.mark.asyncio
@@ -1932,9 +1870,8 @@ async def test_run_apply_atomic_stages_all_scopes_in_one_commit(adapter_client, 
         "snmp-reconciler:snmp-config",
         "static-route-reconciler:static-route-config",
     } <= set(modules)
-    async for db in get_session():
+    async with session() as db:
         assert (await db.get(Job, job_id)).status == JobStatus.succeeded
-        break
 
 
 @pytest.mark.asyncio
@@ -1952,7 +1889,7 @@ async def test_run_apply_atomic_unrenderable_scope_does_not_take_down_the_job(ad
     monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01-legacy")
     await _seed_snmp_and_static_route(device_id)
-    async for db in get_session():
+    async with session() as db:
         row = (
             (await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)))
             .scalars()
@@ -1960,7 +1897,6 @@ async def test_run_apply_atomic_unrenderable_scope_does_not_take_down_the_job(ad
         )
         row.vault_ref = "network/netbox/snmp/legacy"  # pre-#121: no '#key'
         await db.commit()
-        break
     job_id = await _seed_apply_job(device_id)
 
     mock_client = AsyncMock()
@@ -1976,7 +1912,7 @@ async def test_run_apply_atomic_unrenderable_scope_does_not_take_down_the_job(ad
     assert "static-route-reconciler:static-route-config" in modules
     assert "snmp-reconciler:snmp-config" not in modules
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed  # the snmp scope really did fail
         assert job.result["snmp_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
@@ -1994,7 +1930,6 @@ async def test_run_apply_atomic_unrenderable_scope_does_not_take_down_the_job(ad
         )
         assert sr.last_apply_error is None  # an innocent scope was not punished
         assert sr.last_apply_at is not None
-        break
 
 
 @pytest.mark.asyncio
@@ -2008,18 +1943,17 @@ async def test_run_apply_atomic_merges_attr_and_ip_into_one_interface_entry(adap
     iface_id, _attr_id = await _seed_interface_with_intent(
         device_id, "Gi0/1", "description", "uplink", SyncState.accepted
     )
-    async for db in get_session():
+    async with session() as db:
         db.add(
             InterfaceIpIntent(
                 interface_id=iface_id,
                 address="10.0.0.1/30",
                 family="ipv4",
                 secondary=False,
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
     job_id = await _seed_apply_job(device_id)
 
     mock_client = AsyncMock()
@@ -2060,13 +1994,12 @@ async def test_run_apply_atomic_failure_localizes_offender_others_pending(adapte
         stack.enter_context(patch("nso_adapter.core.apply._localize_atomic_failure", _fake_localize))
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         sr = (await db.execute(select(StaticRouteIntent))).scalars().all()
         sc = (await db.execute(select(SnmpCommunityIntent))).scalars().all()
         assert sr and all(r.last_apply_error is not None for r in sr)  # offender → failed
         assert sc and all(r.last_apply_error is None and r.last_apply_at is None for r in sc)  # pending
         assert (await db.get(Job, job_id)).status == JobStatus.failed
-        break
 
 
 @pytest.mark.asyncio
@@ -2081,11 +2014,10 @@ async def test_run_apply_atomic_failure_records_scope_capability(adapter_client,
     monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01")
     await _seed_snmp_and_static_route(device_id)
-    async for db in get_session():  # give the device a known (ned, sw) so no probe is needed
+    async with session() as db:  # give the device a known (ned, sw) so no probe is needed
         dev = await db.get(Device, device_id)
         dev.ned_id, dev.sw_version = "cisco-ios-cli:cisco-ios", "15.7"
         await db.commit()
-        break
     job_id = await _seed_apply_job(device_id)
 
     async def _combined(client, device_name, modules, *, dry_run=False, strict=False):
@@ -2102,7 +2034,7 @@ async def test_run_apply_atomic_failure_records_scope_capability(adapter_client,
         stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         caps = (
             (await db.execute(select(DeviceCapability).where(DeviceCapability.ned_id == "cisco-ios-cli:cisco-ios")))
             .scalars()
@@ -2117,7 +2049,6 @@ async def test_run_apply_atomic_failure_records_scope_capability(adapter_client,
         assert all(r.last_apply_error is not None for r in sr)
         assert all(r.last_apply_error is None and r.last_apply_at is None for r in sc)
         assert (await db.get(Job, job_id)).status == JobStatus.failed
-        break
 
 
 @pytest.mark.asyncio
@@ -2135,20 +2066,19 @@ async def test_run_apply_atomic_iface_rejection_attributed_to_offending_half(ada
     iface_id, _attr_id = await _seed_interface_with_intent(
         device_id, "Gi0/1", "description", "uplink", SyncState.accepted
     )
-    async for db in get_session():
+    async with session() as db:
         db.add(
             InterfaceIpIntent(
                 interface_id=iface_id,
                 address="10.0.0.1/30",
                 family="ipv4",
                 secondary=False,
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         dev = await db.get(Device, device_id)
         dev.ned_id, dev.sw_version = "cisco-ios-cli:cisco-ios", "15.7"
         await db.commit()
-        break
     job_id = await _seed_apply_job(device_id)
 
     # REAL sample shape (captured live on rg03): the 4xx names the ipv4-address node.
@@ -2171,7 +2101,7 @@ async def test_run_apply_atomic_iface_rejection_attributed_to_offending_half(ada
         stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         caps = (
             (await db.execute(select(DeviceCapability).where(DeviceCapability.ned_id == "cisco-ios-cli:cisco-ios")))
             .scalars()
@@ -2181,7 +2111,6 @@ async def test_run_apply_atomic_iface_rejection_attributed_to_offending_half(ada
         assert "interface_ip" in by_scope
         assert by_scope["interface_ip"].name == "ipv4-address"  # construct-named, not coarse
         assert "interface_attribute" not in by_scope  # the attribute half no longer falsely warns
-        break
 
 
 @pytest.mark.asyncio
@@ -2198,20 +2127,19 @@ async def test_run_apply_atomic_iface_rejection_unattributable_falls_back_to_bot
     iface_id, _attr_id = await _seed_interface_with_intent(
         device_id, "Gi0/2", "description", "uplink", SyncState.accepted
     )
-    async for db in get_session():
+    async with session() as db:
         db.add(
             InterfaceIpIntent(
                 interface_id=iface_id,
                 address="10.0.0.5/30",
                 family="ipv4",
                 secondary=False,
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         dev = await db.get(Device, device_id)
         dev.ned_id, dev.sw_version = "cisco-ios-cli:cisco-ios", "15.7"
         await db.commit()
-        break
     job_id = await _seed_apply_job(device_id)
 
     async def _combined(client, device_name, modules, *, dry_run=False, strict=False):
@@ -2227,7 +2155,7 @@ async def test_run_apply_atomic_iface_rejection_unattributable_falls_back_to_bot
         stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         caps = (
             (await db.execute(select(DeviceCapability).where(DeviceCapability.ned_id == "cisco-ios-cli:cisco-ios")))
             .scalars()
@@ -2235,7 +2163,6 @@ async def test_run_apply_atomic_iface_rejection_unattributable_falls_back_to_bot
         )
         by_scope = {c.scope: c for c in caps}
         assert "interface_ip" in by_scope and "interface_attribute" in by_scope  # coarse fallback
-        break
 
 
 @pytest.mark.asyncio
@@ -2250,7 +2177,7 @@ async def test_run_apply_atomic_success_clears_stale_reactive_unsupported(adapte
     device_id = await _seed_device(name="sw01")
     await _seed_snmp_and_static_route(device_id)
     ned = "cisco-ios-cli:cisco-ios"
-    async for db in get_session():
+    async with session() as db:
         dev = await db.get(Device, device_id)
         dev.ned_id, dev.sw_version = ned, "15.7"
         # stale reactive rejections left by an earlier FAILED apply of these scopes
@@ -2286,7 +2213,6 @@ async def test_run_apply_atomic_success_clears_stale_reactive_unsupported(adapte
             ]
         )
         await db.commit()
-        break
     job_id = await _seed_apply_job(device_id)
 
     mock_client = AsyncMock()
@@ -2296,7 +2222,7 @@ async def test_run_apply_atomic_success_clears_stale_reactive_unsupported(adapte
         stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", combined))
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         by_key = {
             (c.scope, c.name): c
             for c in (await db.execute(select(DeviceCapability).where(DeviceCapability.ned_id == ned))).scalars().all()
@@ -2305,13 +2231,12 @@ async def test_run_apply_atomic_success_clears_stale_reactive_unsupported(adapte
         assert ("route_policy", "route_policy") in by_key  # NOT applied → untouched
         assert ("rm-set", "set extcommunity color") in by_key  # fine-grained → never cleared
         assert (await db.get(Job, job_id)).status == JobStatus.succeeded
-        break
 
 
 async def _seed_route_map_intent(device_id, ned_id):
     from nso_adapter.store.models import Device, RoutePolicyObjectIntent
 
-    async for db in get_session():
+    async with session() as db:
         dev = await db.get(Device, device_id)
         dev.ned_id, dev.sw_version = ned_id, ""
         db.add(
@@ -2320,11 +2245,10 @@ async def _seed_route_map_intent(device_id, ned_id):
                 family="route_map",
                 name="TEST-RM",
                 entries=[{"sequence": 10, "action": "permit"}],
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
 
 @pytest.mark.asyncio
@@ -2359,12 +2283,11 @@ async def test_run_apply_atomic_misconfig_device_rejection_records_no_capability
         stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         assert (await db.execute(select(DeviceCapability))).scalars().all() == []  # NOT a capability gap
         rp = (await db.execute(select(RoutePolicyObjectIntent))).scalars().all()
         assert all(r.last_apply_error is not None for r in rp)  # but the apply did fail + recorded the error
         assert (await db.get(Job, job_id)).status == JobStatus.failed
-        break
 
 
 @pytest.mark.asyncio
@@ -2389,10 +2312,9 @@ async def test_run_apply_atomic_transient_failure_records_no_capability(adapter_
         stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         assert (await db.execute(select(DeviceCapability))).scalars().all() == []  # nothing recorded
         assert (await db.get(Job, job_id)).status == JobStatus.failed
-        break
 
 
 @pytest.mark.asyncio
@@ -2405,11 +2327,10 @@ async def test_run_apply_atomic_transient_during_localize_records_no_capability(
     monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01")
     await _seed_snmp_and_static_route(device_id)
-    async for db in get_session():
+    async with session() as db:
         dev = await db.get(Device, device_id)
         dev.ned_id, dev.sw_version = "cisco-ios-cli:cisco-ios", "15.7"
         await db.commit()
-        break
     job_id = await _seed_apply_job(device_id)
 
     device_err = "RPC error: something rejected"
@@ -2429,10 +2350,9 @@ async def test_run_apply_atomic_transient_during_localize_records_no_capability(
         stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", _combined))
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         assert (await db.execute(select(DeviceCapability))).scalars().all() == []  # no false 'unsupported'
         assert (await db.get(Job, job_id)).status == JobStatus.failed
-        break
 
 
 @pytest.mark.asyncio
@@ -2451,9 +2371,8 @@ async def test_run_apply_marks_failed_even_when_session_poisoned(adapter_client,
     with patch("nso_adapter.core.apply._execute_apply", _poison):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         assert (await db.get(Job, job_id)).status == JobStatus.failed
-        break
 
 
 @pytest.mark.asyncio
@@ -2474,12 +2393,11 @@ async def test_run_apply_atomic_staging_failure_reverts_deploying(adapter_client
     with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         assert (await db.get(Job, job_id)).status == JobStatus.failed
         attr_state = await db.get(InterfaceAttrState, attr_id)
         assert attr_state.sync_state != SyncState.deploying  # reverted, not stuck deploying
         assert attr_state.sync_state == SyncState.accepted
-        break
 
 
 def test_capability_scopes_for_interface_config_covers_attribute_and_ip():
@@ -2513,10 +2431,9 @@ async def test_diff_interface_ips_preview_excludes_unaccepted(adapter_client):
         return ""
 
     nso_apply = SimpleNamespace(apply_interface_ips=_apply_ips)
-    async for db in get_session():
+    async with session() as db:
         iface = await db.get(DbInterface, iface_id)
         await _diff_interface_ips(db, nso_apply, object(), "rtr-diff", {iface_id: iface})
-        break
 
     assert {r.address for r in seen_rows} == {"10.0.0.1/24"}  # un-accepted 10.0.0.2/24 excluded
 
@@ -2567,10 +2484,9 @@ async def test_run_apply_atomic_failure_marks_both_subif_and_ip(adapter_client, 
 
     subif_rows, ip_rows = await _ip_and_subif_rows(device_id)
     assert all(r.last_apply_error is not None and r.last_apply_at is None for r in subif_rows + ip_rows)
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
-        break
 
 
 # ── #108: post-apply reader-compare (the #26 silent-drop class, caught in seconds) ──
@@ -2609,18 +2525,17 @@ async def test_run_apply_reader_compare_flags_silent_drop(adapter_client):
 
     device_id = await _seed_device("rtr-rc-drop", 401)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             StaticRouteIntent(
                 device_id=device_id,
                 vrf="",
                 prefix="198.18.26.0/24",
                 next_hop="10.0.0.1",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock(spec=NsoClient)
     mock_client.run_device_state_read.return_value = _rc_action(
@@ -2632,7 +2547,7 @@ async def test_run_apply_reader_compare_flags_silent_drop(adapter_client):
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.result["static_route_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
@@ -2644,7 +2559,6 @@ async def test_run_apply_reader_compare_flags_silent_drop(adapter_client):
         )
         assert row.last_apply_error["code"] == "reader_compare_missing"
         assert "198.18.26.0/24" in row.last_apply_error["message"]
-        break
 
 
 async def test_run_apply_reader_compare_ok_when_key_lands(adapter_client):
@@ -2653,18 +2567,17 @@ async def test_run_apply_reader_compare_ok_when_key_lands(adapter_client):
 
     device_id = await _seed_device("rtr-rc-ok", 402)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             StaticRouteIntent(
                 device_id=device_id,
                 vrf="",
                 prefix="198.18.27.0/24",
                 next_hop="10.0.0.1",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock(spec=NsoClient)
     mock_client.run_device_state_read.return_value = _rc_action(
@@ -2678,7 +2591,7 @@ async def test_run_apply_reader_compare_ok_when_key_lands(adapter_client):
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["static_route_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
@@ -2690,7 +2603,6 @@ async def test_run_apply_reader_compare_ok_when_key_lands(adapter_client):
         )
         assert row.last_apply_error is None
         assert row.last_apply_at is not None
-        break
 
 
 from tests.core.conftest import SNMP_COMMUNITY, SNMP_VAULT_REF, community_export_name  # noqa: E402
@@ -2715,18 +2627,17 @@ async def test_run_apply_reader_compare_does_not_fail_a_landed_community(adapter
 
     device_id = await _seed_device("rtr-rc-snmp", 404)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             SnmpCommunityIntent(
                 device_id=device_id,
                 label="prod-ro",
                 vault_ref="network/netbox/snmp/community/prod-ro#community",
                 access="ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock(spec=NsoClient)
     # The community IS on the device — under its hashed export identity.
@@ -2742,7 +2653,7 @@ async def test_run_apply_reader_compare_does_not_fail_a_landed_community(adapter
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["snmp_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
@@ -2752,7 +2663,6 @@ async def test_run_apply_reader_compare_does_not_fail_a_landed_community(adapter
             .one()
         )
         assert row.last_apply_error is None
-        break
 
 
 async def test_run_apply_reader_compare_still_catches_a_dropped_snmp_host(adapter_client):
@@ -2762,7 +2672,7 @@ async def test_run_apply_reader_compare_still_catches_a_dropped_snmp_host(adapte
 
     device_id = await _seed_device("rtr-rc-snmp-host", 405)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             SnmpHostIntent(
                 device_id=device_id,
@@ -2770,11 +2680,10 @@ async def test_run_apply_reader_compare_still_catches_a_dropped_snmp_host(adapte
                 version="2c",
                 notify_type="traps",
                 community_or_user="prod-ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock(spec=NsoClient)
     mock_client.run_device_state_read.return_value = _rc_action(
@@ -2786,13 +2695,12 @@ async def test_run_apply_reader_compare_still_catches_a_dropped_snmp_host(adapte
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.result["reader_compare"]["snmp"] == "missing"
         row = (await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))).scalars().one()
         assert row.last_apply_error["code"] == "reader_compare_missing"
-        break
 
 
 async def test_run_apply_reader_compare_absent_reader_surface_is_not_a_drop(adapter_client):
@@ -2809,18 +2717,17 @@ async def test_run_apply_reader_compare_absent_reader_surface_is_not_a_drop(adap
 
     device_id = await _seed_device("rtr-rc-none", 406)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             StaticRouteIntent(
                 device_id=device_id,
                 vrf="",
                 prefix="198.18.29.0/24",
                 next_hop="10.0.0.1",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock(spec=NsoClient)
     mock_client.run_device_state_read.return_value = _rc_action(
@@ -2832,7 +2739,7 @@ async def test_run_apply_reader_compare_absent_reader_surface_is_not_a_drop(adap
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["static_route_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
@@ -2843,7 +2750,6 @@ async def test_run_apply_reader_compare_absent_reader_surface_is_not_a_drop(adap
             .one()
         )
         assert row.last_apply_error is None
-        break
 
 
 async def test_run_apply_reader_compare_empty_list_payload_is_still_a_drop(adapter_client):
@@ -2853,18 +2759,17 @@ async def test_run_apply_reader_compare_empty_list_payload_is_still_a_drop(adapt
 
     device_id = await _seed_device("rtr-rc-empty", 407)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             StaticRouteIntent(
                 device_id=device_id,
                 vrf="",
                 prefix="198.18.30.0/24",
                 next_hop="10.0.0.1",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock(spec=NsoClient)
     mock_client.run_device_state_read.return_value = _rc_action(
@@ -2876,16 +2781,15 @@ async def test_run_apply_reader_compare_empty_list_payload_is_still_a_drop(adapt
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.result["reader_compare"]["static_route"] == "missing"
-        break
 
 
 async def _seed_nokia_device(name: str, netbox_id: int) -> int:
     """A device whose NED cannot hold every canonical community member (SR OS)."""
-    async for db in get_session():
+    async with session() as db:
         d = Device(
             nso_instance="nso-dev",
             nso_device_name=name,
@@ -2896,7 +2800,6 @@ async def _seed_nokia_device(name: str, netbox_id: int) -> int:
         await db.commit()
         await db.refresh(d)
         return d.id
-    raise RuntimeError("no session")
 
 
 async def test_run_apply_reader_compare_skips_a_fully_unrepresentable_community_list(adapter_client):
@@ -2914,18 +2817,17 @@ async def test_run_apply_reader_compare_skips_a_fully_unrepresentable_community_
 
     device_id = await _seed_nokia_device("rtr-rp-unsup", 408)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             RoutePolicyObjectIntent(
                 device_id=device_id,
                 family="community_list",
                 name="CL-COLOR-ONLY",
                 entries=[{"community": "bandwidth:64500:100"}],  # unrepresentable on SR OS
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock(spec=NsoClient)
     # The export answers — the object legitimately is not there, because nothing was rendered.
@@ -2941,7 +2843,7 @@ async def test_run_apply_reader_compare_skips_a_fully_unrepresentable_community_
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["route_policy_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
@@ -2951,7 +2853,6 @@ async def test_run_apply_reader_compare_skips_a_fully_unrepresentable_community_
             .one()
         )
         assert row.last_apply_error is None
-        break
 
 
 async def test_run_apply_reader_compare_still_fails_a_representable_community_list(adapter_client):
@@ -2960,18 +2861,17 @@ async def test_run_apply_reader_compare_still_fails_a_representable_community_li
 
     device_id = await _seed_nokia_device("rtr-rp-real", 409)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             RoutePolicyObjectIntent(
                 device_id=device_id,
                 family="community_list",
                 name="CL-STD",
                 entries=[{"community": "64500:100"}],  # plain asn:val — SR OS takes it verbatim
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock(spec=NsoClient)
     # reader-compare reads the device-state ACTION; device-name is echoed by the real action but
@@ -2987,11 +2887,10 @@ async def test_run_apply_reader_compare_still_fails_a_representable_community_li
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.result["reader_compare"]["route_policy"] == "missing"
-        break
 
 
 async def test_run_apply_reader_compare_reader_error_is_nonfatal(adapter_client):
@@ -3001,18 +2900,17 @@ async def test_run_apply_reader_compare_reader_error_is_nonfatal(adapter_client)
 
     device_id = await _seed_device("rtr-rc-err", 403)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             StaticRouteIntent(
                 device_id=device_id,
                 vrf="",
                 prefix="198.18.28.0/24",
                 next_hop="10.0.0.1",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock(spec=NsoClient)
     mock_client.run_device_state_read.side_effect = RuntimeError("reader down")
@@ -3022,12 +2920,11 @@ async def test_run_apply_reader_compare_reader_error_is_nonfatal(adapter_client)
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["static_route_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
         assert job.result["reader_compare"]["static_route"] == "error"
-        break
 
 
 async def test_run_apply_reader_compare_bgp_checks_router_and_peers(adapter_client):
@@ -3037,8 +2934,8 @@ async def test_run_apply_reader_compare_bgp_checks_router_and_peers(adapter_clie
 
     device_id = await _seed_device("rtr-rc-bgp", 404)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
-        router = BgpRouterIntent(device_id=device_id, asn="65100", accepted_at=datetime.utcnow())
+    async with session() as db:
+        router = BgpRouterIntent(device_id=device_id, asn="65100", accepted_at=datetime.now(UTC))
         db.add(router)
         await db.flush()
         scope = BgpScopeIntent(router_id=router.id, vrf="")
@@ -3047,7 +2944,6 @@ async def test_run_apply_reader_compare_bgp_checks_router_and_peers(adapter_clie
         db.add(BgpPeerIntent(scope_id=scope.id, peer_address="10.0.0.7"))
         db.add(BgpPeerIntent(scope_id=scope.id, peer_address="10.0.0.9"))
         await db.commit()
-        break
 
     mock_client = AsyncMock(spec=NsoClient)
     mock_client.run_device_state_read.return_value = _rc_action(
@@ -3061,7 +2957,7 @@ async def test_run_apply_reader_compare_bgp_checks_router_and_peers(adapter_clie
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.result["reader_compare"]["bgp"] == "missing"
@@ -3071,7 +2967,6 @@ async def test_run_apply_reader_compare_bgp_checks_router_and_peers(adapter_clie
         )
         assert router.last_apply_error["code"] == "reader_compare_missing"
         assert "10.0.0.9" in router.last_apply_error["message"]
-        break
 
 
 async def test_run_apply_reader_compare_isis_flags_only_missing_model(adapter_client):
@@ -3081,15 +2976,14 @@ async def test_run_apply_reader_compare_isis_flags_only_missing_model(adapter_cl
 
     device_id = await _seed_device("rtr-rc-isis", 405)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             IsisInterfaceIntent(
-                device_id=device_id, interface_name="ge-0/0/0", af="ipv4", accepted_at=datetime.utcnow()
+                device_id=device_id, interface_name="ge-0/0/0", af="ipv4", accepted_at=datetime.now(UTC)
             )
         )
-        db.add(IsisProcessIntent(device_id=device_id, process_tag="CORE", accepted_at=datetime.utcnow()))
+        db.add(IsisProcessIntent(device_id=device_id, process_tag="CORE", accepted_at=datetime.now(UTC)))
         await db.commit()
-        break
 
     mock_client = AsyncMock(spec=NsoClient)
     mock_client.run_device_state_read.return_value = _rc_action(
@@ -3107,7 +3001,7 @@ async def test_run_apply_reader_compare_isis_flags_only_missing_model(adapter_cl
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.result["reader_compare"]["isis"] == "missing"
@@ -3124,7 +3018,6 @@ async def test_run_apply_reader_compare_isis_flags_only_missing_model(adapter_cl
         )
         assert iface_row.last_apply_error is None
         assert proc_row.last_apply_error["code"] == "reader_compare_missing"
-        break
 
 
 # ── CR-A17: a community that never LANDED is a silent drop like any other ─────────────────────
@@ -3142,18 +3035,17 @@ async def test_run_apply_reader_compare_isis_flags_only_missing_model(adapter_cl
 async def _seed_community(device_id: int, *, label="prod-ro", vault_ref=SNMP_VAULT_REF) -> None:
     from nso_adapter.store.models import SnmpCommunityIntent
 
-    async for db in get_session():
+    async with session() as db:
         db.add(
             SnmpCommunityIntent(
                 device_id=device_id,
                 label=label,
                 vault_ref=vault_ref,
                 access="ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
 
 async def _apply_snmp(device_id: int, job_id: int, snmp_view: dict) -> Job:
@@ -3171,9 +3063,8 @@ async def _apply_snmp(device_id: int, job_id: int, snmp_view: dict) -> Job:
         patch("nso_adapter.nso.apply.apply_snmp_config", new_callable=AsyncMock),
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
-    async for db in get_session():
+    async with session() as db:
         return await db.get(Job, job_id)
-    raise RuntimeError("no session")
 
 
 async def test_a_community_the_writer_SILENTLY_DROPPED_is_now_caught(adapter_client, vault):
@@ -3192,14 +3083,13 @@ async def test_a_community_the_writer_SILENTLY_DROPPED_is_now_caught(adapter_cli
 
     assert job.status == JobStatus.failed
     assert job.result["reader_compare"]["snmp"] == "missing"
-    async for db in get_session():
+    async with session() as db:
         row = (
             (await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)))
             .scalars()
             .one()
         )
         assert row.last_apply_error["code"] == "reader_compare_missing"
-        break
 
 
 async def test_a_community_that_DID_land_is_verified_green_not_merely_skipped(adapter_client, vault):
@@ -3243,14 +3133,13 @@ async def test_VAULT_DOWN_must_not_stamp_a_landed_community_apply_failed(adapter
     )
 
     assert job.status == JobStatus.succeeded
-    async for db in get_session():
+    async with session() as db:
         row = (
             (await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)))
             .scalars()
             .one()
         )
         assert row.last_apply_error is None, "a Vault outage must never accuse the WRITER of dropping"
-        break
 
 
 async def test_a_dropped_HOST_is_still_caught_when_the_community_grain_goes_dark(adapter_client, vault):
@@ -3261,7 +3150,7 @@ async def test_a_dropped_HOST_is_still_caught_when_the_community_grain_goes_dark
     device_id = await _seed_device("rtr-a17-mixed", 434)
     job_id = await _seed_apply_job(device_id)
     await _seed_community(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             SnmpHostIntent(
                 device_id=device_id,
@@ -3269,19 +3158,17 @@ async def test_a_dropped_HOST_is_still_caught_when_the_community_grain_goes_dark
                 version="2c",
                 notify_type="traps",
                 community_or_user="prod-ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     job = await _apply_snmp(device_id, job_id, {"community": [], "v3-user": [], "host": []})
 
     assert job.result["reader_compare"]["snmp"] == "missing"
-    async for db in get_session():
+    async with session() as db:
         host = (await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))).scalars().one()
         assert host.last_apply_error["code"] == "reader_compare_missing"
-        break
 
 
 # ── READSEM 1328 — the reader-compare/action-migration behaviours ─────────────────────────────
@@ -3299,7 +3186,7 @@ async def test_mixed_community_and_host_vault_down_is_PARTIAL_not_ok(adapter_cli
     device_id = await _seed_device("rtr-a17-partial", 435)
     job_id = await _seed_apply_job(device_id)
     await _seed_community(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             SnmpHostIntent(
                 device_id=device_id,
@@ -3307,11 +3194,10 @@ async def test_mixed_community_and_host_vault_down_is_PARTIAL_not_ok(adapter_cli
                 version="2c",
                 notify_type="traps",
                 community_or_user="prod-ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     # the host IS on the device; the community cannot be re-keyed (Vault down)
     job = await _apply_snmp(device_id, job_id, {"community": [], "v3-user": [], "host": [{"address": "198.18.5.9"}]})
@@ -3319,10 +3205,9 @@ async def test_mixed_community_and_host_vault_down_is_PARTIAL_not_ok(adapter_cli
     assert job.status == JobStatus.succeeded  # partial is not a failure
     assert job.result["reader_compare"]["snmp"] == "partial"
     assert job.result["reader_compare_unverifiable"]["snmp"], "the unchecked community must be named"
-    async for db in get_session():
+    async with session() as db:
         host = (await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))).scalars().one()
         assert host.last_apply_error is None  # the host landed and was verified
-        break
 
 
 async def test_all_unverifiable_scope_runs_NO_action_and_is_unknown(adapter_client, vault):
@@ -3342,11 +3227,10 @@ async def test_all_unverifiable_scope_runs_NO_action_and_is_unknown(adapter_clie
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     mock_client.run_device_state_read.assert_not_awaited()  # never ran the action
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["reader_compare"]["snmp"] == "unknown"
-        break
 
 
 async def test_reader_compare_budget_exhaustion_yields_unknown(adapter_client, monkeypatch):
@@ -3363,15 +3247,14 @@ async def test_reader_compare_budget_exhaustion_yields_unknown(adapter_client, m
     monkeypatch.setattr("nso_adapter.core.removal._VERIFY_PER_CALL_TIMEOUT", 0.3)
     device_id = await _seed_device("rtr-rc-budget", 440)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             StaticRouteIntent(
-                device_id=device_id, vrf="", prefix="198.18.40.0/24", next_hop="10.0.0.1", accepted_at=datetime.utcnow()
+                device_id=device_id, vrf="", prefix="198.18.40.0/24", next_hop="10.0.0.1", accepted_at=datetime.now(UTC)
             )
         )
-        db.add(VlanIntent(device_id=device_id, vlan_id=444, name="rc-budget", accepted_at=datetime.utcnow()))
+        db.add(VlanIntent(device_id=device_id, vlan_id=444, name="rc-budget", accepted_at=datetime.now(UTC)))
         await db.commit()
-        break
 
     mock_client = AsyncMock(spec=NsoClient)
     reads: list[str] = []
@@ -3392,7 +3275,7 @@ async def test_reader_compare_budget_exhaustion_yields_unknown(adapter_client, m
     # exactly ONE scope ever reached the action (the first); the budget was spent, so the
     # second scope skipped to unknown without a second action call.
     assert len(reads) == 1, f"a budget-spent scope must NOT run the action, got {reads}"
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded  # the verify never fails the apply
         assert job.result["reader_compare"]["static_route"] == "unknown"  # budget-cut
@@ -3403,7 +3286,6 @@ async def test_reader_compare_budget_exhaustion_yields_unknown(adapter_client, m
             .one()
         )
         assert row.last_apply_error is None  # never accused of a silent drop
-        break
 
 
 async def test_atomic_reader_compare_batches_ONE_action_for_all_scopes(adapter_client, monkeypatch):
@@ -3414,10 +3296,10 @@ async def test_atomic_reader_compare_batches_ONE_action_for_all_scopes(adapter_c
 
     monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01-atomic-rc")
-    async for db in get_session():
+    async with session() as db:
         db.add(
             StaticRouteIntent(
-                device_id=device_id, vrf="", prefix="10.9.9.0/24", next_hop="1.1.1.1", accepted_at=datetime.utcnow()
+                device_id=device_id, vrf="", prefix="10.9.9.0/24", next_hop="1.1.1.1", accepted_at=datetime.now(UTC)
             )
         )
         db.add(
@@ -3427,11 +3309,10 @@ async def test_atomic_reader_compare_batches_ONE_action_for_all_scopes(adapter_c
                 version="2c",
                 notify_type="traps",
                 community_or_user="x",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
     job_id = await _seed_apply_job(device_id)
 
     calls: list[list[str]] = []
@@ -3454,12 +3335,11 @@ async def test_atomic_reader_compare_batches_ONE_action_for_all_scopes(adapter_c
 
     assert len(calls) == 1, f"expected exactly one batched action, got {calls}"
     assert set(calls[0]) == {"static-route", "snmp-config"}
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.result["reader_compare"]["static_route"] == "ok"
         assert job.result["reader_compare"]["snmp"] == "missing"  # the host never landed
         assert job.status == JobStatus.failed
-        break
 
 
 async def test_reader_compare_non_terminal_section_is_error(adapter_client):
@@ -3471,14 +3351,13 @@ async def test_reader_compare_non_terminal_section_is_error(adapter_client):
 
     device_id = await _seed_device("rtr-rc-notready", 441)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             StaticRouteIntent(
-                device_id=device_id, vrf="", prefix="198.18.41.0/24", next_hop="10.0.0.1", accepted_at=datetime.utcnow()
+                device_id=device_id, vrf="", prefix="198.18.41.0/24", next_hop="10.0.0.1", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock(spec=NsoClient)
     mock_client.run_device_state_read.return_value = _rc_action(
@@ -3490,11 +3369,10 @@ async def test_reader_compare_non_terminal_section_is_error(adapter_client):
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded  # error never fails a good apply
         assert job.result["reader_compare"]["static_route"] == "error"
-        break
 
 
 # ── codex review (READSEM 1328): verifier robustness ──────────────────────────────────────────
@@ -3508,14 +3386,13 @@ async def test_reader_compare_malformed_ok_section_is_error_not_job_crash(adapte
 
     device_id = await _seed_device("rtr-rc-malformed", 442)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             StaticRouteIntent(
-                device_id=device_id, vrf="", prefix="198.18.42.0/24", next_hop="10.0.0.1", accepted_at=datetime.utcnow()
+                device_id=device_id, vrf="", prefix="198.18.42.0/24", next_hop="10.0.0.1", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock(spec=NsoClient)
     mock_client.run_device_state_read.return_value = _rc_action(
@@ -3529,7 +3406,7 @@ async def test_reader_compare_malformed_ok_section_is_error_not_job_crash(adapte
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded  # the commit landed — a read-side glitch must not fail it
         assert job.result["reader_compare"]["static_route"] == "error"
@@ -3539,7 +3416,6 @@ async def test_reader_compare_malformed_ok_section_is_error_not_job_crash(adapte
             .one()
         )
         assert row.last_apply_error is None  # never accused of a silent drop
-        break
 
 
 async def test_atomic_reader_compare_malformed_section_is_error_not_job_crash(adapter_client, monkeypatch):
@@ -3549,14 +3425,13 @@ async def test_atomic_reader_compare_malformed_section_is_error_not_job_crash(ad
 
     monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
     device_id = await _seed_device(name="sw01-atomic-malformed")
-    async for db in get_session():
+    async with session() as db:
         db.add(
             StaticRouteIntent(
-                device_id=device_id, vrf="", prefix="10.9.42.0/24", next_hop="1.1.1.1", accepted_at=datetime.utcnow()
+                device_id=device_id, vrf="", prefix="10.9.42.0/24", next_hop="1.1.1.1", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
-        break
     job_id = await _seed_apply_job(device_id)
 
     mock_client = AsyncMock()
@@ -3570,11 +3445,10 @@ async def test_atomic_reader_compare_malformed_section_is_error_not_job_crash(ad
         stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", AsyncMock(return_value=None)))
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["reader_compare"]["static_route"] == "error"
-        break
 
 
 async def test_action_failure_preserves_unverifiable_labels(adapter_client, vault):
@@ -3588,7 +3462,7 @@ async def test_action_failure_preserves_unverifiable_labels(adapter_client, vaul
     device_id = await _seed_device("rtr-a17-actfail", 443)
     job_id = await _seed_apply_job(device_id)
     await _seed_community(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             SnmpHostIntent(
                 device_id=device_id,
@@ -3596,11 +3470,10 @@ async def test_action_failure_preserves_unverifiable_labels(adapter_client, vaul
                 version="2c",
                 notify_type="traps",
                 community_or_user="prod-ro",
-                accepted_at=datetime.utcnow(),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock(spec=NsoClient)
     mock_client.run_device_state_read.side_effect = RuntimeError("action exploded")
@@ -3610,12 +3483,11 @@ async def test_action_failure_preserves_unverifiable_labels(adapter_client, vaul
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded  # a read error never fails a good apply
         assert job.result["reader_compare"]["snmp"] == "error"
         assert job.result["reader_compare_unverifiable"]["snmp"], "the unverifiable community must survive the error"
-        break
 
 
 async def test_verifier_budget_excludes_commit_latency(adapter_client, monkeypatch):
@@ -3627,14 +3499,13 @@ async def test_verifier_budget_excludes_commit_latency(adapter_client, monkeypat
     monkeypatch.setattr("nso_adapter.core.removal._VERIFY_TOTAL_BUDGET", 0.1)
     device_id = await _seed_device("rtr-rc-commitslow", 444)
     job_id = await _seed_apply_job(device_id)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             StaticRouteIntent(
-                device_id=device_id, vrf="", prefix="198.18.44.0/24", next_hop="10.0.0.1", accepted_at=datetime.utcnow()
+                device_id=device_id, vrf="", prefix="198.18.44.0/24", next_hop="10.0.0.1", accepted_at=datetime.now(UTC)
             )
         )
         await db.commit()
-        break
 
     mock_client = AsyncMock(spec=NsoClient)
     mock_client.run_device_state_read.return_value = _rc_action(
@@ -3652,8 +3523,7 @@ async def test_verifier_budget_excludes_commit_latency(adapter_client, monkeypat
     ):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["reader_compare"]["static_route"] == "ok"  # verified despite the slow commit
-        break

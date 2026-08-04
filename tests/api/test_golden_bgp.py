@@ -17,7 +17,7 @@ with router_id null (always present), and the empty device.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import select
@@ -29,6 +29,7 @@ from tests.conftest import (
     pin_store_incarnation,
     seed_bgp_config,
     seed_device,
+    session,
 )
 
 _SYNTH_READ_STATE = {
@@ -47,20 +48,18 @@ _SYNTH_READ_STATE = {
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TS = datetime(2026, 6, 1, 10, 0, 0)
+TS = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
 
 
 async def _set_router_refreshed(device_id: int) -> None:
     """seed_bgp_config leaves last_refreshed_at NULL; set it so the "<iso>Z" path is exercised."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceBgpRouter
 
-    async for db in get_session():
+    async with session() as db:
         rows = (await db.execute(select(DeviceBgpRouter).where(DeviceBgpRouter.device_id == device_id))).scalars().all()
         for r in rows:
             r.last_refreshed_at = TS
         await db.commit()
-        break
 
 
 @pytest.mark.anyio

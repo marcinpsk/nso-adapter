@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
+from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
@@ -261,7 +262,7 @@ async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_rea
     last_ts = latest.last_refreshed_at
     return {
         "device_id": device_id,
-        "last_refreshed_at": last_ts.isoformat() + "Z" if last_ts else None,
+        "last_refreshed_at": iso_z(last_ts),
         "refresh_source": latest.refresh_source,
         "read_state": read_state,
         "processes": [_serialize_isis_process(r) for r in proc_rows],
@@ -293,7 +294,7 @@ class IsisInterfaceEntry(BaseModel):
     bfd_enabled: bool | None = None
     frr_enabled: bool | None = None
     frr_protection: str | None = None
-    accepted_at: datetime | None = None
+    accepted_at: UtcInstant | None = None
 
 
 class IsisLevelEntry(BaseModel):
@@ -315,7 +316,7 @@ class IsisProcessEntry(BaseModel):
     domain_auth_key: str | None = None
     fast_reroute: str | None = None
     microloop_avoidance: bool | None = None
-    accepted_at: datetime | None = None
+    accepted_at: UtcInstant | None = None
     redistribution: list[RedistributionEntry] = []
     levels: list[IsisLevelEntry] = []
 
@@ -362,7 +363,7 @@ async def _sync_keyed_intent(
     count = 0
     cleared = False
     for entry in entries:
-        accepted = entry.accepted_at.replace(tzinfo=None) if entry.accepted_at else now
+        accepted = entry.accepted_at if entry.accepted_at else now
         row = existing.get(key_of(entry))
         before = {f: getattr(row, f) for f in state_fields} if row is not None else None
         if row is None:
@@ -518,7 +519,7 @@ async def put_isis_interface_intent(
     if not device:
         raise api_error(404, "not_found", "Device not found")
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
 
     # Capture the pre-sync keys so the removal job knows what THIS put deleted —
     # the collateral guard's discriminator between an intended retraction and an
@@ -635,7 +636,7 @@ class IsisFlexAlgoEntry(BaseModel):
     admin_group_exclude: str | None = None
     admin_group_include_any: str | None = None
     admin_group_include_all: str | None = None
-    accepted_at: datetime | None = None
+    accepted_at: UtcInstant | None = None
 
 
 class IsisFlexAlgoIntentUpdate(BaseModel):
@@ -665,7 +666,7 @@ async def put_isis_flex_algo_intent(device_id: int, body: IsisFlexAlgoIntentUpda
     if not device:
         raise api_error(404, "not_found", "Device not found")
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
 
     existing_result = await db.execute(select(IsisFlexAlgoIntent).where(IsisFlexAlgoIntent.device_id == device_id))
     existing_rows: dict[tuple, IsisFlexAlgoIntent] = {
@@ -692,7 +693,7 @@ async def put_isis_flex_algo_intent(device_id: int, body: IsisFlexAlgoIntentUpda
     cleared = False
     for item in body.flex_algos:
         key = (item.process_tag, item.algo_id)
-        accepted = item.accepted_at.replace(tzinfo=None) if item.accepted_at else now
+        accepted = item.accepted_at if item.accepted_at else now
         row = existing_rows.get(key)
         # Every flex-algo scalar is emitted only when set (`if row.priority is not None`),
         # so a merge-PATCH apply can never drop one that goes back to unset — a cleared

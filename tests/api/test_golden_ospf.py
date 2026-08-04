@@ -2,11 +2,8 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Golden-body test — GET /api/v1/devices/{id}/ospf.
 
-Deep-equality proof of the exact OSPF read-mirror JSON. Unlike static_route/bgp/
-isis (which format ``.isoformat() + "Z"``), the OSPF reader returns the RAW naive
-datetime (``ospf.py``), so jsonable_encoder emits ``"2026-06-01T10:00:00"`` with
-NO trailing ``Z`` — this golden pins that difference so the response model must be
-typed ``datetime`` (not ``str``) to stay neutral.
+Deep-equality proof of the exact OSPF read-mirror JSON. ``last_refreshed_at`` goes
+through ``iso_z`` like every other family, so it serialises as ``"<iso>Z"``.
 
 Covers a maximal instance (router_id + enabled + areas), a minimal instance
 (``areas`` still present as []), a maximal + minimal interface, and the empty
@@ -15,7 +12,7 @@ device.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -25,6 +22,7 @@ from tests.conftest import (
     VALID_TOKEN,
     pin_store_incarnation,
     seed_device,
+    session,
 )
 
 _SYNTH_READ_STATE = {
@@ -43,14 +41,13 @@ _SYNTH_READ_STATE = {
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TS = datetime(2026, 6, 1, 10, 0, 0)
+TS = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
 
 
 async def _seed_ospf(device_id: int) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceOspfInstance, DeviceOspfInterface
 
-    async for db in get_session():
+    async with session() as db:
         db.add(
             DeviceOspfInstance(
                 device_id=device_id,
@@ -94,7 +91,6 @@ async def _seed_ospf(device_id: int) -> None:
             )
         )
         await db.commit()
-        break
 
 
 @pytest.mark.anyio
@@ -107,7 +103,7 @@ async def test_ospf_golden_body(adapter_client):
 
     assert body == {
         "device_id": device_id,
-        "last_refreshed_at": "2026-06-01T10:00:00",  # RAW datetime — no trailing "Z"
+        "last_refreshed_at": "2026-06-01T10:00:00Z",
         "refresh_source": "poll",
         "read_state": _SYNTH_READ_STATE,
         "instances": [

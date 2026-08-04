@@ -20,8 +20,8 @@ from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.bindings.netbox.scope import PluginScopeRecord
 from nso_adapter.core import scheduler as sched
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import DbInterface, Device, InterfaceIntent, ManagedScope
+from tests.conftest import session
 
 
 def _nso_client():
@@ -34,7 +34,7 @@ def _nso_client():
 async def _seed_devices(*specs: tuple[str, int]) -> dict[str, int]:
     """Seed (nso_device_name, netbox_device_id) devices; return {name: device_id}."""
     ids: dict[str, int] = {}
-    async for db in get_session():
+    async with session() as db:
         for name, nb_id in specs:
             dev = Device(nso_instance="nso-dev", nso_device_name=name, netbox_device_id=nb_id)
             db.add(dev)
@@ -42,7 +42,6 @@ async def _seed_devices(*specs: tuple[str, int]) -> dict[str, int]:
         result = await db.execute(select(Device).where(Device.nso_instance == "nso-dev"))
         for dev in result.scalars().all():
             ids[dev.nso_device_name] = dev.id
-        break
     return ids
 
 
@@ -113,14 +112,13 @@ async def test_family_refresh_skips_device_without_nso_client(adapter_client, mo
 
 @pytest.mark.anyio
 async def test_scheduled_sync_all_enqueues_each_scoped_device(adapter_client, monkeypatch):
-    async for db in get_session():
+    async with session() as db:
         dev = Device(nso_instance="nso-dev", nso_device_name="sw01", netbox_device_id=6001)
         db.add(dev)
         await db.commit()
         db.add(ManagedScope(device_id=dev.id, attribute="description"))
         await db.commit()
         dev_id = dev.id
-        break
 
     enqueue = AsyncMock(return_value=(SimpleNamespace(id=99), True))
     monkeypatch.setattr("nso_adapter.core.jobs.enqueue_job", enqueue)
@@ -133,14 +131,13 @@ async def test_scheduled_sync_all_enqueues_each_scoped_device(adapter_client, mo
 
 @pytest.mark.anyio
 async def test_scheduled_sync_all_handles_skip_and_error(adapter_client, monkeypatch):
-    async for db in get_session():
+    async with session() as db:
         for name, nb in (("sw01", 6101), ("sw02", 6102)):
             dev = Device(nso_instance="nso-dev", nso_device_name=name, netbox_device_id=nb)
             db.add(dev)
             await db.commit()
             db.add(ManagedScope(device_id=dev.id, attribute="description"))
             await db.commit()
-        break
 
     # first device: job already active (created=False, skip branch); second: enqueue raises (error branch)
     enqueue = AsyncMock(side_effect=[(SimpleNamespace(id=1), False), RuntimeError("boom")])
@@ -213,14 +210,13 @@ async def test_scope_reconcile_persists_failover_ips(adapter_client, monkeypatch
 
     await sched._scheduled_scope_reconcile()
 
-    async for db in get_session():
+    async with session() as db:
         fo = (
             await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device_id))
         ).scalar_one_or_none()
         assert fo is not None, "failover row not persisted — reconcile never committed"
         assert fo.primary_ip == "10.0.0.1"
         assert fo.oob_ip == "192.0.2.5"
-        break
 
 
 @pytest.mark.anyio
@@ -356,10 +352,9 @@ async def test_intent_reconcile_aborts_on_fetch_error(adapter_client, monkeypatc
 @pytest.mark.anyio
 async def test_intent_reconcile_replaces_intent_and_skips_unknown_interface(adapter_client, monkeypatch):
     ids = await _seed_devices(("sw01", 8001))
-    async for db in get_session():
+    async with session() as db:
         db.add(DbInterface(device_id=ids["sw01"], name="GigabitEthernet0/1"))
         await db.commit()
-        break
 
     records = [
         SimpleNamespace(
@@ -382,9 +377,8 @@ async def test_intent_reconcile_replaces_intent_and_skips_unknown_interface(adap
 
     await sched._scheduled_intent_reconcile()
 
-    async for db in get_session():
+    async with session() as db:
         rows = (await db.execute(select(InterfaceIntent))).scalars().all()
-        break
     assert [(r.attribute, r.intent_value) for r in rows] == [("description", "uplink")]
 
 
@@ -392,22 +386,20 @@ async def test_intent_reconcile_replaces_intent_and_skips_unknown_interface(adap
 async def test_intent_reconcile_deletes_existing_when_no_records(adapter_client, monkeypatch):
     """A device with a pre-existing intent but no incoming records → row deleted, no re-add."""
     ids = await _seed_devices(("sw01", 8101))
-    async for db in get_session():
+    async with session() as db:
         iface = DbInterface(device_id=ids["sw01"], name="GigabitEthernet0/1")
         db.add(iface)
         await db.flush()
         db.add(InterfaceIntent(interface_id=iface.id, attribute="description", intent_value="stale"))
         await db.commit()
-        break
 
     monkeypatch.setattr("nso_adapter.core.importer.get_netbox_client", lambda: object())
     monkeypatch.setattr("nso_adapter.bindings.netbox.intent.fetch_all_intent", AsyncMock(return_value=[]))
 
     await sched._scheduled_intent_reconcile()
 
-    async for db in get_session():
+    async with session() as db:
         rows = (await db.execute(select(InterfaceIntent))).scalars().all()
-        break
     assert rows == []  # the stale intent was deleted; nothing re-added (count==0)
 
 

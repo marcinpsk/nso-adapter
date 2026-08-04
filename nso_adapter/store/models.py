@@ -27,6 +27,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -114,13 +115,28 @@ class Device(Base):
     # cache resolve this device's (ned_id, sw_version) key WITHOUT a live probe.
     sw_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     mapping_status: Mapped[MappingStatus] = mapped_column(Enum(MappingStatus), default=MappingStatus.mapped)
-    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_sync_status: Mapped[LastSyncStatus | None] = mapped_column(Enum(LastSyncStatus), nullable=True)
     # When last_sync_status == partial: the routing surfaces that failed to read from NSO on the
     # last sync (e.g. ["bgp", "ospf"]). Their mirror rows may be stale. NULL when nothing degraded.
     degraded_surfaces: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
+
+    # Both identities are enforced in the DATABASE, not just by onboard_device's select-then-
+    # insert: two concurrent onboards can both find nothing and both insert, and the duplicates
+    # are permanent — the scope reconcile keys ownership by netbox_device_id and so keeps both.
+    # netbox_device_id is unique only where non-null (a device provisioned into NSO without a
+    # NetBox link is a legitimate leftover, and several may exist).
+    __table_args__ = (
+        UniqueConstraint("nso_instance", "nso_device_name", name="uq_device_nso_identity"),
+        Index(
+            "uq_device_netbox_device_id",
+            "netbox_device_id",
+            unique=True,
+            postgresql_where=text("netbox_device_id IS NOT NULL"),
+        ),
+    )
 
     managed_scope: Mapped[list[ManagedScope]] = relationship(
         "ManagedScope", back_populates="device", cascade="all, delete-orphan", lazy="raise"
@@ -278,7 +294,7 @@ class ManagedScope(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     device_id: Mapped[int] = mapped_column(Integer, ForeignKey("devices.id"), index=True)
     attribute: Mapped[str] = mapped_column(String(64))
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
     device: Mapped[Device] = relationship("Device", back_populates="managed_scope")
 
@@ -326,7 +342,7 @@ class InterfaceAttrState(Base):
     # importer to decide Phase 1 vs Phase 2). There is intentionally no intent_value
     # cache here — a second copy is what caused the Phase-2 split-brain.
     sync_state: Mapped[SyncState] = mapped_column(Enum(SyncState), default=SyncState.unknown)
-    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     interface_obj: Mapped[DbInterface] = relationship("DbInterface", back_populates="attr_states")
 
@@ -334,19 +350,41 @@ class InterfaceAttrState(Base):
 class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
-        # At most one active (queued/running) job per device for the enqueue_job-managed
-        # types. Closes the enqueue_job TOCTOU: the check-then-insert can't materialise two
-        # active rows even under concurrent schedulers/SSE/API. Exclusions:
-        #   * removal jobs are intentionally per-scope (enqueue_removal queues one each for
-        #     bgp/isis/snmp/… on the same device), so they must NOT collide;
-        #   * provision jobs carry device_id=NULL (NULLs are distinct) and dedup by context.
-        # Partial index → terminal (succeeded/failed) jobs never block a fresh enqueue.
+        # At most one QUEUED job per (device, job_type). Closes the enqueue TOCTOU: the
+        # check-then-insert cannot materialise two queued rows of a type even under
+        # concurrent schedulers/SSE/API.
+        #
+        # Scoped to QUEUED, not queued-or-running: a running job must not refuse its own
+        # successor, because the successor is what carries the newer intent. Execution is
+        # serialized by the per-device claim instead, which is the only gate that can span a
+        # job's whole lifetime — an apply goes terminal while its claim is still held through
+        # the post-apply refresh.
+        #
+        # Removals stay EXEMPT, and that is deliberate rather than an oversight:
+        # enqueue_removal queues one job per scope (bgp/isis/snmp/…) on the same device and
+        # every one of them must run. Their FIFO ordering comes from the worker's per-device
+        # head claim, not from uniqueness. Provision rows carry device_id=NULL (NULLs are
+        # distinct) and dedup by context.
         Index(
-            "uq_job_active_per_device",
+            "uq_job_queued_per_device_type",
             "device_id",
+            "job_type",
             unique=True,
-            sqlite_where=text("status IN ('queued', 'running') AND job_type <> 'removal'"),
-            postgresql_where=text("status IN ('queued', 'running') AND job_type <> 'removal'"),
+            postgresql_where=text("status = 'queued' AND job_type <> 'removal'"),
+        ),
+        # At most one ACTIVE provision per (nso_instance, device_name) — the dedupe key for
+        # rows the index above cannot reach, because a provision runs before the adapter
+        # Device exists and so carries device_id NULL.
+        #
+        # Covers RUNNING as well as queued, unlike the per-device index: a provision has no
+        # successor semantics. Re-admitting one mid-flight repeats the NSO node creation,
+        # the host-key fetch and the sync-from against a device already being onboarded.
+        Index(
+            "uq_job_active_provision_pair",
+            text("(context ->> 'nso_instance')"),
+            text("(context ->> 'device_name')"),
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'running') AND job_type = 'provision'"),
         ),
     )
 
@@ -358,13 +396,13 @@ class Job(Base):
     error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # Phase 2: apply jobs snapshot interface_intent rows here at job start
     context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
     # Layer B (durable worker): set when a worker claims the job; heartbeat_at is
     # refreshed periodically while it runs so a crashed/hung job can be detected
     # and requeued (or failed) on the next startup.
-    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     device: Mapped[Device | None] = relationship("Device", back_populates="jobs")
 
@@ -386,7 +424,7 @@ class DeviceSettings(Base):
     # or partial commit leaves the CDB inconsistent and the next apply is refused). Default
     # on; can be disabled per device for NEDs that already sync-on-connect.
     sync_before_apply: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
     device: Mapped[Device] = relationship("Device", back_populates="settings")
 
@@ -423,16 +461,16 @@ class DeviceFailover(Base):
     oob_healthy: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     oob_health_result: Mapped[str | None] = mapped_column(String(16), nullable=True)
     oob_health_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
-    oob_health_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    last_probe_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    oob_health_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_probe_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_probe_result: Mapped[str | None] = mapped_column(String(16), nullable=True)
     last_probe_target: Mapped[str | None] = mapped_column(String(16), nullable=True)
     last_probe_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
-    last_switch_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_switch_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Staggering bookkeeping — per-address due times so the fleet isn't probed in lockstep.
-    next_primary_probe_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    next_oob_probe_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+    next_primary_probe_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_oob_probe_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
     device: Mapped[Device] = relationship("Device", back_populates="failover")
 
@@ -466,7 +504,7 @@ class FailoverConfig(Base):
     # Safety belt: at most this many disruptive flips (set_address+disconnect+connect) per tick.
     max_flips_per_tick: Mapped[int] = mapped_column(Integer, default=8, server_default=text("8"))
     sync_from_after_switch: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
 
 class InterfaceIntent(Base):
@@ -483,8 +521,8 @@ class InterfaceIntent(Base):
     interface_id: Mapped[int] = mapped_column(Integer, ForeignKey("interfaces.id"), index=True)
     attribute: Mapped[str] = mapped_column(String(64))
     intent_value: Mapped[str | None] = mapped_column(Text, nullable=True)
-    accepted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     interface_obj: Mapped[DbInterface] = relationship("DbInterface", back_populates="intent")
@@ -682,7 +720,7 @@ class InterfaceIpIntent(Base):
 
     Structured, NOT string-valued — unlike InterfaceIntent which stores generic
     attribute string values.  Apply pass runs separately from the attribute
-    apply pass but shares the same per-device job lane (core/jobs.py:get_active_job).
+    apply pass but shares the same per-device execution lane (the device claim).
     Keyed (interface_id, address, vrf).
     """
 
@@ -990,12 +1028,54 @@ class StaticRouteIntent(Base):
     """Write-path intent for a static route accepted by the NetBox operator."""
 
     __tablename__ = "static_route_intent"
-    __table_args__ = (UniqueConstraint("device_id", "vrf", "prefix", "next_hop", name="uq_staticrouteintent_identity"),)
+    __table_args__ = (
+        # DEFERRABLE: an identity edit updates the row IN PLACE, so a same-payload swap
+        # (route 7 A->B while route 8 B->A) and a delete-then-reclaim both collide
+        # transiently. Both reach a legal final state; validating at COMMIT is what lets
+        # them through without an ordering trick that cannot fix the swap case anyway.
+        UniqueConstraint(
+            "device_id",
+            "vrf",
+            "prefix",
+            "next_hop",
+            name="uq_staticrouteintent_identity",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        # One intent row per (device, NetBox route pk). Partial so the pre-rollout NULL
+        # rows — the rollout fence's own signal — are not constrained.
+        Index(
+            "uq_sr_intent_device_route_id",
+            "device_id",
+            "route_id",
+            unique=True,
+            postgresql_where=text("route_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     device_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    # The NetBox routing.StaticRoute pk. No FK — a cross-system id. Nullable: the
+    # nullability IS the rollout fence (§3.8), and only the plugin (R3) can fill it.
+    route_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The pusher's intent generation for this route (#1396 R3 §4.5) — a plugin-global,
+    # never-reused value the plugin allocates on every content change. Carried here so an
+    # apply result can name the generation it proves, and settlement can discard a result
+    # for intent that has since been superseded. Adopted only when the push carries one:
+    # a pre-R3 push omits it and must not erase the correlation, exactly as for route_id.
+    intent_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # The triple last proven committed into the service, as ["<vrf>", "<prefix>",
+    # "<next_hop>"]. JSONB because PostgreSQL's `json` has no equality operator and R2's
+    # CAS is `IS NOT DISTINCT FROM`; none_as_null so a Python None is SQL NULL and not
+    # 'null'::jsonb, which would silently stop matching `IS NULL`.
+    deployed_key: Mapped[list | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    # R2 §4.11: store field names cleared by an intent PUT and not yet proven gone from the
+    # device, split by whether the clearing push may authorize a device write —
+    # ``{"authorized": [...], "store_only": [...]}``. NULL = nothing pending. A networked
+    # removal delivers only the ``authorized`` half; either half blocks a proven ``in_sync``.
+    pending_clear: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     vrf: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     prefix: Mapped[str] = mapped_column(String(64), nullable=False)
     next_hop: Mapped[str] = mapped_column(String(64), nullable=False, default="")
@@ -1012,6 +1092,96 @@ class StaticRouteIntent(Base):
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     device: Mapped[Device] = relationship("Device", back_populates="static_route_intents")
+
+
+class DeviceClaim(Base):
+    """Exclusive per-device execution claim. One row = one live acquisition.
+
+    ``device_id`` is the primary key, so ``INSERT … ON CONFLICT (device_id) DO NOTHING``
+    is what decides mutual exclusion — at the database, across connections and
+    processes. A lease timestamp alone would not: a holder inside a slow NSO call whose
+    heartbeats are failing can be stolen from and still complete its own write, which is
+    why writes validate a per-acquisition token under a row lock instead.
+
+    No ``Device`` relationship: a claim is not device state, and teardown's intent-root
+    enumeration derives from ``Device.__mapper__.relationships``.
+    """
+
+    __tablename__ = "device_claim"
+    __table_args__ = (
+        # Closed five-value set — every holder acquires the same claim. String + CHECK
+        # rather than a PG enum, matching ck_srt_marking: a new enum type widens the
+        # parity snapshot's type set and needs ALTER TYPE care forever.
+        CheckConstraint(
+            "purpose IN ('job', 'intent_put', 'teardown', 'sweep', 'failover')",
+            name="ck_device_claim_purpose",
+        ),
+        UniqueConstraint("claim_token", name="uq_device_claim_token"),
+    )
+
+    device_id: Mapped[int] = mapped_column(Integer, ForeignKey("devices.id", ondelete="CASCADE"), primary_key=True)
+    # A FRESH uuid4 per acquisition — never a process identity. Two acquisitions by the
+    # same process must not share a token, or a revoked runner's writes validate against
+    # its successor's claim (ABA).
+    claim_token: Mapped[str] = mapped_column(String(64), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(16), nullable=False)
+    # NULL at the worker's queued-head acquisition: this is a real FK, and PostgreSQL
+    # validates an inserted FK by locking the referenced row FOR KEY SHARE, which
+    # conflicts with the FOR UPDATE an endpoint holds on the queued winner — the worker
+    # would block inside the FK check, before its SKIP LOCKED ever runs. It is set later,
+    # in the guarded transaction that also sets Job.status='running'. PROVISION IS THE
+    # EXCEPTION and sets it at acquisition: its job is already running, is its own, and
+    # carries no winner lock, so the FK check contends with nothing — and without it a
+    # revocation would have no job to re-disposition.
+    job_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
+    acquired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class StaticRouteTombstone(Base):
+    """A deleted/detached static-route intent row whose removal is not yet proven.
+
+    The only surviving carrier of a replacement once the intent row is gone
+    (#1368 Option A). Deleted only on proof of consumption, by snapshotted id —
+    hence no ``consumed_at``: a tombstone created while a job is mid-network-call
+    survives that job by construction.
+
+    No ``Device`` relationship on purpose: a tombstone is not an intent root, and
+    teardown's root enumeration derives from ``Device.__mapper__.relationships``.
+    ``ondelete="CASCADE"`` on ``device_id`` means offboard wipes tombstones with the
+    device — right, because an offboarded device has no service to reconcile against,
+    but note it diverges from ``Job``, which teardown preserves by nulling ``device_id``.
+    """
+
+    __tablename__ = "static_route_tombstone"
+    __table_args__ = (
+        CheckConstraint("marking IN ('delete_origin', 'detach')", name="ck_srt_marking"),
+        # The sweeper's exact predicate, scanned per device and consumed in id order.
+        # Non-unique: one push deleting three routes can orphan three at once.
+        Index("ix_srt_unclaimed", "device_id", "id", postgresql_where=text("job_id IS NULL")),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # NOT NULL: a tombstone is only ever written on a fence-open device (§3.8), and the
+    # fence is open only when every pre-existing intent row of that device carries a
+    # route_id. A NULL here would be an uncorrelatable deletion authority for R2's CAS.
+    route_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    vrf: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    prefix: Mapped[str] = mapped_column(String(64), nullable=False)
+    next_hop: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    deployed_key: Mapped[list | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    # String + CHECK rather than a PG enum: the value set is closed and two-valued, and a
+    # new enum type widens the parity snapshot and needs ALTER TYPE care forever.
+    marking: Mapped[str] = mapped_column(String(16), nullable=False)
+    # The owning removal job. SET NULL, not CASCADE: a deleted job returns the tombstone
+    # to the sweeper rather than destroying the deletion carrier.
+    job_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class DeviceSvi(Base):
@@ -1820,7 +1990,7 @@ class DeviceRoutePolicyPrefixList(Base):
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     family: Mapped[int] = mapped_column(Integer, nullable=False)  # 4 or 6
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="poll")
 
     device: Mapped[Device] = relationship("Device")
@@ -1865,7 +2035,7 @@ class DeviceRoutePolicyCommunityList(Base):
     # carrying NONE of its members. No native form on Cisco community-lists.
     invert_match: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="poll")
 
     device: Mapped[Device] = relationship("Device")
@@ -1908,7 +2078,7 @@ class DeviceRoutePolicyASPath(Base):
     )
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="poll")
 
     device: Mapped[Device] = relationship("Device")
@@ -1946,7 +2116,7 @@ class DeviceRoutePolicyRouteMap(Base):
     )
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     refresh_source: Mapped[str] = mapped_column(String(32), nullable=False, default="poll")
 
     device: Mapped[Device] = relationship("Device")
@@ -1994,8 +2164,8 @@ class RoutePolicyObjectIntent(Base):
     entries: Mapped[dict | list] = mapped_column(JSON, nullable=False)
     # community_list only: Junos invert-match / Nokia "expression NOT (…)".
     invert_match: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
-    accepted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_apply_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     device: Mapped[Device] = relationship("Device", back_populates="route_policy_object_intents")

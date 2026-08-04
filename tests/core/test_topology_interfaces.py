@@ -14,9 +14,9 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 from nso_adapter.bindings.netbox.client import NetboxClient
-from tests.conftest import seed_device
+from tests.conftest import seed_device, session
 
-TS = datetime(2026, 6, 2, 12, 0, 0, tzinfo=UTC).replace(tzinfo=None)
+TS = datetime(2026, 6, 2, 12, 0, 0, tzinfo=UTC)
 
 
 def _nb_client():
@@ -27,7 +27,6 @@ def _nb_client():
 
 
 async def _seed_topology(device_id: int) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import (
         DbInterface,
         DeviceIsisInterface,
@@ -36,7 +35,7 @@ async def _seed_topology(device_id: int) -> None:
         LagMember,
     )
 
-    async for db in get_session():
+    async with session() as db:
         # 1. cfg.port (attribute sync) — physical channelized port + port-level LAG.
         db.add(DbInterface(device_id=device_id, name="1/1/c22/1"))
         db.add(DbInterface(device_id=device_id, name="lag-99"))
@@ -119,13 +118,11 @@ async def _seed_topology(device_id: int) -> None:
         db.add(LagInterface(device_id=device_id, name="lag-4", lag_id=4, last_refreshed_at=TS, refresh_source="test"))
         await db.commit()
         return
-    raise RuntimeError("no DB session")
 
 
 async def _run_ensure(device_id: int, nb_client) -> set[str]:
     """Call ensure_topology_interfaces with bulk_ensure stubbed; return the names set."""
     import nso_adapter.core.topology_interfaces as mod
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device
 
     captured: dict = {}
@@ -140,11 +137,10 @@ async def _run_ensure(device_id: int, nb_client) -> set[str]:
     mod.bulk_ensure_interfaces = _fake_bulk
     expected_nb_id = None
     try:
-        async for db in get_session():
+        async with session() as db:
             device = await db.get(Device, device_id)
             expected_nb_id = device.netbox_device_id
             await mod.ensure_topology_interfaces(db, device, nb_client)
-            break
     finally:
         mod.bulk_ensure_interfaces = orig
     # The resolved NetBox client + the device's netbox id must actually reach bulk_ensure.
@@ -179,13 +175,11 @@ async def test_no_netbox_binding_returns_empty(adapter_client):
 
     nb = _nb_client()
     from nso_adapter.core.topology_interfaces import ensure_topology_interfaces
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device
 
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         result = await ensure_topology_interfaces(db, device, nb)
-        break
     assert result == {}
 
 
@@ -194,13 +188,11 @@ async def test_no_client_returns_empty(adapter_client):
     await _seed_topology(device_id)
 
     from nso_adapter.core.topology_interfaces import ensure_topology_interfaces
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device
 
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         result = await ensure_topology_interfaces(db, device, None)
-        break
     assert result == {}
 
 
@@ -209,17 +201,15 @@ async def test_empty_topology_does_not_call_bulk_ensure(adapter_client):
     # No DbInterface / isis / ip / lag rows seeded.
 
     import nso_adapter.core.topology_interfaces as mod
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device
 
     spy = AsyncMock(return_value={})
     orig = mod.bulk_ensure_interfaces
     mod.bulk_ensure_interfaces = spy
     try:
-        async for db in get_session():
+        async with session() as db:
             device = await db.get(Device, device_id)
             result = await mod.ensure_topology_interfaces(db, device, _nb_client())
-            break
     finally:
         mod.bulk_ensure_interfaces = orig
 

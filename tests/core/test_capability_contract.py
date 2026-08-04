@@ -31,7 +31,7 @@ from nso_adapter.core.capability import (
 )
 
 # adapter_client inits the DB (runs app lifespan -> init_db -> create_all).
-from tests.conftest import adapter_client  # noqa: F401
+from tests.conftest import session
 
 # Mirror of nso-packages route_policy_reconciler.main._PROBE_RM_SET / _PROBE_RM_MATCH
 # labels (the representable-half construct names the probe can emit).
@@ -84,9 +84,8 @@ async def test_recorded_rejection_surfaces_in_preflight(adapter_client):  # noqa
     under a construct name; the operator's next attach must see it.
     """
     from nso_adapter.core.capability import get_device_capability, record_capability_rejection
-    from nso_adapter.store.db import get_session
 
-    async for db in get_session():
+    async with session() as db:
         for key, names in _SET_KEY_CONSTRUCTS.items():
             await record_capability_rejection(db, _NED, _SW, "rm-set", names[0], "% Invalid input")
             rows = await get_device_capability(db, _NED, _SW)
@@ -100,14 +99,12 @@ async def test_recorded_rejection_surfaces_in_preflight(adapter_client):  # noqa
             res = capability.preflight(rows, match_keys=[key])
             assert not res["fully_supported"], f"match_key {key!r} (recorded {names[0]!r}) did not flag"
             assert all(u["element"] in names for u in res["unsupported"]), key
-        break
 
 
 @pytest.mark.asyncio
 async def test_probed_skipped_community_kind_surfaces_for_its_members(adapter_client):  # noqa: F811
     """A community kind probed as skipped flags any member of that kind (the panel/attach claim)."""
     from nso_adapter.core.capability import get_device_capability, record_probe_capability
-    from nso_adapter.store.db import get_session
 
     # representative member per kind → another member of the same kind used at preflight
     cases = {
@@ -115,7 +112,7 @@ async def test_probed_skipped_community_kind_surfaces_for_its_members(adapter_cl
         "large:1:2:3": "large:9:9:9",
         "bandwidth:1:100": "bandwidth:2:200",
     }
-    async for db in get_session():
+    async with session() as db:
         await record_probe_capability(
             db,
             _NED,
@@ -129,4 +126,3 @@ async def test_probed_skipped_community_kind_surfaces_for_its_members(adapter_cl
             assert res["unsupported"][0]["element"] == attached
         # a standard member stays supported (no skipped 'standard' row)
         assert capability.preflight(rows, community_members=["65000:1"])["fully_supported"]
-        break

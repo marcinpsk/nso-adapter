@@ -58,7 +58,7 @@ async def _upsert_lags(
         await db.execute(delete(LagMember).where(LagMember.lag_interface_id.in_(lag_ids)))
     await db.execute(delete(LagInterface).where(LagInterface.device_id == device.id))
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     for lag in lags_data:
         if "lag-id" not in lag:
             # Live ra1: a Nokia lag named without digits ("lag-aa") serves no lag-id, and

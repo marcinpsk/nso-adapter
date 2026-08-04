@@ -2194,7 +2194,7 @@
         "type": "object"
       },
       "IntentApplyResult": {
-        "description": "Shared 2xx body for the full-replace intent PUTs.\n\nEight intent endpoints (static-route/vlan/svi/subinterface/l2-sap/logging/\nbfd/interface-mtu) return exactly this shape: how many rows the payload wrote\n(``count``), how many it dropped (``removed``), and whether a PUT-replace was\nenqueued to revert a removal/clear on the device (``replaced``). Endpoints\nwith a different summary (bgp/ospf/isis/snmp/ip) keep their own inline model.",
+        "description": "Shared 2xx body for the full-replace intent PUTs.\n\nSeven intent endpoints (vlan/svi/subinterface/l2-sap/logging/bfd/interface-mtu)\nreturn exactly this shape: how many rows the payload wrote (``count``), how many\nit dropped (``removed``), and whether a PUT-replace was enqueued to revert a\nremoval/clear on the device (``replaced``). Endpoints with a different summary\n(bgp/ospf/isis/snmp/ip) keep their own inline model, and static-route EXTENDS this\none with its per-route settlement echo (``StaticRouteIntentResult``).",
         "properties": {
           "count": {
             "title": "Count",
@@ -5414,7 +5414,6 @@
           "last_refreshed_at": {
             "anyOf": [
               {
-                "format": "date-time",
                 "type": "string"
               },
               {
@@ -5905,7 +5904,6 @@
           "last_refreshed_at": {
             "anyOf": [
               {
-                "format": "date-time",
                 "type": "string"
               },
               {
@@ -7268,6 +7266,17 @@
             ],
             "title": "Accepted At"
           },
+          "generation": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation"
+          },
           "interface_next_hop": {
             "anyOf": [
               {
@@ -7331,6 +7340,17 @@
             "title": "Prefix",
             "type": "string"
           },
+          "route_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Id"
+          },
           "tag": {
             "anyOf": [
               {
@@ -7353,6 +7373,103 @@
           "next_hop"
         ],
         "title": "StaticRouteEntry",
+        "type": "object"
+      },
+      "StaticRouteIntentEcho": {
+        "description": "One stored row's settlement coordinates \u2014 what the pusher records as its expectation.\n\n``fingerprint`` is the hash of the exact wire entry this row renders, so it moves with\nthe content the adapter really holds and not with the payload that was sent. Both\nnullables stay null for a pre-R3 row: reporting a placeholder would let a result that\ncorrelates with nothing settle something.",
+        "properties": {
+          "fingerprint": {
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "generation": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation"
+          },
+          "route_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Id"
+          }
+        },
+        "required": [
+          "route_id",
+          "generation",
+          "fingerprint"
+        ],
+        "title": "StaticRouteIntentEcho",
+        "type": "object"
+      },
+      "StaticRouteIntentOut": {
+        "description": "The read-back of the same echo, for a PUT whose response was lost after it committed.",
+        "properties": {
+          "device_id": {
+            "title": "Device Id",
+            "type": "integer"
+          },
+          "routes": {
+            "items": {
+              "$ref": "#/components/schemas/StaticRouteIntentEcho"
+            },
+            "title": "Routes",
+            "type": "array"
+          }
+        },
+        "required": [
+          "device_id",
+          "routes"
+        ],
+        "title": "StaticRouteIntentOut",
+        "type": "object"
+      },
+      "StaticRouteIntentResult": {
+        "description": "The static-route PUT's 2xx body: the shared summary plus the per-route echo.",
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": "integer"
+          },
+          "removed": {
+            "title": "Removed",
+            "type": "integer"
+          },
+          "replaced": {
+            "title": "Replaced",
+            "type": "boolean"
+          },
+          "routes": {
+            "items": {
+              "$ref": "#/components/schemas/StaticRouteIntentEcho"
+            },
+            "title": "Routes",
+            "type": "array"
+          }
+        },
+        "required": [
+          "device_id",
+          "count",
+          "removed",
+          "replaced",
+          "routes"
+        ],
+        "title": "StaticRouteIntentResult",
         "type": "object"
       },
       "StaticRouteIntentUpdate": {
@@ -8537,6 +8654,16 @@
               }
             },
             "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Conflict"
           },
           "422": {
             "content": {
@@ -12253,8 +12380,74 @@
       }
     },
     "/api/v1/devices/{device_id}/static-route-intent": {
+      "get": {
+        "description": "Re-serve the settlement triples the last PUT echoed \u2014 the lost-response recovery path.\n\nThe PUT commits its store write before returning (and a terminal apply can notify the\npusher before the response arrives), so a response lost in flight leaves the pusher with\na committed intent it recorded no expectation for, and no other way to obtain one. This\nis that way: the same ``{route_id, generation, fingerprint}`` per stored row, read from\nthe rows themselves, so it cannot drift from what the PUT reported.",
+        "operationId": "get_static_route_intent_api_v1_devices__device_id__static_route_intent_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StaticRouteIntentOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Device not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request validation failed (envelope shape)"
+          }
+        },
+        "security": [
+          {
+            "_OptionalBearer": []
+          }
+        ],
+        "summary": "Get Static Route Intent",
+        "tags": [
+          "static-routes"
+        ]
+      },
       "put": {
-        "description": "Replace the adapter's static-route intent mirror for this device atomically.\n\nFull-replace semantics: rows not present in the request body are deleted.\n``accepted_at`` defaults to now if not supplied.  If ``auto_apply`` is\nenabled on the device, an apply job is enqueued after the upsert.",
+        "description": "Replace the adapter's static-route intent mirror for this device atomically.\n\nFull-replace semantics: rows not present in the request body are deleted.\n``accepted_at`` defaults to now if not supplied.  If ``auto_apply`` is\nenabled on the device, an apply job is enqueued after the upsert.\n\nMatching is ``route_id``-first, falling back to the ``(vrf, prefix, next_hop)``\ntriple: an operator editing a route's prefix or next-hop therefore updates the\nintent row **in place** instead of appearing as an unrelated delete plus insert.\nA deletion on a device whose rows all carry a ``route_id`` also writes a\ntombstone \u2014 the only carrier of that deletion once the row is gone.\n\nEverything the plan depends on is read **under the device claim** (Q8): payload-internal\nrefusals first because they need no store read, then acquisition, then the reload. Read\nbefore claiming and two concurrent pushes both plan against the same snapshot \u2014 the\nsecond then applies a plan whose premise is gone, and the deferred identity constraint\nsurfaces it as a 500 instead of the sequentially correct answer.",
         "operationId": "put_static_route_intent_api_v1_devices__device_id__static_route_intent_put",
         "parameters": [
           {
@@ -12282,7 +12475,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/IntentApplyResult"
+                  "$ref": "#/components/schemas/StaticRouteIntentResult"
                 }
               }
             },
@@ -12307,6 +12500,16 @@
               }
             },
             "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "A job is already running for this device"
           },
           "422": {
             "content": {

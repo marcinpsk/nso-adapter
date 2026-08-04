@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -14,10 +14,9 @@ AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 async def _count_intent(device_id: int) -> int:
     from sqlalchemy import select
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import LoggingHostIntent
 
-    async for db in get_session():
+    async with session() as db:
         rows = (
             (await db.execute(select(LoggingHostIntent).where(LoggingHostIntent.device_id == device_id)))
             .scalars()
@@ -92,10 +91,9 @@ async def test_put_logging_intent_requires_auth(adapter_client):
 async def _levels_intent(device_id: int):
     from sqlalchemy import select
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import LoggingLevelsIntent
 
-    async for db in get_session():
+    async with session() as db:
         return (
             await db.execute(select(LoggingLevelsIntent).where(LoggingLevelsIntent.device_id == device_id))
         ).scalar_one_or_none()
@@ -105,10 +103,9 @@ async def _levels_intent(device_id: int):
 async def _logging_removal_jobs(device_id: int):
     from sqlalchemy import select
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
 
-    async for db in get_session():
+    async with session() as db:
         jobs = (
             (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal)))
             .scalars()

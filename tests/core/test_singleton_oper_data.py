@@ -33,7 +33,6 @@ from nso_adapter.core.snmp import refresh_snmp_config_for_device
 from nso_adapter.core.subinterface import refresh_subinterface_for_device
 from nso_adapter.core.svi import refresh_svi_for_device
 from nso_adapter.core.vlan import refresh_switchport_for_device, refresh_vlan_database_for_device
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import (
     Device,
     DeviceBfdInterface,
@@ -68,17 +67,16 @@ from nso_adapter.store.models import (
     SnmpHost,
     SnmpV3User,
 )
-from tests.conftest import seed_device
+from tests.conftest import seed_device, session
 
 
 @asynccontextmanager
 async def _device_session(device_id: int):
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         assert device is not None
         yield db, device
         return
-    raise RuntimeError("no session")
 
 
 @pytest.mark.anyio
@@ -385,12 +383,12 @@ async def test_ospf_singleton_bare_objects(adapter_client):
         nso_client.get_device_state_section.return_value = {
             "status": "ok",
             "instance": {
-                "process-id": 1,
+                "process-id": "1",
                 "router-id": "1.1.1.1",
                 "vrf": "",
                 "area": {"area-id": "0.0.0.0"},
             },
-            "interface": {"interface-name": "GigabitEthernet0/0", "process-id": 1, "area-id": "0.0.0.0"},
+            "interface": {"interface-name": "GigabitEthernet0/0", "process-id": "1", "area-id": "0.0.0.0"},
         }
 
         ok = await refresh_ospf_for_device(db, device, nso_client, refresh_source="poll")

@@ -13,19 +13,17 @@ from sqlalchemy import select
 from nso_adapter.core.redistribution import refresh_redistribution_for_device, refresh_redistribution_from_outcomes
 from nso_adapter.nso.client import NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import Freshness, Present, Unavailable, UnavailableReason
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, DeviceRedistribution
-from tests.conftest import seed_device
+from tests.conftest import seed_device, session
 
 
 @asynccontextmanager
 async def _device_session(device_id: int):
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         assert device is not None
         yield db, device
         return
-    raise RuntimeError("no session")
 
 
 def _nso_client_with_data(ospf=None, isis=None, bgp=None) -> AsyncMock:
@@ -564,7 +562,7 @@ async def _seed_redist_rows(db, device_id: int, entries: list[tuple[str, str]]) 
 
     from nso_adapter.store.models import DeviceRedistribution
 
-    ts = datetime.now(UTC).replace(tzinfo=None)
+    ts = datetime.now(UTC)
     for dest, source in entries:
         db.add(
             DeviceRedistribution(
@@ -583,7 +581,7 @@ async def _seed_redist_rows(db, device_id: int, entries: list[tuple[str, str]]) 
 async def _latest_outcome(device_id: int):
     from nso_adapter.store.models import RefreshOutcome
 
-    async for db in get_session():
+    async with session() as db:
         return (
             await db.execute(
                 select(RefreshOutcome)
@@ -592,7 +590,6 @@ async def _latest_outcome(device_id: int):
                 .limit(1)
             )
         ).scalar_one()
-    raise AssertionError("no session")
 
 
 @pytest.mark.anyio

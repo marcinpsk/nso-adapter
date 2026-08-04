@@ -7,12 +7,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
 
 from nso_adapter.store.models import (
-    Base,
     Device,
     DeviceSwitchport,
     DeviceSwitchportTaggedVlan,
@@ -21,11 +19,9 @@ from nso_adapter.store.models import (
 
 
 @pytest.fixture
-def db():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    with Session(engine) as session:
-        yield session
+def db(pg_sync_session):
+    """Sync Session on a private PostgreSQL clone (tests/conftest.py::pg_sync_session)."""
+    return pg_sync_session
 
 
 def _make_device(session):
