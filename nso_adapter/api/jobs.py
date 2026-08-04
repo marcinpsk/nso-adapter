@@ -59,7 +59,11 @@ async def list_jobs(
     status: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(Job).order_by(Job.created_at.desc()).limit(100)
+    # `created_at` is transaction time, so a single tick can hold several jobs and ordering
+    # on it alone leaves them in whatever order the plan happens to emit — two consumers
+    # polling the same device can then see different orders. The `id` tiebreak makes the
+    # existing descending page deterministic; it changes no row, direction or limit.
+    query = select(Job).order_by(Job.created_at.desc(), Job.id.desc()).limit(100)
     if device_id is not None:
         query = query.where(Job.device_id == device_id)
     if status is not None:

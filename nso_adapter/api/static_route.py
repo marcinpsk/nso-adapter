@@ -151,6 +151,10 @@ class StaticRouteEntry(BaseModel):
     # The NetBox routing.StaticRoute pk, when the pusher knows it. Optional: a pre-R3
     # plugin omits it entirely, and its absence is what keeps the rollout fence shut.
     route_id: int | None = None
+    # The pusher's intent generation for this route — the token an apply result is
+    # correlated against. Optional and adopted only when non-null, for route_id's reason:
+    # a pusher that never learned the field must not erase a newer pusher's correlation.
+    generation: int | None = None
     vrf: str = ""
     prefix: str
     next_hop: str
@@ -172,6 +176,44 @@ _STATE_FIELDS = ("interface_next_hop", "next_hop_vrf", "metric", "permanent", "t
 
 class StaticRouteIntentUpdate(BaseModel):
     routes: list[StaticRouteEntry]
+
+
+class StaticRouteIntentEcho(BaseModel):
+    """One stored row's settlement coordinates — what the pusher records as its expectation.
+
+    ``fingerprint`` is the hash of the exact wire entry this row renders, so it moves with
+    the content the adapter really holds and not with the payload that was sent. Both
+    nullables stay null for a pre-R3 row: reporting a placeholder would let a result that
+    correlates with nothing settle something.
+    """
+
+    route_id: int | None
+    generation: int | None
+    fingerprint: str
+
+
+class StaticRouteIntentResult(IntentApplyResult):
+    """The static-route PUT's 2xx body: the shared summary plus the per-route echo."""
+
+    routes: list[StaticRouteIntentEcho]
+
+
+class StaticRouteIntentOut(BaseModel):
+    """The read-back of the same echo, for a PUT whose response was lost after it committed."""
+
+    device_id: int
+    routes: list[StaticRouteIntentEcho]
+
+
+def _echo(row) -> dict:
+    """Render one stored row as its settlement triple. The ONE renderer both paths call."""
+    from nso_adapter.core.apply import static_route_fingerprint
+
+    return {
+        "route_id": row.route_id,
+        "generation": row.intent_generation,
+        "fingerprint": static_route_fingerprint(row),
+    }
 
 
 # Logged on every request to a device that still has a route_id-less intent row: that
@@ -273,10 +315,41 @@ def _match_payload_to_rows(
     return matched, [r for r in existing if r.id not in claimed]
 
 
+@router.get(
+    "/{device_id}/static-route-intent",
+    dependencies=[Depends(verify_token)],
+    response_model=StaticRouteIntentOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
+async def get_static_route_intent(device_id: int, db: AsyncSession = Depends(get_read_db)):
+    """Re-serve the settlement triples the last PUT echoed — the lost-response recovery path.
+
+    The PUT commits its store write before returning (and a terminal apply can notify the
+    pusher before the response arrives), so a response lost in flight leaves the pusher with
+    a committed intent it recorded no expectation for, and no other way to obtain one. This
+    is that way: the same ``{route_id, generation, fingerprint}`` per stored row, read from
+    the rows themselves, so it cannot drift from what the PUT reported.
+    """
+    device = await db.get(Device, device_id)
+    if not device:
+        raise api_error(404, "not_found", "Device not found")
+
+    rows = (
+        (
+            await db.execute(
+                select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id).order_by(StaticRouteIntent.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {"device_id": device_id, "routes": [_echo(row) for row in rows]}
+
+
 @router.put(
     "/{device_id}/static-route-intent",
     dependencies=[Depends(verify_token)],
-    response_model=IntentApplyResult,
+    response_model=StaticRouteIntentResult,
     responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_ACTIVE_JOB, **RESP_422_VALIDATION},
 )
 async def put_static_route_intent(device_id: int, body: StaticRouteIntentUpdate, db: AsyncSession = Depends(get_db)):
@@ -406,6 +479,10 @@ async def _apply_static_route_intent(device_id: int, body: StaticRouteIntentUpda
     now = datetime.now(UTC)
     count = 0
     cleared = False
+    # The rows the response echoes, in payload order, so the pusher can pair them with the
+    # entries it sent. Collected as ORM objects and rendered once at the end, off the stored
+    # rows rather than off the payload.
+    echoed: list[StaticRouteIntent] = []
     for index, item in enumerate(body.routes):
         accepted = item.accepted_at if item.accepted_at else now
         row = matched.get(index)
@@ -419,6 +496,8 @@ async def _apply_static_route_intent(device_id: int, body: StaticRouteIntentUpda
             row.next_hop = item.next_hop
             if item.route_id is not None:
                 row.route_id = item.route_id  # adopt/backfill; a pre-R3 push never clears it
+            if item.generation is not None:
+                row.intent_generation = item.generation  # same rule, same reason
             row.accepted_at = accepted
             row.interface_next_hop = item.interface_next_hop
             row.next_hop_vrf = item.next_hop_vrf
@@ -445,25 +524,27 @@ async def _apply_static_route_intent(device_id: int, body: StaticRouteIntentUpda
             )
             if cleared_fields:
                 cleared = True
+            echoed.append(row)
         else:
             # deployed_key stays NULL: R1 never writes it at runtime — nothing is proven
             # committed until R2's CAS writer runs.
-            db.add(
-                StaticRouteIntent(
-                    device_id=device_id,
-                    route_id=item.route_id,
-                    vrf=item.vrf,
-                    prefix=item.prefix,
-                    next_hop=item.next_hop,
-                    interface_next_hop=item.interface_next_hop,
-                    next_hop_vrf=item.next_hop_vrf,
-                    metric=item.metric,
-                    permanent=item.permanent,
-                    tag=item.tag,
-                    name=item.name,
-                    accepted_at=accepted,
-                )
+            row = StaticRouteIntent(
+                device_id=device_id,
+                route_id=item.route_id,
+                intent_generation=item.generation,
+                vrf=item.vrf,
+                prefix=item.prefix,
+                next_hop=item.next_hop,
+                interface_next_hop=item.interface_next_hop,
+                next_hop_vrf=item.next_hop_vrf,
+                metric=item.metric,
+                permanent=item.permanent,
+                tag=item.tag,
+                name=item.name,
+                accepted_at=accepted,
             )
+            db.add(row)
+            echoed.append(row)
         count += 1
 
     # Flushes the tombstone INSERTs and the row DELETEs, so this transaction holds those
@@ -500,6 +581,17 @@ async def _apply_static_route_intent(device_id: int, body: StaticRouteIntentUpda
 
         await enqueue_apply(db, device_id, force=True)
 
+    # Rendered BEFORE the commit, off the rows this transaction just wrote: the echo is the
+    # pusher's settlement expectation, so it must describe exactly what was stored, not what
+    # was asked for.
+    routes = [_echo(row) for row in echoed]
+
     await db.commit()
 
-    return {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}
+    return {
+        "device_id": device_id,
+        "count": count,
+        "removed": len(removed),
+        "replaced": replaced,
+        "routes": routes,
+    }

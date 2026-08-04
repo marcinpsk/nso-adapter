@@ -61,6 +61,7 @@ async def seed_rows(device_id: int, specs: list[dict]) -> dict[tuple, int]:
                 prefix=prefix,
                 next_hop=next_hop,
                 route_id=spec.get("route_id"),
+                intent_generation=spec.get("intent_generation"),
                 deployed_key=spec.get("deployed_key"),
                 accepted_at=spec.get("accepted_at", _NOW),
                 last_apply_at=spec.get("last_apply_at"),

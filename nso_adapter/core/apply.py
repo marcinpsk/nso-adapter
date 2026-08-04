@@ -556,6 +556,24 @@ async def _static_route_bookkeeping(
     residue_found = proof.residue == "found"
     cas_by_row = {c.row_id: c for c in plan.cas}
 
+    # A predecessor this apply was supposed to retract is still on the device. The intent
+    # landed; what failed is the retraction — so the scope fails and NOTHING is consumed.
+    # Built BEFORE the record: the per-route `error` is read off the row, so stamping the
+    # residue verdict afterwards would report every route failed with no error at all.
+    residue_message = ""
+    residue_err: dict | None = None
+    if residue_found:
+        residue_message = (
+            "static_route: the replaced route(s) "
+            f"{[list(k) for k in proof.survivors]} are still on the device after the replace — "
+            "the predecessor was not retracted, so the replacement stays open"
+        )
+        residue_err = {
+            "code": RESIDUE_FOUND_CODE,
+            "message": residue_message,
+            "detail": {"residue": [list(k) for k in proof.survivors]},
+        }
+
     results: list[dict] = []
     for row in plan.rows:
         outcome = SR_UNPROVEN
@@ -567,6 +585,8 @@ async def _static_route_bookkeeping(
             outcome = await _settle_proven_row(
                 db, device, plan, proof, row, put_delivered=put_delivered, cas=cas_by_row.get(row.id)
             )
+        if residue_err is not None:
+            row.last_apply_error = residue_err
         if outcome is SR_UNPROVEN:
             logger.warning(
                 "static_route.route_unproven",
@@ -585,23 +605,18 @@ async def _static_route_bookkeeping(
                 "row_id": row.id,
                 "key": list(triple_of(row)),
                 "fingerprint": static_route_fingerprint(row),
+                # R3 §4.5: the generation this verdict is about, and this route's OWN error.
+                # Without them the consumer can only settle on presence and can only report
+                # one shared message for every failed route of the scope.
+                "generation": row.intent_generation,
                 "outcome": outcome,
+                "error": row.last_apply_error,
             }
         )
 
-    if not residue_found:
+    if residue_err is None:
         return results, None, []
-    # A predecessor this apply was supposed to retract is still on the device. The intent
-    # landed; what failed is the retraction — so the scope fails and NOTHING is consumed.
-    message = (
-        "static_route: the replaced route(s) "
-        f"{[list(k) for k in proof.survivors]} are still on the device after the replace — "
-        "the predecessor was not retracted, so the replacement stays open"
-    )
-    err = {"code": RESIDUE_FOUND_CODE, "message": message, "detail": {"residue": [list(k) for k in proof.survivors]}}
-    for row in plan.rows:
-        row.last_apply_error = err
-    return results, (0, len(plan.rows)), [{"error": message, "code": RESIDUE_FOUND_CODE}]
+    return results, (0, len(plan.rows)), [{"error": residue_message, "code": RESIDUE_FOUND_CODE}]
 
 
 async def _settle_proven_row(db, device, plan, proof: SrProof, row, *, put_delivered: bool, cas) -> str:

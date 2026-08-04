@@ -61,6 +61,43 @@ async def test_list_jobs_filter_invalid_status_raises_422(adapter_client):
         assert exc_info.value.status_code == 422
 
 
+async def test_list_jobs_breaks_a_created_at_tie_by_id(adapter_client):
+    """#1396 R3 P0 — ``created_at`` is transaction time, so a tick can hold several jobs.
+
+    Ordering on it alone leaves those rows in whatever order the executor happens to
+    produce, so two consumers polling the same device can see them in different orders and
+    a cursor over the list can skip one. The ``id`` tiebreak is a standalone correctness
+    fix, independent of any cursor: same rows, same direction, deterministic.
+
+    The discriminator is the UPDATE: it moves the newest job's tuple to the end of the
+    heap, so an unsorted-within-tie plan reports it LAST — the exact reverse of what the
+    tiebreak requires.
+    """
+    from datetime import UTC, datetime
+
+    stamp = datetime(2026, 8, 4, 12, 0, 0, tzinfo=UTC)
+    async with session() as db:
+        d = Device(nso_instance="nso-dev", nso_device_name="jobs-tie-01", netbox_device_id=1450)
+        db.add(d)
+        await db.flush()
+        ids = []
+        for _ in range(4):
+            j = Job(device_id=d.id, job_type=JobType.sync, status=JobStatus.succeeded, created_at=stamp)
+            db.add(j)
+            await db.flush()
+            ids.append(j.id)
+        await db.commit()
+
+    async with session() as db:
+        newest = await db.get(Job, ids[-1])
+        newest.context = {"touched": True}  # rewrites the tuple at the end of the heap
+        await db.commit()
+
+    async with session() as db:
+        listed = await list_jobs(device_id=d.id, db=db)
+        assert [r["id"] for r in listed] == sorted(ids, reverse=True)
+
+
 # ── get_job ───────────────────────────────────────────────────────────────────
 
 

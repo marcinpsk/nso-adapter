@@ -1060,6 +1060,12 @@ class StaticRouteIntent(Base):
     # The NetBox routing.StaticRoute pk. No FK — a cross-system id. Nullable: the
     # nullability IS the rollout fence (§3.8), and only the plugin (R3) can fill it.
     route_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The pusher's intent generation for this route (#1396 R3 §4.5) — a plugin-global,
+    # never-reused value the plugin allocates on every content change. Carried here so an
+    # apply result can name the generation it proves, and settlement can discard a result
+    # for intent that has since been superseded. Adopted only when the push carries one:
+    # a pre-R3 push omits it and must not erase the correlation, exactly as for route_id.
+    intent_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # The triple last proven committed into the service, as ["<vrf>", "<prefix>",
     # "<next_hop>"]. JSONB because PostgreSQL's `json` has no equality operator and R2's
     # CAS is `IS NOT DISTINCT FROM`; none_as_null so a Python None is SQL NULL and not

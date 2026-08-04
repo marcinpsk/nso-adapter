@@ -393,6 +393,123 @@ async def test_c3_6_the_proven_sibling_cases_while_the_missing_one_stays_open(ad
     assert job.result["reader_compare"]["static_route"] == "missing", "the aggregate is unchanged"
 
 
+# ── R3 P0.2 / P0.3 — the generation and the per-route error on the record ────
+
+
+async def test_p0_2_every_result_entry_carries_its_generation_and_its_own_error(adapter_client):
+    """P0.2 — one apply, one route proven landed and one silently dropped.
+
+    Without the generation the plugin cannot tell a result for the intent it pushed from one
+    for intent two edits ago; without a per-route ``error`` it can only fall back to the
+    scope-wide message R2 already proved wrong (P10), so both failed routes would read alike.
+    R2's five keys and the fingerprint must be byte-unchanged — this is additive.
+    """
+    device_id = await seed_device(nso_device_name="sr-proof", netbox_device_id=7320)
+    await seed_rows(
+        device_id,
+        [
+            {"triple": B, "route_id": 7, "intent_generation": 11, "deployed_key": list(A)},
+            {"triple": B2, "route_id": 8, "intent_generation": 12, "deployed_key": list(A2)},
+        ],
+    )
+    client, _rec = proof_client(
+        "sr-proof",
+        state=present(wire(A), wire(A2), device_name="sr-proof"),
+        section=dev_state(wire(B)),  # B landed; B2 never did
+    )
+
+    job = await run_the_apply(device_id, client)
+
+    by_key = {tuple(item["key"]): item for item in job.result["static_route_results"]}
+    assert {k: v["outcome"] for k, v in by_key.items()} == {B: "in_sync", B2: "apply_failed"}
+    assert by_key[B]["generation"] == 11
+    assert by_key[B2]["generation"] == 12
+    assert by_key[B]["error"] is None, "a proven route reports no error"
+    assert by_key[B2]["error"]["code"] == "reader_compare_missing"
+    assert "10.0.5.0/24" in by_key[B2]["error"]["message"], "the failed route's OWN error, not the scope's"
+    assert set(by_key[B]) == {"route_id", "row_id", "key", "fingerprint", "outcome", "generation", "error"}
+    assert by_key[B]["fingerprint"] == _expected_fingerprint({"vrf": B[0], "prefix": B[1], "next-hop": B[2]})
+
+
+async def test_p0_2_a_row_that_never_carried_a_generation_reports_null(adapter_client):
+    """A pre-R3 row has no generation, and the record must say so rather than invent one.
+
+    A default of ``0`` here would collide with the plugin's unallocated sentinel and let an
+    uncorrelated result settle a freshly allocated overlay.
+    """
+    device_id = await seed_device(nso_device_name="sr-proof", netbox_device_id=7321)
+    await seed_rows(device_id, [{"triple": B, "route_id": 7}])
+    client, _rec = proof_client("sr-proof", state=absent(), section=dev_state(wire(B)))
+
+    job = await run_the_apply(device_id, client)
+
+    assert job.result["static_route_results"][0]["generation"] is None
+
+
+async def test_p0_2_a_residue_failure_reports_the_residue_error_per_route(adapter_client):
+    """The residue verdict is written to the rows AFTER the record is built — so it must ride it.
+
+    A record assembled before the residue stamp reports ``apply_failed`` with a null error
+    for every route, which is exactly the shape P0.2 forbids.
+    """
+    device_id = await seed_device(nso_device_name="sr-proof", netbox_device_id=7322)
+    await seed_rows(device_id, [{"triple": B, "route_id": 7, "intent_generation": 4, "deployed_key": list(A)}])
+    client, _rec = proof_client(
+        "sr-proof",
+        state=present(wire(A), device_name="sr-proof"),
+        section=dev_state(wire(A), wire(B)),  # the predecessor survived the replace
+    )
+
+    job = await run_the_apply(device_id, client)
+
+    entry = job.result["static_route_results"][0]
+    assert entry["outcome"] == "apply_failed"
+    assert entry["generation"] == 4
+    assert entry["error"]["code"] == "static_route_residue_found"
+
+
+async def test_p0_3_the_put_echo_tracks_the_row_the_result_reports(adapter_client):
+    """P0.3 — PUT two routes, mutate one row, apply: the echo must follow the mutated one.
+
+    An echo derived from anything constant — the payload, the route_id, a fixed string —
+    would still "match" for the untouched route, so the discriminator is the mutated one:
+    its result fingerprint has to differ from what the PUT echoed.
+    """
+    from nso_adapter.store.models import StaticRouteIntent
+
+    device_id = await seed_device(nso_device_name="sr-proof", netbox_device_id=7323)
+    put = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/static-route-intent",
+        json={
+            "routes": [
+                {"route_id": 7, "generation": 1, "vrf": B[0], "prefix": B[1], "next_hop": B[2], "metric": 5},
+                {"route_id": 8, "generation": 1, "vrf": B2[0], "prefix": B2[1], "next_hop": B2[2], "metric": 5},
+            ]
+        },
+        headers={"Authorization": "Bearer test-bearer-token"},
+    )
+    assert put.status_code == 200
+    echoed = {item["route_id"]: item["fingerprint"] for item in put.json()["routes"]}
+
+    async with session() as db:
+        row = (
+            await db.execute(
+                select(StaticRouteIntent).where(
+                    StaticRouteIntent.device_id == device_id, StaticRouteIntent.route_id == 8
+                )
+            )
+        ).scalar_one()
+        row.metric = 6
+        await db.commit()
+
+    client, _rec = proof_client("sr-proof", state=absent(), section=dev_state(wire(B, metric=5), wire(B2, metric=6)))
+    job = await run_the_apply(device_id, client)
+
+    reported = {item["route_id"]: item["fingerprint"] for item in job.result["static_route_results"]}
+    assert reported[7] == echoed[7], "the untouched row's echo is still what the apply sent"
+    assert reported[8] != echoed[8], "the mutated row's fingerprint moved — the echo is content, not a label"
+
+
 # ── C3.7 / C3.9 — the CAS itself, driven directly ───────────────────────────
 
 
