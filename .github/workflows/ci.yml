@@ -5,14 +5,25 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
 
       - name: Sync dependencies
         run: uv sync --all-groups
@@ -23,47 +34,97 @@ jobs:
       - name: Ruff format check
         run: uv run --native-tls -- ruff format --check .
 
-  test:
-    # Temporarily disabled by operator request. Keep the job/check name in place
-    # so branch-protection configuration does not need to change.
-    if: ${{ false }}
+  container-smoke:
+    name: Container runtime smoke test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
 
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: nso
-          POSTGRES_PASSWORD: nso
-          POSTGRES_DB: nso_adapter
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U nso"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
+      # Run a console script from the copied runtime virtualenv. This catches a
+      # builder-only shebang even when importing with Python would still work.
+      - name: Build and exercise the runtime image
+        run: |
+          docker build --tag nso-adapter:ci .
+          docker run --rm --entrypoint uvicorn nso-adapter:ci --version
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
+
+      # The retired engine must not creep back in. `git grep` scans TRACKED content
+      # only: several working docs are deliberately local-only and do not exist on a
+      # CI clone, so a filesystem grep would be checking a different tree than the one
+      # under review. The two allowlist rules match the alembic guard message and the
+      # two config anti-regression tests, and survive any line movement.
+      #
+      # The one-character brackets keep the search pattern from matching ITSELF — this
+      # file is inside the scanned tree, and a self-match would make the step
+      # permanently red. `sqlit[e]` still matches the word; the literal text does not.
+      - name: No retired-engine references
+        run: |
+          set -uo pipefail
+          hits=$(git grep -nIiE 'sqlit[e]|aiosqlit[e]|journal_mod[e]|:memory[:]' -- \
+                   nso_adapter alembic tests scripts .github pyproject.toml uv.lock README.md \
+                 | grep -vE 'no sqlite fallback|never run against sqlite' \
+                 | grep -vE 'retired SQLite dev setup|no_implicit_sqlite_fallback|obsolete local SQLite database' \
+                 || true)
+          if [ -n "$hits" ]; then
+            echo "$hits" >&2
+            exit 1
+          fi
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
 
       - name: Sync dependencies
         run: uv sync --all-groups
 
-      # Full unit suite on sqlite (fast, hermetic) PLUS the PostgreSQL-gated
-      # parity test — ALEMBIC_PARITY_DB_URL makes test_schema_parity.py run
-      # instead of skip, so create_all↔alembic parity is asserted in one pass
-      # and coverage is measured over the whole suite.
-      - name: Test suite (+ Postgres parity lane)
-        env:
-          ALEMBIC_PARITY_DB_URL: postgresql+psycopg2://nso:nso@localhost:5432/postgres
-        run: uv run --native-tls -- pytest -q
+      # NOT a `services:` container: GitHub service containers cannot override the
+      # image CMD, so the tmpfs + fsync=off tuning that the per-test
+      # `CREATE DATABASE ... TEMPLATE` clone depends on is unreachable there.
+      - name: Start test PostgreSQL (identical flags to docker-compose.dev.yml)
+        run: |
+          set -euo pipefail
+          docker run -d --name adapter-test-db -p 127.0.0.1:55433:5432 \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+            --tmpfs /var/lib/postgresql/data \
+            postgres:16-alpine@sha256:16bc17c64a573ef34162af9298258d1aec548232985b33ed7b1eac33ba35c229 \
+            postgres -c fsync=off -c full_page_writes=off -c synchronous_commit=off \
+                     -c wal_level=minimal -c max_wal_senders=0 -c shared_buffers=256MB \
+                     -c max_connections=200
+          ready=0
+          for _ in $(seq 1 40); do
+            # -h 127.0.0.1: probe the TCP listener — the image's temporary init-time
+            # server answers the Unix socket before the real server is reachable.
+            if docker exec adapter-test-db pg_isready -h 127.0.0.1 -U postgres; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "adapter-test-db never became ready" >&2
+            docker logs adapter-test-db >&2
+            exit 1
+          fi
 
-      # Prove a fresh database bootstraps end-to-end from the squashed baseline.
-      - name: Verify alembic upgrade head on a fresh PostgreSQL DB
+      # The whole suite runs on PostgreSQL: every DB-backed test gets a private
+      # database cloned from a template built by `alembic upgrade head`, so the
+      # migration bootstrap, schema parity and the 90% coverage gate (pyproject
+      # addopts + coverage fail_under) are all asserted in one pass.
+      - name: Test suite (PostgreSQL-only)
         env:
-          DATABASE_URL: postgresql+psycopg2://nso:nso@localhost:5432/nso_adapter
-        run: uv run --native-tls -- python -m nso_adapter.db_migrate
+          NSO_ADAPTER_TEST_DB_URL: postgresql+psycopg2://postgres:postgres@127.0.0.1:55433/postgres
+          NSO_ADAPTER_TEST_STRICT_TEARDOWN: "1"   # a straggler connection fails CI
+          NSO_ADAPTER_TEST_NO_SKIPS: "1"          # any skip fails CI (conftest pytest_sessionfinish)
+          TZ: America/New_York                    # NOT UTC — a UTC runner cannot observe the naive/aware offset bug
+        run: uv run --native-tls -- pytest -q

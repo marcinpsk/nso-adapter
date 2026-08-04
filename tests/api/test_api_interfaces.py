@@ -9,7 +9,7 @@ GET /api/v1/devices/{id}/state
 from __future__ import annotations
 
 from nso_adapter.store.models import DbInterface, InterfaceAttrState, SyncState
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -23,9 +23,8 @@ async def _seed_interface_with_state(
     status: SyncState = SyncState.imported,
 ) -> None:
     """Seed a DbInterface + InterfaceAttrState for a device."""
-    from nso_adapter.store.db import get_session
 
-    async for db in get_session():
+    async with session() as db:
         iface = DbInterface(device_id=device_id, name=iface_name, netbox_interface_id=1000)
         db.add(iface)
         await db.flush()
@@ -38,7 +37,6 @@ async def _seed_interface_with_state(
         )
         db.add(state)
         await db.commit()
-        break
 
 
 # ── GET /api/v1/devices/{id}/interfaces ─────────────────────────────────────

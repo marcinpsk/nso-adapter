@@ -2,7 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """End-to-end tests for PUT /api/v1/devices/{id}/snmp-intent.
 
-These drive the real FastAPI route through the real SQLite-backed session
+These drive the real FastAPI route through the real PostgreSQL-backed session
 (``adapter_client`` + ``get_db``), exercising the full-replace upsert, the
 auto-apply enqueue, and the removal-propagation re-apply. Only the NSO HTTP
 boundary (``get_nso_client`` / ``apply_snmp_config``) is faked, and only in the
@@ -11,7 +11,7 @@ one test that asserts the on-device revert is attempted.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import pytest
@@ -24,7 +24,7 @@ from nso_adapter.store.models import (
     SnmpSystemInfoIntent,
     SnmpV3UserIntent,
 )
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -47,9 +47,8 @@ def _full_body() -> dict:
 
 async def _read_intent(device_id: int):
     """Return (communities, v3_users, hosts, system_info) intent rows for a device."""
-    from nso_adapter.store.db import get_session
 
-    async for db in get_session():
+    async with session() as db:
         comms = (
             (await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)))
             .scalars()
@@ -63,7 +62,6 @@ async def _read_intent(device_id: int):
             await db.execute(select(SnmpSystemInfoIntent).where(SnmpSystemInfoIntent.device_id == device_id))
         ).scalar_one_or_none()
         return comms, users, hosts, sysinfo
-    raise RuntimeError("no session")
 
 
 # ── boundary validation: a ref/enum the writer can never render is rejected HERE ──
@@ -226,7 +224,7 @@ async def test_put_explicit_accepted_at_is_preserved(adapter_client):
     assert resp.status_code == 200
 
     comms, *_ = await _read_intent(device_id)
-    assert comms[0].accepted_at == datetime(2026, 6, 1, 12, 0, 0)  # stored naive, tz stripped
+    assert comms[0].accepted_at == datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)  # the wire 'Z' is kept as UTC
 
 
 # ── full-replace semantics ───────────────────────────────────────────────────
@@ -297,10 +295,9 @@ async def test_put_system_info_null_deletes_existing(adapter_client):
 
 
 async def _seed_settings(device_id: int, *, auto_apply: bool):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceSettings
 
-    async for db in get_session():
+    async with session() as db:
         db.add(DeviceSettings(device_id=device_id, auto_apply=auto_apply))
         await db.commit()
         return
@@ -308,7 +305,6 @@ async def _seed_settings(device_id: int, *, auto_apply: bool):
 
 @pytest.mark.anyio
 async def test_put_auto_apply_enqueues_job(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="snmp-auto-dev", netbox_device_id=965)
@@ -317,9 +313,8 @@ async def test_put_auto_apply_enqueues_job(adapter_client):
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH)
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         jobs = (await db.execute(select(Job).where(Job.device_id == device_id))).scalars().all()
-        break
     assert len(jobs) == 1
     assert jobs[0].job_type == JobType.apply
     assert jobs[0].status == JobStatus.queued
@@ -327,7 +322,6 @@ async def test_put_auto_apply_enqueues_job(adapter_client):
 
 @pytest.mark.anyio
 async def test_put_no_auto_apply_enqueues_nothing(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job
 
     device_id = await seed_device(nso_device_name="snmp-noauto-dev", netbox_device_id=966)
@@ -335,9 +329,8 @@ async def test_put_no_auto_apply_enqueues_nothing(adapter_client):
 
     await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH)
 
-    async for db in get_session():
+    async with session() as db:
         jobs = (await db.execute(select(Job).where(Job.device_id == device_id))).scalars().all()
-        break
     assert jobs == []
 
 
@@ -347,7 +340,6 @@ async def test_put_removal_enqueues_async_removal_job(adapter_client, monkeypatc
     replace-mode device commit that can stall past the plugin timeout). The worker then
     PUT-replaces the snmp service with the remaining accepted intent (replace=True)."""
     from nso_adapter.core.removal import run_removal
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
 
     device_id = await seed_device(nso_device_name="snmp-prop-dev", netbox_device_id=967)
@@ -380,7 +372,7 @@ async def test_put_removal_enqueues_async_removal_job(adapter_client, monkeypatc
     assert resp.status_code == 200
     assert captured == {}  # still no inline device commit — deferred to the worker
 
-    async for db in get_session():
+    async with session() as db:
         jobs = (
             (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal)))
             .scalars()
@@ -400,7 +392,6 @@ async def test_put_removal_enqueues_async_removal_job(adapter_client, monkeypatc
             "detach": True,
         }
         job_id = jobs[0].id
-        break
 
     # The worker runs the removal → PUT-replaces with the remaining intent.
     await run_removal(job_id, device_id)
@@ -412,7 +403,6 @@ async def test_put_removal_enqueues_async_removal_job(adapter_client, monkeypatc
 @pytest.mark.anyio
 async def test_put_no_removal_enqueues_nothing(adapter_client):
     """A pure-add/update PUT (no removals) must NOT enqueue a removal job."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
 
     device_id = await seed_device(nso_device_name="snmp-norm-dev", netbox_device_id=968)
@@ -420,11 +410,10 @@ async def test_put_no_removal_enqueues_nothing(adapter_client):
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH)
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         jobs = (
             (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal)))
             .scalars()
             .all()
         )
         assert jobs == []  # first write, nothing removed → no removal job
-        break

@@ -15,19 +15,17 @@ from nso_adapter.core.vlan import (
     refresh_vlan_database_for_device,
 )
 from nso_adapter.nso.client import NsoExportUnavailableError
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, DeviceSwitchport, DeviceVlan
-from tests.conftest import seed_device
+from tests.conftest import seed_device, session
 
 
 @asynccontextmanager
 async def _device_session(device_id: int):
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         assert device is not None
         yield db, device
         return
-    raise RuntimeError("no session")
 
 
 def _serve_sections(nso: AsyncMock) -> dict:

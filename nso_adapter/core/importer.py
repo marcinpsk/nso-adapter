@@ -58,8 +58,8 @@ _netbox_client = None  # set at startup via set_netbox_client
 
 
 def _utcnow() -> datetime:
-    """Naive-UTC now — the timestamp columns are timezone-naive (datetime.utcnow() is deprecated)."""
-    return datetime.now(UTC).replace(tzinfo=None)
+    """Aware-UTC now — every store timestamp column is timestamptz (datetime.utcnow() is deprecated)."""
+    return datetime.now(UTC)
 
 
 def _attrs_to_interface_list(data: dict | None) -> list[Interface]:

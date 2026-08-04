@@ -17,11 +17,11 @@ the ``*_KEYS`` sets MUST stay identical across both files.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -54,7 +54,6 @@ REQUIRED_RM_ENTRY_KEYS = {
 
 
 async def _seed_route_policy(device_id: int) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import (
         DeviceRoutePolicyASPath,
         DeviceRoutePolicyASPathEntry,
@@ -66,8 +65,8 @@ async def _seed_route_policy(device_id: int) -> None:
         DeviceRoutePolicyRouteMapEntry,
     )
 
-    ts = datetime(2026, 6, 1, 10, 0, 0)
-    async for db in get_session():
+    ts = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
+    async with session() as db:
         pl = DeviceRoutePolicyPrefixList(device_id=device_id, name="PL-1", family=4, last_refreshed_at=ts)
         db.add(pl)
         await db.flush()
@@ -109,7 +108,6 @@ async def _seed_route_policy(device_id: int) -> None:
             )
         )
         await db.commit()
-        break
 
 
 @pytest.mark.anyio

@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 
 # adapter_client inits the DB (runs app lifespan -> init_db -> create_all).
-from tests.conftest import adapter_client  # noqa: F401
+from tests.conftest import session
 
 _NED = "cisco-ios-cli-6.114"
 
@@ -18,10 +18,9 @@ async def test_probe_then_apply_precedence(adapter_client):  # noqa: F811
         record_capability_rejection,
         record_probe_capability,
     )
-    from nso_adapter.store.db import get_session
 
     sw = "15.2(4)E10"
-    async for db in get_session():
+    async with session() as db:
         await record_probe_capability(
             db,
             _NED,
@@ -48,22 +47,19 @@ async def test_probe_then_apply_precedence(adapter_client):  # noqa: F811
         )
         rows = {(r.scope, r.name): r for r in await get_device_capability(db, _NED, sw)}
         assert rows[("rm-set", "set extcommunity")].status == "unsupported"  # apply wins
-        break
 
 
 @pytest.mark.asyncio
 async def test_distinct_sw_version_is_separate_key(adapter_client):  # noqa: F811
     from nso_adapter.core.capability import get_device_capability, record_probe_capability
-    from nso_adapter.store.db import get_session
 
-    async for db in get_session():
+    async with session() as db:
         for sw in ("17.15.4c", "15.2(4)E10"):
             await record_probe_capability(
                 db, _NED, sw, [{"scope": "rm-set", "name": "x", "status": "native", "detail": ""}]
             )
         assert len(await get_device_capability(db, _NED, "17.15.4c")) == 1
         assert len(await get_device_capability(db, _NED, "15.2(4)E10")) == 1
-        break
 
 
 @pytest.mark.asyncio
@@ -77,10 +73,9 @@ async def test_clear_capability_rejections_clears_only_applied_generic_scopes(ad
         get_device_capability,
         record_capability_rejection,
     )
-    from nso_adapter.store.db import get_session
 
     sw = "15.7"
-    async for db in get_session():
+    async with session() as db:
         await record_capability_rejection(db, _NED, sw, "snmp", "snmp", "old error")
         await record_capability_rejection(db, _NED, sw, "isis", "isis", "old error")
         await record_capability_rejection(db, _NED, sw, "rm-set", "set extcommunity color", "fine-grained")
@@ -91,13 +86,11 @@ async def test_clear_capability_rejections_clears_only_applied_generic_scopes(ad
         assert ("snmp", "snmp") not in by_key  # applied scope → stale rejection cleared
         assert ("isis", "isis") in by_key  # NOT applied → untouched
         assert ("rm-set", "set extcommunity color") in by_key  # fine-grained → never cleared
-        break
 
 
 @pytest.mark.asyncio
 async def test_refresh_parses_and_stores_probe_output(adapter_client, monkeypatch):  # noqa: F811
     from nso_adapter.core import capability
-    from nso_adapter.store.db import get_session
 
     async def fake_probe(_client, _name):
         return {
@@ -110,19 +103,17 @@ async def test_refresh_parses_and_stores_probe_output(adapter_client, monkeypatc
         }
 
     monkeypatch.setattr(capability.actions, "capability_probe", fake_probe)
-    async for db in get_session():
+    async with session() as db:
         res = await capability.refresh_device_capability(db, object(), "rg03")
         assert res == {"ned_id": _NED, "sw_version": "17.15.4c", "count": 2}
         rows = await capability.get_device_capability(db, _NED, "17.15.4c")
         assert {(r.scope, r.name) for r in rows} == {("community", "color:0:128"), ("rm-set", "set extcommunity")}
-        break
 
 
 @pytest.mark.asyncio
 async def test_refresh_persists_key_then_cache_only_resolve(adapter_client, monkeypatch):  # noqa: F811
     """A probe persists (ned_id, sw_version) on the device so a later read needs no probe."""
     from nso_adapter.core import capability
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device
     from tests.conftest import seed_device
 
@@ -140,7 +131,7 @@ async def test_refresh_persists_key_then_cache_only_resolve(adapter_client, monk
 
     monkeypatch.setattr(capability.actions, "capability_probe", fake_probe)
 
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         # refresh=False before any probe → key unknown, no probe fired
         assert await capability.resolve_capability_key(db, object(), device, refresh=False) == {}
@@ -157,7 +148,6 @@ async def test_refresh_persists_key_then_cache_only_resolve(adapter_client, monk
         cached = await capability.resolve_capability_key(db, object(), refreshed, refresh=False)
         assert cached == {"ned_id": _NED, "sw_version": "17.15.4c", "count": 0}
         assert probe_calls["n"] == 1
-        break
 
 
 async def test_empty_sw_version_resolves_on_cache_read(adapter_client, monkeypatch):  # noqa: F811
@@ -165,7 +155,6 @@ async def test_empty_sw_version_resolves_on_cache_read(adapter_client, monkeypat
     ``sw_version=''`` and must still resolve on the cheap panel read — otherwise its capability
     reads 'unknown' forever even after a probe (the panel can't find the coverage row)."""
     from nso_adapter.core import capability
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device
     from tests.conftest import seed_device
 
@@ -180,7 +169,7 @@ async def test_empty_sw_version_resolves_on_cache_read(adapter_client, monkeypat
 
     monkeypatch.setattr(capability.actions, "capability_probe", fake_probe)
 
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         info = await capability.resolve_capability_key(db, object(), device, refresh=True)
         assert info["ned_id"] == "timos-nc-23.10" and info["sw_version"] == ""
@@ -192,7 +181,6 @@ async def test_empty_sw_version_resolves_on_cache_read(adapter_client, monkeypat
         # and the coverage row is findable → 'unassessed', not 'unknown'.
         rows = await capability.get_device_capability(db, "timos-nc-23.10", "")
         assert capability.coverage_unknown(rows)
-        break
 
 
 def _row(scope, name, status, source="probe", detail=""):
@@ -290,7 +278,6 @@ async def test_refresh_ned_id_literal_none_not_persisted(adapter_client, monkeyp
     """A probe reporting the literal string 'None' for ned-id (an unselected device_type.cli)
     must NOT become a capability key or be persisted onto the device (#13)."""
     from nso_adapter.core import capability
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device
     from tests.conftest import seed_device
 
@@ -300,12 +287,11 @@ async def test_refresh_ned_id_literal_none_not_persisted(adapter_client, monkeyp
         return {"ned-id": "None", "sw-version": "None", "element": []}
 
     monkeypatch.setattr(capability.actions, "capability_probe", fake_probe)
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         res = await capability.refresh_device_capability(db, object(), "rgX", device)
         assert res == {}  # 'None' ned-id → treated as no NED, nothing recorded
         assert device.ned_id != "None"  # never persisted as a bogus key
-        break
 
 
 @pytest.mark.asyncio
@@ -313,15 +299,13 @@ async def test_record_probe_capability_tolerates_single_element_dict(adapter_cli
     """RESTCONF may render a singleton `element` list as a bare object; record_probe_capability
     must coerce it, not crash iterating dict keys (#24)."""
     from nso_adapter.core.capability import get_device_capability, record_probe_capability
-    from nso_adapter.store.db import get_session
 
     single = {"scope": "rm-set", "name": "set extcommunity", "status": "native", "detail": ""}
-    async for db in get_session():
+    async with session() as db:
         count = await record_probe_capability(db, _NED, "1.0", single)  # a dict, not a list
         assert count == 1
         rows = await get_device_capability(db, _NED, "1.0")
         assert {(r.scope, r.name) for r in rows} == {("rm-set", "set extcommunity")}
-        break
 
 
 # ── preflight_scopes (generic apply-preflight: scope-level matrix check) ────────
@@ -370,9 +354,8 @@ def test_preflight_scopes_empty_request_is_fully_supported():
 async def test_record_read_capability_writes_read_sourced_rows(adapter_client):  # noqa: F811
     """Read elements land as (scope, name='read') rows with source='read'."""
     from nso_adapter.core.capability import get_device_capability, record_read_capability
-    from nso_adapter.store.db import get_session
 
-    async for db in get_session():
+    async with session() as db:
         count = await record_read_capability(
             db,
             _NED,
@@ -391,7 +374,6 @@ async def test_record_read_capability_writes_read_sourced_rows(adapter_client): 
         assert rows[("vlan", "read")].status == "skipped"
         assert rows[("isis", "read")].status == "unknown"
         assert rows[("ospf", "read")].status == "unsupported"
-        break
 
 
 @pytest.mark.asyncio
@@ -400,10 +382,9 @@ async def test_read_unknown_never_downgrades_a_definite_read_row(adapter_client)
     clobber a definite verdict learned from another device on the same (ned, sw) key;
     a later definite observation upgrades an 'unknown'."""
     from nso_adapter.core.capability import get_device_capability, record_read_capability
-    from nso_adapter.store.db import get_session
 
     sw = "23.10.R3"
-    async for db in get_session():
+    async with session() as db:
         await record_read_capability(db, _NED, sw, [{"scope": "bgp", "status": "native", "detail": "read on A"}])
         await record_read_capability(db, _NED, sw, [{"scope": "bgp", "status": "unknown", "detail": "empty on B"}])
         rows = {(r.scope, r.name): r for r in await get_device_capability(db, _NED, sw)}
@@ -413,7 +394,6 @@ async def test_read_unknown_never_downgrades_a_definite_read_row(adapter_client)
         await record_read_capability(db, _NED, sw, [{"scope": "isis", "status": "native", "detail": "read on A"}])
         rows = {(r.scope, r.name): r for r in await get_device_capability(db, _NED, sw)}
         assert rows[("isis", "read")].status == "native"  # definite upgrades unknown
-        break
 
 
 @pytest.mark.asyncio
@@ -426,10 +406,9 @@ async def test_read_rows_coexist_with_apply_rows_for_the_same_scope(adapter_clie
         record_capability_rejection,
         record_read_capability,
     )
-    from nso_adapter.store.db import get_session
 
     sw = "7.11.2"
-    async for db in get_session():
+    async with session() as db:
         await record_capability_rejection(db, _NED, sw, "bgp", "bgp", "NED rejected")
         await record_read_capability(db, _NED, sw, [{"scope": "bgp", "status": "native", "detail": "read fine"}])
         rows = {(r.scope, r.name): r for r in await get_device_capability(db, _NED, sw)}
@@ -440,16 +419,14 @@ async def test_read_rows_coexist_with_apply_rows_for_the_same_scope(adapter_clie
         rows = {(r.scope, r.name): r for r in await get_device_capability(db, _NED, sw)}
         assert ("bgp", "bgp") not in rows  # apply rejection cleared by the clean commit
         assert rows[("bgp", "read")].status == "native"  # read fact untouched
-        break
 
 
 @pytest.mark.asyncio
 async def test_record_read_capability_skips_invalid_elements(adapter_client):  # noqa: F811
     from nso_adapter.core.capability import get_device_capability, record_read_capability
-    from nso_adapter.store.db import get_session
 
     sw = "9.9.9"
-    async for db in get_session():
+    async with session() as db:
         count = await record_read_capability(
             db,
             _NED,
@@ -464,7 +441,6 @@ async def test_record_read_capability_skips_invalid_elements(adapter_client):  #
         assert count == 1
         rows = await get_device_capability(db, _NED, sw)
         assert [(r.scope, r.name, r.status) for r in rows] == [("ospf", "read", "native")]
-        break
 
 
 def test_preflight_scopes_flags_read_gap_rows():
@@ -551,13 +527,11 @@ async def test_clear_capability_rejections_clears_fine_grained_names_in_scope(ad
         get_device_capability,
         record_capability_rejection,
     )
-    from nso_adapter.store.db import get_session
 
     sw = "17.15.4c"
-    async for db in get_session():
+    async with session() as db:
         await record_capability_rejection(db, _NED, sw, "interface_ip", "ipv4-address", "out of range")
         cleared = await clear_capability_rejections(db, _NED, sw, ["interface_ip"])
         assert cleared == 1
         rows = await get_device_capability(db, _NED, sw)
         assert not any(r.scope == "interface_ip" for r in rows)
-        break

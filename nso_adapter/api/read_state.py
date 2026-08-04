@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.timestamps import iso_z
 from nso_adapter.core.families import ALL_FAMILY_KEYS, FAMILIES_VERSION
 from nso_adapter.store import outcome_store
 from nso_adapter.store.meta import get_store_incarnation
@@ -34,21 +35,13 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/api/v1/devices", tags=["read-state"])
 
 
-def _iso_z(ts: datetime | None) -> str | None:
-    if ts is None:
-        return None
-    # Store convention: naive-UTC in sqlite, tz-aware in PG — serialize both as "<iso>Z".
-    naive = ts.replace(tzinfo=None) if ts.tzinfo is not None else ts
-    return naive.isoformat() + "Z"
-
-
 # Wire datetime (SA-2 round 2): serializes as the store's "<iso>Z" (valid RFC 3339) while
 # the OpenAPI schema stays an honest non-nullable string/format=date-time — a bare
 # field_serializer returning `str | None` published unformatted NULLABLE strings, letting
 # a schema-generated consumer accept a null incarnation_born (load-bearing for adoption).
 IsoZDateTime = Annotated[
     datetime,
-    PlainSerializer(_iso_z, return_type=str, when_used="json"),
+    PlainSerializer(iso_z, return_type=str, when_used="json"),
     WithJsonSchema({"type": "string", "format": "date-time"}),
 ]
 

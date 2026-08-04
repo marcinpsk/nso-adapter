@@ -11,9 +11,8 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.core.l2_service import refresh_l2_services_for_device
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, DeviceL2Sap
-from tests.conftest import seed_device
+from tests.conftest import seed_device, session
 
 _NSO_ENTRY = {
     "device-name": "l2-ra1",
@@ -38,12 +37,11 @@ _NSO_ENTRY = {
 
 @asynccontextmanager
 async def _device_session(device_id: int):
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         assert device is not None
         yield db, device
         return
-    raise RuntimeError("no session")
 
 
 @pytest.mark.anyio

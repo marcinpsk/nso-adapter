@@ -15,11 +15,12 @@ from datetime import UTC, datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from nso_adapter.api.timestamps import iso_z
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TS = datetime(2026, 6, 1, 10, 0, 0)
+TS = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
 TS_Z = "2026-06-01T10:00:00Z"
 FROZEN_Z = "2026-06-01T10:00:00Z"
 
@@ -33,15 +34,13 @@ class _FrozenDatetime(datetime):
 
 
 async def _seed_scope_rows(device_id: int, attributes: list[str]) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceSettings, ManagedScope
 
-    async for db in get_session():
+    async with session() as db:
         for attr in attributes:
             db.add(ManagedScope(device_id=device_id, attribute=attr, updated_at=TS))
         db.add(DeviceSettings(device_id=device_id, auto_apply=True, sync_before_apply=False))
         await db.commit()
-        break
 
 
 @pytest.mark.anyio
@@ -104,4 +103,4 @@ async def test_put_scope_result_golden(adapter_client):
 
 
 def test_frozen_now_is_fixed():
-    assert _FrozenDatetime.now(UTC).replace(tzinfo=None).isoformat() + "Z" == FROZEN_Z
+    assert iso_z(_FrozenDatetime.now(UTC)) == FROZEN_Z

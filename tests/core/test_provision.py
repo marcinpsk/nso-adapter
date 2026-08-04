@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from nso_adapter.nso.client import NsoClient
+from tests.conftest import session
 
 
 def _mock_client(*, exists=False, create=None, fetch=None, admin=None, sync=True):
@@ -31,11 +32,10 @@ def _steps(result):
 
 async def test_provision_happy_path(adapter_client_with_nso):
     from nso_adapter.core.onboarding import provision_nso_device
-    from nso_adapter.store.db import get_session
 
     client = _mock_client()
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
-        async for db in get_session():
+        async with session() as db:
             res = await provision_nso_device(
                 db,
                 nso_instance="nso-dev",
@@ -45,7 +45,6 @@ async def test_provision_happy_path(adapter_client_with_nso):
                 authgroup="network",
                 netbox_device_id=99,
             )
-            break
 
     assert res["ok"] is True
     s = _steps(res)
@@ -71,11 +70,10 @@ async def test_provision_derives_netconf_transport_from_ned_id(adapter_client_wi
     transport that left the device unable to sync its netconf config.
     """
     from nso_adapter.core.onboarding import provision_nso_device
-    from nso_adapter.store.db import get_session
 
     client = _mock_client()
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
-        async for db in get_session():
+        async with session() as db:
             res = await provision_nso_device(
                 db,
                 nso_instance="nso-dev",
@@ -84,7 +82,6 @@ async def test_provision_derives_netconf_transport_from_ned_id(adapter_client_wi
                 ned_id="juniper-junos-nc-4.19:juniper-junos-nc-4.19",
                 authgroup="network",
             )
-            break
     assert res["ok"] is True
     _, kwargs = client.create_device.call_args
     assert kwargs["ned_type"] == "netconf"
@@ -95,11 +92,10 @@ async def test_provision_rejects_transport_contradicting_ned_id(adapter_client_w
     import pytest
 
     from nso_adapter.core.onboarding import provision_nso_device
-    from nso_adapter.store.db import get_session
 
     client = _mock_client()
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
-        async for db in get_session():
+        async with session() as db:
             with pytest.raises(ValueError, match="contradicts"):
                 await provision_nso_device(
                     db,
@@ -110,17 +106,15 @@ async def test_provision_rejects_transport_contradicting_ned_id(adapter_client_w
                     authgroup="network",
                     ned_type="cli",
                 )
-            break
     client.create_device.assert_not_awaited()
 
 
 async def test_provision_idempotent_existing_device(adapter_client_with_nso):
     from nso_adapter.core.onboarding import provision_nso_device
-    from nso_adapter.store.db import get_session
 
     client = _mock_client(exists=True)
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
-        async for db in get_session():
+        async with session() as db:
             res = await provision_nso_device(
                 db,
                 nso_instance="nso-dev",
@@ -129,7 +123,6 @@ async def test_provision_idempotent_existing_device(adapter_client_with_nso):
                 ned_id="x",
                 authgroup="network",
             )
-            break
     assert res["ok"] is True
     assert _steps(res)["create"] == "exists"
     client.create_device.assert_not_awaited()
@@ -137,11 +130,10 @@ async def test_provision_idempotent_existing_device(adapter_client_with_nso):
 
 async def test_provision_aborts_on_create_failure(adapter_client_with_nso):
     from nso_adapter.core.onboarding import provision_nso_device
-    from nso_adapter.store.db import get_session
 
     client = _mock_client(create=RuntimeError("boom"))
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
-        async for db in get_session():
+        async with session() as db:
             res = await provision_nso_device(
                 db,
                 nso_instance="nso-dev",
@@ -150,7 +142,6 @@ async def test_provision_aborts_on_create_failure(adapter_client_with_nso):
                 ned_id="x",
                 authgroup="network",
             )
-            break
     assert res["ok"] is False
     assert _steps(res)["create"] == "failed"
     client.fetch_host_keys.assert_not_awaited()
@@ -158,11 +149,10 @@ async def test_provision_aborts_on_create_failure(adapter_client_with_nso):
 
 async def test_provision_aborts_on_fetch_host_keys_failure(adapter_client_with_nso):
     from nso_adapter.core.onboarding import provision_nso_device
-    from nso_adapter.store.db import get_session
 
     client = _mock_client(fetch=RuntimeError("unreachable"))
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
-        async for db in get_session():
+        async with session() as db:
             res = await provision_nso_device(
                 db,
                 nso_instance="nso-dev",
@@ -171,7 +161,6 @@ async def test_provision_aborts_on_fetch_host_keys_failure(adapter_client_with_n
                 ned_id="x",
                 authgroup="network",
             )
-            break
     assert res["ok"] is False
     s = _steps(res)
     # admin-state unlock now precedes fetch-host-keys (a southbound-locked device
@@ -190,7 +179,6 @@ async def test_provision_seeds_failover_when_oob_bootstrap_then_fetch_fails(adap
 
     from nso_adapter.config import get_config
     from nso_adapter.core.onboarding import provision_nso_device
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import ActiveAddress, Device, DeviceFailover
 
     monkeypatch.setattr(get_config().scheduler, "enable_failover", True)
@@ -205,7 +193,7 @@ async def test_provision_seeds_failover_when_oob_bootstrap_then_fetch_fails(adap
         patch("nso_adapter.core.importer.get_nso_client", return_value=client),
         patch("nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()),
     ):
-        async for db in get_session():
+        async with session() as db:
             res = await provision_nso_device(
                 db,
                 nso_instance="nso-dev",
@@ -216,7 +204,6 @@ async def test_provision_seeds_failover_when_oob_bootstrap_then_fetch_fails(adap
                 netbox_device_id=999,
                 oob_ip="192.0.2.5",
             )
-            break
 
     assert res["ok"] is False
     assert _steps(res)["fetch_host_keys"] == "failed"
@@ -224,24 +211,22 @@ async def test_provision_seeds_failover_when_oob_bootstrap_then_fetch_fails(adap
     client.set_address.assert_awaited_once_with("oob-strand", "192.0.2.5")
 
     # A DeviceFailover row must exist so the loop manages + fails it back to primary.
-    async for db in get_session():
+    async with session() as db:
         dev = (await db.execute(select(Device).where(Device.nso_device_name == "oob-strand"))).scalar_one_or_none()
         assert dev is not None, "adapter mapping not created — failover can't manage the OOB-pinned device"
         fo = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == dev.id))).scalar_one_or_none()
         assert fo is not None, "device stranded on OOB with no failover row"
         assert fo.active_address == ActiveAddress.oob.value
         assert fo.oob_ip == "192.0.2.5"
-        break
 
 
 async def test_provision_unlocks_before_fetch_host_keys(adapter_client_with_nso):
     """Regression: unlock MUST happen before fetch-host-keys (locked device blocks SSH)."""
     from nso_adapter.core.onboarding import provision_nso_device
-    from nso_adapter.store.db import get_session
 
     client = _mock_client()
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
-        async for db in get_session():
+        async with session() as db:
             await provision_nso_device(
                 db,
                 nso_instance="nso-dev",
@@ -250,7 +235,6 @@ async def test_provision_unlocks_before_fetch_host_keys(adapter_client_with_nso)
                 ned_id="x",
                 authgroup="network",
             )
-            break
     # The client AsyncMock records every onboarding call in order — no separate parent Mock
     # needed: assert the unlock (set_admin_state) precedes fetch_host_keys.
     order = [c[0] for c in client.mock_calls]
@@ -259,11 +243,10 @@ async def test_provision_unlocks_before_fetch_host_keys(adapter_client_with_nso)
 
 async def test_provision_sync_failure_is_nonfatal(adapter_client_with_nso):
     from nso_adapter.core.onboarding import provision_nso_device
-    from nso_adapter.store.db import get_session
 
     client = _mock_client(sync=False)
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
-        async for db in get_session():
+        async with session() as db:
             res = await provision_nso_device(
                 db,
                 nso_instance="nso-dev",
@@ -273,7 +256,6 @@ async def test_provision_sync_failure_is_nonfatal(adapter_client_with_nso):
                 authgroup="network",
                 netbox_device_id=77,
             )
-            break
     assert res["ok"] is True  # sync-from failure does not block onboarding
     assert _steps(res)["sync_from"] == "failed"
     assert res["device_id"] is not None  # mapping still created
@@ -281,9 +263,8 @@ async def test_provision_sync_failure_is_nonfatal(adapter_client_with_nso):
 
 async def test_provision_unknown_instance_raises(adapter_client):
     from nso_adapter.core.onboarding import provision_nso_device
-    from nso_adapter.store.db import get_session
 
-    async for db in get_session():
+    async with session() as db:
         with pytest.raises(ValueError):
             await provision_nso_device(
                 db,
@@ -293,7 +274,6 @@ async def test_provision_unknown_instance_raises(adapter_client):
                 ned_id="x",
                 authgroup="network",
             )
-        break
 
 
 async def test_provision_retries_fetch_host_keys_once(adapter_client_with_nso):
@@ -301,7 +281,6 @@ async def test_provision_retries_fetch_host_keys_once(adapter_client_with_nso):
     from unittest.mock import AsyncMock
 
     from nso_adapter.core.onboarding import provision_nso_device
-    from nso_adapter.store.db import get_session
 
     client = _mock_client()
     client.fetch_host_keys.side_effect = [RuntimeError("connection reset"), {"result": "updated"}]
@@ -309,7 +288,7 @@ async def test_provision_retries_fetch_host_keys_once(adapter_client_with_nso):
         patch("nso_adapter.core.importer.get_nso_client", return_value=client),
         patch("nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()),
     ):
-        async for db in get_session():
+        async with session() as db:
             res = await provision_nso_device(
                 db,
                 nso_instance="nso-dev",
@@ -318,7 +297,6 @@ async def test_provision_retries_fetch_host_keys_once(adapter_client_with_nso):
                 ned_id="x",
                 authgroup="network",
             )
-            break
     assert res["ok"] is True
     assert _steps(res)["fetch_host_keys"] == "ok"
     assert client.fetch_host_keys.await_count == 2
@@ -329,14 +307,13 @@ async def test_provision_fetch_host_keys_fails_after_one_retry(adapter_client_wi
     from unittest.mock import AsyncMock
 
     from nso_adapter.core.onboarding import provision_nso_device
-    from nso_adapter.store.db import get_session
 
     client = _mock_client(fetch=RuntimeError("still down"))
     with (
         patch("nso_adapter.core.importer.get_nso_client", return_value=client),
         patch("nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()),
     ):
-        async for db in get_session():
+        async with session() as db:
             res = await provision_nso_device(
                 db,
                 nso_instance="nso-dev",
@@ -345,7 +322,6 @@ async def test_provision_fetch_host_keys_fails_after_one_retry(adapter_client_wi
                 ned_id="x",
                 authgroup="network",
             )
-            break
     assert res["ok"] is False
     assert _steps(res)["fetch_host_keys"] == "failed"
     assert client.fetch_host_keys.await_count == 2
@@ -356,7 +332,6 @@ async def test_provision_retries_sync_from_once(adapter_client_with_nso):
     from unittest.mock import AsyncMock
 
     from nso_adapter.core.onboarding import provision_nso_device
-    from nso_adapter.store.db import get_session
 
     client = _mock_client()
     client.sync_from.side_effect = [False, True]
@@ -364,7 +339,7 @@ async def test_provision_retries_sync_from_once(adapter_client_with_nso):
         patch("nso_adapter.core.importer.get_nso_client", return_value=client),
         patch("nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()),
     ):
-        async for db in get_session():
+        async with session() as db:
             res = await provision_nso_device(
                 db,
                 nso_instance="nso-dev",
@@ -373,6 +348,5 @@ async def test_provision_retries_sync_from_once(adapter_client_with_nso):
                 ned_id="x",
                 authgroup="network",
             )
-            break
     assert _steps(res)["sync_from"] == "ok"
     assert client.sync_from.await_count == 2

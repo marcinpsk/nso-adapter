@@ -13,24 +13,154 @@ from __future__ import annotations
 import asyncio
 
 import structlog
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import exists, literal_column, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.core.claim import ClaimLostError, ClaimRegistration, ClaimUnavailableError, lock_claim
 from nso_adapter.store.models import Job, JobStatus, JobType
 
 logger = structlog.get_logger(__name__)
 
 
-async def get_active_job(device_id: int, db: AsyncSession) -> Job | None:
-    """Return the currently queued/running job for *device_id*, or None."""
+async def get_queued_job_of_type(device_id: int, job_type: JobType, db: AsyncSession) -> Job | None:
+    """Return the queued job of *job_type* — the exact cause of a same-type refusal.
+
+    This is the only correct answer for a 409: telling a caller about some unrelated job
+    that happens to be active gives it nothing to wait on or retry against. Ordered so two
+    exempt rows (removals) still yield a deterministic answer rather than raising.
+    """
     result = await db.execute(
-        select(Job).where(
-            Job.device_id == device_id,
-            Job.status.in_([JobStatus.queued, JobStatus.running]),
-        )
+        select(Job)
+        .where(Job.device_id == device_id, Job.job_type == job_type, Job.status == JobStatus.queued)
+        .order_by(Job.created_at, Job.id)
+        .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+async def has_any_active_job(device_id: int, db: AsyncSession) -> bool:
+    """Is anything queued or running for this device? A cheap EXISTS pre-filter.
+
+    Deliberately a boolean and not a row: several rows can legitimately match (removals are
+    exempt from queued uniqueness, one per scope), so anything returning "the" active job is
+    unsound. Note it is only a PRE-filter for serialization decisions — an apply goes
+    terminal while its claim is still held through the post-apply refresh, so a job-status
+    query reads "idle" while the device is genuinely busy. The claim is the real gate.
+    """
+    return bool(
+        await db.scalar(
+            select(
+                exists().where(
+                    Job.device_id == device_id,
+                    Job.status.in_([JobStatus.queued, JobStatus.running]),
+                )
+            )
+        )
+    )
+
+
+async def get_head_queued_job(device_id: int, db: AsyncSession) -> Job | None:
+    """Return the oldest queued job for this device: the per-device FIFO head.
+
+    Worker-internal.
+    """
+    result = await db.execute(
+        select(Job)
+        .where(Job.device_id == device_id, Job.status == JobStatus.queued)
+        .order_by(Job.created_at, Job.id)
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+# The dedupe index's predicate, verbatim. ON CONFLICT infers the arbiter from the index
+# columns PLUS this predicate; PostgreSQL requires it to imply the index's own. The index
+# is not a constraint, so `ON CONFLICT ON CONSTRAINT <name>` raises InvalidObjectDefinition
+# rather than returning empty — which is the 500 atomic admission exists to prevent.
+_QUEUED_DEDUPE_PREDICATE = text("status = 'queued' AND job_type <> 'removal'")
+
+# Bounds applied ONLY to a transaction that ends up holding the queued-winner row lock.
+# Production declares no statement or transaction timeout on the engine, so a hung request
+# holding that row would starve the job indefinitely. SET LOCAL scopes both to this
+# transaction and needs no reset before the connection returns to the pool — a session-level
+# value would, and a short idle-transaction bound set session-wide would also kill the
+# capability refresh, which legitimately holds one transaction across a 120s NSO action.
+_WINNER_LOCK_STATEMENT_TIMEOUT_MS = 60_000
+_WINNER_LOCK_IDLE_TX_TIMEOUT_MS = 120_000
+
+_ADMISSION_RETRIES = 3
+
+
+async def _lock_queued_winner(db: AsyncSession, device_id: int, job_type: JobType) -> Job | None:
+    """Row-lock the queued job that won admission, and hold it to the caller's commit.
+
+    That lock is the handoff guarantee (F6): the worker cannot start the winner until the
+    caller's own intent mutation is visible, so the job it runs can never carry a snapshot
+    older than the request that admitted it.
+
+    Zero rows means the winner is no longer queued — it went running or terminal between the
+    failed insert and this lookup — and the caller should retry admission to create a
+    successor. ``FOR UPDATE`` re-checks the predicate after acquiring the lock, so this
+    cannot return a row that has since changed status.
+    """
+    return await db.scalar(
+        select(Job)
+        .where(Job.device_id == device_id, Job.job_type == job_type, Job.status == JobStatus.queued)
+        .order_by(Job.created_at, Job.id)
+        .limit(1)
+        .with_for_update()
+    )
+
+
+async def admit_queued_job(
+    db: AsyncSession,
+    device_id: int | None,
+    job_type: JobType,
+    *,
+    context: dict | None = None,
+) -> tuple[Job | None, Job | None]:
+    """Atomically admit a queued job of *job_type*, or hand back the queued winner.
+
+    Returns ``(created, winner)`` with exactly one of them set. The insert runs inside a
+    SAVEPOINT so a conflict cannot poison the caller's transaction — every auto-apply
+    endpoint calls this with intent rows already mutated and uncommitted, and losing those
+    is a silent data loss, not a retryable error.
+
+    Does NOT commit: the caller owns its transaction boundary.
+    """
+    for _attempt in range(_ADMISSION_RETRIES):
+        values: dict = {"job_type": job_type, "device_id": device_id, "status": JobStatus.queued}
+        if context is not None:
+            values["context"] = context
+
+        async with db.begin_nested():
+            job_id = await db.scalar(
+                pg_insert(Job)
+                .values(**values)
+                .on_conflict_do_nothing(
+                    index_elements=[Job.device_id, Job.job_type],
+                    index_where=_QUEUED_DEDUPE_PREDICATE,
+                )
+                .returning(Job.id)
+            )
+
+        if job_id is not None:
+            created = await db.get(Job, job_id)
+            return created, None
+
+        # Lost to an existing queued row. Bound this transaction before parking on its lock.
+        await db.execute(text(f"SET LOCAL statement_timeout = '{_WINNER_LOCK_STATEMENT_TIMEOUT_MS}ms'"))
+        await db.execute(text(f"SET LOCAL idle_in_transaction_session_timeout = '{_WINNER_LOCK_IDLE_TX_TIMEOUT_MS}ms'"))
+        winner = await _lock_queued_winner(db, device_id, job_type)
+        if winner is not None:
+            return None, winner
+        # The winner started running: our caller's intent is newer than its snapshot, so a
+        # successor is the correct answer — never "blocked".
+        logger.debug("job.admission.winner_started", device_id=device_id, job_type=str(job_type))
+
+    logger.warning("job.admission.retries_exhausted", device_id=device_id, job_type=str(job_type))
+    return None, None
 
 
 async def enqueue_job(
@@ -47,26 +177,34 @@ async def enqueue_job(
     if job_type not in _JOB_RUNNERS:
         raise ValueError(f"No runner registered for job type {job_type!r}")
 
-    active = await get_active_job(device_id, db)
-    if active:
-        return active, False
+    # Atomic same-type queued dedupe. No check-then-insert: the DB decides, so no TOCTOU
+    # window exists and a conflict never surfaces as an IntegrityError the caller must
+    # recover from. A queued removal does not refuse a sync, and a running job does not
+    # refuse its own successor — the device claim serializes execution.
+    created, winner = await admit_queued_job(db, device_id, job_type)
+    if winner is not None:
+        logger.debug("job.enqueue.race_lost", device_id=device_id, winner_id=winner.id)
+        await db.commit()  # release the winner lock; this helper owns its transaction
+        return winner, False
+    if created is None:  # pragma: no cover - retries exhausted under sustained contention
+        raise RuntimeError(f"could not admit a {job_type} job for device {device_id}")
 
-    job = Job(job_type=job_type, device_id=device_id, status=JobStatus.queued)
-    db.add(job)
-    try:
-        await db.commit()
-    except IntegrityError:
-        # Lost the check-then-insert race: a concurrent enqueue committed the active
-        # job for this device first, and uq_job_active_per_device rejected ours. Recover
-        # by returning the winner instead of surfacing a 500.
-        await db.rollback()
-        winner = await get_active_job(device_id, db)
-        if winner is not None:
-            logger.debug("job.enqueue.race_lost", device_id=device_id, winner_id=winner.id)
-            return winner, False
-        raise
-    await db.refresh(job)
-    return job, True
+    # This helper owns the outer commit and its API/scheduler callers depend on that:
+    # get_db does not auto-commit.
+    await db.commit()
+    await db.refresh(created)
+    return created, True
+
+
+# The provision dedupe index's expressions and predicate, verbatim and defined ONCE: the
+# same two constants are the ON CONFLICT inference target and the lookup's filter, so the
+# lookup can never drift from what the database actually enforces. literal_column, not text:
+# ON CONFLICT infers from column EXPRESSIONS, and a TextClause is not one.
+_PROVISION_PAIR_ELEMENTS = (
+    literal_column("(context ->> 'nso_instance')"),
+    literal_column("(context ->> 'device_name')"),
+)
+_PROVISION_DEDUPE_PREDICATE = text("status IN ('queued', 'running') AND job_type = 'provision'")
 
 
 async def get_active_provision_job(nso_instance: str, device_name: str, db: AsyncSession) -> Job | None:
@@ -75,43 +213,78 @@ async def get_active_provision_job(nso_instance: str, device_name: str, db: Asyn
     Provision jobs run *before* the adapter ``Device`` row exists, so they carry no
     ``device_id`` — the de-dup key lives in ``Job.context`` instead. Scoped to the
     two context fields that uniquely identify the in-flight onboarding.
+
+    Ordered and limited rather than ``scalar_one_or_none``: rows admitted before
+    ``uq_job_active_provision_pair`` existed can still be duplicated, and a lookup that
+    raises on them would take out every subsequent onboarding of that node.
     """
-    result = await db.execute(
-        select(Job).where(
-            Job.job_type == JobType.provision,
-            Job.status.in_([JobStatus.queued, JobStatus.running]),
+    return await db.scalar(
+        select(Job)
+        .where(
+            _PROVISION_DEDUPE_PREDICATE,
+            _PROVISION_PAIR_ELEMENTS[0] == nso_instance,
+            _PROVISION_PAIR_ELEMENTS[1] == device_name,
         )
+        .order_by(Job.created_at, Job.id)
+        .limit(1)
     )
-    for job in result.scalars().all():
-        ctx = job.context or {}
-        if ctx.get("nso_instance") == nso_instance and ctx.get("device_name") == device_name:
-            return job
-    return None
 
 
 async def enqueue_provision_job(params: dict, db: AsyncSession) -> tuple[Job, bool]:
     """Create a queued provision (device-onboarding) job.  Returns (job, created).
 
-    Unlike :func:`enqueue_job`, a provision runs before the device exists, so the job
-    has ``device_id=None`` and carries its parameters in ``context``; de-dup is on
-    (nso_instance, device_name) via :func:`get_active_provision_job` so a double-click
-    returns the in-flight job (created=False) instead of provisioning twice.
-    """
-    active = await get_active_provision_job(params["nso_instance"], params["device_name"], db)
-    if active:
-        return active, False
+    Unlike :func:`enqueue_job`, a provision runs before the device exists, so the job has
+    ``device_id=None`` and carries its parameters in ``context``; de-dup is on
+    (nso_instance, device_name) so a double-click returns the in-flight job
+    (created=False) instead of provisioning twice.
 
-    job = Job(job_type=JobType.provision, device_id=None, status=JobStatus.queued, context=params)
-    db.add(job)
-    await db.commit()
-    await db.refresh(job)
-    return job, True
+    The DB decides, not a preceding lookup. A check-then-insert let two concurrent requests
+    for the same node both find nothing and both admit — and nothing downstream would have
+    stopped them, because the two runners onboard the same NSO node with no claim between
+    them until each reaches its own mapping. The loser now loses on the index conflict and
+    is handed the winner's job.
+
+    Zero rows with no active job means the winner reached a terminal status between the two
+    statements; a fresh admission is then the correct answer, not "blocked".
+    """
+    for _attempt in range(_ADMISSION_RETRIES):
+        async with db.begin_nested():
+            job_id = await db.scalar(
+                pg_insert(Job)
+                .values(job_type=JobType.provision, device_id=None, status=JobStatus.queued, context=params)
+                .on_conflict_do_nothing(
+                    index_elements=_PROVISION_PAIR_ELEMENTS,
+                    index_where=_PROVISION_DEDUPE_PREDICATE,
+                )
+                .returning(Job.id)
+            )
+        if job_id is not None:
+            await db.commit()
+            job = await db.get(Job, job_id)
+            return job, True
+
+        active = await get_active_provision_job(params["nso_instance"], params["device_name"], db)
+        if active is not None:
+            return active, False
+        logger.debug("job.provision_admission.winner_finished", device_name=params.get("device_name"))
+
+    logger.warning("job.provision_admission.retries_exhausted", device_name=params.get("device_name"))
+    raise RuntimeError(f"could not admit a provision job for {params.get('device_name')!r}")
 
 
 # ── Job runners ───────────────────────────────────────────────────────────────
+#
+# Every runner takes the worker's live ClaimRegistration, uniformly, so the worker never
+# has to decide by job type which runners want one. Only provision reads it today: it is
+# the one runner that starts claimless and acquires its claim mid-run.
 
 
-async def _mark_job_failed(db: AsyncSession, job_id: int, error: dict) -> None:
+async def _mark_job_failed(
+    db: AsyncSession,
+    job_id: int,
+    error: dict,
+    reg: ClaimRegistration | None = None,
+) -> None:
     """Record a terminal ``failed`` status on *job_id*, tolerating a poisoned session.
 
     A DB-origin error inside a runner's ``try`` leaves the AsyncSession in a
@@ -120,8 +293,21 @@ async def _mark_job_failed(db: AsyncSession, job_id: int, error: dict) -> None:
     Roll back, re-fetch the (possibly expired) job, then commit the terminal status.
     Same fix as :func:`core.apply.run_apply` (finding #11); shared so the other
     runners stay consistent.
+
+    This is an effectful transaction on a claimed device, so it takes the claim row lock
+    when *reg* is supplied — after the rollback, before the re-fetch, leaving the
+    rollback-first contract intact. Without the lock the concrete failure is: recovery
+    revokes a stale sync's claim and requeues the job, the old runner raises
+    ``ClaimLostError``, its wrapper converts that into a call here, and this write
+    overwrites recovery's disposition — or a fresh worker's ``running``.
     """
     await db.rollback()
+    if reg is not None:
+        try:
+            await lock_claim(db, reg)
+        except ClaimLostError:
+            logger.warning("job.mark_failed_claim_lost", job_id=job_id, device_id=reg.device_id)
+            return
     job = await db.get(Job, job_id)
     if job is not None:
         job.status = JobStatus.failed
@@ -156,19 +342,22 @@ async def _run_with_db(job_id: int, device_id: int, coro_factory, *, timeout: fl
                 job_id,
                 {"code": "timeout", "message": f"Job exceeded {int(timeout)}s timeout", "detail": {}},
             )
+        except ClaimLostError:
+            # Revocation is not a runner error: recovery already owns the disposition.
+            raise
         except Exception as exc:
             logger.exception("job.failed", job_id=job_id, device_id=device_id, error=repr(exc))
             await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}})
 
 
-async def _run_sync(job_id: int, device_id: int) -> None:
+async def _run_sync(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
     from nso_adapter.core.importer import sync_device
 
     logger.info("job.sync.start", job_id=job_id, device_id=device_id)
     await _run_with_db(job_id, device_id, sync_device)
 
 
-async def _run_sync_now(job_id: int, device_id: int) -> None:
+async def _run_sync_now(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
     """Operator Sync-Now: grain-c atomic AND comprehensive (S5a).
 
     One atomic ``device-state-read`` covering ALL surfaces, not just the lean routing
@@ -184,7 +373,7 @@ async def _run_sync_now(job_id: int, device_id: int) -> None:
     await _run_with_db(job_id, device_id, _atomic_sync, timeout=900.0)
 
 
-async def _run_sync_from_nso(job_id: int, device_id: int) -> None:
+async def _run_sync_from_nso(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
     """Operator "Sync from NSO" (S5a B): comprehensive CDB-only mirror read.
 
     All surfaces from ONE atomic ``device-state-read`` — NO device ``sync-from``, no
@@ -220,14 +409,14 @@ async def _run_sync_from_nso(job_id: int, device_id: int) -> None:
     await _run_with_db(job_id, device_id, _mirror_read, timeout=900.0)
 
 
-async def _run_detect_drift(job_id: int, device_id: int) -> None:
+async def _run_detect_drift(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
     from nso_adapter.core.importer import detect_drift
 
     logger.info("job.detect_drift.start", job_id=job_id, device_id=device_id)
     await _run_with_db(job_id, device_id, detect_drift)
 
 
-async def _run_connect(job_id: int, device_id: int) -> None:
+async def _run_connect(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
     from nso_adapter.core.importer import get_nso_client
     from nso_adapter.nso.actions import connect
     from nso_adapter.store.db import get_session
@@ -264,23 +453,28 @@ async def _run_connect(job_id: int, device_id: int) -> None:
                 job_id,
                 {"code": "timeout", "message": f"Connect exceeded {int(_JOB_TIMEOUT)}s timeout", "detail": {}},
             )
+        except ClaimLostError:
+            # Revocation is not a runner error: recovery already owns the disposition.
+            raise
         except Exception as exc:
             logger.exception("job.connect.failed", job_id=job_id, error=repr(exc))
             await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}})
 
 
-async def _run_apply(job_id: int, device_id: int) -> None:
+async def _run_apply(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
     from nso_adapter.core.apply import run_apply
 
     logger.info("job.apply.start", job_id=job_id, device_id=device_id)
-    await run_apply(job_id, device_id, force=True)
+    # The claim registration goes THROUGH to the runner: R1 kept it here, so no write the
+    # runner makes could be claim-scoped. R2's carrier/CAS transactions need the token.
+    await run_apply(job_id, device_id, force=True, reg=reg)
 
 
-async def _run_removal(job_id: int, device_id: int) -> None:
+async def _run_removal(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
     from nso_adapter.core.removal import run_removal
 
     logger.info("job.removal.start", job_id=job_id, device_id=device_id)
-    await run_removal(job_id, device_id)
+    await run_removal(job_id, device_id, reg=reg)
 
 
 async def _notify_provision_complete(job_id: int) -> None:
@@ -301,7 +495,7 @@ async def _notify_provision_complete(job_id: int) -> None:
         logger.warning("netbox.provision_complete_notify_failed", job_id=job_id, error=str(exc) or type(exc).__name__)
 
 
-async def _run_provision(job_id: int, device_id: int | None) -> None:
+async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistration | None = None) -> None:
     """Run a queued device-onboarding job from its stored ``context`` parameters.
 
     Provision has no ``device_id`` (the adapter Device row may be created mid-job);
@@ -311,6 +505,11 @@ async def _run_provision(job_id: int, device_id: int | None) -> None:
     raises for a blocking step — it returns ``{ok: False, steps: [...]}`` — so the job
     *succeeds* (the work ran) and the caller inspects ``result.ok``; only an unexpected
     crash or the timeout marks the job failed.
+
+    The only runner that starts CLAIMLESS and acquires mid-run, which is why it is handed
+    the worker's live ``ClaimRegistration``: everything from the mapping onwards runs under
+    the device claim, and the heartbeat and terminal writer read that same object live.
+    Contention on the device is one such honest failure — see ``device_busy`` below.
     """
     from nso_adapter.core.onboarding import provision_nso_device
     from nso_adapter.store.db import get_session
@@ -326,23 +525,50 @@ async def _run_provision(job_id: int, device_id: int | None) -> None:
         job.status = JobStatus.running
         await db.commit()
         try:
-            result = await asyncio.wait_for(provision_nso_device(db, **params), timeout=_JOB_TIMEOUT)
+            result = await asyncio.wait_for(
+                provision_nso_device(db, **params, reg=reg, job_id=job_id), timeout=_JOB_TIMEOUT
+            )
+            # The terminal write is an effect performed on behalf of the claim once the run
+            # has one, so it takes the row lock like every other guarded write. Without it a
+            # run whose stale claim was revoked, and whose job recovery already
+            # re-dispositioned, still commits `succeeded` over that disposition.
+            if reg is not None:
+                await lock_claim(db, reg)
             job.status = JobStatus.succeeded
             job.result = result
             # Link the job to the device it created so history/lookup works post-onboard.
             if result.get("device_id") is not None:
                 job.device_id = result["device_id"]
             await db.commit()
+        except ClaimUnavailableError as exc:
+            # The device stayed claimed for the whole OQ6 budget, so the mapping was refused
+            # and NOTHING was written. Honestly retryable — and terminal, so the pair's
+            # admission slot frees for the retry. Necessarily still claimless: this is
+            # raised by the acquisition itself.
+            logger.warning("job.provision.device_busy", job_id=job_id, error=repr(exc))
+            await _mark_job_failed(
+                db,
+                job_id,
+                {
+                    "code": "device_busy",
+                    "message": "The device is busy — another operation holds it",
+                    "detail": {"reason": "claim_unavailable", "retryable": True},
+                },
+            )
         except TimeoutError:
             logger.error("job.provision.timeout", job_id=job_id, timeout=_JOB_TIMEOUT)
             await _mark_job_failed(
                 db,
                 job_id,
                 {"code": "timeout", "message": f"Provision exceeded {int(_JOB_TIMEOUT)}s timeout", "detail": {}},
+                reg,
             )
+        except ClaimLostError:
+            # Revocation is not a runner error: recovery already owns the disposition.
+            raise
         except Exception as exc:
             logger.exception("job.provision.failed", job_id=job_id, error=repr(exc))
-            await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}})
+            await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}}, reg)
 
     # Tell the plugin the provision job reached a terminal state (any branch above) so it advances
     # the gated onboarding row off the dashboard-poll path. Best-effort — the plugin's device-tab

@@ -30,7 +30,7 @@ logger = structlog.get_logger(__name__)
 
 
 def _now():
-    return datetime.now(UTC).replace(tzinfo=None)
+    return datetime.now(UTC)
 
 
 def _parse_vlan_string(raw) -> list[int]:

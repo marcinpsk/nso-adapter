@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, IntentApplyResult, api_error
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
+from nso_adapter.api.timestamps import UtcInstant
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, DeviceL2Sap, DeviceSettings, L2SapIntent
@@ -104,7 +105,7 @@ class L2SapEntry(BaseModel):
     port: str = ""
     outer_tag: int | None = None
     inner_tag: int | None = None
-    accepted_at: datetime | None = None
+    accepted_at: UtcInstant | None = None
 
 
 # Scalars the writer emits only when set — `if row.port:` / `if row.outer_tag is not None:` (nso/apply.py)
@@ -144,12 +145,12 @@ async def put_l2_sap_intent(device_id: int, body: L2SapIntentUpdate, db: AsyncSe
         await db.delete(existing_rows[key])
     await db.flush()
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     count = 0
     cleared = False
     for item in body.saps:
         key = (item.service_name, item.sap_id)
-        accepted = item.accepted_at.replace(tzinfo=None) if item.accepted_at else now
+        accepted = item.accepted_at if item.accepted_at else now
         if key in existing_rows:
             row = existing_rows[key]
             before = {f: getattr(row, f) for f in _STATE_FIELDS}

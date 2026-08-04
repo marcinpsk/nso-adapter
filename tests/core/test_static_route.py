@@ -14,19 +14,17 @@ from nso_adapter.core.static_route import (
     STATIC_ROUTE_SPEC,
     refresh_static_routes_for_device,
 )
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, DeviceStaticRoute
-from tests.conftest import seed_device
+from tests.conftest import seed_device, session
 
 
 @asynccontextmanager
 async def _device_session(device_id: int):
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         assert device is not None
         yield db, device
         return
-    raise RuntimeError("no session")
 
 
 @pytest.mark.anyio
@@ -86,11 +84,10 @@ async def test_refresh_replaces_existing_rows(adapter_client):
 async def test_refresh_authoritative_empty_clears_rows(adapter_client):
     """An authoritatively-empty read (status=ok, no routes — RESTCONF omits empty lists) clears the
     rows. (Device-absence, section None, now KEEPS — READSEM S5.)"""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceStaticRoute
 
     device_id = await seed_device(nso_device_name="sr-none-sw01", netbox_device_id=982)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             DeviceStaticRoute(
                 device_id=device_id,
@@ -100,7 +97,6 @@ async def test_refresh_authoritative_empty_clears_rows(adapter_client):
             )
         )
         await db.commit()
-        break
 
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
@@ -114,11 +110,10 @@ async def test_refresh_authoritative_empty_clears_rows(adapter_client):
 @pytest.mark.anyio
 async def test_refresh_nso_error_skips_update(adapter_client):
     """NSO transport error → rows untouched (graceful degradation)."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceStaticRoute
 
     device_id = await seed_device(nso_device_name="sr-error-sw01", netbox_device_id=983)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             DeviceStaticRoute(
                 device_id=device_id,
@@ -128,7 +123,6 @@ async def test_refresh_nso_error_skips_update(adapter_client):
             )
         )
         await db.commit()
-        break
 
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
@@ -165,10 +159,9 @@ async def test_unsupported_keeps_rows_and_reports_success(adapter_client):
     """RED-FIRST S3 delta: the legacy probe-confirmed 404 CLEARED an unsupported-NED
     device's routes; the envelope's declared `unsupported` keeps them."""
     device_id = await seed_device(nso_device_name="sr-unsup-sw01", netbox_device_id=9821)
-    async for db in get_session():
+    async with session() as db:
         db.add(DeviceStaticRoute(device_id=device_id, vrf="", prefix="10.9.0.0/16", next_hop="1.1.1.1"))
         await db.commit()
-        break
     async with _device_session(device_id) as (db, device):
         nso_client = AsyncMock()
         nso_client.get_device_state_section.return_value = {"status": "unsupported"}

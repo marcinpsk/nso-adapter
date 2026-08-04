@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
+from nso_adapter.api.timestamps import iso_z
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import DbInterface, Device, InterfaceAttrState, InterfaceIntent
 
@@ -56,9 +57,7 @@ def _attr_out(attr_state: InterfaceAttrState, intent_row: InterfaceIntent | None
         "netbox_value": attr_state.netbox_value,
         "intent_value": intent_row.intent_value if intent_row else None,
         "status": attr_state.sync_state.value,
-        "last_apply_at": (
-            intent_row.last_apply_at.isoformat() + "Z" if intent_row and intent_row.last_apply_at else None
-        ),
+        "last_apply_at": iso_z(intent_row.last_apply_at) if intent_row else None,
         "last_apply_error": intent_row.last_apply_error if intent_row else None,
     }
 
@@ -195,5 +194,5 @@ async def get_state(device_id: int, db: AsyncSession = Depends(get_db)):
         "device_id": device_id,
         "managed_interfaces": managed,
         "by_status": by_status,
-        "last_checked_at": last_checked_at.isoformat() + "Z" if last_checked_at else None,
+        "last_checked_at": iso_z(last_checked_at),
     }

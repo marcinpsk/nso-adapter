@@ -1,103 +1,140 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""PostgreSQL-gated parity test: the alembic baseline must match create_all.
+"""Parity test: ``Base.metadata`` must match the alembic head.
 
-The unit suite runs on sqlite via create_all (fast, hermetic). Production runs on
-PostgreSQL via `alembic upgrade head`. This test proves the two produce an
-identical schema on PostgreSQL, so the create_all-based unit tests transitively
-trust the deployed (migrated) schema.
+The test suite builds its per-test database by cloning a template built with
+``alembic upgrade head`` — the schema production runs. ``create_all`` therefore has
+exactly one consumer left: this test, whose job is proving the two agree.
 
-It is skipped unless ``ALEMBIC_PARITY_DB_URL`` is set to a PostgreSQL URL whose
-role may CREATE/DROP DATABASE (e.g. the CI ``postgres`` service:
-``postgresql+psycopg2://postgres:postgres@localhost:5432/postgres``). The test
-creates two throwaway databases, builds one with create_all and one with
-``alembic upgrade head``, diffs the reflected schema, and drops both.
+It creates two throwaway databases on the test server, builds one with ``create_all``
+and one with ``alembic upgrade head``, diffs the reflected schema, and drops both.
+It never skips: a schema divergence that only CI could see is the failure mode this
+test exists to remove.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import uuid
+from pathlib import Path
 
-import pytest
 import sqlalchemy as sa
 from sqlalchemy import inspect
-from sqlalchemy.engine import make_url
 
-_PARITY_URL = os.environ.get("ALEMBIC_PARITY_DB_URL")
+from tests.conftest import _drop_database, _url_for
 
-pytestmark = pytest.mark.skipif(
-    not _PARITY_URL,
-    reason="ALEMBIC_PARITY_DB_URL not set — PostgreSQL parity lane (CI only)",
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+_DEFERRABILITY_SQL = sa.text(
+    """
+    SELECT c.conname, c.condeferrable, c.condeferred
+      FROM pg_constraint c
+      JOIN pg_class t ON t.oid = c.conrelid
+      JOIN pg_namespace n ON n.oid = t.relnamespace
+     WHERE c.contype = 'u' AND n.nspname = 'public'
+       AND t.relname = :table
+    """
 )
+
+
+def _deferrability(conn, table: str) -> dict[str, tuple[bool, str]]:
+    """Unique-constraint deferrability, which SQLAlchemy does not reflect."""
+    return {
+        name: (deferrable, "DEFERRED" if deferred else "IMMEDIATE")
+        for name, deferrable, deferred in conn.execute(_DEFERRABILITY_SQL, {"table": table})
+    }
 
 
 def _snapshot(engine) -> dict:
     insp = inspect(engine)
     snap: dict = {}
-    for table in sorted(insp.get_table_names()):
-        if table == "alembic_version":
-            continue
-        snap[table] = {
-            # (type, nullable, server_default) — the server default is included so a
-            # create_all-vs-alembic DEFAULT divergence is caught, not passed green.
-            "cols": {c["name"]: (str(c["type"]), c["nullable"], c.get("default")) for c in insp.get_columns(table)},
-            "pk": tuple(insp.get_pk_constraint(table)["constrained_columns"]),
-            "fks": sorted(
-                (tuple(f["constrained_columns"]), f["referred_table"], tuple(f["referred_columns"]))
-                for f in insp.get_foreign_keys(table)
-            ),
-            "uqs": sorted(tuple(u["column_names"]) for u in insp.get_unique_constraints(table)),
-            "ixs": sorted((tuple(i["column_names"]), i["unique"]) for i in insp.get_indexes(table)),
-            # CHECK constraints compared by their reflected SQL text (names may be generated).
-            "checks": sorted(c["sqltext"] for c in insp.get_check_constraints(table)),
-        }
+    with engine.connect() as conn:
+        for table in sorted(insp.get_table_names()):
+            if table == "alembic_version":
+                continue
+            deferrability = _deferrability(conn, table)
+            snap[table] = {
+                # (type, nullable, server_default) — the server default is included so a
+                # create_all-vs-alembic DEFAULT divergence is caught, not passed green.
+                "cols": {c["name"]: (str(c["type"]), c["nullable"], c.get("default")) for c in insp.get_columns(table)},
+                "pk": tuple(insp.get_pk_constraint(table)["constrained_columns"]),
+                # ondelete normalized (upper-cased, None -> "NO ACTION"): alembic emitting a
+                # restrictive FK where create_all emits CASCADE otherwise passes green, and
+                # offboard then raises instead of removing the child rows.
+                "fks": sorted(
+                    (
+                        tuple(f["constrained_columns"]),
+                        f["referred_table"],
+                        tuple(f["referred_columns"]),
+                        ((f.get("options") or {}).get("ondelete") or "NO ACTION").upper(),
+                    )
+                    for f in insp.get_foreign_keys(table)
+                ),
+                # Deferrability is part of the constraint: an immediate twin of a
+                # DEFERRABLE INITIALLY DEFERRED constraint rejects legal in-transaction swaps.
+                "uqs": sorted(
+                    (tuple(u["column_names"]), *deferrability.get(u["name"], (False, "IMMEDIATE")))
+                    for u in insp.get_unique_constraints(table)
+                ),
+                # The partial-index PREDICATE is part of the index: without it a
+                # postgresql_where divergence between the model and the migration passes green.
+                # An EXPRESSION index reflects column_names as None entries, so a wrong-column
+                # twin is invisible without the reflected expressions.
+                "ixs": sorted(
+                    (
+                        tuple(i.get("expressions") or i["column_names"]),
+                        i["unique"],
+                        (i.get("dialect_options") or {}).get("postgresql_where"),
+                    )
+                    for i in insp.get_indexes(table)
+                ),
+                # CHECK constraints compared by their reflected SQL text (names may be generated).
+                "checks": sorted(c["sqltext"] for c in insp.get_check_constraints(table)),
+            }
     # PostgreSQL ENUM types are schema-level, not per-table: compare their label sets so an
     # enum value-set divergence (a migration adding/renaming a member) is caught too.
     snap["__enums__"] = {e["name"]: tuple(e["labels"]) for e in insp.get_enums()}
     return snap
 
 
-def _db_url(base: str, dbname: str) -> str:
-    # NB: str(URL) masks the password as '***'; render with hide_password=False
-    # so the rendered DSN (used for create_engine and DATABASE_URL) actually auths.
-    return make_url(base).set(database=dbname).render_as_string(hide_password=False)
+def _alembic_upgrade_head(db_url: str) -> None:
+    """Run the production migration entry point in a SUBPROCESS.
+
+    In-process ``command.upgrade`` runs ``alembic/env.py``, whose ``fileConfig`` call
+    reconfigures the ROOT logger for the rest of the pytest session (N13a).
+    """
+    proc = subprocess.run(
+        [sys.executable, "-m", "nso_adapter.db_migrate"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        env={**os.environ, "DATABASE_URL": db_url},
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"alembic upgrade head failed:\n{proc.stdout.decode()}\n{proc.stderr.decode()}")
 
 
-def test_alembic_baseline_matches_create_all():
+def test_alembic_baseline_matches_create_all(pg_admin):
     suffix = uuid.uuid4().hex[:10]
     ca_db = f"parity_ca_{suffix}"
     al_db = f"parity_al_{suffix}"
 
-    admin = sa.create_engine(_PARITY_URL, isolation_level="AUTOCOMMIT")
+    with pg_admin.connect() as conn:
+        conn.exec_driver_sql(f'CREATE DATABASE "{ca_db}"')
+        conn.exec_driver_sql(f'CREATE DATABASE "{al_db}"')
     try:
-        with admin.connect() as conn:
-            conn.exec_driver_sql(f'CREATE DATABASE "{ca_db}"')
-            conn.exec_driver_sql(f'CREATE DATABASE "{al_db}"')
+        ca_url = _url_for(ca_db, driver="postgresql+psycopg2")
+        al_url = _url_for(al_db, driver="postgresql+psycopg2")
 
-        ca_url = _db_url(_PARITY_URL, ca_db)
-        al_url = _db_url(_PARITY_URL, al_db)
-
-        # 1) create_all
         from nso_adapter.store.models import Base
 
         ca_engine = sa.create_engine(ca_url)
         Base.metadata.create_all(ca_engine)
 
-        # 2) alembic upgrade head — env.py reads DATABASE_URL
-        from alembic import command
-        from nso_adapter.db_migrate import make_config
-
-        prev = os.environ.get("DATABASE_URL")
-        os.environ["DATABASE_URL"] = al_url
-        try:
-            command.upgrade(make_config(), "head")
-        finally:
-            if prev is None:
-                os.environ.pop("DATABASE_URL", None)
-            else:
-                os.environ["DATABASE_URL"] = prev
-
+        _alembic_upgrade_head(al_url)
         al_engine = sa.create_engine(al_url)
 
         ca_snap = _snapshot(ca_engine)
@@ -114,10 +151,5 @@ def test_alembic_baseline_matches_create_all():
                 f"schema mismatch in {table!r}:\n  create_all={ca_snap[table]}\n  alembic   ={al_snap[table]}"
             )
     finally:
-        with admin.connect() as conn:
-            for dbname in (ca_db, al_db):
-                conn.exec_driver_sql(
-                    f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{dbname}'"
-                )
-                conn.exec_driver_sql(f'DROP DATABASE IF EXISTS "{dbname}"')
-        admin.dispose()
+        for dbname in (ca_db, al_db):
+            _drop_database(pg_admin, dbname, expect_clean=False)

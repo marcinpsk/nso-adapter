@@ -10,7 +10,7 @@ PUT-replace retracted FASTMAP-owned config from the real device (ra1.lab, remova
 removal (both the ``replace_on_removal`` path and the direct ``enqueue_removal`` path) and
 auto-apply — while the store full-replace still happens.
 
-These drive the real FastAPI routes through the real SQLite-backed session
+These drive the real FastAPI routes through the real PostgreSQL-backed session
 (``adapter_client`` + ``get_db``); nothing NSO-facing is needed because the whole point
 is that NO device-touching job may ever be created.
 """
@@ -20,16 +20,15 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 
 async def _jobs(device_id: int, job_type=None) -> list:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job
 
-    async for db in get_session():
+    async with session() as db:
         stmt = select(Job).where(Job.device_id == device_id)
         if job_type is not None:
             stmt = stmt.where(Job.job_type == job_type)
@@ -38,10 +37,9 @@ async def _jobs(device_id: int, job_type=None) -> list:
 
 
 async def _logging_rows(device_id: int) -> list[str]:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import LoggingHostIntent
 
-    async for db in get_session():
+    async with session() as db:
         rows = (
             (await db.execute(select(LoggingHostIntent).where(LoggingHostIntent.device_id == device_id)))
             .scalars()
@@ -52,10 +50,9 @@ async def _logging_rows(device_id: int) -> list[str]:
 
 
 async def _flex_algo_keys(device_id: int) -> list[tuple[str, int]]:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import IsisFlexAlgoIntent
 
-    async for db in get_session():
+    async with session() as db:
         rows = (
             (await db.execute(select(IsisFlexAlgoIntent).where(IsisFlexAlgoIntent.device_id == device_id)))
             .scalars()
@@ -66,10 +63,9 @@ async def _flex_algo_keys(device_id: int) -> list[tuple[str, int]]:
 
 
 async def _seed_settings(device_id: int, *, auto_apply: bool) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceSettings
 
-    async for db in get_session():
+    async with session() as db:
         db.add(DeviceSettings(device_id=device_id, auto_apply=auto_apply))
         await db.commit()
         return
@@ -158,7 +154,6 @@ async def test_logging_clear_store_only_skips_removal(adapter_client):
 
 @pytest.mark.anyio
 async def test_snmp_shrink_store_only_skips_direct_removal(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import SnmpCommunityIntent
 
     device_id = await seed_device(nso_device_name="so-snmp-dev", netbox_device_id=983)
@@ -171,7 +166,7 @@ async def test_snmp_shrink_store_only_skips_direct_removal(adapter_client):
     )
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         labels = sorted(
             r.label
             for r in (
@@ -180,7 +175,6 @@ async def test_snmp_shrink_store_only_skips_direct_removal(adapter_client):
                 .all()
             )
         )
-        break
     assert labels == ["ro1"]  # store shrank
     assert await _jobs(device_id) == []  # no removal job
 

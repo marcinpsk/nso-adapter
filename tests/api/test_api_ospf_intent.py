@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -18,7 +18,6 @@ async def test_put_ospf_intent_string_process_id(adapter_client):
     coerced value against the String column. Only surfaced once OSPF intent was first
     pushed (greenfield Nokia OSPF).
     """
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import OspfInstanceIntent, OspfInterfaceIntent
 
     device_id = await seed_device(nso_device_name="ospf-intent-dev", netbox_device_id=920)
@@ -29,7 +28,7 @@ async def test_put_ospf_intent_string_process_id(adapter_client):
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH, json=payload)
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         inst = (
             await db.execute(select(OspfInstanceIntent).where(OspfInstanceIntent.device_id == device_id))
         ).scalar_one()
@@ -41,7 +40,6 @@ async def test_put_ospf_intent_string_process_id(adapter_client):
         assert iface.interface_name == "LAG99:99"
         assert iface.process_id == "1"
         assert iface.area_id == "0"
-        break
 
 
 async def test_put_ospf_intent_admin_state(adapter_client):
@@ -51,7 +49,6 @@ async def test_put_ospf_intent_admin_state(adapter_client):
     from unittest.mock import AsyncMock, patch
 
     from nso_adapter.nso.apply import apply_ospf_config
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import OspfInstanceIntent
 
     device_id = await seed_device(nso_device_name="ospf-admin-dev", netbox_device_id=921)
@@ -62,7 +59,7 @@ async def test_put_ospf_intent_admin_state(adapter_client):
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH, json=payload)
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         inst = (
             await db.execute(select(OspfInstanceIntent).where(OspfInstanceIntent.device_id == device_id))
         ).scalar_one()
@@ -79,7 +76,6 @@ async def test_put_ospf_intent_admin_state(adapter_client):
         sent = json.loads(mock_dry.call_args.args[2])  # native_dry_run(client, url, payload, ...)
         proc = sent["ospf-reconciler:ospf-config"][0]["process-config"][0]
         assert proc["enabled"] is True
-        break
 
 
 async def test_put_ospf_intent_removal_enqueues_job_not_inline(adapter_client):
@@ -88,7 +84,6 @@ async def test_put_ospf_intent_removal_enqueues_job_not_inline(adapter_client):
     The PUT must return promptly; the PUT-replace that reverts the dropped process on
     the device runs in the background via the removal job.
     """
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="ospf-removal-dev", netbox_device_id=922)
@@ -114,7 +109,7 @@ async def test_put_ospf_intent_removal_enqueues_job_not_inline(adapter_client):
     )
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         jobs = (
             (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal)))
             .scalars()
@@ -124,7 +119,6 @@ async def test_put_ospf_intent_removal_enqueues_job_not_inline(adapter_client):
         assert jobs[0].status == JobStatus.queued
         # process 2 was just dropped — threaded for the collateral guard
         assert jobs[0].context == {"scope": "ospf", "removed": {"process-config": ["2"]}, "detach": True}
-        break
 
 
 # ── retracting a cleared owned OSPF scalar (#83's flow, ported from IS-IS) ───
@@ -135,10 +129,9 @@ async def test_put_ospf_intent_removal_enqueues_job_not_inline(adapter_client):
 
 
 async def _ospf_removal_jobs(device_id: int):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType
 
-    async for db in get_session():
+    async with session() as db:
         jobs = (
             (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal)))
             .scalars()
@@ -268,7 +261,6 @@ async def test_put_ospf_intent_device_not_found(adapter_client):
 
 async def test_put_ospf_intent_creates_redistribution(adapter_client):
     """Per-instance redistribution entries become RedistributionIntent rows (dest_protocol=ospf)."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import RedistributionIntent
 
     device_id = await seed_device(nso_device_name="ospf-redist-create", netbox_device_id=930)
@@ -296,13 +288,12 @@ async def test_put_ospf_intent_creates_redistribution(adapter_client):
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH, json=payload)
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         rows = (
             (await db.execute(select(RedistributionIntent).where(RedistributionIntent.device_id == device_id)))
             .scalars()
             .all()
         )
-        break
     by_src = {r.source_protocol: r for r in rows}
     assert set(by_src) == {"bgp", "connected"}
     assert all(r.dest_protocol == "ospf" and r.dest_ref == "1" for r in rows)  # dest_ref = process_id
@@ -317,7 +308,6 @@ async def test_put_ospf_intent_creates_redistribution(adapter_client):
 
 async def test_put_ospf_intent_redistribution_full_replace_and_update(adapter_client):
     """Re-PUT drops absent redistribution rows, updates the kept one, and queues a removal job."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType, RedistributionIntent
 
     device_id = await seed_device(nso_device_name="ospf-redist-replace", netbox_device_id=931)
@@ -350,7 +340,7 @@ async def test_put_ospf_intent_redistribution_full_replace_and_update(adapter_cl
     )
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         rows = (
             (await db.execute(select(RedistributionIntent).where(RedistributionIntent.device_id == device_id)))
             .scalars()
@@ -359,7 +349,6 @@ async def test_put_ospf_intent_redistribution_full_replace_and_update(adapter_cl
         job = (
             await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal))
         ).scalar_one_or_none()
-        break
     assert len(rows) == 1  # static dropped
     assert rows[0].source_protocol == "bgp"
     assert (rows[0].route_map, rows[0].metric, rows[0].metric_type) == ("RM-B", 99, "1")  # updated in place
@@ -368,7 +357,6 @@ async def test_put_ospf_intent_redistribution_full_replace_and_update(adapter_cl
 
 async def test_put_ospf_intent_interface_full_replace_and_update(adapter_client):
     """Re-PUT drops an absent interface, updates the kept one in place, and queues a removal job."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Job, JobType, OspfInterfaceIntent
 
     device_id = await seed_device(nso_device_name="ospf-iface-replace", netbox_device_id=932)
@@ -395,7 +383,7 @@ async def test_put_ospf_intent_interface_full_replace_and_update(adapter_client)
     assert resp.status_code == 200
     assert resp.json()["interface_count"] == 1
 
-    async for db in get_session():
+    async with session() as db:
         ifaces = (
             (await db.execute(select(OspfInterfaceIntent).where(OspfInterfaceIntent.device_id == device_id)))
             .scalars()
@@ -404,7 +392,6 @@ async def test_put_ospf_intent_interface_full_replace_and_update(adapter_client)
         job = (
             await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal))
         ).scalar_one_or_none()
-        break
     assert [i.interface_name for i in ifaces] == ["GE0/0"]  # GE0/1 dropped
     assert (ifaces[0].cost, ifaces[0].passive) == (50, True)  # updated in place
     assert job is not None
@@ -413,14 +400,12 @@ async def test_put_ospf_intent_interface_full_replace_and_update(adapter_client)
 async def test_put_ospf_intent_auto_apply_enqueues_apply_job(adapter_client):
     """PUT with auto_apply=True and a non-empty payload enqueues an apply job, so accepted
     OSPF config actually reaches the device — parity with every other intent scope (s3-2)."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceSettings, Job, JobType
 
     device_id = await seed_device(nso_device_name="ospf-intent-autoapply", netbox_device_id=930)
-    async for db in get_session():
+    async with session() as db:
         db.add(DeviceSettings(device_id=device_id, auto_apply=True))
         await db.commit()
-        break
 
     payload = {
         "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
@@ -429,24 +414,21 @@ async def test_put_ospf_intent_auto_apply_enqueues_apply_job(adapter_client):
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH, json=payload)
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         job = (
             await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.apply))
         ).scalar_one_or_none()
         assert job is not None
-        break
 
 
 async def test_put_ospf_intent_no_apply_job_when_auto_apply_disabled(adapter_client):
     """auto_apply=False → no apply job enqueued (operator applies manually)."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceSettings, Job, JobType
 
     device_id = await seed_device(nso_device_name="ospf-intent-noapply", netbox_device_id=931)
-    async for db in get_session():
+    async with session() as db:
         db.add(DeviceSettings(device_id=device_id, auto_apply=False))
         await db.commit()
-        break
 
     payload = {
         "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
@@ -455,24 +437,21 @@ async def test_put_ospf_intent_no_apply_job_when_auto_apply_disabled(adapter_cli
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH, json=payload)
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         job = (
             await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.apply))
         ).scalar_one_or_none()
         assert job is None
-        break
 
 
 async def test_put_ospf_intent_empty_payload_no_apply_job(adapter_client):
     """auto_apply=True but an empty payload → no apply job (nothing to push)."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceSettings, Job, JobType
 
     device_id = await seed_device(nso_device_name="ospf-intent-empty", netbox_device_id=932)
-    async for db in get_session():
+    async with session() as db:
         db.add(DeviceSettings(device_id=device_id, auto_apply=True))
         await db.commit()
-        break
 
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/ospf-intent",
@@ -481,9 +460,8 @@ async def test_put_ospf_intent_empty_payload_no_apply_job(adapter_client):
     )
     assert resp.status_code == 200
 
-    async for db in get_session():
+    async with session() as db:
         job = (
             await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.apply))
         ).scalar_one_or_none()
         assert job is None
-        break

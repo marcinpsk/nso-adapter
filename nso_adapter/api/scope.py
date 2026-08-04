@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.timestamps import iso_z
 from nso_adapter.store.models import Device, DeviceSettings, ManagedScope
 
 router = APIRouter(prefix="/api/v1/devices", tags=["scope"])
@@ -28,13 +29,13 @@ class ScopeOut(BaseModel):
 
 
 def _scope_out(device_id: int, attrs: list[ManagedScope], settings: DeviceSettings | None) -> dict:
-    updated_at = max((s.updated_at for s in attrs), default=datetime.now(UTC).replace(tzinfo=None))
+    updated_at = max((s.updated_at for s in attrs), default=datetime.now(UTC))
     return {
         "device_id": device_id,
         "attributes": [s.attribute for s in attrs],
         "auto_apply": settings.auto_apply if settings else False,
         "sync_before_apply": settings.sync_before_apply if settings else True,
-        "updated_at": updated_at.isoformat() + "Z",
+        "updated_at": iso_z(updated_at),
     }
 
 

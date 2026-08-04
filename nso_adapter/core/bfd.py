@@ -26,7 +26,7 @@ async def _upsert_bfd_data(
 ) -> None:
     """Full-replace: delete existing BFD-interface rows for *device*, then insert fresh."""
     await db.execute(delete(DeviceBfdInterface).where(DeviceBfdInterface.device_id == device.id))
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     seen: set[str] = set()
     for iface in interfaces:
         name = iface.get("interface-name", "")

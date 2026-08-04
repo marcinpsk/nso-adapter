@@ -9,7 +9,7 @@ is deterministic — the real HTTP round-trip is covered separately in test_fail
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -18,7 +18,7 @@ from nso_adapter.config import SchedulerConfig
 from nso_adapter.core.failover import FlipBudget, _next_due, run_failover_tick, step_failback, step_failover
 from nso_adapter.store.models import ActiveAddress, Device, DeviceFailover
 
-_BASE = datetime(2026, 6, 18, 12, 0, 0)
+_BASE = datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC)
 
 
 # ── Pure hysteresis primitives ───────────────────────────────────────────────

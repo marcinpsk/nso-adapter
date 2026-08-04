@@ -41,7 +41,7 @@ async def _upsert_snmp_config(
     refresh_source: str,
 ) -> None:
     """Full-replace all SNMP rows for *device* from *entry*."""
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
 
     await _delete_snmp_rows(db, device)
 

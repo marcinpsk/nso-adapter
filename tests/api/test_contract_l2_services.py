@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -25,11 +25,10 @@ SAP_KEYS = {"sap_id", "port", "outer_tag", "inner_tag"}
 
 @pytest.mark.anyio
 async def test_l2_services_contract(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceL2Sap
 
     device_id = await seed_device(nso_device_name="l2svc-ct", netbox_device_id=7995)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             DeviceL2Sap(
                 device_id=device_id,
@@ -44,7 +43,6 @@ async def test_l2_services_contract(adapter_client):
             )
         )
         await db.commit()
-        break
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/l2-services", headers=AUTH)).json()
     assert set(body.keys()) == TOP_KEYS

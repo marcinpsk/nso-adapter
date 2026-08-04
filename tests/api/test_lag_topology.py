@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 TS = datetime(2026, 5, 27, 9, 41, 12, 221000, tzinfo=UTC)
@@ -22,10 +22,9 @@ async def _seed_lag(
     members: list[tuple[str, str]] | None = None,
 ) -> None:
     """Seed a LagInterface + LagMember rows for a device."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import LagInterface, LagMember
 
-    async for db in get_session():
+    async with session() as db:
         lag = LagInterface(
             device_id=device_id,
             name=name,
@@ -38,7 +37,6 @@ async def _seed_lag(
         for iface_name, mode in members or []:
             db.add(LagMember(lag_interface_id=lag.id, interface_name=iface_name, mode=mode))
         await db.commit()
-        break
 
 
 # ── GET /api/v1/devices/{id}/lag-topology ───────────────────────────────────

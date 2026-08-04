@@ -12,11 +12,11 @@ Mirror (consumer side): ``netbox-nso-plugin/.../tests/test_contract_ospf.py`` â€
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -28,11 +28,10 @@ OPTIONAL_IFACE_KEYS = {"process_id", "area_id", "priority", "cost", "network_typ
 
 
 async def _seed_ospf(device_id: int) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceOspfInstance, DeviceOspfInterface
 
-    ts = datetime(2026, 6, 1, 10, 0, 0)
-    async for db in get_session():
+    ts = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
+    async with session() as db:
         # Maximal instance (router_id set) + minimal instance (omitted).
         db.add(
             DeviceOspfInstance(
@@ -78,7 +77,6 @@ async def _seed_ospf(device_id: int) -> None:
             )
         )
         await db.commit()
-        break
 
 
 @pytest.mark.anyio
@@ -130,11 +128,10 @@ async def test_ospf_get_device_not_found(adapter_client):
 @pytest.mark.anyio
 async def test_ospf_instance_enabled_emitted_when_set(adapter_client):
     """An instance with an explicit admin-state emits ``enabled`` in the response."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceOspfInstance
 
     device_id = await seed_device(nso_device_name="ospf-enabled-dev", netbox_device_id=7932)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             DeviceOspfInstance(
                 device_id=device_id,
@@ -142,12 +139,11 @@ async def test_ospf_instance_enabled_emitted_when_set(adapter_client):
                 vrf="",
                 areas=[],
                 enabled=False,  # explicit admin-state down â†’ must appear (not omitted)
-                last_refreshed_at=datetime(2026, 6, 1, 10, 0, 0),
+                last_refreshed_at=datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC),
                 refresh_source="poll",
             )
         )
         await db.commit()
-        break
 
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/ospf", headers=AUTH)
     assert resp.status_code == 200

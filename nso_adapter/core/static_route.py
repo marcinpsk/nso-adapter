@@ -30,7 +30,7 @@ async def _upsert_static_routes(
     """Full-replace: delete existing rows for *device*, then insert fresh ones (the materializer)."""
     await db.execute(delete(DeviceStaticRoute).where(DeviceStaticRoute.device_id == device.id))
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     for route in routes_data:
         prefix = route.get("prefix", "")
         next_hop = route.get("next-hop", "")

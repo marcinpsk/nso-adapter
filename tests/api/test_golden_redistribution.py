@@ -3,14 +3,13 @@
 """Golden-body test — GET /api/v1/devices/{id}/redistribution.
 
 Deep-equality proof of the exact redistribution JSON. Optional keys (route_map/
-metric/metric_type) are OMITTED when unset. Like OSPF (and unlike static/bgp/isis)
-the reader returns the RAW naive datetime, so ``last_refreshed_at`` serialises with
-NO trailing ``Z`` and the model field must be ``datetime`` (not ``str``).
+metric/metric_type) are OMITTED when unset. ``last_refreshed_at`` goes through
+``iso_z`` like every other family, so it serialises as ``"<iso>Z"``.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -20,6 +19,7 @@ from tests.conftest import (
     VALID_TOKEN,
     pin_store_incarnation,
     seed_device,
+    session,
 )
 
 _SYNTH_READ_STATE = {
@@ -38,14 +38,13 @@ _SYNTH_READ_STATE = {
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TS = datetime(2026, 6, 1, 10, 0, 0)
+TS = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
 
 
 async def _seed_redistribution(device_id: int) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceRedistribution
 
-    async for db in get_session():
+    async with session() as db:
         db.add(
             DeviceRedistribution(
                 device_id=device_id,
@@ -72,7 +71,6 @@ async def _seed_redistribution(device_id: int) -> None:
             )
         )
         await db.commit()
-        break
 
 
 @pytest.mark.anyio
@@ -86,7 +84,7 @@ async def test_redistribution_golden_body(adapter_client):
     # Ordered by (dest_protocol, dest_ref, source_protocol): "isis" < "ospf".
     assert body == {
         "device_id": device_id,
-        "last_refreshed_at": "2026-06-01T10:00:00",  # RAW datetime — no trailing "Z"
+        "last_refreshed_at": "2026-06-01T10:00:00Z",
         "refresh_source": "poll",
         "read_state": _SYNTH_READ_STATE,
         "entries": [

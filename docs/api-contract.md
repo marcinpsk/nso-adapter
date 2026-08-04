@@ -279,6 +279,14 @@ Step `status` ∈ `ok | exists | failed`; a `failed` blocking step (create /
 fetch_host_keys / admin_state) sets `ok=false` and stops. `422` if `nso_instance`
 is unknown.
 
+At most one provision is active per `(nso_instance, device_name)` — enforced by a unique
+index over queued and running rows, not by a lookup — so a double-submit returns the
+in-flight job. From the mapping step onwards the job holds the device's execution claim, so
+a sync, a failover tick or an offboard on that device waits or is refused while it runs. If
+the device is already held when the mapping is reached, the job ends `failed` with
+`error.code = "device_busy"` and `error.detail.reason = "claim_unavailable"`; nothing was
+written, and re-submitting is the retry.
+
 ### `GET /api/v1/devices/{id}` → `200`
 Device object plus `scope` (see below) and `last_job_id`.
 
@@ -579,8 +587,19 @@ directions* under §Conventions).
 ```
 `failed` jobs carry `error` in the standard error shape; `result` is `null`.
 
+`result` is free-form per job type. An **apply** job additionally carries
+`reader_compare` (the per-scope post-apply presence check) and, for devices with static
+routes, `static_route_results` — the per-route record described under
+[Per-route apply results](#per-route-apply-results).
+
 ### `GET /api/v1/jobs?device_id={id}&status={status}` → `200`
-Array of job objects. Both query params optional.
+Array of job objects, newest first, capped at 100. Both query params optional.
+
+Ordering is `created_at` descending, tie-broken by `id` descending. The tiebreak matters:
+`created_at` defaults to the transaction's start time, so several jobs can share one
+timestamp and the page would otherwise be non-deterministic — the same request could serve
+a different 100 rows each time. It makes the page stable; it is **not** a commit order and
+**not** a cursor, so it cannot be walked as a feed.
 
 ---
 
@@ -692,7 +711,31 @@ Field notes:
 - `interface_next_hop`: interface name string; present only when there is no IP next-hop.
 - `metric`, `permanent`, `tag`, `name`: optional; omitted from response when `null`.
 
-### `PUT /api/v1/devices/{id}/static-route-intent` → `200 | 404`
+### `GET /api/v1/devices/{id}/static-route-intent` → `200 | 404`
+
+Re-serves the settlement coordinates of every stored intent row for this device — the same
+`{route_id, generation, fingerprint}` triples the last `PUT` echoed.
+
+```json
+{
+  "device_id": 1,
+  "routes": [
+    { "route_id": 41, "generation": 12, "fingerprint": "9f2c…" }
+  ]
+}
+```
+
+This is the recovery path for a **lost PUT response**. The PUT commits its store write
+before it answers, so a response lost in flight leaves the pusher holding intent the adapter
+has already stored but for which the pusher recorded no expectation — and an apply result
+for that intent would then correlate with nothing. The triples are rendered from the stored
+rows themselves, by the same renderer the PUT uses, so the read-back cannot drift from what
+the PUT reported.
+
+`route_id` and `generation` are `null` for a row whose pusher never supplied them; a `null`
+on either never correlates with anything (see below).
+
+### `PUT /api/v1/devices/{id}/static-route-intent` → `200 | 404 | 409 | 422`
 
 Push (full-replace) the static route intent mirror for this device.
 Only routes with an IP `next_hop` are supported in v1 — interface-only next-hop
@@ -702,6 +745,8 @@ routes must be omitted by the caller.
 {
   "routes": [
     {
+      "route_id": 41,
+      "generation": 12,
       "vrf": "",
       "prefix": "0.0.0.0/0",
       "next_hop": "10.0.0.1",
@@ -715,15 +760,205 @@ routes must be omitted by the caller.
 
 Response:
 ```json
-{ "device_id": 1, "count": 1 }
+{
+  "device_id": 1,
+  "count": 1,
+  "removed": 0,
+  "replaced": false,
+  "routes": [
+    { "route_id": 41, "generation": 12, "fingerprint": "9f2c…" }
+  ]
+}
 ```
 
-Full-replace semantics: any route key `(vrf, prefix, next_hop)` not present in the
-request body is deleted from the intent mirror.  `accepted_at` defaults to the
-server's current UTC time if not supplied.
+Full-replace semantics: any route the body does not carry is deleted from the intent
+mirror.  `accepted_at` defaults to the server's current UTC time if not supplied.
 
 If `auto_apply` is `true` on the device settings and `count > 0`, an apply job is
 enqueued automatically.
+
+#### Matching: `route_id` first, then the triple
+
+`route_id` is optional and holds the pusher's own identifier for the route (the NetBox
+`routing.StaticRoute` pk). Entries are paired with stored rows by `route_id` where it is
+present, and by `(vrf, prefix, next_hop)` otherwise. Because of that, editing a route's
+prefix or next-hop updates the stored row **in place** — it keeps its identity, its
+`accepted_at` history and its record of what was last applied — instead of reading as an
+unrelated delete plus insert.
+
+An entry carrying a `route_id` the store has not seen adopts the row holding its triple
+**only if that row has no `route_id` of its own**, backfilling the id. If the row already
+belongs to a different `route_id`, the two are different routes that happen to share a
+triple: the stored row is deleted (its deletion is recorded) and a new row is inserted.
+
+A push that omits `route_id` on every entry behaves exactly as it always has: matching
+is by triple, and any route the body drops is treated as no longer governed
+(`detach` — the device is not touched). Deletions only produce a correlated deletion
+record once **every** stored row for that device carries a `route_id`.
+
+#### `generation` and the settlement echo
+
+`generation` is the pusher's own token for the *content* an entry carries — the pusher bumps
+it on every content change and never reuses a value. The adapter stores it on the row and
+reports it back on every apply result for that row, which is what lets the pusher tell a
+result about the intent it is still waiting on from a result about intent that has since been
+superseded. The adapter neither allocates nor interprets it; it is opaque carriage.
+
+Like `route_id`, `generation` is **adopted only when non-null**: an entry omitting it leaves
+the stored value alone, so a pusher that never learned the field cannot erase a newer one's
+correlation. A row whose `generation` is `null` correlates with nothing — that is the whole
+point, and it is why nothing is defaulted in its place.
+
+The response's `routes[]` carries, per stored row, the `route_id`, the `generation` now on
+the row, and the `fingerprint` of the exact wire entry that row renders. Those three are what
+a pusher records as its expectation for the next apply result. Because the fingerprint is
+computed from the stored row rather than from the request body, it describes what the adapter
+actually holds; a pusher cannot recompute it locally, which is why it is echoed rather than
+assumed. `GET /api/v1/devices/{id}/static-route-intent` re-serves the same triples if the
+response is lost.
+
+#### `422` refusals
+
+All use the standard envelope with `error.code = "validation_error"`; the specific rule
+is in `error.detail.reason`:
+
+| `reason` | meaning |
+|---|---|
+| `duplicate_triple` | two entries carry the same `(vrf, prefix, next_hop)`; `detail.triple` names it |
+| `duplicate_route_id` | two entries claim the same non-null `route_id`; `detail.route_id` names it |
+
+Entries with no `route_id` never collide with each other — a body of routes that all omit
+it is the normal shape and is accepted.
+
+#### `409` while the device is busy
+
+This endpoint reads the state it plans against **under an exclusive per-device claim**, so
+two concurrent pushes cannot both plan from the same snapshot and then apply plans whose
+premise is gone. If another operation (a running job, a teardown, another intent push)
+holds the device, the request waits **5 seconds by default** — `intent_claim_wait_seconds`
+in the adapter config — and then answers `409 conflict` with
+`error.detail.reason = "device_claimed"`. The wait sits well below the plugin's 30s request
+timeout, so it can never turn a would-be success into a client-side timeout. Retry is safe:
+the push is a full replace.
+
+#### Replacing a route in place: the guarded PUT
+
+Editing a route's identity in place (see *Matching* above) leaves the device carrying the
+**old** `(vrf, prefix, next_hop)` while the store holds the new one. A merge-PATCH only adds,
+so it would leave both live. The adapter records per row what it last proved deployed, and
+when that differs from the row's current triple it delivers the whole scope as a
+**PUT-replace** of the `static-route-config` service instance instead of a merge-PATCH. The
+body is then every *accepted* row of the device, not just the eligible subset — an
+eligible-only replace would retract every accepted-and-clean sibling.
+
+The replace is guarded and gated:
+
+- The live service is read once, and that read must be **conclusive**. A keyed `404` is a real
+  absence and the PUT proceeds; a `200` whose body carries no recognizable non-empty root is
+  *inconclusive*, and the scope fails with `static_route_snapshot_inconclusive` — a
+  destructive body must not be built from a read that may be hiding the entries it was
+  supposed to preserve.
+- Service entries no accepted row asserts are **collateral**. The scope refuses with
+  `removal_blocked_collateral`; `error.detail.items[].orphans` names the keys and
+  `…items[].preview` carries the device delta the replace would have pushed, so the operator
+  can accept those routes into intent or flush them deliberately via
+  `POST /api/v1/devices/{id}/actions/force-removal`.
+- Entries a queued removal still owns ride through **verbatim** — including leaves the intent
+  store has no column for — so an apply never drops what a removal is about to remove.
+- The replace runs only while post-apply verification is enabled (`NSO_ADAPTER_VERIFY_APPLY`).
+  With it off the scope stays a merge-PATCH and records nothing as deployed: a destructive
+  replace whose proof is structurally unavailable is refused rather than run blind.
+- `actions/apply-diff` renders the identical payload as a PUT dry-run, so the preview the
+  operator approves is byte-for-byte what the apply sends.
+
+#### Per-route apply results
+
+An apply job's `result.static_route_results` carries one entry per route the pass covered:
+
+```json
+{ "route_id": 41, "row_id": 12, "key": ["", "0.0.0.0/0", "10.0.0.1"],
+  "fingerprint": "9f2c…", "generation": 12, "outcome": "in_sync", "error": null }
+```
+
+| `outcome` | meaning |
+|---|---|
+| `in_sync` | the write landed **and** the post-apply device view proves this route's key present, with no route it replaced left over |
+| `apply_failed` | the send failed, this route's key is missing from the post-apply device view, or a route this apply was replacing survived on the device |
+| `unproven` | the write was accepted and nothing proves it — verification disabled or inconclusive, the device view unreadable, a replacement a merge-PATCH could not deliver, or a cleared leaf still owed |
+
+`fingerprint` is a SHA-256 over the exact wire entry that was sent, so every emitted leaf moves
+it and a store-only field with no wire form (`name`) does not. `route_id` and `generation` are
+this row's stored values — `null` where the pusher supplied none, which is a statement about
+that one row and never a signal about the device.
+
+`error` is **this route's own** failure, in the standard `{code, message, detail}` shape, so a
+job that fails two routes for two different reasons reports both instead of one shared scope
+message. It is populated only for `apply_failed`: the stored error column outlives a pass, and
+an `unproven` route can still be carrying an earlier apply's error, which reported here would
+date a superseded generation's failure to this job. Every `apply_failed` outcome had its error
+written by this pass, so nothing is lost by the scoping.
+
+`unproven` is **not** a failure: the job still succeeds — a transient read failure must not
+fail an apply whose device write landed — but nothing is recorded as deployed and no green is
+reported for that route. Note that `result.static_route_count_by_outcome` is the older
+per-scope *send* counter: it counts a route the device accepted as `in_sync` even where the
+per-route outcome is `unproven`. `static_route_results` is the authoritative per-route record.
+
+#### Clearing a leaf
+
+Setting `metric`, `tag`, `permanent`, `interface_next_hop` or `next_hop_vrf` back to null is a
+**deletion on the device**, and only a networked PUT can deliver one: the writer omits an unset
+leaf, and a merge-PATCH never drops what it does not carry. The push therefore records the
+cleared field names on the row, and the adapter delivers them either through a PUT-mode apply
+(whose store-rendered body omits the leaf) or through one networked static-route removal job
+queued for the device, whose body deletes exactly the named wire leaves and leaves every other
+leaf at its live value.
+
+Until per-field evidence from the post-write device view shows that leaf **absent or neutral**,
+the route's outcome stays `unproven`. Neutral is defined per field and never by falsiness:
+`metric: 0` and `tag: 0` are real values that keep the route `unproven`; `permanent: false` is
+indistinguishable from unset and counts as cleared.
+
+`?store_only=true` is honored end to end. A clear observed under it is recorded separately and
+**never** authorizes a device write: no removal job is queued for it, and an unrelated networked
+removal will not deliver it. It still blocks `in_sync` — the device really does carry a value
+the store says is unset — and is released only by a later ordinary push re-observing the cleared
+state, or by a PUT-mode apply that omits the leaf as part of its own authorized body.
+
+Clearing `name` is a documented no-op: it has no wire leaf, so there is nothing to deliver.
+No job is queued and the route's outcome is unaffected.
+
+#### Static-route removals are live-service-relative
+
+Removal propagation for `static_route` diverges from the shared pattern in
+[Removal propagation](#removal-propagation), which rebuilds the PUT body from the remaining
+accepted store rows:
+
+- the body is the **live service minus exactly the keys this job is authorized to drop** — the
+  removed route's own triple and whatever it was last proved deployed as. Everything else on
+  the service rides through verbatim, so a removal can neither forward-deploy an unrelated
+  store edit nor flush config no store row describes.
+- because such a body cannot flush collateral, a static-route removal **no longer blocks** on
+  unrelated service-owned entries. It retains them and logs
+  `static_route.removal_retained_orphans`, naming exactly the retained keys no live route
+  claims — that log is the operator's signal. The apply-side guard above still refuses, which
+  is where a store-assertive body really can flush something.
+- if every authorized key has meanwhile been re-claimed by another live route and there is no
+  cleared leaf still to deliver, the job issues no device write at all and succeeds.
+- the proof is **enforcing**. A key still on the device after the PUT, an unreadable device
+  view, or a failed `sync-from` on an un-own fails the job and keeps the deletion record, so it
+  is retried. Removals get no "succeed while unproven" treatment: a succeeded removal is what
+  retires the record, so one that consumed nothing must not report success.
+
+#### Interaction with the atomic apply
+
+With `NSO_ADAPTER_ATOMIC_APPLY` on, every scope normally stages into one combined transaction.
+Staging is merge-PATCH only, so a pass that owes a **PUT-replace** cannot ride it: the
+static-route scope is excluded from the combined body and delivered by its own PUT immediately
+after that transaction commits. The replacement is therefore **not** atomic with the other
+scopes — a rejected follow-on fails the job and stamps only the static-route rows while the rest
+of the apply stays applied. A combined commit that fails issues no follow-on at all, leaving the
+static rows pending and retried, exactly like any other non-offending scope.
 
 ### `GET /api/v1/devices/{id}/interface-ips` → `200 | 404`
 
@@ -1451,6 +1686,11 @@ failed) after a worker restart. Scope is carried in `Job.context.scope` (one of
 `route_policy · bfd · svi · subinterface · static_route · interface_mtu · vlan ·
 logging · l2_sap · ospf · bgp`). Job status is observable via `GET …/jobs` like
 any other job; a failed removal records `error.code = "removal_failed"`.
+
+`static_route` is the one scope that does **not** rebuild its body from the remaining accepted
+rows — it drops exactly what it is authorized to drop and keeps the rest of the live service
+verbatim. See
+[Static-route removals are live-service-relative](#static-route-removals-are-live-service-relative).
 
 ---
 

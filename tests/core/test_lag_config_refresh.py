@@ -13,19 +13,17 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.core.lag_config import refresh_lag_config_for_device
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device, LagBundleConfig, LagMemberConfig
-from tests.conftest import seed_device
+from tests.conftest import seed_device, session
 
 
 @asynccontextmanager
 async def _device_session(device_id: int):
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         assert device is not None
         yield db, device
         return
-    raise RuntimeError("no session")
 
 
 @pytest.mark.anyio
@@ -141,7 +139,7 @@ async def test_refresh_lag_config_clears_on_authoritative_empty(adapter_client):
                 device_id=device.id,
                 name="Port-channel1",
                 lag_id=1,
-                last_refreshed_at=datetime.now(UTC).replace(tzinfo=None),
+                last_refreshed_at=datetime.now(UTC),
                 refresh_source="poll",
             )
         )
@@ -165,7 +163,7 @@ async def test_refresh_lag_config_transport_error_no_change(adapter_client):
                 device_id=device.id,
                 name="Port-channel1",
                 lag_id=1,
-                last_refreshed_at=datetime.now(UTC).replace(tzinfo=None),
+                last_refreshed_at=datetime.now(UTC),
                 refresh_source="poll",
             )
         )

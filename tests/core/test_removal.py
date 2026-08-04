@@ -20,7 +20,6 @@ from sqlalchemy import select
 
 from nso_adapter.core import removal as removal_mod
 from nso_adapter.core.removal import enqueue_removal, replace_on_removal
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import (
     Device,
     IsisFlexAlgoIntent,
@@ -36,10 +35,11 @@ from nso_adapter.store.models import (
     RoutePolicyObjectIntent,
     VlanIntent,
 )
+from tests.conftest import session
 from tests.core.conftest import SNMP_COMMUNITY as _COMMUNITY
 from tests.core.conftest import SNMP_VAULT_REF as _REF
 
-_NOW = datetime.now(UTC).replace(tzinfo=None)
+_NOW = datetime.now(UTC)
 
 # An opaque NSO-client token: removal threads it straight to the apply boundary
 # (which these tests stub), so it is never dereferenced here — a plain sentinel,
@@ -48,17 +48,16 @@ _CLIENT = object()
 
 
 async def _seed_device(*, nso_device_name: str = "sw3", netbox_device_id: int = 42) -> int:
-    async for db in get_session():
+    async with session() as db:
         d = Device(nso_instance="nso-dev", nso_device_name=nso_device_name, netbox_device_id=netbox_device_id)
         db.add(d)
         await db.commit()
         await db.refresh(d)
         return d.id
-    raise RuntimeError("no session")
 
 
 async def _seed_removal_job(device_id: int, scope: str = "vlan", context_extra: dict | None = None) -> int:
-    async for db in get_session():
+    async with session() as db:
         j = Job(
             job_type=JobType.removal,
             device_id=device_id,
@@ -69,7 +68,6 @@ async def _seed_removal_job(device_id: int, scope: str = "vlan", context_extra: 
         await db.commit()
         await db.refresh(j)
         return j.id
-    raise RuntimeError("no session")
 
 
 # ── replace_on_removal (back-compat shim) ─────────────────────────────────────
@@ -78,25 +76,23 @@ async def _seed_removal_job(device_id: int, scope: str = "vlan", context_extra: 
 async def test_replace_on_removal_noop_when_nothing_removed(adapter_client):
     """No removals → no job enqueued, returns False."""
     device_id = await _seed_device()
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         result = await replace_on_removal(db, device, [], VlanIntent)
         assert result is False
         assert (await db.execute(select(Job))).scalars().all() == []
-        break
 
 
 async def test_replace_on_removal_enqueues_job_and_commits(adapter_client):
     """On removal, a `removal` job for the model's scope is enqueued + committed."""
     device_id = await _seed_device()
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         ok = await replace_on_removal(db, device, [3366], VlanIntent)
         assert ok is True
-        break
 
     # Re-read in a fresh session to prove it was committed, not merely flushed.
-    async for db in get_session():
+    async with session() as db:
         jobs = (await db.execute(select(Job))).scalars().all()
         assert len(jobs) == 1
         job = jobs[0]
@@ -104,7 +100,6 @@ async def test_replace_on_removal_enqueues_job_and_commits(adapter_client):
         assert job.device_id == device_id
         assert job.context == {"scope": "vlan", "removed": {"vlan": [3366]}, "detach": True}
         assert job.status == JobStatus.queued
-        break
 
 
 async def test_replace_on_removal_unknown_model_returns_false(adapter_client):
@@ -114,22 +109,20 @@ async def test_replace_on_removal_unknown_model_returns_false(adapter_client):
     class _Unmapped:
         pass
 
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         ok = await replace_on_removal(db, device, [1], _Unmapped)
         assert ok is False
         assert (await db.execute(select(Job))).scalars().all() == []
-        break
 
 
 # ── enqueue_removal ───────────────────────────────────────────────────────────
 
 
 async def test_enqueue_removal_rejects_unknown_scope(adapter_client):
-    async for db in get_session():
+    async with session() as db:
         with pytest.raises(ValueError, match="Unknown removal scope"):
             await enqueue_removal(db, 1, "bogus")
-        break
 
 
 async def test_enqueue_removal_creates_job_for_each_valid_scope(adapter_client):
@@ -138,18 +131,16 @@ async def test_enqueue_removal_creates_job_for_each_valid_scope(adapter_client):
 
     device_id = await _seed_device()
     for scope in VALID_REMOVAL_SCOPES:
-        async for db in get_session():
+        async with session() as db:
             job = await enqueue_removal(db, device_id, scope)
             await db.commit()
             assert job.job_type == JobType.removal
             assert job.context == {"scope": scope, "detach": True}
-            break
 
     # Every scope produced a real persisted removal job.
-    async for db in get_session():
+    async with session() as db:
         scopes = {j.context["scope"] for j in (await db.execute(select(Job))).scalars().all()}
         assert scopes == VALID_REMOVAL_SCOPES
-        break
 
 
 # ── _dispatch_scope ───────────────────────────────────────────────────────────
@@ -158,19 +149,17 @@ async def test_enqueue_removal_creates_job_for_each_valid_scope(adapter_client):
 async def test_dispatch_scope_simple_calls_apply_replace_true(adapter_client):
     """A simple scope fetches ONLY accepted rows and calls its apply with replace=True."""
     device_id = await _seed_device(nso_device_name="sw3")
-    async for db in get_session():
+    async with session() as db:
         db.add(VlanIntent(device_id=device_id, vlan_id=10, accepted_at=_NOW))
         db.add(VlanIntent(device_id=device_id, vlan_id=20, accepted_at=None))  # not accepted → excluded
         await db.commit()
-        break
 
     apply_fn = AsyncMock()
     client = _guard_client(None)  # no service instance in NSO → collateral guard no-ops
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         with patch("nso_adapter.nso.apply.apply_vlan_config", apply_fn):
             await removal_mod._dispatch_scope(db, device, client, "vlan")
-        break
 
     apply_fn.assert_awaited_once()
     args, kwargs = apply_fn.await_args
@@ -187,19 +176,17 @@ async def test_dispatch_scope_logging_carries_accepted_levels(adapter_client):
     from nso_adapter.store.models import LoggingHostIntent, LoggingLevelsIntent
 
     device_id = await _seed_device(nso_device_name="nx-t11")
-    async for db in get_session():
+    async with session() as db:
         db.add(LoggingHostIntent(device_id=device_id, address="10.9.2.1", accepted_at=_NOW))
         db.add(LoggingLevelsIntent(device_id=device_id, console_severity="CRITICAL", accepted_at=_NOW))
         await db.commit()
-        break
 
     apply_fn = AsyncMock()
     client = _guard_client(None)  # no service instance in NSO → collateral guard no-ops
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         with patch("nso_adapter.nso.apply.apply_logging_config", apply_fn):
             await removal_mod._dispatch_scope(db, device, client, "logging")
-        break
 
     apply_fn.assert_awaited_once()
     args, kwargs = apply_fn.await_args
@@ -218,18 +205,16 @@ async def test_dispatch_scope_logging_gate_off_refuses_not_retracts(adapter_clie
 
     monkeypatch.delenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", raising=False)
     device_id = await _seed_device(nso_device_name="nx-t13", netbox_device_id=44)
-    async for db in get_session():
+    async with session() as db:
         db.add(LoggingHostIntent(device_id=device_id, address="10.9.2.3", accepted_at=_NOW))
         db.add(LoggingLevelsIntent(device_id=device_id, console_severity="CRITICAL", accepted_at=_NOW))
         await db.commit()
-        break
 
     client = _guard_client(None)  # no service instance → guard no-ops, plain replace
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         with pytest.raises(NsoApplyError, match="NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE"):
             await removal_mod._dispatch_scope(db, device, client, "logging")
-        break
 
 
 async def test_dispatch_scope_logging_excludes_unaccepted_levels(adapter_client):
@@ -237,19 +222,17 @@ async def test_dispatch_scope_logging_excludes_unaccepted_levels(adapter_client)
     from nso_adapter.store.models import LoggingHostIntent, LoggingLevelsIntent
 
     device_id = await _seed_device(nso_device_name="nx-t12", netbox_device_id=43)
-    async for db in get_session():
+    async with session() as db:
         db.add(LoggingHostIntent(device_id=device_id, address="10.9.2.2", accepted_at=_NOW))
         db.add(LoggingLevelsIntent(device_id=device_id, console_severity="ERROR", accepted_at=None))
         await db.commit()
-        break
 
     apply_fn = AsyncMock()
     client = _guard_client(None)
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         with patch("nso_adapter.nso.apply.apply_logging_config", apply_fn):
             await removal_mod._dispatch_scope(db, device, client, "logging")
-        break
 
     apply_fn.assert_awaited_once()
     assert apply_fn.await_args.kwargs["levels_intent_row"] is None
@@ -262,7 +245,7 @@ async def test_dispatch_scope_ospf_uses_multi_row_apply(adapter_client):
     not-yet-accepted (imported/staged) rows — that would deploy un-reviewed config.
     """
     device_id = await _seed_device(nso_device_name="ra1")
-    async for db in get_session():
+    async with session() as db:
         db.add(OspfInstanceIntent(device_id=device_id, process_id="1", vrf="", accepted_at=_NOW))
         db.add(OspfInstanceIntent(device_id=device_id, process_id="9", vrf="", accepted_at=None))  # excluded
         db.add(OspfInterfaceIntent(device_id=device_id, interface_name="Gi0/0", passive=False, accepted_at=_NOW))
@@ -281,15 +264,13 @@ async def test_dispatch_scope_ospf_uses_multi_row_apply(adapter_client):
             )
         )
         await db.commit()
-        break
 
     apply_fn = AsyncMock()
     client = _guard_client(None)  # no service instance in NSO → collateral guard no-ops
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         with patch("nso_adapter.nso.apply.apply_ospf_config", apply_fn):
             await removal_mod._dispatch_scope(db, device, client, "ospf")
-        break
 
     apply_fn.assert_awaited_once()
     args, kwargs = apply_fn.await_args
@@ -314,7 +295,7 @@ async def test_dispatch_scope_isis_uses_multi_row_apply(adapter_client):
     not-yet-accepted rows, and must scope redistribution to dest_protocol=isis.
     """
     device_id = await _seed_device(nso_device_name="ra1")
-    async for db in get_session():
+    async with session() as db:
         db.add(
             IsisInterfaceIntent(
                 device_id=device_id, interface_name="system", af="ipv4", process_tag="0", passive=True, accepted_at=_NOW
@@ -337,15 +318,13 @@ async def test_dispatch_scope_isis_uses_multi_row_apply(adapter_client):
             RedistributionIntent(device_id=device_id, dest_protocol="bgp", source_protocol="static", accepted_at=_NOW)
         )  # excluded (bgp)
         await db.commit()
-        break
 
     apply_fn = AsyncMock()
     client = _guard_client(None)  # no service instance in NSO → collateral guard no-ops
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         with patch("nso_adapter.nso.apply.apply_isis_interfaces", apply_fn):
             await removal_mod._dispatch_scope(db, device, client, "isis")
-        break
 
     apply_fn.assert_awaited_once()
     args, kwargs = apply_fn.await_args
@@ -364,20 +343,18 @@ async def test_dispatch_scope_route_policy_passes_ned_id(adapter_client):
     translated to the device's NED dialect (identity dialect on ned_id=None pushes the
     wrong wire form / fails to skip unrepresentable members)."""
     device_id = await _seed_device(nso_device_name="ra1")
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         device.ned_id = "cisco-iosxr-nc-7.3"
         db.add(RoutePolicyObjectIntent(device_id=device_id, family="rpl", name="RP-IN", entries=[], accepted_at=_NOW))
         await db.commit()
-        break
 
     apply_fn = AsyncMock()
     client = _guard_client(None)  # no service instance in NSO → collateral guard no-ops
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         with patch("nso_adapter.nso.apply.apply_route_policy_config", apply_fn):
             await removal_mod._dispatch_scope(db, device, client, "route_policy")
-        break
 
     apply_fn.assert_awaited_once()
     args, kwargs = apply_fn.await_args
@@ -393,7 +370,7 @@ async def test_dispatch_interface_config_puts_remaining_and_deletes_empty(adapte
     from nso_adapter.store.models import DbInterface, InterfaceIpIntent
 
     device_id = await _seed_device(nso_device_name="sw3")
-    async for db in get_session():
+    async with session() as db:
         keep = DbInterface(device_id=device_id, name="Gi0/0")  # still has an accepted IP → PUT
         gone = DbInterface(device_id=device_id, name="Gi0/1")  # no remaining intent → DELETE
         db.add(keep)
@@ -401,11 +378,10 @@ async def test_dispatch_interface_config_puts_remaining_and_deletes_empty(adapte
         await db.flush()
         db.add(InterfaceIpIntent(interface_id=keep.id, address="10.0.0.1/24", family="ipv4", vrf="", accepted_at=_NOW))
         await db.commit()
-        break
 
     replace_fn = AsyncMock()
     delete_fn = AsyncMock()
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         with (
             patch("nso_adapter.nso.apply.replace_interface_config", replace_fn),
@@ -414,7 +390,6 @@ async def test_dispatch_interface_config_puts_remaining_and_deletes_empty(adapte
             await removal_mod._dispatch_scope(
                 db, device, _CLIENT, "interface_config", {"interfaces": ["Gi0/0", "Gi0/1"]}
             )
-        break
 
     replace_fn.assert_awaited_once()
     assert replace_fn.await_args.args[1] == "sw3" and replace_fn.await_args.args[2] == "Gi0/0"
@@ -424,11 +399,10 @@ async def test_dispatch_interface_config_puts_remaining_and_deletes_empty(adapte
 
 async def test_dispatch_scope_unknown_raises(adapter_client):
     device_id = await _seed_device()
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         with pytest.raises(ValueError, match="Unknown removal scope"):
             await removal_mod._dispatch_scope(db, device, _CLIENT, "nope")
-        break
 
 
 # ── run_removal (job runner) ──────────────────────────────────────────────────
@@ -453,7 +427,7 @@ async def test_run_removal_dispatches_and_marks_succeeded(adapter_client):
     args = disp.await_args.args
     assert args[1].id == device_id and args[2] is _CLIENT and args[3] == "vlan"
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
         assert job.result["scope"] == "vlan"
@@ -461,7 +435,6 @@ async def test_run_removal_dispatches_and_marks_succeeded(adapter_client):
         # opaque client's reader surface is never touched. Report that honestly — a job
         # that never read the device must not claim the device came back clean.
         assert job.result["residue_check"] == "unsupported"
-        break
 
 
 async def test_run_removal_records_failure(adapter_client):
@@ -477,11 +450,10 @@ async def test_run_removal_records_failure(adapter_client):
     ):
         await run_removal(job_id=job_id, device_id=device_id)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.error["code"] == "removal_failed"
-        break
 
 
 async def test_run_removal_marks_failed_even_when_session_poisoned(adapter_client):
@@ -505,11 +477,10 @@ async def test_run_removal_marks_failed_even_when_session_poisoned(adapter_clien
     ):
         await run_removal(job_id=job_id, device_id=device_id)
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.error["code"] == "removal_failed"
-        break
 
 
 # ── isis removal collateral guard (the ra1 lo0 incident, 2026-07-09) ──────────
@@ -532,7 +503,7 @@ _ISIS_STAGED_SYSTEM = {"interface-config": [{"interface-name": "system", "af": "
 
 
 async def _seed_isis_intent(device_id: int, *ifaces: tuple[str, str]):
-    async for db in get_session():
+    async with session() as db:
         for name, af in ifaces:
             db.add(
                 IsisInterfaceIntent(
@@ -569,13 +540,12 @@ async def test_isis_removal_blocked_on_orphaned_service_rows(adapter_client):
     job_id = await _seed_removal_job(device_id, scope="isis")
     apply_fn = _staging_apply(_ISIS_STAGED_SYSTEM, preview="- interface lo0 (native preview)")
     await _run_guarded_removal(device_id, job_id, client, apply_fn)
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.error["code"] == "removal_blocked_collateral"
         assert job.error["detail"]["orphans"] == {"interface-config": [["lo0", "ipv4"]]}
         assert job.error["detail"]["preview"] == "- interface lo0 (native preview)"
-        break
     # stage + dry-run preview only — nothing was committed
     committed = [c for c in apply_fn.await_args_list if c.kwargs.get("stage") is None and not c.kwargs.get("dry_run")]
     assert committed == []
@@ -596,11 +566,10 @@ async def test_isis_removal_orphaned_process_blocks(adapter_client):
     job_id = await _seed_removal_job(device_id, scope="isis")
     apply_fn = _staging_apply(_ISIS_STAGED_SYSTEM, preview="preview")
     await _run_guarded_removal(device_id, job_id, client, apply_fn)
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.error["detail"]["orphans"] == {"process-config": [["OLD"]]}
-        break
 
 
 async def test_isis_removal_proceeds_when_extra_row_was_just_removed(adapter_client):
@@ -621,10 +590,9 @@ async def test_isis_removal_proceeds_when_extra_row_was_just_removed(adapter_cli
     job_id = await _seed_removal_job(device_id, scope="isis", context_extra={"removed_interfaces": [["lag1", "ipv4"]]})
     apply_fn = _staging_apply(_ISIS_STAGED_SYSTEM)
     await _run_guarded_removal(device_id, job_id, client, apply_fn)
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
-        break
     final = apply_fn.await_args_list[-1]
     assert final.kwargs == {"replace": True}
 
@@ -645,10 +613,9 @@ async def test_isis_removal_force_skips_guard(adapter_client):
     job_id = await _seed_removal_job(device_id, scope="isis", context_extra={"force": True})
     apply_fn = AsyncMock()
     await _run_guarded_removal(device_id, job_id, client, apply_fn)
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
-        break
     apply_fn.assert_awaited_once()
     assert apply_fn.await_args.kwargs == {"replace": True}
 
@@ -661,10 +628,9 @@ async def test_isis_removal_without_service_instance_proceeds(adapter_client):
     job_id = await _seed_removal_job(device_id, scope="isis")
     apply_fn = AsyncMock()
     await _run_guarded_removal(device_id, job_id, client, apply_fn)
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
-        break
     apply_fn.assert_awaited_once()
 
 
@@ -729,13 +695,12 @@ async def test_snmp_removal_blocked_on_orphaned_community(adapter_client):
         {"device": "sw-snmp-guard", "community": [{"name": "ops"}], "host": [{"address": "10.0.0.9"}]}
     )
     await _run_removal_with("snmp", "apply_snmp_config", device_id, job_id, client, apply_fn)
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.error["code"] == "removal_blocked_collateral"
         assert job.error["detail"]["orphans"] == {"community": [["legacy"]]}
         assert job.error["detail"]["preview"] == "native preview"
-        break
     # stage + dry-run preview only — nothing committed
     committed = [c for c in apply_fn.await_args_list if c.kwargs.get("stage") is None and not c.kwargs.get("dry_run")]
     assert committed == []
@@ -748,10 +713,9 @@ async def test_snmp_removal_passes_when_removed_threaded(adapter_client):
     job_id = await _seed_removal_job(device_id, scope="snmp", context_extra={"removed": {"community": ["legacy"]}})
     apply_fn = _staging_apply({"device": "sw-snmp-legit", "community": [{"name": "ops"}]})
     await _run_removal_with("snmp", "apply_snmp_config", device_id, job_id, client, apply_fn)
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
-        break
     final = apply_fn.await_args_list[-1]
     assert final.kwargs.get("replace") is True and final.kwargs.get("stage") is None
 
@@ -763,11 +727,10 @@ async def test_vlan_removal_blocked_on_orphan_vid_normalizes_ints(adapter_client
     job_id = await _seed_removal_job(device_id, scope="vlan")
     apply_fn = _staging_apply({"device": "sw-vlan-guard", "vlan": [{"vlan-id": 10}]})
     await _run_removal_with("vlan", "apply_vlan_config", device_id, job_id, client, apply_fn)
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.error["detail"]["orphans"] == {"vlan": [["99"]]}
-        break
 
 
 async def test_bgp_removal_blocked_on_nested_orphan_peer(adapter_client):
@@ -790,11 +753,10 @@ async def test_bgp_removal_blocked_on_nested_orphan_peer(adapter_client):
     job_id = await _seed_removal_job(device_id, scope="bgp")
     apply_fn = _staging_apply(staged)
     await _run_removal_with("bgp", "apply_bgp_config", device_id, job_id, client, apply_fn)
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.error["detail"]["orphans"] == {"peer": [["192.0.2.9"]]}
-        break
 
 
 async def test_bgp_removal_passes_with_removed_peer_threaded(adapter_client):
@@ -808,44 +770,42 @@ async def test_bgp_removal_passes_with_removed_peer_threaded(adapter_client):
     job_id = await _seed_removal_job(device_id, scope="bgp", context_extra={"removed": {"peer": ["192.0.2.9"]}})
     apply_fn = _staging_apply(staged)
     await _run_removal_with("bgp", "apply_bgp_config", device_id, job_id, client, apply_fn)
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
-        break
 
 
-async def test_static_route_removal_compound_key(adapter_client):
-    """static routes are keyed (vrf, prefix, next-hop); the compound key must round-trip
-    through the removed context (JSON arrays) and match the YANG entry fields."""
+async def test_static_route_removal_no_longer_blocks_on_collateral(adapter_client):
+    """#1396 R2 §4.3/OQ-R2-3 — the DOCUMENTED behavior change, asserted rather than assumed.
+
+    Until R2 this scope built a store-assertive PUT and blocked (``removal_blocked_collateral``)
+    on any service row the store no longer asserts. R2 makes static-route removal bodies
+    live-service-relative, so such a body cannot flush anything and the guard degenerates to
+    "we dropped exactly what we authorized": the unrelated row is RETAINED and named on the job
+    instead. The full branch matrix lives in ``tests/core/test_static_route_removal.py``; this
+    pin exists so the change cannot happen silently for the other twelve scopes' neighbours.
+    """
+    from tests.core.test_static_route_removal import SrFake, run_removal_job, seed_removal_job, sr_client, wire
+
+    survivor = ("", "10.0.0.0/24", "192.0.2.1")
+    dropped = ("", "10.9.0.0/24", "192.0.2.9")
     device_id = await _seed_device(nso_device_name="sw-sr-guard")
-    service = {
-        "device": "sw-sr-guard",
-        "route": [
-            {"vrf": "", "prefix": "10.0.0.0/24", "next-hop": "192.0.2.1"},
-            {"vrf": "", "prefix": "10.9.0.0/24", "next-hop": "192.0.2.9"},
-        ],
-    }
-    staged = {"device": "sw-sr-guard", "route": [{"vrf": "", "prefix": "10.0.0.0/24", "next-hop": "192.0.2.1"}]}
-    client = _guard_client(service)
-    job_id = await _seed_removal_job(
-        device_id, scope="static_route", context_extra={"removed": {"route": [["", "10.9.0.0/24", "192.0.2.9"]]}}
-    )
-    apply_fn = _staging_apply(staged)
-    await _run_removal_with("static_route", "apply_static_routes", device_id, job_id, client, apply_fn)
-    async for db in get_session():
-        job = await db.get(Job, job_id)
-        assert job.status == JobStatus.succeeded
-        break
+    fake = SrFake("sw-sr-guard", service=[wire(survivor), wire(dropped)])
 
-    # same setup WITHOUT the removed context → the dropped route is collateral
-    job2 = await _seed_removal_job(device_id, scope="static_route")
-    apply_fn2 = _staging_apply(staged)
-    await _run_removal_with("static_route", "apply_static_routes", device_id, job2, client, apply_fn2)
-    async for db in get_session():
-        job = await db.get(Job, job2)
-        assert job.status == JobStatus.failed
-        assert job.error["detail"]["orphans"] == {"route": [["", "10.9.0.0/24", "192.0.2.9"]]}
-        break
+    # No `removed` context at all — pre-R2 this was the collateral case that BLOCKED.
+    job_id = await seed_removal_job(device_id, {})
+    job = await run_removal_job(device_id, job_id, sr_client(fake))
+    assert job.status == JobStatus.succeeded
+    assert job.result["superseded"] is True, "nothing authorized and no clear ⇒ no PUT at all"
+    assert fake.service_keys == {survivor, dropped}
+
+    # With the compound key threaded through the context, exactly that key is dropped and the
+    # unrelated one is retained and reported.
+    job2 = await seed_removal_job(device_id, {"removed": {"route": [list(dropped)]}})
+    job = await run_removal_job(device_id, job2, sr_client(fake))
+    assert job.status == JobStatus.succeeded
+    assert fake.service_keys == {survivor}
+    assert job.result["retained_orphans"] == [list(survivor)]
 
 
 async def test_generic_force_skips_guard_and_service_get(adapter_client):
@@ -855,10 +815,9 @@ async def test_generic_force_skips_guard_and_service_get(adapter_client):
     job_id = await _seed_removal_job(device_id, scope="vlan", context_extra={"force": True})
     apply_fn = AsyncMock()
     await _run_removal_with("vlan", "apply_vlan_config", device_id, job_id, client, apply_fn)
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
-        break
     apply_fn.assert_awaited_once()
     assert apply_fn.await_args.kwargs == {"replace": True}
     client.get_service_config.assert_not_awaited()
@@ -871,10 +830,9 @@ async def test_generic_no_service_instance_skips_guard(adapter_client):
     job_id = await _seed_removal_job(device_id, scope="logging")
     apply_fn = AsyncMock()
     await _run_removal_with("logging", "apply_logging_config", device_id, job_id, client, apply_fn)
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
-        break
     apply_fn.assert_awaited_once()
     assert apply_fn.await_args.kwargs == {"replace": True, "levels_intent_row": None}
 
@@ -882,42 +840,38 @@ async def test_generic_no_service_instance_skips_guard(adapter_client):
 async def test_replace_on_removal_threads_removed_keys(adapter_client):
     """The shim maps each simple scope's removed store keys onto its YANG list."""
     device_id = await _seed_device(nso_device_name="sw-shim")
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         ok = await replace_on_removal(db, device, [3366, 3377], VlanIntent)
         assert ok is True
-        break
-    async for db in get_session():
+    async with session() as db:
         job = (await db.execute(select(Job))).scalars().one()
         assert job.context == {"scope": "vlan", "removed": {"vlan": [3366, 3377]}, "detach": True}
-        break
 
 
 async def test_replace_on_removal_maps_route_policy_families(adapter_client):
     """route_policy removed keys are (family, name); the shim buckets them into the
     per-family YANG lists (community_list → community-list etc.)."""
     device_id = await _seed_device(nso_device_name="sw-shim-rp")
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         ok = await replace_on_removal(
             db, device, [("community_list", "example-comm"), ("route_map", "RM-IN")], RoutePolicyObjectIntent
         )
         assert ok is True
-        break
-    async for db in get_session():
+    async with session() as db:
         job = (await db.execute(select(Job))).scalars().one()
         assert job.context == {
             "scope": "route_policy",
             "removed": {"community-list": ["example-comm"], "route-map": ["RM-IN"]},
             "detach": True,
         }
-        break
 
 
 async def test_enqueue_removal_serializes_removed_tuples(adapter_client):
     """Tuple keys (compound) become JSON-safe arrays in the job context."""
     device_id = await _seed_device(nso_device_name="sw-enq")
-    async for db in get_session():
+    async with session() as db:
         job = await enqueue_removal(
             db, device_id, "static_route", removed={"route": [("", "10.0.0.0/24", "192.0.2.1")]}
         )
@@ -927,7 +881,6 @@ async def test_enqueue_removal_serializes_removed_tuples(adapter_client):
             "removed": {"route": [["", "10.0.0.0/24", "192.0.2.1"]]},
             "detach": True,
         }
-        break
 
 
 # ── #104-A: residue-after-retract detection + immediate follow-up sync ────────
@@ -1009,9 +962,8 @@ async def _run(job_id: int, device_id: int, client) -> None:
 
 
 async def _job_after(job_id: int) -> Job:
-    async for db in get_session():
+    async with session() as db:
         return await db.get(Job, job_id)
-    raise RuntimeError("no session")
 
 
 async def test_run_removal_reports_residue_when_removed_key_survives(adapter_client):
@@ -1557,7 +1509,7 @@ async def test_run_removal_enqueues_followup_sync(adapter_client):
 
     await _run(job_id, device_id, _ReaderClient(svi={"interface": []}))
 
-    async for db in get_session():
+    async with session() as db:
         sync_jobs = (
             (
                 await db.execute(
@@ -1572,7 +1524,6 @@ async def test_run_removal_enqueues_followup_sync(adapter_client):
             .all()
         )
         assert len(sync_jobs) == 1
-        break
 
 
 async def test_run_removal_failure_skips_residue_and_sync(adapter_client):
@@ -1591,14 +1542,13 @@ async def test_run_removal_failure_skips_residue_and_sync(adapter_client):
     job = await _job_after(job_id)
     assert job.status == JobStatus.failed
     assert not (job.result or {}).get("residue_check")
-    async for db in get_session():
+    async with session() as db:
         sync_jobs = (
             (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.sync)))
             .scalars()
             .all()
         )
         assert sync_jobs == []
-        break
 
 
 # ── #106: un-own = detach (drop governance, never touch the device) ───────────
@@ -1613,11 +1563,10 @@ async def test_run_removal_failure_skips_residue_and_sync(adapter_client):
 
 async def test_enqueue_removal_unmarked_shrink_defaults_to_detach(adapter_client):
     device_id = await _seed_device(nso_device_name="sw-detach")
-    async for db in get_session():
+    async with session() as db:
         job = await enqueue_removal(db, device_id, "svi", removed={"interface": [["Vlan9"]]})
         await db.commit()
         assert job.context["detach"] is True
-        break
 
 
 async def test_enqueue_removal_delete_origin_is_real_retraction(adapter_client):
@@ -1626,23 +1575,21 @@ async def test_enqueue_removal_delete_origin_is_real_retraction(adapter_client):
     device_id = await _seed_device(nso_device_name="sw-detach")
     token = DELETE_ORIGIN.set(True)
     try:
-        async for db in get_session():
+        async with session() as db:
             job = await enqueue_removal(db, device_id, "svi", removed={"interface": [["Vlan9"]]})
             await db.commit()
             assert "detach" not in (job.context or {})
-            break
     finally:
         DELETE_ORIGIN.reset(token)
 
 
 async def test_enqueue_removal_force_is_real_retraction(adapter_client):
     device_id = await _seed_device(nso_device_name="sw-detach")
-    async for db in get_session():
+    async with session() as db:
         job = await enqueue_removal(db, device_id, "svi", removed={"interface": [["Vlan9"]]}, force=True)
         await db.commit()
         assert job.context.get("force") is True
         assert "detach" not in job.context
-        break
 
 
 async def test_run_removal_detach_syncs_from_and_skips_residue(adapter_client):
@@ -1669,7 +1616,7 @@ async def test_run_removal_detach_syncs_from_and_skips_residue(adapter_client):
     assert "residue" not in job.result
     assert client.reads == 0
     sync_from.assert_awaited_once()
-    async for db in get_session():
+    async with session() as db:
         sync_jobs = (
             (
                 await db.execute(
@@ -1684,7 +1631,6 @@ async def test_run_removal_detach_syncs_from_and_skips_residue(adapter_client):
             .all()
         )
         assert len(sync_jobs) == 1  # the follow-up sync still refreshes the mirrors
-        break
 
 
 async def test_run_removal_real_retraction_does_not_sync_from(adapter_client):
@@ -1712,9 +1658,8 @@ async def test_guarded_apply_detach_skips_collateral_guard(adapter_client):
     stand down — otherwise every un-own on an instance with un-adopted siblings
     blocks forever (the rg03 static sibling condition)."""
     device_id = await _seed_device(nso_device_name="sw-detach")
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
-        break
     client = _guard_client(service_config={"vlan": [{"vlan-id": 100}, {"vlan-id": 200}]})
     apply_fn = _staging_apply({"vlan": [{"vlan-id": 100}]})  # 200 would be an orphan
 

@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -22,21 +22,19 @@ async def test_intent_summary_counts_device_scope(adapter_client):
     """An OSPF instance intent row shows up in the per-scope summary with apply state."""
     from datetime import UTC, datetime
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import OspfInstanceIntent
 
     device_id = await seed_device(nso_device_name="isum-ospf", netbox_device_id=941)
-    async for db in get_session():
+    async with session() as db:
         db.add(
             OspfInstanceIntent(
                 device_id=device_id,
                 process_id="1",
                 router_id="1.1.1.1",
-                accepted_at=datetime.now(UTC).replace(tzinfo=None),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/intent-summary", headers=AUTH)
     assert resp.status_code == 200
@@ -50,11 +48,10 @@ async def test_intent_summary_counts_interface_scope(adapter_client):
     """interface_id-keyed intent (interface_ip) is joined through interfaces correctly."""
     from datetime import UTC, datetime
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DbInterface, InterfaceIpIntent
 
     device_id = await seed_device(nso_device_name="isum-ip", netbox_device_id=942)
-    async for db in get_session():
+    async with session() as db:
         iface = DbInterface(device_id=device_id, name="Gi0/1")
         db.add(iface)
         await db.flush()
@@ -64,11 +61,10 @@ async def test_intent_summary_counts_interface_scope(adapter_client):
                 address="10.0.0.1/31",
                 vrf="",
                 family="ipv4",
-                accepted_at=datetime.now(UTC).replace(tzinfo=None),
+                accepted_at=datetime.now(UTC),
             )
         )
         await db.commit()
-        break
 
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/intent-summary", headers=AUTH)
     assert resp.status_code == 200

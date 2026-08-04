@@ -83,7 +83,7 @@ async def _upsert_isis_data(
     await db.execute(delete(DeviceIsisProcess).where(DeviceIsisProcess.device_id == device.id))
     await db.execute(delete(DeviceIsisInterface).where(DeviceIsisInterface.device_id == device.id))
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
 
     # First-wins in-refresh dedup: a duplicate identity tuple in the export would otherwise
     # IntegrityError on commit and roll back the whole full-replace (uq_deviceisisprocess_identity

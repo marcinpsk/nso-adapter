@@ -38,6 +38,17 @@ if TYPE_CHECKING:
     # EffectiveFailoverConfig is defined below (forward ref; only read by type checkers).
     TickConfig = "SchedulerConfig | EffectiveFailoverConfig"
 
+# The enforced wall-clock lifetime of one device's tick, and the reason it exists: the tick
+# holds its own device_claim row FOR UPDATE from its guard to its commit, so an independent
+# heartbeat task would block on that very lock — a bound is the only option, not merely the
+# preferred one. It must clear a LEGITIMATE worst-case disruptive flip — active re-probe
+# (45s default) + address read (30s client default) + up to three 120s NSO actions
+# (set-address, re-connect, sync-from) ≈ 435s — or it cancels a valid tick after NSO's
+# address changed but before the DB commit, rolling stored state back while NSO stays
+# flipped. And it must stay well under CLAIM_STALE_AFTER, or a legitimately slow tick
+# becomes revocable while it is still writing. A test pins both relations.
+FAILOVER_TICK_BOUND_S = 600.0
+
 logger = structlog.get_logger(__name__)
 
 _PRIMARY = ActiveAddress.primary.value
@@ -140,8 +151,8 @@ class FlipBudget:
 
 
 def _utcnow() -> datetime:
-    """Naive-UTC now — the DeviceFailover DateTime columns are timezone-naive."""
-    return datetime.now(UTC).replace(tzinfo=None)
+    """Aware-UTC now — every DeviceFailover DateTime column is timestamptz."""
+    return datetime.now(UTC)
 
 
 # ── Pure hysteresis primitives (no I/O — fully unit-testable) ─────────────────

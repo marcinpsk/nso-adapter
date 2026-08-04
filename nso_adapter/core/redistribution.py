@@ -199,7 +199,7 @@ async def refresh_redistribution_from_outcomes(
     name = device.nso_device_name
     device_id = device.id
     source_epoch = device.source_epoch
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
 
     # Tier 1 — any confirmed export outage aborts the whole refresh, rows untouched.
     if any(isinstance(o, Unavailable) and o.reason is UnavailableReason.export_down for o in outcomes.values()):

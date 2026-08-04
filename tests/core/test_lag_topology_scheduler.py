@@ -10,8 +10,8 @@ import pytest
 from nso_adapter.config import SchedulerConfig
 from nso_adapter.core import scheduler as scheduler_module
 from nso_adapter.nso.client import NsoClient
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device
+from tests.conftest import session
 
 
 class _FakeScheduler:
@@ -97,6 +97,7 @@ def test_start_scheduler_registers_lag_refresh_job(monkeypatch: pytest.MonkeyPat
                 enable_failover=False,
                 failover_base_tick=1,
                 orphan_reap_interval=5,
+                static_route_reclaim_interval=10,
             )
         ),
     )
@@ -109,6 +110,7 @@ def test_start_scheduler_registers_lag_refresh_job(monkeypatch: pytest.MonkeyPat
         "scope_reconcile",
         "intent_reconcile",
         "orphan_reap",
+        "static_route_reclaim",
         "lag_topology_refresh",
         "lag_config_refresh",
         "bfd_refresh",
@@ -175,6 +177,7 @@ def test_start_scheduler_skips_lag_refresh_when_disabled(monkeypatch: pytest.Mon
                 enable_failover=False,
                 failover_base_tick=1,
                 orphan_reap_interval=5,
+                static_route_reclaim_interval=10,
             )
         ),
     )
@@ -189,6 +192,7 @@ def test_start_scheduler_skips_lag_refresh_when_disabled(monkeypatch: pytest.Mon
         "scope_reconcile",
         "intent_reconcile",
         "orphan_reap",
+        "static_route_reclaim",
         "startup_sync_kick",  # A4: one-shot restart repopulation (always registered)
     }
     scheduler_module.stop_scheduler()
@@ -240,6 +244,7 @@ def _full_scheduler_config(**overrides) -> SimpleNamespace:
         enable_failover=True,
         failover_base_tick=22,
         orphan_reap_interval=23,
+        static_route_reclaim_interval=25,
     )
     base.update(overrides)
     return SimpleNamespace(scheduler=SimpleNamespace(**base))
@@ -260,6 +265,7 @@ def test_start_scheduler_registers_every_job_with_correct_interval(monkeypatch: 
         "scope_reconcile": 2,
         "intent_reconcile": 2,
         "orphan_reap": 23,
+        "static_route_reclaim": 25,
         "lag_topology_refresh": 3,
         "lag_config_refresh": 4,
         "bfd_refresh": 24,
@@ -336,10 +342,9 @@ def test_stop_scheduler_is_noop_when_not_started():
 )
 async def test_poll_job_skips_device_without_nso_client(adapter_client, monkeypatch, scheduled_fn, refresh_target):
     """A device whose NSO instance isn't registered is skipped, not refreshed, without raising."""
-    async for db in get_session():
+    async with session() as db:
         db.add(Device(nso_instance="ghost", nso_device_name="d1", netbox_device_id=4001))
         await db.commit()
-        break
 
     def _raise(*_):
         raise RuntimeError("NSO client for 'ghost' not registered")
@@ -355,7 +360,7 @@ async def test_poll_job_skips_device_without_nso_client(adapter_client, monkeypa
 
 @pytest.mark.anyio
 async def test_scheduled_lag_topology_refresh_refreshes_all_devices(adapter_client, monkeypatch):
-    async for db in get_session():
+    async with session() as db:
         db.add_all(
             [
                 Device(nso_instance="nso-dev", nso_device_name="sw01", netbox_device_id=1001),
@@ -363,7 +368,6 @@ async def test_scheduled_lag_topology_refresh_refreshes_all_devices(adapter_clie
             ]
         )
         await db.commit()
-        break
 
     refresh = AsyncMock()
     nso_client = MagicMock(spec=NsoClient)  # boundary stand-in, bound to the real client interface
@@ -382,7 +386,7 @@ async def test_scheduled_lag_topology_refresh_refreshes_all_devices(adapter_clie
 
 @pytest.mark.anyio
 async def test_scheduled_l2_service_refresh_refreshes_all_devices(adapter_client, monkeypatch):
-    async for db in get_session():
+    async with session() as db:
         db.add_all(
             [
                 Device(nso_instance="nso-dev", nso_device_name="ra1", netbox_device_id=2001),
@@ -390,7 +394,6 @@ async def test_scheduled_l2_service_refresh_refreshes_all_devices(adapter_client
             ]
         )
         await db.commit()
-        break
 
     refresh = AsyncMock()
     nso_client = MagicMock(spec=NsoClient)  # boundary stand-in, bound to the real client interface
@@ -417,7 +420,7 @@ async def test_scheduled_l2_service_refresh_refreshes_all_devices(adapter_client
 )
 async def test_l2l3_family_refresh_refreshes_all_devices(adapter_client, monkeypatch, scheduled_fn, refresh_target):
     """//: the L2/L3 interface-family poll jobs refresh every managed device."""
-    async for db in get_session():
+    async with session() as db:
         db.add_all(
             [
                 Device(nso_instance="nso-dev", nso_device_name="d1", netbox_device_id=3001),
@@ -425,7 +428,6 @@ async def test_l2l3_family_refresh_refreshes_all_devices(adapter_client, monkeyp
             ]
         )
         await db.commit()
-        break
 
     refresh = AsyncMock()
     nso_client = MagicMock(spec=NsoClient)  # boundary stand-in, bound to the real client interface
@@ -456,5 +458,7 @@ def test_start_scheduler_kicks_startup_sync(monkeypatch: pytest.MonkeyPatch):
     assert kick[0]["func"] is scheduler_module._scheduled_sync_all
     assert kick[0]["trigger"] == "date"
     # It must NOT schedule the per-family poll wrappers as startup one-shots (no 17-read burst):
+    # R2 §4.10's activation pass rides its own INTERVAL job with an immediate first run —
+    # one job id, so max_instances also serializes the startup pass against the first tick.
     family_oneshots = [j for j in fake_scheduler.jobs if j["trigger"] == "date" and j.get("id") != "startup_sync_kick"]
     assert family_oneshots == []

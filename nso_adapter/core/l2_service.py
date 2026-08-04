@@ -34,7 +34,7 @@ async def _upsert_l2_saps(
     """Full-replace: delete existing SAP rows for *device*, then insert the fresh set."""
     await db.execute(delete(DeviceL2Sap).where(DeviceL2Sap.device_id == device.id))
 
-    now = datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC)
     for service in services_data:
         service_name = service.get("service-name", "")
         if not service_name:

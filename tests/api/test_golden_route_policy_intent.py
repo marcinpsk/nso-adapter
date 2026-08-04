@@ -15,11 +15,11 @@ name to the codec-unrepresentable community members for the device's NED.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -35,10 +35,9 @@ class _FrozenDatetime(datetime):
 
 
 async def _set_ned(device_id: int, ned_id: str) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device
 
-    async for db in get_session():
+    async with session() as db:
         dev = await db.get(Device, device_id)
         dev.ned_id = ned_id
         await db.commit()
@@ -120,25 +119,23 @@ async def test_route_policy_intent_put_preserves_structured_apply_error(adapter_
     device_id = await seed_device(nso_device_name="rp-intent-golden-apperr", netbox_device_id=7967)
     await _set_ned(device_id, "cisco-iosxr-nc-7.3")
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import RoutePolicyObjectIntent
 
     entries = [{"sequence": 10, "action": "permit"}]
     apply_error = {"code": "apply_failed", "message": "device rejected term", "detail": {"stage": "commit"}}
-    async for db in get_session():
+    async with session() as db:
         db.add(
             RoutePolicyObjectIntent(
                 device_id=device_id,
                 family="route_map",
                 name="RM-FAIL",
                 entries=entries,
-                accepted_at=datetime(2026, 6, 1, 10, 0, 0),
-                last_apply_at=datetime(2026, 6, 1, 10, 0, 0),
+                accepted_at=datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC),
+                last_apply_at=datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC),
                 last_apply_error=apply_error,
             )
         )
         await db.commit()
-        break
 
     # Re-PUT the SAME entries → upsert-in-place, no content shrink, no removal job. The stored
     # last_apply_error dict is untouched by the upsert and flows into the response.

@@ -11,11 +11,11 @@ Mirror (consumer side): ``netbox-nso-plugin/.../tests/test_contract_static_route
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -26,12 +26,11 @@ ROUTE_OPTIONAL_KEYS = {"interface_next_hop", "metric", "permanent", "tag", "name
 
 @pytest.mark.anyio
 async def test_static_routes_contract(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceStaticRoute
 
     device_id = await seed_device(nso_device_name="sr-ct", netbox_device_id=7970)
-    ts = datetime(2026, 6, 1, 10, 0, 0)
-    async for db in get_session():
+    ts = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
+    async with session() as db:
         # Maximal route (every optional) + minimal route (only required).
         db.add(
             DeviceStaticRoute(
@@ -59,7 +58,6 @@ async def test_static_routes_contract(adapter_client):
             )
         )
         await db.commit()
-        break
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/static-routes", headers=AUTH)).json()
     assert set(body.keys()) == TOP_KEYS

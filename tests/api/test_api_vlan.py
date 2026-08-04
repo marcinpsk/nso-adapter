@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device, seed_switchport, seed_vlan_database
+from tests.conftest import VALID_TOKEN, seed_device, seed_switchport, seed_vlan_database, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -100,10 +100,9 @@ async def test_apply_switchport_device_not_found(adapter_client):
 async def _count_vlan_intent(device_id: int) -> int:
     from sqlalchemy import select
 
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import VlanIntent
 
-    async for db in get_session():
+    async with session() as db:
         rows = (await db.execute(select(VlanIntent).where(VlanIntent.device_id == device_id))).scalars().all()
         return len(rows)
     return 0

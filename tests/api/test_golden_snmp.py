@@ -11,7 +11,7 @@ location/contact stay present as null. ``last_refreshed_at`` is a "<iso>Z" strin
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -21,6 +21,7 @@ from tests.conftest import (
     VALID_TOKEN,
     pin_store_incarnation,
     seed_device,
+    session,
 )
 
 _SYNTH_READ_STATE = {
@@ -39,17 +40,16 @@ _SYNTH_READ_STATE = {
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-TS = datetime(2026, 6, 1, 10, 0, 0)
+TS = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
 
 
 @pytest.mark.anyio
 async def test_snmp_golden_body(adapter_client):
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import SnmpCommunity, SnmpHost, SnmpSystemInfo, SnmpV3User
 
     device_id = await seed_device(nso_device_name="snmp-golden", netbox_device_id=7965)
     await pin_store_incarnation()
-    async for db in get_session():
+    async with session() as db:
         db.add(
             SnmpCommunity(
                 device_id=device_id,
@@ -88,7 +88,6 @@ async def test_snmp_golden_body(adapter_client):
             )
         )
         await db.commit()
-        break
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/snmp-config", headers=AUTH)).json()
 
@@ -109,12 +108,11 @@ async def test_snmp_golden_body(adapter_client):
 @pytest.mark.anyio
 async def test_snmp_golden_nulls(adapter_client):
     """acl/version/notify_type/port/username/location/contact all present as null (emit-null)."""
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import SnmpCommunity, SnmpHost, SnmpSystemInfo
 
     device_id = await seed_device(nso_device_name="snmp-golden-nulls", netbox_device_id=7966)
     await pin_store_incarnation()
-    async for db in get_session():
+    async with session() as db:
         db.add(
             SnmpCommunity(
                 device_id=device_id,
@@ -129,7 +127,6 @@ async def test_snmp_golden_nulls(adapter_client):
         db.add(SnmpHost(device_id=device_id, address="10.0.0.1", last_refreshed_at=TS, refresh_source="poll"))
         db.add(SnmpSystemInfo(device_id=device_id, last_refreshed_at=TS, refresh_source="poll"))
         await db.commit()
-        break
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/snmp-config", headers=AUTH)).json()
 

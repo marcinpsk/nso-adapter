@@ -26,9 +26,8 @@ from nso_adapter.core.lag_topology import refresh_lag_topology_for_device
 from nso_adapter.core.subinterface import refresh_subinterface_for_device
 from nso_adapter.core.svi import refresh_svi_for_device
 from nso_adapter.core.vlan import refresh_switchport_for_device, refresh_vlan_database_for_device
-from nso_adapter.store.db import get_session
 from nso_adapter.store.models import Device
-from tests.conftest import seed_device
+from tests.conftest import seed_device, session
 
 # (refresher, a minimal empty-but-valid success payload, wire_name)
 # Every family reads its device-state envelope section (READSEM S5 retired the legacy getters);
@@ -50,12 +49,11 @@ _IDS = [fn.__name__ for fn, _, _ in _NORMALIZED]
 
 @asynccontextmanager
 async def _device_session(device_id: int):
-    async for db in get_session():
+    async with session() as db:
         device = await db.get(Device, device_id)
         assert device is not None
         yield db, device
         return
-    raise RuntimeError("no session")
 
 
 @pytest.mark.anyio

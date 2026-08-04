@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Validate PR title
+
+# release-please derives the version from the commits that land on main. With
+# squash merges that commit is the PR title, so the title has to be a valid
+# conventional commit or the release is silently derived from nothing.
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize]
+
+permissions: {}
+
+jobs:
+  lint-pr-title:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Enforce conventional commit PR title
+        uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50  # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            style
+            refactor
+            perf
+            test
+            build
+            ci
+            chore
+            revert
+          requireScope: false
+          subjectPattern: ^.+$
+          subjectPatternError: "PR title must not be empty after the type/scope prefix."

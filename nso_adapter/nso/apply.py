@@ -38,6 +38,15 @@ logger = structlog.get_logger(__name__)
 # NED, or rejected) — i.e. a false success. Toggle off with NSO_ADAPTER_VERIFY_APPLY=0.
 VERIFY_AFTER_APPLY = os.environ.get("NSO_ADAPTER_VERIFY_APPLY", "1").strip().lower() not in ("0", "false", "no")
 
+# #1396 R2 §4.4 — the explicit proof verdict a committing send returns, instead of letting a
+# caller infer success from "nothing raised". None of the three post-commit signals is
+# conclusive on its own: native verify is optional and fail-open, reader-compare's `unknown`/
+# `error` never fail a scope, and residue is recorded rather than enforced. A consumer that
+# CASes a `deployed_key` or empties a clear carrier must know WHICH of those it got.
+VERIFY_CONCLUSIVE = "conclusive"  # the re-dry-run came back and NSO would push nothing further
+VERIFY_INCONCLUSIVE = "inconclusive"  # transport/5xx/unparseable — native_dry_run returned None
+VERIFY_DISABLED = "disabled"  # NSO_ADAPTER_VERIFY_APPLY is off; no proof was even attempted
+
 # NSO reconcile commit option — a brownfield GUARDRAIL. When a reconciler service's
 # footprint overlaps config the device already carries as *non-service* config (pulled
 # in by sync-from), `keep-non-service-config` tells NSO to KEEP (adopt without deleting)
@@ -246,7 +255,7 @@ async def native_dry_run(
 
 async def _verify_native_or_raise(
     client: NsoClient, url: str, payload: str, device_name: str, *, scope: str, method: str = "patch"
-) -> None:
+) -> str:
     """Re-issue *payload* as a native dry-run; raise if NSO would still change the device.
 
     Catches false successes: a 2xx apply whose intent NSO silently did not fully
@@ -258,16 +267,21 @@ async def _verify_native_or_raise(
     are logged and treated as inconclusive (no raise) so verification never blocks
     an otherwise-successful apply. Compares against NSO's CDB, so out-of-band
     device drift (CDB vs physical) is out of scope here — that needs sync-from.
+
+    Returns the verdict (:data:`VERIFY_CONCLUSIVE` / :data:`VERIFY_INCONCLUSIVE` /
+    :data:`VERIFY_DISABLED`) so a caller that is about to record deletion authority can
+    tell "proven" from "we did not look" — fail-open is right for the apply and wrong
+    for the bookkeeping that follows it (R2 §4.4).
     """
     if not VERIFY_AFTER_APPLY:
-        return
+        return VERIFY_DISABLED
 
     # strict=True: a conclusive 4xx on the re-dry-run raises (the apply did not land),
     # rather than being swallowed as an inconclusive false success.
     delta = await native_dry_run(client, url, payload, device_name, method=method, strict=True)
     if delta is None:
         logger.warning("nso.apply.verify_inconclusive_or_unexpected", scope=scope, device=device_name)
-        return
+        return VERIFY_INCONCLUSIVE
     if delta.strip():
         logger.error("nso.apply.verify_mismatch", scope=scope, device=device_name, delta=delta)
         raise NsoApplyError(
@@ -276,6 +290,7 @@ async def _verify_native_or_raise(
             detail={"device_delta": delta},
         )
     logger.info("nso.apply.verify_ok", scope=scope, device=device_name)
+    return VERIFY_CONCLUSIVE
 
 
 async def _send_service_config(
@@ -303,6 +318,9 @@ async def _send_service_config(
     ``stage[root_key]`` and return WITHOUT any HTTP — the caller commits every staged
     scope in one :func:`apply_combined` transaction. Mutually exclusive with the commit
     here; ignores ``replace``/``dry_run`` (atomic apply is merge-PATCH only).
+
+    Return value follows the mode: the native delta under ``dry_run``, ``None`` under
+    ``stage`` (nothing was sent), and otherwise the R2 §4.4 proof verdict of the commit.
     """
     if stage is not None:
         stage[root_key] = [body]
@@ -350,8 +368,7 @@ async def _send_service_config(
                 detail={"nso_error": err},
             )
     logger.info("nso.apply.service_sent", scope=scope, device=device_name, method=method, replace=replace)
-    await _verify_native_or_raise(client, url, payload, device_name, scope=scope, method=method)
-    return None
+    return await _verify_native_or_raise(client, url, payload, device_name, scope=scope, method=method)
 
 
 async def apply_combined(
@@ -371,7 +388,11 @@ async def apply_combined(
     land together). Carries the ``reconcile`` commit param like every other write.
 
     ``dry_run=True`` returns the native device delta the combined commit would push (no
-    commit). Otherwise commits, runs the post-apply verify guard, and returns None.
+    commit). Otherwise commits, runs the post-apply verify guard, and returns that guard's
+    R2 §4.4 verdict — the commit is ONE transaction, so every scope staged into it shares
+    one verdict. Discarding it (as this used to) leaves the atomic path with no proof
+    channel at all: an inconclusive verify behind a 2xx would either CAS a never-proven
+    row or never bootstrap ``deployed_key`` in atomic mode (G39).
     Raises NsoApplyError on a non-2xx commit. ``strict`` (dry-run only) makes a conclusive
     4xx dry-run rejection raise instead of returning None — used by atomic-failure
     localisation to tell a real NED rejection apart from a transient/inconclusive blip.
@@ -403,8 +424,7 @@ async def apply_combined(
                 detail={"nso_error": err},
             )
     logger.info("nso.apply.combined_sent", device=device_name, modules=list(body))
-    await _verify_native_or_raise(client, url, payload, device_name, scope="combined", method="patch")
-    return None
+    return await _verify_native_or_raise(client, url, payload, device_name, scope="combined", method="patch")
 
 
 # Recognised boolean spellings for the `enabled` interface attribute. The intent value
@@ -968,11 +988,43 @@ async def apply_snmp_config(
     )
 
 
+def static_route_entry(row) -> dict:
+    """Render ONE static-route intent row as the wire entry the reconciler expects.
+
+    The single renderer: the body builder below, the preview and R2's per-route
+    fingerprint all call it, so a fingerprint cannot drift from what was sent.
+    """
+    entry: dict = {
+        "vrf": row.vrf,
+        "prefix": row.prefix,
+        "next-hop": row.next_hop,
+    }
+    # Optional next-hop forms (IOS-XR): an egress/discard interface and an inter-VRF
+    # (leaked) next-hop VRF. Absent on a plain IP next-hop.
+    if getattr(row, "interface_next_hop", None):
+        entry["interface-next-hop"] = row.interface_next_hop
+    if getattr(row, "next_hop_vrf", None):
+        entry["next-hop-vrf"] = row.next_hop_vrf
+    if row.metric is not None:
+        entry["metric"] = row.metric
+    if row.permanent is not None and row.permanent:
+        entry["permanent"] = row.permanent
+    if row.tag is not None:
+        entry["tag"] = row.tag
+    return entry
+
+
+def static_route_entry_key(entry: dict) -> tuple[str, str, str]:
+    """Return the list key of a rendered or verbatim wire entry."""
+    return (entry.get("vrf") or "", entry.get("prefix") or "", entry.get("next-hop") or "")
+
+
 async def apply_static_routes(
     client: NsoClient,
     device_name: str,
     route_intent_rows: list,
     *,
+    extra_entries: list[dict] | None = None,
     replace: bool = False,
     dry_run: bool = False,
     stage: dict[str, list] | None = None,
@@ -983,27 +1035,21 @@ async def apply_static_routes(
     reconcile mode so pre-existing routes are adopted. ``replace=True`` PUT-replaces
     the keyed instance (full desired state) so removed routes are reverted on the
     device. Raises NsoApplyError on failure.
+
+    *extra_entries* are raw wire entries appended verbatim after the rendered ones — R2's
+    tombstone retention, where the live copy carries metric/tag and NED-specific leaves the
+    store has no column for. A rendered row always WINS on a key collision: the store is
+    the authority for a route it still owns.
     """
-    routes = []
-    for row in route_intent_rows:
-        entry: dict = {
-            "vrf": row.vrf,
-            "prefix": row.prefix,
-            "next-hop": row.next_hop,
-        }
-        # Optional next-hop forms (IOS-XR): an egress/discard interface and an inter-VRF
-        # (leaked) next-hop VRF. Absent on a plain IP next-hop.
-        if getattr(row, "interface_next_hop", None):
-            entry["interface-next-hop"] = row.interface_next_hop
-        if getattr(row, "next_hop_vrf", None):
-            entry["next-hop-vrf"] = row.next_hop_vrf
-        if row.metric is not None:
-            entry["metric"] = row.metric
-        if row.permanent is not None and row.permanent:
-            entry["permanent"] = row.permanent
-        if row.tag is not None:
-            entry["tag"] = row.tag
-        routes.append(entry)
+    routes = [static_route_entry(row) for row in route_intent_rows]
+    if extra_entries:
+        seen = {static_route_entry_key(entry) for entry in routes}
+        for entry in extra_entries:
+            key = static_route_entry_key(entry)
+            if key in seen:
+                continue
+            seen.add(key)
+            routes.append(entry)
 
     return await _send_service_config(
         client,

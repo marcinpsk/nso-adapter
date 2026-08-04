@@ -31,6 +31,10 @@ api:
 database_url: postgresql+asyncpg://nso_adapter:replace-me@postgres:5432/nso_adapter
 log_level: INFO
 log_format: json
+# Seconds an intent PUT waits for the per-device claim before answering 409. Keep it well
+# under the plugin's 30s request timeout, or a wait turns into a client-side timeout the
+# adapter cannot report.
+intent_claim_wait_seconds: 5.0
 
 scheduler:
   poll_interval: 15           # minutes between NSO device polls

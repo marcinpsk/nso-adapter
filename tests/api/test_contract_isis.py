@@ -19,11 +19,11 @@ Mirror (consumer side): ``netbox-nso-plugin/.../tests/test_contract_isis.py`` â€
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -132,10 +132,9 @@ SRV6_LOCATOR_KEYS = {
 
 
 async def _seed_isis(device_id: int) -> None:
-    from nso_adapter.store.db import get_session
     from nso_adapter.store.models import DeviceIsisInterface, DeviceIsisProcess
 
-    ts = datetime(2026, 6, 1, 10, 0, 0)
+    ts = datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC)
     # Nested bags are stored hyphenated (as the extractor writes them); the adapter
     # _snake()s them on output â†’ the snake_case keys the plugin consumes.
     instance_level = {
@@ -190,7 +189,7 @@ async def _seed_isis(device_id: int) -> None:
         "enabled": True,
     }
 
-    async for db in get_session():
+    async with session() as db:
         # MAXIMAL process: every scalar set + all four containers populated.
         db.add(
             DeviceIsisProcess(
@@ -291,7 +290,6 @@ async def _seed_isis(device_id: int) -> None:
             )
         )
         await db.commit()
-        break
 
 
 @pytest.mark.anyio

@@ -17,6 +17,14 @@ services:
       # NO_PROXY / no_proxy (NSO + Vault + NetBox hosts) are injected from .env
       # (gitignored) via env_file above. Kept out of this tracked file and out of
       # the environment: block so the shell environment can't shadow them.
+    # REQUIRED, not cosmetic: the worker fail-stops the whole process (os._exit) if a
+    # cancellation drain or a terminal-write cleanup exceeds its bound, because continuing
+    # would risk device writes under an ownership the adapter can no longer prove it holds.
+    # Without a restart policy that exit leaves the adapter permanently down.
+    restart: unless-stopped
+    # Must exceed worker._SHUTDOWN_TASK_WAIT (100s): Docker's default 10s SIGKILL would
+    # cut off the cancellation drain and claim release mid-write. A test pins this.
+    stop_grace_period: 130s
     depends_on:
       adapter-db:
         condition: service_healthy
@@ -31,6 +39,7 @@ services:
   adapter-db:
     image: postgres:16-alpine
     container_name: nso-adapter-postgres-dev
+    restart: unless-stopped
     environment:
       - POSTGRES_USER=nso
       - POSTGRES_PASSWORD=nso
@@ -44,6 +53,34 @@ services:
       retries: 10
     networks:
       - adapter-db
+
+  # Throwaway test server. NOT the dev application DB (adapter-db) — the suite CREATEs
+  # and DROPs a database per test and must never be pointed at dev data.
+  adapter-test-db:
+    image: postgres:16-alpine
+    container_name: nso-adapter-postgres-test
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    ports:
+      - "127.0.0.1:55433:5432"
+    # PGDATA on tmpfs + durability off: the data is worthless by construction, and
+    # CREATE DATABASE ... TEMPLATE is dominated by fsync.
+    tmpfs:
+      - /var/lib/postgresql/data
+    command: >
+      postgres -c fsync=off -c full_page_writes=off -c synchronous_commit=off
+               -c wal_level=minimal -c max_wal_senders=0 -c shared_buffers=256MB
+               -c max_connections=200
+    healthcheck:
+      # -h 127.0.0.1: tmpfs PGDATA re-inits on every start, and the init-time
+      # temporary server answers the Unix socket before TCP is up.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
 
 networks:
   docker_frontend:

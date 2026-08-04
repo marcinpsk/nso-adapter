@@ -17,7 +17,7 @@ doc and the other.
 from __future__ import annotations
 
 from nso_adapter.store.models import DbInterface, InterfaceAttrState, InterfaceIntent, SyncState
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -47,11 +47,9 @@ EXPECTED_ATTR_KEYS = {
 async def _seed_iface_with_intent(device_id: int):
     """Seed an interface whose description attr has BOTH a state and an intent row,
     so every attr key (including last_apply_at / last_apply_error) is exercised."""
-    from datetime import datetime
+    from datetime import UTC, datetime
 
-    from nso_adapter.store.db import get_session
-
-    async for db in get_session():
+    async with session() as db:
         iface = DbInterface(device_id=device_id, name="GE0/0", netbox_interface_id=1000)
         db.add(iface)
         await db.flush()
@@ -69,12 +67,11 @@ async def _seed_iface_with_intent(device_id: int):
                 interface_id=iface.id,
                 attribute="description",
                 intent_value="uplink",
-                last_apply_at=datetime(2026, 5, 20, 10, 0, 0),
+                last_apply_at=datetime(2026, 5, 20, 10, 0, 0, tzinfo=UTC),
                 last_apply_error={"code": "nso_error", "message": "boom"},
             )
         )
         await db.commit()
-        break
 
 
 async def test_interfaces_payload_matches_contract_exactly(adapter_client):

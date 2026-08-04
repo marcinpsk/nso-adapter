@@ -28,6 +28,7 @@ from nso_adapter.main import (
     _shutdown_sse,
     _start_sse_streams,
 )
+from tests.conftest import session
 
 
 def _scheduler(**flags):
@@ -84,16 +85,14 @@ def _sse_event(*names):
 
 
 async def _seed_sse_device(name="sse-rtr", instance="nso-dev", netbox_id=8801):
-    from nso_adapter.store.db import get_session as _gs
     from nso_adapter.store.models import Device as _Device
 
-    async for db in _gs():
+    async with session() as db:
         d = _Device(nso_instance=instance, nso_device_name=name, netbox_device_id=netbox_id)
         db.add(d)
         await db.commit()
         await db.refresh(d)
         return d.id
-    raise RuntimeError("no session")
 
 
 async def _drain_coalescer(tasks: set[asyncio.Task]) -> None:
@@ -106,7 +105,6 @@ async def test_dispatch_runs_one_comprehensive_refresh_per_changed_device(adapte
     comprehensive projected refresh for the device — every family, one doc GET —
     instead of nine per-family section refreshes."""
     from nso_adapter import main as main_mod
-    from nso_adapter.store.db import get_session as _gs
 
     device_id = await _seed_sse_device("sse-rtr-1", netbox_id=8802)
     calls: list[tuple[int, str, bool]] = []
@@ -120,9 +118,8 @@ async def test_dispatch_runs_one_comprehensive_refresh_per_changed_device(adapte
     tasks: set[asyncio.Task] = set()
     coalescer = main_mod._DeviceRefreshCoalescer({"nso-dev": object()}, tasks, tasks.discard)
     cfg = SimpleNamespace(scheduler=_scheduler())
-    async for db in _gs():
+    async with session() as db:
         await main_mod._dispatch_netconf_change(cfg, _sse_event("sse-rtr-1"), db, {"nso-dev": object()}, coalescer)
-        break
     await _drain_coalescer(tasks)
 
     assert calls == [(device_id, "notification", False)]
@@ -131,7 +128,6 @@ async def test_dispatch_runs_one_comprehensive_refresh_per_changed_device(adapte
 async def test_dispatch_scopes_to_the_handler_instance_map(adapter_client, monkeypatch):
     """codex R1-F8: a same-name device on an UNMAPPED instance is untouched."""
     from nso_adapter import main as main_mod
-    from nso_adapter.store.db import get_session as _gs
 
     await _seed_sse_device("sse-dup", instance="nso-other", netbox_id=8803)
     calls: list[int] = []
@@ -144,11 +140,10 @@ async def test_dispatch_scopes_to_the_handler_instance_map(adapter_client, monke
 
     tasks: set[asyncio.Task] = set()
     coalescer = main_mod._DeviceRefreshCoalescer({"nso-dev": object()}, tasks, tasks.discard)
-    async for db in _gs():
+    async with session() as db:
         await main_mod._dispatch_netconf_change(
             SimpleNamespace(scheduler=_scheduler()), _sse_event("sse-dup"), db, {"nso-dev": object()}, coalescer
         )
-        break
     await _drain_coalescer(tasks)
 
     assert calls == []
@@ -487,18 +482,13 @@ async def test_dispose_engine_noop_when_unset(monkeypatch):
     await _dispose_engine()  # must not raise
 
 
-async def test_dispose_engine_disposes_real_engine(monkeypatch):
+async def test_dispose_engine_disposes_real_engine(monkeypatch, pg_url):
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    engine = create_async_engine("sqlite+aiosqlite://")
+    engine = create_async_engine(pg_url)
     monkeypatch.setattr("nso_adapter.main.get_engine", lambda: engine)
 
     await _dispose_engine()  # real engine, real dispose
-
-
-# --------------------------------------------------------------------------- #
-# _build_netbox_client — ca_cert wiring (s3-28) + _init_database gate (s3-25)
-# --------------------------------------------------------------------------- #
 
 
 @pytest.fixture
@@ -508,6 +498,50 @@ def clean_netbox_registry():
     snapshot = importer._netbox_client
     yield
     importer._netbox_client = snapshot
+
+
+async def test_lifespan_binds_the_configured_database(clean_netbox_registry, pg_url, tmp_path, monkeypatch):
+    """The one un-patched lifespan run — nothing stubbed, not even init_db/_dispose_engine.
+
+    ``adapter_client`` patches both out (``store_engine`` owns the process globals, and
+    a lifespan disposal there would orphan a sibling session's checked-out connection),
+    so this is the only place proving the real lifespan reads ``database_url`` from the
+    config file, binds THAT database, and disposes the engine on exit.
+    """
+    from sqlalchemy.engine import make_url
+
+    from nso_adapter.config import reset_config
+    from nso_adapter.main import create_app
+    from nso_adapter.store import db as store_db
+    from tests.conftest import _write_config
+
+    _write_config(tmp_path, monkeypatch, database_url=pg_url)
+    reset_config()
+
+    app = create_app()
+    try:
+        async with app.router.lifespan_context(app):
+            engine = store_db.get_engine()
+            # Full normalized URL: host, port, driver and credentials all matter for
+            # "did it read the config file" — a bare database-name match would not.
+            assert make_url(engine.url).render_as_string(hide_password=False) == pg_url
+            pool_before = engine.sync_engine.pool
+            async with engine.connect() as conn:
+                bound = (await conn.exec_driver_sql("SELECT current_database()")).scalar()
+            assert bound == make_url(pg_url).database
+
+        # dispose() empties the old pool and swaps in a fresh one — observable without
+        # patching anything, and it fails if the lifespan stops disposing.
+        assert engine.sync_engine.pool is not pool_before
+        assert engine.sync_engine.pool.checkedin() == 0
+    finally:
+        store_db._engine = None
+        store_db._session_factory = None
+
+
+# --------------------------------------------------------------------------- #
+# _build_netbox_client — ca_cert wiring (s3-28) + _init_database gate (s3-25)
+# --------------------------------------------------------------------------- #
 
 
 def _netbox_cfg(ca_cert):
@@ -531,30 +565,74 @@ def test_build_netbox_client_defaults_verify_true(clean_netbox_registry):
     assert client._verify is True
 
 
-async def test_init_database_skips_create_all_on_postgres(monkeypatch):
-    """s3-25: on PostgreSQL the entrypoint already ran `alembic upgrade head`, so the lifespan
-    must NOT run create_all (two schema sources → DuplicateTable). The fake engine has no
-    .begin(); reaching the create_all block would raise, so a clean return proves the gate.
+@pytest.fixture
+def unmigrated_pg_url(pg_admin):
+    """A database with NO schema whatsoever — plain CREATE DATABASE, never TEMPLATE.
 
-    SA-4: ensure_store_meta (S4) needs a real session this isolated test never primes —
-    patch it AND assert it ran (the incarnation backfill is part of the init contract)."""
-    import nso_adapter.main as main_mod
+    The normal ``pg_url`` clone is already at head, so a reintroduced ``create_all`` there
+    would be an idempotent no-op and a before/after table comparison would pass vacuously.
+    Starting from zero tables is what makes "the lifespan created nothing" falsifiable.
+    """
+    import uuid as uuid_mod
+
+    from tests.conftest import _drop_database, _url_for
+
+    name = f"nsoadp_empty_{uuid_mod.uuid4().hex[:8]}"
+    with pg_admin.connect() as conn:
+        conn.exec_driver_sql(f'CREATE DATABASE "{name}"')
+    try:
+        yield _url_for(name, driver="postgresql+asyncpg")
+    finally:
+        _drop_database(pg_admin, name, expect_clean=True)
+
+
+async def test_init_database_never_materializes_schema(monkeypatch, unmigrated_pg_url):
+    """s3-25, PG-only: alembic is the ONE schema source. The lifespan binds the engine and
+    mints the incarnation; it must never create tables, because a second materialiser in the
+    startup path is exactly the DuplicateTable hazard.
+
+    Runs against a genuinely EMPTY database, so any DDL the lifespan emits shows up as a
+    table that nothing else could have made. A fake engine would only prove "no .begin()
+    call"; a migrated clone would prove nothing at all."""
+    import sqlalchemy as sa
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from nso_adapter.store import db as store_db
     from nso_adapter.store import meta as store_meta
 
-    fake_pg_engine = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
-    monkeypatch.setattr(main_mod, "init_db", lambda url: None)
-    monkeypatch.setattr(main_mod, "get_engine", lambda: fake_pg_engine)
-    ensure_calls = []
+    def _tables(conn):
+        return set(sa.inspect(conn).get_table_names())
 
-    async def _fake_ensure():
-        ensure_calls.append(True)
-        return ("00000000-0000-0000-0000-000000000001", None)
+    engine = create_async_engine(unmigrated_pg_url)
+    try:
+        async with engine.connect() as conn:
+            before = await conn.run_sync(_tables)
+        assert before == set(), f"the fixture must hand over an EMPTY database, got {sorted(before)}"
 
-    monkeypatch.setattr(store_meta, "ensure_store_meta", _fake_ensure)
+        ensure_calls = []
 
-    await _init_database(SimpleNamespace(database_url="postgresql+asyncpg://u:p@db/adapter"))
-    # no AttributeError on fake_pg_engine.begin → the create_all block was skipped
-    assert ensure_calls, "the store-incarnation backfill must run at init"
+        async def _fake_ensure():
+            # S4's mint needs a primed session this isolated test never sets up; patch it AND
+            # assert it ran, since the incarnation mint is part of the init contract.
+            ensure_calls.append(True)
+            return ("00000000-0000-0000-0000-000000000001", None)
+
+        monkeypatch.setattr(store_meta, "ensure_store_meta", _fake_ensure)
+        try:
+            await _init_database(SimpleNamespace(database_url=unmigrated_pg_url))
+            assert ensure_calls, "the store-incarnation mint must run at init"
+            async with engine.connect() as conn:
+                after = await conn.run_sync(_tables)
+        finally:
+            bound = store_db.get_engine()
+            if bound is not None:
+                await bound.dispose()
+            store_db._engine = None
+            store_db._session_factory = None
+
+        assert after == set(), f"the lifespan materialised schema: {sorted(after)}"
+    finally:
+        await engine.dispose()
 
 
 # --------------------------------------------------------------------------- #

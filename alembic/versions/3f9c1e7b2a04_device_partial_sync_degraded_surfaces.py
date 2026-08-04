@@ -32,8 +32,7 @@ def upgrade() -> None:
 
     # PostgreSQL: extend the existing enum type. ALTER TYPE ... ADD VALUE cannot run
     # inside the migration's transaction, so use alembic's autocommit_block. Place
-    # 'partial' before 'failed' to mirror the Python enum's declared order. SQLite
-    # stores the enum as VARCHAR, so no type alteration is needed there.
+    # 'partial' before 'failed' to mirror the Python enum's declared order.
     bind = op.get_bind()
     if bind.dialect.name == "postgresql":
         with op.get_context().autocommit_block():
