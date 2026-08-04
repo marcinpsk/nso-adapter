@@ -593,7 +593,13 @@ routes, `static_route_results` — the per-route record described under
 [Per-route apply results](#per-route-apply-results).
 
 ### `GET /api/v1/jobs?device_id={id}&status={status}` → `200`
-Array of job objects. Both query params optional.
+Array of job objects, newest first, capped at 100. Both query params optional.
+
+Ordering is `created_at` descending, tie-broken by `id` descending. The tiebreak matters:
+`created_at` defaults to the transaction's start time, so several jobs can share one
+timestamp and the page would otherwise be non-deterministic — the same request could serve
+a different 100 rows each time. It makes the page stable; it is **not** a commit order and
+**not** a cursor, so it cannot be walked as a feed.
 
 ---
 
@@ -705,6 +711,30 @@ Field notes:
 - `interface_next_hop`: interface name string; present only when there is no IP next-hop.
 - `metric`, `permanent`, `tag`, `name`: optional; omitted from response when `null`.
 
+### `GET /api/v1/devices/{id}/static-route-intent` → `200 | 404`
+
+Re-serves the settlement coordinates of every stored intent row for this device — the same
+`{route_id, generation, fingerprint}` triples the last `PUT` echoed.
+
+```json
+{
+  "device_id": 1,
+  "routes": [
+    { "route_id": 41, "generation": 12, "fingerprint": "9f2c…" }
+  ]
+}
+```
+
+This is the recovery path for a **lost PUT response**. The PUT commits its store write
+before it answers, so a response lost in flight leaves the pusher holding intent the adapter
+has already stored but for which the pusher recorded no expectation — and an apply result
+for that intent would then correlate with nothing. The triples are rendered from the stored
+rows themselves, by the same renderer the PUT uses, so the read-back cannot drift from what
+the PUT reported.
+
+`route_id` and `generation` are `null` for a row whose pusher never supplied them; a `null`
+on either never correlates with anything (see below).
+
 ### `PUT /api/v1/devices/{id}/static-route-intent` → `200 | 404 | 409 | 422`
 
 Push (full-replace) the static route intent mirror for this device.
@@ -716,6 +746,7 @@ routes must be omitted by the caller.
   "routes": [
     {
       "route_id": 41,
+      "generation": 12,
       "vrf": "",
       "prefix": "0.0.0.0/0",
       "next_hop": "10.0.0.1",
@@ -729,7 +760,15 @@ routes must be omitted by the caller.
 
 Response:
 ```json
-{ "device_id": 1, "count": 1 }
+{
+  "device_id": 1,
+  "count": 1,
+  "removed": 0,
+  "replaced": false,
+  "routes": [
+    { "route_id": 41, "generation": 12, "fingerprint": "9f2c…" }
+  ]
+}
 ```
 
 Full-replace semantics: any route the body does not carry is deleted from the intent
@@ -756,6 +795,27 @@ A push that omits `route_id` on every entry behaves exactly as it always has: ma
 is by triple, and any route the body drops is treated as no longer governed
 (`detach` — the device is not touched). Deletions only produce a correlated deletion
 record once **every** stored row for that device carries a `route_id`.
+
+#### `generation` and the settlement echo
+
+`generation` is the pusher's own token for the *content* an entry carries — the pusher bumps
+it on every content change and never reuses a value. The adapter stores it on the row and
+reports it back on every apply result for that row, which is what lets the pusher tell a
+result about the intent it is still waiting on from a result about intent that has since been
+superseded. The adapter neither allocates nor interprets it; it is opaque carriage.
+
+Like `route_id`, `generation` is **adopted only when non-null**: an entry omitting it leaves
+the stored value alone, so a pusher that never learned the field cannot erase a newer one's
+correlation. A row whose `generation` is `null` correlates with nothing — that is the whole
+point, and it is why nothing is defaulted in its place.
+
+The response's `routes[]` carries, per stored row, the `route_id`, the `generation` now on
+the row, and the `fingerprint` of the exact wire entry that row renders. Those three are what
+a pusher records as its expectation for the next apply result. Because the fingerprint is
+computed from the stored row rather than from the request body, it describes what the adapter
+actually holds; a pusher cannot recompute it locally, which is why it is echoed rather than
+assumed. `GET /api/v1/devices/{id}/static-route-intent` re-serves the same triples if the
+response is lost.
 
 #### `422` refusals
 
@@ -817,7 +877,7 @@ An apply job's `result.static_route_results` carries one entry per route the pas
 
 ```json
 { "route_id": 41, "row_id": 12, "key": ["", "0.0.0.0/0", "10.0.0.1"],
-  "fingerprint": "9f2c…", "outcome": "in_sync" }
+  "fingerprint": "9f2c…", "generation": 12, "outcome": "in_sync", "error": null }
 ```
 
 | `outcome` | meaning |
@@ -827,7 +887,16 @@ An apply job's `result.static_route_results` carries one entry per route the pas
 | `unproven` | the write was accepted and nothing proves it — verification disabled or inconclusive, the device view unreadable, a replacement a merge-PATCH could not deliver, or a cleared leaf still owed |
 
 `fingerprint` is a SHA-256 over the exact wire entry that was sent, so every emitted leaf moves
-it and a store-only field with no wire form (`name`) does not.
+it and a store-only field with no wire form (`name`) does not. `route_id` and `generation` are
+this row's stored values — `null` where the pusher supplied none, which is a statement about
+that one row and never a signal about the device.
+
+`error` is **this route's own** failure, in the standard `{code, message, detail}` shape, so a
+job that fails two routes for two different reasons reports both instead of one shared scope
+message. It is populated only for `apply_failed`: the stored error column outlives a pass, and
+an `unproven` route can still be carrying an earlier apply's error, which reported here would
+date a superseded generation's failure to this job. Every `apply_failed` outcome had its error
+written by this pass, so nothing is lost by the scoping.
 
 `unproven` is **not** a failure: the job still succeeds — a transient read failure must not
 fail an apply whose device write landed — but nothing is recorded as deployed and no green is
