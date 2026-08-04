@@ -1,4 +1,4 @@
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 WORKDIR /app
 
 RUN pip install uv --no-cache-dir
@@ -10,7 +10,7 @@ COPY nso_adapter/ nso_adapter/
 
 RUN uv sync --no-dev --no-cache --frozen
 
-FROM python:3.12-slim
+FROM python:3.14-slim
 WORKDIR /app
 
 # Add NSO/Vault hosts to NO_PROXY at runtime via compose/.env, not baked into the image.
