@@ -21,7 +21,7 @@ dependencies = [
     "apscheduler>=3.10",
     "hvac>=2.3",
     "pydantic-settings>=2.7",
-    "structlog>=25.1",
+    "structlog>=26.1.0",
     "python-dotenv>=1.1",
     "pyyaml>=6.0",
 ]
