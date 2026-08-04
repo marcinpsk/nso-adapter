@@ -33,7 +33,11 @@ def normalize(schema: dict[str, Any]) -> str:
     Keys are sorted so a dependency bump that merely reorders dict keys does not
     churn the snapshot; array order (``required``, ``enum``, ``anyOf``, …) is
     preserved because it is semantically meaningful and already deterministic.
+    ``info.version`` mirrors the package version, which semantic-release bumps
+    on every release; it is masked so a release cannot fail this review gate.
     """
+    schema = dict(schema)
+    schema["info"] = {**schema["info"], "version": "0.0.0"}
     return json.dumps(schema, indent=2, sort_keys=True) + "\n"
 
 
