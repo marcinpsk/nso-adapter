@@ -2,6 +2,30 @@
 
 <!-- version list -->
 
+## v0.2.1 (2026-08-04)
+
+### Bug Fixes
+
+- **tests**: Mask the release version in the OpenAPI snapshot gate
+  ([`a2543fb`](https://github.com/marcinpsk/nso-adapter/commit/a2543fb338f474a224e179bfd83ea721c7ed4daa))
+
+### Chores
+
+- **deps**: Bump postgres from 16-alpine to 18-alpine
+  ([`4c9abde`](https://github.com/marcinpsk/nso-adapter/commit/4c9abdeba66b26b77c6a84e70a7df0f4b71b4635))
+
+- **deps**: Bump python from 3.12-slim to 3.14-slim
+  ([`c0808d5`](https://github.com/marcinpsk/nso-adapter/commit/c0808d5d43a9867c7769c7dea0ebd90f8b5c0436))
+
+- **deps**: Bump structlog from 25.5.0 to 26.1.0
+  ([`067bb9b`](https://github.com/marcinpsk/nso-adapter/commit/067bb9b3775526e8ab295526f35ac86a79410ddc))
+
+### Continuous Integration
+
+- Pin all actions to latest release SHAs with accurate version comments
+  ([`e39c913`](https://github.com/marcinpsk/nso-adapter/commit/e39c9130c5d4d6c1a922cd0bf29950a439162ff8))
+
+
 ## v0.2.0 (2026-08-04)
 
 ### Bug Fixes
