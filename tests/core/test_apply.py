@@ -15,6 +15,7 @@ from sqlalchemy import select
 
 from nso_adapter.core.apply import _nokia_routed_kind, enqueue_apply, run_apply
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import (
     DbInterface,
     Device,
@@ -206,6 +207,8 @@ async def _seed_device(name: str = "test-rtr", netbox_id: int = 1) -> int:
     async with session() as db:
         d = Device(nso_instance="nso-dev", nso_device_name=name, netbox_device_id=netbox_id)
         db.add(d)
+        await db.flush()
+        await create_counter(db, d.id)
         await db.commit()
         await db.refresh(d)
         return d.id
@@ -2807,6 +2810,8 @@ async def _seed_nokia_device(name: str, netbox_id: int) -> int:
             ned_id="timos-nc-23.10",
         )
         db.add(d)
+        await db.flush()
+        await create_counter(db, d.id)
         await db.commit()
         await db.refresh(d)
         return d.id

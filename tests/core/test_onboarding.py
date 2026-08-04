@@ -112,25 +112,30 @@ async def test_onboard_resolves_a_lost_insert_race(adapter_client_with_nso):
     onboard_device checks identity with select-then-insert, so two callers can both find
     nothing and both insert. The duplicate would be permanent — the scope reconcile keys
     ownership by netbox_device_id and keeps every row it finds — so the DB constraints decide
-    and the loser re-reads the winner. Simulated by inserting the competing row between this
-    caller's lookup and its commit, which is exactly what the lost race looks like.
+    and the loser re-reads the winner. Simulated by committing the competing row between this
+    caller's lookup and its own INSERT, which is exactly what the lost race looks like.
+
+    Driven off ``flush``, not ``commit``: the insert is flushed there so the settle counter
+    can name the device id (Appendix S §3.3). Injecting at commit would let this caller's
+    INSERT land first, and the rival would then block on OUR uncommitted key instead of
+    racing us to it.
     """
     from nso_adapter.core.onboarding import onboard_device
     from tests.conftest import seed_device
 
     async with session() as db:
-        original_commit = db.commit
+        original_flush = db.flush
         winner_id = {}
 
-        async def commit_after_a_competing_insert():
+        async def flush_after_a_competing_insert():
             if not winner_id:
                 winner_id["id"] = await seed_device(
                     nso_instance="nso-dev", nso_device_name="raced-rtr", netbox_device_id=91
                 )
-            db.commit = original_commit
-            await original_commit()
+            db.flush = original_flush
+            await original_flush()
 
-        db.commit = commit_after_a_competing_insert
+        db.flush = flush_after_a_competing_insert
         device = await onboard_device(db, "nso-dev", "raced-rtr", 91)
         assert device.id == winner_id["id"]  # the winner's row, not a second one
 

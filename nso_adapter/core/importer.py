@@ -40,6 +40,7 @@ from nso_adapter.nso.read_outcome import (  # noqa: F401 — Present used below
     classify_envelope_section,
 )
 from nso_adapter.nso.shape import as_list
+from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import (
     DbInterface,
     Device,
@@ -1356,5 +1357,9 @@ async def discover_devices(db: AsyncSession) -> None:
                 )
             )
             if not result.scalar_one_or_none():
-                db.add(Device(nso_instance=inst.name, nso_device_name=name))
+                device = Device(nso_instance=inst.name, nso_device_name=name)
+                db.add(device)
+                # Same transaction as the device, like every other insert site (Appendix S §3.3).
+                await db.flush()
+                await create_counter(db, device.id)
     await db.commit()

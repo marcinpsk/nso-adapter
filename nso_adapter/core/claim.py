@@ -21,7 +21,13 @@ The rule this module exists to enforce, and it is purpose-independent — ``job`
 
 Lock order for every transaction built here, and for every caller (§3.9):
 
-    device_claim -> devices -> intent/tombstone rows -> jobs
+    device_claim -> devices -> intent/tombstone rows -> jobs -> device_settle_counter
+
+The counter comes AFTER jobs (Appendix S §3.3), and that edge is real: a terminal
+transaction takes the job row and then the counter row, and never reaches back to
+``devices``. It can only stay that way while the counter row is pre-created — a lazy insert
+would validate its FK by taking ``FOR KEY SHARE`` on ``devices``, against offboard which
+holds ``devices FOR UPDATE`` and then reaches for ``jobs``.
 
 Retrying on deadlock does NOT repair an inverted order; it only covers lock upgrades and
 PostgreSQL's own internal ordering. Any new transaction that takes two or more of these
@@ -46,6 +52,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.store.device_settle import allocate_settle_seq
 from nso_adapter.store.models import DeviceClaim, Job, JobStatus, JobType
 
 logger = structlog.get_logger(__name__)
@@ -572,6 +579,11 @@ def abandon_claim_to_staleness(reg: ClaimRegistration, outcome: ClaimOutcome) ->
 # because the one caller that conditionally sets a device has to name it.
 UNSET: object = object()
 
+# The two members that end a job, and the two that allocate a settlement sequence. A
+# non-terminal status reaching :func:`terminalize` is a caller bug, not a variant to serve:
+# it would take a device's sequence for a run that has not finished.
+_TERMINAL_STATUSES = frozenset({JobStatus.succeeded, JobStatus.failed})
+
 
 @dataclass(frozen=True)
 class TerminalWrite:
@@ -579,12 +591,18 @@ class TerminalWrite:
 
     *device_id* is read back from the same statement, so a provision that acquires its
     device in the terminal UPDATE reports the device it just created, not the pre-write
-    NULL.
+    NULL — and the sequence is allocated against that device rather than against the
+    pre-write null.
+
+    *settle_seq* is None exactly when *device_id* is: a provision that failed before
+    acquiring a device, the claimless-corruption failure, and anything offboard has already
+    detached. A device-scoped cursor can never reach any of them.
     """
 
     job_id: int
     status: JobStatus
     device_id: int | None
+    settle_seq: int | None = None
 
 
 async def _cas_job_status(
@@ -635,7 +653,17 @@ async def terminalize(
 
     *set_device_id* takes an explicit sentinel rather than None: only the provision
     success path ever sets one, and omitting the argument must mean "leave it attached".
+
+    A device-bound write also allocates the device's next settlement sequence (Appendix S
+    §3.3), in this same transaction and in this order: the status CAS locks the job row and
+    proves ownership, then the counter UPDATE locks the counter row, then the sequence lands
+    on the job row this transaction already holds. A refused CAS returns before any of it,
+    so a doomed write burns no sequence and takes no device-wide lock. A missing counter row
+    raises: the whole terminal transaction aborts and recovery decides, which is strictly
+    better than the deadlock a lazy create would reintroduce.
     """
+    if status not in _TERMINAL_STATUSES:
+        raise ValueError(f"terminalize is for terminal statuses only, not {status.value}")
     values: dict = {}
     if result is not None:
         values["result"] = result
@@ -653,7 +681,16 @@ async def terminalize(
             expected_attempt=run_attempt,
         )
         return None
-    return TerminalWrite(job_id, status, row.device_id)
+    settle_seq: int | None = None
+    if row.device_id is not None:
+        settle_seq = await allocate_settle_seq(db, row.device_id)
+        await db.execute(
+            sa_update(Job)
+            .where(Job.id == job_id)
+            .values(settle_seq=settle_seq)
+            .execution_options(synchronize_session=False)
+        )
+    return TerminalWrite(job_id, status, row.device_id, settle_seq)
 
 
 async def terminalize_queued_bulk(db: AsyncSession, device_id: int, *, error: dict) -> int:

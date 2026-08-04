@@ -766,7 +766,12 @@ async def start_workers(concurrency: int = 1) -> None:
     """Reconcile orphaned jobs, then start the worker pool."""
     global _stop, _workers
     from nso_adapter.core.tombstone_sweep import sweep_tombstones
+    from nso_adapter.store.device_settle import ensure_settle_counters
 
+    # BEFORE the reaper, not after (Appendix S §3.3). Recovery terminalizes, and a
+    # terminalization that finds no counter row raises — appended after the reaper, this
+    # repair could be aborted out of the lifespan by the very state it exists to fix.
+    await ensure_settle_counters()
     await requeue_orphaned_jobs()
     # Before any worker exists, so a revoked device is immediately claimable again.
     await reap_stale_claims()

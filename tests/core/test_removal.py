@@ -20,6 +20,7 @@ from sqlalchemy import select
 
 from nso_adapter.core import removal as removal_mod
 from nso_adapter.core.removal import enqueue_removal, replace_on_removal
+from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import (
     Device,
     IsisFlexAlgoIntent,
@@ -51,6 +52,8 @@ async def _seed_device(*, nso_device_name: str = "sw3", netbox_device_id: int = 
     async with session() as db:
         d = Device(nso_instance="nso-dev", nso_device_name=nso_device_name, netbox_device_id=netbox_device_id)
         db.add(d)
+        await db.flush()
+        await create_counter(db, d.id)
         await db.commit()
         await db.refresh(d)
         return d.id

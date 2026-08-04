@@ -24,6 +24,7 @@ from nso_adapter.core.jobs import (
     has_any_active_job,
 )
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
 from tests.conftest import session
 
@@ -33,6 +34,8 @@ async def _seed_device(nso_device_name: str = "test-rtr", netbox_id: int = 1) ->
     async with session() as db:
         d = Device(nso_instance="nso-dev", nso_device_name=nso_device_name, netbox_device_id=netbox_id)
         db.add(d)
+        await db.flush()
+        await create_counter(db, d.id)
         await db.commit()
         await db.refresh(d)
         return d.id
@@ -382,6 +385,8 @@ async def test_sync_now_timeout_leaves_last_sync_pair_untouched(adapter_client):
             last_sync_status=LastSyncStatus.succeeded,
         )
         db.add(d)
+        await db.flush()
+        await create_counter(db, d.id)
         await db.commit()
         await db.refresh(d)
         device_id = d.id

@@ -468,6 +468,7 @@ async def seed_device(
             device_id = await seed_device(nso_device_name="my-router")
             resp = await adapter_client.get(f"/api/v1/devices/{device_id}", ...)
     """
+    from nso_adapter.store.device_settle import create_counter
     from nso_adapter.store.models import Device, ManagedScope
 
     async with session() as db:
@@ -478,6 +479,10 @@ async def seed_device(
         )
         db.add(d)
         await db.flush()
+        # Every production insert site creates the counter in the device's own transaction
+        # (Appendix S §3.3); a fixture that skips it mints a device whose first terminal job
+        # raises, which is the hard failure — not a fixture convenience to paper over.
+        await create_counter(db, d.id)
         for attr in ["description"] if attributes is None else attributes:
             db.add(ManagedScope(device_id=d.id, attribute=attr))
         await db.commit()

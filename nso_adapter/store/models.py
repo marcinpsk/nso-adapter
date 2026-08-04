@@ -386,6 +386,23 @@ class Job(Base):
             unique=True,
             postgresql_where=text("status IN ('queued', 'running') AND job_type = 'provision'"),
         ),
+        # Appendix S §3.3: the settlement sequence is unique PER DEVICE, and only where it
+        # was allocated. NULLs are distinct, so the unsequenced rows (queued, running, and
+        # every job offboard has detached) do not collide with each other.
+        Index(
+            "uq_job_settle_seq_per_device",
+            "device_id",
+            "settle_seq",
+            unique=True,
+            postgresql_where=text("settle_seq IS NOT NULL"),
+        ),
+        # The feed's access path: one device's sequenced jobs, walked ascending from a cursor.
+        Index(
+            "ix_job_device_settle_seq",
+            "device_id",
+            "settle_seq",
+            postgresql_where=text("settle_seq IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -407,8 +424,35 @@ class Job(Base):
     # row queued -> running and compared by every terminal write. A status-only predicate
     # cannot tell a successor's run from the abandoned one it replaced.
     run_attempt: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"), default=0)
+    # Appendix S §3.3: the per-device settlement sequence, allocated in the terminal
+    # transaction from :class:`DeviceSettleCounter` under a row lock held to COMMIT, which is
+    # what makes allocation order equal COMMIT order per device. NULL until then — a queued or
+    # running job is invisible to an ascending ``settle_seq > :cursor`` page for free.
+    settle_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     device: Mapped[Device | None] = relationship("Device", back_populates="jobs")
+
+
+class DeviceSettleCounter(Base):
+    """The per-device allocator behind ``Job.settle_seq`` (Appendix S §3.3).
+
+    One row per device, created WITH the device and cascaded away with it. Never created
+    from a terminal transaction: the first insert's FK check takes ``FOR KEY SHARE`` on
+    ``devices``, offboard holds ``devices FOR UPDATE`` and then reaches for ``jobs``, and a
+    lazy insert would close that cycle into a deadlock. A missing row is a hard failure
+    repaired by :func:`store.device_settle.ensure_settle_counters`, never a lazy create.
+
+    Allocation is a plain ``UPDATE … SET last_seq = last_seq + 1 … RETURNING`` that changes
+    no FK column and so takes no lock on ``devices`` at all. A rival on the same device blocks
+    on this row until the allocating transaction commits or aborts.
+    """
+
+    __tablename__ = "device_settle_counter"
+
+    device_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("devices.id", ondelete="CASCADE"), primary_key=True, autoincrement=False
+    )
+    last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"), default=0)
 
 
 class DeviceSettings(Base):

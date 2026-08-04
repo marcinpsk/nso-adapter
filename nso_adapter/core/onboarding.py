@@ -30,6 +30,7 @@ from nso_adapter.core.claim import (
 )
 from nso_adapter.core.families import ALL_FAMILY_KEYS
 from nso_adapter.store import outcome_store
+from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import (
     ActiveAddress,
     Base,
@@ -219,6 +220,10 @@ async def onboard_device(
     )
     db.add(device)
     try:
+        # The settle counter is created WITH the device, in this same transaction: a terminal
+        # write may never create it (Appendix S §3.3), so every insert site owes one.
+        await db.flush()
+        await create_counter(db, device.id)
         await db.commit()
     except IntegrityError:
         # Lost a race with a concurrent onboard of the same device. The checks above are
@@ -381,6 +386,8 @@ async def _insert_device_with_claim(
     try:
         await db.flush()
         db.add(DeviceClaim(device_id=device.id, claim_token=token, purpose="job", job_id=job_id))
+        # Same transaction as the device, like every other insert site (Appendix S §3.3).
+        await create_counter(db, device.id)
         await db.commit()
     except IntegrityError:
         # Provably before COMMIT: a concurrent onboard of the same node or netbox id won.
