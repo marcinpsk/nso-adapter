@@ -233,6 +233,46 @@ async def test_a_cancelled_runs_requeue_cannot_touch_a_successor(adapter_client)
     assert await _attempt(job_id) == 2
 
 
+async def test_a_device_busy_provision_cannot_terminalize_a_successor_run(adapter_client, monkeypatch):
+    """S1.2c sibling — the provision lane's ``device_busy`` refusal is bound by the token.
+
+    ``ClaimUnavailableError`` is raised by the acquisition itself, so the run is still
+    CLAIMLESS and has no claim row to lock. Its registration is the only ownership proof
+    it has, and a write that omits it is a status-only compare-and-set: an abandoned
+    attempt whose mapping is refused would mark the SUCCESSOR's run ``failed``.
+    """
+    from nso_adapter.core.claim import ClaimUnavailableError
+    from nso_adapter.store.models import Job, JobStatus, JobType
+
+    await seed_device(nso_device_name="s1-busy", netbox_device_id=9910)
+    job_id = await _queue(None, JobType.provision, context={"nso_instance": "nso-dev", "device_name": "s1-busy"})
+
+    claimed = await worker_mod._claim_next_job()
+    assert claimed is not None and claimed[0] == job_id
+    abandoned_reg = claimed[3]
+
+    async with session() as db:
+        await db.execute(
+            sa.update(Job)
+            .where(Job.id == job_id)
+            .values(heartbeat_at=datetime.now(UTC) - timedelta(seconds=worker_mod.PROVISION_STALE_AFTER + 600))
+        )
+        await db.commit()
+    await worker_mod.requeue_orphaned_jobs()
+    second = await worker_mod._claim_next_job()
+    assert second is not None and second[0] == job_id
+    assert await _status(job_id) is JobStatus.running
+
+    async def _device_busy(_db, **_params):
+        raise ClaimUnavailableError("device 1 is claimed by another operation")
+
+    monkeypatch.setattr("nso_adapter.core.onboarding.provision_nso_device", _device_busy)
+    await jobs_mod._run_provision(job_id, None, abandoned_reg)
+
+    assert await _status(job_id) is JobStatus.running, "an abandoned provision failed its successor's execution"
+    assert await _attempt(job_id) == 2
+
+
 # ── S1.3 (P0.7): a rejected write changes NO column ──────────────────────────
 
 

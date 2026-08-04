@@ -584,7 +584,9 @@ async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistrat
             # The device stayed claimed for the whole OQ6 budget, so the mapping was refused
             # and NOTHING was written. Honestly retryable — and terminal, so the pair's
             # admission slot frees for the retry. Necessarily still claimless: this is
-            # raised by the acquisition itself.
+            # raised by the acquisition itself, which is exactly why the registration must
+            # ride along — with no claim row to lock, the attempt on it is the only proof
+            # this write belongs to THIS run and not to the successor that replaced it.
             logger.warning("job.provision.device_busy", job_id=job_id, error=repr(exc))
             await _mark_job_failed(
                 db,
@@ -594,6 +596,7 @@ async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistrat
                     "message": "The device is busy — another operation holds it",
                     "detail": {"reason": "claim_unavailable", "retryable": True},
                 },
+                reg,
             )
         except TimeoutError:
             logger.error("job.provision.timeout", job_id=job_id, timeout=_JOB_TIMEOUT)
