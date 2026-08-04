@@ -608,9 +608,16 @@ async def _static_route_bookkeeping(
                 # R3 §4.5: the generation this verdict is about, and this route's OWN error.
                 # Without them the consumer can only settle on presence and can only report
                 # one shared message for every failed route of the scope.
+                #
+                # Scoped to `apply_failed` because the column outlives a pass: an atomic
+                # commit that rolls back in a SIBLING scope leaves the static rows untouched
+                # and `unproven`, still carrying an earlier apply's error — reporting it here
+                # would date a superseded generation's failure to this one. Every
+                # `apply_failed` outcome had its error written by THIS pass (send failure,
+                # reader-compare miss, residue or a stage error), so nothing is lost.
                 "generation": row.intent_generation,
                 "outcome": outcome,
-                "error": row.last_apply_error,
+                "error": row.last_apply_error if outcome == SR_APPLY_FAILED else None,
             }
         )
 

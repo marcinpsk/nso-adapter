@@ -2194,7 +2194,7 @@
         "type": "object"
       },
       "IntentApplyResult": {
-        "description": "Shared 2xx body for the full-replace intent PUTs.\n\nEight intent endpoints (static-route/vlan/svi/subinterface/l2-sap/logging/\nbfd/interface-mtu) return exactly this shape: how many rows the payload wrote\n(``count``), how many it dropped (``removed``), and whether a PUT-replace was\nenqueued to revert a removal/clear on the device (``replaced``). Endpoints\nwith a different summary (bgp/ospf/isis/snmp/ip) keep their own inline model.",
+        "description": "Shared 2xx body for the full-replace intent PUTs.\n\nSeven intent endpoints (vlan/svi/subinterface/l2-sap/logging/bfd/interface-mtu)\nreturn exactly this shape: how many rows the payload wrote (``count``), how many\nit dropped (``removed``), and whether a PUT-replace was enqueued to revert a\nremoval/clear on the device (``replaced``). Endpoints with a different summary\n(bgp/ospf/isis/snmp/ip) keep their own inline model, and static-route EXTENDS this\none with its per-route settlement echo (``StaticRouteIntentResult``).",
         "properties": {
           "count": {
             "title": "Count",

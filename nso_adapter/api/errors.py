@@ -98,11 +98,12 @@ class ErrorEnvelope(BaseModel):
 class IntentApplyResult(BaseModel):
     """Shared 2xx body for the full-replace intent PUTs.
 
-    Eight intent endpoints (static-route/vlan/svi/subinterface/l2-sap/logging/
-    bfd/interface-mtu) return exactly this shape: how many rows the payload wrote
-    (``count``), how many it dropped (``removed``), and whether a PUT-replace was
-    enqueued to revert a removal/clear on the device (``replaced``). Endpoints
-    with a different summary (bgp/ospf/isis/snmp/ip) keep their own inline model.
+    Seven intent endpoints (vlan/svi/subinterface/l2-sap/logging/bfd/interface-mtu)
+    return exactly this shape: how many rows the payload wrote (``count``), how many
+    it dropped (``removed``), and whether a PUT-replace was enqueued to revert a
+    removal/clear on the device (``replaced``). Endpoints with a different summary
+    (bgp/ospf/isis/snmp/ip) keep their own inline model, and static-route EXTENDS this
+    one with its per-route settlement echo (``StaticRouteIntentResult``).
     """
 
     device_id: int

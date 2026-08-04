@@ -149,8 +149,19 @@ def atomic_client(device_name: str, *, state, section: dict, dry_run_status: int
     return client, rec
 
 
-async def seed_replacement(device_id: int, *, last_apply_at=None) -> None:
-    await seed_rows(device_id, [{"triple": B, "route_id": 7, "deployed_key": list(A), "last_apply_at": last_apply_at}])
+async def seed_replacement(device_id: int, *, last_apply_at=None, last_apply_error=None) -> None:
+    await seed_rows(
+        device_id,
+        [
+            {
+                "triple": B,
+                "route_id": 7,
+                "deployed_key": list(A),
+                "last_apply_at": last_apply_at,
+                "last_apply_error": last_apply_error,
+            }
+        ],
+    )
 
 
 # ── C5.1 — the replacement leaves the combined transaction, and a PUT follows ─
@@ -213,6 +224,33 @@ async def test_c5_2_a_failed_combined_commit_issues_no_follow_on_put(adapter_cli
     assert await static_rows(device_id) == [(None, None)], "pending, NOT stamped failed"
     assert await deployed_keys(device_id) == {B: list(A)}, "the replacement stays open"
     assert outcomes(job) == {B: "unproven"}, "nothing was delivered, so nothing is proven"
+
+
+async def test_p0_2_an_untouched_row_does_not_pair_a_previous_error_with_this_result(adapter_client):
+    """#1396 R3 P0 — C5.2's row, but carrying an error an EARLIER apply left on it.
+
+    This is the one path where a row keeps a persisted ``last_apply_error`` while this pass
+    neither delivered nor failed it: the combined commit rolls back in a sibling scope, the
+    static rows are deliberately left untouched, and the outcome is ``unproven``. Reading the
+    column straight into the record would hand a generation-correlated consumer a failure
+    from a superseded generation as though it described this one. The row keeps its error —
+    it is still the store's last known failure — but the record must not claim it.
+    """
+    device_id = await seed_device(nso_device_name="sr-atomic", netbox_device_id=7504)
+    stale = {"code": "internal", "message": "a previous apply failed", "detail": {}}
+    await seed_replacement(device_id, last_apply_error=stale)
+    await seed_vlan(device_id)
+    client, rec = atomic_client(
+        "sr-atomic", state=present(wire(A), device_name="sr-atomic"), section=dev_state(wire(B))
+    )
+    rec.fail_combined = True
+
+    job = await run_the_apply(device_id, client)
+
+    entry = job.result["static_route_results"][0]
+    assert entry["outcome"] == "unproven"
+    assert entry["error"] is None, "this pass produced no verdict for this route"
+    assert await static_rows(device_id) == [(None, stale)], "the row still holds it — only the record is scoped"
 
 
 # ── C5.3 — a failed follow-on fails the job, and only the static rows ────────

@@ -65,6 +65,7 @@ async def seed_rows(device_id: int, specs: list[dict]) -> dict[tuple, int]:
                 deployed_key=spec.get("deployed_key"),
                 accepted_at=spec.get("accepted_at", _NOW),
                 last_apply_at=spec.get("last_apply_at"),
+                last_apply_error=spec.get("last_apply_error"),
                 pending_clear=spec.get("pending_clear"),
             )
             db.add(row)
