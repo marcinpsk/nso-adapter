@@ -37,7 +37,7 @@ services:
   # supported runtime engine. container_name is host-unique on purpose (several
   # Postgres run on this host).
   adapter-db:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     container_name: nso-adapter-postgres-dev
     restart: unless-stopped
     environment:
@@ -57,7 +57,7 @@ services:
   # Throwaway test server. NOT the dev application DB (adapter-db) — the suite CREATEs
   # and DROPs a database per test and must never be pointed at dev data.
   adapter-test-db:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     container_name: nso-adapter-postgres-test
     restart: unless-stopped
     environment:
