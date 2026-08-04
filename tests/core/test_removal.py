@@ -58,10 +58,13 @@ async def _seed_device(*, nso_device_name: str = "sw3", netbox_device_id: int = 
 
 async def _seed_removal_job(device_id: int, scope: str = "vlan", context_extra: dict | None = None) -> int:
     async with session() as db:
+        # Started, at attempt 1: run_removal is invoked directly, so nothing else performs
+        # the worker head's queued -> running transition its terminal CAS expects.
         j = Job(
             job_type=JobType.removal,
             device_id=device_id,
-            status=JobStatus.queued,
+            status=JobStatus.running,
+            run_attempt=1,
             context={"scope": scope, **(context_extra or {})},
         )
         db.add(j)

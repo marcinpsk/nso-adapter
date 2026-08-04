@@ -485,6 +485,27 @@ async def seed_device(
         return d.id
 
 
+async def start_job(job_id: int) -> int:
+    """Stand in for the worker head's ``queued -> running`` transition. Returns the attempt.
+
+    Production runners are only ever entered by the worker, which owns that transition and
+    the run-attempt bump (Appendix S §3.1). A test that invokes a runner directly has to
+    perform it, or the runner's terminal compare-and-set correctly refuses to write over a
+    job no execution has started.
+    """
+    from nso_adapter.store.models import Job, JobStatus
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        if job is None:
+            return 0
+        if job.status is JobStatus.queued:
+            job.status = JobStatus.running
+            job.run_attempt = job.run_attempt + 1
+            await db.commit()
+        return job.run_attempt
+
+
 async def seed_l2_saps(device_id: int, services: list[dict]):
     """Insert DeviceL2Sap rows from a list of service dicts.
 

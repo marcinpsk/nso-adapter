@@ -868,13 +868,12 @@ async def offboard_device(db: AsyncSession, device: Device) -> None:
     """
     from sqlalchemy import delete, update
 
-    from nso_adapter.core.claim import acquire_claim_or_refuse
+    from nso_adapter.core.claim import acquire_claim_or_refuse, terminalize_queued_bulk
     from nso_adapter.store.models import (
         InterfaceAttrState,
         InterfaceIntent,
         InterfaceIpIntent,
         Job,
-        JobStatus,
     )
 
     device_id = device.id
@@ -909,17 +908,14 @@ async def offboard_device(db: AsyncSession, device: Device) -> None:
         # job manufactures a non-provision claimless job, which breaks the worker's
         # claimless bypass — it would dispatch it with device_id=None against a device that
         # no longer exists.
-        await db.execute(
-            update(Job)
-            .where(Job.device_id == device_id, Job.status == JobStatus.queued)
-            .values(
-                status=JobStatus.failed,
-                error={
-                    "code": "device_offboarded",
-                    "message": "The device was offboarded before this job ran",
-                    "detail": {},
-                },
-            )
+        await terminalize_queued_bulk(
+            db,
+            device_id,
+            error={
+                "code": "device_offboarded",
+                "message": "The device was offboarded before this job ran",
+                "detail": {},
+            },
         )
         # Null-out device_id on jobs so history is preserved (device_id is nullable by design)
         await db.execute(update(Job).where(Job.device_id == device_id).values(device_id=None))

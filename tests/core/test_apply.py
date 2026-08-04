@@ -211,9 +211,19 @@ async def _seed_device(name: str = "test-rtr", netbox_id: int = 1) -> int:
         return d.id
 
 
-async def _seed_apply_job(device_id: int, status: JobStatus = JobStatus.queued) -> int:
+async def _seed_apply_job(device_id: int, status: JobStatus = JobStatus.running) -> int:
+    """A job as the WORKER HEAD leaves it: started, at attempt 1.
+
+    ``run_apply`` is invoked directly here, so nothing performs the ``queued -> running``
+    transition, and its terminal compare-and-set expects ``running`` (Appendix S §3.1).
+    """
     async with session() as db:
-        j = Job(job_type=JobType.apply, device_id=device_id, status=status)
+        j = Job(
+            job_type=JobType.apply,
+            device_id=device_id,
+            status=status,
+            run_attempt=1 if status is JobStatus.running else 0,
+        )
         db.add(j)
         await db.commit()
         await db.refresh(j)

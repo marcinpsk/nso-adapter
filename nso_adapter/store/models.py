@@ -403,6 +403,10 @@ class Job(Base):
     # and requeued (or failed) on the next startup.
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Appendix S §3.1: the per-execution token, bumped in the same UPDATE that moves the
+    # row queued -> running and compared by every terminal write. A status-only predicate
+    # cannot tell a successor's run from the abandoned one it replaced.
+    run_attempt: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"), default=0)
 
     device: Mapped[Device | None] = relationship("Device", back_populates="jobs")
 

@@ -159,12 +159,22 @@ class ClaimRegistration:
     The worker owns it; the runner and the heartbeat hold the SAME object. A provision
     acquires its claim mid-run, so anything that reads the token at task-creation time
     would keep seeing ``None`` and either leak the claim or write unguarded.
+
+    *run_attempt* is Appendix S's execution token: the value ``jobs.run_attempt`` was
+    bumped to when this run was started. It reaches every runner through this same
+    object, which is why every terminal writer can name the execution it belongs to.
+    It is ``None`` only on the claimless lanes that have no execution to name.
     """
 
-    __slots__ = ("device_id", "token")
+    __slots__ = ("device_id", "run_attempt", "token")
 
-    def __init__(self, device_id: int | None = None, token: str | None = None) -> None:
-        self.device_id, self.token = device_id, token
+    def __init__(
+        self,
+        device_id: int | None = None,
+        token: str | None = None,
+        run_attempt: int | None = None,
+    ) -> None:
+        self.device_id, self.token, self.run_attempt = device_id, token, run_attempt
 
     @property
     def registered(self) -> bool:
@@ -177,7 +187,7 @@ class ClaimRegistration:
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         state = "registered" if self.registered else "unregistered"
-        return f"ClaimRegistration(device_id={self.device_id}, {state})"
+        return f"ClaimRegistration(device_id={self.device_id}, attempt={self.run_attempt}, {state})"
 
 
 @dataclass(frozen=True)
@@ -549,17 +559,151 @@ def abandon_claim_to_staleness(reg: ClaimRegistration, outcome: ClaimOutcome) ->
     )
 
 
+# ── the ONE terminal writer (Appendix S §3.2) ────────────────────────────────
+#
+# Sixteen physical terminal writes across six modules was the failure mode: a
+# seventeenth that forgets the compare-and-set produces a job whose result no consumer
+# can order or attribute, silently. Every per-job status write now runs through
+# :func:`_cas_job_status` here, and ``tests/test_no_direct_terminal_write.py`` fails the
+# build on any module outside this one that assigns a terminal status.
+
+# "leave device_id unchanged". NOT None, which is a legal value the provision success path
+# is the only caller ever to pass, and which an omission must never be read as. Public
+# because the one caller that conditionally sets a device has to name it.
+UNSET: object = object()
+
+
+@dataclass(frozen=True)
+class TerminalWrite:
+    """What a terminal compare-and-set actually wrote.
+
+    *device_id* is read back from the same statement, so a provision that acquires its
+    device in the terminal UPDATE reports the device it just created, not the pre-write
+    NULL.
+    """
+
+    job_id: int
+    status: JobStatus
+    device_id: int | None
+
+
+async def _cas_job_status(
+    db: AsyncSession,
+    job_id: int,
+    *,
+    status: JobStatus,
+    expect: JobStatus,
+    run_attempt: int | None,
+    values: dict | None = None,
+):
+    """Issue the single physical ``jobs.status`` UPDATE; return the row, None on a miss.
+
+    The predicate proves ownership: the status the caller observed AND, for anything with
+    an execution to name, the attempt that execution was started at. *run_attempt* is None
+    only for the queued-sourced writers (offboard, the claimless-corruption failure),
+    which have no execution.
+    """
+    where = [Job.id == job_id, Job.status == expect]
+    if run_attempt is not None:
+        where.append(Job.run_attempt == run_attempt)
+    stmt = (
+        sa_update(Job)
+        .where(*where)
+        .values(status=status, **(values or {}))
+        .returning(Job.device_id)
+        .execution_options(synchronize_session=False)
+    )
+    return (await db.execute(stmt)).one_or_none()
+
+
+async def terminalize(
+    db: AsyncSession,
+    job_id: int,
+    *,
+    status: JobStatus,
+    expect: JobStatus,
+    run_attempt: int | None = None,
+    result: dict | None = None,
+    error: dict | None = None,
+    set_device_id: object = UNSET,
+) -> TerminalWrite | None:
+    """Write one job's terminal status under its ownership predicate. Caller commits.
+
+    Returns None when the predicate matched no row — another execution owns this job, and
+    the caller must treat that as such, never as success. Nothing is written in that case,
+    so the row is left byte-identical for whoever does own it.
+
+    *set_device_id* takes an explicit sentinel rather than None: only the provision
+    success path ever sets one, and omitting the argument must mean "leave it attached".
+    """
+    values: dict = {}
+    if result is not None:
+        values["result"] = result
+    if error is not None:
+        values["error"] = error
+    if set_device_id is not UNSET:
+        values["device_id"] = set_device_id
+    row = await _cas_job_status(db, job_id, status=status, expect=expect, run_attempt=run_attempt, values=values)
+    if row is None:
+        logger.error(
+            "job.terminal_write_refused",
+            job_id=job_id,
+            requested=status.value,
+            expected_status=expect.value,
+            expected_attempt=run_attempt,
+        )
+        return None
+    return TerminalWrite(job_id, status, row.device_id)
+
+
+async def terminalize_queued_bulk(db: AsyncSession, device_id: int, *, error: dict) -> int:
+    """Terminalize EVERY queued job of a device in one statement. Caller commits.
+
+    Offboard's writer. A per-job helper cannot express it: the row set is unbounded and
+    the transaction that runs it goes on to detach every job of the device, terminal ones
+    included. There is no execution to name, so the predicate is the queued status alone.
+    """
+    result = await db.execute(
+        sa_update(Job)
+        .where(Job.device_id == device_id, Job.status == JobStatus.queued)
+        .values(status=JobStatus.failed, error=error)
+        .execution_options(synchronize_session=False)
+    )
+    return result.rowcount
+
+
+async def _queued_successor_id(db: AsyncSession, device_id: int, job_type: JobType) -> int | None:
+    return await db.scalar(
+        select(Job.id)
+        .where(Job.device_id == device_id, Job.job_type == job_type, Job.status == JobStatus.queued)
+        .limit(1)
+    )
+
+
+def _superseded_error(successor_id: int | None) -> dict:
+    return {
+        "code": "superseded",
+        "message": "Interrupted; an equivalent queued job covers the re-run",
+        "detail": {"queued_successor_id": successor_id},
+    }
+
+
 async def terminalize_running(
     db: AsyncSession,
     job_id: int,
     *,
     status: JobStatus,
     error: dict | None = None,
+    expected_attempt: int | None = None,
 ) -> JobStatus | None:
-    """Move a still-running job to *status*; return what was written, None if not running.
+    """Recovery's re-disposition of a still-running job; returns what was WRITTEN.
 
     The status guard matters: a runner can commit its own terminal status and be cancelled
-    at the very next await, and rewriting that would re-run finished work.
+    at the very next await, and rewriting that would re-run finished work. *expected_attempt*
+    is the second half of the predicate and closes the ABA the status alone leaves open —
+    ``requeue_orphaned_jobs`` reads its candidates without a row lock and terminalizes them
+    statements later, with no claim barrier, so a status-only CAS lands on whatever is
+    ``running`` when the UPDATE runs rather than on the run recovery judged stale.
 
     A requeue coalesces with a queued same-type successor: admission deliberately lets a
     running job's successor queue up, so the (device, type) uniqueness slot may already be
@@ -567,7 +711,13 @@ async def terminalize_running(
     lands ``failed``/``superseded`` instead; the successor re-runs the same idempotent
     work. Removals are exempt from the index (one job per scope, all must run) and always
     requeue.
+
+    The coalescing decision spans two statements, and admission can commit a successor
+    between them, so the requeue UPDATE runs in a SAVEPOINT: the resulting ``IntegrityError``
+    would otherwise abort the CALLER's whole transaction — a whole recovery batch — instead
+    of returning the ``failed``/``superseded`` outcome this docstring already promises.
     """
+    coalescible: tuple[int, JobType] | None = None
     if status == JobStatus.queued:
         row = (
             await db.execute(
@@ -575,30 +725,43 @@ async def terminalize_running(
             )
         ).one_or_none()
         if row is not None and row.device_id is not None and row.job_type != JobType.removal:
-            successor_id = await db.scalar(
-                select(Job.id)
-                .where(
-                    Job.device_id == row.device_id,
-                    Job.job_type == row.job_type,
-                    Job.status == JobStatus.queued,
-                )
-                .limit(1)
-            )
+            coalescible = (row.device_id, row.job_type)
+            successor_id = await _queued_successor_id(db, *coalescible)
             if successor_id is not None:
-                status = JobStatus.failed
-                error = {
-                    "code": "superseded",
-                    "message": "Interrupted; an equivalent queued job covers the re-run",
-                    "detail": {"queued_successor_id": successor_id},
-                }
-    values: dict = {"status": status}
-    if error is not None:
-        values["error"] = error
+                status, error = JobStatus.failed, _superseded_error(successor_id)
+
     if status == JobStatus.queued:
-        values["started_at"] = None
-        values["heartbeat_at"] = None
-    result = await db.execute(sa_update(Job).where(Job.id == job_id, Job.status == JobStatus.running).values(**values))
-    return status if result.rowcount else None
+        values: dict = {"started_at": None, "heartbeat_at": None}
+        if error is not None:
+            values["error"] = error
+        try:
+            async with db.begin_nested():
+                landed = await _cas_job_status(
+                    db,
+                    job_id,
+                    status=status,
+                    expect=JobStatus.running,
+                    run_attempt=expected_attempt,
+                    values=values,
+                )
+        except IntegrityError:
+            # A successor was admitted between the lookup and the UPDATE. The savepoint
+            # absorbed it; re-read and re-issue as the coalesced failure.
+            successor_id = await _queued_successor_id(db, *coalescible) if coalescible else None
+            logger.warning("claim.requeue_raced_a_successor", job_id=job_id, queued_successor_id=successor_id)
+            status, error = JobStatus.failed, _superseded_error(successor_id)
+        else:
+            return JobStatus.queued if landed is not None else None
+
+    write = await terminalize(
+        db,
+        job_id,
+        status=status,
+        expect=JobStatus.running,
+        run_attempt=expected_attempt,
+        error=error,
+    )
+    return write.status if write is not None else None
 
 
 async def mark_failed_and_release(
@@ -625,6 +788,7 @@ async def mark_failed_and_release(
                 job_id,
                 status=JobStatus.failed,
                 error={"code": code, "message": message, "detail": {}},
+                expected_attempt=reg.run_attempt,
             )
             await _delete_own_claim(conn, reg)
         except ClaimLostError:
@@ -662,7 +826,7 @@ async def dispose_cancelled(
                 if status == JobStatus.failed
                 else None
             )
-            await terminalize_running(conn, job_id, status=status, error=error)
+            await terminalize_running(conn, job_id, status=status, error=error, expected_attempt=reg.run_attempt)
             await _delete_own_claim(conn, reg)
         except ClaimLostError:
             logger.warning("claim.dispose_claim_lost", job_id=job_id, device_id=reg.device_id)
@@ -731,9 +895,10 @@ async def revoke_stale_claims(
             revoked.append(RevokedClaim(device_id, token, job_id, purpose))
             if job_id is None:
                 continue
-            job_type = await conn.scalar(select(Job.job_type).where(Job.id == job_id))
-            if job_type is None:
+            observed = (await conn.execute(select(Job.job_type, Job.run_attempt).where(Job.id == job_id))).one_or_none()
+            if observed is None:
                 continue
+            job_type, run_attempt = observed
             await terminalize_running(
                 conn,
                 job_id,
@@ -743,6 +908,10 @@ async def revoke_stale_claims(
                     if disposition_for(job_type) == JobStatus.failed
                     else None
                 ),
+                # Carried for uniformity, not for safety: this path's own DELETE holds the
+                # device_claim primary-key row lock to COMMIT, and re-acquisition inserts
+                # that same key, so no successor can re-enter `running` before it lands.
+                expected_attempt=run_attempt,
             )
         await conn.commit()
     for entry in revoked:

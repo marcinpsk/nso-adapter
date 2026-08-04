@@ -296,7 +296,8 @@ async def test_claim_timeout_fails_provision_retryably(adapter_client_with_nso, 
         job = Job(
             job_type=JobType.provision,
             device_id=None,
-            status=JobStatus.queued,
+            status=JobStatus.running,
+            run_attempt=1,
             context={
                 "nso_instance": _INSTANCE,
                 "device_name": "pg-busy",

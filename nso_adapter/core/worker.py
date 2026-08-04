@@ -16,10 +16,11 @@ Concurrency defaults to 1 (serial). A higher count only adds *cross-device*
 parallelism: the per-device claim serializes execution on any one device, whatever
 the worker count, at the cost of more concurrent NSO/NetBox load.
 
-Note: the runners themselves own the terminal status transition (they set
-``running`` on entry and ``succeeded``/``failed`` on exit, each wrapped in a
-600s timeout).  The worker's job is to *claim* (so two workers never grab the
-same row) and *heartbeat*; the runner's redundant ``running`` set is harmless.
+Note: the ``queued -> running`` transition happens HERE and nowhere else — the claimed
+head and the claimless head are the only two sites, and each bumps ``jobs.run_attempt``
+in the same UPDATE (Appendix S §3.1). The runners own only the terminal transition, and
+they take that through ``core.claim.terminalize``, naming the attempt they were started
+at. A runner that re-wrote ``running`` would be a third, unguarded bump site.
 """
 
 from __future__ import annotations
@@ -52,6 +53,7 @@ from nso_adapter.core.claim import (
     lock_claim,
     mark_failed_and_release,
     release_claim,
+    terminalize,
     terminalize_running,
 )
 from nso_adapter.store.db import get_session
@@ -113,14 +115,20 @@ async def _discover_candidates() -> list[int | None]:
     return []
 
 
-async def _start_claimless_head(device_id_is_null_head: Job, db) -> tuple[int, None, JobType] | None:
-    """Start a claimless (provision) job that has already been locked."""
+async def _start_claimless_head(device_id_is_null_head: Job, db) -> tuple[int, None, JobType, int] | None:
+    """Start a claimless (provision) job that has already been locked.
+
+    One of the two ``queued -> running`` transitions, so one of the two sites that bump
+    the run-attempt token. The row is held ``FOR UPDATE``, so read-then-increment is
+    serialized by the lock rather than by the arithmetic.
+    """
     job = device_id_is_null_head
-    claimed = (job.id, None, job.job_type)
     now = _now()
     job.status = JobStatus.running
     job.started_at = now
     job.heartbeat_at = now
+    job.run_attempt = job.run_attempt + 1
+    claimed = (job.id, None, job.job_type, job.run_attempt)
     await db.commit()
     return claimed
 
@@ -152,7 +160,8 @@ async def _claim_next_job() -> tuple[int, int | None, JobType, ClaimRegistration
         if device_id is None:
             claimed = await _claim_next_claimless_job()
             if claimed is not None:
-                return (*claimed, ClaimRegistration())
+                job_id, _none, job_type, attempt = claimed
+                return (job_id, None, job_type, ClaimRegistration(run_attempt=attempt))
             continue
 
         reg = await acquire_claim(device_id, "job")
@@ -196,6 +205,11 @@ async def _start_head_under_claim(device_id: int, reg: ClaimRegistration) -> tup
         job.status = JobStatus.running
         job.started_at = now
         job.heartbeat_at = now
+        # The run-attempt bump rides the SAME UPDATE as the transition (Appendix S §3.1),
+        # under the row lock taken above. The registration carries it to every terminal
+        # writer, so each can name the execution it belongs to.
+        job.run_attempt = job.run_attempt + 1
+        reg.run_attempt = job.run_attempt
         # Association and the running transition in the SAME guarded transaction: a crash
         # between them would leave a queued job plus a job-less claim, which recovery handles,
         # but a released claim with a running job would be unrecoverable.
@@ -209,7 +223,7 @@ async def _start_head_under_claim(device_id: int, reg: ClaimRegistration) -> tup
     return None
 
 
-async def _claim_next_claimless_job() -> tuple[int, None, JobType] | None:
+async def _claim_next_claimless_job() -> tuple[int, None, JobType, int] | None:
     """Start the oldest queued ``device_id IS NULL`` job. Provision only.
 
     Any OTHER type with no device is a corrupt row: the worker would dispatch it with
@@ -230,12 +244,19 @@ async def _claim_next_claimless_job() -> tuple[int, None, JobType] | None:
             return None
         if job.job_type is not JobType.provision:
             logger.error("worker.orphaned_claimless", job_id=job.id, job_type=str(job.job_type))
-            job.status = JobStatus.failed
-            job.error = {
-                "code": "orphaned_claimless",
-                "message": f"{job.job_type} job has no device_id; only provision may be claimless",
-                "detail": {},
-            }
+            # Queued-sourced: there is no execution to name, so no token. The row is held
+            # FOR UPDATE and its status was proven `queued` by the same SELECT.
+            await terminalize(
+                db,
+                job.id,
+                status=JobStatus.failed,
+                expect=JobStatus.queued,
+                error={
+                    "code": "orphaned_claimless",
+                    "message": f"{job.job_type} job has no device_id; only provision may be claimless",
+                    "detail": {},
+                },
+            )
             await db.commit()
             return None
         return await _start_claimless_head(job, db)
@@ -252,7 +273,8 @@ async def _mark_failed(job_id: int, code: str, message: str, reg: ClaimRegistrat
 
     It still writes a terminal status on a claimed device, so it takes the claim row lock
     first when *reg* is supplied: otherwise it can overwrite the disposition recovery
-    already made, or a fresh worker's ``running``.
+    already made, or a fresh worker's ``running``. The attempt on *reg* is the second half
+    of that guard, and it covers the claimless lane too, which has no claim to lock.
     """
     async for db in get_session():
         if reg is not None:
@@ -261,11 +283,14 @@ async def _mark_failed(job_id: int, code: str, message: str, reg: ClaimRegistrat
             except ClaimLostError:
                 logger.warning("worker.mark_failed_claim_lost", job_id=job_id, device_id=reg.device_id)
                 return
-        job = await db.get(Job, job_id)
-        if job is None:
-            return
-        job.status = JobStatus.failed
-        job.error = {"code": code, "message": message, "detail": {}}
+        await terminalize(
+            db,
+            job_id,
+            status=JobStatus.failed,
+            expect=JobStatus.running,
+            run_attempt=reg.run_attempt if reg is not None else None,
+            error={"code": code, "message": message, "detail": {}},
+        )
         await db.commit()
 
 
@@ -614,11 +639,12 @@ async def _dispose(job_id: int, job_type: JobType, reg: ClaimRegistration) -> Cl
     """Disposition a cancelled run, claimed or claimless depending on the live registration."""
     if reg.registered:
         return await dispose_cancelled(job_id, job_type, reg)
-    # The claimless lane: status only, nothing to release.
+    # The claimless lane: status only, nothing to release. The registration is unregistered
+    # here but still carries this run's attempt, which is the only ownership proof available.
     if disposition_for(job_type) is JobStatus.queued:
-        await _requeue_own_claim(job_id, job_type)
+        await _requeue_own_claim(job_id, job_type, run_attempt=reg.run_attempt)
     else:
-        await _mark_failed(job_id, "cancelled", "Worker cancelled the run")
+        await _mark_failed(job_id, "cancelled", "Worker cancelled the run", reg)
     return ClaimOutcome.COMMIT_ACKNOWLEDGED
 
 
@@ -626,7 +652,7 @@ async def _fail_and_release(job_id: int, message: str, reg: ClaimRegistration) -
     """Terminal failure: status AND release in one transaction when a claim is held."""
     if reg.registered:
         return await mark_failed_and_release(job_id, "internal", message, reg)
-    await _mark_failed(job_id, "internal", message)
+    await _mark_failed(job_id, "internal", message, reg)
     return ClaimOutcome.COMMIT_ACKNOWLEDGED
 
 
@@ -635,20 +661,23 @@ async def _release(reg: ClaimRegistration) -> ClaimOutcome:
     return await release_claim(reg)
 
 
-async def _requeue_own_claim(job_id: int, job_type: JobType) -> None:
+async def _requeue_own_claim(job_id: int, job_type: JobType, *, run_attempt: int | None = None) -> None:
     """Best-effort: return a cancelled mid-run claim to the queue (S5a A2).
 
     Status-guarded (codex R4-4): the runner may have committed a terminal status and been
     cancelled at the very next await — ``WHERE status = 'running'`` never re-runs a
-    finished job. Only whitelisted (idempotent) types are requeued; an interrupted apply
-    keeps its existing never-requeue semantics. Best-effort: a second cancel landing
-    mid-requeue leaves recovery to the periodic reap instead.
+    finished job. *run_attempt* is the rest of that guard: this disposition can arrive
+    after recovery already requeued the job and a SUCCESSOR re-entered ``running``, and a
+    status-only predicate would return that successor's execution to the queue. Only
+    whitelisted (idempotent) types are requeued; an interrupted apply keeps its existing
+    never-requeue semantics. Best-effort: a second cancel landing mid-requeue leaves
+    recovery to the periodic reap instead.
     """
     if disposition_for(job_type) is not JobStatus.queued:
         return
     try:
         async for db in get_session():
-            landed = await terminalize_running(db, job_id, status=JobStatus.queued)
+            landed = await terminalize_running(db, job_id, status=JobStatus.queued, expected_attempt=run_attempt)
             await db.commit()
             if landed is not None:
                 logger.warning("worker.requeued_cancelled_claim", job_id=job_id, landed=landed.value)
@@ -702,12 +731,17 @@ async def requeue_orphaned_jobs() -> None:
         # "No claim covers it": a claimed job is the claim scan's business, not ours.
         uncovered = ~select(DeviceClaim.device_id).where(DeviceClaim.job_id == Job.id).exists()
 
+        # The attempt rides the candidate SELECT: this lane holds no claim by construction
+        # and takes no row lock, so the attempt observed HERE is the only thing that ties
+        # the UPDATE below to the execution this pass judged stale.
         rows = (
-            await db.execute(select(Job.id, Job.job_type).where(Job.status == JobStatus.running, stale, uncovered))
+            await db.execute(
+                select(Job.id, Job.job_type, Job.run_attempt).where(Job.status == JobStatus.running, stale, uncovered)
+            )
         ).all()
 
         requeued = failed = 0
-        for job_id, job_type in rows:
+        for job_id, job_type, run_attempt in rows:
             target = disposition_for(job_type)
             error = None
             if target is JobStatus.failed:
@@ -716,7 +750,7 @@ async def requeue_orphaned_jobs() -> None:
                     "message": "Adapter restarted while the job was running",
                     "detail": {},
                 }
-            landed = await terminalize_running(db, job_id, status=target, error=error)
+            landed = await terminalize_running(db, job_id, status=target, error=error, expected_attempt=run_attempt)
             if landed is JobStatus.queued:
                 requeued += 1
             elif landed is not None:
