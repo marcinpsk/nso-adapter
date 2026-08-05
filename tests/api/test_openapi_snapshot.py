@@ -111,3 +111,10 @@ def test_all_internal_refs_resolve(openapi_schema):
     internal = {ref for ref in _iter_refs(openapi_schema) if ref.startswith("#/")}
     dangling = sorted(ref for ref in internal if not _resolve_pointer(openapi_schema, ref))
     assert not dangling, f"OpenAPI $ref targets not present in the document: {dangling}"
+
+
+def test_normalize_masks_the_release_version(openapi_schema):
+    # semantic-release bumps the package version each release; the review gate
+    # must not fail on that bump (it did once: v0.2.0 broke main's CI).
+    bumped = {**openapi_schema, "info": {**openapi_schema["info"], "version": "99.99.99"}}
+    assert normalize(bumped) == normalize(openapi_schema)
