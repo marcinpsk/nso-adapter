@@ -335,3 +335,40 @@ async def test_a_new_row_carries_nothing(adapter_client):
     await put_intent(adapter_client, device_id, [route(X, route_id=1)])
     assert await carriers(device_id) == {X: None}
     assert await removal_jobs(device_id) == []
+
+
+async def stored_metrics(device_id: int) -> dict[tuple, int | None]:
+    """``{triple: metric}`` for every intent row of the device."""
+    from nso_adapter.store.models import StaticRouteIntent
+
+    async with session() as db:
+        rows = (
+            (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        return {(r.vrf, r.prefix, r.next_hop): r.metric for r in rows}
+
+
+async def test_p1_3_a_timos_metric_edit_records_no_clear_and_no_removal(adapter_client):
+    """#1396 P1.3's owed adapter half (R3-A2(iii)): an edit 3 → 5 clears nothing.
+
+    Nokia's default preference 5 used to be suppressed on the pusher's wire, so the edit
+    arrived as an *omission* — and an omitted leaf is a clear, NED-agnostically. That cost a
+    clear record and a networked retract for a value the device already had. The pusher now
+    always sends the metric; this is the other half of that contract, read off the store.
+
+    The second arm is what makes the first discriminating: with the metric omitted, the very
+    same edit does record the clear, so the green above is a statement about the payload and
+    not about this test being unable to see one.
+    """
+    device_id = await seed_device(nso_device_name="sr-pc-timos", netbox_device_id=7113)
+    await put_intent(adapter_client, device_id, [route(X, route_id=41, metric=3)])
+    await put_intent(adapter_client, device_id, [route(X, route_id=41, metric=5)])
+
+    assert await stored_metrics(device_id) == {X: 5}
+    assert await carriers(device_id) == {X: None}
+    assert await removal_jobs(device_id) == []
+
+    await put_intent(adapter_client, device_id, [route(X, route_id=41)])
+    assert await carriers(device_id) == {X: {"authorized": ["metric"], "store_only": []}}

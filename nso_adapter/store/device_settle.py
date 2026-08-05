@@ -104,8 +104,10 @@ async def allocate_settle_seq(db: AsyncSession, device_id: int) -> int:
     equals commit order PER DEVICE. Cross-device pairs interleave freely, which is allowed —
     the consumer's cursor is per device.
 
-    Gaps are correct. A transaction that allocates 5 and rolls back leaves 5 unused; the
-    consumer walks rows, never values, so a gap is invisible.
+    Monotonicity is the contract; contiguity is not. The consumer walks rows, never values,
+    so a gap would be invisible to it — and no consumer may assume there is none. (A
+    rolled-back allocation is not a gap: the UPDATE rolls back with its transaction and the
+    next caller receives the same value.)
     """
     seq = await db.scalar(
         sa_update(DeviceSettleCounter)
