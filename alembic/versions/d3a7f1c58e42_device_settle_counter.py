@@ -46,6 +46,10 @@ def upgrade() -> None:
     op.execute("INSERT INTO device_settle_counter (device_id, last_seq) SELECT id, 0 FROM devices")
 
     op.add_column("jobs", sa.Column("settle_seq", sa.BigInteger(), nullable=True))
+    # ONE index. It enforces the per-device uniqueness AND serves the feed's only access path
+    # (one device's sequenced jobs, walked ascending from a cursor). A second, non-unique twin
+    # on the same columns under the same predicate would be pure write cost on the hottest
+    # table — §3.3 specified both; the duplicate buys nothing.
     op.create_index(
         "uq_job_settle_seq_per_device",
         "jobs",
@@ -53,17 +57,9 @@ def upgrade() -> None:
         unique=True,
         postgresql_where=sa.text("settle_seq IS NOT NULL"),
     )
-    op.create_index(
-        "ix_job_device_settle_seq",
-        "jobs",
-        ["device_id", "settle_seq"],
-        unique=False,
-        postgresql_where=sa.text("settle_seq IS NOT NULL"),
-    )
 
 
 def downgrade() -> None:
-    op.drop_index("ix_job_device_settle_seq", table_name="jobs")
     op.drop_index("uq_job_settle_seq_per_device", table_name="jobs")
     op.drop_column("jobs", "settle_seq")
     op.drop_table("device_settle_counter")

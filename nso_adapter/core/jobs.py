@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import (
     UNSET,
+    BookkeepingOutcomeUnknown,
     ClaimLostError,
     ClaimRegistration,
     ClaimUnavailableError,
@@ -376,6 +377,11 @@ async def _run_with_db(
         except ClaimLostError:
             # Revocation is not a runner error: recovery already owns the disposition.
             raise
+        except BookkeepingOutcomeUnknown:
+            # R2 §4.6 / Appendix S §3.3: the terminal transaction did not complete after its
+            # effect was performed. A second write here reports a failure for work that
+            # really landed; recovery re-dispositions a job still `running` instead.
+            raise
         except Exception as exc:
             logger.exception("job.failed", job_id=job_id, device_id=device_id, error=repr(exc))
             await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}}, reg)
@@ -490,6 +496,11 @@ async def _run_connect(job_id: int, device_id: int, reg: ClaimRegistration | Non
             )
         except ClaimLostError:
             # Revocation is not a runner error: recovery already owns the disposition.
+            raise
+        except BookkeepingOutcomeUnknown:
+            # R2 §4.6 / Appendix S §3.3: the terminal transaction did not complete after its
+            # effect was performed. A second write here reports a failure for work that
+            # really landed; recovery re-dispositions a job still `running` instead.
             raise
         except Exception as exc:
             logger.exception("job.connect.failed", job_id=job_id, error=repr(exc))
@@ -608,6 +619,11 @@ async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistrat
             )
         except ClaimLostError:
             # Revocation is not a runner error: recovery already owns the disposition.
+            raise
+        except BookkeepingOutcomeUnknown:
+            # R2 §4.6 / Appendix S §3.3: the terminal transaction did not complete after its
+            # effect was performed. A second write here reports a failure for work that
+            # really landed; recovery re-dispositions a job still `running` instead.
             raise
         except Exception as exc:
             logger.exception("job.provision.failed", job_id=job_id, error=repr(exc))

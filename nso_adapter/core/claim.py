@@ -52,7 +52,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.store.device_settle import allocate_settle_seq
+from nso_adapter.store.device_settle import MissingSettleCounter, allocate_settle_seq
 from nso_adapter.store.models import DeviceClaim, Job, JobStatus, JobType
 
 logger = structlog.get_logger(__name__)
@@ -128,14 +128,20 @@ class ClaimLostError(Exception):
 
 
 class BookkeepingOutcomeUnknown(Exception):
-    """A terminal bookkeeping COMMIT was neither acknowledged nor provably aborted (R2 §4.6).
+    """A terminal bookkeeping transaction did not complete, after its effect was performed.
+
+    Two causes, one rule. The COMMIT was neither acknowledged nor provably aborted (R2 §4.6);
+    or the settlement allocation inside that transaction aborted — deadlock, lock timeout, or
+    a counter row a concurrent offboard cascaded away (Appendix S §3.3).
 
     Raised INSTEAD of letting the caller fall back to a second terminal write. That fallback
     is the bug: if PostgreSQL applied the commit, the job is already terminal with its CAS,
     per-route results and status intact, and a second write would flip it to ``failed`` over
-    a landed consumption. The runner therefore stops here, the worker skips the terminal
-    write AND the release, the heartbeat stops, and claim recovery re-dispositions only a job
-    still ``running`` — which is exactly the distinction that tells the two cases apart (G38).
+    a landed consumption; and if the allocation aborted, the second write reports ``failed``
+    for a device change that really happened, with the result discarded. The runner therefore
+    stops here, the worker skips the terminal write AND the release, the heartbeat stops, and
+    claim recovery re-dispositions only a job still ``running`` — which is exactly the
+    distinction that tells the cases apart (G38).
     """
 
 
@@ -658,9 +664,14 @@ async def terminalize(
     §3.3), in this same transaction and in this order: the status CAS locks the job row and
     proves ownership, then the counter UPDATE locks the counter row, then the sequence lands
     on the job row this transaction already holds. A refused CAS returns before any of it,
-    so a doomed write burns no sequence and takes no device-wide lock. A missing counter row
-    raises: the whole terminal transaction aborts and recovery decides, which is strictly
-    better than the deadlock a lazy create would reintroduce.
+    so a doomed write burns no sequence and takes no device-wide lock.
+
+    An allocation that ABORTS — deadlock, lock timeout, or a counter row a concurrent
+    offboard cascaded away — takes the whole terminal transaction down with it, including the
+    result and any carrier consumption it carried. That is the three-state contract's case,
+    not a job failure: it raises :class:`BookkeepingOutcomeUnknown` so no caller writes a
+    second terminal status for a device change that already happened, and recovery
+    re-dispositions the job while it is still ``running``.
     """
     if status not in _TERMINAL_STATUSES:
         raise ValueError(f"terminalize is for terminal statuses only, not {status.value}")
@@ -683,13 +694,17 @@ async def terminalize(
         return None
     settle_seq: int | None = None
     if row.device_id is not None:
-        settle_seq = await allocate_settle_seq(db, row.device_id)
-        await db.execute(
-            sa_update(Job)
-            .where(Job.id == job_id)
-            .values(settle_seq=settle_seq)
-            .execution_options(synchronize_session=False)
-        )
+        try:
+            settle_seq = await allocate_settle_seq(db, row.device_id)
+            await db.execute(
+                sa_update(Job)
+                .where(Job.id == job_id)
+                .values(settle_seq=settle_seq)
+                .execution_options(synchronize_session=False)
+            )
+        except (MissingSettleCounter, DBAPIError) as exc:
+            logger.error("job.settle_allocation_failed", job_id=job_id, device_id=row.device_id, error=repr(exc))
+            raise BookkeepingOutcomeUnknown(f"job {job_id}: settlement allocation aborted") from exc
     return TerminalWrite(job_id, status, row.device_id, settle_seq)
 
 

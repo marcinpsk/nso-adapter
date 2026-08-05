@@ -20,9 +20,10 @@ Three operations, deliberately separated by which transaction may run them:
 from __future__ import annotations
 
 import structlog
-from sqlalchemy import literal, select
+from sqlalchemy import select
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.store.models import Device, DeviceSettleCounter
@@ -50,19 +51,45 @@ async def ensure_settle_counters() -> int:
     """Insert a counter row for every device missing one. Returns how many were created.
 
     The repair path for a device that predates the counter or that a future fourth insert
-    site forgets. One statement, its own transaction, no claim: the device key-share locks
-    it takes are harmless here and would not be inside a terminal transaction.
+    site forgets. Its own transaction, no claim: the device key-share locks it takes are
+    harmless here and would not be inside a terminal transaction.
+
+    Row by row, under a SAVEPOINT each, and that is not a style choice. The insert validates
+    its FK by waiting on any offboard holding that device ``FOR UPDATE``; when that offboard
+    commits, the row is gone and the insert raises. As ONE statement that aborts every other
+    device's repair too, and the exception then aborts the caller — which is a recovery tick
+    (or a lifespan startup) whose remaining work would be skipped for the whole interval. One
+    device vanishing under the sweep is normal, and it costs exactly that device's row.
     """
     from nso_adapter.store.db import get_session
 
     async for db in get_session():
-        result = await db.execute(
-            pg_insert(DeviceSettleCounter)
-            .from_select(["device_id", "last_seq"], select(Device.id, literal(0)))
-            .on_conflict_do_nothing(index_elements=["device_id"])
+        missing = (
+            (
+                await db.execute(
+                    select(Device.id)
+                    .outerjoin(DeviceSettleCounter, DeviceSettleCounter.device_id == Device.id)
+                    .where(DeviceSettleCounter.device_id.is_(None))
+                )
+            )
+            .scalars()
+            .all()
         )
+        created = 0
+        for device_id in missing:
+            try:
+                async with db.begin_nested():
+                    result = await db.execute(
+                        pg_insert(DeviceSettleCounter)
+                        .values(device_id=device_id, last_seq=0)
+                        .on_conflict_do_nothing(index_elements=["device_id"])
+                    )
+            except IntegrityError:
+                # The device was offboarded while this insert waited on its row lock.
+                logger.info("settle_counter.device_vanished", device_id=device_id)
+                continue
+            created += result.rowcount
         await db.commit()
-        created = result.rowcount
         if created:
             logger.warning("settle_counter.repaired", created=created)
         return created

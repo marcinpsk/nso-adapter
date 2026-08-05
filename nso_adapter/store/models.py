@@ -388,19 +388,14 @@ class Job(Base):
         ),
         # Appendix S §3.3: the settlement sequence is unique PER DEVICE, and only where it
         # was allocated. NULLs are distinct, so the unsequenced rows (queued, running, and
-        # every job offboard has detached) do not collide with each other.
+        # every job offboard has detached) do not collide with each other. This one index
+        # also IS the feed's access path — one device's sequenced jobs, walked ascending from
+        # a cursor — so the non-unique twin §3.3 also specified would be pure write cost.
         Index(
             "uq_job_settle_seq_per_device",
             "device_id",
             "settle_seq",
             unique=True,
-            postgresql_where=text("settle_seq IS NOT NULL"),
-        ),
-        # The feed's access path: one device's sequenced jobs, walked ascending from a cursor.
-        Index(
-            "ix_job_device_settle_seq",
-            "device_id",
-            "settle_seq",
             postgresql_where=text("settle_seq IS NOT NULL"),
         ),
     )
