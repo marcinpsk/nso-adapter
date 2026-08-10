@@ -98,7 +98,11 @@ def scan_source(source: str, path: str) -> list[Violation]:
 
         if isinstance(node, ast.Call) and _called_name(node) not in _SANCTIONED_WRITERS:
             for kw in node.keywords:
-                if kw.arg == _SEQUENCE_ATTR:
+                if kw.arg is None:
+                    # ``**{...}`` carries the same write with no keyword name to read.
+                    if isinstance(kw.value, ast.Dict):
+                        found.extend(_dict_literal_violations(kw.value, names, path, node.lineno))
+                elif kw.arg == _SEQUENCE_ATTR:
                     found.append(Violation(path, node.lineno, "writes Job.settle_seq directly"))
                 elif kw.arg == "status" and _is_terminal_status(kw.value, names):
                     found.append(Violation(path, node.lineno, "assigns a terminal JobStatus directly"))
@@ -109,14 +113,20 @@ def scan_source(source: str, path: str) -> list[Violation]:
     return found
 
 
-def _dict_literal_violations(arg: ast.Dict, names: set[str], path: str, lineno: int) -> list[Violation]:
+def _mapping_key_name(key: ast.expr | None) -> str | None:
+    """The column a mapping key writes: ``"status"`` or the column object ``Job.status``."""
+    if isinstance(key, ast.Constant):
+        return key.value if isinstance(key.value, str) else None
+    return _target_attr(key) if key is not None else None
+
+
+def _dict_literal_violations(arg: ast.Dict, names: frozenset[str], path: str, lineno: int) -> list[Violation]:
     found: list[Violation] = []
     for key, value in zip(arg.keys, arg.values):
-        if not isinstance(key, ast.Constant):
-            continue
-        if key.value == _SEQUENCE_ATTR:
+        name = _mapping_key_name(key)
+        if name == _SEQUENCE_ATTR:
             found.append(Violation(path, lineno, "writes Job.settle_seq directly"))
-        elif key.value == "status" and _is_terminal_status(value, names):
+        elif name == "status" and _is_terminal_status(value, names):
             found.append(Violation(path, lineno, "assigns a terminal JobStatus directly"))
     return found
 
@@ -178,6 +188,28 @@ def test_flags_a_dict_literal_values_mapping():
     """SQLAlchemy also accepts ``.values({...})`` — as reachable by accident as a keyword."""
     src = 'def f(u):\n    u.values({"status": JobStatus.failed, "settle_seq": 3})\n'
     assert len(scan_source(src, "t.py")) == 2
+
+
+def test_flags_a_double_star_unpacked_dict_literal():
+    """``.values(**{...})`` reaches the same write with no keyword the loop can see."""
+    src = 'def f(u):\n    u.values(**{"status": JobStatus.failed})\n'
+    assert len(scan_source(src, "t.py")) == 1
+
+
+def test_flags_a_double_star_unpacked_settle_seq():
+    src = 'def f(u):\n    u.values(**{"settle_seq": 6})\n'
+    assert len(scan_source(src, "t.py")) == 1
+
+
+def test_flags_column_attribute_keys_in_a_values_mapping():
+    """SQLAlchemy accepts the column object as the key: ``.values({Job.status: ...})``."""
+    src = "def f(u):\n    u.values({Job.status: JobStatus.failed, Job.settle_seq: 3})\n"
+    assert len(scan_source(src, "t.py")) == 2
+
+
+def test_ignores_a_non_literal_double_star_mapping():
+    """A name after ``**`` is not statically resolvable, so it stays out of scope."""
+    assert scan_source("def f(u, kwargs):\n    u.values(**kwargs)\n", "t.py") == []
 
 
 def test_allows_the_sanctioned_writer_but_not_a_lookalike():

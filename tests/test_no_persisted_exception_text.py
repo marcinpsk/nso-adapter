@@ -7,21 +7,33 @@ error its headers. The sanctioned envelopes are ``core.claim.internal_error`` (t
 exception TYPE only; the text belongs in the server log) and ``core.claim.JobError``
 (author-controlled message, raised deliberately). This guard bans the shape that
 leaked: a ``"message"`` or ``"error"`` value built from ``repr()`` — as a call, as
-``builtins.repr``, or as an f-string ``!r``/``!a`` conversion — inside any dict
-literal in the package. ``str(exc)`` stays legal because every current use is a typed
-domain exception whose text is author-controlled; log calls are exempt by construction
-(structlog kwargs are not dict literals).
+``builtins.repr``, or as an ``!r``/``!a`` conversion in an f-string or a
+``str.format()`` template — inside any dict literal in the package. ``str(exc)`` and
+a ``!s`` conversion stay legal because every current use is a typed domain exception
+whose text is author-controlled; log calls are exempt by construction (structlog
+kwargs are not dict literals).
 """
 
 from __future__ import annotations
 
 import ast
+import string
 from pathlib import Path
 
 _PACKAGE = Path(__file__).resolve().parents[1] / "nso_adapter"
 _GUARDED_KEYS = frozenset({"message", "error"})
-# FormattedValue.conversion codes for {x!r} and {x!a} — both emit repr-style text.
-_REPR_CONVERSIONS = frozenset({ord("r"), ord("a")})
+# {x!r} and {x!a} both emit repr-style text, in an f-string or a str.format() template.
+_REPR_CONVERSIONS = frozenset({"r", "a"})
+# ast.FormattedValue.conversion carries the same letters as ordinals.
+_REPR_CONVERSION_CODES = frozenset(ord(c) for c in _REPR_CONVERSIONS)
+
+
+def _template_has_repr_conversion(template: str) -> bool:
+    try:
+        fields = list(string.Formatter().parse(template))
+    except ValueError:  # a malformed template is not a repr, and must not crash the guard
+        return False
+    return any(conversion in _REPR_CONVERSIONS for _, _, _, conversion in fields)
 
 
 def _is_repr(node: ast.AST) -> bool:
@@ -29,9 +41,18 @@ def _is_repr(node: ast.AST) -> bool:
         func = node.func
         if isinstance(func, ast.Name) and func.id == "repr":
             return True
-        if isinstance(func, ast.Attribute) and func.attr == "repr":
-            return True
-    return isinstance(node, ast.FormattedValue) and node.conversion in _REPR_CONVERSIONS
+        if isinstance(func, ast.Attribute):
+            if func.attr == "repr":
+                return True
+            # "...{!r}...".format(exc) reaches the same text with no repr() call to see.
+            if (
+                func.attr == "format"
+                and isinstance(func.value, ast.Constant)
+                and isinstance(func.value.value, str)
+                and _template_has_repr_conversion(func.value.value)
+            ):
+                return True
+    return isinstance(node, ast.FormattedValue) and node.conversion in _REPR_CONVERSION_CODES
 
 
 def _has_repr(value: ast.AST) -> bool:
@@ -76,6 +97,18 @@ def test_flags_an_fstring_repr_conversion() -> None:
 
 def test_flags_builtins_repr() -> None:
     assert scan_source('e = {"message": builtins.repr(exc)}\n', "t.py") == ["t.py:1"]
+
+
+def test_flags_a_format_repr_conversion() -> None:
+    assert scan_source('e = {"message": "{!r}".format(exc)}\n', "t.py") == ["t.py:1"]
+
+
+def test_flags_a_format_ascii_conversion() -> None:
+    assert scan_source('e = {"error": "{0!a}".format(exc)}\n', "t.py") == ["t.py:1"]
+
+
+def test_format_str_conversion_stays_legal() -> None:
+    assert scan_source('e = {"message": "{0!s}".format(exc)}\n', "t.py") == []
 
 
 def test_str_on_a_typed_exception_stays_legal() -> None:
