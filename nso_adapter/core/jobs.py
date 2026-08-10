@@ -23,6 +23,8 @@ from nso_adapter.core.claim import (
     ClaimLostError,
     ClaimRegistration,
     ClaimUnavailableError,
+    JobError,
+    error_envelope,
     lock_claim,
     terminalize,
 )
@@ -384,7 +386,7 @@ async def _run_with_db(
             raise
         except Exception as exc:
             logger.exception("job.failed", job_id=job_id, device_id=device_id, error=repr(exc))
-            await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}}, reg)
+            await _mark_job_failed(db, job_id, error_envelope(exc), reg)
 
 
 async def _run_sync(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
@@ -426,13 +428,13 @@ async def _run_sync_from_nso(job_id: int, device_id: int, reg: ClaimRegistration
     async def _mirror_read(device_id_: int, db) -> dict:
         device = await db.get(Device, device_id_)
         if not device:
-            raise ValueError(f"Device {device_id_} not found")
+            raise JobError("not_found", f"Device {device_id_} not found")
         client = get_nso_client(device.nso_instance)
         failed, supplier_outcome = await refresh_all_surfaces_for_device(
             db, device, client, refresh_source="sync_from_nso", atomic=True
         )
         if supplier_outcome is not None:
-            raise RuntimeError("NSO read unavailable — nothing refreshed; last-known data kept")
+            raise JobError("read_unavailable", "NSO read unavailable — nothing refreshed; last-known data kept")
         nb_client = get_netbox_client()
         if nb_client and device.netbox_device_id:
             try:
@@ -469,7 +471,7 @@ async def _run_connect(job_id: int, device_id: int, reg: ClaimRegistration | Non
         try:
             device = await db.get(Device, device_id)
             if not device:
-                raise ValueError(f"Device {device_id} not found")
+                raise JobError("not_found", f"Device {device_id} not found")
             client = get_nso_client(device.nso_instance)
 
             async def _do_connect(dev_id: int, _db) -> dict:
@@ -504,7 +506,7 @@ async def _run_connect(job_id: int, device_id: int, reg: ClaimRegistration | Non
             raise
         except Exception as exc:
             logger.exception("job.connect.failed", job_id=job_id, error=repr(exc))
-            await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}}, reg)
+            await _mark_job_failed(db, job_id, error_envelope(exc), reg)
 
 
 async def _run_apply(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
@@ -632,7 +634,7 @@ async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistrat
             raise
         except Exception as exc:
             logger.exception("job.provision.failed", job_id=job_id, error=repr(exc))
-            await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}}, reg)
+            await _mark_job_failed(db, job_id, error_envelope(exc), reg)
 
     # Tell the plugin the provision job reached a terminal state (any branch above) so it advances
     # the gated onboarding row off the dashboard-poll path. Best-effort — the plugin's device-tab

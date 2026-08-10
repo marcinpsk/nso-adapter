@@ -25,7 +25,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, terminalize
+from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, internal_error, terminalize
 from nso_adapter.core.static_route_plan import authorized_clear_fields, build_plan
 from nso_adapter.nso.apply import NsoApplyError
 from nso_adapter.store.models import (
@@ -1190,7 +1190,7 @@ async def _apply_attributes(eligible, apply_fn, *, client, device_name, job_id, 
                 attribute=intent_row.attribute,
             )
             attr_state.sync_state = SyncState.apply_failed
-            intent_row.last_apply_error = {"code": "internal", "message": repr(exc), "detail": {}}
+            intent_row.last_apply_error = internal_error(exc)
             failed += 1
             failures.append({"interface": iface.name, "attribute": intent_row.attribute, "error": repr(exc)})
         else:
@@ -1237,7 +1237,7 @@ async def _apply_ips(by_iface, ifaces, apply_fn, *, client, device_name, job_id,
         except Exception as exc:
             logger.exception("apply.ip_unexpected_error", job_id=job_id, interface=iface.name)
             for row in ip_rows:
-                row.last_apply_error = {"code": "internal", "message": repr(exc), "detail": {}}
+                row.last_apply_error = internal_error(exc)
             failed += len(ip_rows)
             failures.append({"interface": iface.name, "error": repr(exc)})
         else:
@@ -2374,7 +2374,7 @@ async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_
         )
     except Exception as exc:
         logger.exception(f"apply.{log_label}_unexpected_error", job_id=job_id)
-        err = {"code": "internal", "message": repr(exc), "detail": {}}
+        err = internal_error(exc)
         for row in rows:
             row.last_apply_error = err
         return 0, len(rows), [{"error": repr(exc)}]
@@ -3052,9 +3052,7 @@ async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -
             # after rollback (it may have been expired) so the status change persists.
             await db.rollback()
             # Commit only a landed write; on a refusal _write_terminal has already rolled back.
-            if await _write_terminal(
-                db, job_id, JobStatus.failed, None, {"code": "internal", "message": repr(exc), "detail": {}}, reg
-            ):
+            if await _write_terminal(db, job_id, JobStatus.failed, None, internal_error(exc), reg):
                 await db.commit()
         else:
             # Apply finalized (succeeded/partial/failed-on-device, no unexpected error): re-read

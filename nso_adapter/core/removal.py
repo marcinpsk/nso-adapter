@@ -28,7 +28,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError
+from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, JobError, error_envelope
 
 logger = structlog.get_logger(__name__)
 
@@ -1134,7 +1134,9 @@ async def _sr_consume(db: AsyncSession, device, out: SrRemoval, per_field: dict,
         if reg is None or not reg.registered:
             # G19: the delete is claim-token-scoped. Making it unguarded to keep a caller
             # convenient is exactly the shortcut §4.7 forbids.
-            raise RuntimeError("static_route removal: consuming tombstones needs a REGISTERED claim registration")
+            raise JobError(
+                "removal_failed", "static_route removal: consuming tombstones needs a REGISTERED claim registration"
+            )
         # Snapshotted ids only — a tombstone written during the network call survives,
         # because nothing has proven anything about it.
         await delete_tombstones(db, out.tombstone_ids, device_id=device.id, claim_token=reg.token)
@@ -1805,9 +1807,7 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
             from nso_adapter.core.jobs import _mark_job_failed
 
             logger.error("removal.failed", job_id=job_id, device_id=device_id, scope=scope, error=repr(exc))
-            await _mark_job_failed(
-                db, job_id, {"code": "removal_failed", "message": repr(exc), "detail": {"scope": scope}}, reg
-            )
+            await _mark_job_failed(db, job_id, error_envelope(exc, code="removal_failed", detail={"scope": scope}), reg)
 
 
 async def _enqueue_followup_sync(db: AsyncSession, job_id: int, device_id: int) -> None:

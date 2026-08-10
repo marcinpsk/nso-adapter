@@ -640,6 +640,38 @@ async def _cas_job_status(
     return (await db.execute(stmt)).one_or_none()
 
 
+def internal_error(exc: BaseException, *, code: str = "internal", detail: dict | None = None) -> dict:
+    """Build the persisted envelope for an unexpected crash: the type only, never the text.
+
+    Exception text can carry credentials — a RESTCONF error echoes the request, an httpx
+    error its headers. The full detail belongs in the server log, never in the store.
+    """
+    return {
+        "code": code,
+        "message": f"internal error ({type(exc).__name__}); see the server log",
+        "detail": detail or {},
+    }
+
+
+class JobError(Exception):
+    """Fail the job deliberately: *code* and *message* are author-controlled, safe to persist.
+
+    The blanket crash handlers persist :func:`internal_error` (the exception type only).
+    Raise this where the failure is a known condition the operator must read verbatim.
+    """
+
+    def __init__(self, code: str, message: str, detail: dict | None = None) -> None:
+        super().__init__(message)
+        self.error = {"code": code, "message": message, "detail": detail or {}}
+
+
+def error_envelope(exc: BaseException, *, code: str = "internal", detail: dict | None = None) -> dict:
+    """Map an exception to its persisted envelope: a JobError verbatim, anything else type-only."""
+    if isinstance(exc, JobError):
+        return {**exc.error, "detail": {**(detail or {}), **exc.error["detail"]}}
+    return internal_error(exc, code=code, detail=detail)
+
+
 async def terminalize(
     db: AsyncSession,
     job_id: int,

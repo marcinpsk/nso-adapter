@@ -267,19 +267,27 @@ async def test_run_with_db_success(adapter_client):
 
 
 async def test_run_with_db_failure(adapter_client):
-    """_run_with_db marks job failed on exception."""
+    """_run_with_db marks the job failed with a client-safe error: type only, no text.
+
+    The raised message stands in for a secret (a RESTCONF error echoes the request, an
+    httpx error its headers). Forbidden: any of it reaching the persisted job error.
+    """
+    import json
+
     device_id = await _seed_device("rtr-11", 21)
     job_id = await _seed_job(device_id, JobStatus.running)
 
     async def fail_factory(dev_id, db):
-        raise RuntimeError("something broke")
+        raise RuntimeError("Bearer sekrit-credential")
 
     await _run_with_db(job_id, device_id, fail_factory)
 
     async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
-        assert "something broke" in job.error["message"]
+        assert job.error["code"] == "internal"
+        assert "sekrit-credential" not in json.dumps(job.error), "exception text reached the persisted error"
+        assert "RuntimeError" in job.error["message"]
 
 
 async def test_run_with_db_timeout(adapter_client):

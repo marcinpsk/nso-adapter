@@ -50,6 +50,7 @@ from nso_adapter.core.claim import (
     acquire_claim,
     dispose_cancelled,
     disposition_for,
+    internal_error,
     lock_claim,
     mark_failed_and_release,
     release_claim,
@@ -611,7 +612,7 @@ async def _run_one_job(
         except Exception as exc:
             logger.exception("worker.job_crashed", worker_id=worker_id, job_id=job_id, error=repr(exc))
             outcome = await _bounded_cleanup(
-                _fail_and_release(job_id, repr(exc), reg), seen, job_id=job_id, device_id=device_id
+                _fail_and_release(job_id, exc, reg), seen, job_id=job_id, device_id=device_id
             )
         else:
             outcome = await _bounded_cleanup(_release(reg), seen, job_id=job_id, device_id=device_id)
@@ -648,11 +649,12 @@ async def _dispose(job_id: int, job_type: JobType, reg: ClaimRegistration) -> Cl
     return ClaimOutcome.COMMIT_ACKNOWLEDGED
 
 
-async def _fail_and_release(job_id: int, message: str, reg: ClaimRegistration) -> ClaimOutcome:
+async def _fail_and_release(job_id: int, exc: BaseException, reg: ClaimRegistration) -> ClaimOutcome:
     """Terminal failure: status AND release in one transaction when a claim is held."""
+    error = internal_error(exc)
     if reg.registered:
-        return await mark_failed_and_release(job_id, "internal", message, reg)
-    await _mark_failed(job_id, "internal", message, reg)
+        return await mark_failed_and_release(job_id, error["code"], error["message"], reg)
+    await _mark_failed(job_id, error["code"], error["message"], reg)
     return ClaimOutcome.COMMIT_ACKNOWLEDGED
 
 
