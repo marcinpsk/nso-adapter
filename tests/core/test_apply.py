@@ -1380,7 +1380,8 @@ async def test_run_apply_scope_unexpected_exception(adapter_client):
         assert job.result["vlan_count_by_outcome"]["apply_failed"] == 1
         rows = (await db.execute(select(VlanIntent).where(VlanIntent.device_id == device_id))).scalars().all()
         assert rows[0].last_apply_error["code"] == "internal"
-        assert "kaboom" in rows[0].last_apply_error["message"]
+        assert "kaboom" not in str(rows[0].last_apply_error), "exception text reached the persisted error"
+        assert "RuntimeError" in rows[0].last_apply_error["message"]
 
 
 # The IS-IS sub-collections (process/level/flex) are eligible on their OWN — a per-level
@@ -1756,7 +1757,8 @@ async def test_run_apply_ip_unexpected_exception(adapter_client):
             .all()
         )
         assert rows[0].last_apply_error["code"] == "internal"
-        assert "transport exploded" in rows[0].last_apply_error["message"]
+        assert "transport exploded" not in str(rows[0].last_apply_error), "exception text reached the persisted error"
+        assert "RuntimeError" in rows[0].last_apply_error["message"]
 
 
 # ── Atomic apply (NSO_ADAPTER_ATOMIC_APPLY): subif + IP in one transaction ─────
