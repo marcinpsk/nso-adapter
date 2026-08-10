@@ -359,7 +359,7 @@ async def _run_with_db(
         logger.info("job.budget", job_id=job_id, device_id=device_id, timeout=timeout)
         try:
             result = await asyncio.wait_for(coro_factory(device_id, db), timeout=timeout)
-            await terminalize(
+            write = await terminalize(
                 db,
                 job_id,
                 status=JobStatus.succeeded,
@@ -367,7 +367,12 @@ async def _run_with_db(
                 run_attempt=reg.run_attempt if reg is not None else None,
                 result=result,
             )
-            await db.commit()
+            if write is not None:
+                await db.commit()
+            else:
+                # Refused: recovery re-dispositioned the job mid-run. The session's writes
+                # belong to an execution that lost ownership, so the transaction is discarded.
+                await db.rollback()
         except TimeoutError:
             logger.error("job.timeout", job_id=job_id, device_id=device_id, timeout=timeout)
             await _mark_job_failed(
@@ -479,7 +484,7 @@ async def _run_connect(job_id: int, device_id: int, reg: ClaimRegistration | Non
                 return {"output": output}
 
             result = await asyncio.wait_for(_do_connect(device_id, db), timeout=_JOB_TIMEOUT)
-            await terminalize(
+            write = await terminalize(
                 db,
                 job_id,
                 status=JobStatus.succeeded,
@@ -487,7 +492,11 @@ async def _run_connect(job_id: int, device_id: int, reg: ClaimRegistration | Non
                 run_attempt=reg.run_attempt if reg is not None else None,
                 result=result,
             )
-            await db.commit()
+            if write is not None:
+                await db.commit()
+            else:
+                # Refused: same discard rule as _run_with_db above.
+                await db.rollback()
         except TimeoutError:
             logger.error("job.connect.timeout", job_id=job_id, timeout=_JOB_TIMEOUT)
             await _mark_job_failed(

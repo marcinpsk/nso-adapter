@@ -290,6 +290,39 @@ async def test_run_with_db_failure(adapter_client):
         assert "RuntimeError" in job.error["message"]
 
 
+async def test_a_refused_terminal_write_discards_the_runner_transaction(adapter_client):
+    """S1 — a stale runner's success must not commit its session writes under a refused CAS.
+
+    The job's ``run_attempt`` moved to a successor while this run was in flight, so the
+    terminal CAS is refused. Any write the runner staged in the session (here a marker on
+    the device row) belongs to an execution that lost its ownership. Forbidden: committing
+    those writes anyway, without a terminal status.
+    """
+    from sqlalchemy import update
+
+    from nso_adapter.core.claim import ClaimRegistration
+
+    device_id = await _seed_device("rtr-stale", 31)
+    job_id = await _seed_job(device_id, JobStatus.running)
+    async with session() as db:
+        await db.execute(update(Job).where(Job.id == job_id).values(run_attempt=2))
+        await db.commit()
+
+    async def write_then_succeed(dev_id, db):
+        device = await db.get(Device, dev_id)
+        device.sw_version = "tail-write"
+        return {"outcome": "ok"}
+
+    await _run_with_db(job_id, device_id, write_then_succeed, reg=ClaimRegistration(run_attempt=1))
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        device = await db.get(Device, device_id)
+    assert job.status is JobStatus.running, "the refused write must leave the successor's row alone"
+    assert job.result is None and job.settle_seq is None
+    assert device.sw_version is None, "the discarded transaction leaked a runner write"
+
+
 async def test_run_with_db_timeout(adapter_client):
     """_run_with_db marks job failed on timeout."""
     device_id = await _seed_device("rtr-12", 22)
