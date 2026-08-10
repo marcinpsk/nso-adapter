@@ -162,9 +162,9 @@ else:
                     except Exception as exc2:
                         check("NSO RESTCONF with Vault credentials", False, str(exc2))
             else:
-                check("Vault KV read", False, f"HTTP {secret_resp.status_code}: {secret_resp.text[:200]}")
+                check("Vault KV read", False, f"HTTP {secret_resp.status_code}")
         else:
-            check("Vault AppRole login", False, f"HTTP {login_resp.status_code}: {login_resp.text[:200]}")
+            check("Vault AppRole login", False, f"HTTP {login_resp.status_code}")
     except Exception as exc:
         check("Vault reachable", False, str(exc))
 
