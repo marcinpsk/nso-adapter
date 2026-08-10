@@ -1381,6 +1381,7 @@ async def test_run_apply_scope_unexpected_exception(adapter_client):
         rows = (await db.execute(select(VlanIntent).where(VlanIntent.device_id == device_id))).scalars().all()
         assert rows[0].last_apply_error["code"] == "internal"
         assert "kaboom" not in str(rows[0].last_apply_error), "exception text reached the persisted error"
+        assert "kaboom" not in str(job.error), "exception text reached the persisted failure items"
         assert "RuntimeError" in rows[0].last_apply_error["message"]
 
 
@@ -1758,6 +1759,7 @@ async def test_run_apply_ip_unexpected_exception(adapter_client):
         )
         assert rows[0].last_apply_error["code"] == "internal"
         assert "transport exploded" not in str(rows[0].last_apply_error), "exception text reached the persisted error"
+        assert "transport exploded" not in str(job.error), "exception text reached the persisted failure items"
         assert "RuntimeError" in rows[0].last_apply_error["message"]
 
 

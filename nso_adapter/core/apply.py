@@ -1192,7 +1192,9 @@ async def _apply_attributes(eligible, apply_fn, *, client, device_name, job_id, 
             attr_state.sync_state = SyncState.apply_failed
             intent_row.last_apply_error = internal_error(exc)
             failed += 1
-            failures.append({"interface": iface.name, "attribute": intent_row.attribute, "error": repr(exc)})
+            failures.append(
+                {"interface": iface.name, "attribute": intent_row.attribute, "error": internal_error(exc)["message"]}
+            )
         else:
             attr_state.sync_state = SyncState.in_sync
             intent_row.last_apply_at = now
@@ -1239,7 +1241,7 @@ async def _apply_ips(by_iface, ifaces, apply_fn, *, client, device_name, job_id,
             for row in ip_rows:
                 row.last_apply_error = internal_error(exc)
             failed += len(ip_rows)
-            failures.append({"interface": iface.name, "error": repr(exc)})
+            failures.append({"interface": iface.name, "error": internal_error(exc)["message"]})
         else:
             for row in ip_rows:
                 row.last_apply_at = now
@@ -2377,7 +2379,7 @@ async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_
         err = internal_error(exc)
         for row in rows:
             row.last_apply_error = err
-        return 0, len(rows), [{"error": repr(exc)}]
+        return 0, len(rows), [{"error": internal_error(exc)["message"]}]
     for row in rows:
         row.last_apply_at = now
         row.last_apply_error = None
