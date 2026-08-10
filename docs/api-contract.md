@@ -646,6 +646,13 @@ Validation is fail-fast, and nothing is coerced:
 - `order=asc` **or** `after_settle_seq` **requires** `device_id` → otherwise `422`
   `validation_error`. Sequences are allocated per device, so an unscoped ascending page
   would interleave two devices' independent sequences into one order that is wrong for both.
+- `after_settle_seq` **requires** `order=asc` → otherwise `422`. The cursor names a position
+  in the settlement order; the descending page is in creation order, and serving the mix
+  would let a consumer skip or repeat settlements.
+- `status` **cannot combine with** `order=asc` → `422`. A filtered-out terminal row still
+  owns its `settle_seq`, so a thinned ascending page advances the cursor past it and that
+  settlement becomes permanently invisible to the cursor. Status filtering stays on the
+  descending list.
 - `limit` outside `1..500` → `422`. It is **not** clamped: a caller that asked for 5000 and
   silently received 500 believes it holds the whole page and advances its cursor as if it did.
 - An `asc` request with no `after_settle_seq` starts at `0`, i.e. the beginning of the

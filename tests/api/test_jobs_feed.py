@@ -30,13 +30,15 @@ pytestmark = pytest.mark.anyio
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 
-async def _terminal_job(device_id: int, *, job_type: JobType = JobType.removal) -> int:
+async def _terminal_job(
+    device_id: int, *, job_type: JobType = JobType.removal, status: JobStatus = JobStatus.succeeded
+) -> int:
     """A job that ran and settled, through the real allocator — so it carries a sequence."""
     async with session() as db:
         job = Job(job_type=job_type, device_id=device_id, status=JobStatus.running, run_attempt=1)
         db.add(job)
         await db.flush()
-        await terminalize(db, job.id, status=JobStatus.succeeded, expect=JobStatus.running, run_attempt=1)
+        await terminalize(db, job.id, status=status, expect=JobStatus.running, run_attempt=1)
         await db.commit()
         return job.id
 
@@ -135,6 +137,66 @@ async def test_ascending_and_cursor_requests_require_a_device_scope(adapter_clie
         headers=AUTH,
     )
     assert scoped.status_code == 200, scoped.text
+
+
+# ── The cursor and the status filter each bind to one page shape ──────────────
+
+
+async def test_the_settlement_cursor_requires_ascending_order(adapter_client):
+    """``after_settle_seq`` without ``order=asc`` is a 422, never a mis-ordered page.
+
+    Forbidden: applying the cursor to the descending page. The predicate filters by
+    sequence while the rows come back in creation order, so a consumer that advances
+    from the last returned row skips or repeats settlements.
+    """
+    device_id = await seed_device(nso_device_name="feed-desc-cursor", netbox_device_id=8303)
+    await _terminal_job(device_id)
+
+    for params in (
+        {"device_id": device_id, "after_settle_seq": 0},
+        {"device_id": device_id, "order": "desc", "after_settle_seq": 0},
+    ):
+        resp = await adapter_client.get("/api/v1/jobs", params=params, headers=AUTH)
+        assert resp.status_code == 422, (params, resp.text)
+        error = resp.json()["error"]
+        assert error["code"] == "validation_error"
+        assert "order=asc" in error["message"]
+
+
+async def test_status_cannot_thin_the_ascending_feed(adapter_client):
+    """``status`` combined with ``order=asc`` is a 422; the feed serves every verdict.
+
+    Forbidden: a filtered ascending page. A filtered-out terminal row still owns its
+    ``settle_seq``, so the consumer's cursor advances past it and that settlement is
+    permanently invisible to that cursor. The mixed walk is the positive half: both
+    verdicts arrive, in sequence order — and ``status`` still filters the descending
+    list view.
+    """
+    device_id = await seed_device(nso_device_name="feed-asc-status", netbox_device_id=8304)
+    ok = await _terminal_job(device_id)
+    failed = await _terminal_job(device_id, status=JobStatus.failed)
+
+    resp = await adapter_client.get(
+        "/api/v1/jobs",
+        params={"device_id": device_id, "order": "asc", "status": "succeeded"},
+        headers=AUTH,
+    )
+    assert resp.status_code == 422, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "validation_error"
+    assert "status" in error["message"]
+
+    rows = await _walk(adapter_client, device_id)
+    assert [r["id"] for r in rows] == [ok, failed]
+    assert [r["status"] for r in rows] == ["succeeded", "failed"]
+
+    listed = await adapter_client.get(
+        "/api/v1/jobs",
+        params={"device_id": device_id, "status": "failed"},
+        headers=AUTH,
+    )
+    assert listed.status_code == 200, listed.text
+    assert [r["id"] for r in listed.json()] == [failed]
 
 
 # ── S3.3: the limit is validated, not clamped ────────────────────────────────

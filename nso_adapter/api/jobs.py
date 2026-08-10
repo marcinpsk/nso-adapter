@@ -115,6 +115,22 @@ async def list_jobs(
             "validation_error",
             "order=asc and after_settle_seq require device_id: the settlement sequence is per device",
         )
+    if after_settle_seq is not None and order != "asc":
+        # The cursor names a position in the settlement order; the descending page is in
+        # creation order. Serving the mix lets a consumer skip or repeat settlements.
+        raise api_error(
+            422,
+            "validation_error",
+            "after_settle_seq requires order=asc: the cursor walks the settlement order",
+        )
+    if status is not None and order == "asc":
+        # A thinned ascending page still advances the cursor over the filtered-out rows,
+        # making those settlements permanently invisible to that cursor.
+        raise api_error(
+            422,
+            "validation_error",
+            "status cannot filter the ascending settlement feed; use the descending list",
+        )
     if not LIMIT_MIN <= limit <= LIMIT_MAX:
         # Not clamped: a caller that asked for 5000 and silently received 500 believes it
         # holds the whole page, and advances its cursor as if it did.
@@ -133,10 +149,8 @@ async def list_jobs(
     # sequence. The predicate is also the visibility rule: `settle_seq > :cursor` is
     # NULL-false, so a queued or running job cannot be paged over and consumed as a result
     # it does not have (P0.6). No `id` tiebreak — `(device_id, settle_seq)` is unique.
-    cursor = 0 if (after_settle_seq is None and order == "asc") else after_settle_seq
-    if cursor is not None:
-        query = query.where(Job.settle_seq > cursor)
     if order == "asc":
+        query = query.where(Job.settle_seq > (after_settle_seq if after_settle_seq is not None else 0))
         query = query.order_by(Job.settle_seq.asc())
     else:
         # `created_at` is transaction time, so a single tick can hold several jobs and
