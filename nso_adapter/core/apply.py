@@ -3051,10 +3051,11 @@ async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -
             # leaving the job stuck 'running' and masking the real error. Re-fetch the job
             # after rollback (it may have been expired) so the status change persists.
             await db.rollback()
-            await _write_terminal(
+            # Commit only a landed write; on a refusal _write_terminal has already rolled back.
+            if await _write_terminal(
                 db, job_id, JobStatus.failed, None, {"code": "internal", "message": repr(exc), "detail": {}}, reg
-            )
-            await db.commit()
+            ):
+                await db.commit()
         else:
             # Apply finalized (succeeded/partial/failed-on-device, no unexpected error): re-read
             # the applied surfaces into the mirror and notify the plugin so a 'deploying' row

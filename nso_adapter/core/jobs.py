@@ -581,7 +581,7 @@ async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistrat
             # The device this run created is attached in the SAME statement as the terminal
             # status. UNSET means "leave it attached" — never "set NULL".
             provisioned_device_id = result.get("device_id")
-            await terminalize(
+            write = await terminalize(
                 db,
                 job_id,
                 status=JobStatus.succeeded,
@@ -590,7 +590,12 @@ async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistrat
                 result=result,
                 set_device_id=provisioned_device_id if provisioned_device_id is not None else UNSET,
             )
-            await db.commit()
+            if write is not None:
+                await db.commit()
+            else:
+                # Refused: recovery re-dispositioned the job mid-run. The session's writes
+                # belong to an execution that lost ownership, so the transaction is discarded.
+                await db.rollback()
         except ClaimUnavailableError as exc:
             # The device stayed claimed for the whole OQ6 budget, so the mapping was refused
             # and NOTHING was written. Honestly retryable — and terminal, so the pair's
