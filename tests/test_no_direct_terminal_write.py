@@ -70,6 +70,13 @@ def _target_attr(node: ast.expr) -> str | None:
     return node.attr if isinstance(node, ast.Attribute) else None
 
 
+def _subscript_key(node: ast.expr) -> str | None:
+    """The column a ``values["status"] = ...`` assignment writes into a bound mapping."""
+    if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+        return node.slice.value if isinstance(node.slice.value, str) else None
+    return None
+
+
 def _called_name(node: ast.Call) -> str | None:
     if isinstance(node.func, ast.Name):
         return node.func.id
@@ -90,26 +97,19 @@ def scan_source(source: str, path: str) -> list[Violation]:
         elif isinstance(node, ast.AnnAssign | ast.AugAssign):
             targets = [node.target]
         for target in targets:
-            attr = _target_attr(target)
+            attr = _target_attr(target) or _subscript_key(target)
             if attr == _SEQUENCE_ATTR:
                 found.append(Violation(path, node.lineno, "writes Job.settle_seq directly"))
             elif attr == "status" and _is_terminal_status(getattr(node, "value", None), names):
                 found.append(Violation(path, node.lineno, "assigns a terminal JobStatus directly"))
+        # A mapping BOUND TO A NAME first reaches .values(vals) with no literal at the call
+        # for the argument scan below to see. Only a bound one: a returned literal of the
+        # same shape is a read serialization (api/jobs.py), not a write.
+        if isinstance(node, ast.Assign | ast.AnnAssign) and isinstance(node.value, ast.Dict):
+            found.extend(_dict_literal_violations(node.value, names, path, node.lineno))
 
-        if isinstance(node, ast.Call) and _called_name(node) not in _SANCTIONED_WRITERS:
-            for kw in node.keywords:
-                if kw.arg is None:
-                    # ``**{...}`` carries the same write with no keyword name to read.
-                    if isinstance(kw.value, ast.Dict):
-                        found.extend(_dict_literal_violations(kw.value, names, path, node.lineno))
-                elif kw.arg == _SEQUENCE_ATTR:
-                    found.append(Violation(path, node.lineno, "writes Job.settle_seq directly"))
-                elif kw.arg == "status" and _is_terminal_status(kw.value, names):
-                    found.append(Violation(path, node.lineno, "assigns a terminal JobStatus directly"))
-            # SQLAlchemy's .values() equally accepts a mapping: .values({"status": ...}).
-            for arg in node.args:
-                if isinstance(arg, ast.Dict):
-                    found.extend(_dict_literal_violations(arg, names, path, node.lineno))
+        if isinstance(node, ast.Call):
+            found.extend(_call_violations(node, names, path))
     return found
 
 
@@ -128,6 +128,27 @@ def _dict_literal_violations(arg: ast.Dict, names: frozenset[str], path: str, li
             found.append(Violation(path, lineno, "writes Job.settle_seq directly"))
         elif name == "status" and _is_terminal_status(value, names):
             found.append(Violation(path, lineno, "assigns a terminal JobStatus directly"))
+    return found
+
+
+def _call_violations(node: ast.Call, names: frozenset[str], path: str) -> list[Violation]:
+    """Every write a call carries: ``status=``/``settle_seq=`` keywords and mapping arguments."""
+    if _called_name(node) in _SANCTIONED_WRITERS:
+        return []
+    found: list[Violation] = []
+    for kw in node.keywords:
+        if kw.arg is None:
+            # ``**{...}`` carries the same write with no keyword name to read.
+            if isinstance(kw.value, ast.Dict):
+                found.extend(_dict_literal_violations(kw.value, names, path, node.lineno))
+        elif kw.arg == _SEQUENCE_ATTR:
+            found.append(Violation(path, node.lineno, "writes Job.settle_seq directly"))
+        elif kw.arg == "status" and _is_terminal_status(kw.value, names):
+            found.append(Violation(path, node.lineno, "assigns a terminal JobStatus directly"))
+    # SQLAlchemy's .values() equally accepts a mapping: .values({"status": ...}).
+    for arg in node.args:
+        if isinstance(arg, ast.Dict):
+            found.extend(_dict_literal_violations(arg, names, path, node.lineno))
     return found
 
 
@@ -188,6 +209,27 @@ def test_flags_a_dict_literal_values_mapping():
     """SQLAlchemy also accepts ``.values({...})`` — as reachable by accident as a keyword."""
     src = 'def f(u):\n    u.values({"status": JobStatus.failed, "settle_seq": 3})\n'
     assert len(scan_source(src, "t.py")) == 2
+
+
+def test_flags_a_dict_literal_bound_to_a_name_first():
+    """``vals = {...}`` handed to ``.values(vals)`` is the same physical write, one line up."""
+    src = 'def f(u):\n    vals = {"status": JobStatus.failed, "settle_seq": 3}\n    u.values(vals)\n'
+    hits = scan_source(src, "t.py")
+    assert [(h.line, h.what) for h in hits] == [
+        (2, "assigns a terminal JobStatus directly"),
+        (2, "writes Job.settle_seq directly"),
+    ]
+
+
+def test_flags_a_subscript_write_into_a_bound_mapping():
+    """``vals["settle_seq"] = 3`` reaches the row through the mapping built one line up."""
+    src = 'def f(u):\n    vals = {"job_type": 1}\n    vals["settle_seq"] = 3\n    u.values(vals)\n'
+    assert [(h.line, h.what) for h in scan_source(src, "t.py")] == [(3, "writes Job.settle_seq directly")]
+
+
+def test_ignores_a_returned_read_serialization():
+    """``return {"settle_seq": j.settle_seq}`` is the jobs API reading the row out, not a write."""
+    assert scan_source('def f(j):\n    return {"status": j.status, "settle_seq": j.settle_seq}\n', "t.py") == []
 
 
 def test_flags_a_double_star_unpacked_dict_literal():

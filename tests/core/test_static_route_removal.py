@@ -209,10 +209,14 @@ async def seed_tomb(
 async def run_removal_job(device_id: int, job_id: int, client, *, reg=None, sync_from=None) -> Job:
     from nso_adapter.core.removal import run_removal
 
-    await start_job(job_id)  # the head transition a directly-invoked runner does not do
+    attempt = await start_job(job_id)  # the head transition a directly-invoked runner does not do
     own_claim = reg is None
     if own_claim:
         reg = await acquire_claim(device_id, "job", job_id=job_id)
+    if reg is not None and reg.run_attempt is None:
+        # The worker hands the runner the attempt its execution was started at; without it
+        # the removal's terminal CAS falls back to status-only and its fence is never run.
+        reg.run_attempt = attempt
     sync = sync_from if sync_from is not None else AsyncMock(return_value={})
     try:
         with (
@@ -1003,6 +1007,38 @@ async def test_c4_29b_consuming_a_tombstone_refuses_an_unregistered_claim(adapte
     assert job.status == JobStatus.failed
     assert "REGISTERED claim" in job.error["message"]
     assert await tombstone_ids(device_id) == [tomb]
+
+
+async def test_a_superseded_run_attempt_refuses_the_removal_terminal_write(adapter_client):
+    """S1 — the removal's terminal CAS is fenced by the run ATTEMPT, not by the status alone.
+
+    Recovery re-dispatched this job to a successor while this run was in flight, so the row
+    stands at attempt 2 when the run reaches terminalize. The write must be refused and the
+    carrier this transaction consumed must roll back with it, ready for the owning execution.
+    """
+    device_id = await seed_device(nso_device_name="sr-attempt-fence", netbox_device_id=7962)
+    fake = SrFake("sr-attempt-fence", service=[wire(A), wire(B)])
+    job_id = await seed_removal_job(device_id, {})
+    tomb = await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+
+    section = fake.section
+
+    async def _supersede(*args, **kwargs):
+        from sqlalchemy import update as sa_update
+
+        async with session() as db:
+            await db.execute(sa_update(Job).where(Job.id == job_id).values(run_attempt=2))
+            await db.commit()
+        return {"static-route": section()}
+
+    client = sr_client(fake)
+    client.run_device_state_read = AsyncMock(side_effect=_supersede)
+
+    job = await run_removal_job(device_id, job_id, client)
+
+    assert job.status == JobStatus.running, "a superseded execution must not write a terminal status"
+    assert job.result is None and job.settle_seq is None
+    assert await tombstone_ids(device_id) == [tomb], "the refused write must discard its consumption"
 
 
 # ── C4.31/C4.32 and C1.13's device half ─────────────────────────────────────

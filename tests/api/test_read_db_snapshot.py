@@ -238,13 +238,17 @@ async def test_every_family_get_reads_pointer_before_rows(adapter_client):
 async def test_every_family_get_depends_on_get_read_db(adapter_client):
     """SA-3 no-bypass: every family GET route must inject get_read_db (a silent revert to
     get_db keeps every other test green while dropping the snapshot guarantee)."""
+    from fastapi.routing import iter_route_contexts
+
     from nso_adapter.api.deps import get_read_db
     from nso_adapter.main import create_app
 
     app = create_app()
     by_path = {}
-    for route in _iter_api_routes(app.routes):
-        if getattr(route, "methods", None) == {"GET"}:
+    # FastAPI >= 0.141 keeps each included router nested instead of flattening its
+    # APIRoutes into app.routes; iter_route_contexts is the supported traversal.
+    for route in iter_route_contexts(app.routes):
+        if route.methods == {"GET"}:
             by_path[route.path] = route
 
     for family, path_tpl in _FAMILY_GET_PATHS.items():
@@ -253,17 +257,6 @@ async def test_every_family_get_depends_on_get_read_db(adapter_client):
         assert route is not None, f"{family}: route {path} not found"
         flat = set(_walk_dependant(route.dependant))
         assert get_read_db in flat, f"{family}: GET {path} does not inject get_read_db"
-
-
-def _iter_api_routes(routes):
-    # FastAPI >= 0.141 keeps each included router nested (original_router) instead of
-    # flattening its APIRoutes into app.routes; nested routes keep their full paths.
-    for route in routes:
-        inner = getattr(route, "original_router", None)
-        if inner is not None:
-            yield from _iter_api_routes(inner.routes)
-        else:
-            yield route
 
 
 def _walk_dependant(dependant):

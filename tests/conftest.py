@@ -507,7 +507,11 @@ async def start_job(job_id: int) -> int:
         if job.status is JobStatus.queued:
             job.status = JobStatus.running
             job.run_attempt = job.run_attempt + 1
+            # Read before the commit: an expire_on_commit session would lazy-load the
+            # expired attribute afterwards, outside the greenlet, and raise MissingGreenlet.
+            attempt = job.run_attempt
             await db.commit()
+            return attempt
         return job.run_attempt
 
 
