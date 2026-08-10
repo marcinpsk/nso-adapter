@@ -2,6 +2,102 @@
 
 <!-- version list -->
 
+## v0.3.0 (2026-08-10)
+
+### Bug Fixes
+
+- **api**: Bind the settlement cursor and the status filter to their page shapes
+  ([`c4a1a64`](https://github.com/marcinpsk/nso-adapter/commit/c4a1a64c4e90f454b2d6241ea1dc6ec09c23bff9))
+
+- **apply**: Keep exception text out of the persisted failure items
+  ([`8d76852`](https://github.com/marcinpsk/nso-adapter/commit/8d76852f91c9cc51c1fb3d80f99c2b4b781ee526))
+
+- **core**: Persist client-safe job errors, never raw exception text
+  ([`3170d80`](https://github.com/marcinpsk/nso-adapter/commit/3170d80e7132bacc7bcee47e6ef0e89ada12304a))
+
+- **jobs**: Branch on the terminal CAS in the sync and connect success paths
+  ([`7c43b82`](https://github.com/marcinpsk/nso-adapter/commit/7c43b82296b657cd623a59525f7ee3abf4c507a4))
+
+- **jobs**: Discard the transaction when the terminal CAS is refused
+  ([`fbecb7f`](https://github.com/marcinpsk/nso-adapter/commit/fbecb7f0ff32edf2df51591f7de237f38890e936))
+
+- **jobs**: Name the execution on provision's device-busy failure
+  ([`ab05ec4`](https://github.com/marcinpsk/nso-adapter/commit/ab05ec43049ada6fb17339ec10db917b7c16e8ed))
+
+- **jobs**: Route a failed settlement allocation through the no-second-write path
+  ([`2dd1629`](https://github.com/marcinpsk/nso-adapter/commit/2dd16293ddf6b051dba6c3017efa677c6c9b302d))
+
+- **scripts**: Keep secret-adjacent text out of validation output
+  ([`3bf8083`](https://github.com/marcinpsk/nso-adapter/commit/3bf8083e99abaae2edf693d68bf35a8d98420ecc))
+
+### Chores
+
+- **deps**: Bump the python-minor-patch group across 1 directory with 7 updates
+  ([`29adc17`](https://github.com/marcinpsk/nso-adapter/commit/29adc17bf6cf52269ddcf793d0f7607bce19bb5c))
+
+- **deps**: Update setuptools requirement from >=74 to >=83.0.0
+  ([`754f3cf`](https://github.com/marcinpsk/nso-adapter/commit/754f3cf12c9f27ef0360f66c0ee7d3978fc1b35c))
+
+- **deps**: Update sqlalchemy[asyncio] requirement
+  ([`647e2f4`](https://github.com/marcinpsk/nso-adapter/commit/647e2f47840c02bf67d4eb71236f01a14edb2b52))
+
+### Continuous Integration
+
+- **release**: Bound the release uv install to the 0.12 series
+  ([`f06fb8b`](https://github.com/marcinpsk/nso-adapter/commit/f06fb8b44df4658ef3eed78ae1f09c0eb388ba55))
+
+- **release**: Publish sdist and wheel to PyPI via trusted publishing
+  ([`e3736b2`](https://github.com/marcinpsk/nso-adapter/commit/e3736b292778e18a87397d8e384212a6caa5e95a))
+
+- **release**: Sync uv.lock's own version into the release commit
+  ([`c622c53`](https://github.com/marcinpsk/nso-adapter/commit/c622c53b353b23bd5e150365c37be06009e67b92))
+
+### Documentation
+
+- **api-contract**: Document the ordered settlement feed and its cursor rules (Appendix S, S7)
+  ([`f5538ca`](https://github.com/marcinpsk/nso-adapter/commit/f5538cab3ed434f09c11c93a5ab5c2ee3404eb7e))
+
+- **guidelines**: State the notification-lane exception and the error-surface layering
+  ([`2760e20`](https://github.com/marcinpsk/nso-adapter/commit/2760e20ed639d80e18a7208b7d61d19c995948e4))
+
+- **guidelines**: The notification payload is one documented identifier
+  ([`59f2ffa`](https://github.com/marcinpsk/nso-adapter/commit/59f2ffa65a94d98162ddf1939b03a86054fef579))
+
+### Features
+
+- **jobs**: Add the run-attempt token and one terminal writer (Appendix S, S1)
+  ([`4ed0f9b`](https://github.com/marcinpsk/nso-adapter/commit/4ed0f9bcc60fcb4f7f9fdc02329b8710b7659e35))
+
+- **jobs**: Allocate a per-device settlement sequence on every terminal write (Appendix S, S2)
+  ([`77cdb65`](https://github.com/marcinpsk/nso-adapter/commit/77cdb65e0393d7ad0b1ec4dace7f0efd73f428e5))
+
+- **jobs**: Serve the ordered settlement feed and validate it (Appendix S, S3)
+  ([`ea77c7e`](https://github.com/marcinpsk/nso-adapter/commit/ea77c7e11cb963f68d80a7d0d3f666d1ed5ab633))
+
+### Refactoring
+
+- **worker**: Route the crash envelope through error_envelope
+  ([`9e305db`](https://github.com/marcinpsk/nso-adapter/commit/9e305db501c27ee5eb9f78dbcd78296f927b7ca2))
+
+### Testing
+
+- **api**: Walk nested included routers when asserting get_read_db injection
+  ([`11b1f2c`](https://github.com/marcinpsk/nso-adapter/commit/11b1f2c35831cce33272c639b881cd595d1d7253))
+
+- **apply**: Pin the sanitized crash envelope on last_apply_error
+  ([`d73d836`](https://github.com/marcinpsk/nso-adapter/commit/d73d836e72cc05e4b1da8731136f843e8bcbed33))
+
+- **guards**: Close str.format repr and values-mapping analyzer gaps
+  ([`6dfb2c9`](https://github.com/marcinpsk/nso-adapter/commit/6dfb2c960c11aec89da16ed559ea3c962a309679))
+
+- **guards**: Close the mapping, f-string repr, and locale-encoding gaps
+  ([`70d1c95`](https://github.com/marcinpsk/nso-adapter/commit/70d1c95a610182c61a231bde61ddf55c5674e191))
+
+- **settlement**: Tighten predicate fidelity, bound the alembic subprocess, fix a dead assertion
+  message
+  ([`5bbff85`](https://github.com/marcinpsk/nso-adapter/commit/5bbff85285a3b4289e58d4683505b01c7ae000a0))
+
+
 ## v0.2.1 (2026-08-04)
 
 ### Bug Fixes
