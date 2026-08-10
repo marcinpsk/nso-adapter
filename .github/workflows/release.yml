@@ -73,7 +73,8 @@ jobs:
         uses: python-semantic-release/python-semantic-release@39dd2052f2ce8282a5d932c31d58a2ca06d2550e  # v10.6.1
         with:
           github_token: ${{ secrets.SEMANTIC_RELEASE_TOKEN || github.token }}
-          build: false
+          # build_command only refreshes uv.lock; distributions build off the tag.
+          build: true
           changelog: true
 
   docker:
