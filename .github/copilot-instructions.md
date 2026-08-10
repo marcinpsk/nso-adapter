@@ -218,10 +218,20 @@ Testing strategy + the scenarios each milestone owns: `docs/testing-strategy.md`
   LAG-topology refresh fallback for when SSE is down — it pulls operational
   state, it does not push intent. Do not read "scheduler now allowed" as
   license to add drift push back.)
-- **No adapter → plugin HTTP calls** (`docs/api-contract.md` §Call
-  directions). "Read from plugin" always goes through NetBox's REST.
+- **Adapter → plugin HTTP is the notification lane only.** The two
+  fire-and-forget POSTs documented in `docs/api-contract.md` §Call
+  directions (`sync-complete`, `provision-complete`) are the sanctioned
+  exceptions: they carry no state, are never read back, and no result may
+  depend on them alone. Everything the adapter *reads* from the plugin goes
+  through NetBox's REST API. Do not add any other adapter → plugin call.
 - **Secrets never logged.** Tokens, passwords, bearer values stay out of
-  logs, exception messages, and debug dumps.
+  logs, exception messages, and debug dumps. Sanitize a secret-bearing
+  exception at the boundary that owns the secret (`raise ... from None`, so
+  the echoing exception never rides the chain). Layering for everything
+  else: persisted and API-visible error surfaces carry only the client-safe
+  envelopes from `core.claim` (`internal_error` / `JobError` /
+  `error_envelope`); the server log is the sanctioned sink for full
+  exception text and tracebacks.
 - **No hard-coded Vault paths or key names.** Always resolve through the
   configurable `*_ref` references.
 - **TLS verification on by default** for both NSO and Vault clients
