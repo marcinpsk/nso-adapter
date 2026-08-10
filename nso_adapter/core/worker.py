@@ -50,7 +50,7 @@ from nso_adapter.core.claim import (
     acquire_claim,
     dispose_cancelled,
     disposition_for,
-    internal_error,
+    error_envelope,
     lock_claim,
     mark_failed_and_release,
     release_claim,
@@ -651,7 +651,7 @@ async def _dispose(job_id: int, job_type: JobType, reg: ClaimRegistration) -> Cl
 
 async def _fail_and_release(job_id: int, exc: BaseException, reg: ClaimRegistration) -> ClaimOutcome:
     """Terminal failure: status AND release in one transaction when a claim is held."""
-    error = internal_error(exc)
+    error = error_envelope(exc)
     if reg.registered:
         return await mark_failed_and_release(job_id, error["code"], error["message"], reg)
     await _mark_failed(job_id, error["code"], error["message"], reg)
