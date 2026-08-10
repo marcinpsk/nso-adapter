@@ -102,6 +102,22 @@ def scan_source(source: str, path: str) -> list[Violation]:
                     found.append(Violation(path, node.lineno, "writes Job.settle_seq directly"))
                 elif kw.arg == "status" and _is_terminal_status(kw.value, names):
                     found.append(Violation(path, node.lineno, "assigns a terminal JobStatus directly"))
+            # SQLAlchemy's .values() equally accepts a mapping: .values({"status": ...}).
+            for arg in node.args:
+                if isinstance(arg, ast.Dict):
+                    found.extend(_dict_literal_violations(arg, names, path, node.lineno))
+    return found
+
+
+def _dict_literal_violations(arg: ast.Dict, names: set[str], path: str, lineno: int) -> list[Violation]:
+    found: list[Violation] = []
+    for key, value in zip(arg.keys, arg.values):
+        if not isinstance(key, ast.Constant):
+            continue
+        if key.value == _SEQUENCE_ATTR:
+            found.append(Violation(path, lineno, "writes Job.settle_seq directly"))
+        elif key.value == "status" and _is_terminal_status(value, names):
+            found.append(Violation(path, lineno, "assigns a terminal JobStatus directly"))
     return found
 
 
@@ -111,7 +127,7 @@ def scan_tree() -> list[Violation]:
     for path in sorted(_PACKAGE.rglob("*.py")):
         if path == _OWNER:
             continue
-        found.extend(scan_source(path.read_text(), str(path.relative_to(_PACKAGE.parent))))
+        found.extend(scan_source(path.read_text(encoding="utf-8"), str(path.relative_to(_PACKAGE.parent))))
     return found
 
 
@@ -156,6 +172,12 @@ def test_flags_an_import_aliased_enum():
 def test_flags_any_settle_seq_write():
     hits = scan_source("def f(job, u):\n    job.settle_seq = 5\n    u.values(settle_seq=6)\n", "t.py")
     assert len(hits) == 2
+
+
+def test_flags_a_dict_literal_values_mapping():
+    """SQLAlchemy also accepts ``.values({...})`` — as reachable by accident as a keyword."""
+    src = 'def f(u):\n    u.values({"status": JobStatus.failed, "settle_seq": 3})\n'
+    assert len(scan_source(src, "t.py")) == 2
 
 
 def test_allows_the_sanctioned_writer_but_not_a_lookalike():

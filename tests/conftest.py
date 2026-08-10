@@ -496,14 +496,14 @@ async def start_job(job_id: int) -> int:
     Production runners are only ever entered by the worker, which owns that transition and
     the run-attempt bump (Appendix S §3.1). A test that invokes a runner directly has to
     perform it, or the runner's terminal compare-and-set correctly refuses to write over a
-    job no execution has started.
+    job no execution has started. Sets neither ``started_at`` nor ``heartbeat_at``; a
+    test that needs them stamps them itself.
     """
     from nso_adapter.store.models import Job, JobStatus
 
     async with session() as db:
         job = await db.get(Job, job_id)
-        if job is None:
-            return 0
+        assert job is not None, f"start_job: job {job_id} does not exist — seed it first"
         if job.status is JobStatus.queued:
             job.status = JobStatus.running
             job.run_attempt = job.run_attempt + 1

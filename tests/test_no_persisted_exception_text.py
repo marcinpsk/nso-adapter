@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
-"""No persisted error ``message`` may be built from ``repr()``.
+"""No persisted error ``message`` or ``error`` may be built from ``repr()``.
 
 Exception text can embed credentials — a RESTCONF error echoes the request, an httpx
 error its headers. The sanctioned envelopes are ``core.claim.internal_error`` (the
 exception TYPE only; the text belongs in the server log) and ``core.claim.JobError``
 (author-controlled message, raised deliberately). This guard bans the shape that
-leaked: a ``"message"`` or ``"error"`` value containing a ``repr()`` call inside any
-dict literal in the package. ``str(exc)`` stays legal because every current use is a
-typed domain exception whose text is author-controlled; log calls are exempt by
-construction (structlog kwargs are not dict literals).
+leaked: a ``"message"`` or ``"error"`` value built from ``repr()`` — as a call, as
+``builtins.repr``, or as an f-string ``!r``/``!a`` conversion — inside any dict
+literal in the package. ``str(exc)`` stays legal because every current use is a typed
+domain exception whose text is author-controlled; log calls are exempt by construction
+(structlog kwargs are not dict literals).
 """
 
 from __future__ import annotations
@@ -18,27 +19,64 @@ import ast
 from pathlib import Path
 
 _PACKAGE = Path(__file__).resolve().parents[1] / "nso_adapter"
-_BANNED_CALLS = frozenset({"repr"})
 _GUARDED_KEYS = frozenset({"message", "error"})
+# FormattedValue.conversion codes for {x!r} and {x!a} — both emit repr-style text.
+_REPR_CONVERSIONS = frozenset({ord("r"), ord("a")})
 
 
-def _banned_calls(node: ast.AST):
-    for sub in ast.walk(node):
-        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id in _BANNED_CALLS:
-            yield sub
+def _is_repr(node: ast.AST) -> bool:
+    if isinstance(node, ast.Call):
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "repr":
+            return True
+        if isinstance(func, ast.Attribute) and func.attr == "repr":
+            return True
+    return isinstance(node, ast.FormattedValue) and node.conversion in _REPR_CONVERSIONS
+
+
+def _has_repr(value: ast.AST) -> bool:
+    return any(_is_repr(sub) for sub in ast.walk(value))
+
+
+def scan_source(source: str, path: str) -> list[str]:
+    """Every guarded-key dict value built from repr(), as ``path:line`` strings."""
+    violations: list[str] = []
+    for node in ast.walk(ast.parse(source, filename=path)):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            if isinstance(key, ast.Constant) and key.value in _GUARDED_KEYS and _has_repr(value):
+                violations.append(f"{path}:{value.lineno}")
+    return violations
+
+
+# ── the guard ────────────────────────────────────────────────────────────────
 
 
 def test_no_message_value_is_built_from_exception_text() -> None:
     violations: list[str] = []
     for path in sorted(_PACKAGE.rglob("*.py")):
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Dict):
-                continue
-            for key, value in zip(node.keys, node.values):
-                if isinstance(key, ast.Constant) and key.value in _GUARDED_KEYS and any(_banned_calls(value)):
-                    violations.append(f"{path.relative_to(_PACKAGE.parent)}:{value.lineno}")
+        violations.extend(scan_source(path.read_text(encoding="utf-8"), str(path.relative_to(_PACKAGE.parent))))
     assert not violations, (
-        "persisted 'message' built from repr()/str() — route it through core.claim.internal_error: "
-        + ", ".join(violations)
+        "persisted 'message'/'error' built from repr() — route it through "
+        "core.claim.internal_error / error_envelope: " + ", ".join(violations)
     )
+
+
+# ── analyzer self-tests (real AST parsing) ───────────────────────────────────
+
+
+def test_flags_a_repr_call() -> None:
+    assert scan_source('e = {"message": repr(exc)}\n', "t.py") == ["t.py:1"]
+
+
+def test_flags_an_fstring_repr_conversion() -> None:
+    assert scan_source('e = {"error": f"boom: {exc!r}"}\n', "t.py") == ["t.py:1"]
+
+
+def test_flags_builtins_repr() -> None:
+    assert scan_source('e = {"message": builtins.repr(exc)}\n', "t.py") == ["t.py:1"]
+
+
+def test_str_on_a_typed_exception_stays_legal() -> None:
+    assert scan_source('e = {"message": str(exc), "detail": {}}\n', "t.py") == []
