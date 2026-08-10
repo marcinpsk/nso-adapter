@@ -20,6 +20,7 @@ from sqlalchemy import select
 
 from nso_adapter.core import removal as removal_mod
 from nso_adapter.core.removal import enqueue_removal, replace_on_removal
+from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import (
     Device,
     IsisFlexAlgoIntent,
@@ -51,6 +52,8 @@ async def _seed_device(*, nso_device_name: str = "sw3", netbox_device_id: int = 
     async with session() as db:
         d = Device(nso_instance="nso-dev", nso_device_name=nso_device_name, netbox_device_id=netbox_device_id)
         db.add(d)
+        await db.flush()
+        await create_counter(db, d.id)
         await db.commit()
         await db.refresh(d)
         return d.id
@@ -58,10 +61,13 @@ async def _seed_device(*, nso_device_name: str = "sw3", netbox_device_id: int = 
 
 async def _seed_removal_job(device_id: int, scope: str = "vlan", context_extra: dict | None = None) -> int:
     async with session() as db:
+        # Started, at attempt 1: run_removal is invoked directly, so nothing else performs
+        # the worker head's queued -> running transition its terminal CAS expects.
         j = Job(
             job_type=JobType.removal,
             device_id=device_id,
-            status=JobStatus.queued,
+            status=JobStatus.running,
+            run_attempt=1,
             context={"scope": scope, **(context_extra or {})},
         )
         db.add(j)

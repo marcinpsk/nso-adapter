@@ -96,7 +96,9 @@ async def seed_tombstone(device_id: int, triple: tuple, *, route_id=99, deployed
 
 async def seed_apply_job(device_id: int) -> int:
     async with session() as db:
-        job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.queued)
+        # Seeded as the worker head leaves it: started, at attempt 1. A directly-invoked
+        # runner never performs that transition, and its terminal CAS expects `running`.
+        job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.running, run_attempt=1)
         db.add(job)
         await db.commit()
         return job.id

@@ -24,6 +24,7 @@ from nso_adapter.core.jobs import (
     has_any_active_job,
 )
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
 from tests.conftest import session
 
@@ -33,15 +34,27 @@ async def _seed_device(nso_device_name: str = "test-rtr", netbox_id: int = 1) ->
     async with session() as db:
         d = Device(nso_instance="nso-dev", nso_device_name=nso_device_name, netbox_device_id=netbox_id)
         db.add(d)
+        await db.flush()
+        await create_counter(db, d.id)
         await db.commit()
         await db.refresh(d)
         return d.id
 
 
 async def _seed_job(device_id: int, status: JobStatus = JobStatus.queued) -> int:
-    """Insert a job and return its id."""
+    """Insert a job and return its id.
+
+    ``JobStatus.running`` seeds it as the WORKER HEAD leaves it — started, at attempt 1.
+    A directly-invoked runner never performs that transition, and every terminal write
+    compares against it (Appendix S §3.1).
+    """
     async with session() as db:
-        j = Job(job_type=JobType.sync, device_id=device_id, status=status)
+        j = Job(
+            job_type=JobType.sync,
+            device_id=device_id,
+            status=status,
+            run_attempt=1 if status is JobStatus.running else 0,
+        )
         db.add(j)
         await db.commit()
         await db.refresh(j)
@@ -240,7 +253,7 @@ async def test_enqueue_job_raises_on_unknown_type(adapter_client):
 async def test_run_with_db_success(adapter_client):
     """_run_with_db marks job succeeded and stores result."""
     device_id = await _seed_device("rtr-10", 20)
-    job_id = await _seed_job(device_id, JobStatus.queued)
+    job_id = await _seed_job(device_id, JobStatus.running)
 
     async def success_factory(dev_id, db):
         return {"outcome": "ok"}
@@ -254,25 +267,66 @@ async def test_run_with_db_success(adapter_client):
 
 
 async def test_run_with_db_failure(adapter_client):
-    """_run_with_db marks job failed on exception."""
+    """_run_with_db marks the job failed with a client-safe error: type only, no text.
+
+    The raised message stands in for a secret (a RESTCONF error echoes the request, an
+    httpx error its headers). Forbidden: any of it reaching the persisted job error.
+    """
+    import json
+
     device_id = await _seed_device("rtr-11", 21)
-    job_id = await _seed_job(device_id, JobStatus.queued)
+    job_id = await _seed_job(device_id, JobStatus.running)
 
     async def fail_factory(dev_id, db):
-        raise RuntimeError("something broke")
+        raise RuntimeError("Bearer sekrit-credential")
 
     await _run_with_db(job_id, device_id, fail_factory)
 
     async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
-        assert "something broke" in job.error["message"]
+        assert job.error["code"] == "internal"
+        assert "sekrit-credential" not in json.dumps(job.error), "exception text reached the persisted error"
+        assert "RuntimeError" in job.error["message"]
+
+
+async def test_a_refused_terminal_write_discards_the_runner_transaction(adapter_client):
+    """S1 — a stale runner's success must not commit its session writes under a refused CAS.
+
+    The job's ``run_attempt`` moved to a successor while this run was in flight, so the
+    terminal CAS is refused. Any write the runner staged in the session (here a marker on
+    the device row) belongs to an execution that lost its ownership. Forbidden: committing
+    those writes anyway, without a terminal status.
+    """
+    from sqlalchemy import update
+
+    from nso_adapter.core.claim import ClaimRegistration
+
+    device_id = await _seed_device("rtr-stale", 31)
+    job_id = await _seed_job(device_id, JobStatus.running)
+    async with session() as db:
+        await db.execute(update(Job).where(Job.id == job_id).values(run_attempt=2))
+        await db.commit()
+
+    async def write_then_succeed(dev_id, db):
+        device = await db.get(Device, dev_id)
+        device.sw_version = "tail-write"
+        return {"outcome": "ok"}
+
+    await _run_with_db(job_id, device_id, write_then_succeed, reg=ClaimRegistration(run_attempt=1))
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        device = await db.get(Device, device_id)
+    assert job.status is JobStatus.running, "the refused write must leave the successor's row alone"
+    assert job.result is None and job.settle_seq is None
+    assert device.sw_version is None, "the discarded transaction leaked a runner write"
 
 
 async def test_run_with_db_timeout(adapter_client):
     """_run_with_db marks job failed on timeout."""
     device_id = await _seed_device("rtr-12", 22)
-    job_id = await _seed_job(device_id, JobStatus.queued)
+    job_id = await _seed_job(device_id, JobStatus.running)
 
     async def slow_factory(dev_id, db):
         await asyncio.sleep(9999)
@@ -307,7 +361,7 @@ async def test_run_with_db_marks_failed_even_when_session_poisoned(adapter_clien
     handler must rollback before the failed-status commit, or that commit itself re-raises and
     the job is stranded 'running' (s3-5 — same fix as run_apply #11)."""
     device_id = await _seed_device("rtr-poison-db", 71)
-    job_id = await _seed_job(device_id, JobStatus.queued)
+    job_id = await _seed_job(device_id, JobStatus.running)
 
     async def poison_factory(dev_id, db):
         # A duplicate PK insert → IntegrityError → AsyncSession enters needs-rollback,
@@ -327,7 +381,7 @@ async def test_run_with_db_marks_failed_even_when_session_poisoned(adapter_clien
 async def test_run_sync_calls_run_with_db(adapter_client):
     """_run_sync delegates to _run_with_db with sync_device."""
     device_id = await _seed_device("rtr-20", 30)
-    job_id = await _seed_job(device_id)
+    job_id = await _seed_job(device_id, JobStatus.running)
 
     with patch("nso_adapter.core.jobs._run_with_db", new_callable=AsyncMock) as mock_run:
         await _run_sync(job_id, device_id)
@@ -342,7 +396,7 @@ async def test_run_sync_now_uses_the_900s_budget(adapter_client):
     from nso_adapter.core.jobs import _run_sync_now
 
     device_id = await _seed_device()
-    job_id = await _seed_job(device_id)
+    job_id = await _seed_job(device_id, JobStatus.running)
 
     with patch("nso_adapter.core.jobs._run_with_db", new_callable=AsyncMock) as rwd:
         await _run_sync_now(job_id, device_id)
@@ -372,10 +426,12 @@ async def test_sync_now_timeout_leaves_last_sync_pair_untouched(adapter_client):
             last_sync_status=LastSyncStatus.succeeded,
         )
         db.add(d)
+        await db.flush()
+        await create_counter(db, d.id)
         await db.commit()
         await db.refresh(d)
         device_id = d.id
-    job_id = await _seed_job(device_id)
+    job_id = await _seed_job(device_id, JobStatus.running)
 
     client = AsyncMock(spec=NsoClient)
     client.get_device_ned_id = AsyncMock(return_value="cisco-ios-cli-6.95")
@@ -422,7 +478,7 @@ async def test_run_sync_from_nso_reads_all_surfaces_without_device_contact(adapt
     from nso_adapter.nso.client import NsoClient as _NsoClient
 
     device_id = await _seed_device("sfn-rtr", 91)
-    job_id = await _seed_job(device_id)
+    job_id = await _seed_job(device_id, JobStatus.running)
 
     client = AsyncMock(spec=_NsoClient)
     imp._nso_clients["nso-dev"] = client
@@ -462,7 +518,7 @@ async def test_run_sync_from_nso_fails_job_on_total_supplier_failure(adapter_cli
     from nso_adapter.nso.read_outcome import Unavailable, UnavailableReason
 
     device_id = await _seed_device("sfn-rtr-down", 92)
-    job_id = await _seed_job(device_id)
+    job_id = await _seed_job(device_id, JobStatus.running)
 
     client = AsyncMock(spec=_NsoClient)
     imp._nso_clients["nso-dev"] = client
@@ -508,7 +564,7 @@ async def test_run_sync_now_requests_comprehensive_atomic(adapter_client):
     from nso_adapter.core.jobs import _run_sync_now
 
     device_id = await _seed_device()
-    job_id = await _seed_job(device_id)
+    job_id = await _seed_job(device_id, JobStatus.running)
 
     with patch("nso_adapter.core.importer.sync_device", new_callable=AsyncMock, return_value={}) as sd:
         await _run_sync_now(job_id, device_id)
@@ -521,7 +577,7 @@ async def test_run_sync_now_requests_comprehensive_atomic(adapter_client):
 async def test_run_detect_drift_calls_run_with_db(adapter_client):
     """_run_detect_drift delegates to _run_with_db."""
     device_id = await _seed_device("rtr-21", 31)
-    job_id = await _seed_job(device_id)
+    job_id = await _seed_job(device_id, JobStatus.running)
 
     with patch("nso_adapter.core.jobs._run_with_db", new_callable=AsyncMock) as mock_run:
         await _run_detect_drift(job_id, device_id)
@@ -554,7 +610,7 @@ def _nso_client_for_connect(output: dict) -> MagicMock:
 async def test_run_connect_success(adapter_client):
     """_run_connect runs the real connect action and threads its output onto the job."""
     device_id = await _seed_device("rtr-30", 40)
-    job_id = await _seed_job(device_id)
+    job_id = await _seed_job(device_id, JobStatus.running)
 
     client = _nso_client_for_connect({"result": "connected"})
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
@@ -570,7 +626,7 @@ async def test_run_connect_success(adapter_client):
 async def test_run_connect_device_not_found(adapter_client):
     """_run_connect marks job failed when get_nso_client raises."""
     device_id = await _seed_device("rtr-31", 41)
-    job_id = await _seed_job(device_id)
+    job_id = await _seed_job(device_id, JobStatus.running)
 
     with patch("nso_adapter.core.importer.get_nso_client", side_effect=KeyError("nso-dev not found")):
         await _run_connect(job_id, device_id)
@@ -584,7 +640,7 @@ async def test_run_connect_device_not_in_db(adapter_client):
     """_run_connect marks job failed when device_id doesn't exist in DB."""
     # Seed a device just to have the job FK work, then use non-existent device_id
     device_id = await _seed_device("rtr-34", 44)
-    job_id = await _seed_job(device_id)
+    job_id = await _seed_job(device_id, JobStatus.running)
     non_existent_device_id = 99998
 
     await _run_connect(job_id, non_existent_device_id)
@@ -605,7 +661,7 @@ async def test_run_connect_job_not_found(adapter_client):
 async def test_run_connect_timeout(adapter_client):
     """_run_connect marks job failed on timeout."""
     device_id = await _seed_device("rtr-33", 43)
-    job_id = await _seed_job(device_id)
+    job_id = await _seed_job(device_id, JobStatus.running)
 
     async def mock_wait_for(coro, timeout):
         coro.close()
@@ -631,7 +687,7 @@ async def test_run_connect_marks_failed_even_when_session_poisoned(adapter_clien
     the runner's db, so a capturing get_session wrapper hands the poison stub the real session
     to fail a flush on — proving the runner rolls back before committing the failed status."""
     device_id = await _seed_device("rtr-poison-c", 72)
-    job_id = await _seed_job(device_id, JobStatus.queued)
+    job_id = await _seed_job(device_id, JobStatus.running)
 
     from nso_adapter.store import db as db_mod
 
@@ -665,7 +721,7 @@ async def test_run_connect_marks_failed_even_when_session_poisoned(adapter_clien
 async def test_run_apply_calls_run_apply(adapter_client):
     """_run_apply delegates to core.apply.run_apply."""
     device_id = await _seed_device("rtr-40", 50)
-    job_id = await _seed_job(device_id)
+    job_id = await _seed_job(device_id, JobStatus.running)
 
     with patch("nso_adapter.core.apply.run_apply", new_callable=AsyncMock) as mock_run:
         await _run_apply(job_id, device_id)
@@ -683,7 +739,8 @@ async def test_run_provision_marks_failed_even_when_session_poisoned(adapter_cli
         j = Job(
             job_type=JobType.provision,
             device_id=None,
-            status=JobStatus.queued,
+            status=JobStatus.running,
+            run_attempt=1,
             context={"nso_instance": "nso-dev", "device_name": "prov-poison"},
         )
         db.add(j)
@@ -713,11 +770,13 @@ class _FakeNb:
 
 
 async def _queue_provision_job(device_name: str) -> int:
+    """A provision job as the CLAIMLESS worker head leaves it: started, at attempt 1."""
     async with session() as db:
         j = Job(
             job_type=JobType.provision,
             device_id=None,
-            status=JobStatus.queued,
+            status=JobStatus.running,
+            run_attempt=1,
             context={"nso_instance": "nso-dev", "device_name": device_name},
         )
         db.add(j)

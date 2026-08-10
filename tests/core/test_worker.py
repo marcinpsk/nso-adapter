@@ -8,6 +8,7 @@ import asyncio
 from unittest.mock import patch
 
 from nso_adapter.core import worker
+from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
 from tests.conftest import session
 
@@ -16,6 +17,8 @@ async def _seed_device(nso_device_name: str = "wrk-rtr", netbox_id: int = 700) -
     async with session() as db:
         d = Device(nso_instance="nso-dev", nso_device_name=nso_device_name, netbox_device_id=netbox_id)
         db.add(d)
+        await db.flush()
+        await create_counter(db, d.id)
         await db.commit()
         await db.refresh(d)
         return d.id

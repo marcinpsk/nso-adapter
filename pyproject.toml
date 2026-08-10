@@ -11,14 +11,14 @@ readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.115",
+    "fastapi>=0.141.1",
     "uvicorn[standard]>=0.52.1",
     "httpx>=0.28",
     "sqlalchemy[asyncio]>=2.0.51",
     "asyncpg>=0.30",
     "psycopg2-binary>=2.9",
-    "alembic>=1.14",
-    "apscheduler>=3.10",
+    "alembic>=1.18.5",
+    "apscheduler>=3.11.3",
     "hvac>=2.3",
     "pydantic-settings>=2.7",
     "structlog>=26.1.0",
@@ -29,14 +29,14 @@ dependencies = [
 [dependency-groups]
 dev = [
     "httpx>=0.28.1",
-    "pre-commit>=4.0",
-    "pytest>=8.3",
-    "pytest-asyncio>=0.25",
+    "pre-commit>=4.6.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
     "pytest-httpx>=0.35",
     "pytest-xdist>=3.8",
     "respx>=0.21",
-    "ruff>=0.9",
+    "ruff>=0.16.1",
     "watchfiles>=1.0",
 ]
 
@@ -51,6 +51,16 @@ commit_parser = "conventional"
 tag_format = "v{version}"
 version_toml = ["pyproject.toml:project.version"]
 version_variables = ["nso_adapter/__init__.py:__version__"]
+# Staged files join the release commit; the PSR action container has no uv.
+build_command = """
+set -e
+command -v uv >/dev/null || python -m pip install 'uv ~= 0.12.3'
+uv lock --upgrade-package nso-adapter
+git add uv.lock
+"""
+# PSR strips the build env to an allowlist; forward only vars that are safe when
+# empty (PSR passes unset entries as "", which uv rejects for boolish UV_* vars).
+build_command_env = ["http_proxy", "https_proxy", "no_proxy"]
 
 [tool.semantic_release.branches.main]
 match = "^main$"

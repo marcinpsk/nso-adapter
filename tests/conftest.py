@@ -468,6 +468,7 @@ async def seed_device(
             device_id = await seed_device(nso_device_name="my-router")
             resp = await adapter_client.get(f"/api/v1/devices/{device_id}", ...)
     """
+    from nso_adapter.store.device_settle import create_counter
     from nso_adapter.store.models import Device, ManagedScope
 
     async with session() as db:
@@ -478,11 +479,36 @@ async def seed_device(
         )
         db.add(d)
         await db.flush()
+        # Every production insert site creates the counter in the device's own transaction
+        # (Appendix S §3.3); a fixture that skips it mints a device whose first terminal job
+        # raises, which is the hard failure — not a fixture convenience to paper over.
+        await create_counter(db, d.id)
         for attr in ["description"] if attributes is None else attributes:
             db.add(ManagedScope(device_id=d.id, attribute=attr))
         await db.commit()
         await db.refresh(d)
         return d.id
+
+
+async def start_job(job_id: int) -> int:
+    """Stand in for the worker head's ``queued -> running`` transition. Returns the attempt.
+
+    Production runners are only ever entered by the worker, which owns that transition and
+    the run-attempt bump (Appendix S §3.1). A test that invokes a runner directly has to
+    perform it, or the runner's terminal compare-and-set correctly refuses to write over a
+    job no execution has started. Sets neither ``started_at`` nor ``heartbeat_at``; a
+    test that needs them stamps them itself.
+    """
+    from nso_adapter.store.models import Job, JobStatus
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job is not None, f"start_job: job {job_id} does not exist — seed it first"
+        if job.status is JobStatus.queued:
+            job.status = JobStatus.running
+            job.run_attempt = job.run_attempt + 1
+            await db.commit()
+        return job.run_attempt
 
 
 async def seed_l2_saps(device_id: int, services: list[dict]):

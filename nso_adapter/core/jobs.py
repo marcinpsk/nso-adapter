@@ -17,7 +17,17 @@ from sqlalchemy import exists, literal_column, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.claim import ClaimLostError, ClaimRegistration, ClaimUnavailableError, lock_claim
+from nso_adapter.core.claim import (
+    UNSET,
+    BookkeepingOutcomeUnknown,
+    ClaimLostError,
+    ClaimRegistration,
+    ClaimUnavailableError,
+    JobError,
+    error_envelope,
+    lock_claim,
+    terminalize,
+)
 from nso_adapter.store.models import Job, JobStatus, JobType
 
 logger = structlog.get_logger(__name__)
@@ -300,6 +310,9 @@ async def _mark_job_failed(
     revokes a stale sync's claim and requeues the job, the old runner raises
     ``ClaimLostError``, its wrapper converts that into a call here, and this write
     overwrites recovery's disposition — or a fresh worker's ``running``.
+
+    The compare-and-set on ``(running, run_attempt)`` is the rest of that guard, and it is
+    what covers the claimless lane, which has no claim row to lock at all.
     """
     await db.rollback()
     if reg is not None:
@@ -308,14 +321,31 @@ async def _mark_job_failed(
         except ClaimLostError:
             logger.warning("job.mark_failed_claim_lost", job_id=job_id, device_id=reg.device_id)
             return
-    job = await db.get(Job, job_id)
-    if job is not None:
-        job.status = JobStatus.failed
-        job.error = error
-        await db.commit()
+    await terminalize(
+        db,
+        job_id,
+        status=JobStatus.failed,
+        expect=JobStatus.running,
+        run_attempt=reg.run_attempt if reg is not None else None,
+        error=error,
+    )
+    await db.commit()
 
 
-async def _run_with_db(job_id: int, device_id: int, coro_factory, *, timeout: float = 600.0) -> None:
+async def _run_with_db(
+    job_id: int,
+    device_id: int,
+    coro_factory,
+    *,
+    timeout: float = 600.0,
+    reg: ClaimRegistration | None = None,
+) -> None:
+    """Run *coro_factory* under a total job budget and write its terminal status.
+
+    *reg* names the execution this run belongs to. Without it the terminal write has no
+    way to say which run it reports, and an abandoned runner could suppress the rerun
+    recovery mandated or clobber the successor that replaced it.
+    """
     from nso_adapter.store.db import get_session
 
     # Total job timeout, default 10 minutes: guards against NSO hung connections that
@@ -324,37 +354,51 @@ async def _run_with_db(job_id: int, device_id: int, coro_factory, *, timeout: fl
     # legal child waits alone sum to ~720s (NED resolve 30 + sync-from 120 + attrs
     # 30+180 escalation + atomic action 360; codex S5a R1-F3).
     async for db in get_session():
-        job = await db.get(Job, job_id)
-        if not job:
+        if await db.scalar(select(Job.id).where(Job.id == job_id)) is None:
             return
-        job.status = JobStatus.running
-        await db.commit()
         logger.info("job.budget", job_id=job_id, device_id=device_id, timeout=timeout)
         try:
             result = await asyncio.wait_for(coro_factory(device_id, db), timeout=timeout)
-            job.status = JobStatus.succeeded
-            job.result = result
-            await db.commit()
+            write = await terminalize(
+                db,
+                job_id,
+                status=JobStatus.succeeded,
+                expect=JobStatus.running,
+                run_attempt=reg.run_attempt if reg is not None else None,
+                result=result,
+            )
+            if write is not None:
+                await db.commit()
+            else:
+                # Refused: recovery re-dispositioned the job mid-run. The session's writes
+                # belong to an execution that lost ownership, so the transaction is discarded.
+                await db.rollback()
         except TimeoutError:
             logger.error("job.timeout", job_id=job_id, device_id=device_id, timeout=timeout)
             await _mark_job_failed(
                 db,
                 job_id,
                 {"code": "timeout", "message": f"Job exceeded {int(timeout)}s timeout", "detail": {}},
+                reg,
             )
         except ClaimLostError:
             # Revocation is not a runner error: recovery already owns the disposition.
             raise
+        except BookkeepingOutcomeUnknown:
+            # R2 §4.6 / Appendix S §3.3: the terminal transaction did not complete after its
+            # effect was performed. A second write here reports a failure for work that
+            # really landed; recovery re-dispositions a job still `running` instead.
+            raise
         except Exception as exc:
             logger.exception("job.failed", job_id=job_id, device_id=device_id, error=repr(exc))
-            await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}})
+            await _mark_job_failed(db, job_id, error_envelope(exc), reg)
 
 
 async def _run_sync(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
     from nso_adapter.core.importer import sync_device
 
     logger.info("job.sync.start", job_id=job_id, device_id=device_id)
-    await _run_with_db(job_id, device_id, sync_device)
+    await _run_with_db(job_id, device_id, sync_device, reg=reg)
 
 
 async def _run_sync_now(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
@@ -370,7 +414,7 @@ async def _run_sync_now(job_id: int, device_id: int, reg: ClaimRegistration | No
     async def _atomic_sync(device_id_: int, db) -> dict:
         return await sync_device(device_id_, db, atomic=True, comprehensive=True)
 
-    await _run_with_db(job_id, device_id, _atomic_sync, timeout=900.0)
+    await _run_with_db(job_id, device_id, _atomic_sync, timeout=900.0, reg=reg)
 
 
 async def _run_sync_from_nso(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
@@ -389,13 +433,13 @@ async def _run_sync_from_nso(job_id: int, device_id: int, reg: ClaimRegistration
     async def _mirror_read(device_id_: int, db) -> dict:
         device = await db.get(Device, device_id_)
         if not device:
-            raise ValueError(f"Device {device_id_} not found")
+            raise JobError("not_found", f"Device {device_id_} not found")
         client = get_nso_client(device.nso_instance)
         failed, supplier_outcome = await refresh_all_surfaces_for_device(
             db, device, client, refresh_source="sync_from_nso", atomic=True
         )
         if supplier_outcome is not None:
-            raise RuntimeError("NSO read unavailable — nothing refreshed; last-known data kept")
+            raise JobError("read_unavailable", "NSO read unavailable — nothing refreshed; last-known data kept")
         nb_client = get_netbox_client()
         if nb_client and device.netbox_device_id:
             try:
@@ -406,14 +450,14 @@ async def _run_sync_from_nso(job_id: int, device_id: int, reg: ClaimRegistration
                 )
         return {"degraded_surfaces": sorted(failed)}
 
-    await _run_with_db(job_id, device_id, _mirror_read, timeout=900.0)
+    await _run_with_db(job_id, device_id, _mirror_read, timeout=900.0, reg=reg)
 
 
 async def _run_detect_drift(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
     from nso_adapter.core.importer import detect_drift
 
     logger.info("job.detect_drift.start", job_id=job_id, device_id=device_id)
-    await _run_with_db(job_id, device_id, detect_drift)
+    await _run_with_db(job_id, device_id, detect_drift, reg=reg)
 
 
 async def _run_connect(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
@@ -427,15 +471,12 @@ async def _run_connect(job_id: int, device_id: int, reg: ClaimRegistration | Non
     logger.info("job.connect.start", job_id=job_id, device_id=device_id)
 
     async for db in get_session():
-        job = await db.get(Job, job_id)
-        if not job:
+        if await db.scalar(select(Job.id).where(Job.id == job_id)) is None:
             return
-        job.status = JobStatus.running
-        await db.commit()
         try:
             device = await db.get(Device, device_id)
             if not device:
-                raise ValueError(f"Device {device_id} not found")
+                raise JobError("not_found", f"Device {device_id} not found")
             client = get_nso_client(device.nso_instance)
 
             async def _do_connect(dev_id: int, _db) -> dict:
@@ -443,22 +484,38 @@ async def _run_connect(job_id: int, device_id: int, reg: ClaimRegistration | Non
                 return {"output": output}
 
             result = await asyncio.wait_for(_do_connect(device_id, db), timeout=_JOB_TIMEOUT)
-            job.status = JobStatus.succeeded
-            job.result = result
-            await db.commit()
+            write = await terminalize(
+                db,
+                job_id,
+                status=JobStatus.succeeded,
+                expect=JobStatus.running,
+                run_attempt=reg.run_attempt if reg is not None else None,
+                result=result,
+            )
+            if write is not None:
+                await db.commit()
+            else:
+                # Refused: same discard rule as _run_with_db above.
+                await db.rollback()
         except TimeoutError:
             logger.error("job.connect.timeout", job_id=job_id, timeout=_JOB_TIMEOUT)
             await _mark_job_failed(
                 db,
                 job_id,
                 {"code": "timeout", "message": f"Connect exceeded {int(_JOB_TIMEOUT)}s timeout", "detail": {}},
+                reg,
             )
         except ClaimLostError:
             # Revocation is not a runner error: recovery already owns the disposition.
             raise
+        except BookkeepingOutcomeUnknown:
+            # R2 §4.6 / Appendix S §3.3: the terminal transaction did not complete after its
+            # effect was performed. A second write here reports a failure for work that
+            # really landed; recovery re-dispositions a job still `running` instead.
+            raise
         except Exception as exc:
             logger.exception("job.connect.failed", job_id=job_id, error=repr(exc))
-            await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}})
+            await _mark_job_failed(db, job_id, error_envelope(exc), reg)
 
 
 async def _run_apply(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
@@ -518,12 +575,10 @@ async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistrat
     logger.info("job.provision.start", job_id=job_id)
 
     async for db in get_session():
-        job = await db.get(Job, job_id)
-        if not job:
+        context = await db.scalar(select(Job.context).where(Job.id == job_id))
+        if context is None and await db.scalar(select(Job.id).where(Job.id == job_id)) is None:
             return
-        params = dict(job.context or {})
-        job.status = JobStatus.running
-        await db.commit()
+        params = dict(context or {})
         try:
             result = await asyncio.wait_for(
                 provision_nso_device(db, **params, reg=reg, job_id=job_id), timeout=_JOB_TIMEOUT
@@ -534,17 +589,31 @@ async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistrat
             # re-dispositioned, still commits `succeeded` over that disposition.
             if reg is not None:
                 await lock_claim(db, reg)
-            job.status = JobStatus.succeeded
-            job.result = result
-            # Link the job to the device it created so history/lookup works post-onboard.
-            if result.get("device_id") is not None:
-                job.device_id = result["device_id"]
-            await db.commit()
+            # The device this run created is attached in the SAME statement as the terminal
+            # status. UNSET means "leave it attached" — never "set NULL".
+            provisioned_device_id = result.get("device_id")
+            write = await terminalize(
+                db,
+                job_id,
+                status=JobStatus.succeeded,
+                expect=JobStatus.running,
+                run_attempt=reg.run_attempt if reg is not None else None,
+                result=result,
+                set_device_id=provisioned_device_id if provisioned_device_id is not None else UNSET,
+            )
+            if write is not None:
+                await db.commit()
+            else:
+                # Refused: recovery re-dispositioned the job mid-run. The session's writes
+                # belong to an execution that lost ownership, so the transaction is discarded.
+                await db.rollback()
         except ClaimUnavailableError as exc:
             # The device stayed claimed for the whole OQ6 budget, so the mapping was refused
             # and NOTHING was written. Honestly retryable — and terminal, so the pair's
             # admission slot frees for the retry. Necessarily still claimless: this is
-            # raised by the acquisition itself.
+            # raised by the acquisition itself, which is exactly why the registration must
+            # ride along — with no claim row to lock, the attempt on it is the only proof
+            # this write belongs to THIS run and not to the successor that replaced it.
             logger.warning("job.provision.device_busy", job_id=job_id, error=repr(exc))
             await _mark_job_failed(
                 db,
@@ -554,6 +623,7 @@ async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistrat
                     "message": "The device is busy — another operation holds it",
                     "detail": {"reason": "claim_unavailable", "retryable": True},
                 },
+                reg,
             )
         except TimeoutError:
             logger.error("job.provision.timeout", job_id=job_id, timeout=_JOB_TIMEOUT)
@@ -566,9 +636,14 @@ async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistrat
         except ClaimLostError:
             # Revocation is not a runner error: recovery already owns the disposition.
             raise
+        except BookkeepingOutcomeUnknown:
+            # R2 §4.6 / Appendix S §3.3: the terminal transaction did not complete after its
+            # effect was performed. A second write here reports a failure for work that
+            # really landed; recovery re-dispositions a job still `running` instead.
+            raise
         except Exception as exc:
             logger.exception("job.provision.failed", job_id=job_id, error=repr(exc))
-            await _mark_job_failed(db, job_id, {"code": "internal", "message": repr(exc), "detail": {}}, reg)
+            await _mark_job_failed(db, job_id, error_envelope(exc), reg)
 
     # Tell the plugin the provision job reached a terminal state (any branch above) so it advances
     # the gated onboarding row off the dashboard-poll path. Best-effort — the plugin's device-tab

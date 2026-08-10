@@ -25,7 +25,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError
+from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, internal_error, terminalize
 from nso_adapter.core.static_route_plan import authorized_clear_fields, build_plan
 from nso_adapter.nso.apply import NsoApplyError
 from nso_adapter.store.models import (
@@ -1190,9 +1190,11 @@ async def _apply_attributes(eligible, apply_fn, *, client, device_name, job_id, 
                 attribute=intent_row.attribute,
             )
             attr_state.sync_state = SyncState.apply_failed
-            intent_row.last_apply_error = {"code": "internal", "message": repr(exc), "detail": {}}
+            intent_row.last_apply_error = internal_error(exc)
             failed += 1
-            failures.append({"interface": iface.name, "attribute": intent_row.attribute, "error": repr(exc)})
+            failures.append(
+                {"interface": iface.name, "attribute": intent_row.attribute, "error": internal_error(exc)["message"]}
+            )
         else:
             attr_state.sync_state = SyncState.in_sync
             intent_row.last_apply_at = now
@@ -1237,9 +1239,9 @@ async def _apply_ips(by_iface, ifaces, apply_fn, *, client, device_name, job_id,
         except Exception as exc:
             logger.exception("apply.ip_unexpected_error", job_id=job_id, interface=iface.name)
             for row in ip_rows:
-                row.last_apply_error = {"code": "internal", "message": repr(exc), "detail": {}}
+                row.last_apply_error = internal_error(exc)
             failed += len(ip_rows)
-            failures.append({"interface": iface.name, "error": repr(exc)})
+            failures.append({"interface": iface.name, "error": internal_error(exc)["message"]})
         else:
             for row in ip_rows:
                 row.last_apply_at = now
@@ -1957,7 +1959,6 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
 
     await _finalize_job(
         db,
-        job,
         job_id,
         device.id,
         True,
@@ -1968,6 +1969,7 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
         reader_compare=reader_compare,
         reader_compare_unverifiable=reader_compare_unverifiable,
         static_route_results=sr_results,
+        reg=reg,
     )
 
     if sr_put_delivered and not sr_send_failed:
@@ -2374,10 +2376,10 @@ async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_
         )
     except Exception as exc:
         logger.exception(f"apply.{log_label}_unexpected_error", job_id=job_id)
-        err = {"code": "internal", "message": repr(exc), "detail": {}}
+        err = internal_error(exc)
         for row in rows:
             row.last_apply_error = err
-        return 0, len(rows), [{"error": repr(exc)}]
+        return 0, len(rows), [{"error": internal_error(exc)["message"]}]
     for row in rows:
         row.last_apply_at = now
         row.last_apply_error = None
@@ -2433,9 +2435,33 @@ async def _commit_terminal(db: AsyncSession, job_id: int) -> None:
         raise BookkeepingOutcomeUnknown(f"apply job {job_id}: terminal commit outcome is {outcome.value}")
 
 
+async def _write_terminal(
+    db: AsyncSession, job_id: int, status: JobStatus, result: dict | None, error: dict | None, reg
+) -> bool:
+    """Write the apply's terminal status under its ownership predicate. False on a refusal.
+
+    A refusal means another execution owns this job — recovery re-dispositioned it while
+    this run was in flight. The per-route results and CAS in this transaction belong to
+    that decision, not to ours, so the transaction is discarded rather than committed
+    under a status we were refused.
+    """
+    write = await terminalize(
+        db,
+        job_id,
+        status=status,
+        expect=JobStatus.running,
+        run_attempt=reg.run_attempt if reg is not None else None,
+        result=result,
+        error=error,
+    )
+    if write is None:
+        await db.rollback()
+        return False
+    return True
+
+
 async def _finalize_job(
     db: AsyncSession,
-    job: Job,
     job_id: int,
     device_id: int,
     any_eligible: bool,
@@ -2446,6 +2472,7 @@ async def _finalize_job(
     reader_compare: dict | None = None,
     reader_compare_unverifiable: dict | None = None,
     static_route_results: list | None = None,
+    reg=None,
 ) -> None:
     """Assemble job.result/status from the pass outcomes and commit.
 
@@ -2467,8 +2494,7 @@ async def _finalize_job(
     """
     if not any_eligible:
         logger.info("apply.nothing_eligible", job_id=job_id, device_id=device_id)
-        job.status = JobStatus.succeeded
-        job.result = {
+        empty_result = {
             "attribute_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
             "ip_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
             "snmp_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
@@ -2483,6 +2509,8 @@ async def _finalize_job(
             "route_policy_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
             "ospf_count_by_outcome": {"in_sync": 0, "apply_failed": 0},
         }
+        if not await _write_terminal(db, job_id, JobStatus.succeeded, empty_result, None, reg):
+            return
         await _commit_terminal(db, job_id)
         return
 
@@ -2502,21 +2530,23 @@ async def _finalize_job(
         result["reader_compare_unverifiable"] = reader_compare_unverifiable
     if static_route_results is not None:
         result["static_route_results"] = static_route_results
-    job.result = result
 
     total_failed = attr_failed + ip_failed + sum(failed for _ok, failed in scope_outcomes.values())
+    error = None
     if total_failed == 0:
-        job.status = JobStatus.succeeded
+        status = JobStatus.succeeded
     else:
-        job.status = JobStatus.failed
+        status = JobStatus.failed
         all_failed = [{"type": "attribute", **a} for a in attr_failures] + [{"type": "ip", **a} for a in ip_failures]
         for key in _SCOPE_RESULT_ORDER:
             all_failed.extend({"type": key, **a} for a in scope_failures.get(key, []))
-        job.error = {
+        error = {
             "code": "nso_commit_failed",
             "message": f"{total_failed} item(s) failed to apply",
             "detail": {"items": all_failed},
         }
+    if not await _write_terminal(db, job_id, status, result, error, reg):
+        return
     await _commit_terminal(db, job_id)
     logger.info(
         "apply.done",
@@ -2932,7 +2962,6 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     # ── Step 7: finalize ── (any_eligible computed up front, before the atomic branch)
     await _finalize_job(
         db,
-        job,
         job_id,
         device_id,
         any_eligible,
@@ -2943,6 +2972,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         reader_compare=reader_compare,
         reader_compare_unverifiable=reader_compare_unverifiable,
         static_route_results=sr_results,
+        reg=reg,
     )
     await _enqueue_pending_clear_retract(db, device, sr_plan, reg=reg)
     await _record_rp_capability_now(db, client, device, device_name, deferred_rp_capability, job_id=job_id)
@@ -3004,8 +3034,6 @@ async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -
         if not job:
             logger.error("apply.job_not_found", job_id=job_id)
             return
-        job.status = JobStatus.running
-        await db.commit()
 
         try:
             await _execute_apply(db, job, job_id, device_id, force, reg=reg)
@@ -3025,10 +3053,8 @@ async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -
             # leaving the job stuck 'running' and masking the real error. Re-fetch the job
             # after rollback (it may have been expired) so the status change persists.
             await db.rollback()
-            job = await db.get(Job, job_id)
-            if job is not None:
-                job.status = JobStatus.failed
-                job.error = {"code": "internal", "message": repr(exc), "detail": {}}
+            # Commit only a landed write; on a refusal _write_terminal has already rolled back.
+            if await _write_terminal(db, job_id, JobStatus.failed, None, internal_error(exc), reg):
                 await db.commit()
         else:
             # Apply finalized (succeeded/partial/failed-on-device, no unexpected error): re-read

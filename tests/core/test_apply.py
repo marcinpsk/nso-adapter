@@ -15,6 +15,7 @@ from sqlalchemy import select
 
 from nso_adapter.core.apply import _nokia_routed_kind, enqueue_apply, run_apply
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import (
     DbInterface,
     Device,
@@ -206,14 +207,26 @@ async def _seed_device(name: str = "test-rtr", netbox_id: int = 1) -> int:
     async with session() as db:
         d = Device(nso_instance="nso-dev", nso_device_name=name, netbox_device_id=netbox_id)
         db.add(d)
+        await db.flush()
+        await create_counter(db, d.id)
         await db.commit()
         await db.refresh(d)
         return d.id
 
 
-async def _seed_apply_job(device_id: int, status: JobStatus = JobStatus.queued) -> int:
+async def _seed_apply_job(device_id: int, status: JobStatus = JobStatus.running) -> int:
+    """A job as the WORKER HEAD leaves it: started, at attempt 1.
+
+    ``run_apply`` is invoked directly here, so nothing performs the ``queued -> running``
+    transition, and its terminal compare-and-set expects ``running`` (Appendix S §3.1).
+    """
     async with session() as db:
-        j = Job(job_type=JobType.apply, device_id=device_id, status=status)
+        j = Job(
+            job_type=JobType.apply,
+            device_id=device_id,
+            status=status,
+            run_attempt=1 if status is JobStatus.running else 0,
+        )
         db.add(j)
         await db.commit()
         await db.refresh(j)
@@ -1367,7 +1380,9 @@ async def test_run_apply_scope_unexpected_exception(adapter_client):
         assert job.result["vlan_count_by_outcome"]["apply_failed"] == 1
         rows = (await db.execute(select(VlanIntent).where(VlanIntent.device_id == device_id))).scalars().all()
         assert rows[0].last_apply_error["code"] == "internal"
-        assert "kaboom" in rows[0].last_apply_error["message"]
+        assert "kaboom" not in str(rows[0].last_apply_error), "exception text reached the persisted error"
+        assert "kaboom" not in str(job.error), "exception text reached the persisted failure items"
+        assert "RuntimeError" in rows[0].last_apply_error["message"]
 
 
 # The IS-IS sub-collections (process/level/flex) are eligible on their OWN — a per-level
@@ -1743,7 +1758,9 @@ async def test_run_apply_ip_unexpected_exception(adapter_client):
             .all()
         )
         assert rows[0].last_apply_error["code"] == "internal"
-        assert "transport exploded" in rows[0].last_apply_error["message"]
+        assert "transport exploded" not in str(rows[0].last_apply_error), "exception text reached the persisted error"
+        assert "transport exploded" not in str(job.error), "exception text reached the persisted failure items"
+        assert "RuntimeError" in rows[0].last_apply_error["message"]
 
 
 # ── Atomic apply (NSO_ADAPTER_ATOMIC_APPLY): subif + IP in one transaction ─────
@@ -2797,6 +2814,8 @@ async def _seed_nokia_device(name: str, netbox_id: int) -> int:
             ned_id="timos-nc-23.10",
         )
         db.add(d)
+        await db.flush()
+        await create_counter(db, d.id)
         await db.commit()
         await db.refresh(d)
         return d.id

@@ -4256,6 +4256,17 @@
             ],
             "title": "Result"
           },
+          "settle_seq": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Settle Seq"
+          },
           "started_at": {
             "anyOf": [
               {
@@ -4291,7 +4302,8 @@
           "created_at",
           "updated_at",
           "started_at",
-          "heartbeat_at"
+          "heartbeat_at",
+          "settle_seq"
         ],
         "title": "JobOut",
         "type": "object"
@@ -13302,6 +13314,46 @@
               ],
               "title": "Status"
             }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "default": "desc",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "title": "Order",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_settle_seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After Settle Seq"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "title": "Limit",
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -13317,7 +13369,15 @@
                 }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful Response",
+            "headers": {
+              "X-Store-Incarnation": {
+                "description": "The live store incarnation; a change means the cursor belongs to a dead store.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "401": {
             "content": {

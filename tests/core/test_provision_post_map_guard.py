@@ -296,7 +296,8 @@ async def test_claim_timeout_fails_provision_retryably(adapter_client_with_nso, 
         job = Job(
             job_type=JobType.provision,
             device_id=None,
-            status=JobStatus.queued,
+            status=JobStatus.running,
+            run_attempt=1,
             context={
                 "nso_instance": _INSTANCE,
                 "device_name": "pg-busy",
@@ -314,7 +315,9 @@ async def test_claim_timeout_fails_provision_retryably(adapter_client_with_nso, 
         patch("nso_adapter.core.importer.get_nso_client", return_value=_client()),
         patch("nso_adapter.core.importer.refresh_all_surfaces_for_device", AsyncMock(return_value=([], None))),
     ):
-        await _JOB_RUNNERS[JobType.provision](job_id, None, ClaimRegistration())
+        # run_attempt=1 matches the seeded row: the terminal write carries the same
+        # attempt predicate the production worker always supplies.
+        await _JOB_RUNNERS[JobType.provision](job_id, None, ClaimRegistration(run_attempt=1))
 
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -326,6 +329,58 @@ async def test_claim_timeout_fails_provision_retryably(adapter_client_with_nso, 
     # B3: the adoption must not have written before the claim.
     assert device.netbox_device_id is None, "a half-adopted row survived a refused mapping"
     assert (await _claim_row(device_id)).claim_token == rival.token
+
+
+async def test_a_refused_terminal_write_discards_the_provision_transaction(adapter_client_with_nso):
+    """S1 — a stale runner's success path must not commit under a refused CAS.
+
+    The job's ``run_attempt`` moved on while this run was in flight (recovery re-dispatched
+    the job to a successor), so the terminal CAS is refused. The device and claim committed
+    mid-run and stay — but any write still riding the FINAL transaction when terminalize is
+    reached (modeled by a mirror-refresh stand-in that stamps the device without
+    committing) belongs to an execution that lost its ownership. Forbidden: committing
+    that transaction anyway.
+    """
+    from nso_adapter.core.jobs import _JOB_RUNNERS
+    from nso_adapter.store.models import Device, Job, JobStatus, JobType
+
+    async def _tail_write(db, device_id, client, *, reg=None):
+        device = await db.get(Device, device_id)
+        device.sw_version = "tail-write"
+
+    async with session() as db:
+        job = Job(
+            job_type=JobType.provision,
+            device_id=None,
+            status=JobStatus.running,
+            run_attempt=2,
+            context={
+                "nso_instance": _INSTANCE,
+                "device_name": "pg-stale-success",
+                "address": "10.0.0.9",
+                "ned_id": _NED,
+                "authgroup": "network",
+                "netbox_device_id": 7191,
+            },
+        )
+        db.add(job)
+        await db.commit()
+        job_id = job.id
+
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_client()),
+        patch("nso_adapter.core.onboarding._initial_mirror_refresh", _tail_write),
+    ):
+        await _JOB_RUNNERS[JobType.provision](job_id, None, ClaimRegistration(run_attempt=1))
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+    device = await _device_by_name("pg-stale-success")
+    assert job.status is JobStatus.running, "the refused write must leave the successor's row alone"
+    assert job.run_attempt == 2
+    assert job.result is None and job.settle_seq is None
+    assert device is not None, "the mid-run device+claim commit is durable by design"
+    assert device.sw_version is None, "the discarded transaction leaked a tail write"
 
 
 # ── M6.9s: teardown vs provision is serialization, not arbitration ───────────
