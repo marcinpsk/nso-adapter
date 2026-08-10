@@ -602,6 +602,7 @@ directions* under §Conventions.
   "heartbeat_at": "2026-05-20T10:05:55Z",
   "settle_seq": 4 }
 ```
+
 Every key is always present; nullables are emitted as `null`.
 `failed` jobs carry `error` in the standard error shape; `result` is `null`.
 
@@ -619,6 +620,7 @@ routes, `static_route_results` — the per-route record described under
 [Per-route apply results](#per-route-apply-results).
 
 ### `GET /api/v1/jobs?device_id={id}&status={status}` → `200`
+
 Array of job objects, newest first, 100 per page by default and 500 at most (see `limit`
 under [The ordered settlement feed](#the-ordered-settlement-feed)). Both query params optional.
 

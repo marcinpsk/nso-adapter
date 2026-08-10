@@ -199,12 +199,15 @@ async def test_every_device_insert_path_creates_a_counter(adapter_client_with_ns
 
 def _alembic(db_url: str, *args: str) -> None:
     """Run the real alembic CLI in a subprocess (its ``fileConfig`` owns the root logger)."""
+    # Bounded: a migration blocking on a lock in the cloned database would otherwise hang
+    # the test until CI kills the job, skipping the finally-block database drop.
     proc = subprocess.run(
         [sys.executable, "-m", "alembic", *args],
         cwd=_REPO_ROOT,
         capture_output=True,
         env={**os.environ, "DATABASE_URL": db_url},
         check=False,
+        timeout=120,
     )
     if proc.returncode != 0:
         raise AssertionError(f"alembic {args} failed:\n{proc.stdout.decode()}\n{proc.stderr.decode()}")
@@ -356,7 +359,7 @@ async def test_a_failed_allocation_never_takes_a_second_terminal_write(adapter_c
     finally:
         await release_claim(reg)
 
-    applied.assert_awaited(), "the pin no longer models a failure AFTER the device work"
+    assert applied.await_count > 0, "the pin no longer models a failure AFTER the device work"
     refresh.assert_not_awaited()
 
     async with session() as db:

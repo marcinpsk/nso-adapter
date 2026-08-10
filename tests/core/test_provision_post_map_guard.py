@@ -315,7 +315,9 @@ async def test_claim_timeout_fails_provision_retryably(adapter_client_with_nso, 
         patch("nso_adapter.core.importer.get_nso_client", return_value=_client()),
         patch("nso_adapter.core.importer.refresh_all_surfaces_for_device", AsyncMock(return_value=([], None))),
     ):
-        await _JOB_RUNNERS[JobType.provision](job_id, None, ClaimRegistration())
+        # run_attempt=1 matches the seeded row: the terminal write carries the same
+        # attempt predicate the production worker always supplies.
+        await _JOB_RUNNERS[JobType.provision](job_id, None, ClaimRegistration(run_attempt=1))
 
     async with session() as db:
         job = await db.get(Job, job_id)
