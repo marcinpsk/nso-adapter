@@ -13,7 +13,7 @@ from sqlalchemy import select
 
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
-from tests.conftest import VALID_TOKEN, session
+from tests.conftest import VALID_TOKEN, session, start_job
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -108,6 +108,7 @@ async def test_worker_runs_provision_job_creates_device(adapter_client_with_nso)
 
     client = _ok_nso_client()
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
+        await start_job(job_id)  # the worker head's transition, which this test stands in for
         await _JOB_RUNNERS[JobType.provision](job_id, None)
 
     async with session() as db:
@@ -142,6 +143,7 @@ async def test_worker_provision_job_records_blocking_step_failure(adapter_client
     client = _ok_nso_client()
     client.create_device.side_effect = RuntimeError("unreachable")
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
+        await start_job(job_id)  # the worker head's transition, which this test stands in for
         await _JOB_RUNNERS[JobType.provision](job_id, None)
 
     async with session() as db:

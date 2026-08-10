@@ -243,7 +243,7 @@ async def test_every_family_get_depends_on_get_read_db(adapter_client):
 
     app = create_app()
     by_path = {}
-    for route in app.routes:
+    for route in _iter_api_routes(app.routes):
         if getattr(route, "methods", None) == {"GET"}:
             by_path[route.path] = route
 
@@ -253,6 +253,17 @@ async def test_every_family_get_depends_on_get_read_db(adapter_client):
         assert route is not None, f"{family}: route {path} not found"
         flat = set(_walk_dependant(route.dependant))
         assert get_read_db in flat, f"{family}: GET {path} does not inject get_read_db"
+
+
+def _iter_api_routes(routes):
+    # FastAPI >= 0.141 keeps each included router nested (original_router) instead of
+    # flattening its APIRoutes into app.routes; nested routes keep their full paths.
+    for route in routes:
+        inner = getattr(route, "original_router", None)
+        if inner is not None:
+            yield from _iter_api_routes(inner.routes)
+        else:
+            yield route
 
 
 def _walk_dependant(dependant):

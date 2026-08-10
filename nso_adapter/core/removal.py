@@ -28,7 +28,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError
+from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, JobError, error_envelope
 
 logger = structlog.get_logger(__name__)
 
@@ -580,8 +580,10 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> t
     return residue, unverifiable
 
 
-async def _record_residue(job, client, device, scope: str, context: dict, *, job_id: int, device_id: int) -> None:
-    """Run the post-replace residue check (#104) and record its verdict on *job*.
+async def _record_residue(
+    result: dict, client, device, scope: str, context: dict, *, job_id: int, device_id: int
+) -> None:
+    """Run the post-replace residue check (#104) and record its verdict in *result*.
 
     A "succeeded" replace can still leave residue on the device (FASTMAP keeps entries
     holding foreign leaves), so re-read the scope's device-tree view and surface survivors.
@@ -599,28 +601,28 @@ async def _record_residue(job, client, device, scope: str, context: dict, *, job
         residue, unverifiable = await _residue_after_removal(client, device, scope, context)
     except Exception as exc:  # noqa: BLE001 — the check must never fail the removal
         logger.warning("removal.residue_check_error", job_id=job_id, device_id=device_id, scope=scope, error=repr(exc))
-        job.result["residue_check"] = "error"
+        result["residue_check"] = "error"
         return
 
     if unverifiable:
         # Grains whose intent key and export key live in different namespaces (snmp
         # community: a label vs a sha256 of a secret the adapter never sees). Never fold
         # these into a "clean" — a survivor there is a credential still live on the router.
-        job.result["residue_unverifiable"] = unverifiable
+        result["residue_unverifiable"] = unverifiable
         logger.warning(
             "removal.residue_unverifiable", job_id=job_id, device_id=device_id, scope=scope, lists=unverifiable
         )
 
     if residue is None:
-        job.result["residue_check"] = "unsupported"
+        result["residue_check"] = "unsupported"
     elif residue:
-        job.result["residue_check"] = "found"
-        job.result["residue"] = residue
+        result["residue_check"] = "found"
+        result["residue"] = residue
         logger.warning("removal.residue_found", job_id=job_id, device_id=device_id, scope=scope, residue=residue)
     elif unverifiable:
-        job.result["residue_check"] = "partial"
+        result["residue_check"] = "partial"
     else:
-        job.result["residue_check"] = "clean"
+        result["residue_check"] = "clean"
 
 
 async def _guarded_apply(client, device, scope: str, context: dict | None, apply_thunk, *, current=_NO_SNAPSHOT):
@@ -1132,7 +1134,9 @@ async def _sr_consume(db: AsyncSession, device, out: SrRemoval, per_field: dict,
         if reg is None or not reg.registered:
             # G19: the delete is claim-token-scoped. Making it unguarded to keep a caller
             # convenient is exactly the shortcut §4.7 forbids.
-            raise RuntimeError("static_route removal: consuming tombstones needs a REGISTERED claim registration")
+            raise JobError(
+                "removal_failed", "static_route removal: consuming tombstones needs a REGISTERED claim registration"
+            )
         # Snapshotted ids only — a tombstone written during the network call survives,
         # because nothing has proven anything about it.
         await delete_tombstones(db, out.tombstone_ids, device_id=device.id, claim_token=reg.token)
@@ -1171,7 +1175,7 @@ async def _commit_terminal_removal(db: AsyncSession, job_id: int) -> None:
         raise BookkeepingOutcomeUnknown(f"removal job {job_id}: terminal commit outcome is {outcome.value}")
 
 
-async def _finalize_static_route_removal(db, job, job_id: int, device, client, out: SrRemoval, *, reg) -> bool:
+async def _finalize_static_route_removal(db, job_id: int, device, client, out: SrRemoval, *, reg) -> bool:
     """Prove the write, then consume and finalize in ONE claim-guarded transaction (§4.4/§4.6).
 
     The status-coupling rule is the most breakable invariant in R2: R1's sweeper only re-issues
@@ -1182,7 +1186,7 @@ async def _finalize_static_route_removal(db, job, job_id: int, device, client, o
 
     Returns whether the job ended ``succeeded``.
     """
-    from nso_adapter.core.claim import ClaimRegistration, lock_claim
+    from nso_adapter.core.claim import ClaimRegistration, lock_claim, terminalize
     from nso_adapter.store.models import JobStatus
 
     result: dict = {"scope": "static_route", "removal_branch": out.branch}
@@ -1222,15 +1226,16 @@ async def _finalize_static_route_removal(db, job, job_id: int, device, client, o
     if consume:
         await _sr_consume(db, device, out, per_field, result, reg=reg)
 
+    status = JobStatus.failed
+    error: dict | None = None
     if residue_found:
-        job.status = JobStatus.failed
-        job.error = {
+        error = {
             "code": "static_route_removal_residue_found",
             "message": f"static_route: removed route(s) {result['residue']['route']} are still on the device",
             "detail": {"scope": "static_route", "residue": result["residue"]},
         }
     elif proven or not owns_carrier:
-        job.status = JobStatus.succeeded
+        status = JobStatus.succeeded
         if not proven:
             result["unproven"] = True
             logger.warning(
@@ -1243,8 +1248,7 @@ async def _finalize_static_route_removal(db, job, job_id: int, device, client, o
             )
     else:
         # Inconclusive, and this job owns a carrier. Succeeding would strand it forever.
-        job.status = JobStatus.failed
-        job.error = {
+        error = {
             "code": "static_route_removal_unproven",
             "message": "static_route: the removal could not be proven, so its carrier is retained for retry",
             "detail": {
@@ -1262,9 +1266,23 @@ async def _finalize_static_route_removal(db, job, job_id: int, device, client, o
             verify=out.verify,
             residue=result.get("residue_check"),
         )
-    job.result = result
+    write = await terminalize(
+        db,
+        job_id,
+        status=status,
+        expect=JobStatus.running,
+        run_attempt=reg.run_attempt if reg is not None else None,
+        result=result,
+        error=error,
+    )
+    if write is None:
+        # Another execution owns this job. The consumption in this transaction belongs to
+        # that owner's decision, not ours: discard it rather than commit a consumed carrier
+        # under a status we were refused.
+        await db.rollback()
+        return False
     await _commit_terminal_removal(db, job_id)
-    return job.status is JobStatus.succeeded
+    return write.status is JobStatus.succeeded
 
 
 async def _replace_logging(db: AsyncSession, device, client, context: dict | None = None) -> None:
@@ -1672,17 +1690,16 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
     token is what was missing, and R2's carrier-consuming writes need it to guard their
     own transactions and to authorize ``delete_tombstones``.
     """
+    from nso_adapter.core.claim import terminalize
     from nso_adapter.core.importer import get_nso_client
     from nso_adapter.store.db import get_session
     from nso_adapter.store.models import Device, Job, JobStatus
 
     async for db in get_session():
-        job = await db.get(Job, job_id)
-        if not job:
+        row = (await db.execute(select(Job.id, Job.context).where(Job.id == job_id))).one_or_none()
+        if row is None:
             return
-        job.status = JobStatus.running
-        await db.commit()
-        context = job.context or {}
+        context = row.context or {}
         scope = context.get("scope")
         try:
             device = await db.get(Device, device_id)
@@ -1701,19 +1718,18 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
                 # R2 §4.4/§4.6: this write owns durable carriers, so its proof, its
                 # consumption and its terminal status are one transaction of their own.
                 # A `force` removal owns nothing and keeps the generic tail below.
-                succeeded = await _finalize_static_route_removal(db, job, job_id, device, client, outcome, reg=reg)
+                succeeded = await _finalize_static_route_removal(db, job_id, device, client, outcome, reg=reg)
                 if succeeded:
                     await _enqueue_followup_sync(db, job_id, device_id)
                 return
-            job.status = JobStatus.succeeded
-            job.result = {"scope": scope}
+            result: dict = {"scope": scope}
             if detach:
                 # Detach (#106): the device was deliberately untouched — the removed
                 # keys are EXPECTED to remain (that is the point), so the residue
                 # check is meaningless here. Re-align CDB with device truth: the
                 # no-networking commit applied FASTMAP's reverse diff to CDB only.
-                job.result["detach"] = True
-                job.result["residue_check"] = "skipped_detach"
+                result["detach"] = True
+                result["residue_check"] = "skipped_detach"
                 from nso_adapter.nso import actions
 
                 for attempt in (1, 2):  # one retry — slow-session flake (sw03 read eof)
@@ -1731,9 +1747,22 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
                         if attempt == 2:
                             # CDB keeps the locally-applied reverse diff until some
                             # later sync-from — make that visible on the job.
-                            job.result["sync_from"] = "failed"
+                            result["sync_from"] = "failed"
             else:
-                await _record_residue(job, client, device, scope, context, job_id=job_id, device_id=device_id)
+                await _record_residue(result, client, device, scope, context, job_id=job_id, device_id=device_id)
+            if (
+                await terminalize(
+                    db,
+                    job_id,
+                    status=JobStatus.succeeded,
+                    expect=JobStatus.running,
+                    run_attempt=reg.run_attempt if reg is not None else None,
+                    result=result,
+                )
+                is None
+            ):
+                await db.rollback()
+                return
             await db.commit()
             await _enqueue_followup_sync(db, job_id, device_id)
         except RemovalBlockedError as blocked:
@@ -1763,6 +1792,7 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
                         ),
                     },
                 },
+                reg,
             )
         except ClaimLostError:
             # Revocation is not a runner error: recovery already owns the disposition.
@@ -1777,9 +1807,7 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
             from nso_adapter.core.jobs import _mark_job_failed
 
             logger.error("removal.failed", job_id=job_id, device_id=device_id, scope=scope, error=repr(exc))
-            await _mark_job_failed(
-                db, job_id, {"code": "removal_failed", "message": repr(exc), "detail": {"scope": scope}}
-            )
+            await _mark_job_failed(db, job_id, error_envelope(exc, code="removal_failed", detail={"scope": scope}), reg)
 
 
 async def _enqueue_followup_sync(db: AsyncSession, job_id: int, device_id: int) -> None:

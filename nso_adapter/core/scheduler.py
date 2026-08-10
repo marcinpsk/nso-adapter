@@ -274,7 +274,11 @@ async def _scheduled_orphan_reap() -> None:
     """
     from nso_adapter.core import worker as _worker
     from nso_adapter.core.tombstone_sweep import sweep_tombstones
+    from nso_adapter.store.device_settle import ensure_settle_counters
 
+    # First statement, ahead of the reaper (Appendix S §3.3): this is the only periodic tick
+    # that terminalizes, and a terminalization that finds no counter row raises.
+    await ensure_settle_counters()
     await _worker.requeue_orphaned_jobs()
     # Claims are reaped on their own clock and their own scan (over device_claim, not over
     # job status): a claim can be stale with no running job at all.

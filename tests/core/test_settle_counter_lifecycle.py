@@ -1,0 +1,465 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
+"""Appendix S, chunk S2: the counter row's lifecycle, and why it is never created lazily.
+
+The counter row exists so the terminal path never reaches the ``devices`` table. PostgreSQL
+validates an inserted FK by locking the referenced row ``FOR KEY SHARE``; offboard holds
+``devices FOR UPDATE`` and then reaches for ``jobs``; so a terminal transaction that holds a
+job row and then INSERTS a counter closes a real cycle. The row is therefore created with its
+device at every insert site, backfilled by the migration for devices that predate it, and
+repaired by a sweep — and a missing row is a hard failure in the terminal path, never a lazy
+create.
+
+The sweep's PLACEMENT is load-bearing, not decorative: recovery terminalizes, and a
+terminalization that finds no counter row raises, so the repair has to run FIRST at both
+sites that recover.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import subprocess
+import sys
+import uuid
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+import sqlalchemy as sa
+
+from nso_adapter.core import worker as worker_mod
+from nso_adapter.store.device_settle import MissingSettleCounter
+from nso_adapter.store.models import Device, DeviceSettleCounter, Job, JobStatus, JobType
+from tests.conftest import _drop_database, _url_for, seed_device, session
+
+pytestmark = pytest.mark.anyio
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+# The revision this chunk chains off: the tree one migration BEFORE the counter exists.
+_PRE_COUNTER_REVISION = "b2d9f4a71c63"
+_BLOCKED_FOR = 0.5
+
+
+async def _counter(device_id: int) -> int | None:
+    async with session() as db:
+        return await db.scalar(
+            sa.select(DeviceSettleCounter.last_seq).where(DeviceSettleCounter.device_id == device_id)
+        )
+
+
+async def _drop_counter(device_id: int) -> None:
+    """Delete the counter out of band — the state a fourth insert site would leave."""
+    async with session() as db:
+        await db.execute(sa.delete(DeviceSettleCounter).where(DeviceSettleCounter.device_id == device_id))
+        await db.commit()
+
+
+async def _stranded_running_job(device_id: int, job_type: JobType = JobType.apply) -> int:
+    """A job stranded ``running`` with a stale heartbeat and no claim: recovery's candidate."""
+    async with session() as db:
+        job = Job(
+            job_type=job_type,
+            device_id=device_id,
+            status=JobStatus.running,
+            run_attempt=1,
+            heartbeat_at=datetime.now(UTC) - timedelta(seconds=worker_mod.PROVISION_STALE_AFTER + 600),
+        )
+        db.add(job)
+        await db.commit()
+        return job.id
+
+
+# ── S2.8 (M5): the terminal path never reaches `devices` ─────────────────────
+
+
+async def test_terminalization_never_locks_the_devices_table(adapter_client, monkeypatch):
+    """S2.8 — a terminal write on a counter-less device, against an offboard holding that device.
+
+    The barrier holds the terminal transaction between its job-row CAS and its allocation,
+    exactly where a lazy counter INSERT would sit. Offboard then locks ``devices FOR UPDATE``
+    and blocks reaching for the same job row.
+
+    Forbidden: the allocation reaching for the ``devices`` key-share lock, which closes the
+    cycle and lets PostgreSQL abort one of the two. The allocation is a plain UPDATE of the
+    counter row, so the missing row simply raises and the transaction aborts cleanly — no
+    deadlock, and no half-written terminal state.
+    """
+    from nso_adapter.core import claim as claim_mod
+    from nso_adapter.core.claim import BookkeepingOutcomeUnknown
+    from nso_adapter.core.onboarding import offboard_device
+
+    device_id = await seed_device(nso_device_name="lc-inversion", netbox_device_id=8601)
+    job_id = await _stranded_running_job(device_id, JobType.sync)
+    await _drop_counter(device_id)
+
+    at_allocation = asyncio.Event()
+    may_allocate = asyncio.Event()
+    real_allocate = claim_mod.allocate_settle_seq
+
+    async def _barrier(db, dev_id):
+        at_allocation.set()
+        await may_allocate.wait()
+        return await real_allocate(db, dev_id)
+
+    monkeypatch.setattr(claim_mod, "allocate_settle_seq", _barrier)
+
+    async def _terminal_write():
+        async with session() as db:
+            await claim_mod.terminalize(db, job_id, status=JobStatus.succeeded, expect=JobStatus.running, run_attempt=1)
+            await db.commit()
+
+    async def _offboard():
+        async with session() as db:
+            await offboard_device(db, await db.get(Device, device_id))
+
+    writer = asyncio.create_task(_terminal_write())
+    await asyncio.wait_for(at_allocation.wait(), timeout=10)  # the job row is held
+
+    teardown = asyncio.create_task(_offboard())
+    await asyncio.sleep(_BLOCKED_FOR)
+    assert not teardown.done(), "offboard did not reach the job row this writer holds"
+
+    may_allocate.set()
+    with pytest.raises(BookkeepingOutcomeUnknown) as raised:
+        await asyncio.wait_for(writer, timeout=30)
+    # Classified for the no-second-write path, but the cause stays readable.
+    assert isinstance(raised.value.__cause__, MissingSettleCounter)
+    await asyncio.wait_for(teardown, timeout=30)  # a deadlock would have aborted one of the two
+
+    async with session() as db:
+        assert await db.get(Device, device_id) is None, "offboard did not complete"
+        job = await db.get(Job, job_id)
+    assert job.settle_seq is None, "a partial terminal state survived the aborted transaction"
+
+
+# ── S2.9 (M5): every path that creates a device creates its counter ──────────
+
+
+async def _created_by_onboard_claimed() -> int:
+    """The claimed provision path: the Device and its claim in ONE transaction."""
+    from unittest.mock import patch
+
+    from nso_adapter.core.onboarding import provision_nso_device
+    from tests.core.test_provision import _mock_client
+
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=_mock_client()):
+        async with session() as db:
+            result = await provision_nso_device(
+                db,
+                nso_instance="nso-dev",
+                device_name="lc-claimed",
+                address="10.0.0.5",
+                ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+                authgroup="network",
+                netbox_device_id=8611,
+            )
+    assert result["device_id"] is not None
+    return result["device_id"]
+
+
+async def _created_by_onboard_mapped() -> int:
+    """The unclaimed mapping path."""
+    from nso_adapter.core.onboarding import onboard_device
+
+    async with session() as db:
+        device = await onboard_device(db, "nso-dev", "lc-mapped", 8612)
+    return device.id
+
+
+async def _created_by_discover(fake_nso_client) -> int:
+    """The scheduler's NSO discovery upsert."""
+    from unittest.mock import patch
+
+    from nso_adapter.core.importer import discover_devices
+
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=fake_nso_client):
+        async with session() as db:
+            await discover_devices(db)
+            return await db.scalar(sa.select(Device.id).where(Device.nso_device_name == "core-rtr-01"))
+
+
+@pytest.mark.parametrize("path", ["onboard_claimed", "onboard_mapped", "discover"])
+async def test_every_device_insert_path_creates_a_counter(adapter_client_with_nso, fake_nso_client, path):
+    """S2.9 — every device insert site leaves a counter at ``last_seq = 0``.
+
+    Forbidden: any site minting a device whose first terminal job then raises. The sweep is
+    the repair path, not the creation path.
+    """
+    if path == "onboard_claimed":
+        device_id = await _created_by_onboard_claimed()
+    elif path == "onboard_mapped":
+        device_id = await _created_by_onboard_mapped()
+    else:
+        device_id = await _created_by_discover(fake_nso_client)
+
+    assert device_id is not None
+    assert await _counter(device_id) == 0, f"{path}: the device was created without a settle counter"
+
+
+def _alembic(db_url: str, *args: str) -> None:
+    """Run the real alembic CLI in a subprocess (its ``fileConfig`` owns the root logger)."""
+    # Bounded: a migration blocking on a lock in the cloned database would otherwise hang
+    # the test until CI kills the job, skipping the finally-block database drop.
+    proc = subprocess.run(
+        [sys.executable, "-m", "alembic", *args],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        env={**os.environ, "DATABASE_URL": db_url},
+        check=False,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"alembic {args} failed:\n{proc.stdout.decode()}\n{proc.stderr.decode()}")
+
+
+def test_every_device_insert_path_creates_a_counter_migration(pg_admin):
+    """S2.9 — the migration backfills a counter for every device that predates it.
+
+    Driven through the real migration chain: a device inserted at the revision BEFORE the
+    counter existed must come out of ``upgrade head`` with one. Forbidden: the upgrade
+    leaving pre-existing devices counter-less, which strands every one of them at its first
+    terminal write.
+    """
+    dbname = f"settle_backfill_{uuid.uuid4().hex[:10]}"
+    with pg_admin.connect() as conn:
+        conn.exec_driver_sql(f'CREATE DATABASE "{dbname}"')
+    try:
+        url = _url_for(dbname, driver="postgresql+psycopg2")
+        _alembic(url, "upgrade", _PRE_COUNTER_REVISION)
+
+        engine = sa.create_engine(url)
+        with engine.begin() as conn:
+            device_id = conn.exec_driver_sql(
+                "INSERT INTO devices "
+                "(nso_instance, nso_device_name, mapping_status, source_epoch, created_at, updated_at) "
+                "VALUES ('nso-dev', 'lc-pre-migration', 'mapped', 1, now(), now()) RETURNING id"
+            ).scalar_one()
+        engine.dispose()
+
+        _alembic(url, "upgrade", "head")
+
+        engine = sa.create_engine(url)
+        with engine.connect() as conn:
+            backfilled = conn.exec_driver_sql(
+                f"SELECT last_seq FROM device_settle_counter WHERE device_id = {device_id}"
+            ).scalar_one_or_none()
+        engine.dispose()
+
+        assert backfilled == 0, "the migration left a pre-existing device without a counter"
+    finally:
+        _drop_database(pg_admin, dbname, expect_clean=False)
+
+
+# ── S2.9b (r2-M3): the sweep precedes EVERY terminal recovery ────────────────
+
+
+@pytest.mark.parametrize("site", ["startup", "periodic"])
+async def test_the_counter_sweep_precedes_every_terminal_recovery(adapter_client, monkeypatch, site):
+    """S2.9b — recovery terminalizes, so the repair must already have run when it does.
+
+    Forbidden: the sweep appended AFTER the reaper. Recovery's terminalization then raises on
+    the missing counter — at startup that can abort the lifespan before the repair it needed
+    ever runs, and on the periodic tick it aborts the reap batch every time.
+
+    S2.9 does not cover this: it proves the helper, not its placement.
+    """
+    device_id = await seed_device(
+        nso_device_name=f"lc-sweep-{site}", netbox_device_id=8621 if site == "startup" else 8622
+    )
+    job_id = await _stranded_running_job(device_id)  # an apply: recovery's disposition is TERMINAL
+    await _drop_counter(device_id)
+    assert await _counter(device_id) is None
+
+    if site == "startup":
+
+        async def _idle_loop(_worker_id, stop):
+            await stop.wait()
+
+        monkeypatch.setattr(worker_mod, "_worker_loop", _idle_loop)
+        await worker_mod.start_workers(concurrency=1)
+        await worker_mod.stop_workers()
+    else:
+        from nso_adapter.core import scheduler as scheduler_mod
+
+        monkeypatch.setattr(worker_mod, "ensure_workers", lambda: None)
+        await scheduler_mod._scheduled_orphan_reap()
+
+    assert await _counter(device_id) == 1, f"{site}: the sweep did not run before the reaper"
+    async with session() as db:
+        job = await db.get(Job, job_id)
+    assert job.status is JobStatus.failed, f"{site}: the stranded job was not recovered in the same pass"
+    assert job.settle_seq == 1, f"{site}: recovery's terminal write took no sequence"
+
+
+# ── the allocation's own failure is a BOOKKEEPING failure, not a job failure ──
+#
+# The allocation runs inside the terminal transaction, AFTER the device work has been
+# performed and committed on the device. If it aborts — deadlock, lock timeout, or a counter
+# row a concurrent offboard deleted — the terminal transaction takes the result, the per-route
+# records and the carrier consumption down with it. Falling back to a second transaction that
+# writes `failed` is precisely the torn state R2 §4.6 exists to prevent: the device change is
+# real and the job would deny it. It routes through the existing no-second-write path instead,
+# and recovery re-dispositions a job that is still `running`.
+
+
+def _deadlock() -> Exception:
+    """A real SQLAlchemy DBAPIError, the shape a serialization failure arrives in."""
+    return sa.exc.OperationalError("UPDATE device_settle_counter …", {}, Exception("deadlock detected"))
+
+
+@pytest.mark.parametrize("failure", ["missing_row", "deadlock"])
+async def test_a_failed_allocation_never_takes_a_second_terminal_write(adapter_client, monkeypatch, failure):
+    """The apply reached the device; its allocation then aborted. Nothing may be written twice.
+
+    Forbidden: ``run_apply``'s generic ``except`` catching the allocation failure, rolling
+    back and writing ``failed`` in a SECOND transaction — which discards the result the device
+    already reflects and denies a change that really happened.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from nso_adapter.core import claim as claim_mod
+    from nso_adapter.core.apply import run_apply
+    from nso_adapter.core.claim import BookkeepingOutcomeUnknown, acquire_claim, release_claim
+    from nso_adapter.store.models import StaticRouteIntent
+
+    device_id = await seed_device(nso_device_name=f"lc-alloc-{failure}", netbox_device_id=8631)
+    async with session() as db:
+        job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.running, run_attempt=1)
+        db.add(job)
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id, prefix="10.6.0.0/24", next_hop="10.6.0.1", accepted_at=datetime.now(UTC)
+            )
+        )
+        await db.commit()
+        job_id = job.id
+
+    if failure == "missing_row":
+        await _drop_counter(device_id)  # a concurrent offboard cascaded it away
+    else:
+
+        async def _deadlocked(_db, _device_id):
+            raise _deadlock()
+
+        monkeypatch.setattr(claim_mod, "allocate_settle_seq", _deadlocked)
+
+    reg = await acquire_claim(device_id, "job", job_id=job_id)
+    reg.run_attempt = 1
+    applied = AsyncMock()
+    refresh = AsyncMock()
+    try:
+        with (
+            patch("nso_adapter.core.importer.get_nso_client", return_value=AsyncMock()),
+            patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=refresh),
+            patch("nso_adapter.nso.apply.apply_static_routes", new=applied),
+        ):
+            with pytest.raises(BookkeepingOutcomeUnknown):
+                await run_apply(job_id=job_id, device_id=device_id, force=True, reg=reg)
+    finally:
+        await release_claim(reg)
+
+    assert applied.await_count > 0, "the pin no longer models a failure AFTER the device work"
+    refresh.assert_not_awaited()
+
+    async with session() as db:
+        row = await db.get(Job, job_id)
+    assert row.status is JobStatus.running, "a second transaction wrote a terminal status"
+    assert row.result is None and row.error is None, "the aborted terminal transaction left a partial record"
+    assert row.settle_seq is None
+
+
+async def test_a_failed_allocation_leaves_a_removals_carrier_alone(adapter_client):
+    """The same rule for a removal, where the discarded transaction owns a tombstone.
+
+    Forbidden: a second-transaction ``failed`` write over a consumption that did not commit —
+    or, worse, one that did. Recovery re-runs the removal; the carrier must still be there.
+    """
+    from nso_adapter.core.claim import BookkeepingOutcomeUnknown, acquire_claim, release_claim
+    from nso_adapter.core.removal import run_removal
+    from tests.core.test_static_route_put import A, wire
+    from tests.core.test_static_route_removal import SrFake, seed_removal_job, seed_tomb, sr_client, tombstone_ids
+
+    device_id = await seed_device(nso_device_name="lc-alloc-removal", netbox_device_id=8632)
+    fake = SrFake("lc-alloc-removal", service=[wire(A)], device=[wire(A)])
+    job_id = await seed_removal_job(device_id, {})
+    tomb = await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    await _drop_counter(device_id)
+
+    reg = await acquire_claim(device_id, "job", job_id=job_id)
+    reg.run_attempt = 1
+    try:
+        from unittest.mock import AsyncMock, patch
+
+        with (
+            patch("nso_adapter.core.importer.get_nso_client", return_value=sr_client(fake)),
+            patch("nso_adapter.nso.actions.sync_from", new=AsyncMock(return_value={})),
+        ):
+            with pytest.raises(BookkeepingOutcomeUnknown):
+                await run_removal(job_id=job_id, device_id=device_id, reg=reg)
+    finally:
+        await release_claim(reg)
+
+    async with session() as db:
+        row = await db.get(Job, job_id)
+    assert row.status is JobStatus.running, "a second transaction wrote a terminal status"
+    assert row.error is None
+    assert await tombstone_ids(device_id) == [tomb], "the carrier was consumed under a status nothing committed"
+
+
+# ── the sweep tolerates a device vanishing under it, per row ─────────────────
+
+
+async def test_the_sweep_survives_an_offboard_of_a_counter_missing_device(adapter_client, monkeypatch):
+    """One device deleted mid-sweep must not cost every other device its repair.
+
+    The sweep's INSERT validates its FK by waiting on offboard's ``devices FOR UPDATE``; when
+    that commits, the row is gone and the insert raises. Forbidden: that aborting the whole
+    statement — every other device stays counter-less, and the exception then aborts the reap
+    tick itself, so recovery and worker supervision are skipped for the whole interval.
+    """
+    from nso_adapter.core import claim as claim_mod
+    from nso_adapter.core import onboarding as onboarding_mod
+    from nso_adapter.core import scheduler as scheduler_mod
+
+    doomed = await seed_device(nso_device_name="lc-vanishing", netbox_device_id=8641)
+    survivor = await seed_device(nso_device_name="lc-survivor", netbox_device_id=8642)
+    stranded = await _stranded_running_job(survivor)
+    await _drop_counter(doomed)
+    await _drop_counter(survivor)
+
+    at_teardown = asyncio.Event()
+    may_finish = asyncio.Event()
+    real_bulk = claim_mod.terminalize_queued_bulk
+
+    async def _held(db, device_id, **kwargs):
+        # Inside offboard's transaction: the `devices FOR UPDATE` lock is already held.
+        at_teardown.set()
+        await may_finish.wait()
+        return await real_bulk(db, device_id, **kwargs)
+
+    # offboard imports it from core.claim at call time, so the module attribute is the seam.
+    monkeypatch.setattr(claim_mod, "terminalize_queued_bulk", _held)
+    monkeypatch.setattr(worker_mod, "ensure_workers", lambda: None)
+
+    async def _offboard():
+        async with session() as db:
+            await onboarding_mod.offboard_device(db, await db.get(Device, doomed))
+
+    teardown = asyncio.create_task(_offboard())
+    await asyncio.wait_for(at_teardown.wait(), timeout=10)
+
+    tick = asyncio.create_task(scheduler_mod._scheduled_orphan_reap())
+    await asyncio.sleep(_BLOCKED_FOR)
+    assert not tick.done(), "the sweep never reached the device offboard is holding"
+
+    may_finish.set()
+    await asyncio.wait_for(teardown, timeout=30)
+    await asyncio.wait_for(tick, timeout=30)  # must not raise: one vanished device is not a tick failure
+
+    async with session() as db:
+        assert await db.get(Device, doomed) is None
+    assert await _counter(doomed) is None, "a counter was created for a device that no longer exists"
+    assert await _counter(survivor) == 1, "one vanished device cost every other device its repair"
+    async with session() as db:
+        assert (await db.get(Job, stranded)).status is JobStatus.failed, "the reap tick was aborted"

@@ -30,6 +30,12 @@
   `api.adapter_token_ref`). Missing/invalid → `401`.
 - Timestamps: ISO-8601 UTC.
 - Async operations return a **job**; the consumer polls `GET /jobs/{id}`.
+- **`X-Store-Incarnation`** is set on every `200` from `GET /api/v1/jobs`. It carries the
+  live incarnation of the adapter store — a new random value each time the store is
+  rebuilt from an empty schema. It is a header and not a body field for two reasons: the
+  default job page must stay byte-identical for the consumers that already read it, and
+  the value has to be readable on an **empty** page, which is exactly what a cursor
+  belonging to a dead store returns. See [The ordered settlement feed](#the-ordered-settlement-feed).
 - Error body (all non-2xx):
   ```json
   { "error": { "code": "string", "message": "human readable", "detail": {} } }
@@ -57,9 +63,9 @@
 
 ### Call directions
 
-The plugin does **not** expose any endpoint the adapter calls back into.
-Everything the adapter "reads from the plugin" goes through NetBox's own
-REST API for the plugin's models.
+Everything the adapter *reads* from the plugin goes through NetBox's own REST API for the
+plugin's models. Beyond those reads it calls exactly two plugin endpoints, both
+fire-and-forget notifications that carry no state and are never read back.
 
 | From | To | What | Phase |
 |------|----|------|-------|
@@ -69,17 +75,24 @@ REST API for the plugin's models.
 | plugin → adapter | `PUT /api/v1/devices/{id}/intent` (+ the per-scope `PUT …/*-intent` family) | **push intent on accept** | 2 |
 | plugin → adapter | `POST /api/v1/devices/{id}/actions/{sync,detect-drift,connect,apply}` | trigger jobs | 1+, `apply` is 2 |
 | plugin → adapter | `GET /api/v1/devices/{id}/{interfaces,state,intent,intent-summary,scope}` (+ the per-scope read mirrors), `GET /api/v1/jobs/...` | read state | 1+, `intent` is 2 |
-| adapter → NetBox | `GET /api/plugins/netbox-nso-plugin/device-management/` | reconcile mirrored scope (pull) | 1+ |
-| adapter → NetBox | `GET /api/plugins/netbox-nso-plugin/interface-state/` | **reconcile mirrored intent (pull)** | 2 |
+| adapter → NetBox | `GET /api/plugins/nso/device-management/` | reconcile mirrored scope (pull) | 1+ |
+| adapter → NetBox | `GET /api/plugins/nso/interface-state/` | **reconcile mirrored intent (pull)** | 2 |
 | adapter → NetBox | `PATCH dcim.Interface` (and create if missing) | write synced attribute values | 1+ |
 | adapter → NSO   | RESTCONF `sync-from`, `compare-config`, `check-sync`, `connect` (`/devices/device`) | Phase 1 NSO surface | 1+ |
 | adapter → NSO   | RESTCONF write to a thin reconcile-commit service (Spike S2) | apply intent | 2 |
-| adapter → plugin | **nothing** — direct adapter→plugin calls are not part of the contract | — | — |
+| adapter → plugin | `POST /api/plugins/nso/sync-complete/` — `{"netbox_device_id": <int>}` | a device sync finished; refresh its overlays | 1+ |
+| adapter → plugin | `POST /api/plugins/nso/provision-complete/` — `{"provision_job_id": <int>}` | a provision job reached a terminal state | 1+ |
 
-Implementers: if you find yourself adding an HTTP call from the adapter to
-a path on the plugin (anything under `/plugins/netbox-nso-plugin/` other
-than via NetBox's REST for the plugin model), stop — that direction is not
-in the spec.
+Both notifications are best effort: the adapter logs a failure and does not retry, and
+neither answer is read. **No result may depend on them alone.** A plugin-side consumer
+that reacts to a notification must also have a clock that runs plugin → adapter, because
+the two directions fail independently — an adapter-to-NetBox token that has gone invalid
+answers `401` on every callback while plugin-to-adapter reads stay healthy. The settlement
+feed below is consumed on both.
+
+Beyond those two, if you find yourself adding an HTTP call from the adapter to a path on
+the plugin (anything under `/api/plugins/nso/` other than the rows above), stop — that
+direction is not in the spec.
 
 ## Enums
 
@@ -568,8 +581,8 @@ user doesn't have to wait for the next scheduled poll. Same 202/409 semantics
 as `actions/sync`.
 
 This is the **only** plugin → adapter push beyond the standard `/api/v1/*`
-client calls. The adapter never calls back into the plugin (see *Call
-directions* under §Conventions).
+client calls. For the two notifications that run the other way, see *Call
+directions* under §Conventions.
 ```json
 { "job_id": 9 }
 ```
@@ -582,10 +595,24 @@ directions* under §Conventions).
   "result": { "interfaces_written": 12, "interfaces_created": 2,
               "changes_detected": 1 },
   "error": null,
+  "context": null,
   "created_at": "2026-05-20T10:05:30Z",
-  "updated_at": "2026-05-20T10:06:00Z" }
+  "updated_at": "2026-05-20T10:06:00Z",
+  "started_at": "2026-05-20T10:05:31Z",
+  "heartbeat_at": "2026-05-20T10:05:55Z",
+  "settle_seq": 4 }
 ```
+
+Every key is always present; nullables are emitted as `null`.
 `failed` jobs carry `error` in the standard error shape; `result` is `null`.
+
+`settle_seq` is this job's position in its **device's** settlement order, described under
+[The ordered settlement feed](#the-ordered-settlement-feed). It is `null` while the job is
+`queued` or `running`, and `null` forever for a job that reached a terminal state with no
+device: a provision that failed before it acquired one, and the queued jobs a device
+offboard terminalizes on its way out. Offboarding also detaches the device's **already
+sequenced** history — those rows keep the sequence they were given and simply leave the
+device's feed with it, because the device they belonged to is gone.
 
 `result` is free-form per job type. An **apply** job additionally carries
 `reader_compare` (the per-scope post-apply presence check) and, for devices with static
@@ -593,13 +620,83 @@ routes, `static_route_results` — the per-route record described under
 [Per-route apply results](#per-route-apply-results).
 
 ### `GET /api/v1/jobs?device_id={id}&status={status}` → `200`
-Array of job objects, newest first, capped at 100. Both query params optional.
+
+Array of job objects, newest first, 100 per page by default and 500 at most (see `limit`
+under [The ordered settlement feed](#the-ordered-settlement-feed)). Both query params optional.
 
 Ordering is `created_at` descending, tie-broken by `id` descending. The tiebreak matters:
 `created_at` defaults to the transaction's start time, so several jobs can share one
 timestamp and the page would otherwise be non-deterministic — the same request could serve
 a different 100 rows each time. It makes the page stable; it is **not** a commit order and
 **not** a cursor, so it cannot be walked as a feed.
+
+### The ordered settlement feed
+
+The same collection serves a second, opt-in shape: a per-device feed of terminal jobs in
+**commit** order, which a consumer walks under a durable cursor to settle the intent it
+pushed. Three query parameters select it, all optional and all defaulting to today's
+behavior:
+
+| parameter | default | meaning |
+|---|---|---|
+| `order` | `desc` | `asc` orders by `settle_seq` ascending — the feed. `desc` is the page above, unchanged. |
+| `after_settle_seq` | none | the cursor. Serves rows with `settle_seq > <value>` only. |
+| `limit` | `100` | page size, `1..500`. |
+
+Validation is fail-fast, and nothing is coerced:
+
+- `order=asc` **or** `after_settle_seq` **requires** `device_id` → otherwise `422`
+  `validation_error`. Sequences are allocated per device, so an unscoped ascending page
+  would interleave two devices' independent sequences into one order that is wrong for both.
+- `after_settle_seq` **requires** `order=asc` → otherwise `422`. The cursor names a position
+  in the settlement order; the descending page is in creation order, and serving the mix
+  would let a consumer skip or repeat settlements.
+- `status` **cannot combine with** `order=asc` → `422`. A filtered-out terminal row still
+  owns its `settle_seq`, so a thinned ascending page advances the cursor past it and that
+  settlement becomes permanently invisible to the cursor. Status filtering stays on the
+  descending list.
+- `limit` outside `1..500` → `422`. It is **not** clamped: a caller that asked for 5000 and
+  silently received 500 believes it holds the whole page and advances its cursor as if it did.
+- An `asc` request with no `after_settle_seq` starts at `0`, i.e. the beginning of the
+  sequence.
+
+**What `settle_seq` guarantees.** It is allocated per device from a counter row locked
+until the terminal transaction **commits**, so for one device *sequence order equals commit
+order*. Two devices' terminal writes interleave freely; that is allowed, because the cursor
+is per device. Monotonicity is the contract; **contiguity is not** — walk rows, never
+values, and never treat a missing number as a lost result. `created_at` cannot substitute
+for any of this: it is transaction time, not commit time.
+
+**A terminal job is written exactly once.** A terminal write made by a running execution
+names that execution (an internal `run_attempt` token, not served) and is applied as a
+compare-and-set on it, so a runner that was abandoned — and whose job has since been
+requeued or restarted — cannot write over the run that succeeded it. (Writes that name no
+execution because there is none to name, such as the bulk terminalization of a device's
+queued jobs during offboard, compare on the `queued` status instead.) A rejected write
+changes no column and allocates no sequence, so a job appears in the feed exactly once,
+under one sequence. Queued and running jobs carry no sequence and are therefore invisible
+to the ascending page — the `settle_seq > :cursor` predicate is the visibility rule, and it
+needs no status filter.
+
+**The cursor belongs to one store and one device.** A consumer must key its saved cursor on
+the pair *(store incarnation, adapter device id)* and compare **both** on every read,
+against the `X-Store-Incarnation` header of the page it is about to consume and against the
+adapter device id it is polling:
+
+- the store half must come from the **header**, not from any locally cached copy. A store
+  rebuilt from an empty schema restarts every counter at 1, and if it recreates the device
+  under the same numeric id, a cursor at 100 silently hides settlements 1..100.
+- the device half matters because a device may be remapped to a different adapter device id
+  within one incarnation. A fresh adapter device also starts at 1.
+
+On either mismatch the consumer resets its cursor, records the new pair, and re-requests
+the page from the start rather than applying the old cursor to it.
+
+**One unresolvable result must not block the device.** The feed is strictly ordered, so a
+consumer that cannot decide the row at the head would stop forever. Bound it: count
+attempts against the specific `settle_seq` that is stuck, and after a fixed number of
+passes advance past it with a loud log. The plugin's bound is five attempts, and it is
+persisted per device so a process restart does not reset it.
 
 ---
 

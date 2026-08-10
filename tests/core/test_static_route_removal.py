@@ -27,7 +27,7 @@ from sqlalchemy import select
 
 from nso_adapter.core.claim import acquire_claim, release_claim
 from nso_adapter.store.models import Job, JobStatus, JobType, StaticRouteIntent, StaticRouteTombstone
-from tests.conftest import seed_device, session
+from tests.conftest import seed_device, session, start_job
 from tests.core.test_static_route_put import A, B, C, D, seed_apply_job, seed_rows, wire
 
 pytestmark = pytest.mark.anyio
@@ -167,10 +167,12 @@ def sr_client(fake: SrFake):
 
 async def seed_removal_job(device_id: int, context: dict) -> int:
     async with session() as db:
+        # Started, at attempt 1: see seed_apply_job in test_static_route_put.
         job = Job(
             job_type=JobType.removal,
             device_id=device_id,
-            status=JobStatus.queued,
+            status=JobStatus.running,
+            run_attempt=1,
             context={"scope": "static_route", **context},
         )
         db.add(job)
@@ -207,6 +209,7 @@ async def seed_tomb(
 async def run_removal_job(device_id: int, job_id: int, client, *, reg=None, sync_from=None) -> Job:
     from nso_adapter.core.removal import run_removal
 
+    await start_job(job_id)  # the head transition a directly-invoked runner does not do
     own_claim = reg is None
     if own_claim:
         reg = await acquire_claim(device_id, "job", job_id=job_id)

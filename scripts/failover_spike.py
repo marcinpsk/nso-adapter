@@ -118,7 +118,7 @@ async def measure_reachable(client: NsoClient, name: str, timeout: float, n: int
     for _ in range(n):
         reachable, detail, elapsed = await actions.probe_reachable(client, name, timeout)
         out.append(elapsed)
-        print(f"    reachable-connect {name}: {elapsed:.3f}s reachable={reachable} {detail[:40]}")
+        print(f"    reachable-connect {name}: {elapsed:.3f}s reachable={reachable}")
     return out
 
 
@@ -127,7 +127,7 @@ async def measure_unreachable(client: NsoClient, name: str, timeout: float, n: i
     for _ in range(n):
         reachable, detail, elapsed = await actions.probe_reachable(client, name, timeout)
         out.append(elapsed)
-        print(f"    {tag} {name} (timeout={timeout}s): {elapsed:.3f}s reachable={reachable} {detail[:50]}")
+        print(f"    {tag} {name} (timeout={timeout}s): {elapsed:.3f}s reachable={reachable}")
     return out
 
 
@@ -209,7 +209,7 @@ async def run() -> None:
                 reachable, detail, _ = await actions.probe_reachable(client, name, probe_timeout)
                 flip = time.perf_counter() - t0
                 flip_samples.append(flip)
-                print(f"    [dev15] flip→OOB #{i + 1}: {flip:.3f}s reachable_on_oob={reachable} {detail[:40]}")
+                print(f"    [dev15] flip→OOB #{i + 1}: {flip:.3f}s reachable_on_oob={reachable}")
                 # back to primary
                 t0 = time.perf_counter()
                 await client.set_address(name, orig_addr)
@@ -217,7 +217,7 @@ async def run() -> None:
                 reachable, detail, _ = await actions.probe_reachable(client, name, probe_timeout)
                 back = time.perf_counter() - t0
                 flip_samples.append(back)
-                print(f"    [dev15] flip→primary #{i + 1}: {back:.3f}s reachable_on_primary={reachable} {detail[:40]}")
+                print(f"    [dev15] flip→primary #{i + 1}: {back:.3f}s reachable_on_primary={reachable}")
             results["flip_cycle"] = flip_samples
         else:
             print("[dev15] no OOB IP on device 15 — skipping real failover flip")
@@ -233,7 +233,7 @@ async def run() -> None:
         await client.set_address(name, orig_addr)
         await client.disconnect(name)
         reachable, detail, _ = await actions.probe_reachable(client, name, probe_timeout)
-        print(f"[dev15] RESTORED address={orig_addr} reachable={reachable} {detail[:40]}")
+        print(f"[dev15] RESTORED address={orig_addr} reachable={reachable}")
 
     _report(results, probe_timeout)
 
