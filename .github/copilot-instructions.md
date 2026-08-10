@@ -221,8 +221,8 @@ Testing strategy + the scenarios each milestone owns: `docs/testing-strategy.md`
 - **Adapter → plugin HTTP is the notification lane only.** The two
   fire-and-forget POSTs documented in `docs/api-contract.md` §Call
   directions (`sync-complete`, `provision-complete`) are the sanctioned
-  exceptions: they carry no state, are never read back, and no result may
-  depend on them alone. Everything the adapter *reads* from the plugin goes
+  exceptions: each carries only its documented identifier and no other
+  state, is never read back, and no result may depend on them alone. Everything the adapter *reads* from the plugin goes
   through NetBox's REST API. Do not add any other adapter → plugin call.
 - **Secrets never logged.** Tokens, passwords, bearer values stay out of
   logs, exception messages, and debug dumps. Sanitize a secret-bearing
