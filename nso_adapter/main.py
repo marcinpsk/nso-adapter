@@ -29,6 +29,7 @@ from nso_adapter.api.errors import (
 )
 from nso_adapter.api.health import router as health_router
 from nso_adapter.api.intent import router as intent_router
+from nso_adapter.api.intent_receipts import router as intent_receipts_router
 from nso_adapter.api.interface_ip import router as interface_ip_router
 from nso_adapter.api.interface_mtu import router as interface_mtu_router
 from nso_adapter.api.interfaces import router as interfaces_router
@@ -415,6 +416,7 @@ def create_app() -> FastAPI:
     app.include_router(devices_router)
     app.include_router(scope_router)
     app.include_router(intent_router)
+    app.include_router(intent_receipts_router)
     app.include_router(actions_router)
     app.include_router(interfaces_router)
     app.include_router(lag_topology_router)

@@ -2370,6 +2370,137 @@
         "title": "IntentReadOut",
         "type": "object"
       },
+      "IntentReceiptOut": {
+        "description": "One ``(device, section)`` receipt \u2014 EMIT-NULL, every key always present.\n\n``section`` is the adapter's own stream vocabulary (:mod:`core.intent_protocol`). The\npusher's delivery key for the interface family is ``interface`` and maps onto\n``interface_config`` here; the other fifteen names are identical on both sides.",
+        "properties": {
+          "backfill_only": {
+            "title": "Backfill Only",
+            "type": "boolean"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "delete_origin": {
+            "title": "Delete Origin",
+            "type": "boolean"
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": "integer"
+          },
+          "generation_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation Id"
+          },
+          "push_seq": {
+            "title": "Push Seq",
+            "type": "integer"
+          },
+          "request_digest": {
+            "title": "Request Digest",
+            "type": "string"
+          },
+          "response": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response"
+          },
+          "section": {
+            "title": "Section",
+            "type": "string"
+          },
+          "status_code": {
+            "title": "Status Code",
+            "type": "integer"
+          },
+          "store_only": {
+            "title": "Store Only",
+            "type": "boolean"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "device_id",
+          "section",
+          "push_seq",
+          "request_digest",
+          "store_only",
+          "delete_origin",
+          "backfill_only",
+          "status_code",
+          "response",
+          "generation_id",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "IntentReceiptOut",
+        "type": "object"
+      },
+      "IntentReceiptsOut": {
+        "properties": {
+          "global_max_push_seq": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Global Max Push Seq"
+          },
+          "global_max_route_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Global Max Route Id"
+          },
+          "receipts": {
+            "items": {
+              "$ref": "#/components/schemas/IntentReceiptOut"
+            },
+            "title": "Receipts",
+            "type": "array"
+          }
+        },
+        "required": [
+          "receipts",
+          "global_max_push_seq",
+          "global_max_route_id"
+        ],
+        "title": "IntentReceiptsOut",
+        "type": "object"
+      },
       "IntentRowOut": {
         "description": "One mirror row \u2014 EMIT-NULL (all six keys always present).",
         "properties": {
@@ -14024,6 +14155,87 @@
         "summary": "Put Vlan Intent",
         "tags": [
           "vlan"
+        ]
+      }
+    },
+    "/api/v1/intent-receipts": {
+      "get": {
+        "description": "Serve the per-key receipts, filterable, plus the two fleet-wide maxima.",
+        "operationId": "list_intent_receipts_api_v1_intent_receipts_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "device_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Device Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "section",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Section"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IntentReceiptsOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request validation failed (envelope shape)"
+          }
+        },
+        "security": [
+          {
+            "_OptionalBearer": []
+          }
+        ],
+        "summary": "List Intent Receipts",
+        "tags": [
+          "intent-receipts"
         ]
       }
     },

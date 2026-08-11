@@ -820,6 +820,53 @@ persisted per device so a process restart does not reset it.
 
 ## SNMP Configuration (M11)
 
+### `GET /api/v1/intent-receipts` → `200 | 401 | 422`
+
+Every per-key push receipt, plus the two fleet-wide maxima a restored pusher needs before
+it resolves a single outstanding claim. Filterable by `device_id` and by `section`; an
+unrecognised `section` is a **422** (`reason = "unknown_section"`, with the valid set in
+`detail.sections`) rather than an empty page, because an empty page reads as "this key has
+no receipt" and sends the restore down the wrong branch.
+
+```json
+{
+  "receipts": [
+    {
+      "device_id": 1,
+      "section": "static_route",
+      "push_seq": 4,
+      "request_digest": "3b1f…",
+      "store_only": false,
+      "delete_origin": false,
+      "backfill_only": false,
+      "status_code": 200,
+      "response": { "device_id": 1, "count": 1, "removed": 0, "replaced": false, "routes": [] },
+      "generation_id": 12,
+      "created_at": "2026-08-11T10:00:00Z",
+      "updated_at": "2026-08-11T10:00:00Z"
+    }
+  ],
+  "global_max_push_seq": 11,
+  "global_max_route_id": 4242
+}
+```
+
+`section` is the adapter's own stream vocabulary — the sixteen names in the `X-Push-Seq`
+table above. The plugin's delivery key for the interface family is `interface` and maps onto
+`interface_config` here; the other fifteen are identical on both sides.
+
+`response` is the stored response that push returned. A restored pusher re-validates its
+claim's exact deletion set against it rather than re-sending.
+
+**Both maxima are fleet-wide, filter or no filter.** `global_max_push_seq` is the highest
+admitted sequence anywhere, so a restored pusher allocates above it and never re-uses one.
+`global_max_route_id` is the highest NetBox route pk the adapter holds anywhere, counting the
+tombstones as well as the live intent rows: a plugin-only restore rewinds `StaticRoute`'s pk
+sequence, so a snapshot taken before pk R existed can re-allocate R while the adapter still
+holds an unrelated row carrying `route_id = R` — and the deletion partition's first pass
+would bind that row as genuine and authorize removing it. Advancing the pk sequence past this
+value is what closes that. `null` on both means the adapter holds nothing, which is not `0`.
+
 ### `GET /api/v1/devices/{id}/snmp-config` → `200 | 404`
 
 Read-mirror of SNMP config as exported by the `network-state-export` NSO package.
