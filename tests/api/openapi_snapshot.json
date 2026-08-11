@@ -1126,7 +1126,7 @@
         "type": "object"
       },
       "DeletedRoute": {
-        "description": "One NetBox route pk the operator deleted, and where the adapter may be holding it.\n\n``triples`` is the route's LINEAGE, most-authoritative-first (last acknowledged, then\ncurrent): a content edit whose push never landed leaves the adapter on the older triple,\nso an id carrying only the current one would match nothing and be called moot (\u00a74.1).\nAn empty list restores the undecidable degraded-versus-moot partition and is a 422.\n\n``unverified`` is declared, never inferred from the lineage's shape: a verified ``[C, C]``\ndeduplicates to exactly what a genuinely unverified ``[C]`` produces (R10-B1).",
+        "description": "One NetBox route pk the operator deleted, and where the adapter may be holding it.\n\n``triples`` is the route's LINEAGE, most-authoritative-first (last acknowledged, then\ncurrent): a content edit whose push never landed leaves the adapter on the older triple,\nso an id carrying only the current one would match nothing and be called moot (\u00a74.1).\nAn empty list restores the undecidable degraded-versus-moot partition and is a 422.\n\nTwo is the ceiling, not a convention (R9-M2): the adapter can only hold a triple that was\nsent, and at most one claim is ever unresolved. A third distinct triple would be\nclassification evidence the contract never grants \u2014 a ``route_id IS NULL`` row matching\nonly it flips the acknowledgement from moot to degraded \u2014 so it is a 422 too.\n\n``unverified`` is declared, never inferred from the lineage's shape: a verified ``[C, C]``\ndeduplicates to exactly what a genuinely unverified ``[C]`` produces (R10-B1).",
         "properties": {
           "route_id": {
             "title": "Route Id",
@@ -1136,6 +1136,7 @@
             "items": {
               "$ref": "#/components/schemas/RouteTriple"
             },
+            "maxItems": 2,
             "minItems": 1,
             "title": "Triples",
             "type": "array"

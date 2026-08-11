@@ -521,6 +521,60 @@ async def test_a_deletion_record_with_no_triples_is_refused(adapter_client):
     assert resp.json()["error"]["code"] == "validation_error"
 
 
+async def test_a_deletion_record_with_a_third_triple_is_refused(adapter_client):
+    """R9-M2 — the lineage is provably at most two: the last acknowledged triple, then the
+    current one. A third is classification evidence the contract never grants — a
+    ``route_id IS NULL`` row matching only it flips the acknowledgement from moot to
+    degraded — and an unbounded list makes the lineage deduplication quadratic.
+    """
+    device_id = await seed_device(nso_device_name="sr-o2b-3triples", netbox_device_id=9933)
+    await seed_intent(device_id, [{"triple": C, "route_id": 101}])
+    before = await read_intent_all_columns(device_id)
+
+    resp = await put(
+        adapter_client,
+        device_id,
+        [entry(C, route_id=101)],
+        deleted_routes=[deleted(7, [A, B, D])],
+    )
+
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
+    assert await read_intent_all_columns(device_id) == before
+    assert await receipt(device_id) is None
+
+
+async def test_a_two_triple_lineage_still_classifies_on_its_last_acknowledged_triple(adapter_client):
+    """The control the bound must not break: §4.1's whole reason for carrying a lineage.
+
+    A content edit whose push never landed leaves the adapter on the OLDER triple, so a
+    record carrying only the current one would match nothing and be called moot.
+    """
+    device_id = await seed_device(nso_device_name="sr-o2b-2triples", netbox_device_id=9934)
+    await seed_intent(
+        device_id,
+        [
+            {"triple": A, "route_id": None, "deployed_key": list(A)},
+            {"triple": C, "route_id": 101, "deployed_key": list(C)},
+        ],
+    )
+
+    resp = await put(
+        adapter_client,
+        device_id,
+        [entry(C, route_id=101)],
+        deleted_routes=[deleted(7, [A, B])],
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert partition_of(resp.json()) == {
+        "executed": [],
+        "degraded": [7],
+        "moot": [],
+        "uncorrelated": [],
+    }
+
+
 async def test_two_deletion_records_claiming_one_route_id_are_refused(adapter_client):
     """One pk cannot have two outcomes: emission is id-oriented, exactly once per id."""
     device_id = await seed_device(nso_device_name="sr-o2b-duprid", netbox_device_id=9931)

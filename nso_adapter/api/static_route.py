@@ -202,12 +202,17 @@ class DeletedRoute(BaseModel):
     so an id carrying only the current one would match nothing and be called moot (§4.1).
     An empty list restores the undecidable degraded-versus-moot partition and is a 422.
 
+    Two is the ceiling, not a convention (R9-M2): the adapter can only hold a triple that was
+    sent, and at most one claim is ever unresolved. A third distinct triple would be
+    classification evidence the contract never grants — a ``route_id IS NULL`` row matching
+    only it flips the acknowledgement from moot to degraded — so it is a 422 too.
+
     ``unverified`` is declared, never inferred from the lineage's shape: a verified ``[C, C]``
     deduplicates to exactly what a genuinely unverified ``[C]`` produces (R10-B1).
     """
 
     route_id: int
-    triples: list[RouteTriple] = Field(min_length=1)
+    triples: list[RouteTriple] = Field(min_length=1, max_length=2)
     unverified: bool
 
 

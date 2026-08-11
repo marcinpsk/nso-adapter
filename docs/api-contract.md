@@ -1104,7 +1104,7 @@ an operator un-owning it produce the same shrink, and the two have opposite devi
 | field | meaning |
 |---|---|
 | `route_id` | the deleted `routing.StaticRoute` pk |
-| `triples` | its LINEAGE, most-authoritative-first: the last acknowledged triple, then the current one. At most two, deduplicated. Empty is a **422** |
+| `triples` | its LINEAGE, most-authoritative-first: the last acknowledged triple, then the current one. Deduplicated. Empty is a **422**, and so is a third triple — the ceiling is enforced at request validation, not assumed |
 | `unverified` | declared by the pusher when the overlay held no acknowledged triple. Never inferred from the lineage's shape — a verified `[C, C]` deduplicates to exactly what an unverified `[C]` produces |
 
 The field is optional today and its absence is the PRE-ACTIVATION shape: the scope is still
