@@ -207,7 +207,7 @@ async def _next_seq(db: AsyncSession, device_id: int) -> int:
 
 
 async def allocate_settlement_cohort(db: AsyncSession) -> int:
-    """Reserve one globally unique identifier for a marking-split request."""
+    """Reserve one globally unique identifier for a request settlement group."""
     cohort = await db.scalar(select(SETTLEMENT_COHORT_SEQUENCE.next_value()))
     if cohort is None:  # pragma: no cover - PostgreSQL nextval always returns one value
         raise RuntimeError("the settlement cohort sequence returned no value")

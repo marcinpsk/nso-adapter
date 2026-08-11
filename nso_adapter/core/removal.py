@@ -1854,9 +1854,8 @@ async def enqueue_removal(
     caller rather than derived from *scope*: two endpoints share the ``interface_config``
     scope and two share ``isis``, so promoting the whole section would authorize the sibling
     lane's un-promoted store-only state (#103). An endpoint passes its own delivery stream.
-    *settlement_cohort* is non-null only for the marking-specific jobs created by one split
-    static-route request. It makes those generations one settlement barrier without linking
-    an unrelated generation that happens to carry the same stream revision.
+    *settlement_cohort* makes all promoted generations created by one request a settlement
+    barrier. It stays NULL when the request creates only this generation.
     *force* names none — see below.
     *interfaces* scopes an ``interface_config`` removal to the affected interface names.
     *removed* maps each YANG list to the keys the trigger JUST deleted so the
@@ -2030,6 +2029,7 @@ async def enqueue_static_route_removals(
     removed: dict[str, list],
     tombstones=(),
     retract: bool = False,
+    settlement_cohort: int | None = None,
 ) -> list:
     """Queue ONE marking-homogeneous removal job per marking this push deleted at (§4.5).
 
@@ -2048,6 +2048,8 @@ async def enqueue_static_route_removals(
     the request's rows is an un-own, exactly as an unsplit push defers it today.
 
     Every job promotes the same streams, because one store state stands behind them all.
+    The caller supplies *settlement_cohort* when the request also creates an apply
+    generation. A marking split allocates its own cohort when no request cohort was supplied.
 
     Returns the jobs in creation order, or ``[]`` on a store-only request (no device write,
     and no carrier was written either).
@@ -2057,7 +2059,8 @@ async def enqueue_static_route_removals(
     present = [marking for marking in _MARKING_ORDER if removed.get(marking)]
     if not present and not retract:
         return []
-    settlement_cohort = await allocate_settlement_cohort(db) if len(present) > 1 else None
+    if settlement_cohort is None and len(present) > 1:
+        settlement_cohort = await allocate_settlement_cohort(db)
     jobs: dict = {}
     # A pure clear deletes nothing, so it carries no marking at all and is never a detach.
     for index, marking in enumerate(present or [None]):

@@ -691,6 +691,17 @@ async def _apply_static_route_intent(
     # rows before it touches `jobs` — the §3.9 order, `intent + tombstone -> jobs`.
     await db.flush()
 
+    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    settings = settings_result.scalar_one_or_none()
+    auto_apply = bool(settings and settings.auto_apply and count > 0)
+    removal_generation_count = len(removed_by_marking) if removed_rows else int(cleared)
+    promoted_generation_count = 0 if STORE_ONLY.get() else removal_generation_count + int(auto_apply)
+    settlement_cohort = None
+    if promoted_generation_count > 1:
+        from nso_adapter.core.generation import allocate_settlement_cohort
+
+        settlement_cohort = await allocate_settlement_cohort(db)
+
     # Removal BEFORE apply, and both inside this transaction. The order is the contract:
     # the removal must carry the lower (created_at, id) so the worker's per-device head
     # claim runs it first — a retract that lands after the re-apply undoes the apply.
@@ -710,15 +721,20 @@ async def _apply_static_route_intent(
                 removed=removed_by_marking,
                 tombstones=tombstones,
                 retract=cleared,
+                settlement_cohort=settlement_cohort,
             )
         )
 
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
-    if settings and settings.auto_apply and count > 0:
+    if auto_apply:
         from nso_adapter.core.apply import enqueue_apply
 
-        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
+        await enqueue_apply(
+            db,
+            device_id,
+            force=True,
+            stream=delivery.stream,
+            settlement_cohort=settlement_cohort,
+        )
 
     # Rendered BEFORE the commit, off the rows this transaction just wrote: the echo is the
     # pusher's settlement expectation, so it must describe exactly what was stored, not what
