@@ -44,18 +44,34 @@ async def test_intent_apply_result_golden(adapter_client, suffix, body):
 
 @pytest.mark.anyio
 async def test_static_route_intent_result_golden(adapter_client):
-    """The static-route PUT is the shared summary PLUS the settlement echo (#1396 R3 P0).
+    """The static-route PUT is the shared summary, the settlement echo AND the deletion ack.
 
     Deep equality, not a subset check: the echo is what the pusher records as its
     expectation, so a key that quietly disappears from it is a settlement that silently
-    stops correlating.
+    stops correlating. The four acknowledgement fields (#1503 §4.4) are emitted on EVERY
+    response, including one that carried no deletion authority at all — the pusher validates
+    the partition unconditionally, so a missing list is not the same as an empty one.
     """
     device_id = await seed_device(nso_device_name="wr-static-route-intent", netbox_device_id=8001)
     body = {"routes": [{"route_id": 41, "generation": 7, "prefix": "10.0.0.0/8", "next_hop": "192.0.2.1"}]}
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/static-route-intent", json=body, headers=AUTH)
     assert resp.status_code == 200
     payload = resp.json()
-    assert set(payload) == {"device_id", "count", "removed", "replaced", "routes"}
+    assert set(payload) == {
+        "device_id",
+        "count",
+        "removed",
+        "replaced",
+        "routes",
+        "deleted_executed_ids",
+        "deleted_degraded_ids",
+        "deleted_moot_ids",
+        "removed_uncorrelated",
+    }
     assert (payload["device_id"], payload["count"], payload["removed"], payload["replaced"]) == (device_id, 1, 0, False)
     assert [(r["route_id"], r["generation"]) for r in payload["routes"]] == [(41, 7)]
     assert set(payload["routes"][0]) == {"route_id", "generation", "fingerprint"}
+    assert payload["deleted_executed_ids"] == []
+    assert payload["deleted_degraded_ids"] == []
+    assert payload["deleted_moot_ids"] == []
+    assert payload["removed_uncorrelated"] == []

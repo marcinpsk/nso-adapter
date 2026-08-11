@@ -21,9 +21,10 @@ One receipt per ``(device, stream)``, replaced as the sequence advances, decides
 **Why the mode is part of the identity.** The digest covers the wire BODY, and the body
 alone does not say what the request does with it: ``?store_only=true`` mutates the store and
 authorizes no device write, ``?delete_origin=true`` turns a shrink into a networked
-retraction, and the unmarked form detaches instead (#106). The same sequence carrying the
-same bytes under two of those is three different deployments, so the two flags are stored
-as receipt COLUMNS and compared at admission. The digest ALGORITHM is untouched — it is
+retraction, the unmarked form detaches instead (#106), and ``?backfill_only=true`` adopts ids
+and prunes uncorrelated rows while writing no content at all (#1503 §4.4). The same sequence
+carrying the same bytes under two of those is two different operations, so the flags are
+stored as receipt COLUMNS and compared at admission. The digest ALGORITHM is untouched — it is
 pinned by the plugin, which computes it over the raw body it sent.
 
 The receipt is written in the SAME transaction as the mutation it admits. A receipt that
@@ -81,6 +82,7 @@ class PushIdentity:
     digest: str
     store_only: bool
     delete_origin: bool
+    backfill_only: bool
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,11 @@ class IntentDelivery:
 
     stream: str
     identity: PushIdentity | None
+
+    @property
+    def push_seq(self) -> int | None:
+        """The claim sequence this delivery carries, or ``None`` when it is claim-less."""
+        return self.identity.seq if self.identity is not None else None
 
 
 def digest_body(body: object) -> str:
@@ -127,9 +134,9 @@ async def latest_receipt(db: AsyncSession, device_id: int, stream: str) -> Inten
     )
 
 
-def _mode(carrier) -> tuple[bool, bool]:
-    """Return the request mode as one comparable pair: ``(store_only, delete_origin)``."""
-    return bool(carrier.store_only), bool(carrier.delete_origin)
+def _mode(carrier) -> tuple[bool, bool, bool]:
+    """Return the request mode as one comparable triple, receipt row and identity alike."""
+    return bool(carrier.store_only), bool(carrier.delete_origin), bool(carrier.backfill_only)
 
 
 async def admit_push(db: AsyncSession, device_id: int, delivery: IntentDelivery) -> tuple[dict | None, int] | None:
@@ -157,6 +164,7 @@ async def admit_push(db: AsyncSession, device_id: int, delivery: IntentDelivery)
                 request_digest=identity.digest,
                 store_only=identity.store_only,
                 delete_origin=identity.delete_origin,
+                backfill_only=identity.backfill_only,
             )
         )
         await db.flush()
@@ -175,6 +183,7 @@ async def admit_push(db: AsyncSession, device_id: int, delivery: IntentDelivery)
                 "admitted_digest": receipt.request_digest,
                 "admitted_store_only": receipt.store_only,
                 "admitted_delete_origin": receipt.delete_origin,
+                "admitted_backfill_only": receipt.backfill_only,
             },
         )
     if identity.seq < receipt.push_seq:
@@ -187,6 +196,7 @@ async def admit_push(db: AsyncSession, device_id: int, delivery: IntentDelivery)
     receipt.request_digest = identity.digest
     receipt.store_only = identity.store_only
     receipt.delete_origin = identity.delete_origin
+    receipt.backfill_only = identity.backfill_only
     receipt.response = None
     receipt.status_code = 200
     receipt.generation_id = None

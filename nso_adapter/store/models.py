@@ -592,10 +592,14 @@ class IntentPushReceipt(Base):
     section: Mapped[str] = mapped_column(String(32), nullable=False)
     push_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
     request_digest: Mapped[str] = mapped_column(String(64), nullable=False)
-    #: The admitted delivery's ``?store_only=true`` / ``?delete_origin=true``, canonicalised
-    #: to booleans by the same parser the middleware uses. Part of the admission identity.
+    #: The admitted delivery's ``?store_only=true`` / ``?delete_origin=true`` /
+    #: ``?backfill_only=true``, canonicalised to booleans by the same parser the middleware
+    #: uses. Part of the admission identity: one body under two of these modes is two
+    #: different operations, and a backfill-only pass in particular writes a completely
+    #: different set of rows than the ordinary push it would otherwise replay as (#1503 §4.4).
     store_only: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"), default=False)
     delete_origin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"), default=False)
+    backfill_only: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"), default=False)
     #: The response body this push returned, replayed byte for byte on a repeat delivery.
     response: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     status_code: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("200"), default=200)

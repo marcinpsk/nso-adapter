@@ -614,8 +614,16 @@ async def test_f4_d_a_malformed_push_sequence_is_not_echoed(adapter_client):
     assert resp.json() == {
         "error": {
             "code": "validation_error",
-            "message": "X-Push-Seq must be an integer between 1 and 9223372036854775807",
-            "detail": {},
+            "message": "Request validation failed",
+            "detail": {
+                "errors": [
+                    {
+                        "loc": ["header", "X-Push-Seq"],
+                        "type": "int_parsing",
+                        "msg": "Invalid value",
+                    }
+                ]
+            },
         }
     }
 

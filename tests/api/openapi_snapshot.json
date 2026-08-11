@@ -1125,6 +1125,34 @@
         "title": "CapabilityOut",
         "type": "object"
       },
+      "DeletedRoute": {
+        "description": "One NetBox route pk the operator deleted, and where the adapter may be holding it.\n\n``triples`` is the route's LINEAGE, most-authoritative-first (last acknowledged, then\ncurrent): a content edit whose push never landed leaves the adapter on the older triple,\nso an id carrying only the current one would match nothing and be called moot (\u00a74.1).\nAn empty list restores the undecidable degraded-versus-moot partition and is a 422.\n\n``unverified`` is declared, never inferred from the lineage's shape: a verified ``[C, C]``\ndeduplicates to exactly what a genuinely unverified ``[C]`` produces (R10-B1).",
+        "properties": {
+          "route_id": {
+            "title": "Route Id",
+            "type": "integer"
+          },
+          "triples": {
+            "items": {
+              "$ref": "#/components/schemas/RouteTriple"
+            },
+            "minItems": 1,
+            "title": "Triples",
+            "type": "array"
+          },
+          "unverified": {
+            "title": "Unverified",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "route_id",
+          "triples",
+          "unverified"
+        ],
+        "title": "DeletedRoute",
+        "type": "object"
+      },
       "DeviceCreate": {
         "properties": {
           "netbox_device_id": {
@@ -6548,6 +6576,30 @@
         "title": "RoutePolicyRouteMapOut",
         "type": "object"
       },
+      "RouteTriple": {
+        "description": "One ``(vrf, prefix, next_hop)`` identity.\n\nThe only thing the adapter can match a deleted NetBox route by once its intent row is gone.",
+        "properties": {
+          "next_hop": {
+            "title": "Next Hop",
+            "type": "string"
+          },
+          "prefix": {
+            "title": "Prefix",
+            "type": "string"
+          },
+          "vrf": {
+            "default": "",
+            "title": "Vrf",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prefix",
+          "next_hop"
+        ],
+        "title": "RouteTriple",
+        "type": "object"
+      },
       "ScopeOut": {
         "description": "EMIT-NULL fixed-key scope shape (updated_at = max attr time, or a read-time mint if empty).",
         "properties": {
@@ -7472,11 +7524,32 @@
         "type": "object"
       },
       "StaticRouteIntentResult": {
-        "description": "The static-route PUT's 2xx body: the shared summary plus the per-route echo.",
+        "description": "The static-route PUT's 2xx body: the shared summary, the per-route echo, the ack.\n\nThe three id lists PARTITION the ``deleted_routes`` the request carried \u2014 unique within\neach list, pairwise disjoint, no id the request did not send, and exact coverage. The\npusher validates all four properties and treats anything else as a protocol violation, so\na union of the three is not enough: executed ``[1]`` with degraded ``[1]`` would otherwise\ndrive both a degradation record and a restore decision for one id.\n\n``removed_uncorrelated`` is emitted on EVERY mode, normal, store-only and backfill-only\nalike (R11-B2): a normal push detaches a ``route_id IS NULL`` row nobody claimed exactly\nas a backfill pass prunes one, and the pusher's conservative attribution rule reads it.",
         "properties": {
           "count": {
             "title": "Count",
             "type": "integer"
+          },
+          "deleted_degraded_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Deleted Degraded Ids",
+            "type": "array"
+          },
+          "deleted_executed_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Deleted Executed Ids",
+            "type": "array"
+          },
+          "deleted_moot_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Deleted Moot Ids",
+            "type": "array"
           },
           "device_id": {
             "title": "Device Id",
@@ -7485,6 +7558,13 @@
           "removed": {
             "title": "Removed",
             "type": "integer"
+          },
+          "removed_uncorrelated": {
+            "items": {
+              "$ref": "#/components/schemas/RouteTriple"
+            },
+            "title": "Removed Uncorrelated",
+            "type": "array"
           },
           "replaced": {
             "title": "Replaced",
@@ -7503,13 +7583,31 @@
           "count",
           "removed",
           "replaced",
-          "routes"
+          "routes",
+          "deleted_executed_ids",
+          "deleted_degraded_ids",
+          "deleted_moot_ids",
+          "removed_uncorrelated"
         ],
         "title": "StaticRouteIntentResult",
         "type": "object"
       },
       "StaticRouteIntentUpdate": {
         "properties": {
+          "deleted_routes": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/DeletedRoute"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deleted Routes"
+          },
           "routes": {
             "items": {
               "$ref": "#/components/schemas/StaticRouteEntry"
@@ -9770,6 +9868,26 @@
               "title": "Device Id",
               "type": "integer"
             }
+          },
+          {
+            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+              "title": "X-Push-Seq"
+            }
           }
         ],
         "requestBody": {
@@ -9925,6 +10043,26 @@
             "schema": {
               "title": "Device Id",
               "type": "integer"
+            }
+          },
+          {
+            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+              "title": "X-Push-Seq"
             }
           }
         ],
@@ -10245,6 +10383,26 @@
               "title": "Device Id",
               "type": "integer"
             }
+          },
+          {
+            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+              "title": "X-Push-Seq"
+            }
           }
         ],
         "requestBody": {
@@ -10536,6 +10694,26 @@
               "title": "Device Id",
               "type": "integer"
             }
+          },
+          {
+            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+              "title": "X-Push-Seq"
+            }
           }
         ],
         "requestBody": {
@@ -10762,6 +10940,26 @@
               "title": "Device Id",
               "type": "integer"
             }
+          },
+          {
+            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+              "title": "X-Push-Seq"
+            }
           }
         ],
         "requestBody": {
@@ -10850,6 +11048,26 @@
               "title": "Device Id",
               "type": "integer"
             }
+          },
+          {
+            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+              "title": "X-Push-Seq"
+            }
           }
         ],
         "requestBody": {
@@ -10937,6 +11155,26 @@
             "schema": {
               "title": "Device Id",
               "type": "integer"
+            }
+          },
+          {
+            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+              "title": "X-Push-Seq"
             }
           }
         ],
@@ -11092,6 +11330,26 @@
             "schema": {
               "title": "Device Id",
               "type": "integer"
+            }
+          },
+          {
+            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+              "title": "X-Push-Seq"
             }
           }
         ],
@@ -11535,6 +11793,26 @@
               "title": "Device Id",
               "type": "integer"
             }
+          },
+          {
+            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+              "title": "X-Push-Seq"
+            }
           }
         ],
         "requestBody": {
@@ -11689,6 +11967,26 @@
             "schema": {
               "title": "Device Id",
               "type": "integer"
+            }
+          },
+          {
+            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+              "title": "X-Push-Seq"
             }
           }
         ],
@@ -11981,6 +12279,26 @@
             "schema": {
               "title": "Device Id",
               "type": "integer"
+            }
+          },
+          {
+            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+              "title": "X-Push-Seq"
             }
           }
         ],
@@ -12549,6 +12867,26 @@
               "title": "Device Id",
               "type": "integer"
             }
+          },
+          {
+            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+              "title": "X-Push-Seq"
+            }
           }
         ],
         "requestBody": {
@@ -12769,6 +13107,26 @@
             "schema": {
               "title": "Device Id",
               "type": "integer"
+            }
+          },
+          {
+            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+              "title": "X-Push-Seq"
             }
           }
         ],
@@ -12993,6 +13351,26 @@
               "title": "Device Id",
               "type": "integer"
             }
+          },
+          {
+            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+              "title": "X-Push-Seq"
+            }
           }
         ],
         "requestBody": {
@@ -13148,6 +13526,26 @@
             "schema": {
               "title": "Device Id",
               "type": "integer"
+            }
+          },
+          {
+            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+              "title": "X-Push-Seq"
             }
           }
         ],
@@ -13533,6 +13931,26 @@
             "schema": {
               "title": "Device Id",
               "type": "integer"
+            }
+          },
+          {
+            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+              "title": "X-Push-Seq"
             }
           }
         ],

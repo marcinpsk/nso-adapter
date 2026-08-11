@@ -387,7 +387,7 @@ async def test_admission_refuses_a_stream_outside_the_vocabulary(adapter_client)
     device_id = await seed_device(nso_device_name="rcp-bad-stream", netbox_device_id=None)
     delivery = IntentDelivery(
         stream="lacp",
-        identity=PushIdentity(seq=1, digest="0" * 64, store_only=False, delete_origin=False),
+        identity=PushIdentity(seq=1, digest="0" * 64, store_only=False, delete_origin=False, backfill_only=False),
     )
     async with session() as db:
         with pytest.raises(RuntimeError, match="not an in-protocol intent stream"):
@@ -426,3 +426,49 @@ async def test_a_keyed_invalid_utf8_body_is_a_validation_error(adapter_client):
             "detail": {},
         }
     }
+
+
+# ── O2b.7: the header is DECLARED, not an undocumented convention ─────────────
+
+
+def _push_seq_parameters(schema: dict, path: str) -> list[dict]:
+    operation = schema["paths"][path.replace("{device_id}", "{device_id}")]["put"]
+    return [p for p in operation.get("parameters", []) if p["name"] == "X-Push-Seq"]
+
+
+def test_o2b_7_every_in_protocol_intent_put_declares_the_push_sequence_header():
+    """O2b.7 — OpenAPI truthfulness applies to headers too (§4.4).
+
+    The sequence is what makes a delivery replayable, so leaving it as a convention
+    documented only in prose is exactly what the truthfulness program exists to prevent.
+    """
+    from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS
+    from nso_adapter.main import create_app
+
+    schema = create_app().openapi()
+    for path in INTENT_PUT_ENDPOINTS:
+        declared = _push_seq_parameters(schema, path)
+        assert len(declared) == 1, f"{path} does not declare X-Push-Seq"
+        assert declared[0]["in"] == "header"
+
+
+def test_o2b_7_the_out_of_protocol_puts_declare_no_push_sequence_header():
+    """O2b.7 control — a claim-less delivery must not appear to be on the sequence path."""
+    from nso_adapter.core.intent_protocol import OUT_OF_PROTOCOL_PUTS
+    from nso_adapter.main import create_app
+
+    schema = create_app().openapi()
+    for path in OUT_OF_PROTOCOL_PUTS:
+        assert _push_seq_parameters(schema, path) == [], f"{path} declares X-Push-Seq"
+
+
+def test_o2b_7_the_declared_domain_is_the_one_the_receipt_column_can_hold():
+    """O2b.7 — the bounds are declared, so a client reads them instead of discovering them."""
+    from nso_adapter.core.request_flags import MAX_PUSH_SEQ, MIN_PUSH_SEQ
+    from nso_adapter.main import create_app
+
+    declared = _push_seq_parameters(create_app().openapi(), "/api/v1/devices/{device_id}/vlan-intent")[0]
+    bounds = [sub for sub in declared["schema"].get("anyOf", [declared["schema"]]) if sub.get("type") == "integer"]
+
+    assert bounds, declared["schema"]
+    assert (bounds[0]["minimum"], bounds[0]["maximum"]) == (MIN_PUSH_SEQ, MAX_PUSH_SEQ)

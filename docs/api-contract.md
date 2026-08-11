@@ -125,12 +125,13 @@ authorized, with the collateral guard off — so it promotes no stream and marks
 
 - the digest is `sha256` over the canonical JSON of the raw request body
   (`json.dumps(body, sort_keys=True, default=str)`);
-- the mode is the pair (`?store_only=`, `?delete_origin=`) as parsed — `1`, `true`,
-  `yes`, `on` are true, everything else (absent included) is false. The body does
-  not say what the request does with it: store-only authorizes no device write,
-  delete-origin turns a shrink into a networked retraction, and the unmarked form
-  detaches instead. One sequence carrying one body under two of those is two
-  different deployments.
+- the mode is the triple (`?store_only=`, `?delete_origin=`, `?backfill_only=`) as
+  parsed — `1`, `true`, `yes`, `on` are true, everything else (absent included) is
+  false. The body does not say what the request does with it: store-only authorizes no
+  device write, delete-origin turns a shrink into a networked retraction, the unmarked
+  form detaches instead, and backfill-only adopts ids and prunes uncorrelated rows while
+  writing no content at all. One sequence carrying one body under two of those is two
+  different operations.
 
 **Admission.**
 
@@ -148,8 +149,10 @@ already gone — the outbox retrying a push while an operator removes the device
 race, not a server error.
 
 The sequence domain is `1 … 2^63-1`; a present header that is malformed or outside it
-is **422**, never a silent downgrade to an unkeyed write. An ABSENT header is accepted
-and simply gets no receipt — the direct-apply families (lacp, switchport) are
+is **422**, never a silent downgrade to an unkeyed write. The header is a DECLARED
+parameter of each of the sixteen endpoints above, with those bounds, and appears in
+`/openapi.json`; the two out-of-protocol PUTs declare no such parameter. An ABSENT header
+is accepted and simply gets no receipt — the direct-apply families (lacp, switchport) are
 deliberately claim-less, and they are POSTs, not intent PUTs. The two remaining PUTs
 (`/api/v1/config/failover` and `PUT /api/v1/devices/{id}/scope`) are adapter
 configuration rather than intent deliveries and carry no claim either.
@@ -966,6 +969,13 @@ routes must be omitted by the caller.
       "permanent": false,
       "tag": null
     }
+  ],
+  "deleted_routes": [
+    {
+      "route_id": 40,
+      "triples": [{ "vrf": "", "prefix": "10.0.0.0/24", "next_hop": "10.0.0.2" }],
+      "unverified": false
+    }
   ]
 }
 ```
@@ -975,11 +985,15 @@ Response:
 {
   "device_id": 1,
   "count": 1,
-  "removed": 0,
-  "replaced": false,
+  "removed": 1,
+  "replaced": true,
   "routes": [
     { "route_id": 41, "generation": 12, "fingerprint": "9f2c…" }
-  ]
+  ],
+  "deleted_executed_ids": [40],
+  "deleted_degraded_ids": [],
+  "deleted_moot_ids": [],
+  "removed_uncorrelated": []
 }
 ```
 
@@ -1029,6 +1043,73 @@ actually holds; a pusher cannot recompute it locally, which is why it is echoed 
 assumed. `GET /api/v1/devices/{id}/static-route-intent` re-serves the same triples if the
 response is lost.
 
+#### `deleted_routes` — the deletion authority, and its acknowledgement
+
+A full-replace body cannot say WHY a route left it: an operator deleting a NetBox route and
+an operator un-owning it produce the same shrink, and the two have opposite device outcomes.
+`deleted_routes` is that answer, one record per deleted NetBox route pk:
+
+| field | meaning |
+|---|---|
+| `route_id` | the deleted `routing.StaticRoute` pk |
+| `triples` | its LINEAGE, most-authoritative-first: the last acknowledged triple, then the current one. At most two, deduplicated. Empty is a **422** |
+| `unverified` | declared by the pusher when the overlay held no acknowledged triple. Never inferred from the lineage's shape — a verified `[C, C]` deduplicates to exactly what an unverified `[C]` produces |
+
+The field is optional today and its absence is the PRE-ACTIVATION shape: the scope is still
+marked for the whole request by `?delete_origin=`. A list — empty included — means the push
+marks **per object**, and `?delete_origin=` no longer applies to this scope.
+
+**Classification.** Two ordered passes over the rows this push removes:
+
+1. **by `route_id`, exclusively.** A requested id equal to a removed row's `route_id` is
+   GENUINE: its removal retracts from the device, and both the id and the row leave the pool.
+2. **by triple, over the remainder.** A removed `route_id IS NULL` row classifies EVERY
+   remaining id whose lineage carries its triple, identically — NetBox has no uniqueness
+   constraint on the triple, so two deleted pks can legitimately share one against one
+   adapter row. Those ids are DEGRADED: the row is detached, and the record exists so the
+   detach is not silent.
+
+A remaining id that matched nothing is MOOT, unless its lineage is `unverified` **and** this
+push removed at least one uncorrelated row — then it is degraded, attributed to that row.
+
+The response carries the three id lists plus `removed_uncorrelated`, the triples of the
+removed `route_id IS NULL` rows no requested id claimed. The three lists PARTITION the
+requested set: unique within each, pairwise disjoint, no unknown id, exact coverage. All four
+fields are emitted on **every** mode — normal, store-only and backfill-only.
+
+Request order never reaches the wire: every list is sorted, so two orderings of one request
+produce byte-identical responses and byte-identical stored receipts.
+
+#### `409` before any effect: `fence_shut` and `store_only_deletion`
+
+A genuine deletion needs a tombstone — the only carrier of the deletion once the intent row
+is gone. No tombstone is written while the device's replacement fence is shut (some row still
+carries no `route_id`) or the request is `?store_only=true`. A request carrying a genuine
+deletion under either condition is refused with `409 conflict` and
+`error.detail.reason = "fence_shut"` or `"store_only_deletion"`, **before any effect**: no row
+deleted, no tombstone, no job, and no receipt — so the sequence is not burned and the pusher
+can abandon the claim and re-send at a new one. `error.detail.route_ids` names the ids.
+
+#### `?backfill_only=true` — opening the fence
+
+A key holding a pending genuine deletion cannot open its own fence: any ordinary push omitting
+the deleted route destroys the before-image the deletion depends on. This mode is the way out.
+Under it the request:
+
+- adopts `route_id` and `generation` from every payload entry onto its matched row, and writes
+  **no content** — a row whose adapter state has drifted stays drifted;
+- leaves every omitted row that carries a `route_id` exactly as it is;
+- prunes every omitted row whose `route_id` is NULL, reporting each in `removed_uncorrelated`;
+- spawns nothing: no removal job, no tombstone, no auto-apply;
+- carries no authority: a non-empty `deleted_routes` is a **422**
+  (`reason = "backfill_carries_deletions"`);
+- takes an `X-Push-Seq` and writes a receipt, so it is replayable and cannot be re-applied at
+  a stale sequence. The mode is part of the receipt identity, so the same sequence delivered
+  once as a backfill and once as an ordinary push is `409 sequence_reuse`, never a replay.
+
+`static_route` is the only stream that implements it. Any other in-protocol intent PUT
+carrying the flag is a **422** (`reason = "backfill_only_unsupported"`).
+
 #### `422` refusals
 
 All use the standard envelope with `error.code = "validation_error"`; the specific rule
@@ -1038,6 +1119,8 @@ is in `error.detail.reason`:
 |---|---|
 | `duplicate_triple` | two entries carry the same `(vrf, prefix, next_hop)`; `detail.triple` names it |
 | `duplicate_route_id` | two entries claim the same non-null `route_id`; `detail.route_id` names it |
+| `duplicate_deleted_route_id` | two `deleted_routes` records claim the same `route_id`; emission is id-oriented, exactly one outcome per id |
+| `backfill_carries_deletions` | a `?backfill_only=true` body carried a non-empty `deleted_routes` |
 
 Entries with no `route_id` never collide with each other — a body of routes that all omit
 it is the normal shape and is accepted.
