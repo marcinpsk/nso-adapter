@@ -63,6 +63,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.core.projection import projection_streams, snapshot_stream, stream_section
 from nso_adapter.store.db import execute_dml
 from nso_adapter.store.models import (
+    SETTLEMENT_COHORT_SEQUENCE,
     DeploymentGeneration,
     DeviceGenerationCounter,
     DeviceProjectionStream,
@@ -205,6 +206,14 @@ async def _next_seq(db: AsyncSession, device_id: int) -> int:
     return seq
 
 
+async def allocate_settlement_cohort(db: AsyncSession) -> int:
+    """Reserve one globally unique identifier for a marking-split request."""
+    cohort = await db.scalar(select(SETTLEMENT_COHORT_SEQUENCE.next_value()))
+    if cohort is None:  # pragma: no cover - PostgreSQL nextval always returns one value
+        raise RuntimeError("the settlement cohort sequence returned no value")
+    return cohort
+
+
 def _compose_document(fragments: dict[str, dict]) -> dict:
     """Compose ``{stream: fragment}`` into the ``{section: {table: rows}}`` outbound document.
 
@@ -277,6 +286,7 @@ async def create_generation(
     allowed_removal_keys: dict | None = None,
     document: dict | None = None,
     removal_context: dict | None = None,
+    settlement_cohort: int | None = None,
 ) -> DeploymentGeneration:
     """Promote *streams* and store the immutable generation they authorize. Caller commits.
 
@@ -336,6 +346,7 @@ async def create_generation(
         source_push_seq=source_push_seq,
         stream_revisions=stream_revisions,
         removal_context=removal_context,
+        settlement_cohort=settlement_cohort,
     )
 
 
@@ -349,6 +360,7 @@ async def _store_generation(
     source_push_seq: dict,
     stream_revisions: dict,
     removal_context: dict | None,
+    settlement_cohort: int | None,
 ) -> DeploymentGeneration:
     """Allocate the sequence and write the immutable row. The projection lock is held."""
     generation = DeploymentGeneration(
@@ -362,6 +374,7 @@ async def _store_generation(
         source_push_seq=source_push_seq,
         stream_revisions=stream_revisions,
         removal_context=removal_context,
+        settlement_cohort=settlement_cohort,
     )
     db.add(generation)
     await db.flush()
@@ -447,6 +460,7 @@ async def create_reissue_generation(
         source_push_seq={row.stream: row.source_push_seq for row in rows if row.authorized_document},
         stream_revisions={},
         removal_context=removal_context,
+        settlement_cohort=None,
     )
 
 
@@ -675,28 +689,34 @@ async def settle_job_generations(
         )
         return
     targets = {
-        (generation.device_id, stream, revision)
+        (generation.device_id, stream, revision, generation.settlement_cohort)
         for generation in carried
         for stream, revision in (generation.stream_revisions or {}).items()
     }
-    for device_id, stream, revision in sorted(targets):
-        unsettled_sibling = (
-            select(DeploymentGeneration.id)
-            .where(
-                DeploymentGeneration.device_id == device_id,
-                DeploymentGeneration.status != GenerationStatus.settled,
-                DeploymentGeneration.stream_revisions[stream].as_string() == str(revision),
+    for device_id, stream, revision, settlement_cohort in sorted(
+        targets,
+        key=lambda target: (target[0], target[1], target[2], target[3] is not None, target[3] or 0),
+    ):
+        conditions = [
+            DeviceProjectionStream.device_id == device_id,
+            DeviceProjectionStream.stream == stream,
+            DeviceProjectionStream.applied_revision < revision,
+        ]
+        if settlement_cohort is not None:
+            unsettled_sibling = (
+                select(DeploymentGeneration.id)
+                .where(
+                    DeploymentGeneration.device_id == device_id,
+                    DeploymentGeneration.status != GenerationStatus.settled,
+                    DeploymentGeneration.stream_revisions[stream].as_string() == str(revision),
+                    DeploymentGeneration.settlement_cohort == settlement_cohort,
+                )
+                .exists()
             )
-            .exists()
-        )
+            conditions.append(~unsettled_sibling)
         await db.execute(
             sa_update(DeviceProjectionStream)
-            .where(
-                DeviceProjectionStream.device_id == device_id,
-                DeviceProjectionStream.stream == stream,
-                DeviceProjectionStream.applied_revision < revision,
-                ~unsettled_sibling,
-            )
+            .where(*conditions)
             .values(applied_revision=revision, updated_at=now)
             .execution_options(synchronize_session=False)
         )
@@ -1049,6 +1069,7 @@ __all__ = [
     "GenerationTampered",
     "advance_device_generations",
     "advance_generations_locked",
+    "allocate_settlement_cohort",
     "attach_to_job",
     "authorized_streams",
     "consume_last_enqueued_generation_id",

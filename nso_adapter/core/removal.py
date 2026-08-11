@@ -1824,6 +1824,7 @@ async def enqueue_removal(
     marking: str | None,
     defer_retract: bool,
     promotes: tuple[str, ...],
+    settlement_cohort: int | None = None,
     interfaces: list[str] | None = None,
     removed: dict[str, list] | None = None,
     vault_refs: dict[str, str] | None = None,
@@ -1853,6 +1854,9 @@ async def enqueue_removal(
     caller rather than derived from *scope*: two endpoints share the ``interface_config``
     scope and two share ``isis``, so promoting the whole section would authorize the sibling
     lane's un-promoted store-only state (#103). An endpoint passes its own delivery stream.
+    *settlement_cohort* is non-null only for the marking-specific jobs created by one split
+    static-route request. It makes those generations one settlement barrier without linking
+    an unrelated generation that happens to carry the same stream revision.
     *force* names none — see below.
     *interfaces* scopes an ``interface_config`` removal to the affected interface names.
     *removed* maps each YANG list to the keys the trigger JUST deleted so the
@@ -1963,6 +1967,7 @@ async def enqueue_removal(
             mode=mode,
             allowed_removal_keys=context.get("removed") or {},
             removal_context=context,
+            settlement_cohort=settlement_cohort,
         )
     job = Job(
         job_type=JobType.removal,
@@ -2047,9 +2052,12 @@ async def enqueue_static_route_removals(
     Returns the jobs in creation order, or ``[]`` on a store-only request (no device write,
     and no carrier was written either).
     """
+    from nso_adapter.core.generation import allocate_settlement_cohort
+
     present = [marking for marking in _MARKING_ORDER if removed.get(marking)]
     if not present and not retract:
         return []
+    settlement_cohort = await allocate_settlement_cohort(db) if len(present) > 1 else None
     jobs: dict = {}
     # A pure clear deletes nothing, so it carries no marking at all and is never a detach.
     for index, marking in enumerate(present or [None]):
@@ -2060,6 +2068,7 @@ async def enqueue_static_route_removals(
             marking=marking,
             defer_retract=DETACH_MARKING in present,
             promotes=promotes,
+            settlement_cohort=settlement_cohort,
             removed=removed_map("static_route", removed[marking]) if marking is not None else None,
             retract=retract and index == 0,
             shrank=marking is not None,

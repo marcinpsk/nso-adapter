@@ -407,6 +407,32 @@ async def test_settlement_never_regresses_applied_revision(adapter_client):
     assert (await _stream(device_id, "vlan")).applied_revision == 7
 
 
+async def test_an_unchanged_apply_settles_after_the_same_revision_was_abandoned(adapter_client):
+    """An abandoned deployment at revision 1 does not block a later Apply of revision 1."""
+    from nso_adapter.store.models import GenerationStatus, JobStatus
+
+    device_id = await _device("gen-abandoned-same-revision", 9713)
+    await _vlan(device_id, 41)
+    await _push(adapter_client, device_id)
+
+    assert await _finish(device_id, JobStatus.failed) is not None
+    abandon = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/abandon-generation",
+        headers=_AUTH,
+    )
+    assert abandon.status_code == 202
+
+    apply = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/apply", headers=_AUTH)
+    assert apply.status_code == 202
+    first, second = await _generations(device_id)
+    assert first.status is GenerationStatus.abandoned
+    assert first.stream_revisions == second.stream_revisions == {"vlan": 1}
+
+    assert await _finish(device_id, JobStatus.succeeded) == second.job_id
+    stream = await _stream(device_id, "vlan")
+    assert (stream.desired_revision, stream.authorized_revision, stream.applied_revision) == (1, 1, 1)
+
+
 # ── §H2: the success barrier ─────────────────────────────────────────────────
 
 
