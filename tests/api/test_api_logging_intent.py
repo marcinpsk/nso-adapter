@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -35,7 +35,7 @@ async def test_put_logging_intent_stores_rows(adapter_client):
             {"address": "10.0.0.2", "port": 6514, "vrf": "MGMT"},
         ]
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/logging-intent", json=body, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/logging-intent", json=body, headers=AUTH | push_seq())
     assert resp.status_code == 200
     assert resp.json()["count"] == 2
     assert await _count_intent(device_id) == 2
@@ -47,13 +47,13 @@ async def test_put_logging_intent_full_replace(adapter_client):
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent",
         json={"hosts": [{"address": "10.0.0.1"}, {"address": "10.0.0.2"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     # Second PUT with only one host → the other is deleted (full-replace).
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent",
         json={"hosts": [{"address": "10.0.0.2", "severity": "debugging"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     assert resp.json()["count"] == 1
@@ -66,16 +66,20 @@ async def test_put_logging_intent_clears_on_empty(adapter_client):
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent",
         json={"hosts": [{"address": "10.0.0.1"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/logging-intent", json={"hosts": []}, headers=AUTH)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/logging-intent", json={"hosts": []}, headers=AUTH | push_seq()
+    )
     assert resp.status_code == 200
     assert await _count_intent(device_id) == 0
 
 
 @pytest.mark.anyio
 async def test_put_logging_intent_unknown_device_404(adapter_client):
-    resp = await adapter_client.put("/api/v1/devices/9999/logging-intent", json={"hosts": []}, headers=AUTH)
+    resp = await adapter_client.put(
+        "/api/v1/devices/9999/logging-intent", json={"hosts": []}, headers=AUTH | push_seq()
+    )
     assert resp.status_code == 404
 
 
@@ -121,7 +125,7 @@ async def test_put_local_levels_upserts_singleton(adapter_client):
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent",
         json={"hosts": [], "local_levels": {"console_severity": "CRITICAL", "monitor_severity": "NOTICE"}},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     assert resp.json() == {"device_id": device_id, "count": 1, "removed": 0, "replaced": False}
@@ -141,12 +145,12 @@ async def test_put_omitted_local_levels_preserves_intent(adapter_client):
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent",
         json={"hosts": [], "local_levels": {"console_severity": "ERROR"}},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent",
         json={"hosts": [{"address": "10.0.0.8"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     row = await _levels_intent(device_id)
@@ -162,12 +166,12 @@ async def test_put_local_levels_null_deletes_and_retracts(adapter_client):
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent",
         json={"hosts": [], "local_levels": {"console_severity": "CRITICAL"}},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent",
         json={"hosts": [], "local_levels": None},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     assert resp.json() == {"device_id": device_id, "count": 0, "removed": 1, "replaced": True}
@@ -186,12 +190,12 @@ async def test_put_local_levels_cleared_severity_retracts(adapter_client):
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent",
         json={"hosts": [], "local_levels": {"console_severity": "CRITICAL", "monitor_severity": "NOTICE"}},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent",
         json={"hosts": [], "local_levels": {"console_severity": "CRITICAL"}},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     row = await _levels_intent(device_id)
@@ -203,8 +207,8 @@ async def test_put_local_levels_cleared_severity_retracts(adapter_client):
 async def test_put_local_levels_same_values_no_retract(adapter_client):
     device_id = await seed_device()
     body = {"hosts": [], "local_levels": {"console_severity": "CRITICAL"}}
-    await adapter_client.put(f"/api/v1/devices/{device_id}/logging-intent", json=body, headers=AUTH)
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/logging-intent", json=body, headers=AUTH)
+    await adapter_client.put(f"/api/v1/devices/{device_id}/logging-intent", json=body, headers=AUTH | push_seq())
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/logging-intent", json=body, headers=AUTH | push_seq())
     assert resp.status_code == 200
     assert await _logging_removal_jobs(device_id) == []
 
@@ -215,7 +219,7 @@ async def test_put_local_levels_invalid_severity_422(adapter_client):
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent",
         json={"hosts": [], "local_levels": {"console_severity": "verbose"}},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 422
     assert await _levels_intent(device_id) is None

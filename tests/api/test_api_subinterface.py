@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device, seed_subinterface, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, seed_subinterface, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -109,7 +109,9 @@ async def test_put_subinterface_intent_stores_and_full_replaces(adapter_client):
             },
         ]
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/subinterface-intent", json=body, headers=AUTH)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/subinterface-intent", json=body, headers=AUTH | push_seq()
+    )
     assert resp.status_code == 200 and resp.json()["count"] == 2
     assert await _count_subif_intent(device_id) == 2
     resp = await adapter_client.put(
@@ -124,7 +126,7 @@ async def test_put_subinterface_intent_stores_and_full_replaces(adapter_client):
                 }
             ]
         },
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.json()["count"] == 1
     assert await _count_subif_intent(device_id) == 1
@@ -132,5 +134,7 @@ async def test_put_subinterface_intent_stores_and_full_replaces(adapter_client):
 
 @pytest.mark.anyio
 async def test_put_subinterface_intent_unknown_device_404(adapter_client):
-    resp = await adapter_client.put("/api/v1/devices/999999/subinterface-intent", json={"interfaces": []}, headers=AUTH)
+    resp = await adapter_client.put(
+        "/api/v1/devices/999999/subinterface-intent", json={"interfaces": []}, headers=AUTH | push_seq()
+    )
     assert resp.status_code == 404

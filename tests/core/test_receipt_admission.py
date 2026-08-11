@@ -73,6 +73,19 @@ async def _receipt(device_id: int, stream: str):
         )
 
 
+async def _projection_stream(device_id: int, stream: str):
+    """The row ``note_write`` creates. Absent = the handler never ran, on ANY endpoint."""
+    from nso_adapter.store.models import DeviceProjectionStream
+
+    async with session() as db:
+        return await db.scalar(
+            sa.select(DeviceProjectionStream).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == stream,
+            )
+        )
+
+
 def _url(path: str, device_id: int) -> str:
     return path.replace("{device_id}", str(device_id))
 
@@ -188,15 +201,25 @@ async def test_every_in_protocol_endpoint_admits_replays_and_refuses(adapter_cli
 
 
 @pytest.mark.parametrize("path", sorted(MINIMAL_BODIES))
-async def test_an_unkeyed_delivery_stays_legal_and_writes_no_receipt(adapter_client, path):
+async def test_a_delivery_without_the_sequence_header_is_refused_with_no_effect(adapter_client, path):
+    """O3.2 — a header-less in-protocol PUT is a 422, not an unkeyed write.
+
+    An admitted-but-unkeyed mutation is unresolvable: it commits without a receipt, so a
+    lost response makes the plugin's retry a SECOND operation rather than a replay.
+    """
     from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS
 
     stream = INTENT_PUT_ENDPOINTS[path].stream
     device_id = await seed_device(nso_device_name=f"rcp-unkeyed-{stream}", netbox_device_id=None)
 
     resp = await adapter_client.put(_url(path, device_id), json=MINIMAL_BODIES[path], headers=AUTH)
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 422, resp.text
+    envelope = resp.json()["error"]
+    assert envelope["code"] == "validation_error"
+    assert any(error["loc"][-1] == "X-Push-Seq" for error in envelope["detail"]["errors"]), envelope
+
     assert await _receipt(device_id, stream) is None
+    assert await _projection_stream(device_id, stream) is None, f"{path} mutated on a refused delivery"
 
 
 # ── item 8: the mode is part of the receipt identity ──────────────────────────
@@ -450,6 +473,7 @@ def test_o2b_7_every_in_protocol_intent_put_declares_the_push_sequence_header():
         declared = _push_seq_parameters(schema, path)
         assert len(declared) == 1, f"{path} does not declare X-Push-Seq"
         assert declared[0]["in"] == "header"
+        assert declared[0]["required"] is True, f"{path} declares X-Push-Seq as optional"
 
 
 def test_o2b_7_the_out_of_protocol_puts_declare_no_push_sequence_header():

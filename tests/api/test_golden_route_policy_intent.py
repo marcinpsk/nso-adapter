@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -68,7 +68,7 @@ async def test_route_policy_intent_put_golden(adapter_client, monkeypatch):
     ]
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "objects": [
                 {"family": "community_list", "name": "CL-1", "entries": cl_entries, "accepted": True},
@@ -141,7 +141,7 @@ async def test_route_policy_intent_put_preserves_structured_apply_error(adapter_
     # last_apply_error dict is untouched by the upsert and flows into the response.
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"objects": [{"family": "route_map", "name": "RM-FAIL", "entries": entries, "accepted": True}]},
     )
     assert resp.status_code == 200, resp.text
@@ -175,7 +175,7 @@ async def test_route_policy_intent_put_golden_unaccepted(adapter_client, monkeyp
 
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"objects": [{"family": "as_path", "name": "AP-1", "entries": [], "accepted": False}]},
     )
     assert resp.status_code == 200, resp.text

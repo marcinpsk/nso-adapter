@@ -21,7 +21,7 @@ import httpx
 import pytest
 import sqlalchemy as sa
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 pytestmark = pytest.mark.anyio
 
@@ -154,9 +154,7 @@ async def put_vlans(
     """One real VLAN intent push. *accepted* pins a vid's ``accepted_at`` so a re-push can
     leave that row byte-identical — the plugin sends the stamp it holds, and a row whose
     authorization did not move is not a new intent."""
-    headers = dict(AUTH)
-    if seq is not None:
-        headers["X-Push-Seq"] = str(seq)
+    headers = AUTH | push_seq(seq)
     names = names or {}
     accepted = accepted or {}
     entries = []
@@ -170,7 +168,7 @@ async def put_vlans(
 
 async def put_snmp(client, device_id: int, labels, *, query: str = ""):
     body = {"communities": [{"label": label, "vault_ref": f"kv/snmp#{label}", "access": "ro"} for label in labels]}
-    return await client.put(f"/api/v1/devices/{device_id}/snmp-intent{query}", json=body, headers=AUTH)
+    return await client.put(f"/api/v1/devices/{device_id}/snmp-intent{query}", json=body, headers=AUTH | push_seq())
 
 
 # The four pushes that exercise the two SHARED document families: two endpoint streams each
@@ -184,24 +182,28 @@ async def put_interface_attrs(client, device_id: int, descriptions: dict[str, st
             for name, value in descriptions.items()
         ]
     }
-    return await client.put(f"/api/v1/devices/{device_id}/intent{query}", json=body, headers=AUTH)
+    return await client.put(f"/api/v1/devices/{device_id}/intent{query}", json=body, headers=AUTH | push_seq())
 
 
 async def put_ips(client, device_id: int, addresses: dict[str, str], *, query: str = ""):
     body = {
         "addresses": [{"interface": name, "address": address, "family": "ipv4"} for name, address in addresses.items()]
     }
-    return await client.put(f"/api/v1/devices/{device_id}/ip-intent{query}", json=body, headers=AUTH)
+    return await client.put(f"/api/v1/devices/{device_id}/ip-intent{query}", json=body, headers=AUTH | push_seq())
 
 
 async def put_isis_interfaces(client, device_id: int, names, *, query: str = ""):
     body = {"interfaces": [{"interface_name": name, "af": "ipv4"} for name in names]}
-    return await client.put(f"/api/v1/devices/{device_id}/isis-interface-intent{query}", json=body, headers=AUTH)
+    return await client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent{query}", json=body, headers=AUTH | push_seq()
+    )
 
 
 async def put_isis_flex_algos(client, device_id: int, algo_ids, *, query: str = ""):
     body = {"flex_algos": [{"process_tag": "", "algo_id": algo_id} for algo_id in algo_ids]}
-    return await client.put(f"/api/v1/devices/{device_id}/isis-flex-algo-intent{query}", json=body, headers=AUTH)
+    return await client.put(
+        f"/api/v1/devices/{device_id}/isis-flex-algo-intent{query}", json=body, headers=AUTH | push_seq()
+    )
 
 
 async def generations(device_id: int) -> list:

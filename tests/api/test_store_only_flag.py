@@ -20,7 +20,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -94,12 +94,12 @@ async def test_logging_shrink_without_flag_enqueues_removal(adapter_client):
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent",
         json={"hosts": [{"address": "10.9.0.1"}, {"address": "10.9.0.2"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent",
         json={"hosts": [{"address": "10.9.0.2"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     assert resp.json()["replaced"] is True
@@ -115,12 +115,12 @@ async def test_logging_shrink_store_only_skips_removal_but_updates_store(adapter
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent",
         json={"hosts": [{"address": "10.9.1.1"}, {"address": "10.9.1.2"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent?store_only=true",
         json={"hosts": [{"address": "10.9.1.2"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -137,12 +137,12 @@ async def test_logging_clear_store_only_skips_removal(adapter_client):
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent",
         json={"hosts": [{"address": "10.9.2.1"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent?store_only=true",
         json={"hosts": []},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     assert await _logging_rows(device_id) == []
@@ -157,12 +157,12 @@ async def test_snmp_shrink_store_only_skips_direct_removal(adapter_client):
     from nso_adapter.store.models import SnmpCommunityIntent
 
     device_id = await seed_device(nso_device_name="so-snmp-dev", netbox_device_id=983)
-    await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_snmp_body(), headers=AUTH)
+    await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_snmp_body(), headers=AUTH | push_seq())
 
     trimmed = _snmp_body()
     trimmed["communities"] = [trimmed["communities"][0]]  # drop rw1
     resp = await adapter_client.put(
-        f"/api/v1/devices/{device_id}/snmp-intent?store_only=true", json=trimmed, headers=AUTH
+        f"/api/v1/devices/{device_id}/snmp-intent?store_only=true", json=trimmed, headers=AUTH | push_seq()
     )
     assert resp.status_code == 200
 
@@ -205,13 +205,13 @@ async def test_flex_algo_shrink_store_only_does_not_touch_the_device(adapter_cli
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-flex-algo-intent",
         json={"flex_algos": [{"process_tag": "1", "algo_id": 128}, {"process_tag": "1", "algo_id": 129}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
 
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-flex-algo-intent?store_only=true",
         json={"flex_algos": [{"process_tag": "1", "algo_id": 129}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     assert resp.json()["flex_algo_count"] == 1
@@ -232,7 +232,7 @@ async def test_store_only_skips_auto_apply(adapter_client):
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent?store_only=true",
         json={"hosts": [{"address": "10.9.3.1"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     assert await _logging_rows(device_id) == ["10.9.3.1"]
@@ -274,12 +274,12 @@ async def test_store_only_false_behaves_like_absent(adapter_client):
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent",
         json={"hosts": [{"address": "10.9.4.1"}, {"address": "10.9.4.2"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/logging-intent?store_only=false",
         json={"hosts": [{"address": "10.9.4.2"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     assert len(await _jobs(device_id, JobType.removal)) == 1

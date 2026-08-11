@@ -27,7 +27,7 @@ from tests.api.test_static_route_identity import (
     read_tombstones,
     seed_intent,
 )
-from tests.conftest import seed_device, session
+from tests.conftest import push_seq, seed_device, session
 
 pytestmark = pytest.mark.anyio
 
@@ -54,9 +54,7 @@ async def put(
     body: dict = {"routes": routes}
     if deleted_routes is not None:
         body["deleted_routes"] = deleted_routes
-    headers = dict(AUTH)
-    if seq is not None:
-        headers["X-Push-Seq"] = str(seq)
+    headers = AUTH | push_seq(seq)
     return await client.put(
         f"/api/v1/devices/{device_id}/static-route-intent{query}",
         json=body,

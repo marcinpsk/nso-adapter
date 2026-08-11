@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -33,7 +33,7 @@ async def _seed_settings(device_id: int, *, auto_apply: bool):
 @pytest.mark.anyio
 async def test_put_isis_intent_device_not_found(adapter_client):
     resp = await adapter_client.put(
-        "/api/v1/devices/99999/isis-interface-intent", headers=AUTH, json={"interfaces": []}
+        "/api/v1/devices/99999/isis-interface-intent", headers=AUTH | push_seq(), json={"interfaces": []}
     )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "not_found"
@@ -51,7 +51,9 @@ async def test_put_isis_intent_creates_interfaces_and_processes(adapter_client):
         ],
         "processes": [{"process_tag": "1", "net": "49.0001.0000.0000.0001.00", "is_type": "level-2"}],
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/isis-interface-intent", headers=AUTH, json=body)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent", headers=AUTH | push_seq(), json=body
+    )
     assert resp.status_code == 200
     assert resp.json() == {"device_id": device_id, "interface_count": 2, "process_count": 1}
 
@@ -79,7 +81,7 @@ async def test_put_isis_intent_full_replace_and_update(adapter_client):
     device_id = await seed_device(nso_device_name="isis-replace", netbox_device_id=981)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "interfaces": [
                 {"interface_name": "Gi0/0", "af": "ipv4", "metric": 10},
@@ -91,7 +93,7 @@ async def test_put_isis_intent_full_replace_and_update(adapter_client):
     # Keep Gi0/0 (changed metric) + process 1 (changed is_type); drop Gi0/1 + process 2.
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "metric": 99}],
             "processes": [{"process_tag": "1", "is_type": "level-2"}],
@@ -137,7 +139,7 @@ async def test_clearing_owned_scalar_enqueues_isis_removal(adapter_client):
     # Own an interface with metric 10 (accepted, applied).
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"interfaces": [{"interface_name": "system", "af": "ipv4", "metric": 10, "passive": True}]},
     )
     assert await _isis_removal_jobs(device_id) == []  # the initial add is not a retraction
@@ -145,7 +147,7 @@ async def test_clearing_owned_scalar_enqueues_isis_removal(adapter_client):
     # Clear the metric (omitted → None) while keeping the interface owned.
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"interfaces": [{"interface_name": "system", "af": "ipv4", "passive": True}]},
     )
     assert resp.status_code == 200
@@ -159,7 +161,7 @@ async def test_deleting_owned_interface_enqueues_isis_removal(adapter_client):
     device_id = await seed_device(nso_device_name="isis-del", netbox_device_id=988)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "interfaces": [
                 {"interface_name": "system", "af": "ipv4", "metric": 10, "passive": True},
@@ -170,7 +172,7 @@ async def test_deleting_owned_interface_enqueues_isis_removal(adapter_client):
     # Drop lag1.
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"interfaces": [{"interface_name": "system", "af": "ipv4", "metric": 10, "passive": True}]},
     )
     assert len(await _isis_removal_jobs(device_id)) == 1
@@ -184,7 +186,7 @@ async def test_deleting_rows_threads_removed_keys_into_removal_context(adapter_c
     device_id = await seed_device(nso_device_name="isis-ctx", netbox_device_id=990)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "interfaces": [
                 {"interface_name": "system", "af": "ipv4", "passive": True},
@@ -194,7 +196,7 @@ async def test_deleting_rows_threads_removed_keys_into_removal_context(adapter_c
     )
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"interfaces": [{"interface_name": "system", "af": "ipv4", "passive": True}]},
     )
     (job,) = await _isis_removal_jobs(device_id)
@@ -210,13 +212,13 @@ async def test_pure_add_or_widen_does_not_enqueue_isis_removal(adapter_client):
     device_id = await seed_device(nso_device_name="isis-add", netbox_device_id=989)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"interfaces": [{"interface_name": "system", "af": "ipv4", "passive": True}]},
     )
     # Set the metric from blank → 20 (widen) and add a new interface — both additive.
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "interfaces": [
                 {"interface_name": "system", "af": "ipv4", "metric": 20, "passive": True},
@@ -237,7 +239,7 @@ async def test_put_isis_intent_levels_create_and_full_replace(adapter_client):
     device_id = await seed_device(nso_device_name="isis-levels", netbox_device_id=982)
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "interfaces": [],
             "processes": [
@@ -255,7 +257,7 @@ async def test_put_isis_intent_levels_create_and_full_replace(adapter_client):
 
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "interfaces": [],
             "processes": [{"process_tag": "", "levels": [{"level": 2, "labeled_preference": 9}]}],
@@ -284,7 +286,7 @@ async def test_put_isis_intent_redistribution_create_and_replace(adapter_client)
 
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json=_body(
             [
                 {
@@ -300,7 +302,7 @@ async def test_put_isis_intent_redistribution_create_and_replace(adapter_client)
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json=_body([{"source_protocol": "bgp", "source_ref": "65001", "route_map": "RM-B", "metric": 50}]),
     )
     assert resp.status_code == 200
@@ -325,7 +327,7 @@ async def test_put_isis_intent_auto_apply_enqueues_job(adapter_client):
 
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4"}], "processes": []},
     )
     assert resp.status_code == 200
@@ -343,7 +345,7 @@ async def test_put_isis_intent_auto_apply_enqueues_job(adapter_client):
 @pytest.mark.anyio
 async def test_put_flex_algo_device_not_found(adapter_client):
     resp = await adapter_client.put(
-        "/api/v1/devices/99999/isis-flex-algo-intent", headers=AUTH, json={"flex_algos": []}
+        "/api/v1/devices/99999/isis-flex-algo-intent", headers=AUTH | push_seq(), json={"flex_algos": []}
     )
     assert resp.status_code == 404
 
@@ -355,7 +357,7 @@ async def test_put_flex_algo_creates_and_updates_in_place(adapter_client):
     device_id = await seed_device(nso_device_name="isis-flex", netbox_device_id=984)
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-flex-algo-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"flex_algos": [{"process_tag": "1", "algo_id": 128, "priority": 100, "metric_type": "delay"}]},
     )
     assert resp.status_code == 200
@@ -364,7 +366,7 @@ async def test_put_flex_algo_creates_and_updates_in_place(adapter_client):
     # Re-PUT same (process_tag, algo_id) with a changed priority → updated in place.
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-flex-algo-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"flex_algos": [{"process_tag": "1", "algo_id": 128, "priority": 200, "metric_type": "delay"}]},
     )
     assert resp.status_code == 200
@@ -388,7 +390,7 @@ async def test_put_flex_algo_auto_apply_enqueues_job(adapter_client):
 
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-flex-algo-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"flex_algos": [{"process_tag": "1", "algo_id": 128}]},
     )
     assert resp.status_code == 200
@@ -419,14 +421,14 @@ async def test_put_flex_algo_removal_queues_the_guarded_removal_job(adapter_clie
     device_id = await seed_device(nso_device_name="isis-flex-removal", netbox_device_id=986)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-flex-algo-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"flex_algos": [{"process_tag": "1", "algo_id": 128}]},
     )
 
     # PUT an empty set → the seeded flex-algo is removed → the removal job is queued.
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-flex-algo-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"flex_algos": []},
     )
     assert resp.status_code == 200
@@ -456,12 +458,12 @@ async def test_put_flex_algo_unmarked_shrink_detaches(adapter_client):
     device_id = await seed_device(nso_device_name="isis-flex-detach", netbox_device_id=987)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-flex-algo-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"flex_algos": [{"process_tag": "1", "algo_id": 128}]},
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-flex-algo-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"flex_algos": []},
     )
     assert resp.status_code == 200
@@ -481,12 +483,12 @@ async def test_put_flex_algo_delete_origin_shrink_retracts(adapter_client):
     device_id = await seed_device(nso_device_name="isis-flex-del", netbox_device_id=988)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-flex-algo-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"flex_algos": [{"process_tag": "1", "algo_id": 128}]},
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-flex-algo-intent?delete_origin=true",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"flex_algos": []},
     )
     assert resp.status_code == 200
@@ -505,7 +507,7 @@ async def test_put_isis_intent_stores_bfd_enabled(adapter_client):
     device_id = await seed_device(nso_device_name="isis-bfd", netbox_device_id=990)
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "bfd_enabled": True, "passive": False}]},
     )
     assert resp.status_code == 200
@@ -525,13 +527,13 @@ async def test_clearing_bfd_enabled_enqueues_isis_removal(adapter_client):
     device_id = await seed_device(nso_device_name="isis-bfd-clear", netbox_device_id=991)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "bfd_enabled": True, "passive": False}]},
     )
     assert await _isis_removal_jobs(device_id) == []  # the initial enable is not a retraction
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False}]},  # bfd_enabled omitted
     )
     assert resp.status_code == 200
@@ -555,12 +557,12 @@ async def test_clearing_an_owned_scalar_retracts_for_real(adapter_client):
     device_id = await seed_device(nso_device_name="isis-clear-retract", netbox_device_id=994)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False, "metric": 10}]},
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False}]},  # metric cleared
     )
     assert resp.status_code == 200
@@ -578,7 +580,7 @@ async def test_unmarked_row_removal_still_detaches(adapter_client):
     device_id = await seed_device(nso_device_name="isis-unown-detach", netbox_device_id=995)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "interfaces": [
                 {"interface_name": "Gi0/0", "af": "ipv4", "passive": False, "metric": 10},
@@ -588,7 +590,7 @@ async def test_unmarked_row_removal_still_detaches(adapter_client):
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False, "metric": 10}]},
     )
     assert resp.status_code == 200
@@ -608,7 +610,7 @@ async def test_unown_riding_along_with_a_clear_defers_the_retract(adapter_client
     device_id = await seed_device(nso_device_name="isis-mixed", netbox_device_id=996)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "interfaces": [
                 {"interface_name": "Gi0/0", "af": "ipv4", "passive": False, "metric": 10},
@@ -618,7 +620,7 @@ async def test_unown_riding_along_with_a_clear_defers_the_retract(adapter_client
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         # Gi0/1 un-owned AND Gi0/0's metric cleared, in the same push
         json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False}]},
     )
@@ -636,12 +638,12 @@ async def test_clearing_a_scalar_under_store_only_touches_nothing(adapter_client
     device_id = await seed_device(nso_device_name="isis-clear-so", netbox_device_id=997)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False, "metric": 10}]},
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent?store_only=true",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False}]},
     )
     assert resp.status_code == 200
@@ -657,7 +659,7 @@ async def test_put_isis_intent_stores_frr(adapter_client):
     device_id = await seed_device(nso_device_name="isis-frr-int", netbox_device_id=992)
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "interfaces": [
                 {
@@ -696,13 +698,13 @@ async def test_clearing_frr_enabled_enqueues_isis_removal(adapter_client):
     device_id = await seed_device(nso_device_name="isis-frr-clear", netbox_device_id=993)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False, "frr_enabled": True}]},
     )
     assert await _isis_removal_jobs(device_id) == []
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/isis-interface-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "passive": False}]},
     )
     assert resp.status_code == 200

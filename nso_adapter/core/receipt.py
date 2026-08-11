@@ -31,10 +31,11 @@ The receipt is written in the SAME transaction as the mutation it admits. A rece
 outlived a rolled-back operation would turn the plugin's retry into a silent no-op, which is
 the one outcome worse than a double apply.
 
-Absence of the header is NOT an error here: the ratified #1503 contract keeps lacp and
-switchport out of the protocol as claim-less direct-apply deliveries, so an unkeyed write is
-admitted and simply gets no receipt. A malformed or out-of-domain header IS an error, and
-the API boundary rejects it before any of this runs (:mod:`core.request_flags`).
+Every in-protocol delivery is keyed: the header is REQUIRED on all sixteen PUTs, so a missing,
+malformed or out-of-domain value is a 422 at the API boundary and nothing here ever sees an
+unkeyed one (:mod:`api.intent_push`). The ratified #1503 contract keeps lacp and switchport
+out of the protocol as claim-less direct-apply deliveries — they are POSTs, they never reach
+admission, and they need no representation in these types.
 """
 
 from __future__ import annotations
@@ -90,7 +91,8 @@ class IntentDelivery:
     """One intent PUT as the protocol sees it (see :mod:`core.intent_protocol`).
 
     *stream* is the receipt key AND the promotion unit — the endpoint's lane and the intent
-    tables it owns. *identity* is ``None`` for a claim-less, out-of-protocol delivery.
+    tables it owns. *identity* is not optional: an in-protocol delivery without a claim is
+    refused at the boundary, so there is no unkeyed shape to represent.
 
     The document family the lane composes into is not carried: nothing a request does needs
     it. It is declared on :class:`core.intent_protocol.IntentEndpoint`, where
@@ -98,12 +100,12 @@ class IntentDelivery:
     """
 
     stream: str
-    identity: PushIdentity | None
+    identity: PushIdentity
 
     @property
-    def push_seq(self) -> int | None:
-        """The claim sequence this delivery carries, or ``None`` when it is claim-less."""
-        return self.identity.seq if self.identity is not None else None
+    def push_seq(self) -> int:
+        """The claim sequence this delivery carries."""
+        return self.identity.seq
 
 
 def digest_body(body: object) -> str:
@@ -142,9 +144,9 @@ def _mode(carrier) -> tuple[bool, bool, bool]:
 async def admit_push(db: AsyncSession, device_id: int, delivery: IntentDelivery) -> tuple[dict | None, int] | None:
     """Admit one keyed push. Returns the stored ``(response, status)`` on a replay.
 
-    ``None`` means "do the work": either the push is unkeyed, or this sequence is new. The
-    caller must already hold the device's projection lock, so two concurrent deliveries of
-    the same sequence cannot both read "no receipt" and both proceed.
+    ``None`` means "do the work": this sequence is new. The caller must already hold the
+    device's projection lock, so two concurrent deliveries of the same sequence cannot both
+    read "no receipt" and both proceed.
 
     Raises :class:`PushSequenceConflict` for a reused sequence or a stale one.
     """
@@ -152,8 +154,6 @@ async def admit_push(db: AsyncSession, device_id: int, delivery: IntentDelivery)
     if stream not in INTENT_STREAMS:
         raise RuntimeError(f"{stream!r} is not an in-protocol intent stream")
     identity = delivery.identity
-    if identity is None:
-        return None
     receipt = await latest_receipt(db, device_id, stream)
     if receipt is None:
         db.add(
@@ -224,10 +224,7 @@ async def record_response(
     from nso_adapter.core.generation import consume_last_enqueued_generation_id
 
     identity = delivery.identity
-    # Consumed even on an unkeyed delivery, so it cannot outlive the request that enqueued it.
     enqueued_generation_id = consume_last_enqueued_generation_id()
-    if identity is None:
-        return
     receipt = await latest_receipt(db, device_id, delivery.stream)
     if receipt is None or receipt.push_seq != identity.seq:  # pragma: no cover — admit_push just wrote it
         raise RuntimeError(f"no admitted receipt for device {device_id} stream {delivery.stream!r} seq {identity.seq}")

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, push_seq, seed_device
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -37,7 +37,7 @@ CASES = [
 @pytest.mark.parametrize("suffix,body", CASES)
 async def test_intent_apply_result_golden(adapter_client, suffix, body):
     device_id = await seed_device(nso_device_name=f"wr-{suffix}", netbox_device_id=8000)
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/{suffix}", json=body, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/{suffix}", json=body, headers=AUTH | push_seq())
     assert resp.status_code == 200
     assert resp.json() == {"device_id": device_id, "count": 1, "removed": 0, "replaced": False}
 
@@ -54,7 +54,9 @@ async def test_static_route_intent_result_golden(adapter_client):
     """
     device_id = await seed_device(nso_device_name="wr-static-route-intent", netbox_device_id=8001)
     body = {"routes": [{"route_id": 41, "generation": 7, "prefix": "10.0.0.0/8", "next_hop": "192.0.2.1"}]}
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/static-route-intent", json=body, headers=AUTH)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/static-route-intent", json=body, headers=AUTH | push_seq()
+    )
     assert resp.status_code == 200
     payload = resp.json()
     assert set(payload) == {

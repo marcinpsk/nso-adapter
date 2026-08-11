@@ -20,7 +20,7 @@ import pytest
 from pydantic import BaseModel, field_validator
 
 from nso_adapter.api.errors import ERROR_CODES, ErrorCode, api_error
-from tests.conftest import VALID_TOKEN
+from tests.conftest import VALID_TOKEN, push_seq
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -61,7 +61,7 @@ async def test_validation_error_with_non_primitive_ctx(adapter_client):
                 {"name": "public", "vault_ref": "not-a-valid-triple"},
             ]
         },
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 422, resp.text
     err = resp.json()["error"]

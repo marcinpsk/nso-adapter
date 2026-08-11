@@ -26,7 +26,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -105,11 +105,11 @@ _CASES = [
 async def test_clearing_an_owned_scalar_retracts_for_real(adapter_client, scope, url, body_set, body_cleared):
     device_id = await seed_device(nso_device_name=f"clr-{scope}", netbox_device_id=abs(hash(scope)) % 10000)
 
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/{url}", json=body_set, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/{url}", json=body_set, headers=AUTH | push_seq())
     assert resp.status_code == 200
     assert await _removal_jobs(device_id, scope) == []  # setting a value is not a retraction
 
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/{url}", json=body_cleared, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/{url}", json=body_cleared, headers=AUTH | push_seq())
     assert resp.status_code == 200
 
     jobs = await _removal_jobs(device_id, scope)
@@ -126,9 +126,9 @@ async def test_clearing_an_owned_scalar_under_store_only_touches_nothing(
     """The store-only re-sync re-pushes every scope and promises not to touch the device."""
     device_id = await seed_device(nso_device_name=f"clrso-{scope}", netbox_device_id=abs(hash(scope)) % 10000 + 1)
 
-    await adapter_client.put(f"/api/v1/devices/{device_id}/{url}", json=body_set, headers=AUTH)
+    await adapter_client.put(f"/api/v1/devices/{device_id}/{url}", json=body_set, headers=AUTH | push_seq())
     resp = await adapter_client.put(
-        f"/api/v1/devices/{device_id}/{url}?store_only=true", json=body_cleared, headers=AUTH
+        f"/api/v1/devices/{device_id}/{url}?store_only=true", json=body_cleared, headers=AUTH | push_seq()
     )
     assert resp.status_code == 200
     assert await _removal_jobs(device_id, scope) == []
@@ -142,12 +142,12 @@ async def test_setting_a_value_from_blank_is_not_a_retraction(adapter_client):
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/interface-mtu-intent",
         json={"interfaces": [{"interface_name": "Gi0/0"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/interface-mtu-intent",
         json={"interfaces": [{"interface_name": "Gi0/0", "mtu": 9000}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert await _removal_jobs(device_id, "interface_mtu") == []
 
@@ -173,14 +173,14 @@ async def test_toggling_a_boolean_off_IS_a_retraction_for_static_routes(adapter_
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/static-route-intent",
         json={"routes": [{**route, "permanent": True}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert await _removal_jobs(device_id, "static_route") == []
 
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/static-route-intent",
         json={"routes": [{**route, "permanent": False}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     jobs = await _removal_jobs(device_id, "static_route")
     assert len(jobs) == 1

@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -49,7 +49,7 @@ async def test_put_bgp_intent_device_not_found(adapter_client):
     resp = await adapter_client.put(
         "/api/v1/devices/99999/bgp-intent",
         json={"routers": [MINIMAL_ROUTER]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 404
 
@@ -64,7 +64,7 @@ async def test_put_bgp_intent_happy_path(adapter_client):
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/bgp-intent",
         json={"routers": [MINIMAL_ROUTER]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -87,7 +87,7 @@ async def test_put_bgp_intent_persists_rows(adapter_client):
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/bgp-intent",
         json={"routers": [MINIMAL_ROUTER]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
 
@@ -120,7 +120,7 @@ async def test_put_bgp_intent_persists_router_id(adapter_client):
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/bgp-intent",
         json={"routers": [{**MINIMAL_ROUTER, "router_id": "10.255.0.1"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
 
@@ -138,7 +138,7 @@ async def test_put_bgp_intent_router_id_defaults_none(adapter_client):
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/bgp-intent",
         json={"routers": [MINIMAL_ROUTER]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
 
@@ -157,13 +157,13 @@ async def test_put_bgp_intent_full_replace(adapter_client):
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/bgp-intent",
         json={"routers": [MINIMAL_ROUTER, {**MINIMAL_ROUTER, "asn": "65200"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
 
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/bgp-intent",
         json={"routers": [{**MINIMAL_ROUTER, "asn": "65300"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     assert resp.json()["router_count"] == 1
@@ -186,12 +186,12 @@ async def test_put_bgp_intent_empty_routers_clears_intent(adapter_client):
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/bgp-intent",
         json={"routers": [MINIMAL_ROUTER]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/bgp-intent",
         json={"routers": []},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     assert resp.json()["router_count"] == 0
@@ -229,7 +229,7 @@ async def test_put_bgp_intent_with_password(adapter_client):
             }
         ]
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/bgp-intent", json=payload, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/bgp-intent", json=payload, headers=AUTH | push_seq())
     assert resp.status_code == 200
 
     async with session() as db:
@@ -269,7 +269,7 @@ async def test_put_bgp_intent_with_source(adapter_client):
             }
         ]
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/bgp-intent", json=payload, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/bgp-intent", json=payload, headers=AUTH | push_seq())
     assert resp.status_code == 200
 
     async with session() as db:
@@ -295,7 +295,7 @@ async def test_put_bgp_intent_auto_apply_enqueues_job(adapter_client):
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/bgp-intent",
         json={"routers": [MINIMAL_ROUTER]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
 
@@ -322,7 +322,7 @@ async def test_put_bgp_intent_no_auto_apply_when_disabled(adapter_client):
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/bgp-intent",
         json={"routers": [MINIMAL_ROUTER]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
 
@@ -365,7 +365,7 @@ async def test_put_bgp_intent_creates_redistribution_rows(adapter_client):
             )
         ]
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/bgp-intent", json=body, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/bgp-intent", json=body, headers=AUTH | push_seq())
     assert resp.status_code == 200
 
     async with session() as db:
@@ -399,7 +399,7 @@ async def test_put_bgp_intent_redistribution_full_replace_and_update(adapter_cli
                 )
             ]
         },
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
 
     # Re-PUT keeping ospf (changed route_map/metric), dropping static.
@@ -412,7 +412,7 @@ async def test_put_bgp_intent_redistribution_full_replace_and_update(adapter_cli
                 )
             ]
         },
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
 
@@ -440,14 +440,14 @@ async def test_put_bgp_intent_redistribution_removal_enqueues_removal_job(adapte
                 _router_with_redist([{"source_protocol": "ospf", "source_ref": "1", "route_map": None, "metric": None}])
             ]
         },
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
 
     # Same router/scope/AF, but the redistribution entry is gone → removal propagation.
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/bgp-intent",
         json={"routers": [_router_with_redist([])]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
 
@@ -567,7 +567,7 @@ async def test_clearing_an_owned_peer_scalar_queues_a_retract(adapter_client, fi
 
     peer = {"peer_address": "192.0.2.1", "address_families": [{"af": "ipv4-unicast"}], field: value}
     resp = await adapter_client.put(
-        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(peer)]}, headers=AUTH
+        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(peer)]}, headers=AUTH | push_seq()
     )
     assert resp.status_code == 200
     assert await _removal_job(device_id) is None, "the initial push adds intent — nothing to retract"
@@ -575,7 +575,9 @@ async def test_clearing_an_owned_peer_scalar_queues_a_retract(adapter_client, fi
     # Same peer, same identity — the operator just blanked the value.
     cleared_peer = {"peer_address": "192.0.2.1", "address_families": [{"af": "ipv4-unicast"}]}
     resp = await adapter_client.put(
-        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(cleared_peer)]}, headers=AUTH
+        f"/api/v1/devices/{device_id}/bgp-intent",
+        json={"routers": [_peer_router(cleared_peer)]},
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
 
@@ -599,7 +601,7 @@ async def test_removing_a_route_map_from_a_neighbour_queues_a_retract(adapter_cl
         "address_families": [{"af": "ipv4-unicast", "routemap_in": "RM-IN", "routemap_out": "RM-OUT"}],
     }
     await adapter_client.put(
-        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(with_rm)]}, headers=AUTH
+        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(with_rm)]}, headers=AUTH | push_seq()
     )
     assert await _removal_job(device_id) is None
 
@@ -609,7 +611,9 @@ async def test_removing_a_route_map_from_a_neighbour_queues_a_retract(adapter_cl
         "address_families": [{"af": "ipv4-unicast"}],
     }
     resp = await adapter_client.put(
-        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(without_rm)]}, headers=AUTH
+        f"/api/v1/devices/{device_id}/bgp-intent",
+        json={"routers": [_peer_router(without_rm)]},
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
 
@@ -630,13 +634,13 @@ async def test_dropping_an_address_family_from_a_surviving_peer_queues_a_retract
         "address_families": [{"af": "ipv4-unicast"}, {"af": "ipv6-unicast"}],
     }
     await adapter_client.put(
-        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(both)]}, headers=AUTH
+        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(both)]}, headers=AUTH | push_seq()
     )
     assert await _removal_job(device_id) is None
 
     one = {"peer_address": "192.0.2.1", "remote_as": "65200", "address_families": [{"af": "ipv4-unicast"}]}
     resp = await adapter_client.put(
-        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(one)]}, headers=AUTH
+        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(one)]}, headers=AUTH | push_seq()
     )
     assert resp.status_code == 200
     assert await _removal_job(device_id) is not None, "a dropped address-family must queue a removal"
@@ -650,11 +654,13 @@ async def test_clearing_a_router_id_queues_a_retract(adapter_client):
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/bgp-intent",
         json={"routers": [{**router, "router_id": "10.0.0.1"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert await _removal_job(device_id) is None
 
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [router]}, headers=AUTH)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [router]}, headers=AUTH | push_seq()
+    )
     assert resp.status_code == 200
     assert await _removal_job(device_id) is not None, "clearing router_id must queue a removal"
 
@@ -668,7 +674,7 @@ async def test_an_unchanged_republish_queues_nothing(adapter_client):
     peer = {"peer_address": "192.0.2.1", "remote_as": "65200", "address_families": [{"af": "ipv4-unicast"}]}
     for _ in range(2):
         resp = await adapter_client.put(
-            f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(peer)]}, headers=AUTH
+            f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(peer)]}, headers=AUTH | push_seq()
         )
         assert resp.status_code == 200
     assert await _removal_job(device_id) is None
@@ -681,11 +687,11 @@ async def test_setting_a_scalar_that_was_unset_queues_nothing(adapter_client):
 
     bare = {"peer_address": "192.0.2.1", "address_families": [{"af": "ipv4-unicast"}]}
     await adapter_client.put(
-        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(bare)]}, headers=AUTH
+        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(bare)]}, headers=AUTH | push_seq()
     )
     grown = {**bare, "remote_as": "65200", "ttl": 2}
     resp = await adapter_client.put(
-        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(grown)]}, headers=AUTH
+        f"/api/v1/devices/{device_id}/bgp-intent", json={"routers": [_peer_router(grown)]}, headers=AUTH | push_seq()
     )
     assert resp.status_code == 200
     assert await _removal_job(device_id) is None

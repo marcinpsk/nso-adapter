@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 import pytest
 
 from nso_adapter.api.timestamps import iso_z
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -96,7 +96,7 @@ async def test_put_intent_result_golden(adapter_client, monkeypatch):
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
         json={"attributes": [{"interface": "GigabitEthernet0/0", "attribute": "description", "intent_value": "x"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     assert resp.json() == {"device_id": device_id, "attribute_count": 1, "updated_at": FROZEN_Z}

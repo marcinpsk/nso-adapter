@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -45,7 +45,9 @@ async def _read_intent(device_id: int):
 
 @pytest.mark.anyio
 async def test_put_route_policy_intent_device_not_found(adapter_client):
-    resp = await adapter_client.put("/api/v1/devices/99999/route-policy-intent", headers=AUTH, json={"objects": []})
+    resp = await adapter_client.put(
+        "/api/v1/devices/99999/route-policy-intent", headers=AUTH | push_seq(), json={"objects": []}
+    )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "not_found"
 
@@ -54,7 +56,7 @@ async def test_put_route_policy_intent_device_not_found(adapter_client):
 async def test_put_route_policy_intent_requires_objects_list(adapter_client):
     device_id = await seed_device(nso_device_name="rp-noobj", netbox_device_id=7950)
     resp = await adapter_client.put(
-        f"/api/v1/devices/{device_id}/route-policy-intent", headers=AUTH, json={"not_objects": 1}
+        f"/api/v1/devices/{device_id}/route-policy-intent", headers=AUTH | push_seq(), json={"not_objects": 1}
     )
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "invalid_payload"
@@ -65,7 +67,7 @@ async def test_put_route_policy_intent_rejects_unknown_family(adapter_client):
     device_id = await seed_device(nso_device_name="rp-badfam", netbox_device_id=7951)
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"objects": [_obj("bogus_family", "X")]},
     )
     assert resp.status_code == 422
@@ -77,7 +79,7 @@ async def test_put_route_policy_intent_rejects_empty_name(adapter_client):
     device_id = await seed_device(nso_device_name="rp-noname", netbox_device_id=7952)
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"objects": [_obj("prefix_list", "")]},
     )
     assert resp.status_code == 422
@@ -89,7 +91,7 @@ async def test_put_route_policy_intent_rejects_non_list_entries(adapter_client):
     device_id = await seed_device(nso_device_name="rp-badentries", netbox_device_id=7953)
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"objects": [{"family": "prefix_list", "name": "PL", "entries": "nope"}]},
     )
     assert resp.status_code == 422
@@ -111,7 +113,7 @@ async def test_missing_device_beats_non_list_objects(adapter_client):
     """404 (device) wins over 422 (non-list ``objects``): the device lookup precedes the
     body-shape check. A Pydantic ``objects: list`` body model would 422 here instead."""
     resp = await adapter_client.put(
-        "/api/v1/devices/999999/route-policy-intent", headers=AUTH, json={"objects": "not-a-list"}
+        "/api/v1/devices/999999/route-policy-intent", headers=AUTH | push_seq(), json={"objects": "not-a-list"}
     )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "not_found"
@@ -123,7 +125,7 @@ async def test_missing_device_beats_bad_per_object(adapter_client):
     lookup precedes the per-object validation loop."""
     resp = await adapter_client.put(
         "/api/v1/devices/999999/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"objects": [{"family": "bogus", "name": ""}]},
     )
     assert resp.status_code == 404
@@ -135,7 +137,9 @@ async def test_non_dict_body_is_framework_validation_error(adapter_client):
     """``body: dict`` still enforces a JSON object at the framework layer: a non-object body
     (here a JSON array) is rejected as the S0 ``validation_error`` envelope, matching the
     ``type: object`` requestBody the openapi_extra schema documents."""
-    resp = await adapter_client.put("/api/v1/devices/999999/route-policy-intent", headers=AUTH, json=[1, 2, 3])
+    resp = await adapter_client.put(
+        "/api/v1/devices/999999/route-policy-intent", headers=AUTH | push_seq(), json=[1, 2, 3]
+    )
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "validation_error"
 
@@ -147,7 +151,7 @@ async def test_invalid_family_beats_invalid_name_within_object(adapter_client):
     device_id = await seed_device(nso_device_name="rp-fam-then-name", netbox_device_id=7960)
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"objects": [{"family": "bogus", "name": ""}]},
     )
     assert resp.status_code == 422
@@ -161,7 +165,7 @@ async def test_invalid_name_beats_invalid_entries_within_object(adapter_client):
     device_id = await seed_device(nso_device_name="rp-name-then-entries", netbox_device_id=7961)
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"objects": [{"family": "prefix_list", "name": "", "entries": "nope"}]},
     )
     assert resp.status_code == 422
@@ -176,7 +180,7 @@ async def test_primitive_list_items_rejected_as_invalid_payload(adapter_client):
     device_id = await seed_device(nso_device_name="rp-primitive-items", netbox_device_id=7962)
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"objects": [1, 2]},
     )
     assert resp.status_code == 422
@@ -188,7 +192,7 @@ async def test_missing_device_beats_primitive_list_items(adapter_client):
     """404 (device) still wins over the non-object-item 422: the device lookup precedes the
     per-item shape check, exactly as it does for the non-list-objects case."""
     resp = await adapter_client.put(
-        "/api/v1/devices/999999/route-policy-intent", headers=AUTH, json={"objects": [1, 2]}
+        "/api/v1/devices/999999/route-policy-intent", headers=AUTH | push_seq(), json={"objects": [1, 2]}
     )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "not_found"
@@ -203,7 +207,7 @@ async def test_put_route_policy_intent_creates_objects(adapter_client):
     entries = [{"sequence": 10, "action": "permit", "prefix": "10.0.0.0/8"}]
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "objects": [
                 _obj("prefix_list", "PL-1", entries=entries, accepted=True),
@@ -299,14 +303,14 @@ async def test_put_route_policy_intent_updates_in_place(adapter_client):
     device_id = await seed_device(nso_device_name="rp-update", netbox_device_id=7955)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"objects": [_obj("prefix_list", "PL-1", entries=[{"sequence": 10}], accepted=False)]},
     )
     # Re-PUT same (family, name) with new entries + accepted now true.
     new_entries = [{"sequence": 20, "action": "deny", "prefix": "0.0.0.0/0"}]
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"objects": [_obj("prefix_list", "PL-1", entries=new_entries, accepted=True)]},
     )
     assert resp.status_code == 200
@@ -324,13 +328,13 @@ async def test_put_route_policy_intent_full_replace_removes_and_enqueues(adapter
     device_id = await seed_device(nso_device_name="rp-replace", netbox_device_id=7956)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"objects": [_obj("prefix_list", "PL-1"), _obj("as_path", "AP-1")]},
     )
     # Re-PUT keeping only PL-1 → AP-1 dropped → removal propagation.
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"objects": [_obj("prefix_list", "PL-1")]},
     )
     assert resp.status_code == 200
@@ -356,12 +360,12 @@ async def test_put_route_policy_intent_no_removal_when_nothing_dropped(adapter_c
     # Two PUTs that only add/keep objects → never a removal.
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"objects": [_obj("prefix_list", "PL-1")]},
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"objects": [_obj("prefix_list", "PL-1"), _obj("route_map", "RM-1")]},
     )
     assert resp.status_code == 200
@@ -401,7 +405,7 @@ async def test_put_reports_unrepresentable_community_members_for_nokia(adapter_c
     ]
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"objects": [_obj("community_list", "example-comm", entries=entries, accepted=True)]},
     )
     assert resp.status_code == 200
@@ -418,7 +422,7 @@ async def test_put_reports_no_unrepresentable_members_for_identity_ned(adapter_c
     entries = [{"sequence": 1, "action": "permit", "community": "color:0:12."}]
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"objects": [_obj("community_list", "example-comm", entries=entries, accepted=True)]},
     )
     assert resp.status_code == 200
@@ -446,7 +450,7 @@ async def _removal_job(device_id: int):
 
 async def _put(adapter_client, device_id: int, objects: list[dict]):
     resp = await adapter_client.put(
-        f"/api/v1/devices/{device_id}/route-policy-intent", headers=AUTH, json={"objects": objects}
+        f"/api/v1/devices/{device_id}/route-policy-intent", headers=AUTH | push_seq(), json={"objects": objects}
     )
     assert resp.status_code == 200, resp.text
     return resp

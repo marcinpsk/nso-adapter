@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from tests.conftest import VALID_TOKEN, seed_device, seed_l2_saps, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, seed_l2_saps, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -98,7 +98,7 @@ async def test_put_l2_sap_intent_upserts(adapter_client):
             },
         ]
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/l2-sap-intent", json=body, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/l2-sap-intent", json=body, headers=AUTH | push_seq())
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["device_id"] == device_id
@@ -118,21 +118,25 @@ async def test_put_l2_sap_intent_full_replace_prunes(adapter_client):
             {"service_name": "TL", "service_type": "epipe", "sap_id": "lag-60:4022", "port": "lag-60"},
         ]
     }
-    await adapter_client.put(f"/api/v1/devices/{device_id}/l2-sap-intent", json=first, headers=AUTH)
+    await adapter_client.put(f"/api/v1/devices/{device_id}/l2-sap-intent", json=first, headers=AUTH | push_seq())
     # Second PUT drops the second SAP.
     second = {
         "saps": [
             {"service_name": "TL", "service_type": "epipe", "sap_id": "lag-60:3999", "port": "lag-60"},
         ]
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/l2-sap-intent", json=second, headers=AUTH)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/l2-sap-intent", json=second, headers=AUTH | push_seq()
+    )
     assert resp.json()["count"] == 1
     rows = await _get_intents(device_id)
     assert set(rows) == {("TL", "lag-60:3999")}
 
 
 async def test_put_l2_sap_intent_unknown_device_404(adapter_client):
-    resp = await adapter_client.put("/api/v1/devices/999999/l2-sap-intent", json={"saps": []}, headers=AUTH)
+    resp = await adapter_client.put(
+        "/api/v1/devices/999999/l2-sap-intent", json={"saps": []}, headers=AUTH | push_seq()
+    )
     assert resp.status_code == 404
 
 

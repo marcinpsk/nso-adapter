@@ -16,7 +16,7 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.core.claim import acquire_claim, release_claim
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -88,7 +88,7 @@ async def test_a_successful_put_leaves_no_claim_behind(adapter_client):
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/static-route-intent",
         json={"routes": [entry(A, route_id=7)]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
 
@@ -102,7 +102,7 @@ async def test_payload_refusal_never_acquires_a_claim(adapter_client):
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/static-route-intent",
         json={"routes": [entry(A, route_id=7), entry(A, route_id=8)]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 422
 
@@ -119,7 +119,7 @@ async def test_a_held_claim_turns_the_put_into_a_409(adapter_client, monkeypatch
         resp = await adapter_client.put(
             f"/api/v1/devices/{device_id}/static-route-intent",
             json={"routes": [entry(A, route_id=7)]},
-            headers=AUTH,
+            headers=AUTH | push_seq(),
         )
     finally:
         await release_claim(holder)
@@ -170,7 +170,7 @@ async def test_the_put_waits_for_the_claim_instead_of_reading_around_it(adapter_
         adapter_client.put(
             f"/api/v1/devices/{device_id}/static-route-intent",
             json={"routes": [entry(C, route_id=7), entry(B, route_id=8)]},
-            headers=AUTH,
+            headers=AUTH | push_seq(),
         )
     )
     try:
@@ -229,7 +229,7 @@ async def test_a_failure_after_the_guard_lock_neither_hangs_nor_leaks_the_claim(
         adapter_client.put(
             f"/api/v1/devices/{device_id}/static-route-intent",
             json={"routes": [entry(A)]},
-            headers=AUTH,
+            headers=AUTH | push_seq(),
         ),
         timeout=15,
     )

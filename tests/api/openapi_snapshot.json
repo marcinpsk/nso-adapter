@@ -10001,23 +10001,16 @@
             }
           },
           {
-            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
             "in": "header",
             "name": "X-Push-Seq",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "maximum": 9223372036854775807,
-                  "minimum": 1,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
-              "title": "X-Push-Seq"
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
             }
           }
         ],
@@ -10177,23 +10170,16 @@
             }
           },
           {
-            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
             "in": "header",
             "name": "X-Push-Seq",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "maximum": 9223372036854775807,
-                  "minimum": 1,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
-              "title": "X-Push-Seq"
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
             }
           }
         ],
@@ -10516,23 +10502,16 @@
             }
           },
           {
-            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
             "in": "header",
             "name": "X-Push-Seq",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "maximum": 9223372036854775807,
-                  "minimum": 1,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
-              "title": "X-Push-Seq"
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
             }
           }
         ],
@@ -10827,23 +10806,16 @@
             }
           },
           {
-            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
             "in": "header",
             "name": "X-Push-Seq",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "maximum": 9223372036854775807,
-                  "minimum": 1,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
-              "title": "X-Push-Seq"
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
             }
           }
         ],
@@ -11073,23 +11045,16 @@
             }
           },
           {
-            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
             "in": "header",
             "name": "X-Push-Seq",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "maximum": 9223372036854775807,
-                  "minimum": 1,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
-              "title": "X-Push-Seq"
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
             }
           }
         ],
@@ -11181,23 +11146,16 @@
             }
           },
           {
-            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
             "in": "header",
             "name": "X-Push-Seq",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "maximum": 9223372036854775807,
-                  "minimum": 1,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
-              "title": "X-Push-Seq"
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
             }
           }
         ],
@@ -11289,23 +11247,16 @@
             }
           },
           {
-            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
             "in": "header",
             "name": "X-Push-Seq",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "maximum": 9223372036854775807,
-                  "minimum": 1,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
-              "title": "X-Push-Seq"
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
             }
           }
         ],
@@ -11464,23 +11415,16 @@
             }
           },
           {
-            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
             "in": "header",
             "name": "X-Push-Seq",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "maximum": 9223372036854775807,
-                  "minimum": 1,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
-              "title": "X-Push-Seq"
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
             }
           }
         ],
@@ -11926,23 +11870,16 @@
             }
           },
           {
-            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
             "in": "header",
             "name": "X-Push-Seq",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "maximum": 9223372036854775807,
-                  "minimum": 1,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
-              "title": "X-Push-Seq"
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
             }
           }
         ],
@@ -12101,23 +12038,16 @@
             }
           },
           {
-            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
             "in": "header",
             "name": "X-Push-Seq",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "maximum": 9223372036854775807,
-                  "minimum": 1,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
-              "title": "X-Push-Seq"
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
             }
           }
         ],
@@ -12413,23 +12343,16 @@
             }
           },
           {
-            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
             "in": "header",
             "name": "X-Push-Seq",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "maximum": 9223372036854775807,
-                  "minimum": 1,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
-              "title": "X-Push-Seq"
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
             }
           }
         ],
@@ -13000,23 +12923,16 @@
             }
           },
           {
-            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
             "in": "header",
             "name": "X-Push-Seq",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "maximum": 9223372036854775807,
-                  "minimum": 1,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
-              "title": "X-Push-Seq"
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
             }
           }
         ],
@@ -13241,23 +13157,16 @@
             }
           },
           {
-            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
             "in": "header",
             "name": "X-Push-Seq",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "maximum": 9223372036854775807,
-                  "minimum": 1,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
-              "title": "X-Push-Seq"
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
             }
           }
         ],
@@ -13484,23 +13393,16 @@
             }
           },
           {
-            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
             "in": "header",
             "name": "X-Push-Seq",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "maximum": 9223372036854775807,
-                  "minimum": 1,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
-              "title": "X-Push-Seq"
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
             }
           }
         ],
@@ -13660,23 +13562,16 @@
             }
           },
           {
-            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
             "in": "header",
             "name": "X-Push-Seq",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "maximum": 9223372036854775807,
-                  "minimum": 1,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
-              "title": "X-Push-Seq"
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
             }
           }
         ],
@@ -14065,23 +13960,16 @@
             }
           },
           {
-            "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
             "in": "header",
             "name": "X-Push-Seq",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "maximum": 9223372036854775807,
-                  "minimum": 1,
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "The delivering claim's identity. Required on every in-protocol intent PUT; absent only on a claim-less delivery. A present value outside 1 \u2026 2^63-1 is a 422, never a silent downgrade to an unkeyed write.",
-              "title": "X-Push-Seq"
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
             }
           }
         ],

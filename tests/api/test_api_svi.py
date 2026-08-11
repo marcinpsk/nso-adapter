@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device, seed_svi, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, seed_svi, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -74,14 +74,14 @@ async def test_put_svi_intent_stores_and_full_replaces(adapter_client):
             {"interface_name": "Vlan200", "vlan_id": 200, "type": "svi"},
         ]
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/svi-intent", json=body, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/svi-intent", json=body, headers=AUTH | push_seq())
     assert resp.status_code == 200 and resp.json()["count"] == 2
     assert await _count_svi_intent(device_id) == 2
     # full-replace: one interface → the other is deleted
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/svi-intent",
         json={"interfaces": [{"interface_name": "Vlan200", "vlan_id": 200, "type": "svi"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.json()["count"] == 1
     assert await _count_svi_intent(device_id) == 1
@@ -89,5 +89,7 @@ async def test_put_svi_intent_stores_and_full_replaces(adapter_client):
 
 @pytest.mark.anyio
 async def test_put_svi_intent_unknown_device_404(adapter_client):
-    resp = await adapter_client.put("/api/v1/devices/999999/svi-intent", json={"interfaces": []}, headers=AUTH)
+    resp = await adapter_client.put(
+        "/api/v1/devices/999999/svi-intent", json={"interfaces": []}, headers=AUTH | push_seq()
+    )
     assert resp.status_code == 404

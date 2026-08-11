@@ -10,7 +10,7 @@ from nso_adapter.store.models import (
     InterfaceAttrState,
     SyncState,
 )
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -57,7 +57,7 @@ async def test_put_intent_happy_path(adapter_client):
                 {"interface": "GigabitEthernet0/0", "attribute": "description", "intent_value": "uplink to core"}
             ]
         },
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -79,14 +79,14 @@ async def test_put_intent_replaces_existing(adapter_client):
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
         json={"attributes": [{"interface": "Loopback0", "attribute": "description", "intent_value": "first-value"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
 
     # Second PUT with different value — should replace
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
         json={"attributes": [{"interface": "Loopback0", "attribute": "description", "intent_value": "second-value"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     assert resp.json()["attribute_count"] == 1
@@ -108,7 +108,7 @@ async def test_put_intent_unknown_interface_lands(adapter_client):
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
         json={"attributes": [{"interface": "ae99.999", "attribute": "description", "intent_value": "greenfield"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     assert resp.json()["attribute_count"] == 1  # landed, not skipped
@@ -146,7 +146,7 @@ async def test_put_intent_stamps_accepted_on_imported(adapter_client):
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
         json={"attributes": [{"interface": "eth0", "attribute": "description", "intent_value": "stamped"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
 
     from sqlalchemy import select
@@ -169,7 +169,7 @@ async def test_put_intent_does_not_override_in_sync(adapter_client):
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
         json={"attributes": [{"interface": "eth1", "attribute": "description", "intent_value": "in-sync-value"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
 
     from sqlalchemy import select
@@ -196,7 +196,7 @@ async def test_put_intent_auto_apply_enqueues_job(adapter_client):
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
         json={"attributes": [{"interface": "eth2", "attribute": "description", "intent_value": "auto-applied"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
 
@@ -216,7 +216,7 @@ async def test_put_intent_unknown_device_returns_404(adapter_client):
     resp = await adapter_client.put(
         "/api/v1/devices/9999/intent",
         json={"attributes": []},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "not_found"
@@ -239,7 +239,7 @@ async def test_put_intent_unmanaged_attribute_returns_422(adapter_client):
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
         json={"attributes": [{"interface": "Gi0/0", "attribute": "vlan", "intent_value": "100"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "validation_error"
@@ -272,7 +272,7 @@ async def test_get_intent_returns_set_attributes(adapter_client):
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
         json={"attributes": [{"interface": "GE0/1", "attribute": "description", "intent_value": "test-desc"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
 
     resp = await adapter_client.get(f"/api/v1/devices/{device_id}/intent", headers=AUTH)

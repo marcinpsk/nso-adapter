@@ -45,6 +45,23 @@ def pytest_xdist_auto_num_workers(config: pytest.Config) -> int:
 
 VALID_TOKEN = "test-bearer-token"
 
+# Every in-protocol intent PUT REQUIRES X-Push-Seq (a header-less delivery is a 422), so a
+# test that pushes is a claim sender like any other. The counter only ever increases, and
+# starts above every sequence any test spells out, so an auto-keyed push can never be judged
+# stale against a hand-written one. Sequences are compared per (device, stream); the tests
+# seed their own devices, so xdist workers each running this counter cannot collide.
+_push_seq_counter = itertools.count(1_000_000)
+
+
+def push_seq(seq: int | None = None) -> dict[str, str]:
+    """The ``X-Push-Seq`` header for one delivery — merge it into a test's auth headers.
+
+    Pass *seq* only when the test asserts on the sequence itself (a replay, a stale
+    redelivery, a recorded receipt); otherwise take the next unused one.
+    """
+    return {"X-Push-Seq": str(next(_push_seq_counter) if seq is None else seq)}
+
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 ADMIN_URL = os.environ.get(
     "NSO_ADAPTER_TEST_DB_URL",

@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 TS = datetime(2026, 5, 27, 9, 41, 12, 221000, tzinfo=UTC)
@@ -198,7 +198,7 @@ async def test_put_ip_intent_creates_rows(adapter_client):
             {"interface": "GigabitEthernet0/1", "address": "10.0.0.1/24", "family": "ipv4"},
         ]
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=payload)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH | push_seq(), json=payload)
     assert resp.status_code == 200
     body = resp.json()
     assert body["device_id"] == device_id
@@ -222,7 +222,7 @@ async def test_put_ip_intent_full_replace(adapter_client):
             {"interface": "GigabitEthernet0/2", "address": "10.0.0.2/24", "family": "ipv4"},
         ]
     }
-    seed = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=payload1)
+    seed = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH | push_seq(), json=payload1)
     assert seed.status_code == 200, seed.text
 
     # Second PUT: only one address
@@ -231,7 +231,7 @@ async def test_put_ip_intent_full_replace(adapter_client):
             {"interface": "GigabitEthernet0/2", "address": "10.0.0.1/24", "family": "ipv4"},
         ]
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=payload2)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH | push_seq(), json=payload2)
     assert resp.json()["address_count"] == 1
 
     async with session() as db:
@@ -259,11 +259,11 @@ async def test_put_ip_intent_removal_enqueues_interface_config_job(adapter_clien
             {"interface": "Gi0/3", "address": "10.0.0.2/24", "family": "ipv4"},
         ]
     }
-    seed = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=p1)
+    seed = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH | push_seq(), json=p1)
     assert seed.status_code == 200, seed.text
 
     p2 = {"addresses": [{"interface": "Gi0/3", "address": "10.0.0.1/24", "family": "ipv4"}]}
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=p2)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH | push_seq(), json=p2)
     assert resp.json()["removed_interfaces"] == 1
     assert resp.json()["replaced"] is True
 
@@ -331,11 +331,11 @@ async def test_put_ip_intent_removal_captures_values_per_interface(adapter_clien
             {"interface": "Gi0/6", "address": "10.0.3.1/30", "family": "ipv4"},
         ]
     }
-    seed = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=p1)
+    seed = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH | push_seq(), json=p1)
     assert seed.status_code == 200, seed.text
 
     p2 = {"addresses": [{"interface": "Gi0/6", "address": "10.0.3.1/30", "family": "ipv4"}]}
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=p2)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH | push_seq(), json=p2)
     assert resp.json()["removed_interfaces"] == 1
 
     async with session() as db:
@@ -367,7 +367,7 @@ async def test_put_ip_intent_unknown_interface_lands(adapter_client):
             {"interface": "GigabitEthernet99/99", "address": "192.168.1.1/30", "family": "ipv4"},
         ]
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=payload)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH | push_seq(), json=payload)
     assert resp.status_code == 200
     assert resp.json()["address_count"] == 1  # landed, not dropped
 
@@ -406,7 +406,7 @@ async def test_put_ip_intent_greenfield_routed_creates_interface(adapter_client)
             }
         ]
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=payload)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH | push_seq(), json=payload)
     assert resp.status_code == 200
     assert resp.json()["address_count"] == 1
 
@@ -448,7 +448,7 @@ async def test_put_ip_intent_routed_backfills_binding_only_when_missing(adapter_
             }
         ]
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=payload)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH | push_seq(), json=payload)
     assert resp.status_code == 200
     async with session() as db:
         iface = (
@@ -463,7 +463,7 @@ async def test_put_ip_intent_routed_backfills_binding_only_when_missing(adapter_
 async def test_put_ip_intent_404_unknown_device(adapter_client):
     """Device not found → 404 not_found."""
     payload = {"addresses": []}
-    resp = await adapter_client.put("/api/v1/devices/9999/ip-intent", headers=AUTH, json=payload)
+    resp = await adapter_client.put("/api/v1/devices/9999/ip-intent", headers=AUTH | push_seq(), json=payload)
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "not_found"
 

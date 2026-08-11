@@ -148,12 +148,17 @@ INSIDE that lock answers **404 `not_found`**, the same as a push for a device th
 already gone — the outbox retrying a push while an operator removes the device is a
 race, not a server error.
 
-The sequence domain is `1 … 2^63-1`; a present header that is malformed or outside it
-is **422**, never a silent downgrade to an unkeyed write. The header is a DECLARED
-parameter of each of the sixteen endpoints above, with those bounds, and appears in
-`/openapi.json`; the two out-of-protocol PUTs declare no such parameter. An ABSENT header
-is accepted and simply gets no receipt — the direct-apply families (lacp, switchport) are
-deliberately claim-less, and they are POSTs, not intent PUTs. The two remaining PUTs
+The header is **required** on every one of the sixteen endpoints above, and the sequence
+domain is `1 … 2^63-1`. An absent header is a **422**, exactly as a malformed or
+out-of-domain one is, and never a silent downgrade to an unkeyed write: the refusal happens
+at request validation, so the mutation does not run and no receipt is written. Without it
+the delivery is unresolvable — the write commits with nothing to recognise a redelivery by,
+so a lost response turns the retry into a second operation.
+
+The header is a DECLARED, required parameter of each of the sixteen endpoints, with those
+bounds, and appears in `/openapi.json`; the two out-of-protocol PUTs declare no such
+parameter. The direct-apply families (lacp, switchport) are deliberately claim-less and are
+POSTs, not intent PUTs, so they never reach admission. The two remaining PUTs
 (`/api/v1/config/failover` and `PUT /api/v1/devices/{id}/scope`) are adapter
 configuration rather than intent deliveries and carry no claim either.
 

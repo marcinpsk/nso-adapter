@@ -23,7 +23,7 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.store.models import Job, JobStatus, JobType
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 pytestmark = pytest.mark.anyio
 
@@ -631,7 +631,9 @@ async def test_a1_discriminator_a_later_authorized_push_releases_the_parked_clea
 
     async def put_intent(routes, query=""):
         resp = await adapter_client.put(
-            f"/api/v1/devices/{device_id}/static-route-intent{query}", json={"routes": routes}, headers=AUTH
+            f"/api/v1/devices/{device_id}/static-route-intent{query}",
+            json={"routes": routes},
+            headers=AUTH | push_seq(),
         )
         assert resp.status_code == 200, resp.text
 
