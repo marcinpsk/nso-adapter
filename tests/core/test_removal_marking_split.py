@@ -342,6 +342,76 @@ async def test_o2_6_the_sweeper_reissues_each_carrier_at_its_own_marking(adapter
     assert len(contexts) == 3, "the succeeded job's keys must not be re-issued"
 
 
+async def test_a_split_revision_is_not_applied_when_one_marking_job_fails(adapter_client):
+    """One promoted revision is applied only when both marking-specific jobs land."""
+    from nso_adapter.store.models import DeviceProjectionStream
+
+    device_id = await seed_device(nso_device_name="sr-split-settle-fail", netbox_device_id=9880)
+    out = await _enqueue_split(device_id, removed={"delete_origin": [A], "detach": [C]})
+    marked, unmarked = out["jobs"]
+
+    fake = SrFake("sr-split-settle-fail", service=[wire(A), wire(C)])
+    first = await run_removal_job(device_id, marked, sr_client(fake))
+    blind = SrFake("sr-split-settle-fail", service=[wire(C)], service_status="inconclusive")
+    second = await run_removal_job(device_id, unmarked, sr_client(blind))
+
+    assert (first.status, second.status) == (JobStatus.succeeded, JobStatus.failed)
+    async with session() as db:
+        stream = await db.scalar(
+            select(DeviceProjectionStream).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == "static_route",
+            )
+        )
+    assert (stream.desired_revision, stream.authorized_revision) == (1, 1)
+    assert stream.applied_revision == 0, "the successful half certified a revision its failed sibling did not land"
+
+
+async def test_a_split_revision_is_applied_when_both_marking_jobs_succeed(adapter_client):
+    """The shared revision is certified once both marking-specific jobs land."""
+    from nso_adapter.store.models import DeviceProjectionStream
+
+    device_id = await seed_device(nso_device_name="sr-split-settle-success", netbox_device_id=9881)
+    out = await _enqueue_split(device_id, removed={"delete_origin": [A], "detach": [C]})
+    marked, unmarked = out["jobs"]
+
+    fake = SrFake("sr-split-settle-success", service=[wire(A), wire(C)])
+    first = await run_removal_job(device_id, marked, sr_client(fake))
+    second = await run_removal_job(device_id, unmarked, sr_client(fake))
+
+    assert (first.status, second.status) == (JobStatus.succeeded, JobStatus.succeeded)
+    async with session() as db:
+        stream = await db.scalar(
+            select(DeviceProjectionStream).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == "static_route",
+            )
+        )
+    assert (stream.desired_revision, stream.authorized_revision, stream.applied_revision) == (1, 1, 1)
+
+
+async def test_a_homogeneous_removal_still_applies_its_revision(adapter_client):
+    """The ordinary one-generation settlement keeps its existing revision behavior."""
+    from nso_adapter.store.models import DeviceProjectionStream
+
+    device_id = await seed_device(nso_device_name="sr-single-settle", netbox_device_id=9882)
+    out = await _enqueue_split(device_id, removed={"delete_origin": [A]})
+    (job_id,) = out["jobs"]
+
+    fake = SrFake("sr-single-settle", service=[wire(A)])
+    job = await run_removal_job(device_id, job_id, sr_client(fake))
+
+    assert job.status is JobStatus.succeeded
+    async with session() as db:
+        stream = await db.scalar(
+            select(DeviceProjectionStream).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == "static_route",
+            )
+        )
+    assert (stream.desired_revision, stream.authorized_revision, stream.applied_revision) == (1, 1, 1)
+
+
 # ── O2.7: two enqueues in one request ───────────────────────────────────────
 
 

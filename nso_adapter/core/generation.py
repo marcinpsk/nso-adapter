@@ -646,7 +646,9 @@ async def settle_job_generations(
     Runs INSIDE the terminal transaction, so a generation can never be settled by a status
     write that was rolled back. On success each carried stream is stamped applied at THE
     REVISION THE GENERATION CARRIED — never at the store's current revision, which may
-    already hold writes this deployment never contained (§G2).
+    already hold writes this deployment never contained (§G2). A marking-split removal can
+    put the same stream revision in two generations. That revision is stamped only after
+    every generation carrying it has settled successfully.
     """
     carried = await _job_generations(db, job_id)
     if not carried:
@@ -672,18 +674,32 @@ async def settle_job_generations(
             seqs=[g.seq for g in carried],
         )
         return
-    for generation in carried:
-        for stream, revision in (generation.stream_revisions or {}).items():
-            await db.execute(
-                sa_update(DeviceProjectionStream)
-                .where(
-                    DeviceProjectionStream.device_id == generation.device_id,
-                    DeviceProjectionStream.stream == stream,
-                    DeviceProjectionStream.applied_revision < revision,
-                )
-                .values(applied_revision=revision, updated_at=now)
-                .execution_options(synchronize_session=False)
+    targets = {
+        (generation.device_id, stream, revision)
+        for generation in carried
+        for stream, revision in (generation.stream_revisions or {}).items()
+    }
+    for device_id, stream, revision in sorted(targets):
+        unsettled_sibling = (
+            select(DeploymentGeneration.id)
+            .where(
+                DeploymentGeneration.device_id == device_id,
+                DeploymentGeneration.status != GenerationStatus.settled,
+                DeploymentGeneration.stream_revisions[stream].as_string() == str(revision),
             )
+            .exists()
+        )
+        await db.execute(
+            sa_update(DeviceProjectionStream)
+            .where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == stream,
+                DeviceProjectionStream.applied_revision < revision,
+                ~unsettled_sibling,
+            )
+            .values(applied_revision=revision, updated_at=now)
+            .execution_options(synchronize_session=False)
+        )
 
 
 async def requeue_job_generations(db: AsyncSession, job_id: int) -> None:
