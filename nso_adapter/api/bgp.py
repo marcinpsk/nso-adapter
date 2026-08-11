@@ -14,7 +14,8 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
+from nso_adapter.api.intent_push import admit_or_replay, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.core.removal import is_cleared
@@ -548,7 +549,7 @@ async def _sync_redistribution(
     return removed
 
 
-async def _maybe_enqueue_apply(db: AsyncSession, device_id: int, router_count: int) -> None:
+async def _maybe_enqueue_apply(db: AsyncSession, device_id: int, router_count: int, *, stream: str) -> None:
     """Enqueue an apply job when the payload is non-empty and the device has auto_apply on."""
     if router_count <= 0:
         return
@@ -558,7 +559,7 @@ async def _maybe_enqueue_apply(db: AsyncSession, device_id: int, router_count: i
     if settings and settings.auto_apply:
         from nso_adapter.core.apply import enqueue_apply
 
-        await enqueue_apply(db, device_id, force=True)
+        await enqueue_apply(db, device_id, force=True, stream=stream)
 
 
 def _bgp_removed(
@@ -583,9 +584,14 @@ class BgpIntentResult(BaseModel):
     "/{device_id}/bgp-intent",
     dependencies=[Depends(verify_token)],
     response_model=BgpIntentResult,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_PUSH_SEQ, **RESP_422_VALIDATION},
 )
-async def put_bgp_intent(device_id: int, body: BgpIntentUpdate, db: AsyncSession = Depends(get_db)):
+async def put_bgp_intent(
+    device_id: int,
+    body: BgpIntentUpdate,
+    db: AsyncSession = Depends(get_db),
+    delivery=Depends(get_intent_delivery),
+):
     """Replace the adapter's BGP intent mirror for this device atomically.
 
     Full-replace semantics per device: all existing intent rows for the device
@@ -598,6 +604,17 @@ async def put_bgp_intent(device_id: int, body: BgpIntentUpdate, db: AsyncSession
     if not device:
         raise api_error(404, "not_found", "Device not found")
 
+    # Every accepted write records its projection revision, store-only and
+    # auto-apply-off included, and takes the device's projection lock before anything is
+    # read (#1522 §G2). Only a promotion authorizes a deployment.
+    from nso_adapter.core.generation import note_write
+    from nso_adapter.core.receipt import record_response
+    from nso_adapter.core.request_flags import PUSH_SEQ
+
+    await note_write(db, device_id, delivery.stream, push_seq=PUSH_SEQ.get())
+    if (replay := await admit_or_replay(db, device_id, delivery)) is not None:
+        return replay
+
     # Snapshot identities AND owned scalar values before the wipe: the rebuild drops the whole
     # tree, so this is the only chance to see what the payload cleared (see _capture_bgp_values).
     existing_asns, existing_peers = await _capture_bgp_identities(db, device_id)
@@ -607,7 +624,7 @@ async def put_bgp_intent(device_id: int, body: BgpIntentUpdate, db: AsyncSession
     router_count = await _rebuild_router_intent(db, device_id, body.routers, now)
     removed_redist = await _sync_redistribution(db, device_id, body.routers, now)
 
-    await _maybe_enqueue_apply(db, device_id, router_count)
+    await _maybe_enqueue_apply(db, device_id, router_count, stream=delivery.stream)
 
     removed_asns, removed_peers = _bgp_removed(existing_asns, existing_peers, body.routers)
     cleared = _bgp_cleared(before_values, body.routers)
@@ -624,11 +641,13 @@ async def put_bgp_intent(device_id: int, body: BgpIntentUpdate, db: AsyncSession
             db,
             device_id,
             "bgp",
+            promotes=(delivery.stream,),
             removed={"router": removed_asns, "peer": removed_peers},
             retract=cleared,
             shrank=shrank,
         )
 
+    result = {"device_id": device_id, "router_count": router_count}
+    await record_response(db, device_id, delivery, result)
     await db.commit()
-
-    return {"device_id": device_id, "router_count": router_count}
+    return result

@@ -13,7 +13,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
+from nso_adapter.api.intent_push import admit_or_replay, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.core.removal import lost_content
@@ -399,13 +400,14 @@ async def _upsert_route_policy_object(db: AsyncSession, device_id: int, obj: dic
     "/{device_id}/route-policy-intent",
     dependencies=[Depends(verify_token)],
     response_model=RoutePolicyIntentPutOut,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_PUSH_SEQ, **RESP_422_VALIDATION},
     openapi_extra=_ROUTE_POLICY_INTENT_OPENAPI,
 )
 async def put_route_policy_intent(
     device_id: int,
     body: dict,
     db: AsyncSession = Depends(get_db),
+    delivery=Depends(get_intent_delivery),
 ):
     """Store per-object route-policy intent for a device (full-replace per object).
 
@@ -424,6 +426,17 @@ async def put_route_policy_intent(
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+
+    # Every accepted write records its projection revision, store-only and
+    # auto-apply-off included, and takes the device's projection lock before anything is
+    # read (#1522 §G2). Only a promotion authorizes a deployment.
+    from nso_adapter.core.generation import note_write
+    from nso_adapter.core.receipt import record_response
+    from nso_adapter.core.request_flags import PUSH_SEQ
+
+    await note_write(db, device_id, delivery.stream, push_seq=PUSH_SEQ.get())
+    if (replay := await admit_or_replay(db, device_id, delivery)) is not None:
+        return replay
 
     objects = body.get("objects")
     if not isinstance(objects, list):
@@ -463,7 +476,21 @@ async def put_route_policy_intent(
         if await _upsert_route_policy_object(db, device_id, obj, before_entries, now):
             cleared = True  # a term/line/member disappeared, or a leaf inside one was blanked
 
-    await db.commit()
+    if removed or cleared:
+        from nso_adapter.core.removal import replace_on_removal
+        from nso_adapter.nso.apply import apply_route_policy_config
+
+        # retract=cleared: an object that only lost a term is still OWNED and accepted — nothing
+        # is being un-owned, so the PUT-replace must actually reach the device rather than
+        # detach with no-networking (#106's detach-by-default is for shrinking OWNERSHIP).
+        await replace_on_removal(
+            db,
+            device,
+            removed,
+            RoutePolicyObjectIntent,
+            apply_route_policy_config,
+            retract=cleared,
+        )
 
     # Which community-list members can this device's NED NOT hold? The apply path
     # silently skips them (a wildcard color on Nokia has no exact ext-community), which
@@ -491,31 +518,15 @@ async def put_route_policy_intent(
         unsupported=sum(len(v) for v in unsupported_members.values()),
     )
 
-    if removed or cleared:
-        from nso_adapter.core.removal import replace_on_removal
-        from nso_adapter.nso.apply import apply_route_policy_config
-
-        # retract=cleared: an object that only lost a term is still OWNED and accepted — nothing
-        # is being un-owned, so the PUT-replace must actually reach the device rather than
-        # detach with no-networking (#106's detach-by-default is for shrinking OWNERSHIP).
-        await replace_on_removal(
-            db,
-            device,
-            removed,
-            RoutePolicyObjectIntent,
-            apply_route_policy_config,
-            retract=cleared,
-        )
-
     # Return updated intent state for all objects on this device, plus the per-object
     # unsupported-member map so the plugin can surface codec-skipped members.
-    result = await db.execute(
+    rows_result = await db.execute(
         select(RoutePolicyObjectIntent)
         .where(RoutePolicyObjectIntent.device_id == device_id)
         .order_by(RoutePolicyObjectIntent.family, RoutePolicyObjectIntent.name)
     )
-    rows = result.scalars().all()
-    return {
+    rows = rows_result.scalars().all()
+    result = {
         "device_id": device_id,
         "objects": [
             {
@@ -531,3 +542,6 @@ async def put_route_policy_intent(
         ],
         "unsupported_members": unsupported_members,
     }
+    await record_response(db, device_id, delivery, result)
+    await db.commit()
+    return result

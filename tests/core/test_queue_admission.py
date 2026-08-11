@@ -21,7 +21,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from tests.conftest import seed_device, session
+from tests.conftest import note_projection_write, seed_device, session
 
 pytestmark = pytest.mark.anyio
 
@@ -250,7 +250,8 @@ async def test_two_concurrent_auto_apply_puts_both_commit(adapter_client, rival_
         async with rival() as db:
             db.add(InterfaceMtuIntent(device_id=device_id, interface_name="ge-0/0/1", mtu=9000))
             await db.flush()
-            await enqueue_apply(db, device_id, force=True)
+            await note_projection_write(db, device_id, "interface_mtu")
+            await enqueue_apply(db, device_id, force=True, stream="interface_mtu")
             await db.commit()
         second_done.set()
 
@@ -258,7 +259,8 @@ async def test_two_concurrent_auto_apply_puts_both_commit(adapter_client, rival_
     async with session() as db:
         db.add(BfdIntent(device_id=device_id, interface_name="ge-0/0/0", min_tx=300))
         await db.flush()
-        await enqueue_apply(db, device_id, force=True)
+        await note_projection_write(db, device_id, "bfd")
+        await enqueue_apply(db, device_id, force=True, stream="bfd")
         first_admitted.set()
         # The rival is now contending; the winner lock means it waits for this commit.
         await asyncio.sleep(0.2)
@@ -295,14 +297,16 @@ async def test_two_concurrent_static_route_puts_both_commit(adapter_client, riva
                 StaticRouteIntent(device_id=device_id, vrf="", prefix="10.9.0.0/24", next_hop="192.0.2.9", route_id=91)
             )
             await db.flush()
-            await enqueue_apply(db, device_id, force=True)
+            await note_projection_write(db, device_id, "static_route")
+            await enqueue_apply(db, device_id, force=True, stream="static_route")
             await db.commit()
 
     task = asyncio.create_task(_second())
     async with session() as db:
         db.add(StaticRouteIntent(device_id=device_id, vrf="", prefix="10.8.0.0/24", next_hop="192.0.2.8", route_id=90))
         await db.flush()
-        await enqueue_apply(db, device_id, force=True)
+        await note_projection_write(db, device_id, "static_route")
+        await enqueue_apply(db, device_id, force=True, stream="static_route")
         first_admitted.set()
         await asyncio.sleep(0.2)
         await db.commit()

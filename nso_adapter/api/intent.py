@@ -17,7 +17,8 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
+from nso_adapter.api.intent_push import admit_or_replay, get_intent_delivery
 from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.store.models import (
     DbInterface,
@@ -102,9 +103,14 @@ def _intent_row_out(row: InterfaceIntent, if_name: str) -> dict:
     "/{device_id}/intent",
     dependencies=[Depends(verify_token)],
     response_model=IntentPutResultOut,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_PUSH_SEQ, **RESP_422_VALIDATION},
 )
-async def put_intent(device_id: int, body: IntentUpdate, db: AsyncSession = Depends(get_db)):
+async def put_intent(
+    device_id: int,
+    body: IntentUpdate,
+    db: AsyncSession = Depends(get_db),
+    delivery=Depends(get_intent_delivery),
+):
     """Replace the adapter's intent mirror for this device atomically.
 
     The plugin sends the full snapshot (not a delta); a missing entry
@@ -114,6 +120,17 @@ async def put_intent(device_id: int, body: IntentUpdate, db: AsyncSession = Depe
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+
+    # Every accepted write records its projection revision, store-only and
+    # auto-apply-off included, and takes the device's projection lock before anything is
+    # read (#1522 §G2). Only a promotion authorizes a deployment.
+    from nso_adapter.core.generation import note_write
+    from nso_adapter.core.receipt import record_response
+    from nso_adapter.core.request_flags import PUSH_SEQ
+
+    await note_write(db, device_id, delivery.stream, push_seq=PUSH_SEQ.get())
+    if (replay := await admit_or_replay(db, device_id, delivery)) is not None:
+        return replay
 
     # Validate all requested attributes against the device's managed scope
     scope_result = await db.execute(select(ManagedScope).where(ManagedScope.device_id == device_id))
@@ -189,15 +206,17 @@ async def put_intent(device_id: int, body: IntentUpdate, db: AsyncSession = Depe
     if settings and settings.auto_apply and count > 0:
         from nso_adapter.core.apply import enqueue_apply
 
-        await enqueue_apply(db, device_id, force=True)
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
 
-    await db.commit()
-    logger.info("intent.put.ok", device_id=device_id, attribute_count=count)
-    return {
+    result = {
         "device_id": device_id,
         "attribute_count": count,
         "updated_at": iso_z(now),
     }
+    await record_response(db, device_id, delivery, result)
+    await db.commit()
+    logger.info("intent.put.ok", device_id=device_id, attribute_count=count)
+    return result
 
 
 @router.get(

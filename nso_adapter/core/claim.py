@@ -53,7 +53,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.store.device_settle import MissingSettleCounter, allocate_settle_seq
-from nso_adapter.store.models import DeviceClaim, Job, JobStatus, JobType
+from nso_adapter.store.models import DeviceClaim, GenerationStatus, Job, JobStatus, JobType
 
 logger = structlog.get_logger(__name__)
 
@@ -682,6 +682,7 @@ async def terminalize(
     result: dict | None = None,
     error: dict | None = None,
     set_device_id: object = UNSET,
+    generation_outcome: GenerationStatus | None = None,
 ) -> TerminalWrite | None:
     """Write one job's terminal status under its ownership predicate. Caller commits.
 
@@ -704,6 +705,12 @@ async def terminalize(
     not a job failure: it raises :class:`BookkeepingOutcomeUnknown` so no caller writes a
     second terminal status for a device change that already happened, and recovery
     re-dispositions the job while it is still ``running``.
+
+    Any deployment generations the job carries settle HERE, in this same transaction
+    (#1522 §G1): a generation settled by a status write that was later rolled back would
+    let the next one cross a barrier that never opened. *generation_outcome* overrides the
+    status-derived verdict for the one caller that knows better — recovery, which never
+    observed the run and so can only report ``outcome_unknown``.
     """
     if status not in _TERMINAL_STATUSES:
         raise ValueError(f"terminalize is for terminal statuses only, not {status.value}")
@@ -724,6 +731,15 @@ async def terminalize(
             expected_attempt=run_attempt,
         )
         return None
+    from nso_adapter.core.generation import settle_job_generations
+
+    await settle_job_generations(
+        db,
+        job_id,
+        outcome=generation_outcome
+        or (GenerationStatus.settled if status is JobStatus.succeeded else GenerationStatus.failed),
+        error=error,
+    )
     settle_seq: int | None = None
     if row.device_id is not None:
         try:
@@ -801,6 +817,8 @@ async def terminalize_running(
     would otherwise abort the CALLER's whole transaction — a whole recovery batch — instead
     of returning the ``failed``/``superseded`` outcome this docstring already promises.
     """
+    from nso_adapter.core.generation import requeue_job_generations
+
     coalescible: tuple[int, JobType] | None = None
     if status == JobStatus.queued:
         row = (
@@ -835,7 +853,12 @@ async def terminalize_running(
             logger.warning("claim.requeue_raced_a_successor", job_id=job_id, queued_successor_id=successor_id)
             status, error = JobStatus.failed, _superseded_error(successor_id)
         else:
-            return JobStatus.queued if landed is not None else None
+            if landed is not None:
+                # The SAME job will re-run the SAME documents, so its generations are
+                # un-started rather than blocked.
+                await requeue_job_generations(db, job_id)
+                return JobStatus.queued
+            return None
 
     write = await terminalize(
         db,
@@ -844,6 +867,10 @@ async def terminalize_running(
         expect=JobStatus.running,
         run_attempt=expected_attempt,
         error=error,
+        # Recovery did not watch the run: the device write may or may not have landed, so
+        # the honest verdict on its generations is unknown, not failed. Both block the
+        # successors; only an explicit reconcile or a settling retry opens the barrier.
+        generation_outcome=GenerationStatus.outcome_unknown if status is JobStatus.failed else None,
     )
     return write.status if write is not None else None
 

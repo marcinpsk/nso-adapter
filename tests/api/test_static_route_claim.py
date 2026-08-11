@@ -126,8 +126,26 @@ async def test_a_held_claim_turns_the_put_into_a_409(adapter_client, monkeypatch
 
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "conflict"
+    assert resp.json()["error"]["detail"]["reason"] == "device_claimed"
     # Refused, not half-applied.
     assert await _triples_by_route_id(device_id) == {}
+
+    # The published 409 must name the cause the endpoint just refused on. It refuses on ANY
+    # competing device claim — here a plain "job" claim with no job row behind it — so the
+    # fragment saying "a job is already running for this device" documented a narrower
+    # condition than the one that fires (#1558 rework 3, finding 5).
+    described = _published_409_description()
+    assert "busy with another operation" in described, described
+    assert "job is already running" not in described, described
+
+
+def _published_409_description() -> str:
+    """The 409 description the OpenAPI schema publishes for the static-route intent PUT."""
+    from nso_adapter.main import create_app
+
+    schema = create_app().openapi()
+    put = schema["paths"]["/api/v1/devices/{device_id}/static-route-intent"]["put"]
+    return put["responses"]["409"]["description"]
 
 
 async def test_the_put_waits_for_the_claim_instead_of_reading_around_it(adapter_client, monkeypatch):
@@ -187,7 +205,7 @@ async def test_a_failure_after_the_guard_lock_neither_hangs_nor_leaks_the_claim(
 
     device_id = await seed_device(nso_device_name="sr-claim-lockfail", netbox_device_id=9405)
 
-    async def _boom(device_id, body, db):
+    async def _boom(device_id, body, db, delivery):
         raise RuntimeError("forced post-lock failure")
 
     monkeypatch.setattr(sr_mod, "_apply_static_route_intent", _boom)

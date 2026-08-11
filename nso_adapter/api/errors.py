@@ -53,6 +53,10 @@ ERROR_CODES: frozenset[str] = frozenset(
         "no_nso_client",
         "nso_unavailable",
         "secrets_write_unsupported",
+        # Receipt admission on a keyed intent push (#1522 §G2): the same X-Push-Seq
+        # re-delivered with a different body, and a sequence older than the admitted one.
+        "sequence_reuse",
+        "stale",
         "vault_error",
     }
 )
@@ -80,6 +84,8 @@ ErrorCode = Literal[
     "no_nso_client",
     "nso_unavailable",
     "secrets_write_unsupported",
+    "sequence_reuse",
+    "stale",
     "vault_error",
 ]
 
@@ -133,8 +139,38 @@ def api_error(
     )
 
 
+def push_conflict_error(code: str, message: str, detail: dict | None = None) -> ApiError:
+    """Map a receipt-admission refusal (#1522 §G2) onto the wire.
+
+    Here, not at the endpoints: both codes are written out literally in ONE place, which is
+    what keeps every code greppable (``test_call_site_codes_are_subset_of_error_codes``
+    forbids a dynamic code argument) and what stops the twelve endpoints that join the
+    protocol from each spelling the mapping out again.
+    """
+    if code == "sequence_reuse":
+        return api_error(409, "sequence_reuse", message, detail)
+    if code == "stale":
+        return api_error(409, "stale", message, detail)
+    raise ValueError(f"unknown push-admission code {code!r}")
+
+
 async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content=exc.detail)
+
+
+async def projection_gone_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Answer a device offboarded UNDER a write with the same 404 the endpoints raise.
+
+    Every accepted projection write takes the device's lock before it reads anything, and an
+    offboard committing inside that window is a legitimate race, not a bug: the plugin's
+    outbox retries a push while an operator removes the device. Mapped here, once, because it
+    can surface from any of the sixteen intent PUTs and the two generation actions — each
+    catching it locally is how the endpoints that did not came to answer 500.
+    """
+    return JSONResponse(
+        status_code=404,
+        content={"error": {"code": "not_found", "message": "Device not found", "detail": {}}},
+    )
 
 
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
@@ -182,6 +218,25 @@ RESP_404_DEVICE = {404: {**_ENVELOPE_SCHEMA, "description": "Device not found"}}
 RESP_404 = {404: {**_ENVELOPE_SCHEMA, "description": "Not found"}}
 RESP_409_ACTIVE_JOB = {409: {**_ENVELOPE_SCHEMA, "description": "A job is already running for this device"}}
 RESP_409 = {409: {**_ENVELOPE_SCHEMA, "description": "Conflict"}}
+RESP_409_PUSH_SEQ = {
+    409: {
+        **_ENVELOPE_SCHEMA,
+        "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one",
+    }
+}
+# One status, one description: an endpoint that can emit BOTH 409s must say so, or merging
+# the two fragments silently drops whichever comes first. The second cause is the DEVICE
+# CLAIM, not a running job: the static-route PUT refuses whenever any competing operation
+# holds the device — an apply, a removal, a teardown, another intent push.
+RESP_409_PUSH_SEQ_OR_DEVICE_BUSY = {
+    409: {
+        **_ENVELOPE_SCHEMA,
+        "description": (
+            "The device is busy with another operation, or X-Push-Seq was reused with a "
+            "different body or mode / is older than the admitted one"
+        ),
+    }
+}
 RESP_422_VALIDATION = {422: {**_ENVELOPE_SCHEMA, "description": "Request validation failed (envelope shape)"}}
 RESP_501 = {501: {**_ENVELOPE_SCHEMA, "description": "Not supported by the configured provider"}}
 RESP_502_NSO = {502: {**_ENVELOPE_SCHEMA, "description": "NSO unreachable"}}

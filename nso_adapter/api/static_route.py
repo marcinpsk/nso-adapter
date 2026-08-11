@@ -16,11 +16,12 @@ from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import (
     RESP_401,
     RESP_404_DEVICE,
-    RESP_409_ACTIVE_JOB,
+    RESP_409_PUSH_SEQ_OR_DEVICE_BUSY,
     RESP_422_VALIDATION,
     IntentApplyResult,
     api_error,
 )
+from nso_adapter.api.intent_push import admit_or_replay, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.config import get_config
@@ -350,9 +351,14 @@ async def get_static_route_intent(device_id: int, db: AsyncSession = Depends(get
     "/{device_id}/static-route-intent",
     dependencies=[Depends(verify_token)],
     response_model=StaticRouteIntentResult,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_ACTIVE_JOB, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_PUSH_SEQ_OR_DEVICE_BUSY, **RESP_422_VALIDATION},
 )
-async def put_static_route_intent(device_id: int, body: StaticRouteIntentUpdate, db: AsyncSession = Depends(get_db)):
+async def put_static_route_intent(
+    device_id: int,
+    body: StaticRouteIntentUpdate,
+    db: AsyncSession = Depends(get_db),
+    delivery=Depends(get_intent_delivery),
+):
     """Replace the adapter's static-route intent mirror for this device atomically.
 
     Full-replace semantics: rows not present in the request body are deleted.
@@ -387,7 +393,7 @@ async def put_static_route_intent(device_id: int, body: StaticRouteIntentUpdate,
             # what makes a concurrent revoke serialize against this transaction instead of
             # racing it.
             await lock_claim(db, claim_reg)
-            return await _apply_static_route_intent(device_id, body, db)
+            return await _apply_static_route_intent(device_id, body, db, delivery)
     except ClaimUnavailableError:
         logger.warning("static_route.intent_claim_timeout", device_id=device_id)
         raise api_error(
@@ -435,12 +441,44 @@ def _write_tombstones(
     return tombstones
 
 
-async def _apply_static_route_intent(device_id: int, body: StaticRouteIntentUpdate, db: AsyncSession) -> dict:
+def _reject_double_claimed_triple(routes: list[StaticRouteEntry], matched: dict[int, StaticRouteIntent]) -> None:
+    """Refuse a push whose PLANNED outcome gives one triple two distinct route_id claimants.
+
+    The planned outcome pairs each entry's triple with the route_id that will claim it. An
+    entry naming no route_id keeps whatever its matched row already carries.
+    """
+    planned: list[tuple[tuple[str, str, str], int | None]] = []
+    for index, item in enumerate(routes):
+        row = matched.get(index)
+        claimant = item.route_id if item.route_id is not None else (row.route_id if row is not None else None)
+        planned.append((_triple(item), claimant))
+    conflict = _double_claimed_triple(planned)
+    if conflict is not None:
+        raise api_error(
+            422,
+            "validation_error",
+            "Two routes would claim the same (vrf, prefix, next_hop)",
+            {"reason": "duplicate_triple", "triple": list(conflict)},
+        )
+
+
+async def _apply_static_route_intent(device_id: int, body: StaticRouteIntentUpdate, db: AsyncSession, delivery) -> dict:
     """Run steps 3-9 of Q8, all under the claim the caller acquired and guard-locked."""
     device = await db.get(Device, device_id)
     if not device:
         # Offboarded between the 404 check and the claim: nothing left to write intent for.
         raise api_error(404, "not_found", "Device not found")
+
+    # Every accepted write records its projection revision, store-only and
+    # auto-apply-off included, and takes the device's projection lock before anything is
+    # read (#1522 §G2). Only a promotion authorizes a deployment.
+    from nso_adapter.core.generation import note_write
+    from nso_adapter.core.receipt import record_response
+    from nso_adapter.core.request_flags import PUSH_SEQ
+
+    await note_write(db, device_id, delivery.stream, push_seq=PUSH_SEQ.get())
+    if (replay := await admit_or_replay(db, device_id, delivery)) is not None:
+        return replay
 
     existing_result = await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id))
     existing = list(existing_result.scalars().all())
@@ -454,22 +492,7 @@ async def _apply_static_route_intent(device_id: int, body: StaticRouteIntentUpda
         logger.warning(_FALLBACK_EVENT, device_id=device_id, null_route_id_count=null_route_ids)
 
     matched, removed_rows = _match_payload_to_rows(body.routes, existing)
-
-    # The planned outcome: each entry's triple paired with the route_id that will claim it.
-    # An entry naming no route_id keeps whatever its matched row already carries.
-    planned: list[tuple[tuple[str, str, str], int | None]] = []
-    for index, item in enumerate(body.routes):
-        row = matched.get(index)
-        claimant = item.route_id if item.route_id is not None else (row.route_id if row is not None else None)
-        planned.append((_triple(item), claimant))
-    conflict = _double_claimed_triple(planned)
-    if conflict is not None:
-        raise api_error(
-            422,
-            "validation_error",
-            "Two routes would claim the same (vrf, prefix, next_hop)",
-            {"reason": "duplicate_triple", "triple": list(conflict)},
-        )
+    _reject_double_claimed_triple(body.routes, matched)
 
     removed = [(r.vrf, r.prefix, r.next_hop) for r in removed_rows]
     tombstones = _write_tombstones(db, device_id, removed_rows, fence_open=fence_open)
@@ -565,6 +588,7 @@ async def _apply_static_route_intent(device_id: int, body: StaticRouteIntentUpda
             db,
             device_id,
             "static_route",
+            promotes=(delivery.stream,),
             removed=removed_map("static_route", removed) if removed else None,
             retract=cleared,
             shrank=bool(removed),
@@ -579,19 +603,20 @@ async def _apply_static_route_intent(device_id: int, body: StaticRouteIntentUpda
     if settings and settings.auto_apply and count > 0:
         from nso_adapter.core.apply import enqueue_apply
 
-        await enqueue_apply(db, device_id, force=True)
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
 
     # Rendered BEFORE the commit, off the rows this transaction just wrote: the echo is the
     # pusher's settlement expectation, so it must describe exactly what was stored, not what
     # was asked for.
     routes = [_echo(row) for row in echoed]
 
-    await db.commit()
-
-    return {
+    result = {
         "device_id": device_id,
         "count": count,
         "removed": len(removed),
         "replaced": replaced,
         "routes": routes,
     }
+    await record_response(db, device_id, delivery, result)
+    await db.commit()
+    return result

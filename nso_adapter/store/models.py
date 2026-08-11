@@ -11,6 +11,7 @@ import enum
 from datetime import datetime
 
 from sqlalchemy import (
+    DDL,
     JSON,
     BigInteger,
     Boolean,
@@ -24,11 +25,14 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     func,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+from nso_adapter.store.ddl import generation_immutability_ddl
 
 
 class Base(DeclarativeBase):
@@ -449,6 +453,225 @@ class DeviceSettleCounter(Base):
         BigInteger, ForeignKey("devices.id", ondelete="CASCADE"), primary_key=True, autoincrement=False
     )
     last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"), default=0)
+
+
+class GenerationMode(str, enum.Enum):
+    """How a deployment generation reaches NSO (#1522 §G1).
+
+    ``networked`` commits to the device; ``detach`` commits ``no-networking`` and re-aligns
+    CDB with a sync-from, dropping service governance without touching the device (#106).
+    The mode is part of the generation's identity: two adjacent generations of different
+    modes may never be coalesced into one device write.
+    """
+
+    networked = "networked"
+    detach = "detach"
+
+
+class GenerationStatus(str, enum.Enum):
+    """A deployment generation's lifecycle (#1522 §G1 + §H2's success barrier).
+
+    ``settled`` and ``abandoned`` are the only statuses a successor may cross. ``failed``
+    (the executing job reported a failure) and ``outcome_unknown`` (nobody observed the
+    outcome — a crashed or revoked run) both BLOCK every later generation of the device
+    until the head is retried into ``settled`` or explicitly reconciled to ``abandoned``.
+    """
+
+    pending = "pending"
+    running = "running"
+    settled = "settled"
+    failed = "failed"
+    outcome_unknown = "outcome_unknown"
+    abandoned = "abandoned"
+
+
+class DeviceGenerationCounter(Base):
+    """Per-device generation allocator AND the projection serialization point (#1522 §G1).
+
+    Two jobs, one row, deliberately: the sequence must equal the order in which projection
+    mutations COMMIT, so the row lock that orders the allocation is the same lock that keeps
+    two device-projection writers from interleaving. Every accepted projection write takes
+    it (``core.generation.lock_projection``) before it reads anything the document is built
+    from, which is what gives generation creation the single consistent snapshot §G1 calls
+    for without an isolation-level change (see the module docstring).
+
+    Created lazily by an upsert, unlike :class:`DeviceSettleCounter`: generation creation is
+    never a terminal transaction, so the FK check's ``FOR KEY SHARE`` on ``devices`` closes
+    no cycle here — the deadlock that forbids a lazy settle counter does not exist on this
+    path.
+    """
+
+    __tablename__ = "device_generation_counter"
+
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), primary_key=True, autoincrement=False
+    )
+    last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"), default=0)
+
+
+class DeviceProjectionStream(Base):
+    """One projection STREAM's revision triple for a device (#1522 §G2).
+
+    The row is per endpoint stream, not per document section: sixteen streams compose
+    fourteen families, and a stream owns an explicit set of intent tables
+    (:mod:`core.projection`). Keying this at section grain let a normal ``ip`` push authorize
+    the interface ATTRIBUTES an un-promoted store-only repair had left in the store, and the
+    same for the two IS-IS lanes.
+
+    * ``desired_revision`` — bumped by ANY accepted write, store-only and backfill included.
+    * ``authorized_revision`` — the desired revision a NORMAL claim promoted into a
+      generation. Store-only and backfill writes never advance it, which is what stops an
+      un-authorized store repair from riding along on the next device write (#103).
+    * ``applied_revision`` — settlement's compare-and-set target: the revision the EXECUTED
+      generation carried, never the current one. Separate from ``authorized_revision``
+      because promotion happens at generation creation (§H4) while the proof of application
+      only exists at settlement; folding the two would stamp a newer raw row as applied.
+
+    ``source_push_seq`` is the plugin's ``X-Push-Seq`` for the write that last bumped
+    ``desired_revision`` — the provenance a replayed push is recognised by.
+    """
+
+    __tablename__ = "device_projection_stream"
+    __table_args__ = (UniqueConstraint("device_id", "stream", name="uq_projection_stream"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    stream: Mapped[str] = mapped_column(String(32), nullable=False)
+    desired_revision: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"), default=0)
+    authorized_revision: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"), default=0)
+    applied_revision: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"), default=0)
+    source_push_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    #: The FRAGMENT this stream owns, as of its last PROMOTION: ``{table: [row, …]}`` for the
+    #: tables the stream owns and no others. A generation's document composes each section
+    #: from its streams' fragments, so the document is the complete outbound device document
+    #: and never an omission that would read as "delete this family" (#1522 §G1).
+    #: NULL until the stream is promoted once — an unpromoted lane has nothing on the device
+    #: the adapter authorized, so it contributes nothing.
+    authorized_document: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
+
+
+class IntentPushReceipt(Base):
+    """The last admitted keyed push per (device, section) — the replay boundary (#1522 §G2).
+
+    One row per device+section, REPLACED as the sequence advances. The generation chain
+    already keeps per-push history (``DeploymentGeneration.source_push_seq``), so nothing
+    needs a per-sequence receipt archive; admission only ever asks about the LATEST one:
+
+    * same ``push_seq`` + same ``request_digest`` + same MODE → replay, return ``response``
+      verbatim, apply nothing;
+    * same ``push_seq`` + a different digest or a different mode → refuse
+      (``sequence_reuse``);
+    * a LOWER ``push_seq`` → refuse (``stale``);
+    * a higher ``push_seq`` → admit, and this row becomes that push's receipt.
+
+    ``request_digest`` is sha256 over the canonical JSON of the RAW wire body, so two
+    deliveries of the same push digest alike whatever the store does with them. The digest
+    does NOT cover the request MODE — the body says nothing about ``?store_only`` or
+    ``?delete_origin``, and one sequence carrying one body under two of those is two
+    different deployments — so the two flags are stored as columns and compared alongside it.
+    ``section`` holds the intent-ENDPOINT vocabulary (:mod:`core.intent_protocol`), one
+    receipt per outbox STREAM, which is why ``ip`` and ``interface_config`` are separate rows
+    even though they compose into one projection family. The code calls that vocabulary
+    ``stream``; the column keeps the name the receipt table's shape is pinned on.
+
+    The row is written in the SAME transaction as the mutation it admits: a receipt for an
+    operation that rolled back would make the retry a silent no-op.
+    """
+
+    __tablename__ = "intent_push_receipt"
+    __table_args__ = (UniqueConstraint("device_id", "section", name="uq_push_receipt_device_section"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    section: Mapped[str] = mapped_column(String(32), nullable=False)
+    push_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    request_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: The admitted delivery's ``?store_only=true`` / ``?delete_origin=true``, canonicalised
+    #: to booleans by the same parser the middleware uses. Part of the admission identity.
+    store_only: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"), default=False)
+    delete_origin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"), default=False)
+    #: The response body this push returned, replayed byte for byte on a repeat delivery.
+    response: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    status_code: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("200"), default=200)
+    #: The generation this push authorized, when it authorized one (store-only does not).
+    generation_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("deployment_generation.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
+
+
+class DeploymentGeneration(Base):
+    """One immutable, ordered unit of device deployment (#1522 §G1).
+
+    The document is stored VERBATIM as JSON with the row — there is no second normalized
+    schema for it, and nothing rewrites it after creation. A retry re-executes this exact
+    document under this exact mode, which is what makes the success barrier (§H2) safe: the
+    head is retried, never rebuilt from a store that has moved on.
+
+    ``seq`` is allocated from :class:`DeviceGenerationCounter` under its row lock, so per
+    device the sequence equals the commit order of the mutations that created the
+    generations. Execution follows ``seq``, and generation N+1 may not start until N is
+    ``settled`` (or explicitly ``abandoned``).
+
+    ``job_id`` is the job that carries this generation to NSO. Several ADJACENT generations
+    of the SAME mode may share one job (the queued-winner coalescing that already exists);
+    a generation may never join a job carrying the other mode — a networked apply absorbing
+    a detach would retract config the detach exists to leave alone (#106).
+    """
+
+    __tablename__ = "deployment_generation"
+    __table_args__ = (
+        UniqueConstraint("device_id", "seq", name="uq_generation_seq_per_device"),
+        Index("ix_generation_device_status", "device_id", "status"),
+        Index("ix_generation_job", "job_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    mode: Mapped[GenerationMode] = mapped_column(Enum(GenerationMode), nullable=False)
+    status: Mapped[GenerationStatus] = mapped_column(
+        Enum(GenerationStatus), nullable=False, default=GenerationStatus.pending
+    )
+    #: The exact full document this generation deploys. Immutable after INSERT.
+    document: Mapped[dict] = mapped_column(JSON, nullable=False)
+    #: sha256 over (mode, canonical document). Proves a retry re-sent the same bytes.
+    digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: Per YANG list, the keys this generation's document is allowed to drop — what the
+    #: collateral guard may watch disappear.
+    allowed_removal_keys: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    #: stream -> the plugin ``X-Push-Seq`` that authorized it. Provenance for replay.
+    source_push_seq: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    #: stream -> the desired revision this document was built from. Settlement CASes
+    #: exactly these, never whatever the store holds when the job finishes.
+    stream_revisions: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    #: For a generation a removal produced: the job context that executes it (scope, the
+    #: allowed removal keys, ``detach``, ``force``, vault refs). It lives HERE and not only
+    #: on the job because a retry of a blocked detach has to rebuild a job that commits the
+    #: same operation, and the failed job's row is not a safe place to read it back from.
+    #: NULL for a generation an apply produced — those need no context beyond the document.
+    removal_context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    job_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"), default=0)
+    last_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# ``create_all`` installs the SAME immutability trigger the migration does, rendered from
+# the one definition in store.ddl — the schema-parity test compares tables, not triggers, so
+# a create_all-only database would otherwise silently accept a rewritten generation.
+for _statement in generation_immutability_ddl():
+    event.listen(DeploymentGeneration.__table__, "after_create", DDL(_statement))
 
 
 class DeviceSettings(Base):

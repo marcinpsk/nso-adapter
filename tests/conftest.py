@@ -571,6 +571,18 @@ async def seed_device(
         return d.id
 
 
+async def note_projection_write(db, device_id: int, stream: str) -> None:
+    """Record the projection write an intent endpoint performs before it enqueues (#1522 §G2).
+
+    Production never reaches ``enqueue_apply``/``enqueue_removal`` without it — the mutation
+    site records the revision the enqueue then promotes — so a test that drives those choke
+    points directly has to perform it too, or the promotion has nothing to authorize.
+    """
+    from nso_adapter.core.generation import note_write
+
+    await note_write(db, device_id, stream)
+
+
 async def start_job(job_id: int) -> int:
     """Stand in for the worker head's ``queued -> running`` transition. Returns the attempt.
 

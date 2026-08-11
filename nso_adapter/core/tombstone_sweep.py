@@ -62,6 +62,35 @@ def _removal_context(row: StaticRouteTombstone) -> dict:
     }
 
 
+async def reissue_removal_job(conn, device_id: int, row: StaticRouteTombstone) -> Job:
+    """Re-issue *row*'s removal as a generation and the job that carries it. Caller commits.
+
+    Shared by the sweeper and the reclaimer, which are the same operation reached from two
+    directions: a deletion an earlier push already authorized still has no proof of delivery.
+    It PROMOTES NOTHING — there is no new operator intent — but it does take a place in the
+    device's ordered chain, so it cannot cross a blocked head and a later push cannot cross
+    it (#1522 §H2).
+    """
+    from nso_adapter.core.generation import create_reissue_generation
+    from nso_adapter.store.models import GenerationMode
+
+    context = _removal_context(row)
+    generation = await create_reissue_generation(
+        conn,
+        device_id,
+        mode=GenerationMode.detach if context["detach"] else GenerationMode.networked,
+        removal_context=context,
+        allowed_removal_keys=context["removed"],
+    )
+    job = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued, context=context)
+    conn.add(job)
+    await conn.flush()
+    generation.job_id = job.id
+    row.job_id = job.id
+    await conn.flush()
+    return job
+
+
 async def _devices_with_eligible_tombstones(db: AsyncSession | None = None) -> list[int]:
     async with claim_session(db) as conn:
         rows = await conn.execute(
@@ -124,15 +153,7 @@ async def sweep_one_device(device_id: int, *, db: AsyncSession | None = None) ->
                 .all()
             )
             for row in rows:
-                job = Job(
-                    job_type=JobType.removal,
-                    device_id=device_id,
-                    status=JobStatus.queued,
-                    context=_removal_context(row),
-                )
-                conn.add(job)
-                await conn.flush()
-                row.job_id = job.id
+                await reissue_removal_job(conn, device_id, row)
                 created += 1
             await conn.commit()
     finally:

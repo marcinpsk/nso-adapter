@@ -15,7 +15,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
+from nso_adapter.api.intent_push import admit_or_replay, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.store import outcome_store
@@ -347,9 +348,14 @@ class SnmpIntentResult(BaseModel):
     "/{device_id}/snmp-intent",
     dependencies=[Depends(verify_token)],
     response_model=SnmpIntentResult,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_PUSH_SEQ, **RESP_422_VALIDATION},
 )
-async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSession = Depends(get_db)):
+async def put_snmp_intent(
+    device_id: int,
+    body: SnmpIntentUpdate,
+    db: AsyncSession = Depends(get_db),
+    delivery=Depends(get_intent_delivery),
+):
     """Replace the adapter's SNMP intent mirror for this device atomically.
 
     Full-replace semantics: rows not present in the request body are deleted.
@@ -360,6 +366,17 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+
+    # Every accepted write records its projection revision, store-only and
+    # auto-apply-off included, and takes the device's projection lock before anything is
+    # read (#1522 §G2). Only a promotion authorizes a deployment.
+    from nso_adapter.core.generation import note_write
+    from nso_adapter.core.receipt import record_response
+    from nso_adapter.core.request_flags import PUSH_SEQ
+
+    await note_write(db, device_id, delivery.stream, push_seq=PUSH_SEQ.get())
+    if (replay := await admit_or_replay(db, device_id, delivery)) is not None:
+        return replay
 
     now = datetime.now(UTC)
 
@@ -429,7 +446,7 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
     if settings and settings.auto_apply and total_count > 0:
         from nso_adapter.core.apply import enqueue_apply
 
-        await enqueue_apply(db, device_id, force=True)
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
 
     # A removal reverts on-device via an ASYNC removal job (like every other scope) — the
     # PUT no longer blocks on a full replace-mode device commit (which could stall the PUT
@@ -446,10 +463,20 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
             db,
             device_id,
             "snmp",
+            promotes=(delivery.stream,),
             removed={"community": removed_comms, "v3-user": removed_users, "host": removed_hosts},
             vault_refs={label: ref for label, ref in removed_comm_refs.items() if ref},
         )
 
+    result = {
+        "device_id": device_id,
+        "community_count": comm_count,
+        "v3_user_count": user_count,
+        "host_count": host_count,
+        "has_system_info": body.system_info is not None,
+        "updated_at": iso_z(now),
+    }
+    await record_response(db, device_id, delivery, result)
     await db.commit()
 
     logger.info(
@@ -460,11 +487,4 @@ async def put_snmp_intent(device_id: int, body: SnmpIntentUpdate, db: AsyncSessi
         host_count=host_count,
         has_system_info=body.system_info is not None,
     )
-    return {
-        "device_id": device_id,
-        "community_count": comm_count,
-        "v3_user_count": user_count,
-        "host_count": host_count,
-        "has_system_info": body.system_info is not None,
-        "updated_at": iso_z(now),
-    }
+    return result

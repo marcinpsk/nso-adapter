@@ -13,7 +13,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, IntentApplyResult, api_error
+from nso_adapter.api.errors import (
+    RESP_401,
+    RESP_404_DEVICE,
+    RESP_409_PUSH_SEQ,
+    RESP_422_VALIDATION,
+    IntentApplyResult,
+    api_error,
+)
+from nso_adapter.api.intent_push import admit_or_replay, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.core.removal import is_cleared
@@ -200,9 +208,14 @@ async def _sync_local_levels(
     "/{device_id}/logging-intent",
     dependencies=[Depends(verify_token)],
     response_model=IntentApplyResult,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_PUSH_SEQ, **RESP_422_VALIDATION},
 )
-async def put_logging_intent(device_id: int, body: LoggingIntentUpdate, db: AsyncSession = Depends(get_db)):
+async def put_logging_intent(
+    device_id: int,
+    body: LoggingIntentUpdate,
+    db: AsyncSession = Depends(get_db),
+    delivery=Depends(get_intent_delivery),
+):
     """Replace the adapter's remote-syslog + local-levels intent mirror atomically.
 
     Full-replace semantics for ``hosts``: rows not present in the request body are
@@ -213,6 +226,17 @@ async def put_logging_intent(device_id: int, body: LoggingIntentUpdate, db: Asyn
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+
+    # Every accepted write records its projection revision, store-only and
+    # auto-apply-off included, and takes the device's projection lock before anything is
+    # read (#1522 §G2). Only a promotion authorizes a deployment.
+    from nso_adapter.core.generation import note_write
+    from nso_adapter.core.receipt import record_response
+    from nso_adapter.core.request_flags import PUSH_SEQ
+
+    await note_write(db, device_id, delivery.stream, push_seq=PUSH_SEQ.get())
+    if (replay := await admit_or_replay(db, device_id, delivery)) is not None:
+        return replay
 
     existing_result = await db.execute(select(LoggingHostIntent).where(LoggingHostIntent.device_id == device_id))
     existing_rows: dict[str, LoggingHostIntent] = {r.address: r for r in existing_result.scalars().all()}
@@ -251,15 +275,6 @@ async def put_logging_intent(device_id: int, body: LoggingIntentUpdate, db: Asyn
 
     await db.flush()
 
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
-    if settings and settings.auto_apply and (count > 0 or levels_count > 0):
-        from nso_adapter.core.apply import enqueue_apply
-
-        await enqueue_apply(db, device_id, force=True)
-
-    await db.commit()
-
     replaced = False
     if removed or cleared or levels_cleared:
         from nso_adapter.core.removal import replace_on_removal
@@ -269,4 +284,14 @@ async def put_logging_intent(device_id: int, body: LoggingIntentUpdate, db: Asyn
             db, device, removed, LoggingHostIntent, apply_logging_config, retract=cleared or levels_cleared
         )
 
-    return {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}
+    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    settings = settings_result.scalar_one_or_none()
+    if settings and settings.auto_apply and (count > 0 or levels_count > 0):
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
+
+    result = {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}
+    await record_response(db, device_id, delivery, result)
+    await db.commit()
+    return result

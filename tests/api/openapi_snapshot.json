@@ -1588,6 +1588,8 @@
               "no_nso_client",
               "nso_unavailable",
               "secrets_write_unsupported",
+              "sequence_reuse",
+              "stale",
               "vault_error"
             ],
             "title": "Code",
@@ -1973,6 +1975,36 @@
           "scope"
         ],
         "title": "ForceRemovalBody",
+        "type": "object"
+      },
+      "GenerationOut": {
+        "description": "The blocked head a retry or an abandon acted on.",
+        "properties": {
+          "generation_id": {
+            "title": "Generation Id",
+            "type": "integer"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "seq": {
+            "title": "Seq",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "generation_id",
+          "seq"
+        ],
+        "title": "GenerationOut",
         "type": "object"
       },
       "HTTPValidationError": {
@@ -8849,6 +8881,84 @@
         ]
       }
     },
+    "/api/v1/devices/{device_id}/actions/abandon-generation": {
+      "post": {
+        "description": "Give up on this device's blocked generation so its successors may run (#1522 \u00a7H2).\n\nThe other exit. Deliberately destructive of intent: this deployment is recorded as never\ndelivered and the chain moves past it, so the operator is asserting that the device state\nit was meant to establish is either already there or no longer wanted.",
+        "operationId": "action_abandon_generation_api_v1_devices__device_id__actions_abandon_generation_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenerationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request validation failed (envelope shape)"
+          }
+        },
+        "security": [
+          {
+            "_OptionalBearer": []
+          }
+        ],
+        "summary": "Action Abandon Generation",
+        "tags": [
+          "actions"
+        ]
+      }
+    },
     "/api/v1/devices/{device_id}/actions/apply": {
       "post": {
         "description": "Phase 2 \u2014 push accepted NetBox intent to NSO via reconcile-commit service.",
@@ -9171,7 +9281,7 @@
     },
     "/api/v1/devices/{device_id}/actions/force-removal": {
       "post": {
-        "description": "Re-run a scope's removal with the collateral guard DISABLED.\n\nThe operator override for a ``removal_blocked_collateral`` failure: after\nreviewing the blocked job's orphan list + dry-run preview, this deliberately\nflushes the orphaned service rows (PUT-replace with only the remaining intent).\n\n``interface_config`` is per-instance (interface-reconciler is keyed by\n``(device, interface-name)``), so its removal job flushes exactly the interfaces named\nin *interfaces* \u2014 with none, ``_replace_interface_config`` iterates an empty list and\nthe job succeeds having pushed NOTHING, telling the operator their orphaned addresses\nwere flushed while the config is still live on the device. Reject that rather than\nsucceed at nothing.",
+        "description": "Re-run a scope's removal with the collateral guard DISABLED.\n\nThe operator override for a ``removal_blocked_collateral`` failure: after\nreviewing the blocked job's orphan list + dry-run preview, this deliberately\nflushes the orphaned service rows (PUT-replace with only the remaining intent).\n\n``interface_config`` is per-instance (interface-reconciler is keyed by\n``(device, interface-name)``), so its removal job flushes exactly the interfaces named\nin *interfaces* \u2014 with none, ``_replace_interface_config`` iterates an empty list and\nthe job succeeds having pushed NOTHING, telling the operator their orphaned addresses\nwere flushed while the config is still live on the device. Reject that rather than\nsucceed at nothing.\n\nIt PROMOTES NOTHING (#1522 \u00a7G2). The flush re-deploys state an earlier push already\nauthorized, with the guard off, so ``enqueue_removal`` gives it a reissue generation.\nTreating it as an operator write instead authorized every stream of the family, and its\nsettlement then certified them applied \u2014 the sibling lane's un-promoted store-only state\nincluded, on interfaces this job never sends.",
         "operationId": "action_force_removal_api_v1_devices__device_id__actions_force_removal_post",
         "parameters": [
           {
@@ -9252,6 +9362,84 @@
           }
         ],
         "summary": "Action Force Removal",
+        "tags": [
+          "actions"
+        ]
+      }
+    },
+    "/api/v1/devices/{device_id}/actions/retry-generation": {
+      "post": {
+        "description": "Re-admit this device's blocked deployment generation (#1522 \u00a7H2).\n\nOne of the two explicit exits from the success barrier. The head is re-queued with the\nSAME document, mode and digest \u2014 it is re-sent, never rebuilt \u2014 and its successors go\nback to waiting behind it. Use it after fixing whatever the device refused.",
+        "operationId": "action_retry_generation_api_v1_devices__device_id__actions_retry_generation_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenerationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request validation failed (envelope shape)"
+          }
+        },
+        "security": [
+          {
+            "_OptionalBearer": []
+          }
+        ],
+        "summary": "Action Retry Generation",
         "tags": [
           "actions"
         ]
@@ -9633,6 +9821,16 @@
             },
             "description": "Device not found"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -9778,6 +9976,16 @@
               }
             },
             "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
           },
           "422": {
             "content": {
@@ -10088,6 +10296,16 @@
             },
             "description": "Device not found"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -10369,6 +10587,16 @@
             },
             "description": "Device not found"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -10585,6 +10813,16 @@
             },
             "description": "Device not found"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -10663,6 +10901,16 @@
             },
             "description": "Device not found"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -10740,6 +10988,16 @@
               }
             },
             "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
           },
           "422": {
             "content": {
@@ -10885,6 +11143,16 @@
               }
             },
             "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
           },
           "422": {
             "content": {
@@ -11318,6 +11586,16 @@
             },
             "description": "Device not found"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -11462,6 +11740,16 @@
               }
             },
             "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
           },
           "422": {
             "content": {
@@ -11798,6 +12086,16 @@
               }
             },
             "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
           },
           "422": {
             "content": {
@@ -12302,6 +12600,16 @@
             },
             "description": "Device not found"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -12521,7 +12829,7 @@
                 }
               }
             },
-            "description": "A job is already running for this device"
+            "description": "The device is busy with another operation, or X-Push-Seq was reused with a different body or mode / is older than the admitted one"
           },
           "422": {
             "content": {
@@ -12736,6 +13044,16 @@
             },
             "description": "Device not found"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -12881,6 +13199,16 @@
               }
             },
             "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
           },
           "422": {
             "content": {
@@ -13203,7 +13531,7 @@
     },
     "/api/v1/devices/{device_id}/vlan-intent": {
       "put": {
-        "description": "Replace the adapter's VLAN-database intent mirror for this device atomically.\n\nFull-replace: rows not in the body are deleted. ``accepted_at`` defaults to now.\nIf ``auto_apply`` is enabled on the device, an apply job is enqueued. The single\ndevice Apply commits these via the vlan-reconciler.",
+        "description": "Replace the adapter's VLAN-database intent mirror for this device atomically.\n\nFull-replace: rows not in the body are deleted. ``accepted_at`` defaults to now.\nIf ``auto_apply`` is enabled on the device, an apply job is enqueued. The single\ndevice Apply commits these via the vlan-reconciler.\n\nONE transaction covers the whole delivery (#1522 \u00a7G1/\u00a7G2): the receipt that admits this\n``X-Push-Seq``, the row changes, the projection revision, the deployment generations the\nchange authorizes, their jobs, and the stored response. A re-delivery of the same\nsequence replays that response and applies nothing; the same sequence with a different\nbody, or an older sequence, is refused.",
         "operationId": "put_vlan_intent_api_v1_devices__device_id__vlan_intent_put",
         "parameters": [
           {
@@ -13256,6 +13584,16 @@
               }
             },
             "description": "Device not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one"
           },
           "422": {
             "content": {

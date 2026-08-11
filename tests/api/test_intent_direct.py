@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from nso_adapter.api.errors import ApiError
 from nso_adapter.api.intent import IntentAttribute, IntentUpdate, get_intent, put_intent
+from nso_adapter.core.receipt import IntentDelivery
 from nso_adapter.store.models import (
     DbInterface,
     Device,
@@ -22,6 +23,10 @@ from nso_adapter.store.models import (
     SyncState,
 )
 from tests.conftest import session
+
+#: What the ``get_intent_delivery`` dependency resolves to for this endpoint on an UNKEYED
+#: delivery. These tests call the handler directly, so FastAPI resolves nothing for them.
+UNKEYED = IntentDelivery(stream="interface_config", identity=None)
 
 
 async def _seed_device_with_interface(nso_device_name: str, netbox_id: int):
@@ -46,7 +51,7 @@ async def test_put_intent_device_not_found(adapter_client):
     async with session() as db:
         body = IntentUpdate(attributes=[])
         with pytest.raises(ApiError) as exc_info:
-            await put_intent(device_id=99992, body=body, db=db)
+            await put_intent(device_id=99992, body=body, db=db, delivery=UNKEYED)
         assert exc_info.value.status_code == 404
 
 
@@ -55,7 +60,7 @@ async def test_put_intent_empty_attributes(adapter_client):
     device_id, _ = await _seed_device_with_interface("intent-dev-01", 1200)
     async with session() as db:
         body = IntentUpdate(attributes=[])
-        result = await put_intent(device_id=device_id, body=body, db=db)
+        result = await put_intent(device_id=device_id, body=body, db=db, delivery=UNKEYED)
         assert result["device_id"] == device_id
         assert result["attribute_count"] == 0
 
@@ -69,7 +74,7 @@ async def test_put_intent_inserts_known_interface(adapter_client):
                 IntentAttribute(interface="GigabitEthernet0/2", attribute="description", intent_value="my-desc")
             ]
         )
-        result = await put_intent(device_id=device_id, body=body, db=db)
+        result = await put_intent(device_id=device_id, body=body, db=db, delivery=UNKEYED)
         assert result["attribute_count"] == 1
 
 
@@ -81,7 +86,7 @@ async def test_put_intent_unknown_interface_lands(adapter_client):
         body = IntentUpdate(
             attributes=[IntentAttribute(interface="ae0.7", attribute="description", intent_value="val")]
         )
-        result = await put_intent(device_id=device_id, body=body, db=db)
+        result = await put_intent(device_id=device_id, body=body, db=db, delivery=UNKEYED)
         assert result["attribute_count"] == 1  # landed, not skipped
     async with session() as db:
         iface = (
@@ -117,7 +122,7 @@ async def test_put_intent_transitions_imported_to_accepted(adapter_client):
                 IntentAttribute(interface="GigabitEthernet0/2", attribute="description", intent_value="new-val")
             ]
         )
-        result = await put_intent(device_id=device_id, body=body, db=db)
+        result = await put_intent(device_id=device_id, body=body, db=db, delivery=UNKEYED)
         assert result["attribute_count"] == 1
 
 
@@ -133,9 +138,9 @@ async def test_put_intent_auto_apply_triggers_enqueue(adapter_client):
             attributes=[IntentAttribute(interface="GigabitEthernet0/2", attribute="description", intent_value="v")]
         )
         with patch("nso_adapter.core.apply.enqueue_apply", new_callable=AsyncMock) as mock_enq:
-            result = await put_intent(device_id=device_id, body=body, db=db)
+            result = await put_intent(device_id=device_id, body=body, db=db, delivery=UNKEYED)
         assert result["attribute_count"] == 1
-        mock_enq.assert_called_once_with(db, device_id, force=True)
+        mock_enq.assert_called_once_with(db, device_id, force=True, stream="interface_config")
 
 
 async def test_put_intent_replaces_existing_intent(adapter_client):
@@ -145,13 +150,13 @@ async def test_put_intent_replaces_existing_intent(adapter_client):
         body1 = IntentUpdate(
             attributes=[IntentAttribute(interface="GigabitEthernet0/2", attribute="description", intent_value="first")]
         )
-        await put_intent(device_id=device_id, body=body1, db=db)
+        await put_intent(device_id=device_id, body=body1, db=db, delivery=UNKEYED)
 
     async with session() as db:
         body2 = IntentUpdate(
             attributes=[IntentAttribute(interface="GigabitEthernet0/2", attribute="description", intent_value="second")]
         )
-        result = await put_intent(device_id=device_id, body=body2, db=db)
+        result = await put_intent(device_id=device_id, body=body2, db=db, delivery=UNKEYED)
         assert result["attribute_count"] == 1
 
 
@@ -190,7 +195,7 @@ async def test_get_intent_returns_set_intent(adapter_client):
                 )
             ]
         )
-        await put_intent(device_id=device_id, body=body, db=db)
+        await put_intent(device_id=device_id, body=body, db=db, delivery=UNKEYED)
 
     async with session() as db:
         result = await get_intent(device_id=device_id, db=db)

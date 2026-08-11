@@ -187,6 +187,18 @@ async def enqueue_job(
     if job_type not in _JOB_RUNNERS:
         raise ValueError(f"No runner registered for job type {job_type!r}")
 
+    if job_type is JobType.apply and device_id is not None:
+        # §H4's atomic-under-lock boundary, taken BEFORE anything is selected: WHICH streams
+        # this Apply promotes, the document they authorize and the job that carries it are
+        # one unit against every other projection writer. Selecting first and locking inside
+        # create_generation left a window in which a stream committed after the selection
+        # was promoted by nobody — its intent stayed undeployed with no record of why.
+        # It also fixes the lock order on this path: every other producer takes the
+        # projection lock before it touches a job row.
+        from nso_adapter.core.generation import lock_projection
+
+        await lock_projection(db, device_id)
+
     # Atomic same-type queued dedupe. No check-then-insert: the DB decides, so no TOCTOU
     # window exists and a conflict never surfaces as an IntegrityError the caller must
     # recover from. A queued removal does not refuse a sync, and a running job does not
@@ -199,11 +211,42 @@ async def enqueue_job(
     if created is None:  # pragma: no cover - retries exhausted under sustained contention
         raise RuntimeError(f"could not admit a {job_type} job for device {device_id}")
 
+    if job_type is JobType.apply and device_id is not None:
+        await _authorize_apply_job(db, device_id, created)
+
     # This helper owns the outer commit and its API/scheduler callers depend on that:
     # get_db does not auto-commit.
     await db.commit()
     await db.refresh(created)
     return created, True
+
+
+async def _authorize_apply_job(db: AsyncSession, device_id: int, job: Job) -> None:
+    """Give an operator-triggered Apply its deployment generation (#1522 §G1/§H4).
+
+    Here rather than in the API handler, and inside the SAME transaction as the job insert:
+    an apply job with no generation is a device write with no place in the device's ordered
+    chain — free to cross a blocked head, and settling nothing when it succeeds.
+
+    Pressing Apply IS the authorization for what the store holds; that is already what the
+    apply job pushes. So every stream with a desired state is promoted and the resulting
+    complete document becomes what the job deploys. The plugin-side selection of WHICH
+    revisions an Apply promotes (§H4) narrows this set in slice 2; it does not change the
+    shape.
+
+    The caller already holds the device's projection lock, so the selection below and the
+    promotion that follows read one snapshot.
+    """
+    from nso_adapter.core.generation import attach_to_job, authorized_streams, create_generation
+    from nso_adapter.store.models import GenerationMode
+
+    streams = await authorized_streams(db, device_id)
+    if not streams:
+        # Nothing has ever been written for this device: the apply has nothing to deploy, and
+        # a generation over an empty document would order a device write that does not exist.
+        return
+    generation = await create_generation(db, device_id, streams=streams, mode=GenerationMode.networked)
+    await attach_to_job(db, generation, job)
 
 
 # The provision dedupe index's expressions and predicate, verbatim and defined ONCE: the

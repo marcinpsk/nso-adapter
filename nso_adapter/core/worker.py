@@ -179,27 +179,58 @@ async def _claim_next_job() -> tuple[int, int | None, JobType, ClaimRegistration
 
 
 async def _start_head_under_claim(device_id: int, reg: ClaimRegistration) -> tuple[int, int, JobType] | None:
-    """Lock this device's exact queued head under the claim and start it. One transaction."""
+    """Lock this device's first ADMISSIBLE queued job under the claim and start it.
+
+    One transaction. The candidates are walked in per-device FIFO order and the first one the
+    success barrier admits is started — stopping at an inadmissible head instead would wedge
+    the device for good: a retried generation cannot always take over a queued successor's
+    job (a removal may not take over an apply, or the reverse), so its own job is created
+    LATER and sits behind the very successor its failure blocks. Nothing is reordered by
+    this: a generation-carrying job is admissible only when every predecessor generation has
+    settled or been abandoned, so an admissible successor is one the barrier already cleared.
+
+    Each candidate is still locked BY EXACT ID with ``SKIP LOCKED``, and a skipped lock ends
+    the whole attempt rather than moving on — an endpoint holding a queued winner means its
+    intent is not visible yet, and running a later job in that window is the FIFO break the
+    lock exists to prevent.
+    """
+    from nso_adapter.core.generation import job_admissible, mark_job_generations_running
+
     async for db in get_session():
         await lock_claim(db, reg)  # claim -> jobs, per the global lock order
 
-        head = await db.scalar(
-            select(Job.id)
-            .where(Job.device_id == device_id, Job.status == JobStatus.queued)
-            .order_by(Job.created_at, Job.id)
-            .limit(1)
+        candidates = (
+            (
+                await db.execute(
+                    select(Job.id)
+                    .where(Job.device_id == device_id, Job.status == JobStatus.queued)
+                    .order_by(Job.created_at, Job.id)
+                )
+            )
+            .scalars()
+            .all()
         )
-        if head is None:
-            await db.rollback()
-            return None
 
-        # By EXACT id, so a locked head is never silently replaced by a later job.
-        job = await db.scalar(
-            select(Job).where(Job.id == head, Job.status == JobStatus.queued).with_for_update(skip_locked=True)
-        )
+        job = None
+        for candidate in candidates:
+            # By EXACT id, so a locked head is never silently replaced by a later job.
+            locked = await db.scalar(
+                select(Job).where(Job.id == candidate, Job.status == JobStatus.queued).with_for_update(skip_locked=True)
+            )
+            if locked is None:
+                await db.rollback()
+                return None
+            # The success barrier (#1522 §H2). Selecting a queued job is NOT enough on its
+            # own: a job carrying generation N+1 must not run while N is failed or its
+            # outcome unknown, or the successor deploys over a state nobody established.
+            if await job_admissible(db, locked.id, device_id):
+                job = locked
+                break
+            logger.debug("worker.skipped_inadmissible", device_id=device_id, job_id=locked.id)
         if job is None:
             await db.rollback()
             return None
+        await mark_job_generations_running(db, job.id)
 
         claimed = (job.id, device_id, job.job_type)
         now = _now()
@@ -630,10 +661,28 @@ async def _run_one_job(
             await hb
         _drains.pop(task, None)
 
+    if device_id is not None and not seen.hit:
+        # This run settled (or blocked) its generations; the NEXT one may now be startable
+        # and, if its own admission could not attach it to a job, has none yet. Own
+        # transaction on purpose — a job insert inside the terminal transaction would put
+        # the ``jobs -> devices`` FK edge back into it. Skipped on a cancellation: shutdown
+        # must not open one more DB round trip, and startup recovery advances the chain.
+        await _advance_generations(device_id)
+
     if seen.hit:
         # Re-raised only now, after every cleanup step. Recorded rather than propagated at the
         # point of the cancel, because propagating there skipped the disposition and release.
         raise asyncio.CancelledError()
+
+
+async def _advance_generations(device_id: int) -> None:
+    """Hand the device's next executable generation a job. Never fails the finished run."""
+    from nso_adapter.core.generation import advance_device_generations
+
+    try:
+        await advance_device_generations(device_id)
+    except Exception as exc:  # noqa: BLE001 — the run is over; startup recovery re-advances
+        logger.warning("worker.generation_advance_failed", device_id=device_id, error=repr(exc))
 
 
 async def _dispose(job_id: int, job_type: JobType, reg: ClaimRegistration) -> ClaimOutcome:
@@ -767,6 +816,7 @@ async def requeue_orphaned_jobs() -> None:
 async def start_workers(concurrency: int = 1) -> None:
     """Reconcile orphaned jobs, then start the worker pool."""
     global _stop, _workers
+    from nso_adapter.core.generation import recover_generations
     from nso_adapter.core.tombstone_sweep import sweep_tombstones
     from nso_adapter.store.device_settle import ensure_settle_counters
 
@@ -775,6 +825,10 @@ async def start_workers(concurrency: int = 1) -> None:
     # repair could be aborted out of the lifespan by the very state it exists to fix.
     await ensure_settle_counters()
     await requeue_orphaned_jobs()
+    # After the job recovery, so a generation whose job was just requeued is still covered,
+    # and before the pool starts: a generation the dead process left ``running`` has an
+    # unknown outcome and must block its successors from the first poll onwards (#1522 §H2).
+    await recover_generations()
     # Before any worker exists, so a revoked device is immediately claimable again.
     await reap_stale_claims()
     # And before the pool drains anything: a deletion whose removal job was lost with the

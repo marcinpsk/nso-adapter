@@ -1,0 +1,261 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
+"""Receipt admission across the WHOLE in-protocol intent vocabulary (#1558 items 8-10).
+
+Three things are pinned here, all against the real app over real HTTP:
+
+* the stream vocabulary is derived from the intent-PUT ENDPOINTS, not from the removal
+  scopes — so ``ip`` and ``isis_flex_algo``, which have a PUT and no removal scope, are
+  admissible, and a future endpoint cannot silently fall out of the protocol;
+* every in-protocol endpoint admits, replays and refuses, not just the vlan vertical;
+* the receipt's identity includes the request MODE, so one sequence carrying one body
+  cannot alias a store-only, a delete-origin and a networked operation.
+"""
+
+from __future__ import annotations
+
+import pytest
+import sqlalchemy as sa
+from fastapi.routing import iter_route_contexts
+
+from tests.conftest import VALID_TOKEN, seed_device, session
+
+pytestmark = pytest.mark.anyio
+
+AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
+
+#: One minimal, valid body per in-protocol intent PUT. Empty payloads on purpose: what is
+#: under test is admission, and an empty full-replace is a legal delivery for every family.
+MINIMAL_BODIES: dict[str, dict] = {
+    "/api/v1/devices/{device_id}/bfd-intent": {"interfaces": []},
+    "/api/v1/devices/{device_id}/bgp-intent": {"routers": []},
+    "/api/v1/devices/{device_id}/intent": {"attributes": []},
+    "/api/v1/devices/{device_id}/interface-mtu-intent": {"interfaces": []},
+    "/api/v1/devices/{device_id}/ip-intent": {"addresses": []},
+    "/api/v1/devices/{device_id}/isis-flex-algo-intent": {"flex_algos": []},
+    "/api/v1/devices/{device_id}/isis-interface-intent": {"interfaces": []},
+    "/api/v1/devices/{device_id}/l2-sap-intent": {"saps": []},
+    "/api/v1/devices/{device_id}/logging-intent": {"hosts": []},
+    "/api/v1/devices/{device_id}/ospf-intent": {},
+    "/api/v1/devices/{device_id}/route-policy-intent": {"objects": []},
+    "/api/v1/devices/{device_id}/snmp-intent": {},
+    "/api/v1/devices/{device_id}/static-route-intent": {"routes": []},
+    "/api/v1/devices/{device_id}/subinterface-intent": {"interfaces": []},
+    "/api/v1/devices/{device_id}/svi-intent": {"interfaces": []},
+    "/api/v1/devices/{device_id}/vlan-intent": {"vlans": []},
+}
+
+
+def _put_routes():
+    from nso_adapter.main import create_app
+
+    return [r for r in iter_route_contexts(create_app().routes) if "PUT" in (r.methods or ())]
+
+
+def _walk_dependant(dependant):
+    for dep in dependant.dependencies:
+        yield dep.call
+        yield from _walk_dependant(dep)
+
+
+async def _receipt(device_id: int, stream: str):
+    from nso_adapter.store.models import IntentPushReceipt
+
+    async with session() as db:
+        return await db.scalar(
+            sa.select(IntentPushReceipt).where(
+                IntentPushReceipt.device_id == device_id,
+                IntentPushReceipt.section == stream,
+            )
+        )
+
+
+def _url(path: str, device_id: int) -> str:
+    return path.replace("{device_id}", str(device_id))
+
+
+# ── item 10: the vocabulary comes from the endpoints ──────────────────────────
+
+
+def test_every_in_protocol_intent_put_has_an_admissible_stream():
+    """A PUT that is neither registered nor explicitly out of protocol fails HERE.
+
+    The vocabulary used to be derived from the removal scopes, which have no entry for the
+    interface-IP or the IS-IS flex-algo PUT — both keyed by the plugin, both unadmittable.
+    """
+    from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS, OUT_OF_PROTOCOL_PUTS
+
+    live = {route.path for route in _put_routes()}
+    assert live - OUT_OF_PROTOCOL_PUTS == set(INTENT_PUT_ENDPOINTS)
+    assert OUT_OF_PROTOCOL_PUTS <= live, "an out-of-protocol exemption names a route that no longer exists"
+
+
+def test_the_stream_vocabulary_is_the_sixteen_endpoint_streams():
+    from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS, INTENT_STREAMS
+
+    assert INTENT_STREAMS == {endpoint.stream for endpoint in INTENT_PUT_ENDPOINTS.values()}
+    assert len(INTENT_STREAMS) == len(INTENT_PUT_ENDPOINTS) == 16
+    # The two the removal-scope derivation could never reach.
+    assert {"ip", "isis_flex_algo"} <= INTENT_STREAMS
+
+
+def test_every_intent_stream_promotes_a_real_projection_family():
+    from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS
+    from nso_adapter.core.projection import projection_sections, projection_streams
+
+    known = projection_sections()
+    for path, endpoint in INTENT_PUT_ENDPOINTS.items():
+        assert endpoint.promotes in known, f"{path} promotes unknown projection section {endpoint.promotes!r}"
+    assert projection_streams() == {endpoint.stream for endpoint in INTENT_PUT_ENDPOINTS.values()}
+
+
+def test_every_in_protocol_put_injects_the_delivery_dependency():
+    """The admission seam is a dependency, so an endpoint cannot join without one."""
+    from nso_adapter.api.intent_push import get_intent_delivery
+    from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS
+
+    for route in _put_routes():
+        if route.path not in INTENT_PUT_ENDPOINTS:
+            continue
+        assert get_intent_delivery in set(_walk_dependant(route.dependant)), (
+            f"{route.path} does not inject get_intent_delivery"
+        )
+
+
+def test_the_minimal_body_table_covers_every_in_protocol_endpoint():
+    from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS
+
+    assert set(MINIMAL_BODIES) == set(INTENT_PUT_ENDPOINTS)
+
+
+# ── item 9: admission is not a single-vertical deferral ───────────────────────
+
+
+@pytest.mark.parametrize("path", sorted(MINIMAL_BODIES))
+async def test_every_in_protocol_endpoint_admits_replays_and_refuses(adapter_client, path):
+    """One keyed delivery per endpoint: admitted, replayed verbatim, then refused as stale."""
+    from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS
+
+    stream = INTENT_PUT_ENDPOINTS[path].stream
+    device_id = await seed_device(nso_device_name=f"rcp-{stream}", netbox_device_id=None)
+    url = _url(path, device_id)
+    body = MINIMAL_BODIES[path]
+
+    first = await adapter_client.put(url, json=body, headers={**AUTH, "X-Push-Seq": "7"})
+    assert first.status_code == 200, first.text
+    receipt = await _receipt(device_id, stream)
+    assert receipt is not None, f"{path} accepted a keyed push without writing a receipt"
+    assert receipt.push_seq == 7
+
+    replay = await adapter_client.put(url, json=body, headers={**AUTH, "X-Push-Seq": "7"})
+    assert replay.status_code == 200
+    assert replay.json() == first.json(), f"{path} did not replay the stored response"
+
+    stale = await adapter_client.put(url, json=body, headers={**AUTH, "X-Push-Seq": "6"})
+    assert stale.status_code == 409
+    assert stale.json()["error"]["code"] == "stale"
+
+
+@pytest.mark.parametrize("path", sorted(MINIMAL_BODIES))
+async def test_an_unkeyed_delivery_stays_legal_and_writes_no_receipt(adapter_client, path):
+    from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS
+
+    stream = INTENT_PUT_ENDPOINTS[path].stream
+    device_id = await seed_device(nso_device_name=f"rcp-unkeyed-{stream}", netbox_device_id=None)
+
+    resp = await adapter_client.put(_url(path, device_id), json=MINIMAL_BODIES[path], headers=AUTH)
+    assert resp.status_code == 200, resp.text
+    assert await _receipt(device_id, stream) is None
+
+
+# ── item 8: the mode is part of the receipt identity ──────────────────────────
+
+
+@pytest.mark.parametrize("query", ["?store_only=true", "?delete_origin=true"])
+async def test_the_same_sequence_and_body_in_another_mode_is_refused(adapter_client, query):
+    """Same seq, same bytes, different operation — refused, never replayed as the first one."""
+    device_id = await seed_device(nso_device_name=f"rcp-mode{query[1:6]}", netbox_device_id=None)
+    body = {"vlans": [{"vlan_id": 10, "name": "ten"}]}
+    url = f"/api/v1/devices/{device_id}/vlan-intent"
+
+    assert (await adapter_client.put(url, json=body, headers={**AUTH, "X-Push-Seq": "5"})).status_code == 200
+
+    resp = await adapter_client.put(url + query, json=body, headers={**AUTH, "X-Push-Seq": "5"})
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "sequence_reuse"
+
+
+async def test_a_replay_in_the_same_mode_still_returns_the_stored_response(adapter_client):
+    device_id = await seed_device(nso_device_name="rcp-mode-replay", netbox_device_id=None)
+    body = {"vlans": [{"vlan_id": 10, "name": "ten"}]}
+    url = f"/api/v1/devices/{device_id}/vlan-intent?store_only=true"
+
+    first = await adapter_client.put(url, json=body, headers={**AUTH, "X-Push-Seq": "5"})
+    assert first.status_code == 200
+    replay = await adapter_client.put(url, json=body, headers={**AUTH, "X-Push-Seq": "5"})
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+
+    receipt = await _receipt(device_id, "vlan")
+    assert receipt.store_only is True
+    assert receipt.delete_origin is False
+
+
+async def test_the_receipt_records_the_mode_the_delivery_carried(adapter_client):
+    device_id = await seed_device(nso_device_name="rcp-mode-columns", netbox_device_id=None)
+    url = f"/api/v1/devices/{device_id}/vlan-intent"
+    assert (await adapter_client.put(url, json={"vlans": []}, headers={**AUTH, "X-Push-Seq": "1"})).status_code == 200
+
+    receipt = await _receipt(device_id, "vlan")
+    assert (receipt.store_only, receipt.delete_origin) == (False, False)
+
+    resp = await adapter_client.put(
+        url + "?delete_origin=true", json={"vlans": []}, headers={**AUTH, "X-Push-Seq": "2"}
+    )
+    assert resp.status_code == 200
+    receipt = await _receipt(device_id, "vlan")
+    assert (receipt.store_only, receipt.delete_origin) == (False, True)
+
+
+async def test_two_endpoints_of_one_promotion_family_keep_separate_receipts(adapter_client):
+    """``interface`` and ``ip`` promote one family but are two outbox streams.
+
+    Sharing a receipt row would make the second endpoint's own sequence read as stale.
+    """
+    device_id = await seed_device(nso_device_name="rcp-two-streams", netbox_device_id=None)
+
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/intent", json={"attributes": []}, headers={**AUTH, "X-Push-Seq": "40"}
+    )
+    assert resp.status_code == 200
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ip-intent", json={"addresses": []}, headers={**AUTH, "X-Push-Seq": "3"}
+    )
+    assert resp.status_code == 200, "the ip stream was judged against the interface stream's sequence"
+
+    assert (await _receipt(device_id, "interface_config")).push_seq == 40
+    assert (await _receipt(device_id, "ip")).push_seq == 3
+
+
+# ── the two boundary refusals ─────────────────────────────────────────────────
+
+
+def test_an_unregistered_route_path_has_no_stream():
+    from nso_adapter.core.intent_protocol import intent_endpoint
+
+    with pytest.raises(RuntimeError, match="not a registered in-protocol intent PUT"):
+        intent_endpoint("/api/v1/devices/{device_id}/not-an-intent")
+
+
+async def test_admission_refuses_a_stream_outside_the_vocabulary(adapter_client):
+    """Guessing a stream would dedupe one outbox lane against another's sequences."""
+    from nso_adapter.core.receipt import IntentDelivery, PushIdentity, admit_push
+
+    device_id = await seed_device(nso_device_name="rcp-bad-stream", netbox_device_id=None)
+    delivery = IntentDelivery(
+        stream="lacp",
+        identity=PushIdentity(seq=1, digest="0" * 64, store_only=False, delete_origin=False),
+    )
+    async with session() as db:
+        with pytest.raises(RuntimeError, match="not an in-protocol intent stream"):
+            await admit_push(db, device_id, delivery)
