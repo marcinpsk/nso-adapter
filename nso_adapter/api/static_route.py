@@ -27,7 +27,7 @@ from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z, latest_refreshed
 from nso_adapter.config import get_config
 from nso_adapter.core.claim import ClaimUnavailableError, held_claim, lock_claim
-from nso_adapter.core.request_flags import DELETE_ORIGIN, STORE_ONLY
+from nso_adapter.core.request_flags import STORE_ONLY, request_marking
 from nso_adapter.core.static_route_plan import (
     SR_CLEAR_FIELDS,
     null_route_id_count,
@@ -411,8 +411,13 @@ def _write_tombstones(
     removed_rows: list[StaticRouteIntent],
     *,
     fence_open: bool,
+    markings: dict[int, str],
 ) -> list[StaticRouteTombstone]:
     """Add a carrier for every row this push deletes; the caller stamps the job id.
+
+    *markings* gives each removed row's deletion provenance by intent-row id, rather than
+    this function reading the request flag: the marking is per OBJECT (§4.5), and a carrier
+    marked here is what its removal job's authority is read from later.
 
     Written BEFORE the delete, because the delete expires the attributes they copy, and
     gated on the same ``STORE_ONLY`` check the job enqueue is — a tombstone with no job
@@ -420,7 +425,6 @@ def _write_tombstones(
     """
     if not removed_rows or not fence_open or STORE_ONLY.get():
         return []
-    marking = "delete_origin" if DELETE_ORIGIN.get() else "detach"
     tombstones = [
         StaticRouteTombstone(
             device_id=device_id,
@@ -429,7 +433,7 @@ def _write_tombstones(
             prefix=row.prefix,
             next_hop=row.next_hop,
             deployed_key=row.deployed_key,
-            marking=marking,
+            marking=markings[row.id],
             # Stamped by the caller with the removal job enqueued in THIS transaction. A
             # tombstone left NULL here is, to the sweeper, a deletion whose job never got
             # created.
@@ -494,10 +498,16 @@ async def _apply_static_route_intent(
     matched, removed_rows = _match_payload_to_rows(body.routes, existing)
     _reject_double_claimed_triple(body.routes, matched)
 
-    removed = [(r.vrf, r.prefix, r.next_hop) for r in removed_rows]
-    tombstones = _write_tombstones(db, device_id, removed_rows, fence_open=fence_open)
-    for removed_row in removed_rows:
-        await db.delete(removed_row)
+    # ``?delete_origin`` marks the WHOLE request today, so this map is homogeneous and the
+    # push produces one job. §4.5's activation replaces this one line with the payload's
+    # per-route ``deleted_routes`` markings; nothing below it changes when it does.
+    markings = {row.id: request_marking() for row in removed_rows}
+    removed_by_marking: dict[str, list] = {}
+    for row in removed_rows:
+        removed_by_marking.setdefault(markings[row.id], []).append((row.vrf, row.prefix, row.next_hop))
+    tombstones = _write_tombstones(db, device_id, removed_rows, fence_open=fence_open, markings=markings)
+    for row in removed_rows:
+        await db.delete(row)
 
     now = datetime.now(UTC)
     count = 0
@@ -578,25 +588,23 @@ async def _apply_static_route_intent(
     # the removal must carry the lower (created_at, id) so the worker's per-device head
     # claim runs it first — a retract that lands after the re-apply undoes the apply.
     replaced = False
-    if removed or cleared:
-        from nso_adapter.core.removal import enqueue_removal, removed_map
+    if removed_rows or cleared:
+        from nso_adapter.core.removal import enqueue_static_route_removals
 
         # Direct, not via `replace_on_removal`: that shim commits first and enqueues
         # afterwards, which is what put the apply ahead of the removal and left the
-        # tombstone with no job to point at.
-        removal_job = await enqueue_removal(
-            db,
-            device_id,
-            "static_route",
-            promotes=(delivery.stream,),
-            removed=removed_map("static_route", removed) if removed else None,
-            retract=cleared,
-            shrank=bool(removed),
+        # tombstone with no job to point at. One job per marking, each stamping its own
+        # carriers (§4.5). A homogeneous push, which is every push today, gets exactly one.
+        replaced = bool(
+            await enqueue_static_route_removals(
+                db,
+                device_id,
+                promotes=(delivery.stream,),
+                removed=removed_by_marking,
+                tombstones=tombstones,
+                retract=cleared,
+            )
         )
-        if removal_job is not None:
-            replaced = True
-            for tombstone in tombstones:
-                tombstone.job_id = removal_job.id
 
     settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
     settings = settings_result.scalar_one_or_none()
@@ -613,7 +621,7 @@ async def _apply_static_route_intent(
     result = {
         "device_id": device_id,
         "count": count,
-        "removed": len(removed),
+        "removed": len(removed_rows),
         "replaced": replaced,
         "routes": routes,
     }

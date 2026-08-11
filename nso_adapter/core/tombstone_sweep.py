@@ -23,6 +23,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import acquire_claim, claim_session, lock_claim, release_claim
+from nso_adapter.core.request_flags import DETACH_MARKING
 from nso_adapter.core.static_route_plan import as_triple, triple_of
 from nso_adapter.store.models import Job, JobStatus, JobType, StaticRouteTombstone
 
@@ -50,11 +51,13 @@ def _eligible():
 def _removal_context(row: StaticRouteTombstone) -> dict:
     """Build the removal job's context from the TOMBSTONE, never from request state.
 
-    Deliberately not ``enqueue_removal``: that derives ``detach`` from the request-scoped
-    ``DELETE_ORIGIN`` ContextVar, and the sweeper has no originating request. An unset
-    flag would make every swept job a detach, silently converting a failed
-    **delete-origin** retract into a no-networking retry — a destructive-semantics flip,
-    not a cosmetic default.
+    One job per tombstone, at ITS OWN marking: the carriers of one push can be marked
+    differently (§4.5), and a re-issue that took a marking from anywhere else would convert
+    a failed **delete-origin** retract into a no-networking retry: a destructive-semantics
+    flip, not a cosmetic default.
+
+    Deliberately not ``enqueue_removal``: a re-issue promotes nothing (there is no new
+    operator intent behind it), so it builds its own generation.
     """
     triple = triple_of(row)
     removed = [triple]
@@ -64,7 +67,7 @@ def _removal_context(row: StaticRouteTombstone) -> dict:
     return {
         "scope": "static_route",
         "removed": {"route": [list(key) for key in removed]},
-        "detach": row.marking == "detach",
+        "detach": row.marking == DETACH_MARKING,
         "tombstone_ids": [row.id],
     }
 

@@ -172,7 +172,7 @@ def test_enqueue_removal_requires_a_promotion_disposition():
 async def test_enqueue_removal_rejects_unknown_scope(adapter_client):
     async with session() as db:
         with pytest.raises(ValueError, match="Unknown removal scope"):
-            await enqueue_removal(db, 1, "bogus", promotes=("vlan",))
+            await enqueue_removal(db, 1, "bogus", marking="detach", defer_retract=False, promotes=("vlan",))
 
 
 async def test_enqueue_removal_creates_job_for_each_valid_scope(adapter_client):
@@ -185,7 +185,14 @@ async def test_enqueue_removal_creates_job_for_each_valid_scope(adapter_client):
         async with session() as db:
             stream = section_streams(scope)[0]
             await note_projection_write(db, device_id, stream)
-            job = await enqueue_removal(db, device_id, scope, promotes=(stream,))
+            job = await enqueue_removal(
+                db,
+                device_id,
+                scope,
+                marking="detach",
+                defer_retract=False,
+                promotes=(stream,),
+            )
             await db.commit()
             assert job.job_type == JobType.removal
             assert job.context == {"scope": scope, "detach": True}
@@ -934,6 +941,8 @@ async def test_enqueue_removal_serializes_removed_tuples(adapter_client):
             db,
             device_id,
             "static_route",
+            marking="detach",
+            defer_retract=False,
             promotes=("static_route",),
             removed={"route": [("", "10.0.0.0/24", "192.0.2.1")]},
         )
@@ -1624,15 +1633,27 @@ async def test_run_removal_failure_skips_residue_and_sync(adapter_client):
 
 
 async def test_enqueue_removal_unmarked_shrink_defaults_to_detach(adapter_client):
+    from nso_adapter.core.removal import query_flag_marking
+
     device_id = await _seed_device(nso_device_name="sw-detach")
     async with session() as db:
         await note_projection_write(db, device_id, "svi")
-        job = await enqueue_removal(db, device_id, "svi", promotes=("svi",), removed={"interface": [["Vlan9"]]})
+        marks = query_flag_marking(deletes=True)
+        job = await enqueue_removal(
+            db,
+            device_id,
+            "svi",
+            marking=marks.marking,
+            defer_retract=marks.defer_retract,
+            promotes=("svi",),
+            removed={"interface": [["Vlan9"]]},
+        )
         await db.commit()
         assert job.context["detach"] is True
 
 
 async def test_enqueue_removal_delete_origin_is_real_retraction(adapter_client):
+    from nso_adapter.core.removal import query_flag_marking
     from nso_adapter.core.request_flags import DELETE_ORIGIN
 
     device_id = await _seed_device(nso_device_name="sw-detach")
@@ -1640,7 +1661,16 @@ async def test_enqueue_removal_delete_origin_is_real_retraction(adapter_client):
     try:
         async with session() as db:
             await note_projection_write(db, device_id, "svi")
-            job = await enqueue_removal(db, device_id, "svi", promotes=("svi",), removed={"interface": [["Vlan9"]]})
+            marks = query_flag_marking(deletes=True)
+            job = await enqueue_removal(
+                db,
+                device_id,
+                "svi",
+                marking=marks.marking,
+                defer_retract=marks.defer_retract,
+                promotes=("svi",),
+                removed={"interface": [["Vlan9"]]},
+            )
             await db.commit()
             assert "detach" not in (job.context or {})
     finally:
@@ -1650,7 +1680,16 @@ async def test_enqueue_removal_delete_origin_is_real_retraction(adapter_client):
 async def test_enqueue_removal_force_is_real_retraction(adapter_client):
     device_id = await _seed_device(nso_device_name="sw-detach")
     async with session() as db:
-        job = await enqueue_removal(db, device_id, "svi", promotes=(), removed={"interface": [["Vlan9"]]}, force=True)
+        job = await enqueue_removal(
+            db,
+            device_id,
+            "svi",
+            marking=None,
+            defer_retract=False,
+            promotes=(),
+            removed={"interface": [["Vlan9"]]},
+            force=True,
+        )
         await db.commit()
         assert job.context.get("force") is True
         assert "detach" not in job.context
@@ -1666,7 +1705,9 @@ async def test_enqueue_removal_force_refuses_to_promote(adapter_client):
     async with session() as db:
         await note_projection_write(db, device_id, "svi")
         with pytest.raises(ValueError, match="promotes nothing"):
-            await enqueue_removal(db, device_id, "svi", promotes=("svi",), force=True)
+            await enqueue_removal(
+                db, device_id, "svi", marking=None, defer_retract=False, promotes=("svi",), force=True
+            )
 
 
 async def test_run_removal_detach_syncs_from_and_skips_residue(adapter_client):

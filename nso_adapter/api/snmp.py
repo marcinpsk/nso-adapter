@@ -447,16 +447,19 @@ async def put_snmp_intent(
     # past the plugin client timeout). Enqueue before the commit so the job row lands with
     # the trimmed intent it will re-apply.
     if removed:
-        from nso_adapter.core.removal import enqueue_removal
+        from nso_adapter.core.removal import enqueue_removal, query_flag_marking
 
         # Thread the PER-COLLECTION removed keys (community/v3-user/host) so the
         # collateral guard can tell this intended retraction from an orphaned service
         # row — the merged `removed` list is namespace-ambiguous (a community and a
         # host may share a name) and system-info is a non-guarded scalar.
+        marks = query_flag_marking(deletes=True)
         await enqueue_removal(
             db,
             device_id,
             "snmp",
+            marking=marks.marking,
+            defer_retract=marks.defer_retract,
             promotes=(delivery.stream,),
             removed={"community": removed_comms, "v3-user": removed_users, "host": removed_hosts},
             vault_refs={label: ref for label, ref in removed_comm_refs.items() if isinstance(ref, str)},

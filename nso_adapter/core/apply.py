@@ -398,7 +398,15 @@ async def _enqueue_pending_clear_retract(db: AsyncSession, device, plan, *, reg=
         # the run, so no request wrote the revision it promotes (#1522 §G2).
         await note_write(db, device.id, "static_route")
         job = await enqueue_removal(
-            db, device_id=device.id, scope="static_route", promotes=("static_route",), retract=True
+            db,
+            device_id=device.id,
+            scope="static_route",
+            # A pure clear deletes nothing, so it carries no deletion marking and nothing
+            # of this run's un-owns can defer it: it exists only to network the clear.
+            marking=None,
+            defer_retract=False,
+            promotes=("static_route",),
+            retract=True,
         )
         await db.commit()
     except ClaimLostError:

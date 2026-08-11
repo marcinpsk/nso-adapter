@@ -27,10 +27,18 @@ STORE_ONLY: ContextVar[bool] = ContextVar("store_only", default=False)
 # this from the device". Every UNMARKED intent shrink is an un-own ("NetBox stops
 # governing") and its removal job runs as a DETACH — no-networking replace + sync-from,
 # device untouched (tracker #106: a real PUT-replace of an ADOPTED entry plays FASTMAP's
-# reverse diff against the live device and stripped an IOS route-map filter). Guarded at
-# the same enqueue choke point as STORE_ONLY so the safe default holds for every intent
-# endpoint without each one threading a flag.
+# reverse diff against the live device and stripped an IOS route-map filter). Read ONCE per
+# request, by :func:`request_marking`, and passed on as an explicit argument from there:
+# a removal job's marking is part of its identity, and a request can produce one job per
+# marking (#1503 §4.5).
 DELETE_ORIGIN: ContextVar[bool] = ContextVar("delete_origin", default=False)
+
+#: The deletion provenance one removal job carries. ``delete_origin`` retracts from the
+#: device; ``detach`` un-owns without touching it. The values are also the
+#: ``static_route_tombstone.marking`` domain, one source of truth for both.
+DELETE_ORIGIN_MARKING = "delete_origin"
+DETACH_MARKING = "detach"
+REMOVAL_MARKINGS: tuple[str, ...] = (DELETE_ORIGIN_MARKING, DETACH_MARKING)
 
 # ``PUSH_SEQ`` carries the plugin's ``X-Push-Seq`` header: the identity of the outbox claim
 # this request delivers. It is the key receipt admission dedupes on (#1522 §G2) and the
@@ -56,6 +64,17 @@ class InvalidPushSequence(ValueError):
 def parse_store_only(raw: str | None) -> bool:
     """Parse a raw boolean query value (mirrors FastAPI's bool query coercion)."""
     return raw is not None and raw.strip().lower() in _TRUTHY
+
+
+def request_marking() -> str:
+    """Return the deletion provenance THIS request marks the rows it deletes with.
+
+    The one read of :data:`DELETE_ORIGIN` on the removal path. Everything downstream takes
+    the marking as an argument, so a request that deletes at both markings (§4.5's
+    per-object static routes) can build one job per marking instead of one job whose
+    job-wide ``detach`` flag would misdeliver half of them.
+    """
+    return DELETE_ORIGIN_MARKING if DELETE_ORIGIN.get() else DETACH_MARKING
 
 
 def parse_push_seq(raw: str | None) -> int | None:

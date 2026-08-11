@@ -32,6 +32,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from nso_adapter.core.request_flags import REMOVAL_MARKINGS
 from nso_adapter.store.ddl import generation_immutability_ddl
 
 
@@ -1425,7 +1426,9 @@ class StaticRouteTombstone(Base):
 
     __tablename__ = "static_route_tombstone"
     __table_args__ = (
-        CheckConstraint("marking IN ('delete_origin', 'detach')", name="ck_srt_marking"),
+        # Derived from the one place the vocabulary is defined, so the column, the removal
+        # jobs and the sweeper cannot drift apart.
+        CheckConstraint(f"marking IN ({', '.join(repr(m) for m in REMOVAL_MARKINGS)})", name="ck_srt_marking"),
         # The sweeper's exact predicate, scanned per device and consumed in id order.
         # Non-unique: one push deleting three routes can orphan three at once.
         Index("ix_srt_unclaimed", "device_id", "id", postgresql_where=text("job_id IS NULL")),
