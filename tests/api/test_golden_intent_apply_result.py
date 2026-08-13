@@ -53,7 +53,10 @@ async def test_static_route_intent_result_golden(adapter_client):
     the partition unconditionally, so a missing list is not the same as an empty one.
     """
     device_id = await seed_device(nso_device_name="wr-static-route-intent", netbox_device_id=8001)
-    body = {"routes": [{"route_id": 41, "generation": 7, "prefix": "10.0.0.0/8", "next_hop": "192.0.2.1"}]}
+    body = {
+        "routes": [{"route_id": 41, "generation": 7, "prefix": "10.0.0.0/8", "next_hop": "192.0.2.1"}],
+        "deleted_routes": [],
+    }
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/static-route-intent", json=body, headers=AUTH | push_seq()
     )

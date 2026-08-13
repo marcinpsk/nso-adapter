@@ -62,8 +62,11 @@ _CASES = [
     (
         "static_route",
         "static-route-intent",
-        {"routes": [{"vrf": "", "prefix": "10.9.0.0/24", "next_hop": "10.9.0.1", "metric": 20}]},
-        {"routes": [{"vrf": "", "prefix": "10.9.0.0/24", "next_hop": "10.9.0.1"}]},
+        {
+            "routes": [{"vrf": "", "prefix": "10.9.0.0/24", "next_hop": "10.9.0.1", "metric": 20}],
+            "deleted_routes": [],
+        },
+        {"routes": [{"vrf": "", "prefix": "10.9.0.0/24", "next_hop": "10.9.0.1"}], "deleted_routes": []},
     ),
     (
         "bfd",
@@ -170,14 +173,14 @@ async def test_toggling_a_boolean_off_IS_a_retraction_for_static_routes(adapter_
 
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/static-route-intent",
-        json={"routes": [{**route, "permanent": True}]},
+        json={"routes": [{**route, "permanent": True}], "deleted_routes": []},
         headers=AUTH | push_seq(),
     )
     assert await _removal_jobs(device_id, "static_route") == []
 
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/static-route-intent",
-        json={"routes": [{**route, "permanent": False}]},
+        json={"routes": [{**route, "permanent": False}], "deleted_routes": []},
         headers=AUTH | push_seq(),
     )
     jobs = await _removal_jobs(device_id, "static_route")

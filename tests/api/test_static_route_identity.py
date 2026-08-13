@@ -174,10 +174,12 @@ async def read_jobs(device_id: int) -> list[dict]:
         return [{"id": r.id, "job_type": r.job_type.value, "context": r.context} for r in rows]
 
 
-async def put_intent(client, device_id: int, routes: list[dict], *, query: str = ""):
+async def put_intent(
+    client, device_id: int, routes: list[dict], *, query: str = "", deleted_routes: list[dict] | None = None
+):
     return await client.put(
         f"/api/v1/devices/{device_id}/static-route-intent{query}",
-        json={"routes": routes},
+        json={"routes": routes, "deleted_routes": deleted_routes or []},
         headers=AUTH | push_seq(),
     )
 
@@ -457,12 +459,17 @@ async def test_never_applied_row_gets_a_detach_tombstone(adapter_client):
     assert removals[0]["context"]["detach"] is True
 
 
-async def test_never_applied_delete_origin_authorizes_the_triple_only(adapter_client):
-    """M1.12 — a NULL deployed_key must not read as unrestricted deletion authority."""
+async def test_never_applied_deleted_route_authorizes_the_triple_only(adapter_client):
+    """M1.12: a NULL deployed_key must not read as unrestricted deletion authority."""
     device_id = await seed_device(nso_device_name="sr-m1-12", netbox_device_id=9713)
     await seed_intent(device_id, [{"triple": A, "route_id": 7, "deployed_key": None}])
 
-    resp = await put_intent(adapter_client, device_id, [], query="?delete_origin=true")
+    resp = await put_intent(
+        adapter_client,
+        device_id,
+        [],
+        deleted_routes=[{"route_id": 7, "triples": [entry(A)], "unverified": False}],
+    )
     assert resp.status_code == 200
 
     tombs = await read_tombstones(device_id)
@@ -482,12 +489,17 @@ async def test_never_applied_delete_origin_authorizes_the_triple_only(adapter_cl
     assert removals[0]["context"]["removed"] == {"route": [list(A)]}
 
 
-async def test_applied_delete_origin_tombstone_carries_the_deployed_key(adapter_client):
-    """OQ2 — with a proven predecessor the authorized set is {triple} ∪ {deployed_key}."""
+async def test_applied_deleted_route_tombstone_carries_the_deployed_key(adapter_client):
+    """OQ2: with a proven predecessor the authorized set is {triple} ∪ {deployed_key}."""
     device_id = await seed_device(nso_device_name="sr-m1-12b", netbox_device_id=9714)
     await seed_intent(device_id, [{"triple": B, "route_id": 7, "deployed_key": list(A)}])
 
-    resp = await put_intent(adapter_client, device_id, [], query="?delete_origin=true")
+    resp = await put_intent(
+        adapter_client,
+        device_id,
+        [],
+        deleted_routes=[{"route_id": 7, "triples": [entry(B)], "unverified": False}],
+    )
     assert resp.status_code == 200
 
     assert await read_tombstones(device_id) == [

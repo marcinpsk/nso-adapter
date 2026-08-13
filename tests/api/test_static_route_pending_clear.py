@@ -35,10 +35,12 @@ def route(triple, *, route_id=None, **extra) -> dict:
     return body
 
 
-async def put_intent(client, device_id: int, routes: list[dict], *, query: str = ""):
+async def put_intent(
+    client, device_id: int, routes: list[dict], *, query: str = "", deleted_routes: list[dict] | None = None
+):
     resp = await client.put(
         f"/api/v1/devices/{device_id}/static-route-intent{query}",
-        json={"routes": routes},
+        json={"routes": routes, "deleted_routes": deleted_routes or []},
         headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200, resp.text
@@ -313,9 +315,9 @@ async def test_the_carrier_is_written_even_when_the_job_is_a_detach(adapter_clie
     assert (await carriers(device_id))[X] == {"authorized": ["metric"], "store_only": []}
 
 
-async def test_a_delete_origin_push_with_a_clear_still_carries_it(adapter_client):
-    """A delete-origin removal is networked, but neither ``retract`` nor the cleared field
-    survives into its job context — so the carrier is the only place it can find them.
+async def test_a_genuine_deletion_push_with_a_clear_still_carries_it(adapter_client):
+    """A genuine removal is networked, but neither ``retract`` nor the cleared field
+    survives into its job context, so the carrier is the only place it can find them.
     """
     device_id = await seed_device(nso_device_name="sr-pc-delorigin", netbox_device_id=7111)
     await put_intent(
@@ -323,7 +325,12 @@ async def test_a_delete_origin_push_with_a_clear_still_carries_it(adapter_client
         device_id,
         [route(X, route_id=1, metric=10), route(Y, route_id=2, metric=5)],
     )
-    await put_intent(adapter_client, device_id, [route(X, route_id=1)], query="?delete_origin=true")
+    await put_intent(
+        adapter_client,
+        device_id,
+        [route(X, route_id=1)],
+        deleted_routes=[{"route_id": 2, "triples": [route(Y)], "unverified": False}],
+    )
 
     contexts = await removal_jobs(device_id)
     assert len(contexts) == 1

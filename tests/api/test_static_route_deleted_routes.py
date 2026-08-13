@@ -636,9 +636,25 @@ async def test_two_deletion_records_claiming_one_route_id_are_refused(adapter_cl
     assert resp.json()["error"]["detail"]["reason"] == "duplicate_deleted_route_id"
 
 
-async def test_a_push_without_deleted_routes_still_reports_the_uncorrelated_rows(adapter_client):
-    """§4.4 (R11-B2) — the field is reported on EVERY mode, including a push carrying none."""
+async def test_a_push_without_deleted_routes_is_refused_at_the_validation_boundary(adapter_client):
+    """O3.2: every static-route push must declare its per-object deletion authority."""
     device_id = await seed_device(nso_device_name="sr-o2b-nolist", netbox_device_id=9932)
+
+    resp = await put(adapter_client, device_id, [entry(C, route_id=101)], seq=1)
+
+    assert resp.status_code == 422, resp.text
+    envelope = resp.json()["error"]
+    assert envelope["code"] == "validation_error"
+    assert any(
+        error["type"] == "missing" and error["loc"] == ["body", "deleted_routes"]
+        for error in envelope["detail"]["errors"]
+    ), envelope
+
+
+async def test_an_empty_list_push_still_reports_the_uncorrelated_rows(adapter_client):
+    """§4.4 (R11-B2) — the field is reported on EVERY mode, including a push carrying no
+    deletion records at all (the O3-activated spelling of the old omitted-field arm)."""
+    device_id = await seed_device(nso_device_name="sr-o2b-emptylist", netbox_device_id=9933)
     await seed_intent(
         device_id,
         [
@@ -647,7 +663,7 @@ async def test_a_push_without_deleted_routes_still_reports_the_uncorrelated_rows
         ],
     )
 
-    resp = await put(adapter_client, device_id, [entry(C, route_id=101)], seq=1)
+    resp = await put(adapter_client, device_id, [entry(C, route_id=101)], deleted_routes=[], seq=1)
 
     assert resp.status_code == 200
     assert partition_of(resp.json()) == {

@@ -252,7 +252,12 @@ async def test_the_tombstone_carries_its_removal_job_id(adapter_client):
     device_id = await seed_device(nso_device_name="sr-stamp", netbox_device_id=9781)
     await seed_intent(device_id, [{"triple": A, "route_id": 7, "deployed_key": list(A)}])
 
-    resp = await put_intent(adapter_client, device_id, [], query="?delete_origin=true")
+    resp = await put_intent(
+        adapter_client,
+        device_id,
+        [],
+        deleted_routes=[{"route_id": 7, "triples": [entry(A)], "unverified": False}],
+    )
     assert resp.status_code == 200
 
     jobs = await read_jobs(device_id)

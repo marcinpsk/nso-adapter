@@ -7961,18 +7961,11 @@
       "StaticRouteIntentUpdate": {
         "properties": {
           "deleted_routes": {
-            "anyOf": [
-              {
-                "items": {
-                  "$ref": "#/components/schemas/DeletedRoute"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Deleted Routes"
+            "items": {
+              "$ref": "#/components/schemas/DeletedRoute"
+            },
+            "title": "Deleted Routes",
+            "type": "array"
           },
           "routes": {
             "items": {
@@ -7983,7 +7976,8 @@
           }
         },
         "required": [
-          "routes"
+          "routes",
+          "deleted_routes"
         ],
         "title": "StaticRouteIntentUpdate",
         "type": "object"

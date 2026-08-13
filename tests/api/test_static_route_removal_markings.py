@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
-"""#1503 Appendix-O chunk O2: the marking-homogeneous split must change NOTHING here.
+"""#1503 Appendix-O chunk O2: marking-homogeneous removal jobs.
 
-O2.4: every current production path is marking-HOMOGENEOUS, because ``?delete_origin``
-marks the whole request. This file characterizes what such a push produces today: the job
-count, each job's whole context, the generation each job carries, the carriers' stamps, the
-queue order against the apply and the response body, so "byte-identical" is asserted rather
-than assumed.
+O2.4 characterizes homogeneous genuine-deletion and detach pushes. O3 supplies genuine
+deletions through explicit ``deleted_routes`` records. An empty list marks omissions as
+per-object detaches. The tests pin the job count, context, generations, carriers, queue
+order, and response body.
 
 Written and made green BEFORE the split landed; it is the regression net for it.
 """
@@ -30,6 +29,10 @@ from tests.api.test_static_route_identity import (
 from tests.conftest import seed_device, session
 
 pytestmark = pytest.mark.anyio
+
+
+def deleted(route_id: int, triple: tuple[str, str, str]) -> dict:
+    return {"route_id": route_id, "triples": [entry(triple)], "unverified": False}
 
 
 async def read_generations(device_id: int) -> list[dict]:
@@ -71,7 +74,7 @@ async def carriers(device_id: int) -> dict[tuple, dict | None]:
         return {(r.vrf, r.prefix, r.next_hop): r.pending_clear for r in rows}
 
 
-async def test_o2_4_a_delete_origin_shrink_is_one_networked_job(adapter_client):
+async def test_o2_4_a_genuine_shrink_is_one_networked_job(adapter_client):
     """O2.4, a marked shrink: ONE job, no ``detach``, both carriers on it, one generation."""
     device_id = await seed_device(nso_device_name="sr-o24-a", netbox_device_id=9860)
     await seed_intent(
@@ -83,7 +86,12 @@ async def test_o2_4_a_delete_origin_shrink_is_one_networked_job(adapter_client):
         ],
     )
 
-    resp = await put_intent(adapter_client, device_id, [entry(C, route_id=3)], query="?delete_origin=true")
+    resp = await put_intent(
+        adapter_client,
+        device_id,
+        [entry(C, route_id=3)],
+        deleted_routes=[deleted(1, A), deleted(2, B)],
+    )
     assert resp.status_code == 200
     assert resp.json()["removed"] == 2
     assert resp.json()["replaced"] is True
@@ -151,7 +159,7 @@ async def test_o2_4_c_an_unmarked_shrink_with_a_clear_defers_the_retract(adapter
     assert (await carriers(device_id))[A] == {"authorized": ["metric"], "store_only": []}
 
 
-async def test_o2_4_d_a_marked_shrink_with_a_clear_stays_networked(adapter_client):
+async def test_o2_4_d_a_genuine_shrink_with_a_clear_stays_networked(adapter_client):
     """O2.4: nothing is un-owned, so the clear rides out with the deletion."""
     device_id = await seed_device(nso_device_name="sr-o24-d", netbox_device_id=9863)
     await put_intent(
@@ -160,7 +168,12 @@ async def test_o2_4_d_a_marked_shrink_with_a_clear_stays_networked(adapter_clien
         [entry(A, route_id=1, metric=10), entry(B, route_id=2)],
     )
 
-    resp = await put_intent(adapter_client, device_id, [entry(A, route_id=1)], query="?delete_origin=true")
+    resp = await put_intent(
+        adapter_client,
+        device_id,
+        [entry(A, route_id=1)],
+        deleted_routes=[deleted(2, B)],
+    )
     assert resp.status_code == 200
 
     jobs = [j for j in await read_jobs(device_id) if j["job_type"] == "removal"]
@@ -200,8 +213,8 @@ async def test_o2_4_f_a_store_only_shrink_creates_no_job_and_no_carrier(adapter_
     assert await read_generations(device_id) == []
 
 
-async def test_o2_4_g_a_fence_shut_shrink_keeps_its_keys_without_a_carrier(adapter_client):
-    """O2.4: with the fence shut the job's ``removed`` keys ARE the deletion authority."""
+async def test_o2_4_g_the_query_flag_does_not_override_empty_per_object_authority(adapter_client):
+    """O3: an empty list marks a fence-shut omission as a detach, even with the old flag."""
     device_id = await seed_device(nso_device_name="sr-o24-g", netbox_device_id=9866)
     await seed_intent(
         device_id,
@@ -214,7 +227,7 @@ async def test_o2_4_g_a_fence_shut_shrink_keeps_its_keys_without_a_carrier(adapt
     assert (await put_intent(adapter_client, device_id, [entry(B)], query="?delete_origin=true")).status_code == 200
 
     jobs = await read_jobs(device_id)
-    assert [j["context"] for j in jobs] == [{"scope": "static_route", "removed": {"route": [list(A)]}}]
+    assert [j["context"] for j in jobs] == [{"scope": "static_route", "removed": {"route": [list(A)]}, "detach": True}]
     assert await read_tombstones(device_id) == []
 
 
@@ -239,4 +252,36 @@ async def test_o2_4_h_the_removal_precedes_the_apply(adapter_client):
     assert [(g["seq"], g["mode"], g["job_id"]) for g in await read_generations(device_id)] == [
         (1, "detach", jobs[0]["id"]),
         (2, "networked", jobs[1]["id"]),
+    ]
+
+
+async def test_o3_3_a_stray_query_flag_is_inert_and_the_list_decides(adapter_client):
+    """O3.3, adapter half: ``?delete_origin=true`` beside a list changes NOTHING.
+
+    The unlisted omitted row detaches despite the flag; only the listed id retracts.
+    """
+    device_id = await seed_device(nso_device_name="sr-o33-a", netbox_device_id=9868)
+    await seed_intent(
+        device_id,
+        [
+            {"triple": A, "route_id": 1, "deployed_key": list(A)},
+            {"triple": B, "route_id": 2, "deployed_key": list(B)},
+            {"triple": C, "route_id": 3, "deployed_key": list(C)},
+        ],
+    )
+
+    resp = await put_intent(
+        adapter_client,
+        device_id,
+        [entry(C, route_id=3)],
+        query="?delete_origin=true",
+        deleted_routes=[deleted(1, A)],
+    )
+    assert resp.status_code == 200
+    assert resp.json()["removed"] == 2
+
+    tombstones = await read_tombstones(device_id)
+    assert sorted((t["route_id"], t["marking"]) for t in tombstones) == [
+        (1, "delete_origin"),
+        (2, "detach"),
     ]
