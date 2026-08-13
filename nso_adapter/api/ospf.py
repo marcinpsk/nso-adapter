@@ -324,17 +324,14 @@ async def _sync_ospf_redistribution(
     return removed, cleared
 
 
-async def _maybe_enqueue_apply(db: AsyncSession, device_id: int, count: int, *, stream: str) -> None:
-    """Enqueue an apply job when the payload is non-empty and the device has auto_apply on."""
+async def _auto_apply_requested(db: AsyncSession, device_id: int, count: int) -> bool:
+    """Return whether this request will create an automatic apply generation."""
     if count <= 0:
-        return
+        return False
     settings = (
         await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
     ).scalar_one_or_none()
-    if settings and settings.auto_apply:
-        from nso_adapter.core.apply import enqueue_apply
-
-        await enqueue_apply(db, device_id, force=True, stream=stream)
+    return bool(settings and settings.auto_apply)
 
 
 class OspfIntentResult(BaseModel):
@@ -414,7 +411,16 @@ async def put_ospf_intent(
     # kept the old value forever and the operator could not clear it.
     deleted = bool(removed_inst or removed_iface or removed_redist)
     cleared = inst_cleared or iface_cleared or redist_cleared
-    if deleted or cleared:
+    apply_requested = await _auto_apply_requested(db, device_id, len(payload.instances) + len(payload.interfaces))
+    removal_requested = deleted or cleared
+    from nso_adapter.core.generation import request_settlement_cohort
+
+    settlement_cohort = await request_settlement_cohort(db, int(removal_requested) + int(apply_requested))
+    if apply_requested:
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
+    if removal_requested:
         from nso_adapter.core.removal import enqueue_removal, query_flag_marking
 
         # Thread the just-removed keys so the collateral guard can tell this intended
@@ -428,6 +434,7 @@ async def put_ospf_intent(
             marking=marks.marking,
             defer_retract=marks.defer_retract,
             promotes=(delivery.stream,),
+            settlement_cohort=settlement_cohort,
             removed={"interface-config": removed_iface, "process-config": removed_inst},
             retract=cleared,
             shrank=deleted,

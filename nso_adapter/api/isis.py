@@ -489,17 +489,16 @@ async def _sync_isis_redistribution(
     return deleted, cleared
 
 
-async def _maybe_enqueue_isis_apply(db, device_id: int, iface_count: int, proc_count: int, *, stream: str) -> None:
-    """Enqueue an apply job when auto_apply is on and the payload changed something."""
+async def _isis_auto_apply_requested(db, device_id: int, iface_count: int, proc_count: int) -> bool:
+    """Return whether this request will create an automatic apply generation."""
     from nso_adapter.store.models import DeviceSettings
 
+    if iface_count <= 0 and proc_count <= 0:
+        return False
     settings = (
         await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
     ).scalar_one_or_none()
-    if settings and settings.auto_apply and (iface_count > 0 or proc_count > 0):
-        from nso_adapter.core.apply import enqueue_apply
-
-        await enqueue_apply(db, device_id, force=True, stream=stream)
+    return bool(settings and settings.auto_apply)
 
 
 class IsisInterfaceIntentResult(BaseModel):
@@ -628,7 +627,16 @@ async def put_isis_interface_intent(
     # retract: the device kept the old value forever while the operator saw it as removed.
     deleted = iface_deleted or proc_deleted or level_deleted or redist_deleted
     cleared = iface_cleared or proc_cleared or level_cleared or redist_cleared
-    if deleted or cleared:
+    apply_requested = await _isis_auto_apply_requested(db, device_id, iface_count, proc_count)
+    removal_requested = deleted or cleared
+    from nso_adapter.core.generation import request_settlement_cohort
+
+    settlement_cohort = await request_settlement_cohort(db, int(removal_requested) + int(apply_requested))
+    if apply_requested:
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
+    if removal_requested:
         from nso_adapter.core.removal import enqueue_removal, query_flag_marking
 
         removed_ifaces = sorted(pre_iface_keys - {(e.interface_name, e.af) for e in body.interfaces})
@@ -641,12 +649,11 @@ async def put_isis_interface_intent(
             marking=marks.marking,
             defer_retract=marks.defer_retract,
             promotes=(delivery.stream,),
+            settlement_cohort=settlement_cohort,
             removed={"interface-config": removed_ifaces, "process-config": removed_procs},
             retract=cleared,
             shrank=deleted,
         )
-
-    await _maybe_enqueue_isis_apply(db, device_id, iface_count, proc_count, stream=delivery.stream)
 
     result = {"device_id": device_id, "interface_count": iface_count, "process_count": proc_count}
     await record_response(db, device_id, delivery, result)
@@ -758,6 +765,20 @@ async def put_isis_flex_algo_intent(
 
     await db.flush()
 
+    from nso_adapter.store.models import DeviceSettings
+
+    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    settings = settings_result.scalar_one_or_none()
+    apply_requested = bool(settings and settings.auto_apply and count > 0)
+    removal_requested = bool(removed_keys or cleared)
+    from nso_adapter.core.generation import request_settlement_cohort
+
+    settlement_cohort = await request_settlement_cohort(db, int(removal_requested) + int(apply_requested))
+    if apply_requested:
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
+
     # A merge-PATCH apply never drops an omitted flex-algo (and a node-level DELETE can't
     # address an empty-string process-tag key), so retracting one needs a PUT-replace of
     # the whole service. Queue the async ``isis`` removal job — :func:`_replace_isis`
@@ -772,7 +793,7 @@ async def put_isis_flex_algo_intent(
     # INSIDE process-config, so the shrink removes no key at the guard's grain and needs
     # no orphan allowance.
     removal_queued = False
-    if removed_keys or cleared:
+    if removal_requested:
         from nso_adapter.core.removal import enqueue_removal, query_flag_marking
 
         marks = query_flag_marking(deletes=bool(removed_keys))
@@ -783,12 +804,11 @@ async def put_isis_flex_algo_intent(
             marking=marks.marking,
             defer_retract=marks.defer_retract,
             promotes=(delivery.stream,),
+            settlement_cohort=settlement_cohort,
             retract=cleared,
             shrank=bool(removed_keys),
         )
         removal_queued = job is not None
-
-    await _maybe_enqueue_isis_apply(db, device_id, count, 0, stream=delivery.stream)
 
     result = {"device_id": device_id, "flex_algo_count": count, "removal_queued": removal_queued}
     await record_response(db, device_id, delivery, result)

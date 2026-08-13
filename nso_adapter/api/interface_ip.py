@@ -302,6 +302,12 @@ async def put_ip_intent(
 
     await db.flush()
 
+    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    settings = settings_result.scalar_one_or_none()
+    apply_requested = bool(settings and settings.auto_apply and count > 0)
+    from nso_adapter.core.generation import request_settlement_cohort
+
+    settlement_cohort = await request_settlement_cohort(db, int(bool(removed_interfaces)) + int(apply_requested))
     # Removal propagation: a merge-PATCH apply can't drop an address the payload removed, so
     # enqueue an interface_config removal (PUT-replace/DELETE per affected interface) — mirrors
     # every other service's replace_on_removal, and always runs (removal is not auto_apply-gated).
@@ -320,18 +326,17 @@ async def put_ip_intent(
                 # The ADDRESS lane only: an un-promoted store-only write to the attribute lane
                 # is not authorized by an address push (#103).
                 promotes=(delivery.stream,),
+                settlement_cohort=settlement_cohort,
                 interfaces=sorted(removed_interfaces),
                 removed={"address": removed_addresses},
             )
             is not None
         )
 
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
-    if settings and settings.auto_apply and count > 0:
+    if apply_requested:
         from nso_adapter.core.apply import enqueue_apply
 
-        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
 
     result = {
         "device_id": device_id,

@@ -705,6 +705,24 @@ async def _guarded_apply(client, device, scope: str, context: dict | None, apply
     return await apply_thunk(replace=True)
 
 
+async def _replacement_section_rows(db: AsyncSession, scope: str, job_id: int | None) -> dict[type, list] | None:
+    """Hydrate one removal's document section, or select live mode for legacy scopes."""
+    from nso_adapter.core.generation import executing_generation
+    from nso_adapter.core.projection import DOCUMENT_EXECUTED_SECTIONS, hydrate_section
+
+    if scope not in DOCUMENT_EXECUTED_SECTIONS or job_id is None:
+        return None
+    generation = await executing_generation(db, job_id)
+    if generation is None:
+        raise RuntimeError(f"removal job {job_id} for scope {scope!r} carries no generation to deploy")
+    if not generation.stream_revisions:
+        return None
+    return {
+        model: [row for row in rows if row.accepted_at]
+        for model, rows in hydrate_section(generation.document, scope).items()
+    }
+
+
 async def _replacement_rows(db: AsyncSession, device, scope: str, model, job_id: int | None) -> list:
     """Return the rows the PUT-replace body asserts: the generation's document, or the store.
 
@@ -716,15 +734,9 @@ async def _replacement_rows(db: AsyncSession, device, scope: str, model, job_id:
     store used by the operator override. Everything else still reads the store. See
     :data:`core.projection.LIVE_READ_SECTIONS`.
     """
-    from nso_adapter.core.generation import executing_generation
-    from nso_adapter.core.projection import DOCUMENT_EXECUTED_SECTIONS, hydrate_section
-
-    if scope in DOCUMENT_EXECUTED_SECTIONS and job_id is not None:
-        generation = await executing_generation(db, job_id)
-        if generation is None:
-            raise RuntimeError(f"removal job {job_id} for scope {scope!r} carries no generation to deploy")
-        if generation.stream_revisions:
-            return [row for row in hydrate_section(generation.document, scope).get(model, []) if row.accepted_at]
+    document_rows = await _replacement_section_rows(db, scope, job_id)
+    if document_rows is not None:
+        return document_rows.get(model, [])
     return list(
         (await db.execute(select(model).where(model.device_id == device.id, model.accepted_at.is_not(None))))
         .scalars()
@@ -1408,48 +1420,56 @@ async def _replace_logging(db: AsyncSession, device, client, context: dict | Non
     await _guarded_apply(client, device, "logging", context, _apply)
 
 
-async def _replace_ospf(db: AsyncSession, device, client, context: dict | None = None) -> None:
+async def _replace_ospf(
+    db: AsyncSession, device, client, context: dict | None = None, *, job_id: int | None = None
+) -> None:
     from nso_adapter.nso.apply import apply_ospf_config
     from nso_adapter.store.models import OspfInstanceIntent, OspfInterfaceIntent, RedistributionIntent
 
     # A PUT-replace re-asserts the FULL desired state, so it must include only accepted
     # rows — never not-yet-accepted (imported/staged) intent, which would deploy
     # un-reviewed config to the device (matches _replace_simple / _replace_bgp).
-    insts = (
-        (
-            await db.execute(
-                select(OspfInstanceIntent).where(
-                    OspfInstanceIntent.device_id == device.id, OspfInstanceIntent.accepted_at.is_not(None)
+    document_rows = await _replacement_section_rows(db, "ospf", job_id)
+    if document_rows is not None:
+        insts = document_rows.get(OspfInstanceIntent, [])
+        ifaces = document_rows.get(OspfInterfaceIntent, [])
+        redist = document_rows.get(RedistributionIntent, [])
+    else:
+        insts = (
+            (
+                await db.execute(
+                    select(OspfInstanceIntent).where(
+                        OspfInstanceIntent.device_id == device.id, OspfInstanceIntent.accepted_at.is_not(None)
+                    )
                 )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-    ifaces = (
-        (
-            await db.execute(
-                select(OspfInterfaceIntent).where(
-                    OspfInterfaceIntent.device_id == device.id, OspfInterfaceIntent.accepted_at.is_not(None)
+        ifaces = (
+            (
+                await db.execute(
+                    select(OspfInterfaceIntent).where(
+                        OspfInterfaceIntent.device_id == device.id, OspfInterfaceIntent.accepted_at.is_not(None)
+                    )
                 )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-    redist = (
-        (
-            await db.execute(
-                select(RedistributionIntent).where(
-                    RedistributionIntent.device_id == device.id,
-                    RedistributionIntent.dest_protocol == "ospf",
-                    RedistributionIntent.accepted_at.is_not(None),
+        redist = (
+            (
+                await db.execute(
+                    select(RedistributionIntent).where(
+                        RedistributionIntent.device_id == device.id,
+                        RedistributionIntent.dest_protocol == "ospf",
+                        RedistributionIntent.accepted_at.is_not(None),
+                    )
                 )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
 
     async def _apply(**kwargs):
         return await apply_ospf_config(client, device.nso_device_name, insts, ifaces, redist, **kwargs)
@@ -1557,7 +1577,9 @@ async def _replace_interface_config(db: AsyncSession, device, client, interface_
         await replace_interface_config(client, device.nso_device_name, name, entry)
 
 
-async def _replace_isis(db: AsyncSession, device, client, context: dict | None = None) -> None:
+async def _replace_isis(
+    db: AsyncSession, device, client, context: dict | None = None, *, job_id: int | None = None
+) -> None:
     """PUT-replace the isis-reconciler with the device's full remaining accepted intent.
 
     Bespoke (not a _SIMPLE_TARGET) because apply_isis_interfaces takes several row
@@ -1579,17 +1601,25 @@ async def _replace_isis(db: AsyncSession, device, client, context: dict | None =
         RedistributionIntent,
     )
 
-    device_id = device.id
+    document_rows = await _replacement_section_rows(db, "isis", job_id)
+    if document_rows is not None:
+        ifaces = document_rows.get(IsisInterfaceIntent, [])
+        procs = document_rows.get(IsisProcessIntent, [])
+        flex = document_rows.get(IsisFlexAlgoIntent, [])
+        levels = document_rows.get(IsisLevelIntent, [])
+        redist = document_rows.get(RedistributionIntent, [])
+    else:
+        device_id = device.id
 
-    async def _accepted(model, *extra):
-        stmt = select(model).where(model.device_id == device_id, model.accepted_at.is_not(None), *extra)
-        return (await db.execute(stmt)).scalars().all()
+        async def _accepted(model, *extra):
+            stmt = select(model).where(model.device_id == device_id, model.accepted_at.is_not(None), *extra)
+            return (await db.execute(stmt)).scalars().all()
 
-    ifaces = await _accepted(IsisInterfaceIntent)
-    procs = await _accepted(IsisProcessIntent)
-    flex = await _accepted(IsisFlexAlgoIntent)
-    levels = await _accepted(IsisLevelIntent)
-    redist = await _accepted(RedistributionIntent, RedistributionIntent.dest_protocol == "isis")
+        ifaces = await _accepted(IsisInterfaceIntent)
+        procs = await _accepted(IsisProcessIntent)
+        flex = await _accepted(IsisFlexAlgoIntent)
+        levels = await _accepted(IsisLevelIntent)
+        redist = await _accepted(RedistributionIntent, RedistributionIntent.dest_protocol == "isis")
 
     async def _apply(**kwargs):
         return await apply_isis_interfaces(
@@ -1655,13 +1685,13 @@ async def _dispatch_scope(
     if scope == "static_route":
         return await _replace_static_route(db, device, client, context, job_id=job_id, reg=reg)
     if scope == "ospf":
-        await _replace_ospf(db, device, client, context)
+        await _replace_ospf(db, device, client, context, job_id=job_id)
     elif scope == "bgp":
         await _replace_bgp(db, device, client, context)
     elif scope == "snmp":
         await _replace_snmp(db, device, client, context)
     elif scope == "isis":
-        await _replace_isis(db, device, client, context)
+        await _replace_isis(db, device, client, context, job_id=job_id)
     elif scope == "logging":
         await _replace_logging(db, device, client, context)
     elif scope == "interface_config":
@@ -2434,7 +2464,14 @@ def removed_map(scope: str, removed) -> dict[str, list]:
 
 
 async def replace_on_removal(
-    db: AsyncSession, device, removed, store_model, apply_callable=None, *, retract: bool = False
+    db: AsyncSession,
+    device,
+    removed,
+    store_model,
+    apply_callable=None,
+    *,
+    retract: bool = False,
+    settlement_cohort: int | None = None,
 ) -> bool:
     """Enqueue an async removal job for *store_model*'s scope.
 
@@ -2474,6 +2511,7 @@ async def replace_on_removal(
         # The stream comes from the same model the scope does, so a model that later moves
         # into a split section promotes ITS lane and not its sibling's.
         promotes=(stream_for_model(store_model),),
+        settlement_cohort=settlement_cohort,
         removed=removed_map(scope, removed) if removed else None,
         retract=retract,
         shrank=bool(removed),

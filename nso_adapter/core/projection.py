@@ -456,7 +456,9 @@ async def _rows_for(db: AsyncSession, device_id: int, spec: _Spec) -> list[dict]
 #: is named in :data:`LIVE_READ_SECTIONS` with the reason it cannot yet, and
 #: ``test_projection_document.py`` pins the partition — so a new section cannot drift out of
 #: the protocol unnoticed, and closing a reason without wiring the section fails.
-DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset({"vlan"})
+DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset(
+    {"vlan", "svi", "subinterface", "bfd", "interface_mtu", "l2_sap", "isis", "route_policy", "ospf"}
+)
 
 #: The document-executed sections a manual Apply may select. This set equals
 #: :data:`DOCUMENT_EXECUTED_SECTIONS` today. The names remain separate because one states
@@ -465,22 +467,12 @@ DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset({"vlan"})
 #: intent.
 ACTION_APPLY_EXECUTABLE_SECTIONS: frozenset[str] = frozenset({"vlan"})
 
-#: Why each remaining section still reads live rows at apply time. Most await #1522's
-#: aggregate device-intent builder, which is the general producer of a complete document;
-#: three need something more specific, named here.
+#: Why each remaining section still reads live rows at apply time.
 LIVE_READ_SECTIONS: dict[str, str] = {
     "snmp": "the payload resolves Vault refs per row at send time",
     "static_route": "build_plan classifies against tombstones, carriers and deployed keys",
     "logging": "shares the snmp module's per-row secret resolution",
-    "svi": "awaits the aggregate builder",
-    "subinterface": "awaits the aggregate builder",
-    "bfd": "awaits the aggregate builder",
-    "interface_mtu": "awaits the aggregate builder",
-    "l2_sap": "awaits the aggregate builder",
-    "isis": "awaits the aggregate builder",
     "bgp": "the payload walks the router -> scope -> af -> peer relationship graph",
-    "route_policy": "awaits the aggregate builder",
-    "ospf": "awaits the aggregate builder",
     "interface_config": "eligibility is keyed off InterfaceAttrState, which is not intent",
 }
 
@@ -547,11 +539,14 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
     if section not in document:
         raise ValueError(f"document does not carry section {section!r}")
     tables = document[section] or {}
+    allowed_models = {spec.model for spec in _SECTION_TABLES[section]}
     rows: dict[type, list] = {}
     for table_name, records in tables.items():
         model = _MODEL_BY_TABLE.get(table_name)
         if model is None:
             raise ValueError(f"document section {section!r} names unknown table {table_name!r}")
+        if model not in allowed_models:
+            raise ValueError(f"document table {table_name!r} does not belong to section {section!r}")
         columns = {column.key: column for column in model.__table__.columns}
         keys = [column.key for column in model.__table__.primary_key.columns]
         built = []

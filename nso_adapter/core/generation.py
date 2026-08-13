@@ -249,6 +249,17 @@ async def allocate_settlement_cohort(db: AsyncSession) -> int:
     return cohort
 
 
+async def request_settlement_cohort(db: AsyncSession, generation_count: int) -> int | None:
+    """Allocate one cohort exactly when this intent request promotes several generations."""
+    from nso_adapter.core.request_flags import STORE_ONLY
+
+    if generation_count < 0:
+        raise ValueError("generation_count cannot be negative")
+    if generation_count <= 1 or STORE_ONLY.get():
+        return None
+    return await allocate_settlement_cohort(db)
+
+
 def _compose_document(fragments: dict[str, dict]) -> dict:
     """Compose ``{stream: fragment}`` into the ``{section: {table: rows}}`` outbound document.
 
@@ -1119,10 +1130,10 @@ async def settle_job_generations(
     Runs INSIDE the terminal transaction, so a generation can never be settled by a status
     write that was rolled back. On success each carried stream is stamped applied at THE
     REVISION THE GENERATION CARRIED — never at the store's current revision, which may
-    already hold writes this deployment never contained (§G2). A marking-split removal can
-    put the same stream revision in two generations. That revision is stamped only after
-    every cohort member has either settled or been explicitly abandoned, and only when at
-    least one member settled successfully.
+    already hold writes this deployment never contained (§G2). A cohort is request-atomic:
+    every stream it carries is stamped only after at least one member settles and every
+    member is either settled or explicitly abandoned. A live or failed member withholds all
+    streams in the request.
     """
     carried = await _job_generations(db, job_id)
     if not carried:
@@ -1148,9 +1159,23 @@ async def settle_job_generations(
             seqs=[g.seq for g in carried],
         )
         return
+    cohorts = {generation.settlement_cohort for generation in carried if generation.settlement_cohort is not None}
+    cohort_generations = []
+    if cohorts:
+        cohort_generations = list(
+            (
+                await db.execute(
+                    select(DeploymentGeneration).where(DeploymentGeneration.settlement_cohort.in_(sorted(cohorts)))
+                )
+            )
+            .scalars()
+            .all()
+        )
+    target_generations = [generation for generation in carried if generation.settlement_cohort is None]
+    target_generations.extend(cohort_generations)
     targets = {
         (generation.device_id, stream, revision, generation.settlement_cohort)
-        for generation in carried
+        for generation in target_generations
         for stream, revision in (generation.stream_revisions or {}).items()
     }
     await _stamp_applied_revisions(db, targets, now)
@@ -1196,21 +1221,20 @@ async def _stamp_applied_revisions(
 
 async def _stamp_settled_cohort(db: AsyncSession, settlement_cohort: int, now: datetime) -> None:
     """Re-evaluate one cohort after a blocker becomes explicitly crossable."""
-    settled = (
+    cohort_generations = (
         (
             await db.execute(
-                select(DeploymentGeneration).where(
-                    DeploymentGeneration.settlement_cohort == settlement_cohort,
-                    DeploymentGeneration.status == GenerationStatus.settled,
-                )
+                select(DeploymentGeneration).where(DeploymentGeneration.settlement_cohort == settlement_cohort)
             )
         )
         .scalars()
         .all()
     )
+    if not any(generation.status is GenerationStatus.settled for generation in cohort_generations):
+        return
     targets: set[tuple[int, str, int, int | None]] = {
         (generation.device_id, stream, revision, settlement_cohort)
-        for generation in settled
+        for generation in cohort_generations
         for stream, revision in (generation.stream_revisions or {}).items()
     }
     await _stamp_applied_revisions(db, targets, now)
@@ -1583,6 +1607,7 @@ __all__ = [
     "note_write",
     "recover_generations",
     "reconcile_generation",
+    "request_settlement_cohort",
     "requeue_job_generations",
     "retry_generation",
     "settle_job_generations",

@@ -175,20 +175,32 @@ async def put_interface_mtu_intent(
         count += 1
 
     await db.flush()
+    settings = (
+        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    ).scalar_one_or_none()
+    apply_requested = bool(settings and settings.auto_apply and count > 0)
+    from nso_adapter.core.generation import request_settlement_cohort
+
+    settlement_cohort = await request_settlement_cohort(db, int(bool(removed or cleared)) + int(apply_requested))
     replaced = False
     if removed or cleared:
         from nso_adapter.core.removal import replace_on_removal
         from nso_adapter.nso.apply import apply_mtu_config
 
-        replaced = await replace_on_removal(db, device, removed, InterfaceMtuIntent, apply_mtu_config, retract=cleared)
+        replaced = await replace_on_removal(
+            db,
+            device,
+            removed,
+            InterfaceMtuIntent,
+            apply_mtu_config,
+            retract=cleared,
+            settlement_cohort=settlement_cohort,
+        )
 
-    settings = (
-        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    ).scalar_one_or_none()
-    if settings and settings.auto_apply and count > 0:
+    if apply_requested:
         from nso_adapter.core.apply import enqueue_apply
 
-        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
 
     result = {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}
     await record_response(db, device_id, delivery, result)

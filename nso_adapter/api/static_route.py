@@ -706,11 +706,9 @@ async def _apply_static_route_intent(
     auto_apply = bool(settings and settings.auto_apply and count > 0)
     removal_generation_count = len(removed_by_marking) if removed_rows else int(cleared)
     promoted_generation_count = 0 if STORE_ONLY.get() else removal_generation_count + int(auto_apply)
-    settlement_cohort = None
-    if promoted_generation_count > 1:
-        from nso_adapter.core.generation import allocate_settlement_cohort
+    from nso_adapter.core.generation import request_settlement_cohort
 
-        settlement_cohort = await allocate_settlement_cohort(db)
+    settlement_cohort = await request_settlement_cohort(db, promoted_generation_count)
 
     # Removal BEFORE apply, and both inside this transaction. The order is the contract:
     # the removal must carry the lower (created_at, id) so the worker's per-device head

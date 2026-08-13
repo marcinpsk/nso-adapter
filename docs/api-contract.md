@@ -717,7 +717,10 @@ the apply generation; detach removal generations follow it, so the top-level `jo
 the first networked removal when one exists. The networked intermediate document
 retains every detach-only row. The detach generation stores the selected desired document.
 All links in the request share one non-null `settlement_cohort`; a singleton leaves it null.
-A failed head blocks every successor through the ordinary generation success barrier.
+Settlement is request-atomic within that cohort. One failed member withholds every member's
+`applied_revision`. A successful retry of the failed member releases and stamps the full
+cohort. A failed head also blocks every successor through the ordinary generation success
+barrier.
 
 Apply refuses the whole request with `409 apply_unexecutable` when any selected stream cannot
 be routed faithfully through those runners. The refusal names each stream and reason. It does
@@ -726,15 +729,15 @@ not promote or enqueue a subset. Reasons are stable machine codes:
 `unresolved_interface_identity`. A push can also return `outstanding_deletion_provenance`
 when its receipt still carries deletion work.
 
-The current manual-Apply boundary is exactly `DOCUMENT_EXECUTED_SECTIONS`, which currently
-contains only `vlan`. Every other selected stream refuses with `409 apply_unexecutable` and
-reason `live_read_execution`, because its runner reads the live intent store and cannot
-guarantee that it executes the selected revision. Static route remains outside the boundary:
-its companion apply reads live `StaticRouteIntent`, and removal claim subtraction also reads
-live claims. A store-only push between Apply and worker start could otherwise deploy
-unselected state under the selected generation. `ACTION_APPLY_EXECUTABLE_SECTIONS` declares
-this boundary. It widens when a section moves into `DOCUMENT_EXECUTED_SECTIONS` as the
-aggregate document builder lands.
+The current manual-Apply boundary is exactly `DOCUMENT_EXECUTED_SECTIONS`. It contains
+`vlan`, `svi`, `subinterface`, `bfd`, `interface_mtu`, `l2_sap`, `isis`, `route_policy`, and
+`ospf`. A selected stream outside this set refuses with `409 apply_unexecutable` and reason
+`live_read_execution`, because its runner reads the live intent store and cannot guarantee
+that it executes the selected revision. Static route remains outside the boundary: its
+companion apply reads live `StaticRouteIntent`, and removal claim subtraction also reads live
+claims. A store-only push between Apply and worker start could otherwise deploy unselected
+state under the selected generation. `ACTION_APPLY_EXECUTABLE_SECTIONS` declares this
+boundary. It widens when another section moves into `DOCUMENT_EXECUTED_SECTIONS`.
 
 Deletion provenance from a store-only revision remains an execution obligation. If a later
 ordinary push would promote that stream without executing the carried deletion, the entire

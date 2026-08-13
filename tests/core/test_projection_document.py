@@ -22,6 +22,10 @@ from tests.conftest import seed_device, session
 
 pytestmark = pytest.mark.anyio
 
+_INCREMENT_ONE_SECTIONS = frozenset(
+    {"svi", "subinterface", "bfd", "interface_mtu", "l2_sap", "isis", "route_policy", "ospf"}
+)
+
 
 def test_every_section_is_either_document_executed_or_names_its_blocker():
     """No third state. Manual selection and execution stay equal but distinct concepts."""
@@ -93,6 +97,128 @@ def test_composing_an_empty_promoted_stream_preserves_its_section():
     assert _compose_document({"vlan": {}}) == {"vlan": {}}
 
 
+def test_increment_one_sections_are_document_executed():
+    from nso_adapter.core.projection import DOCUMENT_EXECUTED_SECTIONS, LIVE_READ_SECTIONS
+
+    assert _INCREMENT_ONE_SECTIONS <= DOCUMENT_EXECUTED_SECTIONS
+    assert not (_INCREMENT_ONE_SECTIONS & set(LIVE_READ_SECTIONS))
+
+
+@pytest.mark.parametrize(
+    ("section", "model_name", "values", "changed_field", "successor_value"),
+    [
+        pytest.param(
+            "svi",
+            "SviIntent",
+            {"interface_name": "Vlan100", "vlan_id": 100, "svi_type": "svi"},
+            "vlan_id",
+            200,
+            id="svi",
+        ),
+        pytest.param(
+            "subinterface",
+            "SubinterfaceIntent",
+            {
+                "interface_name": "GigabitEthernet0/1.100",
+                "parent_interface": "GigabitEthernet0/1",
+                "dot1q_vlan": 100,
+                "sub_type": "subinterface",
+            },
+            "dot1q_vlan",
+            200,
+            id="subinterface",
+        ),
+        pytest.param(
+            "bfd",
+            "BfdIntent",
+            {"interface_name": "Port-channel1", "min_tx": 300, "min_rx": 300, "multiplier": 3},
+            "min_tx",
+            900,
+            id="bfd",
+        ),
+        pytest.param(
+            "interface_mtu",
+            "InterfaceMtuIntent",
+            {"interface_name": "Port-channel1", "mtu": 9216},
+            "mtu",
+            9000,
+            id="interface_mtu",
+        ),
+        pytest.param(
+            "l2_sap",
+            "L2SapIntent",
+            {
+                "service_name": "EXAMPLE",
+                "service_type": "epipe",
+                "sap_id": "lag-60:3999",
+                "port": "lag-60",
+            },
+            "port",
+            "lag-61",
+            id="l2_sap",
+        ),
+        pytest.param(
+            "isis",
+            "IsisInterfaceIntent",
+            {"interface_name": "system", "af": "ipv4", "process_tag": "0", "metric": 10},
+            "metric",
+            20,
+            id="isis",
+        ),
+        pytest.param(
+            "route_policy",
+            "RoutePolicyObjectIntent",
+            {"family": "prefix_list", "name": "EXAMPLE-PFX", "entries": [{"sequence": 10}]},
+            "entries",
+            [{"sequence": 20}],
+            id="route_policy",
+        ),
+        pytest.param(
+            "ospf",
+            "OspfInstanceIntent",
+            {"process_id": "1", "router_id": "192.0.2.1", "vrf": ""},
+            "router_id",
+            "192.0.2.2",
+            id="ospf",
+        ),
+    ],
+)
+async def test_increment_one_apply_rows_come_from_the_generation_document(
+    adapter_client,
+    section,
+    model_name,
+    values,
+    changed_field,
+    successor_value,
+):
+    """A successor can change the store, but the run still pushes the selected document."""
+    from sqlalchemy import inspect as sa_inspect
+
+    from nso_adapter.core.apply import _Projection
+    from nso_adapter.core.projection import snapshot_stream
+    from nso_adapter.store import models
+
+    device_id = await seed_device(nso_device_name=f"document-{section}")
+    model = getattr(models, model_name)
+    accepted = datetime(2026, 8, 1, tzinfo=UTC)
+    async with session() as db:
+        row = model(device_id=device_id, accepted_at=accepted, **values)
+        db.add(row)
+        await db.flush()
+        original_value = getattr(row, changed_field)
+        document = {section: await snapshot_stream(db, device_id, section)}
+        setattr(row, changed_field, successor_value)
+        await db.commit()
+
+    async with session() as db:
+        source = _Projection(db, device_id, True, document, frozenset({section}))
+        selected = await source.collect(model, section=section)
+
+    assert [getattr(row, changed_field) for row in selected.push] == [original_value]
+    assert all(sa_inspect(row).transient for row in selected.push)
+    assert selected.stamp == [], "the successor row differs from the document and must stay pending"
+
+
 async def test_a_snapshot_hydrates_back_into_the_rows_it_was_taken_from(adapter_client):
     """Round-trip fidelity, including the types JSON cannot hold natively."""
     from nso_adapter.core.projection import hydrate_section, snapshot_stream
@@ -150,6 +276,13 @@ def test_only_the_static_route_tables_carry_a_correlation_column():
         if CORRELATION_COLUMNS & {column.key for column in spec.model.__table__.columns}
     }
     assert carriers == {"static_route_intent", "static_route_tombstone"}
+
+def test_hydrating_a_known_table_under_the_wrong_section_is_refused():
+    """A document cannot smuggle one section's rows into another section."""
+    from nso_adapter.core.projection import hydrate_section
+
+    with pytest.raises(ValueError, match="does not belong"):
+        hydrate_section({"svi": {"vlan_intent": []}}, "svi")
 
 
 # ── stream ownership: the authorization partition ────────────────────────────

@@ -470,6 +470,140 @@ async def test_dispatch_scope_route_policy_passes_ned_id(adapter_client):
     assert kwargs.get("replace") is True
 
 
+@pytest.mark.parametrize(
+    ("scope", "model_name", "values", "changed_field", "successor_value", "apply_target", "rows_arg"),
+    [
+        pytest.param(
+            "svi",
+            "SviIntent",
+            {"interface_name": "Vlan100", "vlan_id": 100, "svi_type": "svi"},
+            "vlan_id",
+            200,
+            "apply_svi_config",
+            2,
+            id="svi",
+        ),
+        pytest.param(
+            "subinterface",
+            "SubinterfaceIntent",
+            {
+                "interface_name": "GigabitEthernet0/1.100",
+                "parent_interface": "GigabitEthernet0/1",
+                "dot1q_vlan": 100,
+                "sub_type": "subinterface",
+            },
+            "dot1q_vlan",
+            200,
+            "apply_subinterface_config",
+            2,
+            id="subinterface",
+        ),
+        pytest.param(
+            "bfd",
+            "BfdIntent",
+            {"interface_name": "Port-channel1", "min_tx": 300, "min_rx": 300, "multiplier": 3},
+            "min_tx",
+            900,
+            "apply_bfd_config",
+            2,
+            id="bfd",
+        ),
+        pytest.param(
+            "interface_mtu",
+            "InterfaceMtuIntent",
+            {"interface_name": "Port-channel1", "mtu": 9216},
+            "mtu",
+            9000,
+            "apply_mtu_config",
+            2,
+            id="interface_mtu",
+        ),
+        pytest.param(
+            "l2_sap",
+            "L2SapIntent",
+            {
+                "service_name": "EXAMPLE",
+                "service_type": "epipe",
+                "sap_id": "lag-60:3999",
+                "port": "lag-60",
+            },
+            "port",
+            "lag-61",
+            "apply_l2_saps",
+            2,
+            id="l2_sap",
+        ),
+        pytest.param(
+            "isis",
+            "IsisInterfaceIntent",
+            {"interface_name": "system", "af": "ipv4", "process_tag": "0", "metric": 10},
+            "metric",
+            20,
+            "apply_isis_interfaces",
+            2,
+            id="isis",
+        ),
+        pytest.param(
+            "route_policy",
+            "RoutePolicyObjectIntent",
+            {"family": "prefix_list", "name": "EXAMPLE-PFX", "entries": [{"sequence": 10}]},
+            "entries",
+            [{"sequence": 20}],
+            "apply_route_policy_config",
+            2,
+            id="route_policy",
+        ),
+        pytest.param(
+            "ospf",
+            "OspfInstanceIntent",
+            {"process_id": "1", "router_id": "192.0.2.1", "vrf": ""},
+            "router_id",
+            "192.0.2.2",
+            "apply_ospf_config",
+            2,
+            id="ospf",
+        ),
+    ],
+)
+async def test_increment_one_removal_rows_come_from_the_generation_document(
+    adapter_client,
+    scope,
+    model_name,
+    values,
+    changed_field,
+    successor_value,
+    apply_target,
+    rows_arg,
+):
+    """A removal PUT-replace asserts its own document after the live store changes."""
+    from nso_adapter.store import models
+
+    device_id = await _seed_device(nso_device_name=f"removal-document-{scope}")
+    model = getattr(models, model_name)
+    async with session() as db:
+        row = model(device_id=device_id, accepted_at=_NOW, **values)
+        db.add(row)
+        await db.commit()
+
+    job_id = await _seed_removal_job(device_id, scope)
+    async with session() as db:
+        row = await db.scalar(select(model).where(model.device_id == device_id))
+        original_value = getattr(row, changed_field)
+        setattr(row, changed_field, successor_value)
+        await db.commit()
+
+    apply_fn = AsyncMock()
+    client = _guard_client(None)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with patch(f"nso_adapter.nso.apply.{apply_target}", apply_fn):
+            await removal_mod._dispatch_scope(db, device, client, scope, job_id=job_id)
+
+    apply_fn.assert_awaited_once()
+    rows = apply_fn.await_args.args[rows_arg]
+    assert [getattr(row, changed_field) for row in rows] == [original_value]
+
+
 async def test_dispatch_interface_config_puts_remaining_and_deletes_empty(adapter_client):
     """interface_config removal PUT-replaces an interface that still has accepted intent, and
     DELETEs one with none — so a removed IP is reverted on the device (#5)."""

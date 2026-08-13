@@ -8,6 +8,7 @@ import asyncio
 import time
 from types import SimpleNamespace
 
+import httpx
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
@@ -52,12 +53,35 @@ async def _put_snmp(client, device_id: int, labels: list[str], *, seq: int, quer
     )
 
 
+async def _put_svis(client, device_id: int, vlan_ids: list[int], *, seq: int, query: str = ""):
+    return await client.put(
+        f"/api/v1/devices/{device_id}/svi-intent{query}",
+        json={
+            "interfaces": [
+                {"interface_name": f"Vlan{vlan_id}", "vlan_id": vlan_id, "type": "svi"} for vlan_id in vlan_ids
+            ]
+        },
+        headers=AUTH | {"X-Push-Seq": str(seq)},
+    )
+
+
 async def _apply(client, device_id: int, selected: dict[str, int]):
     return await client.post(
         f"/api/v1/devices/{device_id}/actions/apply",
         json={"selected": selected},
         headers=AUTH,
     )
+
+
+def _reject_restconf_patches(client, message: str) -> None:
+    async def reject(url, content=None, headers=None, **kwargs):
+        return httpx.Response(
+            400,
+            request=httpx.Request("PATCH", url),
+            json={"errors": {"error": [{"error-message": message}]}},
+        )
+
+    client._client.return_value.__aenter__.return_value.patch.side_effect = reject
 
 
 def _bgp_router(remote_as: str) -> dict:
@@ -216,6 +240,180 @@ async def test_mixed_promotion_stamps_applied_only_after_the_whole_chain_settles
     await _settle(apply.job_id, GenerationStatus.settled)
     stream = await _stream(device_id, "static_route")
     assert (stream.desired_revision, stream.authorized_revision, stream.applied_revision) == (2, 2, 2)
+
+
+async def test_request_atomic_cohort_stamps_no_stream_until_every_member_succeeds(adapter_client):
+    """One failed cohort member withholds every stream until that member is retried."""
+    from nso_adapter.core.claim import terminalize
+    from nso_adapter.core.generation import (
+        allocate_settlement_cohort,
+        attach_to_job,
+        create_generation,
+        mark_job_generations_running,
+        note_write,
+        retry_generation,
+    )
+    from nso_adapter.store.models import (
+        GenerationMode,
+        Job,
+        JobStatus,
+        JobType,
+        SviIntent,
+        VlanIntent,
+    )
+
+    device_id = await seed_device(nso_device_name="request-atomic-cohort", netbox_device_id=9990)
+    async with session() as db:
+        db.add(VlanIntent(device_id=device_id, vlan_id=10, accepted_at=sa.func.now()))
+        db.add(SviIntent(device_id=device_id, interface_name="Vlan10", vlan_id=10, accepted_at=sa.func.now()))
+        await db.flush()
+        cohort = await allocate_settlement_cohort(db)
+
+        await note_write(db, device_id, "vlan")
+        vlan_generation = await create_generation(
+            db,
+            device_id,
+            streams=("vlan",),
+            mode=GenerationMode.networked,
+            settlement_cohort=cohort,
+        )
+        vlan_job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.running)
+        db.add(vlan_job)
+        await db.flush()
+        await attach_to_job(db, vlan_generation, vlan_job)
+
+        await note_write(db, device_id, "svi")
+        svi_generation = await create_generation(
+            db,
+            device_id,
+            streams=("svi",),
+            mode=GenerationMode.networked,
+            settlement_cohort=cohort,
+        )
+        svi_job = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued)
+        db.add(svi_job)
+        await db.flush()
+        await attach_to_job(db, svi_generation, svi_job)
+        await db.commit()
+
+    async with session() as db:
+        assert await terminalize(db, vlan_job.id, status=JobStatus.succeeded, expect=JobStatus.running) is not None
+        await db.commit()
+    assert (await _stream(device_id, "vlan")).applied_revision == 0
+    assert (await _stream(device_id, "svi")).applied_revision == 0
+
+    async with session() as db:
+        queued = await db.get(Job, svi_job.id)
+        queued.status = JobStatus.running
+        await mark_job_generations_running(db, svi_job.id)
+        await db.flush()
+        assert await terminalize(db, svi_job.id, status=JobStatus.failed, expect=JobStatus.running) is not None
+        await db.commit()
+    assert (await _stream(device_id, "vlan")).applied_revision == 0
+    assert (await _stream(device_id, "svi")).applied_revision == 0
+
+    async with session() as db:
+        retry = await retry_generation(db, svi_generation.id)
+        assert retry is not None
+        await db.commit()
+        retry.status = JobStatus.running
+        await mark_job_generations_running(db, retry.id)
+        await db.flush()
+        assert await terminalize(db, retry.id, status=JobStatus.succeeded, expect=JobStatus.running) is not None
+        await db.commit()
+
+    assert (await _stream(device_id, "vlan")).applied_revision == 1
+    assert (await _stream(device_id, "svi")).applied_revision == 1
+
+
+async def test_svi_request_with_removal_and_apply_uses_one_cohort(adapter_client):
+    """Every generation promoted by one non-static request shares one request cohort."""
+    from nso_adapter.store.models import GenerationStatus
+
+    device_id = await seed_device(nso_device_name="svi-request-cohort", netbox_device_id=9991)
+    await seed_settings(device_id, auto_apply=True)
+    assert (await _put_svis(adapter_client, device_id, [100, 200], seq=6401)).status_code == 200
+    (baseline,) = await _generations(device_id)
+    await _settle(baseline.job_id, GenerationStatus.settled)
+
+    assert (await _put_svis(adapter_client, device_id, [100], seq=6402)).status_code == 200
+    removal, apply = (await _generations(device_id))[1:]
+    assert removal.settlement_cohort is not None
+    assert apply.settlement_cohort == removal.settlement_cohort
+
+
+async def test_svi_action_apply_executes_the_selected_document(adapter_client):
+    """A store-only successor landing after Apply cannot leak into the selected run."""
+    from tests.core.test_generation_protocol import recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="svi-exact-selection", netbox_device_id=9992)
+    await seed_settings(device_id, auto_apply=False)
+    assert (await _put_svis(adapter_client, device_id, [100], seq=6501, query="?store_only=true")).status_code == 200
+    response = await _apply(adapter_client, device_id, {"svi": 6501})
+    assert response.status_code == 202, response.text
+
+    async def successor():
+        result = await _put_svis(adapter_client, device_id, [200], seq=6502, query="?store_only=true")
+        assert result.status_code == 200
+
+    client, recorder = recorded_client("svi-exact-selection", on_sync_from=successor)
+    assert await run_head(device_id, client) is not None
+    bodies = recorder.bodies("svi-reconciler:svi-config")
+    assert [[entry["vlan-id"] for entry in body["svi-reconciler:svi-config"][0]["interface"]] for body in bodies] == [
+        [100]
+    ]
+
+
+async def test_failed_svi_document_send_with_no_stamp_rows_fails_generation(adapter_client):
+    from nso_adapter.store.models import GenerationStatus, JobStatus
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="svi-failed-empty-stamp", netbox_device_id=9993)
+    await seed_settings(device_id, auto_apply=False)
+    assert (await _put_svis(adapter_client, device_id, [100], seq=6601, query="?store_only=true")).status_code == 200
+    response = await _apply(adapter_client, device_id, {"svi": 6601})
+    assert response.status_code == 202, response.text
+
+    async def successor():
+        result = await _put_svis(adapter_client, device_id, [200], seq=6602, query="?store_only=true")
+        assert result.status_code == 200
+
+    client, _recorder = recorded_client("svi-failed-empty-stamp", on_sync_from=successor)
+    _reject_restconf_patches(client, "svi commit rejected")
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+
+    job = await job_row(job_id)
+    assert job.status is JobStatus.failed
+    assert job.result["svi_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
+    assert (await _generations(device_id))[0].status is GenerationStatus.failed
+    assert (await _stream(device_id, "svi")).applied_revision == 0
+
+
+async def test_failed_vlan_document_send_with_no_stamp_rows_fails_generation(adapter_client):
+    from nso_adapter.store.models import GenerationStatus, JobStatus
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="vlan-failed-empty-stamp", netbox_device_id=9994)
+    await seed_settings(device_id, auto_apply=False)
+    assert (await _put_vlans(adapter_client, device_id, [10], seq=6701, query="?store_only=true")).status_code == 200
+    response = await _apply(adapter_client, device_id, {"vlan": 6701})
+    assert response.status_code == 202, response.text
+
+    async def successor():
+        result = await _put_vlans(adapter_client, device_id, [20], seq=6702, query="?store_only=true")
+        assert result.status_code == 200
+
+    client, _recorder = recorded_client("vlan-failed-empty-stamp", on_sync_from=successor)
+    _reject_restconf_patches(client, "vlan commit rejected")
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+
+    job = await job_row(job_id)
+    assert job.status is JobStatus.failed
+    assert job.result["vlan_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
+    assert (await _generations(device_id))[0].status is GenerationStatus.failed
+    assert (await _stream(device_id, "vlan")).applied_revision == 0
 
 
 async def test_failed_networked_link_blocks_detach_successor(adapter_client):
