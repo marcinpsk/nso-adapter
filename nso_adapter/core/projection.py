@@ -42,6 +42,7 @@ from typing import Any, NamedTuple
 from sqlalchemy import UniqueConstraint, select
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from nso_adapter.store.models import (
     BfdIntent,
@@ -371,16 +372,7 @@ def _identity_fields(spec: _Spec) -> tuple[str, ...]:
     return tuple(field for field in candidates[0] if field != scope)
 
 
-def _rows_by_id(fragment: dict[str, list[dict]], table: str, by_id: dict[str, dict]) -> dict:
-    """Return *table*'s ``{id: row}`` map, built once per index pass and reused per row."""
-    index = by_id.get(table)
-    if index is None:
-        index = {row.get("id"): row for row in fragment.get(table, [])}
-        by_id[table] = index
-    return index
-
-
-def _row_identity(fragment: dict[str, list[dict]], spec: _Spec, row: dict, by_id: dict[str, dict]) -> tuple:
+def _row_identity(spec: _Spec, row: dict, identities_by_id: dict[type, dict[Any, tuple]]) -> tuple:
     parent_identity: tuple = ()
     if spec.parent is not None:
         fk = _fk_column(spec.model, spec.parent)
@@ -390,12 +382,42 @@ def _row_identity(fragment: dict[str, list[dict]], spec: _Spec, row: dict, by_id
             # DbInterface is outside the projection and is not rebuilt by an intent PUT.
             parent_identity = (parent_id,)
         else:
-            parent_table = spec.parent.__tablename__
-            parent_row = _rows_by_id(fragment, parent_table, by_id).get(parent_id)
-            if parent_row is None:
-                raise RuntimeError(f"{spec.model.__tablename__} row references missing {parent_table} id {parent_id!r}")
-            parent_identity = _row_identity(fragment, parent_spec, parent_row, by_id)
+            parent_identity = identities_by_id.get(spec.parent, {}).get(parent_id)
+            if parent_identity is None:
+                raise RuntimeError(
+                    f"{spec.model.__tablename__} row references missing {spec.parent.__tablename__} id {parent_id!r}"
+                )
     return (*parent_identity, *(row.get(field) for field in _identity_fields(spec)))
+
+
+def _identity_indexes(fragment: dict[str, list[dict]], specs: tuple[_Spec, ...]) -> dict[type, dict[tuple, dict]]:
+    """Index each table once, with parents before children."""
+    identities_by_id: dict[type, dict[Any, tuple]] = {}
+    rows_by_identity: dict[type, dict[tuple, dict]] = {}
+    for spec in specs:
+        indexed: dict[tuple, dict] = {}
+        by_id: dict[Any, tuple] = {}
+        for row in fragment.get(spec.model.__tablename__, []):
+            identity = _row_identity(spec, row, identities_by_id)
+            if identity in indexed:
+                raise RuntimeError(
+                    f"{spec.model.__tablename__} projection contains duplicate durable identity {identity!r}"
+                )
+            indexed[identity] = row
+            by_id[row.get("id")] = identity
+        rows_by_identity[spec.model] = indexed
+        identities_by_id[spec.model] = by_id
+    return rows_by_identity
+
+
+def _identity_lineage(spec: _Spec) -> tuple[_Spec, ...]:
+    """Return the projected ancestors of *spec*, followed by *spec*."""
+    lineage = [spec]
+    parent = _SPEC_BY_MODEL.get(spec.parent)
+    while parent is not None:
+        lineage.append(parent)
+        parent = _SPEC_BY_MODEL.get(parent.parent)
+    return tuple(reversed(lineage))
 
 
 def rows_by_intent_identity(fragment: dict[str, list[dict]], table: str) -> dict[tuple, dict]:
@@ -405,20 +427,13 @@ def rows_by_intent_identity(fragment: dict[str, list[dict]], table: str) -> dict
     logical parent identity, so full-replace writers can mint new database ids without making
     unchanged BGP scopes, peers, or address families look deleted.
 
-    Each parent table is indexed by id ONCE per call: BGP repeats the lineage walk at four
-    levels, so scanning the parent list per row is quadratic in the fragment size.
+    Each table in the lineage is indexed ONCE per call, parents before children: BGP repeats
+    the walk at four levels, so re-deriving a parent per child row is quadratic.
     """
     spec = _SPEC_BY_TABLE.get(table)
     if spec is None:
         raise ValueError(f"unknown projection table {table!r}")
-    by_id: dict[str, dict] = {}
-    indexed: dict[tuple, dict] = {}
-    for row in fragment.get(table, []):
-        identity = _row_identity(fragment, spec, row, by_id)
-        if identity in indexed:
-            raise RuntimeError(f"{table} projection contains duplicate durable identity {identity!r}")
-        indexed[identity] = row
-    return indexed
+    return _identity_indexes(fragment, _identity_lineage(spec))[spec.model]
 
 
 def is_intent_deletion(table: str, identity: tuple, desired_rows: dict[tuple, dict]) -> bool:
@@ -480,6 +495,7 @@ async def _rows_for(db: AsyncSession, device_id: int, spec: _Spec) -> list[dict]
 #: the protocol unnoticed, and closing a reason without wiring the section fails.
 DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset(
     {
+        "bgp",
         "vlan",
         "snmp",
         "logging",
@@ -504,7 +520,6 @@ ACTION_APPLY_EXECUTABLE_SECTIONS: frozenset[str] = frozenset({"vlan"})
 #: Why each remaining section still reads live rows at apply time.
 LIVE_READ_SECTIONS: dict[str, str] = {
     "static_route": "build_plan classifies against tombstones, carriers and deployed keys",
-    "bgp": "the payload walks the router -> scope -> af -> peer relationship graph",
     "interface_config": "eligibility is keyed off InterfaceAttrState, which is not intent",
 }
 
@@ -558,6 +573,53 @@ def intent_state(row) -> dict:
     return {key: value for key, value in _row_dict(row).items() if key not in APPLY_BOOKKEEPING_COLUMNS}
 
 
+@cache
+def _collection_relationship(parent: type, child: type) -> str:
+    """Return the parent's one collection relationship to *child*."""
+    relationships = [
+        relation.key
+        for relation in sa_inspect(parent).relationships
+        if relation.uselist and relation.mapper.class_ is child
+    ]
+    if len(relationships) != 1:
+        raise RuntimeError(
+            f"{parent.__name__} needs one collection relationship to {child.__name__}, got {relationships}"
+        )
+    return relationships[0]
+
+
+def _attach_hydrated_relationships(
+    fragment: dict[str, list[dict]], section: str, records: dict[type, list[tuple[dict, object]]]
+) -> None:
+    """Rebuild in-document parent collections from durable logical identities."""
+    section_specs = _SECTION_TABLES[section]
+    relationship_models = {
+        model for spec in section_specs if spec.parent in _SPEC_BY_MODEL for model in (spec.parent, spec.model)
+    }
+    indexes = _identity_indexes(fragment, tuple(spec for spec in section_specs if spec.model in relationship_models))
+    for spec in section_specs:
+        parent_spec = _SPEC_BY_MODEL.get(spec.parent)
+        if parent_spec is None:
+            continue
+        parent_pairs = records.get(spec.parent, [])
+        child_pairs = records.get(spec.model, [])
+        instance_by_record = {id(record): instance for record, instance in parent_pairs}
+        parents = {identity: instance_by_record[id(record)] for identity, record in indexes[spec.parent].items()}
+        grouped = {identity: [] for identity in parents}
+        child_instance_by_record = {id(record): instance for record, instance in child_pairs}
+        local_identity_size = len(_identity_fields(spec))
+        for identity, record in indexes[spec.model].items():
+            parent_identity = identity[:-local_identity_size]
+            if parent_identity not in grouped:
+                raise RuntimeError(
+                    f"{spec.model.__tablename__} row references missing durable parent identity {parent_identity!r}"
+                )
+            grouped[parent_identity].append(child_instance_by_record[id(record)])
+        relationship = _collection_relationship(spec.parent, spec.model)
+        for identity, parent in parents.items():
+            set_committed_value(parent, relationship, grouped[identity])
+
+
 def hydrate_section(document: dict, section: str) -> dict[type, list]:
     """Rebuild *section*'s rows from a stored document as TRANSIENT ORM instances.
 
@@ -573,7 +635,8 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
     tables = document[section] or {}
     allowed_models = {spec.model for spec in _SECTION_TABLES[section]}
     rows: dict[type, list] = {}
-    for table_name, records in tables.items():
+    row_records: dict[type, list[tuple[dict, object]]] = {}
+    for table_name, serialized_rows in tables.items():
         model = _MODEL_BY_TABLE.get(table_name)
         if model is None:
             raise ValueError(f"document section {section!r} names unknown table {table_name!r}")
@@ -582,7 +645,8 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
         columns = {column.key: column for column in model.__table__.columns}
         keys = [column.key for column in model.__table__.primary_key.columns]
         built = []
-        for record in records:
+        model_records = []
+        for record in serialized_rows:
             instance = model()
             for key, value in record.items():
                 column = columns.get(key)
@@ -592,7 +656,10 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
             if any(record.get(key) is None for key in keys):
                 raise ValueError(f"document row for {table_name!r} omits the primary key {keys!r}")
             built.append(instance)
+            model_records.append((record, instance))
         rows[model] = built
+        row_records[model] = model_records
+    _attach_hydrated_relationships(tables, section, row_records)
     return rows
 
 

@@ -680,6 +680,65 @@ async def test_logging_removal_rows_come_from_the_generation_document(adapter_cl
     assert levels.console_severity == "CRITICAL"
 
 
+async def test_bgp_removal_graph_comes_from_the_generation_document(adapter_client):
+    """The BGP replacement keeps its selected graph after a successor rebuilds the store."""
+    from sqlalchemy import delete
+
+    from nso_adapter.store.models import (
+        BgpAfIntent,
+        BgpPeerAfIntent,
+        BgpPeerIntent,
+        BgpRouterIntent,
+        BgpScopeIntent,
+    )
+
+    def router(remote_as: str) -> BgpRouterIntent:
+        return BgpRouterIntent(
+            device_id=device_id,
+            asn="64512",
+            accepted_at=_NOW,
+            scopes=[
+                BgpScopeIntent(
+                    vrf="",
+                    address_families=[BgpAfIntent(af="ipv4-unicast")],
+                    peers=[
+                        BgpPeerIntent(
+                            peer_address="192.0.2.1",
+                            remote_as=remote_as,
+                            peer_address_families=[BgpPeerAfIntent(af="ipv4-unicast", enabled=True)],
+                        )
+                    ],
+                )
+            ],
+        )
+
+    device_id = await _seed_device(nso_device_name="removal-document-bgp", netbox_device_id=47)
+    async with session() as db:
+        db.add(router("64513"))
+        await db.commit()
+
+    job_id = await _seed_removal_job(device_id, "bgp")
+    async with session() as db:
+        await db.execute(delete(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))
+        db.add(router("64514"))
+        await db.commit()
+
+    apply_fn = AsyncMock()
+    client = _guard_client(None)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with patch("nso_adapter.nso.apply.apply_bgp_config", apply_fn):
+            await removal_mod._dispatch_scope(db, device, client, "bgp", job_id=job_id)
+
+    apply_fn.assert_awaited_once()
+    selected = apply_fn.await_args.args[2][0]
+    assert selected.asn == "64512"
+    assert [scope.vrf for scope in selected.scopes] == [""]
+    assert [af.af for af in selected.scopes[0].address_families] == ["ipv4-unicast"]
+    assert [peer.remote_as for peer in selected.scopes[0].peers] == ["64513"]
+    assert [af.af for af in selected.scopes[0].peers[0].peer_address_families] == ["ipv4-unicast"]
+
+
 async def test_dispatch_interface_config_puts_remaining_and_deletes_empty(adapter_client):
     """interface_config removal PUT-replaces an interface that still has accepted intent, and
     DELETEs one with none — so a removed IP is reverted on the device (#5)."""

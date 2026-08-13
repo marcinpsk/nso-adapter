@@ -26,6 +26,7 @@ _INCREMENT_ONE_SECTIONS = frozenset(
     {"svi", "subinterface", "bfd", "interface_mtu", "l2_sap", "isis", "route_policy", "ospf"}
 )
 _INCREMENT_TWO_SECTIONS = frozenset({"snmp", "logging"})
+_INCREMENT_THREE_SECTIONS = frozenset({"bgp"})
 
 
 def test_every_section_is_either_document_executed_or_names_its_blocker():
@@ -110,6 +111,13 @@ def test_increment_two_sections_are_document_executed():
 
     assert _INCREMENT_TWO_SECTIONS <= DOCUMENT_EXECUTED_SECTIONS
     assert not (_INCREMENT_TWO_SECTIONS & set(LIVE_READ_SECTIONS))
+
+
+def test_increment_three_sections_are_document_executed():
+    from nso_adapter.core.projection import DOCUMENT_EXECUTED_SECTIONS, LIVE_READ_SECTIONS
+
+    assert _INCREMENT_THREE_SECTIONS <= DOCUMENT_EXECUTED_SECTIONS
+    assert not (_INCREMENT_THREE_SECTIONS & set(LIVE_READ_SECTIONS))
 
 
 @pytest.mark.parametrize(
@@ -311,6 +319,118 @@ async def test_a_snapshot_hydrates_back_into_the_rows_it_was_taken_from(adapter_
     assert [(r.vlan_id, r.name) for r in rows] == [(10, "MGMT"), (20, None)]
     # A datetime survives as a datetime, not as the ISO string the document stores.
     assert [r.accepted_at for r in rows] == [accepted, accepted]
+
+
+async def test_bgp_snapshot_hydrates_the_relationship_graph_for_the_writer(adapter_client):
+    """Durable parent identities rebuild the complete BGP writer graph."""
+    from nso_adapter.core.projection import hydrate_section, rows_by_intent_identity, snapshot_stream
+    from nso_adapter.nso.apply import apply_bgp_config
+    from nso_adapter.store.models import (
+        BgpAfIntent,
+        BgpPeerAfIntent,
+        BgpPeerIntent,
+        BgpRouterIntent,
+        BgpScopeIntent,
+    )
+
+    device_id = await seed_device(nso_device_name="projection-bgp-graph", netbox_device_id=9826)
+    accepted = datetime(2026, 8, 1, tzinfo=UTC)
+    async with session() as db:
+        db.add(
+            BgpRouterIntent(
+                device_id=device_id,
+                asn="64512",
+                router_id="192.0.2.254",
+                accepted_at=accepted,
+                scopes=[
+                    BgpScopeIntent(
+                        vrf="",
+                        address_families=[BgpAfIntent(af="ipv4-unicast")],
+                        peers=[
+                            BgpPeerIntent(
+                                peer_address="192.0.2.1",
+                                remote_as="64513",
+                                peer_address_families=[BgpPeerAfIntent(af="ipv4-unicast", enabled=True)],
+                            )
+                        ],
+                    )
+                ],
+            )
+        )
+        await db.commit()
+
+    async with session() as db:
+        fragment = await snapshot_stream(db, device_id, "bgp")
+
+    assert set(rows_by_intent_identity(fragment, "bgp_peer_af_intent")) == {("64512", "", "192.0.2.1", "ipv4-unicast")}
+    rows = hydrate_section({"bgp": fragment}, "bgp")
+    stage: dict[str, list] = {}
+    await apply_bgp_config(None, "projection-bgp-graph", rows[BgpRouterIntent], stage=stage)
+
+    router = stage["bgp-reconciler:bgp-config"][0]["router"][0]
+    assert router == {
+        "asn": 64512,
+        "router-id": "192.0.2.254",
+        "scope": [
+            {
+                "vrf": "",
+                "address-family": [{"afi": "ipv4-unicast"}],
+                "peer": [
+                    {
+                        "peer-address": "192.0.2.1",
+                        "enabled": True,
+                        "remote-as": "64513",
+                        "peer-address-family": [{"afi": "ipv4-unicast", "enabled": True}],
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_bgp_hydration_resolves_parents_in_linear_work():
+    """Parent lookup may inspect each peer a few times, but not once per peer AF."""
+    from nso_adapter.core.projection import hydrate_section
+    from nso_adapter.store.models import BgpRouterIntent
+
+    class CountingRows(list):
+        def __init__(self, rows):
+            super().__init__(rows)
+            self.visits = 0
+
+        def __iter__(self):
+            for row in super().__iter__():
+                self.visits += 1
+                yield row
+
+    peer_count = 100
+    peers = CountingRows(
+        [
+            {
+                "id": 1000 + index,
+                "scope_id": 2,
+                "peer_address": f"198.18.0.{index + 1}",
+            }
+            for index in range(peer_count)
+        ]
+    )
+    fragment = {
+        "bgp_router_intent": [{"id": 1, "device_id": 1, "asn": "64512"}],
+        "bgp_scope_intent": [{"id": 2, "router_id": 1, "vrf": ""}],
+        "bgp_af_intent": [],
+        "bgp_peer_intent": peers,
+        "bgp_peer_af_intent": [
+            {"id": 2000 + index, "peer_id": 1000 + index, "af": "ipv4-unicast"} for index in range(peer_count)
+        ],
+        "redistribution_intent": [],
+    }
+
+    rows = hydrate_section({"bgp": fragment}, "bgp")
+
+    (router,) = rows[BgpRouterIntent]
+    assert len(router.scopes[0].peers) == peer_count
+    assert all(len(peer.peer_address_families) == 1 for peer in router.scopes[0].peers)
+    assert peers.visits <= peer_count * 4
 
 
 async def test_snmp_snapshot_stores_vault_references_verbatim(adapter_client):

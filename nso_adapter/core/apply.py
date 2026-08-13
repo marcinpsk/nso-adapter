@@ -3003,13 +3003,16 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         isis_flex_rows,
         isis_level_rows,
     )
-    bgp_eligible = (await source.collect(BgpRouterIntent, section="bgp")).push
-    if bgp_eligible:
-        # Eagerly load BGP relationships for apply (avoids lazy-raise on the worker greenlet).
+    bgp_router_rows = await source.collect(BgpRouterIntent, section="bgp")
+    if bgp_router_rows.push and not sa_inspect(bgp_router_rows.push[0]).transient:
+        # Live BGP rows still need their relationship collections loaded.
         from nso_adapter.core.bgp_load import attach_bgp_relationships
 
-        await attach_bgp_relationships(db, bgp_eligible)
-    redist_bgp = (await source.collect(RedistributionIntent, section="bgp")).push
+        await attach_bgp_relationships(db, bgp_router_rows.push)
+    redist_bgp_rows = await source.collect(RedistributionIntent, section="bgp")
+    bgp_rows = _combine_rows(bgp_router_rows, redist_bgp_rows)
+    bgp_eligible = bgp_router_rows.push
+    redist_bgp = redist_bgp_rows.push
     rp_rows = await source.collect(RoutePolicyObjectIntent, section="route_policy")
     ospf_instance_rows = await source.collect(OspfInstanceIntent, section="ospf")
     ospf_iface_rows = await source.collect(OspfInterfaceIntent, section="ospf")
@@ -3114,6 +3117,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
                 "interface_mtu": mtu_rows.stamp,
                 "l2_sap": l2_rows.stamp,
                 "isis": isis_rows.stamp,
+                "bgp": bgp_rows.stamp,
                 "route_policy": rp_rows.stamp,
                 "ospf": ospf_rows.stamp,
             },
@@ -3127,6 +3131,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
                 "interface_mtu": mtu_rows.stamp_of,
                 "l2_sap": l2_rows.stamp_of,
                 "isis": isis_rows.stamp_of,
+                "bgp": bgp_rows.stamp_of,
                 "route_policy": rp_rows.stamp_of,
                 "ospf": ospf_rows.stamp_of,
             },
@@ -3275,13 +3280,15 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         _Scope(
             "bgp",
             "bgp",
-            [*bgp_eligible, *redist_bgp],
+            bgp_rows.stamp,
             lambda: apply_bgp_config(
                 client=client,
                 device_name=device_name,
                 router_intent_rows=bgp_eligible,
                 redistribution_rows=redist_bgp,
             ),
+            push=bgp_rows.push,
+            stamp_of=bgp_rows.stamp_of,
         ),
         _Scope(
             "route_policy",

@@ -53,6 +53,14 @@ async def _put_snmp(client, device_id: int, labels: list[str], *, seq: int, quer
     )
 
 
+async def _put_bgp(client, device_id: int, remote_as: str, *, seq: int, query: str = ""):
+    return await client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent{query}",
+        json={"routers": [_bgp_router(remote_as)]},
+        headers=AUTH | {"X-Push-Seq": str(seq)},
+    )
+
+
 async def _put_svis(client, device_id: int, vlan_ids: list[int], *, seq: int, query: str = ""):
     return await client.put(
         f"/api/v1/devices/{device_id}/svi-intent{query}",
@@ -397,6 +405,35 @@ async def test_snmp_action_apply_executes_the_selected_document(adapter_client):
         "vault-path": "snmp",
         "vault-key": "selected",
     }
+
+
+async def test_bgp_action_apply_executes_the_selected_graph(adapter_client):
+    """A later BGP tree cannot replace the selected graph at worker claim time."""
+    from nso_adapter.store.models import JobStatus
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="bgp-exact-selection", netbox_device_id=9996)
+    await seed_settings(device_id, auto_apply=False)
+    assert (await _put_bgp(adapter_client, device_id, "64513", seq=6561, query="?store_only=true")).status_code == 200
+    response = await _apply(adapter_client, device_id, {"bgp": 6561})
+    assert response.status_code == 202, response.text
+
+    async def successor():
+        result = await _put_bgp(adapter_client, device_id, "64514", seq=6562, query="?store_only=true")
+        assert result.status_code == 200
+
+    client, recorder = recorded_client("bgp-exact-selection", on_sync_from=successor)
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+    job = await job_row(job_id)
+    assert job.status is JobStatus.succeeded
+    assert job.result["bgp_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
+    bodies = recorder.bodies("bgp-reconciler:bgp-config")
+    router = bodies[0]["bgp-reconciler:bgp-config"][0]["router"][0]
+    assert router["asn"] == 64512
+    assert router["scope"][0]["address-family"] == [{"afi": "ipv4-unicast"}]
+    assert router["scope"][0]["peer"][0]["remote-as"] == "64513"
+    assert router["scope"][0]["peer"][0]["peer-address-family"] == [{"afi": "ipv4-unicast", "enabled": True}]
 
 
 async def test_failed_svi_document_send_with_no_stamp_rows_fails_generation(adapter_client):
@@ -1049,27 +1086,29 @@ async def test_action_apply_refuses_a_live_read_stream_without_promoting_an_exec
     device_id = await seed_device(nso_device_name="apply-live-read-refusal", netbox_device_id=9967)
     await seed_settings(device_id, auto_apply=False)
     assert (await _put_vlans(adapter_client, device_id, [10], seq=4701, query="?store_only=true")).status_code == 200
-    bgp = await adapter_client.put(
-        f"/api/v1/devices/{device_id}/bgp-intent?store_only=true",
-        json={"routers": [_bgp_router("64513")]},
-        headers=AUTH | {"X-Push-Seq": "4702"},
+    routes = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_A, route_id=1, generation=1)],
+        seq=4702,
+        query="?store_only=true",
     )
-    assert bgp.status_code == 200, bgp.text
+    assert routes.status_code == 200, routes.text
 
-    response = await _apply(adapter_client, device_id, {"vlan": 4701, "bgp": 4702})
+    response = await _apply(adapter_client, device_id, {"vlan": 4701, "static_route": 4702})
 
     assert response.status_code == 409
     assert response.json() == {
         "error": {
             "code": "apply_unexecutable",
-            "message": "Selected stream(s) cannot be applied faithfully: bgp",
-            "detail": {"streams": {"bgp": "live_read_execution"}},
+            "message": "Selected stream(s) cannot be applied faithfully: static_route",
+            "detail": {"streams": {"static_route": "live_read_execution"}},
         }
     }
     assert await _generations(device_id) == []
     assert await _jobs(device_id) == []
     assert (await _stream(device_id, "vlan")).authorized_revision == 0
-    assert (await _stream(device_id, "bgp")).authorized_revision == 0
+    assert (await _stream(device_id, "static_route")).authorized_revision == 0
 
 
 async def test_action_apply_refuses_static_route_until_it_executes_from_the_document(adapter_client):
@@ -1325,26 +1364,28 @@ async def test_non_static_detach_mix_keeps_positive_delta_on_apply_link(adapter_
     assert apply.settlement_cohort == detach.settlement_cohort
 
 
-async def test_action_apply_refuses_bgp_until_its_graph_executes_from_the_document(adapter_client):
-    """The live-read BGP graph cannot execute an exact selected revision."""
+async def test_action_apply_accepts_bgp_once_its_graph_executes_from_the_document(adapter_client):
+    """The manual Apply boundary includes BGP after its graph becomes document-executed."""
     device_id = await seed_device(nso_device_name="apply-bgp-rebuild", netbox_device_id=9975)
     await seed_settings(device_id, auto_apply=False)
-    first = await adapter_client.put(
-        f"/api/v1/devices/{device_id}/bgp-intent?store_only=true",
-        json={"routers": [_bgp_router("64513")]},
-        headers=AUTH | {"X-Push-Seq": "5501"},
-    )
+    first = await _put_bgp(adapter_client, device_id, "64513", seq=5501, query="?store_only=true")
     assert first.status_code == 200, first.text
 
     response = await _apply(adapter_client, device_id, {"bgp": 5501})
 
-    assert response.status_code == 409
-    assert response.json()["error"]["detail"] == {
-        "streams": {"bgp": "live_read_execution"},
+    assert response.status_code == 202, response.text
+    (generation,) = await _generations(device_id)
+    assert generation.stream_revisions == {"bgp": 1}
+    assert set(generation.document["bgp"]) == {
+        "bgp_router_intent",
+        "bgp_scope_intent",
+        "bgp_af_intent",
+        "bgp_peer_intent",
+        "bgp_peer_af_intent",
+        "redistribution_intent",
     }
-    assert await _generations(device_id) == []
-    assert await _jobs(device_id) == []
-    assert (await _stream(device_id, "bgp")).authorized_revision == 0
+    assert len(await _jobs(device_id)) == 1
+    assert (await _stream(device_id, "bgp")).authorized_revision == 1
 
 
 async def test_promoted_static_route_detach_fails_when_proof_is_inconclusive(adapter_client):

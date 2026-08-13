@@ -718,7 +718,7 @@ async def _replacement_section_rows(db: AsyncSession, scope: str, job_id: int | 
     if not generation.stream_revisions:
         return None
     return {
-        model: [row for row in rows if row.accepted_at]
+        model: [row for row in rows if getattr(row, "accepted_at", True)]
         for model, rows in hydrate_section(generation.document, scope).items()
     }
 
@@ -1485,36 +1485,44 @@ async def _replace_ospf(
     await _guarded_apply(client, device, "ospf", context, _apply)
 
 
-async def _replace_bgp(db: AsyncSession, device, client, context: dict | None = None) -> None:
-    from nso_adapter.core.bgp_load import attach_bgp_relationships
+async def _replace_bgp(
+    db: AsyncSession, device, client, context: dict | None = None, *, job_id: int | None = None
+) -> None:
     from nso_adapter.nso.apply import apply_bgp_config
     from nso_adapter.store.models import BgpRouterIntent, RedistributionIntent
 
-    routers = (
-        (
-            await db.execute(
-                select(BgpRouterIntent).where(
-                    BgpRouterIntent.device_id == device.id, BgpRouterIntent.accepted_at.is_not(None)
+    document_rows = await _replacement_section_rows(db, "bgp", job_id)
+    if document_rows is not None:
+        routers = document_rows.get(BgpRouterIntent, [])
+        redist = document_rows.get(RedistributionIntent, [])
+    else:
+        from nso_adapter.core.bgp_load import attach_bgp_relationships
+
+        routers = (
+            (
+                await db.execute(
+                    select(BgpRouterIntent).where(
+                        BgpRouterIntent.device_id == device.id, BgpRouterIntent.accepted_at.is_not(None)
+                    )
                 )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-    await attach_bgp_relationships(db, routers)
-    redist = (
-        (
-            await db.execute(
-                select(RedistributionIntent).where(
-                    RedistributionIntent.device_id == device.id,
-                    RedistributionIntent.dest_protocol == "bgp",
-                    RedistributionIntent.accepted_at.is_not(None),
+        await attach_bgp_relationships(db, routers)
+        redist = (
+            (
+                await db.execute(
+                    select(RedistributionIntent).where(
+                        RedistributionIntent.device_id == device.id,
+                        RedistributionIntent.dest_protocol == "bgp",
+                        RedistributionIntent.accepted_at.is_not(None),
+                    )
                 )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
 
     async def _apply(**kwargs):
         return await apply_bgp_config(client, device.nso_device_name, routers, redist, **kwargs)
@@ -1707,7 +1715,7 @@ async def _dispatch_scope(
     if scope == "ospf":
         await _replace_ospf(db, device, client, context, job_id=job_id)
     elif scope == "bgp":
-        await _replace_bgp(db, device, client, context)
+        await _replace_bgp(db, device, client, context, job_id=job_id)
     elif scope == "snmp":
         await _replace_snmp(db, device, client, context, job_id=job_id)
     elif scope == "isis":
