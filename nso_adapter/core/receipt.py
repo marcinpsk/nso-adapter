@@ -50,7 +50,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.intent_protocol import INTENT_STREAMS
-from nso_adapter.store.models import IntentPushReceipt
+from nso_adapter.store.models import DeviceProjectionStream, IntentPushReceipt
 
 logger = structlog.get_logger(__name__)
 
@@ -68,6 +68,14 @@ class PushSequenceConflict(Exception):
         self.code = code
         self.message = message
         self.detail = detail or {}
+
+
+class PromotionProvenanceUnexecutable(RuntimeError):
+    """A direct promotion would discard deletion work carried from an earlier push."""
+
+    def __init__(self, stream: str):
+        super().__init__(f"push cannot promote outstanding deletion provenance for {stream}")
+        self.stream = stream
 
 
 @dataclass(frozen=True)
@@ -120,6 +128,140 @@ def digest_body(body: object) -> str:
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _private_response(response: object) -> dict:
+    if not isinstance(response, dict):
+        return {}
+    return {key: value for key, value in response.items() if key.startswith("_")}
+
+
+def _deletion_identity(record: object) -> tuple | None:
+    if not isinstance(record, dict) or not isinstance(record.get("table"), str):
+        return None
+    if isinstance(record.get("route_id"), int):
+        return record["table"], "route_id", record["route_id"]
+    key = record.get("key")
+    if isinstance(key, list):
+        return record["table"], "key", tuple(key)
+    if isinstance(record.get("id"), int):
+        return record["table"], "id", record["id"]
+    return None
+
+
+def _merge_private_response(previous: dict, response: dict, *, retired: frozenset[tuple] = frozenset()) -> dict:
+    """Carry private promotion provenance forward until Apply consumes it."""
+    merged = dict(previous)
+    merged.update(response)
+    merged.pop("_promotion_deletions", None)
+    old_deletions = previous.get("_promotion_deletions") or []
+    new_deletions = response.get("_promotion_deletions") or []
+    if old_deletions or new_deletions:
+        by_identity = {
+            identity: record
+            for record in old_deletions
+            if (identity := _deletion_identity(record)) is not None and identity not in retired
+        }
+        # A continuously absent row keeps its first marking. Restoration retires that
+        # provenance before a later disappearance records a new marking.
+        for record in new_deletions:
+            identity = _deletion_identity(record)
+            if identity is not None:
+                by_identity.setdefault(identity, record)
+        if by_identity:
+            merged["_promotion_deletions"] = list(by_identity.values())
+    return merged
+
+
+def _record_matches_row(identity: tuple, row: dict) -> bool:
+    _table, kind, value = identity
+    if kind == "route_id":
+        return row.get("route_id") == value
+    if kind == "key":
+        return (row.get("vrf") or "", row.get("prefix") or "", row.get("next_hop") or "") == value
+    return row.get("id") == value
+
+
+def _restored_deletion_identities(previous: dict, authorized: dict, desired: dict) -> frozenset[tuple]:
+    """Return accumulated deletion records whose logical rows are desired again."""
+    from nso_adapter.core.projection import rows_by_intent_identity
+
+    retired: set[tuple] = set()
+    for record in previous.get("_promotion_deletions") or []:
+        deletion_identity = _deletion_identity(record)
+        if deletion_identity is None:
+            continue
+        table = deletion_identity[0]
+        desired_rows = rows_by_intent_identity(desired, table)
+        if deletion_identity[1] != "id" and any(
+            _record_matches_row(deletion_identity, row) for row in desired_rows.values()
+        ):
+            retired.add(deletion_identity)
+            continue
+        previous_identity = next(
+            (
+                identity
+                for identity, row in rows_by_intent_identity(authorized, table).items()
+                if _record_matches_row(deletion_identity, row)
+            ),
+            None,
+        )
+        if previous_identity is not None and previous_identity in desired_rows:
+            retired.add(deletion_identity)
+    return frozenset(retired)
+
+
+async def _record_projection_deletions(
+    db: AsyncSession,
+    device_id: int,
+    delivery: IntentDelivery,
+    receipt: IntentPushReceipt,
+    response: dict,
+) -> tuple[dict, frozenset[tuple]]:
+    """Add first-seen row deletion markings to the receipt's private promotion data."""
+    from nso_adapter.core.projection import is_intent_deletion, rows_by_intent_identity, snapshot_stream
+    from nso_adapter.core.request_flags import DELETE_ORIGIN_MARKING, DETACH_MARKING
+
+    projection = await db.scalar(
+        select(DeviceProjectionStream).where(
+            DeviceProjectionStream.device_id == device_id,
+            DeviceProjectionStream.stream == delivery.stream,
+        )
+    )
+    if projection is None or not projection.authorized_document:
+        return response, frozenset()
+    desired = await snapshot_stream(db, device_id, delivery.stream)
+    retired = _restored_deletion_identities(
+        _private_response(receipt.response), projection.authorized_document, desired
+    )
+    explicit = {
+        identity: record
+        for record in response.get("_promotion_deletions") or []
+        if (identity := _deletion_identity(record)) is not None
+    }
+    marking = DELETE_ORIGIN_MARKING if receipt.delete_origin else DETACH_MARKING
+    for table, previous in projection.authorized_document.items():
+        desired_identities = rows_by_intent_identity(desired, table)
+        for identity, row in rows_by_intent_identity(projection.authorized_document, table).items():
+            row_id = row.get("id")
+            if not isinstance(row_id, int) or not is_intent_deletion(table, identity, desired_identities):
+                continue
+            route_id = row.get("route_id")
+            key = (row.get("vrf") or "", row.get("prefix") or "", row.get("next_hop") or "")
+            if (
+                (isinstance(route_id, int) and (table, "route_id", route_id) in explicit)
+                or (table, "key", key) in explicit
+                or (table, "id", row_id) in explicit
+            ):
+                continue
+            explicit.setdefault(
+                (table, "id", row_id),
+                {"table": table, "id": row_id, "marking": marking},
+            )
+    if explicit:
+        response = dict(response)
+        response["_promotion_deletions"] = list(explicit.values())
+    return response, retired
 
 
 async def latest_receipt(db: AsyncSession, device_id: int, stream: str) -> IntentPushReceipt | None:
@@ -197,7 +339,9 @@ async def admit_push(db: AsyncSession, device_id: int, delivery: IntentDelivery)
     receipt.store_only = identity.store_only
     receipt.delete_origin = identity.delete_origin
     receipt.backfill_only = identity.backfill_only
-    receipt.response = None
+    # Public replay data belongs to this new push. Private promotion provenance belongs to
+    # the unpromoted projection and survives until manual Apply consumes it.
+    receipt.response = _private_response(receipt.response) or None
     receipt.status_code = 200
     receipt.generation_id = None
     receipt.updated_at = _now()
@@ -228,18 +372,44 @@ async def record_response(
     receipt = await latest_receipt(db, device_id, delivery.stream)
     if receipt is None or receipt.push_seq != identity.seq:  # pragma: no cover — admit_push just wrote it
         raise RuntimeError(f"no admitted receipt for device {device_id} stream {delivery.stream!r} seq {identity.seq}")
-    receipt.response = response
+    previous = _private_response(receipt.response)
+    response, retired = await _record_projection_deletions(db, device_id, delivery, receipt, response)
+    carried_deletions = [
+        record
+        for record in previous.get("_promotion_deletions") or []
+        if (identity := _deletion_identity(record)) is not None and identity not in retired
+    ]
+    receipt.response = _merge_private_response(previous, response, retired=retired)
+    projection = await db.scalar(
+        select(DeviceProjectionStream).where(
+            DeviceProjectionStream.device_id == device_id,
+            DeviceProjectionStream.stream == delivery.stream,
+        )
+    )
+    if projection is not None and projection.authorized_revision >= projection.desired_revision:
+        if carried_deletions:
+            raise PromotionProvenanceUnexecutable(delivery.stream)
+        consume_promotion_provenance(receipt)
     receipt.status_code = status_code
     receipt.generation_id = generation_id if generation_id is not None else enqueued_generation_id
     receipt.updated_at = _now()
     await db.flush()
 
 
+def consume_promotion_provenance(receipt: IntentPushReceipt) -> None:
+    """Remove private deletion markings after their projection revision is promoted."""
+    if not isinstance(receipt.response, dict) or "_promotion_deletions" not in receipt.response:
+        return
+    receipt.response = {key: value for key, value in receipt.response.items() if key != "_promotion_deletions"}
+
+
 __all__ = [
     "IntentDelivery",
+    "PromotionProvenanceUnexecutable",
     "PushIdentity",
     "PushSequenceConflict",
     "admit_push",
+    "consume_promotion_provenance",
     "digest_body",
     "latest_receipt",
     "record_response",

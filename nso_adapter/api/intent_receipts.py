@@ -16,8 +16,9 @@ own side, so before it resolves a single outstanding claim it reads this surface
   pk R existed can re-allocate R while the adapter still holds an acknowledged, unrelated row
   carrying ``route_id = R``. The deletion partition's first pass would then bind that row as
   GENUINE and authorize removing it: a device write with no authority behind it. Advancing the
-  pk sequence past this value is what closes it (R9-B4), and the value therefore counts the
-  TOMBSTONES too — a carrier holds the pk of a route whose deletion is still in flight.
+  pk sequence past this value is what closes it (R9-B4), and the value therefore counts both
+  TOMBSTONES and receipt-held promotion deletions. Either carrier can hold the pk of a route
+  whose deletion is still in flight.
 
 Both maxima stay fleet-wide under a filter: the pusher advances ONE sequence for the whole
 fleet, and a per-key answer would let it advance past its own key while another key's receipt
@@ -70,6 +71,9 @@ class IntentReceiptsOut(BaseModel):
 
 
 def _receipt_out(row: IntentPushReceipt) -> dict:
+    response = row.response
+    if isinstance(response, dict):
+        response = {key: value for key, value in response.items() if not key.startswith("_")}
     return {
         "device_id": row.device_id,
         "section": row.section,
@@ -79,7 +83,7 @@ def _receipt_out(row: IntentPushReceipt) -> dict:
         "delete_origin": row.delete_origin,
         "backfill_only": row.backfill_only,
         "status_code": row.status_code,
-        "response": row.response,
+        "response": response,
         "generation_id": row.generation_id,
         "created_at": iso_z(row.created_at),
         "updated_at": iso_z(row.updated_at),
@@ -119,7 +123,17 @@ async def list_intent_receipts(
     max_push_seq = await db.scalar(select(func.max(IntentPushReceipt.push_seq)))
     max_live_route_id = await db.scalar(select(func.max(StaticRouteIntent.route_id)))
     max_tombstoned_route_id = await db.scalar(select(func.max(StaticRouteTombstone.route_id)))
-    held_route_ids = [value for value in (max_live_route_id, max_tombstoned_route_id) if value is not None]
+    receipt_responses = (await db.execute(select(IntentPushReceipt.response))).scalars().all()
+    receipt_route_ids = [
+        record["route_id"]
+        for response in receipt_responses
+        if isinstance(response, dict)
+        for record in response.get("_promotion_deletions") or []
+        if isinstance(record, dict) and isinstance(record.get("route_id"), int)
+    ]
+    held_route_ids = [
+        value for value in (max_live_route_id, max_tombstoned_route_id, *receipt_route_ids) if value is not None
+    ]
 
     return {
         "receipts": [_receipt_out(row) for row in rows],

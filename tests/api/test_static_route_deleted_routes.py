@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
-"""#1503 Appendix-O chunk O2b: ``deleted_routes``, its partition and the pre-effect refusal.
+"""#1503 Appendix-O chunk O2b: ``deleted_routes``, its partition and its carriers.
 
 Rows O2b.8, O2b.11, O2b.13 and O2b.14, every arm driven through the REAL
 ``PUT /api/v1/devices/{id}/static-route-intent`` against real PostgreSQL rows. The response
@@ -79,7 +79,7 @@ def partition_of(payload: dict) -> dict:
     }
 
 
-# ── O2b.8 — the fence, the store-only refusal, and the three classes ──────────
+# ── O2b.8: the immediate fence, store-only carriage, and the three classes ────
 
 
 async def test_o2b_8_a_a_genuine_deletion_on_a_fence_shut_device_is_refused_before_any_effect(adapter_client):
@@ -216,8 +216,8 @@ async def test_o2b_8_e_a_request_mixing_a_genuine_and_a_degraded_id_is_refused_w
     assert await receipt(device_id) is None
 
 
-async def test_o2b_8_f_a_store_only_request_may_not_carry_a_genuine_deletion(adapter_client):
-    """O2b.8(f) — store-only writes no tombstone either, so the same genuine id is unmarkable."""
+async def test_o2b_8_f_store_only_carries_a_genuine_deletion_with_the_fence_shut(adapter_client):
+    """A store-only receipt preserves provenance without creating a tombstone or job."""
     device_id = await seed_device(nso_device_name="sr-o2b8-f", netbox_device_id=9894)
     await seed_intent(
         device_id,
@@ -227,8 +227,6 @@ async def test_o2b_8_f_a_store_only_request_may_not_carry_a_genuine_deletion(ada
             {"triple": C, "route_id": 101, "deployed_key": list(C)},
         ],
     )
-    before = await read_intent_all_columns(device_id)
-
     resp = await put(
         adapter_client,
         device_id,
@@ -238,14 +236,19 @@ async def test_o2b_8_f_a_store_only_request_may_not_carry_a_genuine_deletion(ada
         seq=1,
     )
 
-    assert resp.status_code == 409
-    assert resp.json()["error"]["detail"]["reason"] == "store_only_deletion"
-    assert await read_intent_all_columns(device_id) == before
-    assert await receipt(device_id) is None
+    assert resp.status_code == 200
+    assert {row["route_id"] for row in await read_intent_all_columns(device_id)} == {101}
+    stored = await receipt(device_id)
+    assert stored.response["_promotion_deletions"] == [
+        {"table": "static_route_intent", "route_id": 100, "key": list(A), "marking": "delete_origin"},
+        {"table": "static_route_intent", "route_id": None, "key": list(B), "marking": "detach"},
+    ]
+    assert await read_tombstones(device_id) == []
+    assert await read_jobs(device_id) == []
 
 
-async def test_o2b_8_f_store_only_is_refused_on_a_fence_open_device_too(adapter_client):
-    """O2b.8(f) — the refusal is about the missing carrier, not about the fence."""
+async def test_o2b_8_f_store_only_carries_a_genuine_deletion_with_the_fence_open(adapter_client):
+    """The same receipt carrier works after the immediate-removal fence opens."""
     device_id = await seed_device(nso_device_name="sr-o2b8-f2", netbox_device_id=9895)
     await seed_intent(
         device_id,
@@ -254,8 +257,6 @@ async def test_o2b_8_f_store_only_is_refused_on_a_fence_open_device_too(adapter_
             {"triple": C, "route_id": 101, "deployed_key": list(C)},
         ],
     )
-    before = await read_intent_all_columns(device_id)
-
     resp = await put(
         adapter_client,
         device_id,
@@ -265,9 +266,14 @@ async def test_o2b_8_f_store_only_is_refused_on_a_fence_open_device_too(adapter_
         seq=1,
     )
 
-    assert resp.status_code == 409
-    assert resp.json()["error"]["detail"]["reason"] == "store_only_deletion"
-    assert await read_intent_all_columns(device_id) == before
+    assert resp.status_code == 200
+    assert {row["route_id"] for row in await read_intent_all_columns(device_id)} == {101}
+    stored = await receipt(device_id)
+    assert stored.response["_promotion_deletions"] == [
+        {"table": "static_route_intent", "route_id": 100, "key": list(A), "marking": "delete_origin"}
+    ]
+    assert await read_tombstones(device_id) == []
+    assert await read_jobs(device_id) == []
 
 
 async def test_o2b_8_f_store_only_acknowledges_a_degraded_deletion_without_a_carrier(adapter_client):

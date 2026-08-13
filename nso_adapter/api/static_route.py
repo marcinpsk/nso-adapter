@@ -609,6 +609,15 @@ async def _apply_static_route_intent(
     _refuse_unmarkable_deletions(partition, fence_open=fence_open)
 
     markings = _removal_markings(removed_rows, partition, per_object=body.deleted_routes is not None)
+    promotion_deletions = [
+        {
+            "table": "static_route_intent",
+            "route_id": row.route_id,
+            "key": [row.vrf, row.prefix, row.next_hop],
+            "marking": markings[row.id],
+        }
+        for row in removed_rows
+    ]
     removed_by_marking: dict[str, list] = {}
     for row in removed_rows:
         removed_by_marking.setdefault(markings[row.id], []).append((row.vrf, row.prefix, row.next_hop))
@@ -747,6 +756,8 @@ async def _apply_static_route_intent(
         "removed": len(removed_rows),
         "replaced": replaced,
         "routes": routes,
+        # The public response model filters this receipt-only carrier from the wire.
+        "_promotion_deletions": promotion_deletions,
         **_acknowledgement(partition),
     }
     await record_response(db, device_id, delivery, result)
@@ -873,10 +884,9 @@ def _acknowledgement(partition) -> dict:
 def _refuse_unmarkable_deletions(partition, *, fence_open: bool) -> None:
     """Refuse, before ANY effect, a request whose genuine deletions cannot be marked (§4.4).
 
-    A genuine id needs a tombstone: it is the only carrier of the deletion once the intent row
-    is gone. ``_write_tombstones`` writes none while the fence is shut or the request is
-    store-only, so processing the request would delete the before-image the operator's
-    deletion still depends on (`:476-477`, the O-A4 hazard) and record nothing at all.
+    A genuine id needs a tombstone on an immediately promoted request. A store-only request
+    preserves the removed row and its marking in the durable receipt for a later selected
+    Apply. The fence remains mandatory for an immediate removal job.
 
     Nothing is written yet — the caller's ``held_claim`` rolls this transaction back — so the
     sequence is NOT burned and the pusher can abandon the claim and re-send at a new one once
@@ -884,9 +894,8 @@ def _refuse_unmarkable_deletions(partition, *, fence_open: bool) -> None:
     """
     if not partition.executed:
         return
-    store_only = STORE_ONLY.get()
-    if store_only or not fence_open:
-        reason = "store_only_deletion" if store_only else "fence_shut"
+    if not STORE_ONLY.get() and not fence_open:
+        reason = "fence_shut"
         logger.warning("static_route.deletion_refused", reason=reason, route_ids=list(partition.executed))
         raise api_error(
             409,

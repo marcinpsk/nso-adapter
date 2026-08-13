@@ -26,6 +26,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from nso_adapter.core.receipt import PromotionProvenanceUnexecutable
+
 logger = structlog.get_logger(__name__)
 
 # Closed set. Every member is documented in docs/api-contract.md (error body).
@@ -42,6 +44,7 @@ ErrorCode = Literal[
     "internal",
     "not_implemented",
     "nso_commit_failed",
+    "apply_unexecutable",
     # per-endpoint
     "ambiguous_device",
     "bad_request",
@@ -182,6 +185,21 @@ async def projection_gone_handler(request: Request, exc: Exception) -> JSONRespo
     return JSONResponse(
         status_code=404,
         content={"error": {"code": "not_found", "message": "Device not found", "detail": {}}},
+    )
+
+
+async def promotion_provenance_handler(request: Request, exc: PromotionProvenanceUnexecutable) -> JSONResponse:
+    """Refuse a push that cannot execute deletion provenance from an earlier revision."""
+    stream = exc.stream
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": {
+                "code": "apply_unexecutable",
+                "message": f"Push cannot promote outstanding deletion provenance for {stream}",
+                "detail": {"streams": {stream: "outstanding_deletion_provenance"}},
+            }
+        },
     )
 
 

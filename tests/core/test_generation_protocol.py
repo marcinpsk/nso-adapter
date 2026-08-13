@@ -769,9 +769,14 @@ async def test_f6_a_manual_apply_creates_a_generation_from_authorized_state(adap
     assert (await put_vlans(adapter_client, device_id, [10])).status_code == 200
     assert await generations(device_id) == []
 
-    resp = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/apply", headers=AUTH)
+    push_seq = (await stream_row(device_id, "vlan")).source_push_seq
+    resp = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/apply",
+        json={"selected": {"vlan": push_seq}},
+        headers=AUTH,
+    )
     assert resp.status_code == 202
-    job_id = resp.json()["job_id"]
+    job_id = resp.json()["generations"][0]["job_id"]
 
     chain = await generations(device_id)
     assert len(chain) == 1, "the manual apply trigger enqueued a job with no generation"
