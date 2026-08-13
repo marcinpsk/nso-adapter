@@ -413,6 +413,38 @@ written, and re-submitting is the retry.
 ### `GET /api/v1/devices/{id}` → `200`
 Device object plus `scope` (see below) and `last_job_id`.
 
+### `GET /api/v1/devices/{id}/generations` → `200 | 401 | 404 | 422`
+
+Return the device's deployment generations in ascending `seq` order. The optional
+`since_seq` query parameter selects only generations whose `seq` is strictly greater
+than the supplied value. The endpoint does not paginate the result.
+
+```json
+[
+  {
+    "generation_id": 81,
+    "seq": 4,
+    "status": "pending",
+    "job_id": null,
+    "mode": "networked",
+    "settlement_cohort": null,
+    "digest": "7e4a...",
+    "stream_revisions": {"vlan": 12},
+    "source_push_seq": {"vlan": 501},
+    "created_at": "2026-08-12T09:15:00Z",
+    "updated_at": "2026-08-12T09:30:00Z"
+  }
+]
+```
+
+Every object always contains every shown field. An unset field is `null`, never
+missing. `job_id` is `null` while a pending generation is not attached to a job.
+`settlement_cohort` is `null` when the generation is not part of a request-atomic
+settlement cohort. `status` is one of `pending`, `running`, `settled`, `failed`,
+`outcome_unknown`, or `abandoned`. `mode` is `networked` or `detach`.
+
+`404 not_found` if the device does not exist.
+
 ### `PATCH /api/v1/devices/{id}` — correct the mapping
 Request (any subset):
 ```json

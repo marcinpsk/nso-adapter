@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.api.deps import get_db, verify_token
+from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import (
     RESP_401,
     RESP_404,
@@ -20,8 +20,11 @@ from nso_adapter.api.errors import (
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.store.models import (
     DbInterface,
+    DeploymentGeneration,
     Device,
     DeviceFailover,
+    GenerationMode,
+    GenerationStatus,
     InterfaceAttrState,
     Job,
     ManagedScope,
@@ -166,6 +169,23 @@ class ProvisionOut(BaseModel):
     job_id: str
     nso_device_name: str
     status: str
+
+
+class DeviceGenerationOut(BaseModel):
+    """One deployment generation, with every receipt-facing field always present."""
+
+    generation_id: int
+    seq: int
+    status: GenerationStatus
+    job_id: int | None
+    mode: GenerationMode
+    settlement_cohort: int | None
+    digest: str
+    stream_revisions: dict[str, int]
+    # a reissue-shaped map value is None by design (create_generation persists it)
+    source_push_seq: dict[str, int | None]
+    created_at: str
+    updated_at: str
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -320,6 +340,59 @@ async def get_device(device_id: int, db: AsyncSession = Depends(get_db)):
     out["last_job_id"] = await _last_job_id(device_id, db)
     out["failover"] = _failover_out(await _load_failover(device_id, db))
     return out
+
+
+@router.get(
+    "/{device_id}/generations",
+    dependencies=[Depends(verify_token)],
+    response_model=list[DeviceGenerationOut],
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+)
+async def list_device_generations(
+    device_id: int,
+    since_seq: int | None = None,
+    db: AsyncSession = Depends(get_read_db),
+):
+    if not await db.get(Device, device_id):
+        raise api_error(404, "not_found", "Device not found")
+
+    # metadata columns only: the immutable document JSON is large and never served here
+    query = (
+        select(
+            DeploymentGeneration.id,
+            DeploymentGeneration.seq,
+            DeploymentGeneration.status,
+            DeploymentGeneration.job_id,
+            DeploymentGeneration.mode,
+            DeploymentGeneration.settlement_cohort,
+            DeploymentGeneration.digest,
+            DeploymentGeneration.stream_revisions,
+            DeploymentGeneration.source_push_seq,
+            DeploymentGeneration.created_at,
+            DeploymentGeneration.updated_at,
+        )
+        .where(DeploymentGeneration.device_id == device_id)
+        .order_by(DeploymentGeneration.seq)
+    )
+    if since_seq is not None:
+        query = query.where(DeploymentGeneration.seq > since_seq)
+    rows = (await db.execute(query)).all()
+    return [
+        {
+            "generation_id": row.id,
+            "seq": row.seq,
+            "status": row.status,
+            "job_id": row.job_id,
+            "mode": row.mode,
+            "settlement_cohort": row.settlement_cohort,
+            "digest": row.digest,
+            "stream_revisions": row.stream_revisions,
+            "source_push_seq": row.source_push_seq,
+            "created_at": iso_z(row.created_at),
+            "updated_at": iso_z(row.updated_at),
+        }
+        for row in rows
+    ]
 
 
 class DevicePatch(BaseModel):
