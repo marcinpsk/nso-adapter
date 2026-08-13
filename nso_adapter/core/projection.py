@@ -310,8 +310,30 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+_VAULT_REFERENCE_COLUMNS: dict[type, frozenset[str]] = {
+    SnmpCommunityIntent: frozenset({"vault_ref"}),
+    SnmpV3UserIntent: frozenset({"auth_vault_ref", "priv_vault_ref"}),
+}
+
+
+def _document_value(row, key: str) -> Any:
+    """Return one durable-document value after enforcing the secret boundary."""
+    value = getattr(row, key)
+    # '' is the API's absent optional leg (apply_snmp_config skips it) — nothing to parse
+    if value is not None and value != "" and key in _VAULT_REFERENCE_COLUMNS.get(type(row), ()):
+        from nso_adapter.secrets.refs import VaultRefError, parse_vault_ref
+
+        try:
+            parse_vault_ref(value, require_key=True)
+        except VaultRefError:
+            raise ValueError(
+                f"{type(row).__tablename__}.{key}: refusing to serialize non-reference secret material"
+            ) from None
+    return _jsonable(value)
+
+
 def _row_dict(row) -> dict:
-    return {attr.key: _jsonable(getattr(row, attr.key)) for attr in sa_inspect(type(row)).column_attrs}
+    return {attr.key: _document_value(row, attr.key) for attr in sa_inspect(type(row)).column_attrs}
 
 
 _SPEC_BY_MODEL: dict[type, _Spec] = {spec.model: spec for specs in _SECTION_TABLES.values() for spec in specs}
@@ -457,7 +479,19 @@ async def _rows_for(db: AsyncSession, device_id: int, spec: _Spec) -> list[dict]
 #: ``test_projection_document.py`` pins the partition — so a new section cannot drift out of
 #: the protocol unnoticed, and closing a reason without wiring the section fails.
 DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset(
-    {"vlan", "svi", "subinterface", "bfd", "interface_mtu", "l2_sap", "isis", "route_policy", "ospf"}
+    {
+        "vlan",
+        "snmp",
+        "logging",
+        "svi",
+        "subinterface",
+        "bfd",
+        "interface_mtu",
+        "l2_sap",
+        "isis",
+        "route_policy",
+        "ospf",
+    }
 )
 
 #: The document-executed sections a manual Apply may select. This set equals
@@ -469,9 +503,7 @@ ACTION_APPLY_EXECUTABLE_SECTIONS: frozenset[str] = frozenset({"vlan"})
 
 #: Why each remaining section still reads live rows at apply time.
 LIVE_READ_SECTIONS: dict[str, str] = {
-    "snmp": "the payload resolves Vault refs per row at send time",
     "static_route": "build_plan classifies against tombstones, carriers and deployed keys",
-    "logging": "shares the snmp module's per-row secret resolution",
     "bgp": "the payload walks the router -> scope -> af -> peer relationship graph",
     "interface_config": "eligibility is keyed off InterfaceAttrState, which is not intent",
 }

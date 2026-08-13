@@ -730,8 +730,10 @@ not promote or enqueue a subset. Reasons are stable machine codes:
 when its receipt still carries deletion work.
 
 The current manual-Apply boundary is exactly `DOCUMENT_EXECUTED_SECTIONS`. It contains
-`vlan`, `svi`, `subinterface`, `bfd`, `interface_mtu`, `l2_sap`, `isis`, `route_policy`, and
-`ospf`. A selected stream outside this set refuses with `409 apply_unexecutable` and reason
+`vlan`, `snmp`, `logging`, `svi`, `subinterface`, `bfd`, `interface_mtu`, `l2_sap`, `isis`,
+`route_policy`, and `ospf`. SNMP documents store Vault references verbatim. The SNMP writer
+reads those references from the hydrated rows when it builds the send body. A selected stream
+outside this set refuses with `409 apply_unexecutable` and reason
 `live_read_execution`, because its runner reads the live intent store and cannot guarantee
 that it executes the selected revision. Static route remains outside the boundary: its
 companion apply reads live `StaticRouteIntent`, and removal claim subtraction also reads live

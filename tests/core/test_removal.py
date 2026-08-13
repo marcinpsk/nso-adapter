@@ -604,6 +604,82 @@ async def test_increment_one_removal_rows_come_from_the_generation_document(
     assert [getattr(row, changed_field) for row in rows] == [original_value]
 
 
+async def test_snmp_removal_rows_and_vault_refs_come_from_the_generation_document(adapter_client):
+    """The SNMP replacement reads every collection and reference from its stored document."""
+    from nso_adapter.store.models import SnmpCommunityIntent
+
+    device_id = await _seed_device(nso_device_name="removal-document-snmp", netbox_device_id=45)
+    async with session() as db:
+        db.add(
+            SnmpCommunityIntent(
+                device_id=device_id,
+                label="readonly",
+                vault_ref="network/snmp/communities/selected#community",
+                access="RO",
+                accepted_at=_NOW,
+            )
+        )
+        await db.commit()
+
+    job_id = await _seed_removal_job(device_id, "snmp")
+    async with session() as db:
+        row = await db.scalar(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id))
+        row.vault_ref = "network/snmp/communities/successor#community"
+        await db.commit()
+
+    apply_fn = AsyncMock()
+    client = _guard_client(None)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with patch("nso_adapter.nso.apply.apply_snmp_config", apply_fn):
+            await removal_mod._dispatch_scope(db, device, client, "snmp", job_id=job_id)
+
+    apply_fn.assert_awaited_once()
+    communities = apply_fn.await_args.args[2]
+    assert [(row.label, row.vault_ref) for row in communities] == [
+        ("readonly", "network/snmp/communities/selected#community")
+    ]
+
+
+async def test_logging_removal_rows_come_from_the_generation_document(adapter_client):
+    """The logging replacement reads its hosts and levels singleton from one stored document."""
+    from nso_adapter.store.models import LoggingHostIntent, LoggingLevelsIntent
+
+    device_id = await _seed_device(nso_device_name="removal-document-logging", netbox_device_id=46)
+    async with session() as db:
+        db.add(
+            LoggingHostIntent(
+                device_id=device_id,
+                address="198.18.0.10",
+                severity="ERROR",
+                accepted_at=_NOW,
+            )
+        )
+        db.add(LoggingLevelsIntent(device_id=device_id, console_severity="CRITICAL", accepted_at=_NOW))
+        await db.commit()
+
+    job_id = await _seed_removal_job(device_id, "logging")
+    async with session() as db:
+        host = await db.scalar(select(LoggingHostIntent).where(LoggingHostIntent.device_id == device_id))
+        levels = await db.scalar(select(LoggingLevelsIntent).where(LoggingLevelsIntent.device_id == device_id))
+        host.severity = "WARNING"
+        levels.console_severity = "ERROR"
+        await db.commit()
+
+    apply_fn = AsyncMock()
+    client = _guard_client(None)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with patch("nso_adapter.nso.apply.apply_logging_config", apply_fn):
+            await removal_mod._dispatch_scope(db, device, client, "logging", job_id=job_id)
+
+    apply_fn.assert_awaited_once()
+    hosts = apply_fn.await_args.args[2]
+    levels = apply_fn.await_args.kwargs["levels_intent_row"]
+    assert [(row.address, row.severity) for row in hosts] == [("198.18.0.10", "ERROR")]
+    assert levels.console_severity == "CRITICAL"
+
+
 async def test_dispatch_interface_config_puts_remaining_and_deletes_empty(adapter_client):
     """interface_config removal PUT-replaces an interface that still has accepted intent, and
     DELETEs one with none — so a removed IP is reverted on the device (#5)."""

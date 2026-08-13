@@ -1383,7 +1383,9 @@ async def _finalize_static_route_removal(db, job_id: int, device, client, out: S
     return write.status is JobStatus.succeeded
 
 
-async def _replace_logging(db: AsyncSession, device, client, context: dict | None = None) -> None:
+async def _replace_logging(
+    db: AsyncSession, device, client, context: dict | None = None, *, job_id: int | None = None
+) -> None:
     """PUT-replace the logging-reconciler with hosts AND the local-levels singleton.
 
     Bespoke (not routed through :func:`_replace_simple`) because the replace body must
@@ -1395,24 +1397,30 @@ async def _replace_logging(db: AsyncSession, device, client, context: dict | Non
     from nso_adapter.nso.apply import apply_logging_config
     from nso_adapter.store.models import LoggingHostIntent, LoggingLevelsIntent
 
-    rows = (
-        (
-            await db.execute(
-                select(LoggingHostIntent).where(
-                    LoggingHostIntent.device_id == device.id, LoggingHostIntent.accepted_at.is_not(None)
+    document_rows = await _replacement_section_rows(db, "logging", job_id)
+    if document_rows is not None:
+        rows = document_rows.get(LoggingHostIntent, [])
+        level_rows = document_rows.get(LoggingLevelsIntent, [])
+        levels = level_rows[0] if level_rows else None
+    else:
+        rows = (
+            (
+                await db.execute(
+                    select(LoggingHostIntent).where(
+                        LoggingHostIntent.device_id == device.id, LoggingHostIntent.accepted_at.is_not(None)
+                    )
                 )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-    levels = (
-        await db.execute(
-            select(LoggingLevelsIntent).where(
-                LoggingLevelsIntent.device_id == device.id, LoggingLevelsIntent.accepted_at.is_not(None)
+        levels = (
+            await db.execute(
+                select(LoggingLevelsIntent).where(
+                    LoggingLevelsIntent.device_id == device.id, LoggingLevelsIntent.accepted_at.is_not(None)
+                )
             )
-        )
-    ).scalar_one_or_none()
+        ).scalar_one_or_none()
 
     async def _apply(**kwargs):
         return await apply_logging_config(client, device.nso_device_name, rows, levels_intent_row=levels, **kwargs)
@@ -1629,7 +1637,9 @@ async def _replace_isis(
     await _guarded_apply(client, device, "isis", context, _apply)
 
 
-async def _replace_snmp(db: AsyncSession, device, client, context: dict | None = None) -> None:
+async def _replace_snmp(
+    db: AsyncSession, device, client, context: dict | None = None, *, job_id: int | None = None
+) -> None:
     """PUT-replace the snmp-reconciler with the device's full remaining intent (all collections).
 
     Bespoke (not a _SIMPLE_TARGET) because apply_snmp_config takes four collections
@@ -1643,17 +1653,27 @@ async def _replace_snmp(db: AsyncSession, device, client, context: dict | None =
         SnmpV3UserIntent,
     )
 
-    device_id = device.id
-    comms = (
-        (await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)))
-        .scalars()
-        .all()
-    )
-    users = (await db.execute(select(SnmpV3UserIntent).where(SnmpV3UserIntent.device_id == device_id))).scalars().all()
-    hosts = (await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))).scalars().all()
-    sysinfo = (
-        await db.execute(select(SnmpSystemInfoIntent).where(SnmpSystemInfoIntent.device_id == device_id))
-    ).scalar_one_or_none()
+    document_rows = await _replacement_section_rows(db, "snmp", job_id)
+    if document_rows is not None:
+        comms = document_rows.get(SnmpCommunityIntent, [])
+        users = document_rows.get(SnmpV3UserIntent, [])
+        hosts = document_rows.get(SnmpHostIntent, [])
+        sysinfo_rows = document_rows.get(SnmpSystemInfoIntent, [])
+        sysinfo = sysinfo_rows[0] if sysinfo_rows else None
+    else:
+        device_id = device.id
+        comms = (
+            (await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        users = (
+            (await db.execute(select(SnmpV3UserIntent).where(SnmpV3UserIntent.device_id == device_id))).scalars().all()
+        )
+        hosts = (await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))).scalars().all()
+        sysinfo = (
+            await db.execute(select(SnmpSystemInfoIntent).where(SnmpSystemInfoIntent.device_id == device_id))
+        ).scalar_one_or_none()
 
     async def _apply(**kwargs):
         return await apply_snmp_config(client, device.nso_device_name, comms, users, hosts, sysinfo, **kwargs)
@@ -1689,11 +1709,11 @@ async def _dispatch_scope(
     elif scope == "bgp":
         await _replace_bgp(db, device, client, context)
     elif scope == "snmp":
-        await _replace_snmp(db, device, client, context)
+        await _replace_snmp(db, device, client, context, job_id=job_id)
     elif scope == "isis":
         await _replace_isis(db, device, client, context, job_id=job_id)
     elif scope == "logging":
-        await _replace_logging(db, device, client, context)
+        await _replace_logging(db, device, client, context, job_id=job_id)
     elif scope == "interface_config":
         await _replace_interface_config(db, device, client, (context or {}).get("interfaces") or [])
     elif scope in _SIMPLE_TARGETS:

@@ -364,6 +364,41 @@ async def test_svi_action_apply_executes_the_selected_document(adapter_client):
     ]
 
 
+async def test_snmp_action_apply_executes_the_selected_document(adapter_client):
+    """A later SNMP push cannot replace the selected rows or Vault references at send time."""
+    from tests.core.test_generation_protocol import recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="snmp-exact-selection", netbox_device_id=9995)
+    await seed_settings(device_id, auto_apply=False)
+    assert (
+        await _put_snmp(adapter_client, device_id, ["selected"], seq=6551, query="?store_only=true")
+    ).status_code == 200
+    response = await _apply(adapter_client, device_id, {"snmp": 6551})
+    assert response.status_code == 202, response.text
+
+    async def successor():
+        result = await _put_snmp(
+            adapter_client,
+            device_id,
+            ["successor"],
+            seq=6552,
+            query="?store_only=true",
+        )
+        assert result.status_code == 200
+
+    client, recorder = recorded_client("snmp-exact-selection", on_sync_from=successor)
+    assert await run_head(device_id, client) is not None
+    bodies = recorder.bodies("snmp-reconciler:snmp-config")
+    assert [entry["name"] for entry in bodies[0]["snmp-reconciler:snmp-config"][0]["community"]] == ["selected"]
+    assert bodies[0]["snmp-reconciler:snmp-config"][0]["community"][0] == {
+        "name": "selected",
+        "access": "ro",
+        "vault-mount": "kv",
+        "vault-path": "snmp",
+        "vault-key": "selected",
+    }
+
+
 async def test_failed_svi_document_send_with_no_stamp_rows_fails_generation(adapter_client):
     from nso_adapter.store.models import GenerationStatus, JobStatus
     from tests.core.test_generation_protocol import job_row, recorded_client, run_head
@@ -1014,22 +1049,27 @@ async def test_action_apply_refuses_a_live_read_stream_without_promoting_an_exec
     device_id = await seed_device(nso_device_name="apply-live-read-refusal", netbox_device_id=9967)
     await seed_settings(device_id, auto_apply=False)
     assert (await _put_vlans(adapter_client, device_id, [10], seq=4701, query="?store_only=true")).status_code == 200
-    assert (await _put_snmp(adapter_client, device_id, ["new"], seq=4702, query="?store_only=true")).status_code == 200
+    bgp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent?store_only=true",
+        json={"routers": [_bgp_router("64513")]},
+        headers=AUTH | {"X-Push-Seq": "4702"},
+    )
+    assert bgp.status_code == 200, bgp.text
 
-    response = await _apply(adapter_client, device_id, {"vlan": 4701, "snmp": 4702})
+    response = await _apply(adapter_client, device_id, {"vlan": 4701, "bgp": 4702})
 
     assert response.status_code == 409
     assert response.json() == {
         "error": {
             "code": "apply_unexecutable",
-            "message": "Selected stream(s) cannot be applied faithfully: snmp",
-            "detail": {"streams": {"snmp": "live_read_execution"}},
+            "message": "Selected stream(s) cannot be applied faithfully: bgp",
+            "detail": {"streams": {"bgp": "live_read_execution"}},
         }
     }
     assert await _generations(device_id) == []
     assert await _jobs(device_id) == []
     assert (await _stream(device_id, "vlan")).authorized_revision == 0
-    assert (await _stream(device_id, "snmp")).authorized_revision == 0
+    assert (await _stream(device_id, "bgp")).authorized_revision == 0
 
 
 async def test_action_apply_refuses_static_route_until_it_executes_from_the_document(adapter_client):

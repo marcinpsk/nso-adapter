@@ -2959,12 +2959,15 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         document_sections,
     )
 
-    snmp_comm = (await source.collect(SnmpCommunityIntent, section="snmp")).push
-    snmp_user = (await source.collect(SnmpV3UserIntent, section="snmp")).push
-    snmp_host = (await source.collect(SnmpHostIntent, section="snmp")).push
-    snmp_sysinfo_rows = (await source.collect(SnmpSystemInfoIntent, section="snmp")).push
-    snmp_sysinfo = snmp_sysinfo_rows[0] if snmp_sysinfo_rows else None
-    snmp_rows = [*snmp_comm, *snmp_user, *snmp_host, *([snmp_sysinfo] if snmp_sysinfo else [])]
+    snmp_comm_rows = await source.collect(SnmpCommunityIntent, section="snmp")
+    snmp_user_rows = await source.collect(SnmpV3UserIntent, section="snmp")
+    snmp_host_rows = await source.collect(SnmpHostIntent, section="snmp")
+    snmp_sysinfo_rows = await source.collect(SnmpSystemInfoIntent, section="snmp")
+    snmp_rows = _combine_rows(snmp_comm_rows, snmp_user_rows, snmp_host_rows, snmp_sysinfo_rows)
+    snmp_comm = snmp_comm_rows.push
+    snmp_user = snmp_user_rows.push
+    snmp_host = snmp_host_rows.push
+    snmp_sysinfo = snmp_sysinfo_rows.push[0] if snmp_sysinfo_rows.push else None
 
     sr_eligible = (await source.collect(StaticRouteIntent, section="static_route")).push
     # #1396 R2 §3: ONE classifier decides the static-route mode and snapshots the rows the
@@ -2977,10 +2980,11 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     # What the static-route send learned, for §4.4's proof: the verify verdict and the exact
     # route keys the body carried. Filled by the scope coroutine, read after it returns.
     sr_outbox: dict = {}
-    logging_eligible = (await source.collect(LoggingHostIntent, section="logging")).push
-    logging_levels_rows = (await source.collect(LoggingLevelsIntent, section="logging")).push
-    logging_levels = logging_levels_rows[0] if logging_levels_rows else None
-    logging_rows = [*logging_eligible, *([logging_levels] if logging_levels else [])]
+    logging_host_rows = await source.collect(LoggingHostIntent, section="logging")
+    logging_level_rows = await source.collect(LoggingLevelsIntent, section="logging")
+    logging_rows = _combine_rows(logging_host_rows, logging_level_rows)
+    logging_eligible = logging_host_rows.push
+    logging_levels = logging_level_rows.push[0] if logging_level_rows.push else None
     svi_rows = await source.collect(SviIntent, section="svi")
     subif_rows = await source.collect(SubinterfaceIntent, section="subinterface")
     vlan_rows = await source.collect(VlanIntent, section="vlan")
@@ -3040,12 +3044,12 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         [
             attr_eligible,
             ip_eligible_by_iface,
-            snmp_rows,
+            snmp_rows.push,
             # From the PLAN, never the eligible list: in PUT mode a force=False apply can
             # have an empty eligible list and a non-empty body, and _finalize_job's
             # all-zero early success would then report a clean no-op AFTER a real PUT.
             sr_plan.rows,
-            logging_rows,
+            logging_rows.push,
             svi_eligible,
             subif_eligible,
             vlan_rows.push,
@@ -3075,7 +3079,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             "attr": attr_eligible,
             "ip_by_iface": ip_eligible_by_iface,
             "subif": subif_eligible,
-            "snmp_rows": snmp_rows,
+            "snmp_rows": snmp_rows.push,
             "snmp_comm": snmp_comm,
             "snmp_user": snmp_user,
             "snmp_host": snmp_host,
@@ -3101,6 +3105,8 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             "redist_bgp": redist_bgp,
             # The body uses the document rows. Bookkeeping uses matching live rows.
             "stamp": {
+                "snmp": snmp_rows.stamp,
+                "logging": logging_rows.stamp,
                 "svi": svi_rows.stamp,
                 "subinterface": subif_rows.stamp,
                 "vlan": vlan_rows.stamp,
@@ -3112,6 +3118,8 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
                 "ospf": ospf_rows.stamp,
             },
             "stamp_of": {
+                "snmp": snmp_rows.stamp_of,
+                "logging": logging_rows.stamp_of,
                 "svi": svi_rows.stamp_of,
                 "subinterface": subif_rows.stamp_of,
                 "vlan": vlan_rows.stamp_of,
@@ -3164,7 +3172,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         _Scope(
             "snmp",
             "snmp",
-            snmp_rows,
+            snmp_rows.stamp,
             lambda: apply_snmp_config(
                 client=client,
                 device_name=device_name,
@@ -3173,6 +3181,8 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
                 host_intents=snmp_host,
                 system_info_intent=snmp_sysinfo,
             ),
+            push=snmp_rows.push,
+            stamp_of=snmp_rows.stamp_of,
         ),
         _Scope(
             "static_route",
@@ -3186,13 +3196,15 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         _Scope(
             "logging",
             "logging",
-            logging_rows,
+            logging_rows.stamp,
             lambda: apply_logging_config(
                 client=client,
                 device_name=device_name,
                 host_intent_rows=logging_eligible,
                 levels_intent_row=logging_levels,
             ),
+            push=logging_rows.push,
+            stamp_of=logging_rows.stamp_of,
         ),
         _Scope(
             "svi",

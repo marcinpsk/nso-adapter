@@ -25,6 +25,7 @@ pytestmark = pytest.mark.anyio
 _INCREMENT_ONE_SECTIONS = frozenset(
     {"svi", "subinterface", "bfd", "interface_mtu", "l2_sap", "isis", "route_policy", "ospf"}
 )
+_INCREMENT_TWO_SECTIONS = frozenset({"snmp", "logging"})
 
 
 def test_every_section_is_either_document_executed_or_names_its_blocker():
@@ -102,6 +103,13 @@ def test_increment_one_sections_are_document_executed():
 
     assert _INCREMENT_ONE_SECTIONS <= DOCUMENT_EXECUTED_SECTIONS
     assert not (_INCREMENT_ONE_SECTIONS & set(LIVE_READ_SECTIONS))
+
+
+def test_increment_two_sections_are_document_executed():
+    from nso_adapter.core.projection import DOCUMENT_EXECUTED_SECTIONS, LIVE_READ_SECTIONS
+
+    assert _INCREMENT_TWO_SECTIONS <= DOCUMENT_EXECUTED_SECTIONS
+    assert not (_INCREMENT_TWO_SECTIONS & set(LIVE_READ_SECTIONS))
 
 
 @pytest.mark.parametrize(
@@ -219,6 +227,71 @@ async def test_increment_one_apply_rows_come_from_the_generation_document(
     assert selected.stamp == [], "the successor row differs from the document and must stay pending"
 
 
+async def test_snmp_apply_rows_and_vault_refs_come_from_the_generation_document(adapter_client):
+    """A successor ref stays pending while the selected document's ref reaches send."""
+    from sqlalchemy import inspect as sa_inspect
+
+    from nso_adapter.core.apply import _Projection
+    from nso_adapter.core.projection import snapshot_stream
+    from nso_adapter.store.models import SnmpCommunityIntent
+
+    device_id = await seed_device(nso_device_name="document-snmp", netbox_device_id=9824)
+    accepted = datetime(2026, 8, 1, tzinfo=UTC)
+    async with session() as db:
+        row = SnmpCommunityIntent(
+            device_id=device_id,
+            label="readonly",
+            vault_ref="network/snmp/communities/selected#community",
+            access="RO",
+            accepted_at=accepted,
+        )
+        db.add(row)
+        await db.flush()
+        document = {"snmp": await snapshot_stream(db, device_id, "snmp")}
+        row.vault_ref = "network/snmp/communities/successor#community"
+        await db.commit()
+
+    async with session() as db:
+        source = _Projection(db, device_id, True, document, frozenset({"snmp"}))
+        selected = await source.collect(SnmpCommunityIntent, section="snmp")
+
+    assert [row.vault_ref for row in selected.push] == ["network/snmp/communities/selected#community"]
+    assert all(sa_inspect(row).transient for row in selected.push)
+    assert selected.stamp == [], "the successor ref differs from the selected document and must stay pending"
+
+
+async def test_logging_apply_rows_come_from_the_generation_document(adapter_client):
+    """A successor can change logging intent, but the selected document still reaches send."""
+    from sqlalchemy import inspect as sa_inspect
+
+    from nso_adapter.core.apply import _Projection
+    from nso_adapter.core.projection import snapshot_stream
+    from nso_adapter.store.models import LoggingHostIntent
+
+    device_id = await seed_device(nso_device_name="document-logging", netbox_device_id=9825)
+    accepted = datetime(2026, 8, 1, tzinfo=UTC)
+    async with session() as db:
+        row = LoggingHostIntent(
+            device_id=device_id,
+            address="198.18.0.10",
+            severity="ERROR",
+            accepted_at=accepted,
+        )
+        db.add(row)
+        await db.flush()
+        document = {"logging": await snapshot_stream(db, device_id, "logging")}
+        row.severity = "WARNING"
+        await db.commit()
+
+    async with session() as db:
+        source = _Projection(db, device_id, True, document, frozenset({"logging"}))
+        selected = await source.collect(LoggingHostIntent, section="logging")
+
+    assert [row.severity for row in selected.push] == ["ERROR"]
+    assert all(sa_inspect(row).transient for row in selected.push)
+    assert selected.stamp == [], "the changed successor differs from the selected document and must stay pending"
+
+
 async def test_a_snapshot_hydrates_back_into_the_rows_it_was_taken_from(adapter_client):
     """Round-trip fidelity, including the types JSON cannot hold natively."""
     from nso_adapter.core.projection import hydrate_section, snapshot_stream
@@ -238,6 +311,91 @@ async def test_a_snapshot_hydrates_back_into_the_rows_it_was_taken_from(adapter_
     assert [(r.vlan_id, r.name) for r in rows] == [(10, "MGMT"), (20, None)]
     # A datetime survives as a datetime, not as the ISO string the document stores.
     assert [r.accepted_at for r in rows] == [accepted, accepted]
+
+
+async def test_snmp_snapshot_stores_vault_references_verbatim(adapter_client):
+    """The durable document carries locators only. NSO resolves them when it sends."""
+    from nso_adapter.core.projection import snapshot_stream
+    from nso_adapter.store.models import SnmpCommunityIntent, SnmpV3UserIntent
+
+    device_id = await seed_device(nso_device_name="projection-snmp-refs", netbox_device_id=9822)
+    accepted = datetime(2026, 8, 1, tzinfo=UTC)
+    async with session() as db:
+        db.add(
+            SnmpCommunityIntent(
+                device_id=device_id,
+                label="readonly",
+                vault_ref="network/snmp/communities/readonly#community",
+                access="RO",
+                accepted_at=accepted,
+            )
+        )
+        db.add(
+            SnmpV3UserIntent(
+                device_id=device_id,
+                username="monitor",
+                auth_vault_ref="network/snmp/users/monitor#auth",
+                priv_vault_ref="network/snmp/users/monitor#priv",
+                accepted_at=accepted,
+            )
+        )
+        await db.commit()
+
+    async with session() as db:
+        snapshot = await snapshot_stream(db, device_id, "snmp")
+
+    assert snapshot["snmp_community_intent"][0]["vault_ref"] == ("network/snmp/communities/readonly#community")
+    assert snapshot["snmp_v3_user_intent"][0]["auth_vault_ref"] == "network/snmp/users/monitor#auth"
+    assert snapshot["snmp_v3_user_intent"][0]["priv_vault_ref"] == "network/snmp/users/monitor#priv"
+
+
+async def test_snmp_snapshot_refuses_secret_material_in_a_vault_reference_column(adapter_client):
+    """A resolved secret must never cross the durable-document serialization boundary."""
+    from nso_adapter.core.projection import snapshot_stream
+    from nso_adapter.store.models import SnmpCommunityIntent
+
+    device_id = await seed_device(nso_device_name="projection-snmp-secret-refusal", netbox_device_id=9823)
+    async with session() as db:
+        db.add(
+            SnmpCommunityIntent(
+                device_id=device_id,
+                label="readonly",
+                vault_ref="resolved-secret-placeholder",
+                access="RO",
+                accepted_at=datetime(2026, 8, 1, tzinfo=UTC),
+            )
+        )
+        await db.commit()
+
+    async with session() as db:
+        with pytest.raises(ValueError, match="refusing to serialize non-reference secret material") as exc:
+            await snapshot_stream(db, device_id, "snmp")
+
+    assert "resolved-secret-placeholder" not in str(exc.value)
+
+
+async def test_snmp_snapshot_treats_an_empty_optional_vault_reference_as_absent(adapter_client):
+    """The API stores '' for an absent optional v3 leg; serialization must not parse it."""
+    from nso_adapter.core.projection import snapshot_stream
+    from nso_adapter.store.models import SnmpV3UserIntent
+
+    device_id = await seed_device(nso_device_name="projection-snmp-empty-ref", netbox_device_id=9824)
+    async with session() as db:
+        db.add(
+            SnmpV3UserIntent(
+                device_id=device_id,
+                username="monitor",
+                auth_vault_ref="network/snmp/users/monitor#auth",
+                priv_vault_ref="",
+                accepted_at=datetime(2026, 8, 1, tzinfo=UTC),
+            )
+        )
+        await db.commit()
+
+    async with session() as db:
+        snapshot = await snapshot_stream(db, device_id, "snmp")
+
+    assert snapshot["snmp_v3_user_intent"][0]["priv_vault_ref"] == ""
 
 
 def test_hydrating_an_unknown_table_or_column_is_refused():
