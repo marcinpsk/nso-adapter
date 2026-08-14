@@ -761,19 +761,14 @@ not promote or enqueue a subset. Reasons are stable machine codes:
 `unresolved_interface_identity`. A push can also return `outstanding_deletion_provenance`
 when its receipt still carries deletion work.
 
-The current manual-Apply boundary is exactly `DOCUMENT_EXECUTED_SECTIONS`. It contains
-`vlan`, `snmp`, `logging`, `svi`, `subinterface`, `bfd`, `interface_mtu`, `l2_sap`, `isis`,
-`bgp`, `route_policy`, and `ospf`. SNMP documents store Vault references verbatim. The SNMP
-writer reads those references from the hydrated rows when it builds the send body. BGP
-documents store the router, scope, address-family, peer, and peer address-family tables. The
-hydrator rebuilds their relationship graph from durable parent identities before the writer
-walks it. A selected stream outside this set refuses with `409 apply_unexecutable` and reason
-`live_read_execution`, because its runner reads the live intent store and cannot guarantee
-that it executes the selected revision. Static route remains outside the boundary: its
-companion apply reads live `StaticRouteIntent`, and removal claim subtraction also reads live
-claims. A store-only push between Apply and worker start could otherwise deploy unselected
-state under the selected generation. `ACTION_APPLY_EXECUTABLE_SECTIONS` declares this
-boundary. It widens when another section moves into `DOCUMENT_EXECUTED_SECTIONS`.
+The manual-Apply boundary is exactly `DOCUMENT_EXECUTED_SECTIONS`. It contains every section,
+so all sixteen streams are executable through `ACTION_APPLY_EXECUTABLE_SECTIONS`. SNMP
+documents store Vault references verbatim. The SNMP writer reads those references from the
+hydrated rows when it builds the send body. BGP documents store the router, scope,
+address-family, peer, and peer address-family tables. The hydrator rebuilds their relationship
+graph from durable parent identities before the writer walks it. Static-route documents also
+record the apply and removal classifications. A store-only push between Apply and worker start
+cannot change the selected body, removal authority, proof carriers, or deployed-key decisions.
 
 Deletion provenance from a store-only revision remains an execution obligation. If a later
 ordinary push would promote that stream without executing the carried deletion, the entire
@@ -1362,6 +1357,8 @@ The replace is guarded and gated:
 - The replace runs only while post-apply verification is enabled (`NSO_ADAPTER_VERIFY_APPLY`).
   With it off the scope stays a merge-PATCH and records nothing as deployed: a destructive
   replace whose proof is structurally unavailable is refused rather than run blind.
+  A queued generation whose immutable plan already records `PUT` is failed before sync-from
+  or any RESTCONF request if verification is disabled when its worker starts.
 - `actions/apply-diff` renders the identical payload as a PUT dry-run, so the preview the
   operator approves is byte-for-byte what the apply sends.
 
@@ -1434,11 +1431,12 @@ accepted store rows:
   store edit nor flush config no store row describes.
 - because such a body cannot flush collateral, a static-route removal **no longer blocks** on
   unrelated service-owned entries. It retains them and logs
-  `static_route.removal_retained_orphans`, naming exactly the retained keys no live route
-  claims — that log is the operator's signal. The apply-side guard above still refuses, which
+  `static_route.removal_retained_orphans`, naming exactly the retained keys no route in the
+  generation document claims. That log is the operator's signal. The apply-side guard above still refuses, which
   is where a store-assertive body really can flush something.
-- if every authorized key has meanwhile been re-claimed by another live route and there is no
-  cleared leaf still to deliver, the job issues no device write at all and succeeds.
+- if the generation-creation snapshot shows that every authorized key is claimed and there is
+  no cleared leaf to deliver, the job issues no device write at all and succeeds. A later push
+  cannot change that recorded decision.
 - the proof is **enforcing**. A key still on the device after the PUT, an unreadable device
   view, or a failed `sync-from` on an un-own fails the job and keeps the deletion record, so it
   is retried. Removals get no "succeed while unproven" treatment: a succeeded removal is what
@@ -2211,10 +2209,9 @@ tombstone (and no apply job, whatever the device's `auto_apply` setting) — cli
 must not wait for jobs it never creates.
 The `PUT .../static-route-intent?backfill_only=true` path is also an exception: it
 prunes omitted uncorrelated rows but creates neither a removal job nor a tombstone.
-A worker runs each job in the background and PUT-replaces the service. A promoted
-removal in a document-executed section renders from its generation's immutable
-document; a force-reissue renders from the current accepted rows. Either way the
-job is idempotent and is requeued (not failed) after a worker restart. Scope is carried in `Job.context.scope` (one of
+A worker runs each job in the background. A generated job hydrates its exact stored document,
+so a retry repeats the same selected operation after a worker restart. A generationless legacy
+job retains the live-store path. Scope is carried in `Job.context.scope` (one of
 `route_policy · bfd · svi · subinterface · static_route · interface_mtu · vlan ·
 logging · l2_sap · ospf · bgp · isis · interface_config · snmp`). Job status is
 observable via `GET …/jobs` like any other job; a failed removal records

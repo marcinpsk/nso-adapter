@@ -26,17 +26,22 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, internal_error, terminalize
+from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, JobError, internal_error, terminalize
 from nso_adapter.core.generation import executing_generation, generation_execution_sections, note_write
 from nso_adapter.core.projection import (
-    DOCUMENT_EXECUTED_SECTIONS,
     INTERFACE_ATTRIBUTE_ELIGIBLE_STATES,
     hydrate_interface_execution,
     hydrate_section,
     intent_state,
     section_models,
 )
-from nso_adapter.core.static_route_plan import SrPlan, authorized_clear_fields, build_plan
+from nso_adapter.core.static_route_plan import (
+    SrPlan,
+    authorized_clear_fields,
+    build_plan,
+    hydrate_static_route_apply_plan,
+    recorded_static_route_apply_mode,
+)
 from nso_adapter.nso.apply import NsoApplyError
 from nso_adapter.store.models import (
     BfdIntent,
@@ -585,6 +590,7 @@ async def _static_route_bookkeeping(
     job_id: int,
     reg=None,
     send_failed: bool,
+    stamp_of: dict | None = None,
 ) -> tuple[list[dict], tuple[int, int] | None, list[dict]]:
     """Consume, CAS and record — the ONE transaction §4.6 requires, minus its commit.
 
@@ -642,6 +648,7 @@ async def _static_route_bookkeeping(
 
     results: list[dict] = []
     for row in plan.rows:
+        stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
         outcome = SR_UNPROVEN
         if send_failed or residue_found:
             outcome = SR_APPLY_FAILED
@@ -649,10 +656,17 @@ async def _static_route_bookkeeping(
             outcome = SR_APPLY_FAILED
         elif _sr_row_proven(row, proof, conclusive=conclusive) and not residue_blocks:
             outcome = await _settle_proven_row(
-                db, device, plan, proof, row, put_delivered=put_delivered, cas=cas_by_row.get(row.id)
+                db,
+                device,
+                plan,
+                proof,
+                row,
+                stamp=stamp,
+                put_delivered=put_delivered,
+                cas=cas_by_row.get(row.id),
             )
-        if residue_err is not None:
-            row.last_apply_error = residue_err
+        if residue_err is not None and stamp is not None:
+            stamp.last_apply_error = residue_err
         if outcome is SR_UNPROVEN:
             logger.warning(
                 "static_route.route_unproven",
@@ -683,7 +697,11 @@ async def _static_route_bookkeeping(
                 # reader-compare miss, residue or a stage error), so nothing is lost.
                 "generation": row.intent_generation,
                 "outcome": outcome,
-                "error": row.last_apply_error if outcome == SR_APPLY_FAILED else None,
+                "error": (
+                    residue_err or row.last_apply_error or (stamp.last_apply_error if stamp is not None else None)
+                )
+                if outcome == SR_APPLY_FAILED
+                else None,
             }
         )
 
@@ -692,7 +710,7 @@ async def _static_route_bookkeeping(
     return results, (0, len(plan.rows)), [{"error": residue_message, "code": RESIDUE_FOUND_CODE}]
 
 
-async def _settle_proven_row(db, device, plan, proof: SrProof, row, *, put_delivered: bool, cas) -> str:
+async def _settle_proven_row(db, device, plan, proof: SrProof, row, *, stamp, put_delivered: bool, cas) -> str:
     """CAS and consume for one row whose own key is proven present → its outcome.
 
     Two things can still block ``in_sync`` after the key proof: an undelivered replacement
@@ -709,6 +727,9 @@ async def _settle_proven_row(db, device, plan, proof: SrProof, row, *, put_deliv
     )
     from nso_adapter.store.static_route_store import CAS_ROW, CAS_TOMBSTONE, cas_deployed_key
 
+    if stamp is None:
+        # A successor changed or deleted this row before the selected generation ran.
+        return SR_UNPROVEN
     if replacement_open(row) and not put_delivered:
         # The merge added the new triple and left the predecessor. Recording the new triple
         # as deployed would destroy the only pointer to what is still on the device.
@@ -732,25 +753,32 @@ async def _settle_proven_row(db, device, plan, proof: SrProof, row, *, put_deliv
     pending = pending_clear_fields(row.pending_clear)
     if not pending:
         return SR_IN_SYNC
+    # The immutable document records the carrier as it stood when this generation was
+    # created. A preceding removal generation can prove and consume some or all of that
+    # carrier before this apply runs. The matching live stamp is safe evidence of that
+    # predecessor outcome: the document/live join already compared every intent field and
+    # authorization stamp, while pending_clear is apply bookkeeping by design.
+    fulfilled = pending - pending_clear_fields(stamp.pending_clear)
     if not put_delivered:
         # Only the PUT path delivers a clear: the merge body omits the leaf but the merge
-        # never drops one. Promotion is by DELIVERY (A1), so a PATCH consumes nothing.
-        return SR_UNPROVEN
+        # never drops one. A preceding removal can already have fulfilled the obligation.
+        return SR_IN_SYNC if pending == fulfilled else SR_UNPROVEN
     entry = proof.entries.get(triple_of(row))
-    proven = {field for field in pending if entry is not None and leaf_is_neutral(field, entry)}
-    if proven:
-        carrier = row.pending_clear or {}
-        remaining_auth = sorted({*(carrier.get(AUTHORIZED) or ())} - proven)
-        remaining_store = sorted({*(carrier.get(STORE_ONLY) or ())} - proven)
-        row.pending_clear = (
+    device_proven = {field for field in pending - fulfilled if entry is not None and leaf_is_neutral(field, entry)}
+    if device_proven:
+        carrier = stamp.pending_clear or {}
+        remaining_auth = sorted({*(carrier.get(AUTHORIZED) or ())} - device_proven)
+        remaining_store = sorted({*(carrier.get(STORE_ONLY) or ())} - device_proven)
+        stamp.pending_clear = (
             {AUTHORIZED: remaining_auth, STORE_ONLY: remaining_store} if (remaining_auth or remaining_store) else None
         )
         logger.info(
             "static_route.pending_clear_consumed",
             device_id=device.id,
             row_id=row.id,
-            fields=sorted(proven),
+            fields=sorted(device_proven),
         )
+    proven = fulfilled | device_proven
     return SR_IN_SYNC if pending == proven else SR_UNPROVEN
 
 
@@ -768,6 +796,7 @@ async def _settle_static_routes(
     scope_outcomes: dict,
     scope_failures: dict,
     reg=None,
+    stamp_of: dict | None = None,
 ) -> list[dict] | None:
     """Run §4.4's proof and §4.5/§4.6's bookkeeping for the static-route scope.
 
@@ -800,7 +829,15 @@ async def _settle_static_routes(
         want_fields=want_fields,
     )
     results, adjusted, extra_fails = await _static_route_bookkeeping(
-        db, device, plan, proof, put_delivered=put_delivered, job_id=job_id, reg=reg, send_failed=send_failed
+        db,
+        device,
+        plan,
+        proof,
+        put_delivered=put_delivered,
+        job_id=job_id,
+        reg=reg,
+        send_failed=send_failed,
+        stamp_of=stamp_of,
     )
     if adjusted is not None:
         scope_outcomes["static_route"] = adjusted
@@ -1108,14 +1145,14 @@ class _Scope(NamedTuple):
     #: lists differ whenever a successor moved a row (#1522 §G1).
     push: list | None = None
     #: Where a finding about a PUSHED row is recorded: ``{row id -> the live row}``. ``None``
-    #: for a live-read scope, where the pushed row IS the live row. A pushed row absent from
+    #: for a generationless scope, where the pushed row IS the live row. A pushed row absent from
     #: the map has no live counterpart left — it still fails the scope, it simply leaves no
     #: bookkeeping behind, because a transient hydrated row's stamp goes nowhere.
     stamp_of: dict | None = None
 
     @property
     def sent(self) -> list:
-        """Return the rows this scope's body carries. Equal to ``rows`` for a live-read scope.
+        """Return the rows this scope's body carries. Equal to ``rows`` for a generationless scope.
 
         Whether the scope RUNS is decided by this and never by ``rows``, and so is what the
         post-apply presence check looks for: an empty stamp list means the deployment records
@@ -1157,8 +1194,8 @@ class _Rows(NamedTuple):
     """One model's contribution to an apply pass, split by what each half is FOR.
 
     *push* is what reaches the device AND what the post-apply presence check looks for;
-    *stamp* is what records the outcome. They are the same list for a live-read section. For
-    a document-executed one they differ on purpose: *push* is rebuilt from the generation's
+    *stamp* is what records the outcome. They are the same list for a generationless job. For
+    a generated one they differ on purpose: *push* is rebuilt from the generation's
     immutable document (transient rows that must never reach the store), while *stamp* is the
     LIVE rows this deployment actually carried — a row the successor added, changed or
     re-authorized after this generation was cut is not stamped by a deployment that never
@@ -1212,12 +1249,9 @@ def _reject_transient_stamps(scope_label: str, rows) -> None:
 class _Projection:
     """Where one apply run reads the rows it deploys (#1522 §G1).
 
-    Built once per run. For a section in :data:`DOCUMENT_EXECUTED_SECTIONS` the rows come
-    from the executing generation's stored document, so a successor committing between the
-    worker's ``running`` commit and this read cannot be deployed under the wrong
-    generation's identity. Every other section still reads live rows — see
-    :data:`core.projection.LIVE_READ_SECTIONS` for what each one needs from #1522's
-    aggregate device-intent builder before it can join.
+    Built once per run. Every generated section comes from the executing generation's
+    stored document, so a successor committing between the worker's ``running`` commit and
+    this read cannot be deployed under the wrong generation's identity.
 
     A ``document`` of None is the one job that carries no generation: an Apply on a device
     nothing was ever written for. Its live read returns nothing either, so the two agree.
@@ -1237,29 +1271,31 @@ class _Projection:
         self._document = document
         self._sections = sections
         self._hydrated: dict[str, dict[type, list]] = {}
-        self._live: dict[type, list] = {}
+        self._live: dict[tuple[type, bool], list] = {}
 
     def _document_rows(self, section: str) -> dict[type, list]:
         if section not in self._hydrated:
             self._hydrated[section] = hydrate_section(self._document, section)
         return self._hydrated[section]
 
-    async def collect(self, model, *, section: str) -> _Rows:
+    async def collect(self, model, *, section: str, force: bool | None = None) -> _Rows:
         if model not in section_models({section}):
             raise ValueError(f"{model.__name__} does not belong to projection section {section!r}")
         if self._sections is not None and section not in self._sections:
             return _Rows(push=[], stamp=[])
-        if model not in self._live:
-            self._live[model] = await _collect_eligible(self._db, model, self._device_id, self._force)
-        live = self._live[model]
+        effective_force = self._force if force is None else force
+        live_key = (model, effective_force)
+        if live_key not in self._live:
+            self._live[live_key] = await _collect_eligible(self._db, model, self._device_id, effective_force)
+        live = self._live[live_key]
         if model is RedistributionIntent:
             live = [row for row in live if row.dest_protocol == section]
-        if self._document is None or section not in DOCUMENT_EXECUTED_SECTIONS:
+        if self._document is None:
             return _Rows(push=live, stamp=live)
         if self._sections is None and section not in self._document:
             return _Rows(push=[], stamp=[])
         document_rows = self._document_rows(section).get(model, [])
-        push = [row for row in document_rows if _is_eligible(row, self._force)]
+        push = [row for row in document_rows if _is_eligible(row, effective_force)]
         # Matched on CONTENT, not on the id alone. A successor push rewrites a row in place,
         # so the id it kept says nothing about whether this document carried what the row now
         # holds; stamping on the id would report the successor's intent as applied by a
@@ -2153,6 +2189,8 @@ async def _static_route_followon_put(
     scope_failures: dict,
     reader_compare: dict,
     reader_compare_unverifiable: dict,
+    stamp_rows: list,
+    stamp_of: dict | None,
 ) -> tuple[bool, dict[int, str]]:
     """Deliver the ``PUT``-mode replacement the combined transaction cannot (§4.9).
 
@@ -2175,7 +2213,8 @@ async def _static_route_followon_put(
     scope_ok, scope_failed, fails = await _run_scope(
         "static_route",
         _static_route_coro(client, device, plan, outbox=outbox),
-        plan.rows,
+        stamp_rows,
+        sent_rows=plan.rows,
         job_id=job_id,
         device_name=device_name,
         now=now,
@@ -2192,6 +2231,7 @@ async def _static_route_followon_put(
             job_id=job_id,
             device_name=device_name,
             timeout=_VERIFY_PER_CALL_TIMEOUT,
+            stamp_of=stamp_of,
         )
         if status is not None:
             reader_compare["static_route"] = status
@@ -2222,6 +2262,8 @@ def _stamp_batch_scopes_atomic(sent_rows, stamp_rows, offenders, commit_error, e
                 row.last_apply_error = None
             scope_outcomes[scope_key] = (len(sent), 0)
         elif root_key in offenders:
+            for row in sent:
+                row.last_apply_error = err
             for row in stamps:
                 row.last_apply_error = err
             scope_outcomes[scope_key] = (0, len(sent))
@@ -2307,6 +2349,8 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
         stamped = rows.stamp.get(scope_key) or []
         _reject_transient_stamps(scope_key, stamped)
         stage_err = {"code": stage_exc.code, "message": stage_exc.message, "detail": stage_exc.detail}
+        for row in rows.sent.get(scope_key) or []:
+            row.last_apply_error = stage_err
         for row in stamped:
             row.last_apply_error = stage_err
         # Counted against what the body WOULD have carried: a scope whose live rows a
@@ -2354,6 +2398,8 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
             scope_failures=scope_failures,
             reader_compare=reader_compare,
             reader_compare_unverifiable=reader_compare_unverifiable,
+            stamp_rows=elig["stamp"].get("static_route") or [],
+            stamp_of=rows.stamp_of.get("static_route"),
         )
         sr_put_delivered = True
 
@@ -2372,6 +2418,7 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
             scope_outcomes=scope_outcomes,
             scope_failures=scope_failures,
             reg=reg,
+            stamp_of=rows.stamp_of.get("static_route"),
         )
 
     await _finalize_job(
@@ -2634,13 +2681,17 @@ def _reader_compare_walk(
             f"success but the key(s) never landed (silent writer drop, #26 class)"
         )
         sent = row_by_id[rid]
+        current_error = {
+            "code": "reader_compare_missing",
+            "message": msg,
+            "detail": {"scope": scope},
+        }
+        # The sent row can be document-hydrated and have no live stamp after a successor
+        # rewrite. Keep this pass's error on that in-memory carrier for the per-route result.
+        sent.last_apply_error = current_error
         target = sent if stamp_of is None else stamp_of.get(_stamp_key(sent))
         if target is not None:
-            target.last_apply_error = {
-                "code": "reader_compare_missing",
-                "message": msg,
-                "detail": {"scope": scope},
-            }
+            target.last_apply_error = current_error
         fails.append({"error": msg})
     logger.error("apply.reader_compare_missing", job_id=job_id, device=device_name, scope=scope, missing=len(missing))
     # Clamped: ``ok`` counts rows this pass STAMPED, and a successor-rewritten scope stamps
@@ -3046,6 +3097,20 @@ async def _finalize_job(
     )
 
 
+def _refuse_unverifiable_recorded_put(generation, execution_sections) -> None:
+    """Refuse a recorded destructive PUT when verification is disabled at execution."""
+    from nso_adapter.nso import apply as nso_apply
+
+    if generation is None or "static_route" not in (execution_sections or ()):
+        return
+    if recorded_static_route_apply_mode(generation.document) == "PUT" and not nso_apply.VERIFY_AFTER_APPLY:
+        raise JobError(
+            "static_route_put_verify_disabled",
+            "Static-route PUT verification is disabled at worker execution. "
+            "The recorded destructive replace was not sent.",
+        )
+
+
 async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int, force: bool, *, reg=None) -> None:
     """Run the apply body: sync-from, snapshot intent, push each scope, finalize the job.
 
@@ -3076,11 +3141,6 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     device = await db.get(Device, device_id)
     if not device:
         raise ValueError(f"Device {device_id} not found")
-    client = get_nso_client(device.nso_instance)
-    device_name = device.nso_device_name
-
-    # ── Step 0: sync-from before apply (best-effort) ──
-    await _maybe_sync_from(db, client, device_name, device_id)
 
     # WHAT this run deploys is decided by the generation the job carries, not by the store as
     # it stands now (#1522 §G1). Between the worker committing `running` and this point a
@@ -3088,6 +3148,14 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     # this generation's identity and settled as this generation's revision.
     generation = await executing_generation(db, job_id)
     execution_sections = await generation_execution_sections(db, job_id)
+    _refuse_unverifiable_recorded_put(generation, execution_sections)
+
+    client = get_nso_client(device.nso_instance)
+    device_name = device.nso_device_name
+
+    # ── Step 0: sync-from before apply (best-effort) ──
+    await _maybe_sync_from(db, client, device_name, device_id)
+
     source = _Projection(
         db,
         device_id,
@@ -3123,14 +3191,24 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     snmp_host = snmp_host_rows.push
     snmp_sysinfo = snmp_sysinfo_rows.push[0] if snmp_sysinfo_rows.push else None
 
-    sr_eligible = (await source.collect(StaticRouteIntent, section="static_route")).push
-    # #1396 R2 §3: ONE classifier decides the static-route mode and snapshots the rows the
-    # body is built from, the rows this pass stamps, the keys the guard may see disappear
-    # and the tombstones the body must retain.
-    if execution_sections is None or "static_route" in execution_sections:
+    sr_eligible_rows = await source.collect(StaticRouteIntent, section="static_route")
+    sr_eligible = sr_eligible_rows.push
+    if generation is not None and "static_route" in (execution_sections or ()):
+        sr_all_rows = await source.collect(StaticRouteIntent, section="static_route", force=True)
+        sr_plan = hydrate_static_route_apply_plan(generation.document, eligible_rows=sr_eligible)
+        sr_stamp_of = sr_all_rows.stamp_of
+        sr_stamp_rows = [
+            stamp for row in sr_plan.rows if (stamp := (sr_stamp_of or {}).get(_stamp_key(row))) is not None
+        ]
+    elif generation is None:
+        # Generationless jobs predate document execution and still serve explicit local runs.
         sr_plan = await build_plan(db, device, eligible_rows=sr_eligible)
+        sr_stamp_rows = sr_plan.rows
+        sr_stamp_of = None
     else:
         sr_plan = SrPlan("PATCH", [], set(), [], [], 0)
+        sr_stamp_rows = []
+        sr_stamp_of = {}
     # What the static-route send learned, for §4.4's proof: the verify verdict and the exact
     # route keys the body carried. Filled by the scope coroutine, read after it returns.
     sr_outbox: dict = {}
@@ -3242,7 +3320,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             "snmp_user": snmp_user,
             "snmp_host": snmp_host,
             "snmp_sysinfo": snmp_sysinfo,
-            "static_route": sr_eligible,
+            "static_route": sr_plan.rows,
             "logging": logging_eligible,
             "logging_levels": logging_levels,
             "svi": svi_eligible,
@@ -3264,6 +3342,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             # The body uses the document rows. Bookkeeping uses matching live rows.
             "stamp": {
                 "snmp": snmp_rows.stamp,
+                "static_route": sr_stamp_rows,
                 "logging": logging_rows.stamp,
                 "svi": svi_rows.stamp,
                 "subinterface": subif_rows.stamp,
@@ -3278,6 +3357,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             },
             "stamp_of": {
                 "snmp": snmp_rows.stamp_of,
+                "static_route": sr_stamp_of,
                 "logging": logging_rows.stamp_of,
                 "svi": svi_rows.stamp_of,
                 "subinterface": subif_rows.stamp_of,
@@ -3353,10 +3433,12 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             "static_route",
             "static_route",
             # plan.rows, not the eligible list: in PUT mode the body is every ACCEPTED row
-            # (an eligible-only body retracts every accepted-and-clean route), so those are
-            # exactly the rows this pass stamps. In PATCH mode the two are the same list.
-            sr_plan.rows,
+            # (an eligible-only body retracts every accepted-and-clean route). Only matching
+            # live rows receive bookkeeping for the recorded body.
+            sr_stamp_rows,
             lambda: _static_route_coro(client, device, sr_plan, outbox=sr_outbox),
+            push=sr_plan.rows,
+            stamp_of=sr_stamp_of,
         ),
         _Scope(
             "logging",
@@ -3552,6 +3634,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         scope_outcomes=scope_outcomes,
         scope_failures=scope_failures,
         reg=reg,
+        stamp_of=sr_stamp_of,
     )
 
     # ── Step 7: finalize ── (any_eligible computed up front, before the atomic branch)
@@ -3641,6 +3724,11 @@ async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -
             # §4.6's single transaction exists to prevent. Nothing further is written, the
             # post-apply refresh is skipped, and claim recovery decides (G38).
             raise
+        except JobError as exc:
+            logger.warning("apply.refused", job_id=job_id, device_id=device_id, code=exc.error["code"])
+            await db.rollback()
+            if await _write_terminal(db, job_id, JobStatus.failed, None, exc.error, reg):
+                await _commit_terminal(db, job_id)
         except Exception as exc:
             logger.exception("apply.unexpected_error", job_id=job_id, device_id=device_id)
             # Roll back first: if the failure came from a DB error the session is in a

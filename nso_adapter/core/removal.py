@@ -12,9 +12,9 @@ entries.
 That PUT-replace is a synchronous device commit and can take well over the
 plugin's HTTP client timeout (~30s). So it does NOT run inline in the intent
 PUT anymore — :func:`replace_on_removal` enqueues a ``removal`` job and returns
-immediately; the worker runs :func:`run_removal` in the background. The job is
-idempotent (it re-reads the current accepted rows and PUT-replaces), so it is
-safe to requeue after a restart.
+immediately; the worker runs :func:`run_removal` in the background. Promoted jobs execute
+their immutable projection document. Reissues and generationless jobs retain live-store
+behavior.
 """
 
 from __future__ import annotations
@@ -708,16 +708,16 @@ async def _guarded_apply(client, device, scope: str, context: dict | None, apply
 async def _replacement_section_rows(db: AsyncSession, scope: str, job_id: int | None) -> dict[type, list] | None:
     """Hydrate one promoted removal section, or select the established live mode."""
     from nso_adapter.core.generation import executing_generation
-    from nso_adapter.core.projection import DOCUMENT_EXECUTED_SECTIONS, hydrate_section
+    from nso_adapter.core.projection import hydrate_section
 
-    if scope not in DOCUMENT_EXECUTED_SECTIONS or job_id is None:
+    if job_id is None:
         return None
     generation = await executing_generation(db, job_id)
     if generation is None:
         raise RuntimeError(f"removal job {job_id} for scope {scope!r} carries no generation to deploy")
-    # A force-removal reissues already-authorized live state for named instances. Its
-    # document orders the operation, but it does not select a promoted projection.
-    if (generation.removal_context or {}).get("force"):
+    # A reissue orders an operation but promotes no projection. It retains the live-store
+    # execution used by force-removal, the sweeper and the static-route reclaimer.
+    if not generation.stream_revisions:
         return None
     return {
         model: [row for row in rows if getattr(row, "accepted_at", True)]
@@ -731,10 +731,8 @@ async def _replacement_rows(db: AsyncSession, device, scope: str, model, job_id:
     A removal is a full-document write too, so the same race applies (#1522 §G1): between the
     worker committing ``running`` and this read, a successor push can commit, and a
     live-store body would retract under this generation's identity whatever the successor
-    happens to have removed. For a promoted document-executed section the body therefore
-    comes from the stored document. A force reissue promotes no stream and retains the live
-    store used by the operator override. Everything else still reads the store. See
-    :data:`core.projection.LIVE_READ_SECTIONS`.
+    happens to have removed. A promoted generation therefore uses the stored document.
+    Reissues and generationless jobs retain the established live-store behavior.
     """
     document_rows = await _replacement_section_rows(db, scope, job_id)
     if document_rows is not None:
@@ -775,11 +773,10 @@ async def _replace_simple(
 # every surviving row, which the ratified policy forbids — and it is also what made a removal
 # block on unrelated service orphans, since a body it never asserted looks like collateral.
 
-#: Consumption by supersession: a live intent row reclaimed every key this job was going to
-#: drop, so there is nothing to retract and nothing to fail.
+#: Consumption by supersession: the selected plan claims every key the job could drop.
 SR_SUPERSEDED_EVENT = "static_route.removal_superseded"
 
-#: The keys a live-relative body PRESERVES that no live intent row claims (§6/OQ-R2-3). With
+#: The keys a live-relative body preserves that no selected intent row claims (§6/OQ-R2-3). With
 #: the guard unreachable on this path, this event is the operator's only remaining signal —
 #: a spec obligation, not a nicety.
 SR_RETAINED_ORPHANS_EVENT = "static_route.removal_retained_orphans"
@@ -796,7 +793,7 @@ class SrRemoval(NamedTuple):
     #: ``force`` | ``detach`` | ``networked`` | ``superseded``.
     branch: str
     #: The keys this job may drop from the device — tombstone triples ∪ ``deployed_key``s,
-    #: minus everything a live intent row still claims.
+    #: minus everything the recorded plan or current reissue state claims.
     authorized: frozenset
     #: The tombstone ids snapshotted BEFORE the network call; only these may be deleted.
     tombstone_ids: tuple[int, ...]
@@ -810,6 +807,8 @@ class SrRemoval(NamedTuple):
     verify: str | None
     #: ``{intent row id: [store field names]}`` whose wire leaves this body deleted.
     clears: dict[int, tuple[str, ...]]
+    #: The creation-time route key for each delivered carrier.
+    clear_keys: dict[int, tuple[str, str, str]]
     #: The retained keys no live row claims — what ``SR_RETAINED_ORPHANS_EVENT`` reported.
     retained_orphans: tuple
 
@@ -926,33 +925,53 @@ def _sr_candidate_clears(rows) -> dict[int, tuple[str, ...]]:
     return candidates
 
 
-def _sr_body(current: dict, rows, authorized: set, clears: dict[int, tuple[str, ...]]):
-    """Build the live-relative body → ``(entries, delivered)``.
+async def _sr_execution_plan(db: AsyncSession, device, context: dict, *, job_id: int | None):
+    """Return a promoted removal plan, or classify a reissue or generationless job live."""
+    from nso_adapter.core.generation import executing_generation
+    from nso_adapter.core.static_route_plan import SrClear, SrRemovalPlan, hydrate_static_route_removal_plan, triple_of
+
+    if job_id is not None:
+        generation = await executing_generation(db, job_id)
+        if generation is not None and generation.stream_revisions:
+            return hydrate_static_route_removal_plan(generation.document)
+    tombstones, authorized, claimed, rows, reclaimed = await _sr_authorization(db, device, context, job_id=job_id)
+    candidates = _sr_candidate_clears(rows) if not context.get("detach") and not context.get("retract_deferred") else {}
+    return SrRemovalPlan(
+        frozenset(authorized),
+        frozenset(claimed),
+        tuple(tombstone.id for tombstone in tombstones),
+        tuple(SrClear(row.id, triple_of(row), candidates[row.id]) for row in rows if row.id in candidates),
+        tuple(reclaimed),
+    )
+
+
+def _sr_body(current: dict, authorized: set, clears) -> tuple[list[dict], dict, dict]:
+    """Build the live-relative body and report the delivered selected clears.
 
     ``current − authorized``, then the leaf-level clear overlay: for a surviving entry whose
-    row carries a pending clear, delete exactly the named wire leaves and keep every other
-    leaf at its LIVE value. An absent live entry is a no-op — never synthesize one.
+    selected plan carries a pending clear, delete exactly the named wire leaves and keep every
+    other leaf at its live value. An absent live entry is a no-op.
     """
-    from nso_adapter.core.static_route_plan import CLEAR_WIRE_LEAF, triple_of
+    from nso_adapter.core.static_route_plan import CLEAR_WIRE_LEAF
     from nso_adapter.nso.apply import static_route_entry_key
 
-    rows_by_key = {triple_of(row): row for row in rows}
+    clears_by_key = {clear.key: clear for clear in clears}
     entries: list[dict] = []
     delivered: dict[int, tuple[str, ...]] = {}
+    delivered_keys: dict[int, tuple[str, str, str]] = {}
     for entry in current.get("route") or []:
         key = static_route_entry_key(entry)
         if key in authorized:
             continue
         kept = dict(entry)
-        row = rows_by_key.get(key)
-        fields = clears.get(row.id) if row is not None else None
-        if fields:
-            assert row is not None
-            for field in fields:
+        clear = clears_by_key.get(key)
+        if clear is not None:
+            for field in clear.fields:
                 kept.pop(CLEAR_WIRE_LEAF[field], None)
-            delivered[row.id] = fields
+            delivered[clear.row_id] = clear.fields
+            delivered_keys[clear.row_id] = clear.key
         entries.append(kept)
-    return entries, delivered
+    return entries, delivered, delivered_keys
 
 
 async def _replace_static_route(
@@ -984,21 +1003,20 @@ async def _replace_static_route(
     store would forward-deploy every co-edited field on it (``metric 10→NULL`` **and**
     ``tag 100→200`` in one push would immediately deploy tag 200).
 
-    Authorization is evaluated here, under the claim the worker holds:
+    Promoted generation creation records the removal classification under the projection lock:
 
     1. every tombstone owned by THIS job contributes ``{triple} ∪ {deployed_key}`` (X6);
        a job that owns none falls back to ``context["removed"]["route"]`` (fence-shut and
        legacy jobs);
-    2. supersession subtracts every key a live intent row still claims as its ``triple`` or
-       its ``deployed_key`` — ownership, not eligibility;
+    2. supersession subtracts every key the selected plan claims as its ``triple`` or
+       its ``deployed_key``. A promotion uses the recorded document. A reissue uses current
+       accepted intent;
     3. nothing left to drop and no clear to deliver ⇒ **no HTTP at all**: the tombstones are
        consumed by supersession, not by failure.
 
-    The clear set comes from the durable carrier, read here rather than from a job-context
-    snapshot: a snapshot goes stale between enqueue and execution and does not survive a job
-    failure or a sweeper re-issue, which rebuilds the context from the tombstone alone (G37).
-    Only the ``authorized`` half is visible — a ``?store_only=true`` push may mutate the store
-    but must never cause a device write.
+    A reissue promotes nothing and records no execution plan. It re-derives this classification
+    at execution from its job and tombstone rows, including the durable clear carrier. Only the
+    ``authorized`` half is visible.
 
     *reg* is threaded but unused HERE on purpose: this function only reads and writes to the
     device. Every store write this job makes — the tombstone delete, the carrier update and the
@@ -1015,17 +1033,23 @@ async def _replace_static_route(
     context = context or {}
     if context.get("force"):
         await _replace_simple(db, device, client, "static_route", context)
-        return SrRemoval("force", frozenset(), (), frozenset(), True, False, None, {}, ())
+        return SrRemoval("force", frozenset(), (), frozenset(), True, False, None, {}, {}, ())
 
-    tombstones, authorized, claimed, rows, reclaimed = await _sr_authorization(db, device, context, job_id=job_id)
+    plan = await _sr_execution_plan(db, device, context, job_id=job_id)
+    authorized = set(plan.authorized)
+    claimed = set(plan.claimed)
+    reclaimed = plan.reclaimed
     detach = bool(context.get("detach"))
-    # A no-networking PUT can never remove a leaf from the device, and a push that also
-    # un-owned rows deferred its clear at enqueue time (§4.5), which a NETWORKED job of a
-    # marking-split request can be. Either way the carrier keeps it for the next retract.
-    deliver_clears = not detach and not context.get("retract_deferred")
-    candidate_clears = _sr_candidate_clears(rows) if deliver_clears else {}
+    candidate_clears = plan.clears
+    tombstone_ids = plan.tombstone_ids
 
-    tombstone_ids = tuple(t.id for t in tombstones)
+    if reclaimed:
+        logger.warning(
+            "static_route.removal_key_reclaimed",
+            device_id=device.id,
+            job_id=job_id,
+            keys=[list(key) for key in reclaimed],
+        )
 
     def _nothing_to_do() -> SrRemoval:
         logger.info(
@@ -1035,7 +1059,7 @@ async def _replace_static_route(
             tombstones=list(tombstone_ids),
             reclaimed=[list(k) for k in reclaimed],
         )
-        return SrRemoval("superseded", frozenset(), tombstone_ids, frozenset(), False, False, None, {}, ())
+        return SrRemoval("superseded", frozenset(), tombstone_ids, frozenset(), False, False, None, {}, {}, ())
 
     if not authorized and not candidate_clears:
         return _nothing_to_do()
@@ -1056,9 +1080,9 @@ async def _replace_static_route(
         # `absent` proves the SERVICE has no instance, never that the device is clean (G9):
         # a previously detached route can sit unowned on the device. So no PUT — and the
         # proof still runs, which is also what keeps a retried detach provable at all.
-        return SrRemoval(branch, frozenset(authorized), tombstone_ids, frozenset(), False, True, None, {}, ())
+        return SrRemoval(branch, frozenset(authorized), tombstone_ids, frozenset(), False, True, None, {}, {}, ())
 
-    body_entries, delivered = _sr_body(current, rows, authorized, candidate_clears)
+    body_entries, delivered, delivered_keys = _sr_body(current, authorized, candidate_clears)
     if not authorized and not delivered:
         # The store-side clear check got us past the pre-read branch, but the live entry it
         # named is gone (the row's identity moved, or the key was never on the service). The
@@ -1101,6 +1125,7 @@ async def _replace_static_route(
         False,
         verdict,
         delivered,
+        delivered_keys,
         retained_orphans,
     )
 
@@ -1167,7 +1192,7 @@ async def _sr_sync_from(client, device, result: dict, *, job_id: int) -> bool:
     return False
 
 
-async def _sr_networked_proof(db: AsyncSession, client, device, out: SrRemoval, result: dict):
+async def _sr_networked_proof(client, device, out: SrRemoval, result: dict):
     """Gather §4.4's evidence for a networked removal → ``(proven, residue_found, per_field)``.
 
     ONE certified device-state read serves both consumers: the residue check over the keys
@@ -1177,8 +1202,7 @@ async def _sr_networked_proof(db: AsyncSession, client, device, out: SrRemoval, 
     wire leaf is absent or neutral in that read.
     """
     from nso_adapter.core.apply import _static_route_device_state
-    from nso_adapter.core.static_route_plan import leaf_is_neutral, triple_of
-    from nso_adapter.store.models import StaticRouteIntent
+    from nso_adapter.core.static_route_plan import leaf_is_neutral
 
     status, entries = await _static_route_device_state(client, device)
     # §4.4's set literally: `authorized − keys in the sent body`. The subtraction is empty by
@@ -1201,8 +1225,7 @@ async def _sr_networked_proof(db: AsyncSession, client, device, out: SrRemoval, 
     per_field: dict[int, tuple[str, ...]] = {}
     clears_ok = True
     for row_id, fields in out.clears.items():
-        row = await db.get(StaticRouteIntent, row_id)
-        entry = entries.get(triple_of(row)) if (row is not None and status == "ok") else None
+        entry = entries.get(out.clear_keys[row_id]) if status == "ok" else None
         proven = tuple(f for f in fields if entry is not None and leaf_is_neutral(f, entry))
         per_field[row_id] = proven
         if len(proven) != len(fields):
@@ -1215,7 +1238,7 @@ async def _sr_networked_proof(db: AsyncSession, client, device, out: SrRemoval, 
 
 async def _sr_consume(db: AsyncSession, device, out: SrRemoval, per_field: dict, result: dict, *, reg) -> None:
     """Delete the snapshotted tombstones and empty the proven carrier fields. Nothing else."""
-    from nso_adapter.core.static_route_plan import AUTHORIZED, STORE_ONLY
+    from nso_adapter.core.static_route_plan import AUTHORIZED, STORE_ONLY, triple_of
     from nso_adapter.store.models import StaticRouteIntent
     from nso_adapter.store.tombstone_store import delete_tombstones
 
@@ -1235,7 +1258,7 @@ async def _sr_consume(db: AsyncSession, device, out: SrRemoval, per_field: dict,
         if not fields:
             continue
         row = await db.get(StaticRouteIntent, row_id)
-        if row is None:
+        if row is None or triple_of(row) != out.clear_keys[row_id]:
             continue
         carrier = row.pending_clear or {}
         # Both halves: they are disjoint by construction (an authorized clear promotes out of
@@ -1288,8 +1311,7 @@ async def _finalize_static_route_removal(db, job_id: int, device, client, out: S
     per_field: dict[int, tuple[str, ...]] = {}
     residue_found = False
     if out.branch == "superseded":
-        # Consumption by supersession, not by failure: a live intent row reclaimed every key,
-        # so there is nothing left to retract and nothing to prove.
+        # The selected plan claimed every authorized key, so there is nothing to prove.
         result["residue_check"] = "skipped_superseded"
         result["superseded"] = True
         proven = True
@@ -1303,7 +1325,7 @@ async def _finalize_static_route_removal(db, job_id: int, device, client, out: S
         # sees no instance and could never satisfy the predicate.
         proven = service_clean and sync_ok and (out.put_issued or out.service_absent) and _sr_verify_ok(out)
     else:
-        proven, residue_found, per_field = await _sr_networked_proof(db, client, device, out, result)
+        proven, residue_found, per_field = await _sr_networked_proof(client, device, out, result)
 
     with db.no_autoflush:
         promotes_static_route = await db.scalar(
@@ -1941,11 +1963,13 @@ async def enqueue_removal(
     settlement_cohort: int | None = None,
     interfaces: list[str] | None = None,
     removed: dict[str, list] | None = None,
+    allowed_removal_keys: dict[str, list] | None = None,
     vault_refs: dict[str, str] | None = None,
     force: bool = False,
     retract: bool = False,
     shrank: bool = False,
     document: dict | None = None,
+    static_route_tombstone_ids: tuple[int, ...] = (),
 ):
     """Queue an async ``removal`` job that PUT-replaces *scope*'s service.
 
@@ -2082,17 +2106,25 @@ async def enqueue_removal(
     if force:
         if promotes:
             raise ValueError(f"a force-removal of {scope!r} promotes nothing; got {promotes!r}")
-        generation = await create_reissue_generation(db, device_id, mode=mode, removal_context=context)
+        generation = await create_reissue_generation(
+            db,
+            device_id,
+            mode=mode,
+            removal_context=context,
+        )
     else:
         generation = await create_generation(
             db,
             device_id,
             streams=promotes,
             mode=mode,
-            allowed_removal_keys=context.get("removed") or {},
+            allowed_removal_keys=allowed_removal_keys
+            if allowed_removal_keys is not None
+            else context.get("removed") or {},
             document=document,
             removal_context=context,
             settlement_cohort=settlement_cohort,
+            static_route_tombstone_ids=static_route_tombstone_ids,
         )
     job = Job(
         job_type=JobType.removal,
@@ -2190,6 +2222,7 @@ async def enqueue_static_route_removals(
     jobs: dict = {}
     # A pure clear deletes nothing, so it carries no marking at all and is never a detach.
     for index, marking in enumerate(present or [None]):
+        owned_tombstone_ids = tuple(tombstone.id for tombstone in tombstones if tombstone.marking == marking)
         job = await enqueue_removal(
             db,
             device_id,
@@ -2201,6 +2234,7 @@ async def enqueue_static_route_removals(
             removed=removed_map("static_route", removed[marking]) if marking is not None else None,
             retract=retract and index == 0,
             shrank=marking is not None,
+            static_route_tombstone_ids=owned_tombstone_ids,
         )
         if job is None:
             # Store-only, and the flag is request-scoped: no job was created for any marking.
@@ -2220,8 +2254,9 @@ async def enqueue_static_route_removals(
 async def run_removal(job_id: int, device_id: int, reg=None) -> None:
     """Execute a queued ``removal`` job: PUT-replace the scope's reconciler service.
 
-    Idempotent — reads the CURRENT accepted rows at run time, so a requeue after a
-    restart re-asserts whatever the present desired state is.
+    Promoted generations execute their recorded document and classification. Reissues retain
+    live-store execution with job and tombstone bookkeeping. A retry repeats the same selected
+    operation after a restart.
 
     *reg* is the worker's live ``ClaimRegistration`` for this device. Physical continuity
     already existed (the worker holds the claim for the runner's whole lifetime); the

@@ -571,6 +571,43 @@ async def test_plan_snapshots_tombstones_and_the_watermark(adapter_client):
     assert plan.allowed == {A, C}
 
 
+async def test_generation_records_the_complete_static_route_apply_plan(adapter_client):
+    """Generation creation freezes every fact that selects PATCH versus PUT."""
+    from nso_adapter.core.generation import create_generation, note_write
+    from nso_adapter.store.models import GenerationMode
+
+    device_id = await seed_device(nso_device_name="sr-recorded-plan", netbox_device_id=7014)
+    ids = await _seed_rows(device_id, [{"triple": B, "route_id": 2, "deployed_key": list(A)}])
+    tomb_id = await _seed_tombstone(device_id, C, deployed_key=list(A))
+
+    async with session() as db:
+        await note_write(db, device_id, "static_route")
+        generation = await create_generation(
+            db,
+            device_id,
+            streams=("static_route",),
+            mode=GenerationMode.networked,
+        )
+        await db.commit()
+
+    recorded = generation.document["static_route"]["_execution"]["apply"]
+    assert recorded == {
+        "mode": "PUT",
+        "row_ids": [ids[B]],
+        "allowed_removal_keys": [list(A), list(C)],
+        "tombstone_ids": [tomb_id],
+        "cas": [
+            {
+                "row_id": ids[B],
+                "route_id": 2,
+                "sent_triple": list(B),
+                "expected_old": list(A),
+            }
+        ],
+        "tombstone_id_watermark": tomb_id,
+    }
+
+
 async def test_plan_writes_nothing(adapter_client):
     """``build_plan`` is read-only — no stamping, no consumption, no HTTP."""
     from nso_adapter.store.models import Device, StaticRouteIntent

@@ -28,6 +28,7 @@ _INCREMENT_ONE_SECTIONS = frozenset(
 _INCREMENT_TWO_SECTIONS = frozenset({"snmp", "logging"})
 _INCREMENT_THREE_SECTIONS = frozenset({"bgp"})
 _INCREMENT_FOUR_SECTIONS = frozenset({"interface_config"})
+_INCREMENT_FIVE_SECTIONS = frozenset({"static_route"})
 
 
 def test_every_section_is_either_document_executed_or_names_its_blocker():
@@ -126,6 +127,24 @@ def test_increment_four_sections_are_document_executed():
 
     assert _INCREMENT_FOUR_SECTIONS <= DOCUMENT_EXECUTED_SECTIONS
     assert not (_INCREMENT_FOUR_SECTIONS & set(LIVE_READ_SECTIONS))
+
+
+def test_increment_five_completes_document_execution():
+    from nso_adapter.core.projection import (
+        ACTION_APPLY_EXECUTABLE_SECTIONS,
+        DOCUMENT_EXECUTED_SECTIONS,
+        LIVE_READ_SECTIONS,
+        projection_sections,
+        projection_streams,
+        stream_section,
+    )
+
+    assert _INCREMENT_FIVE_SECTIONS <= DOCUMENT_EXECUTED_SECTIONS
+    assert LIVE_READ_SECTIONS == {}
+    assert ACTION_APPLY_EXECUTABLE_SECTIONS == DOCUMENT_EXECUTED_SECTIONS == projection_sections()
+    assert {
+        stream for stream in projection_streams() if stream_section(stream) in ACTION_APPLY_EXECUTABLE_SECTIONS
+    } == (projection_streams())
 
 
 @pytest.mark.parametrize(

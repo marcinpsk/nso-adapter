@@ -490,11 +490,8 @@ async def _rows_for(db: AsyncSession, device_id: int, spec: _Spec) -> list[dict]
 #: Sections whose apply pass is served from the executing generation's stored document
 #: rather than from live intent rows (#1522 §G1).
 #:
-#: Membership is a property of the SECTION, not a switch: a section joins when its whole
-#: outbound payload can be rebuilt from :func:`snapshot_sections` alone. Every other section
-#: is named in :data:`LIVE_READ_SECTIONS` with the reason it cannot yet, and
-#: ``test_projection_document.py`` pins the partition — so a new section cannot drift out of
-#: the protocol unnoticed, and closing a reason without wiring the section fails.
+#: Membership is a property of the SECTION, not a switch. Every outbound payload can now be
+#: rebuilt from the stored document. ``test_projection_document.py`` pins the complete set.
 DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset(
     {
         "bgp",
@@ -510,20 +507,16 @@ DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset(
         "isis",
         "route_policy",
         "ospf",
+        "static_route",
     }
 )
 
-#: The document-executed sections a manual Apply may select. This set equals
-#: :data:`DOCUMENT_EXECUTED_SECTIONS` today. The names remain separate because one states
-#: how a section executes and the other states whether an operator may select it. A section
-#: can join this set only after its companion apply and claim subtraction stop reading live
-#: intent.
-ACTION_APPLY_EXECUTABLE_SECTIONS: frozenset[str] = frozenset({"vlan"})
+#: The manual Apply selection boundary equals the document-executed boundary. Every
+#: projection stream now maps to a section that executes from its stored document.
+ACTION_APPLY_EXECUTABLE_SECTIONS: frozenset[str] = DOCUMENT_EXECUTED_SECTIONS
 
-#: Why each remaining section still reads live rows at apply time.
-LIVE_READ_SECTIONS: dict[str, str] = {
-    "static_route": "build_plan classifies against tombstones, carriers and deployed keys",
-}
+#: No section reads live intent to decide what a generation executes.
+LIVE_READ_SECTIONS: dict[str, str] = {}
 
 INTERFACE_EXECUTION_KEY = "_execution"
 INTERFACE_ATTRIBUTE_ELIGIBLE_STATES: frozenset[SyncState] = frozenset(
@@ -769,7 +762,7 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
     rows: dict[type, list] = {}
     row_records: dict[type, list[tuple[dict, object]]] = {}
     for table_name, serialized_rows in tables.items():
-        if section == "interface_config" and table_name == INTERFACE_EXECUTION_KEY:
+        if table_name == INTERFACE_EXECUTION_KEY and section in {"interface_config", "static_route"}:
             continue
         model = _MODEL_BY_TABLE.get(table_name)
         if model is None:

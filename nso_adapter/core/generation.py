@@ -63,7 +63,6 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.projection import (
-    ACTION_APPLY_EXECUTABLE_SECTIONS,
     InterfaceEligibilityUnresolved,
     is_intent_deletion,
     projection_row_state,
@@ -595,6 +594,11 @@ async def _enqueue_action_removal_links(
             raise ApplyUnexecutable({link.stream: "unresolved_interface_identity"}) from None
         if scope == "interface_config" and not context.interfaces:
             raise ApplyUnexecutable({link.stream: "no_executable_interface"})
+        allowed_removal_keys = context.removed
+        if scope == "static_route":
+            from nso_adapter.core.static_route_plan import promotion_removal_keys
+
+            allowed_removal_keys = promotion_removal_keys(link.removed)
         marking = DELETE_ORIGIN_MARKING if link.mode is GenerationMode.networked and link.removed else None
         if link.mode is GenerationMode.detach:
             marking = DETACH_MARKING
@@ -610,6 +614,7 @@ async def _enqueue_action_removal_links(
             settlement_cohort=cohort,
             interfaces=context.interfaces,
             removed=context.removed,
+            allowed_removal_keys=allowed_removal_keys,
             vault_refs=context.vault_refs,
             retract=bool(link.replacement),
             shrank=bool(link.removed),
@@ -660,13 +665,6 @@ async def create_action_apply(
     from nso_adapter.core.receipt import consume_promotion_provenance
 
     await lock_projection(db, device_id)
-    unexecutable = {
-        stream: "live_read_execution"
-        for stream in selected
-        if stream_section(stream) not in ACTION_APPLY_EXECUTABLE_SECTIONS
-    }
-    if unexecutable:
-        raise ApplyUnexecutable(unexecutable)
     selected_rows, skipped, skipped_detail = await _selected_promotions(db, device_id, selected)
     if not selected_rows:
         return ActionApplyResult([], skipped, skipped_detail)
@@ -756,6 +754,7 @@ async def create_generation(
     document: dict | None = None,
     removal_context: dict | None = None,
     settlement_cohort: int | None = None,
+    static_route_tombstone_ids: tuple[int, ...] = (),
 ) -> DeploymentGeneration:
     """Promote *streams* and store the immutable generation they authorize. Caller commits.
 
@@ -816,6 +815,7 @@ async def create_generation(
         stream_revisions=stream_revisions,
         removal_context=removal_context,
         settlement_cohort=settlement_cohort,
+        static_route_tombstone_ids=static_route_tombstone_ids,
     )
 
 
@@ -830,17 +830,31 @@ async def _store_generation(
     stream_revisions: dict,
     removal_context: dict | None,
     settlement_cohort: int | None,
+    static_route_tombstone_ids: tuple[int, ...],
 ) -> DeploymentGeneration:
     """Allocate the sequence and write the immutable row. The projection lock is held."""
     body = deepcopy(document)
-    if (removal_context or {}).get("scope") == "interface_config":
-        section = body.setdefault("interface_config", {})
-        section.setdefault("interface_intent", [])
-        section.setdefault("interface_ip_intent", [])
-    try:
-        await record_interface_execution(db, device_id, body)
-    except InterfaceEligibilityUnresolved:
-        raise ApplyUnexecutable({"interface_config": "interface_attribute_eligibility_unresolved"}) from None
+    # Only a promotion freezes execution-time store facts. A reissue carries no promoted
+    # revisions and keeps its established live-store, job-row and tombstone-row semantics.
+    if stream_revisions:
+        if (removal_context or {}).get("scope") == "interface_config":
+            section = body.setdefault("interface_config", {})
+            section.setdefault("interface_intent", [])
+            section.setdefault("interface_ip_intent", [])
+        try:
+            await record_interface_execution(db, device_id, body)
+        except InterfaceEligibilityUnresolved:
+            raise ApplyUnexecutable({"interface_config": "interface_attribute_eligibility_unresolved"}) from None
+        from nso_adapter.core.static_route_plan import record_static_route_execution
+
+        await record_static_route_execution(
+            db,
+            device_id,
+            body,
+            removal_context=removal_context,
+            allowed_removal_keys=allowed_removal_keys,
+            tombstone_ids=static_route_tombstone_ids,
+        )
     generation = DeploymentGeneration(
         device_id=device_id,
         seq=await _next_seq(db, device_id),
@@ -893,12 +907,12 @@ async def create_reissue_generation(
     here: the force-removal action is exempt from it at its own choke point
     (:func:`core.removal.enqueue_removal`) and the two scheduled producers carry no request.
 
-    It therefore settles NOTHING: ``stream_revisions`` is empty. The document composes every
-    authorized stream so the write stays complete, but the job behind it executes ONE
-    removal context's scope, and settlement advances exactly what a generation lists. Listing
+    It therefore settles NOTHING: ``stream_revisions`` is empty. Its composed authorized
+    fragments carry no execution plan. The job behind it executes ONE removal context's
+    scope from live state, and settlement advances exactly what a generation lists. Listing
     every authorized revision let a static-route reissue certify a VLAN revision whose own
-    deployment had failed or been abandoned — a lane marked applied by a write that never
-    carried it. ``source_push_seq`` stays: it is provenance, not a settlement target.
+    deployment had failed or been abandoned. The reissue never carried that lane.
+    ``source_push_seq`` stays: it is provenance, not a settlement target.
     """
     await lock_projection(db, device_id)
     rows = (
@@ -917,6 +931,7 @@ async def create_reissue_generation(
         stream_revisions={},
         removal_context=removal_context,
         settlement_cohort=None,
+        static_route_tombstone_ids=(),
     )
 
 
@@ -937,9 +952,8 @@ async def _job_generations(db: AsyncSession, job_id: int) -> list[DeploymentGene
 async def generation_execution_sections(db: AsyncSession, job_id: int) -> frozenset[str] | None:
     """Return the sections carried by this job, or ``None`` when it carries no generation.
 
-    Adjacent generations can share one apply job. Their sections form the execution boundary.
-    Each section independently selects its source: document-executed sections use the highest
-    generation's complete document, while a live-read section still uses the current store.
+    Adjacent generations can share one apply job. Their streams form the execution boundary,
+    and every selected section uses the highest generation's complete document.
     """
     generations = await _job_generations(db, job_id)
     if not generations:
