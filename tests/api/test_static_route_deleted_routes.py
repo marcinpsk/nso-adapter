@@ -651,6 +651,24 @@ async def test_a_push_without_deleted_routes_is_refused_at_the_validation_bounda
     ), envelope
 
 
+async def test_a_push_with_null_deleted_routes_is_refused_at_the_validation_boundary(adapter_client):
+    device_id = await seed_device(nso_device_name="sr-o2b-null-list", netbox_device_id=9933)
+
+    response = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/static-route-intent",
+        json={"routes": [entry(C, route_id=101)], "deleted_routes": None},
+        headers=AUTH | push_seq(1),
+    )
+
+    assert response.status_code == 422, response.text
+    envelope = response.json()["error"]
+    assert envelope["code"] == "validation_error"
+    assert any(
+        error["type"] == "list_type" and error["loc"] == ["body", "deleted_routes"]
+        for error in envelope["detail"]["errors"]
+    ), envelope
+
+
 async def test_an_empty_list_push_still_reports_the_uncorrelated_rows(adapter_client):
     """§4.4 (R11-B2) — the field is reported on EVERY mode, including a push carrying no
     deletion records at all (the O3-activated spelling of the old omitted-field arm)."""
