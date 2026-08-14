@@ -89,7 +89,7 @@ def recorded_client(device_name: str, *, on_sync_from=None, fail_vlan: bool = Fa
 
     rec = _Recorder(device_name, fail_vlan=fail_vlan)
     http = AsyncMock()
-    for method in ("get", "put", "patch", "post"):
+    for method in ("get", "put", "patch", "post", "delete"):
 
         def _bind(m=method):
             async def _call(url, content=None, headers=None, **kwargs):
@@ -121,6 +121,19 @@ def recorded_client(device_name: str, *, on_sync_from=None, fail_vlan: bool = Fa
 
     client.sync_from = AsyncMock(side_effect=_sync_from)
     return client, rec
+
+
+async def test_recorded_client_captures_delete_requests():
+    """A reconciler DELETE is observable at the same boundary as every other verb."""
+    client, recorder = recorded_client("gen-delete-recorder")
+
+    async with client._client() as http:
+        response = await http.delete("http://nso/restconf/data/example:item=1")
+
+    assert response.status_code == 204
+    assert [(call["method"], call["url"]) for call in recorder.calls] == [
+        ("delete", "http://nso/restconf/data/example:item=1")
+    ]
 
 
 # ── helpers over the real app and the real worker ────────────────────────────
@@ -562,9 +575,12 @@ async def test_f4_c_a_lower_sequence_is_stale(adapter_client):
     assert (await stream_row(device_id, "vlan")).desired_revision == 1
 
 
-@pytest.mark.parametrize("raw", ["abc", "", " ", "1.5", "0", "-1", str(2**63)])
-async def test_f4_d_a_malformed_or_out_of_domain_push_sequence_is_rejected(adapter_client, raw):
-    device_id = await seed_device(nso_device_name=f"gen-badseq-{abs(hash(raw)) % 10000}", netbox_device_id=None)
+@pytest.mark.parametrize(
+    ("case_id", "raw"),
+    list(enumerate(["abc", "", " ", "1.5", "0", "-1", str(2**63)])),
+)
+async def test_f4_d_a_malformed_or_out_of_domain_push_sequence_is_rejected(adapter_client, case_id, raw):
+    device_id = await seed_device(nso_device_name=f"gen-badseq-{case_id}", netbox_device_id=None)
     await seed_settings(device_id)
 
     resp = await adapter_client.put(
@@ -994,7 +1010,9 @@ async def test_f9_a_a_dropped_key_fails_the_job_even_with_nothing_to_stamp(adapt
     device_id = await seed_device(nso_device_name="gen-verify-sent", netbox_device_id=9840)
     await seed_settings(device_id)
     stamp = "2026-08-01T00:00:00Z"
-    assert (await put_vlans(adapter_client, device_id, [10], names={10: "before"}, accepted={10: stamp})).status_code
+    assert (
+        await put_vlans(adapter_client, device_id, [10], names={10: "before"}, accepted={10: stamp})
+    ).status_code == 200
 
     async def successor():
         resp = await put_vlans(adapter_client, device_id, [10], names={10: "after"}, accepted={10: stamp})
@@ -1019,7 +1037,9 @@ async def test_f9_b_atomic_mode_verifies_the_document_it_sent(adapter_client, mo
     device_id = await seed_device(nso_device_name="gen-verify-atomic", netbox_device_id=9841)
     await seed_settings(device_id)
     stamp = "2026-08-01T00:00:00Z"
-    assert (await put_vlans(adapter_client, device_id, [10], names={10: "before"}, accepted={10: stamp})).status_code
+    assert (
+        await put_vlans(adapter_client, device_id, [10], names={10: "before"}, accepted={10: stamp})
+    ).status_code == 200
 
     async def successor():
         resp = await put_vlans(adapter_client, device_id, [10], names={10: "after"}, accepted={10: stamp})
@@ -1044,7 +1064,9 @@ async def test_f9_c_a_present_key_still_settles_and_stamps_the_row_it_carried(ad
     device_id = await seed_device(nso_device_name="gen-verify-present", netbox_device_id=9842)
     await seed_settings(device_id)
     stamp = "2026-08-01T00:00:00Z"
-    assert (await put_vlans(adapter_client, device_id, [10], names={10: "before"}, accepted={10: stamp})).status_code
+    assert (
+        await put_vlans(adapter_client, device_id, [10], names={10: "before"}, accepted={10: stamp})
+    ).status_code == 200
 
     async def successor():
         resp = await put_vlans(adapter_client, device_id, [10], names={10: "after"}, accepted={10: stamp})

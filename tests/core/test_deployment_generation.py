@@ -296,6 +296,7 @@ async def test_settlement_stamps_the_carried_revision_not_the_newer_store(adapte
     assert (await _stream(device_id, "vlan")).desired_revision == 3
 
     generations = await _generations(device_id)
+    assert len(generations) == 3
     assert generations[0].status is GenerationStatus.settled
     assert [g.status for g in generations[1:]] == [GenerationStatus.pending] * (len(generations) - 1)
     section = await _stream(device_id, "vlan")

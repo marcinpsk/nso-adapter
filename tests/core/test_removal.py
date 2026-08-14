@@ -71,14 +71,13 @@ async def _seed_removal_job(device_id: int, scope: str = "vlan", context_extra: 
     from nso_adapter.store.models import GenerationMode
 
     context = {"scope": scope, **(context_extra or {})}
-    streams = section_streams(scope)
+    stream = section_streams(scope)[0]
     async with session() as db:
-        for stream in streams:
-            await note_write(db, device_id, stream)
+        await note_write(db, device_id, stream)
         generation = await create_generation(
             db,
             device_id,
-            streams=streams,
+            streams=(stream,),
             mode=GenerationMode.detach if context.get("detach") else GenerationMode.networked,
             allowed_removal_keys=context.get("removed") or {},
             removal_context=context,
@@ -165,10 +164,9 @@ async def test_enqueue_removal_creates_job_for_each_valid_scope(adapter_client):
     device_id = await _seed_device()
     for scope in VALID_REMOVAL_SCOPES:
         async with session() as db:
-            streams = section_streams(scope)
-            for stream in streams:
-                await note_projection_write(db, device_id, stream)
-            job = await enqueue_removal(db, device_id, scope, promotes=streams)
+            stream = section_streams(scope)[0]
+            await note_projection_write(db, device_id, stream)
+            job = await enqueue_removal(db, device_id, scope, promotes=(stream,))
             await db.commit()
             assert job.job_type == JobType.removal
             assert job.context == {"scope": scope, "detach": True}
