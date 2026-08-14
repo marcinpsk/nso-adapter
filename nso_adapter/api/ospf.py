@@ -409,10 +409,6 @@ async def put_ospf_intent(
         mutation_count=len(payload.instances) + len(payload.interfaces),
         removal_generation_count=int(removal_requested),
     )
-    if apply_requested:
-        from nso_adapter.core.apply import enqueue_apply
-
-        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
     if removal_requested:
         from nso_adapter.core.removal import enqueue_removal, query_flag_marking
 
@@ -433,7 +429,10 @@ async def put_ospf_intent(
             shrank=deleted,
         )
 
-    await _maybe_enqueue_apply(db, device_id, len(payload.instances) + len(payload.interfaces), stream=delivery.stream)
+    if apply_requested:
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
 
     result = {
         "device_id": device_id,
