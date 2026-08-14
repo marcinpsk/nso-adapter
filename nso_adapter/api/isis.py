@@ -489,18 +489,6 @@ async def _sync_isis_redistribution(
     return deleted, cleared
 
 
-async def _isis_auto_apply_requested(db, device_id: int, iface_count: int, proc_count: int) -> bool:
-    """Return whether this request will create an automatic apply generation."""
-    from nso_adapter.store.models import DeviceSettings
-
-    if iface_count <= 0 and proc_count <= 0:
-        return False
-    settings = (
-        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    ).scalar_one_or_none()
-    return bool(settings and settings.auto_apply)
-
-
 class IsisInterfaceIntentResult(BaseModel):
     device_id: int
     interface_count: int
@@ -627,11 +615,15 @@ async def put_isis_interface_intent(
     # retract: the device kept the old value forever while the operator saw it as removed.
     deleted = iface_deleted or proc_deleted or level_deleted or redist_deleted
     cleared = iface_cleared or proc_cleared or level_cleared or redist_cleared
-    apply_requested = await _isis_auto_apply_requested(db, device_id, iface_count, proc_count)
     removal_requested = deleted or cleared
-    from nso_adapter.core.generation import request_settlement_cohort
+    from nso_adapter.core.generation import prepare_request_settlement
 
-    settlement_cohort = await request_settlement_cohort(db, int(removal_requested) + int(apply_requested))
+    apply_requested, settlement_cohort = await prepare_request_settlement(
+        db,
+        device_id,
+        mutation_count=iface_count + proc_count,
+        removal_generation_count=int(removal_requested),
+    )
     if apply_requested:
         from nso_adapter.core.apply import enqueue_apply
 
@@ -765,15 +757,15 @@ async def put_isis_flex_algo_intent(
 
     await db.flush()
 
-    from nso_adapter.store.models import DeviceSettings
-
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
-    apply_requested = bool(settings and settings.auto_apply and count > 0)
     removal_requested = bool(removed_keys or cleared)
-    from nso_adapter.core.generation import request_settlement_cohort
+    from nso_adapter.core.generation import prepare_request_settlement
 
-    settlement_cohort = await request_settlement_cohort(db, int(removal_requested) + int(apply_requested))
+    apply_requested, settlement_cohort = await prepare_request_settlement(
+        db,
+        device_id,
+        mutation_count=count,
+        removal_generation_count=int(removal_requested),
+    )
     if apply_requested:
         from nso_adapter.core.apply import enqueue_apply
 

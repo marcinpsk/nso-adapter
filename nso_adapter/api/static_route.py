@@ -46,7 +46,6 @@ from nso_adapter.core.static_route_plan import fence_open as sr_fence_open
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
     Device,
-    DeviceSettings,
     DeviceStaticRoute,
     StaticRouteIntent,
     StaticRouteTombstone,
@@ -701,14 +700,15 @@ async def _apply_static_route_intent(
     # rows before it touches `jobs` — the §3.9 order, `intent + tombstone -> jobs`.
     await db.flush()
 
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
-    auto_apply = bool(settings and settings.auto_apply and count > 0)
     removal_generation_count = len(removed_by_marking) if removed_rows else int(cleared)
-    promoted_generation_count = 0 if STORE_ONLY.get() else removal_generation_count + int(auto_apply)
-    from nso_adapter.core.generation import request_settlement_cohort
+    from nso_adapter.core.generation import prepare_request_settlement
 
-    settlement_cohort = await request_settlement_cohort(db, promoted_generation_count)
+    auto_apply, settlement_cohort = await prepare_request_settlement(
+        db,
+        device_id,
+        mutation_count=count,
+        removal_generation_count=removal_generation_count,
+    )
 
     # Removal BEFORE apply, and both inside this transaction. The order is the contract:
     # the removal must carry the lower (created_at, id) so the worker's per-device head

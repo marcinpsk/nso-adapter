@@ -417,7 +417,8 @@ Device object plus `scope` (see below) and `last_job_id`.
 
 Return the device's deployment generations in ascending `seq` order. The optional
 `since_seq` query parameter selects only generations whose `seq` is strictly greater
-than the supplied value. The endpoint does not paginate the result.
+than the supplied value. `limit` defaults to 100 and must be between 1 and 500. An
+out-of-range limit returns `422 validation_error`; it is never clamped.
 
 ```json
 [

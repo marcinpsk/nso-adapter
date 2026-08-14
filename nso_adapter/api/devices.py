@@ -17,6 +17,7 @@ from nso_adapter.api.errors import (
     RESP_422_VALIDATION,
     api_error,
 )
+from nso_adapter.api.pagination import DEFAULT_PAGE, validate_page_limit
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.store.models import (
     DbInterface,
@@ -351,8 +352,10 @@ async def get_device(device_id: int, db: AsyncSession = Depends(get_db)):
 async def list_device_generations(
     device_id: int,
     since_seq: int | None = None,
+    limit: int = DEFAULT_PAGE,
     db: AsyncSession = Depends(get_read_db),
 ):
+    limit = validate_page_limit(limit)
     if not await db.get(Device, device_id):
         raise api_error(404, "not_found", "Device not found")
 
@@ -376,6 +379,7 @@ async def list_device_generations(
     )
     if since_seq is not None:
         query = query.where(DeploymentGeneration.seq > since_seq)
+    query = query.limit(limit)
     rows = (await db.execute(query)).all()
     return [
         {

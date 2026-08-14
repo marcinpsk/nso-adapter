@@ -35,7 +35,6 @@ from nso_adapter.store.models import (
     DeviceBgpPeerGroupAddressFamily,
     DeviceBgpRouter,
     DeviceBgpScope,
-    DeviceSettings,
     RedistributionIntent,
 )
 
@@ -553,16 +552,6 @@ async def _sync_redistribution(
     return removed, cleared
 
 
-async def _auto_apply_requested(db: AsyncSession, device_id: int, router_count: int) -> bool:
-    """Return whether this request will create an automatic apply generation."""
-    if router_count <= 0:
-        return False
-    settings = (
-        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    ).scalar_one_or_none()
-    return bool(settings and settings.auto_apply)
-
-
 def _bgp_removed(
     existing_asns: set[str], existing_peers: set[str], routers: list[BgpRouterModel]
 ) -> tuple[list[str], list[str]]:
@@ -625,11 +614,15 @@ async def put_bgp_intent(
     removed_asns, removed_peers = _bgp_removed(existing_asns, existing_peers, body.routers)
     cleared = _bgp_cleared(before_values, body.routers) or redistribution_cleared
     shrank = bool(removed_asns or removed_peers or removed_redist)
-    apply_requested = await _auto_apply_requested(db, device_id, router_count)
     removal_requested = shrank or cleared
-    from nso_adapter.core.generation import request_settlement_cohort
+    from nso_adapter.core.generation import prepare_request_settlement
 
-    settlement_cohort = await request_settlement_cohort(db, int(removal_requested) + int(apply_requested))
+    apply_requested, settlement_cohort = await prepare_request_settlement(
+        db,
+        device_id,
+        mutation_count=router_count,
+        removal_generation_count=int(removal_requested),
+    )
     if apply_requested:
         from nso_adapter.core.apply import enqueue_apply
 

@@ -344,6 +344,70 @@ async def test_dispatch_scope_logging_excludes_unaccepted_levels(adapter_client)
     assert apply_fn.await_args.kwargs["levels_intent_row"] is None
 
 
+async def test_dispatch_scope_snmp_excludes_unaccepted_live_rows(adapter_client):
+    from nso_adapter.store.models import (
+        SnmpCommunityIntent,
+        SnmpHostIntent,
+        SnmpSystemInfoIntent,
+        SnmpV3UserIntent,
+    )
+
+    device_id = await _seed_device(nso_device_name="snmp-accepted-filter", netbox_device_id=47)
+    async with session() as db:
+        db.add_all(
+            [
+                SnmpCommunityIntent(
+                    device_id=device_id,
+                    label="accepted",
+                    vault_ref="network/snmp/accepted#community",
+                    access="RO",
+                    accepted_at=_NOW,
+                ),
+                SnmpCommunityIntent(
+                    device_id=device_id,
+                    label="pending",
+                    vault_ref="network/snmp/pending#community",
+                    access="RO",
+                    accepted_at=None,
+                ),
+                SnmpV3UserIntent(device_id=device_id, username="accepted", accepted_at=_NOW),
+                SnmpV3UserIntent(device_id=device_id, username="pending", accepted_at=None),
+                SnmpHostIntent(
+                    device_id=device_id,
+                    address="198.18.0.10",
+                    version="3",
+                    notify_type="trap",
+                    community_or_user="accepted",
+                    accepted_at=_NOW,
+                ),
+                SnmpHostIntent(
+                    device_id=device_id,
+                    address="198.18.0.11",
+                    version="3",
+                    notify_type="trap",
+                    community_or_user="pending",
+                    accepted_at=None,
+                ),
+                SnmpSystemInfoIntent(device_id=device_id, location="accepted", accepted_at=_NOW),
+            ]
+        )
+        await db.commit()
+
+    apply_fn = AsyncMock()
+    client = _guard_client(None)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with patch("nso_adapter.nso.apply.apply_snmp_config", apply_fn):
+            await removal_mod._dispatch_scope(db, device, client, "snmp")
+
+    apply_fn.assert_awaited_once()
+    args = apply_fn.await_args.args
+    assert [row.label for row in args[2]] == ["accepted"]
+    assert [row.username for row in args[3]] == ["accepted"]
+    assert [row.address for row in args[4]] == ["198.18.0.10"]
+    assert args[5].location == "accepted"
+
+
 async def test_dispatch_scope_ospf_uses_multi_row_apply(adapter_client):
     """OSPF dispatch fetches ONLY accepted instances+interfaces+redist(ospf only), replace=True.
 

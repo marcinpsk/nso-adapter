@@ -24,7 +24,6 @@ from nso_adapter.store.models import (
     Device,
     DeviceOspfInstance,
     DeviceOspfInterface,
-    DeviceSettings,
     OspfInstanceIntent,
     OspfInterfaceIntent,
     RedistributionIntent,
@@ -324,16 +323,6 @@ async def _sync_ospf_redistribution(
     return removed, cleared
 
 
-async def _auto_apply_requested(db: AsyncSession, device_id: int, count: int) -> bool:
-    """Return whether this request will create an automatic apply generation."""
-    if count <= 0:
-        return False
-    settings = (
-        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    ).scalar_one_or_none()
-    return bool(settings and settings.auto_apply)
-
-
 class OspfIntentResult(BaseModel):
     device_id: int
     instance_count: int
@@ -411,11 +400,15 @@ async def put_ospf_intent(
     # kept the old value forever and the operator could not clear it.
     deleted = bool(removed_inst or removed_iface or removed_redist)
     cleared = inst_cleared or iface_cleared or redist_cleared
-    apply_requested = await _auto_apply_requested(db, device_id, len(payload.instances) + len(payload.interfaces))
     removal_requested = deleted or cleared
-    from nso_adapter.core.generation import request_settlement_cohort
+    from nso_adapter.core.generation import prepare_request_settlement
 
-    settlement_cohort = await request_settlement_cohort(db, int(removal_requested) + int(apply_requested))
+    apply_requested, settlement_cohort = await prepare_request_settlement(
+        db,
+        device_id,
+        mutation_count=len(payload.instances) + len(payload.interfaces),
+        removal_generation_count=int(removal_requested),
+    )
     if apply_requested:
         from nso_adapter.core.apply import enqueue_apply
 

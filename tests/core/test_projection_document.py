@@ -142,9 +142,9 @@ def test_increment_five_completes_document_execution():
     assert _INCREMENT_FIVE_SECTIONS <= DOCUMENT_EXECUTED_SECTIONS
     assert LIVE_READ_SECTIONS == {}
     assert ACTION_APPLY_EXECUTABLE_SECTIONS == DOCUMENT_EXECUTED_SECTIONS == projection_sections()
-    assert {
-        stream for stream in projection_streams() if stream_section(stream) in ACTION_APPLY_EXECUTABLE_SECTIONS
-    } == (projection_streams())
+    assert ACTION_APPLY_EXECUTABLE_SECTIONS is not DOCUMENT_EXECUTED_SECTIONS
+    assert len(projection_streams()) == 16
+    assert all(stream_section(stream) in ACTION_APPLY_EXECUTABLE_SECTIONS for stream in projection_streams())
 
 
 @pytest.mark.parametrize(
@@ -592,7 +592,7 @@ def test_hydrating_a_known_table_under_the_wrong_section_is_refused():
 
 def test_interface_execution_context_hydrates_beside_intent_tables():
     """Execution metadata is explicit and does not masquerade as an intent table."""
-    from nso_adapter.core.projection import hydrate_interface_execution, hydrate_section
+    from nso_adapter.core.projection import EXECUTION_KEY, hydrate_interface_execution, hydrate_section
     from nso_adapter.store.models import InterfaceIntent
 
     document = {
@@ -606,7 +606,7 @@ def test_interface_execution_context_hydrates_beside_intent_tables():
                 }
             ],
             "interface_ip_intent": [],
-            "_execution": {
+            EXECUTION_KEY: {
                 "interfaces": [
                     {
                         "id": 7,

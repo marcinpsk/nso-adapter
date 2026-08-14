@@ -29,7 +29,7 @@ from nso_adapter.core.importer import get_nso_client
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.core.switchport_intent import apply_switchport_config as apply_switchport_core
 from nso_adapter.store import outcome_store
-from nso_adapter.store.models import Device, DeviceSettings, DeviceSwitchport, DeviceVlan, VlanIntent
+from nso_adapter.store.models import Device, DeviceSwitchport, DeviceVlan, VlanIntent
 
 router = APIRouter(prefix="/api/v1/devices", tags=["vlan"])
 
@@ -276,13 +276,14 @@ async def put_vlan_intent(
         count += 1
 
     await db.flush()
-    settings = (
-        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    ).scalar_one_or_none()
-    apply_requested = bool(settings and settings.auto_apply and count > 0)
-    from nso_adapter.core.generation import request_settlement_cohort
+    from nso_adapter.core.generation import prepare_request_settlement
 
-    settlement_cohort = await request_settlement_cohort(db, int(bool(removed_vids or cleared)) + int(apply_requested))
+    apply_requested, settlement_cohort = await prepare_request_settlement(
+        db,
+        device_id,
+        mutation_count=count,
+        removal_generation_count=int(bool(removed_vids or cleared)),
+    )
 
     # Removal propagation: a dropped vid won't be removed by the next merge-PATCH apply, so
     # PUT-replace the vlan-reconciler instance with the remaining list. Enqueued BEFORE the

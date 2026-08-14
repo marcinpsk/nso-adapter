@@ -151,6 +151,28 @@ async def test_generations_list_filters_strictly_after_since_seq(adapter_client)
     assert [(row["generation_id"], row["seq"]) for row in response.json()] == [(late_id, 9)]
 
 
+async def test_generations_list_applies_a_fail_fast_page_limit(adapter_client):
+    device_id = await seed_device(nso_device_name="generation-page", netbox_device_id=1560)
+    early_id, _late_id, _job_id = await _seed_generation_chain(device_id)
+
+    page = await adapter_client.get(
+        f"/api/v1/devices/{device_id}/generations",
+        params={"limit": 1},
+        headers=AUTH,
+    )
+    invalid = await adapter_client.get(
+        "/api/v1/devices/999999/generations",
+        params={"limit": 0},
+        headers=AUTH,
+    )
+
+    assert page.status_code == 200, page.text
+    assert [(row["generation_id"], row["seq"]) for row in page.json()] == [(early_id, 4)]
+    assert invalid.status_code == 422
+    assert invalid.json()["error"]["code"] == "validation_error"
+    assert invalid.json()["error"]["message"] == "limit must be between 1 and 500: 0"
+
+
 async def test_generations_list_returns_not_found_for_an_unknown_device(adapter_client):
     response = await adapter_client.get("/api/v1/devices/999999/generations", headers=AUTH)
 

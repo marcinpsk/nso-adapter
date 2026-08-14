@@ -189,7 +189,7 @@ async def projection_gone_handler(request: Request, exc: Exception) -> JSONRespo
     )
 
 
-async def apply_unexecutable_handler(request: Request, exc: Exception) -> JSONResponse:
+async def apply_unexecutable_handler(request: Request, exc: ApplyUnexecutable) -> JSONResponse:
     """Refuse generation creation when its selected projection cannot execute exactly."""
     assert isinstance(exc, ApplyUnexecutable)
     reasons = exc.reasons

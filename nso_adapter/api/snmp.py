@@ -22,7 +22,6 @@ from nso_adapter.api.timestamps import UtcInstant, iso_z, latest_refreshed
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
     Device,
-    DeviceSettings,
     SnmpCommunity,
     SnmpCommunityIntent,
     SnmpHost,
@@ -441,13 +440,15 @@ async def put_snmp_intent(
 
     await db.flush()
 
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
     total_count = comm_count + user_count + host_count + (1 if body.system_info else 0)
-    apply_requested = bool(settings and settings.auto_apply and total_count > 0)
-    from nso_adapter.core.generation import request_settlement_cohort
+    from nso_adapter.core.generation import prepare_request_settlement
 
-    settlement_cohort = await request_settlement_cohort(db, int(bool(removed)) + int(apply_requested))
+    apply_requested, settlement_cohort = await prepare_request_settlement(
+        db,
+        device_id,
+        mutation_count=total_count,
+        removal_generation_count=int(bool(removed)),
+    )
     # A removal reverts on-device via an ASYNC removal job (like every other scope) — the
     # PUT no longer blocks on a full replace-mode device commit (which could stall the PUT
     # past the plugin client timeout). Enqueue before the commit so the job row lands with

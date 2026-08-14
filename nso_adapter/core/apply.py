@@ -1215,6 +1215,16 @@ def _stamp_key(row) -> tuple[type, object]:
     return type(row), getattr(row, "id", None)
 
 
+def _stamp_join(document_rows: list, live_rows: list) -> dict[tuple[type, object], object]:
+    """Map document rows to live rows that still hold the same intent."""
+    live_by_id = {row.id: row for row in live_rows}
+    return {
+        _stamp_key(row): live
+        for row in document_rows
+        if (live := live_by_id.get(row.id)) is not None and intent_state(live) == intent_state(row)
+    }
+
+
 def _combine_rows(*groups: _Rows) -> _Rows:
     """Combine one section's model collections without losing their stamp joins."""
     push = [row for group in groups for row in group.push]
@@ -1301,9 +1311,9 @@ class _Projection:
         # holds; stamping on the id would report the successor's intent as applied by a
         # deployment that never sent it. A row whose content moved simply stays pending and
         # the successor's own generation stamps it.
-        carried = {row.id: intent_state(row) for row in push}
-        stamp = [row for row in live if carried.get(row.id) == intent_state(row)]
-        return _Rows(push=push, stamp=stamp, stamp_of={_stamp_key(row): row for row in stamp})
+        stamp_of = _stamp_join(push, live)
+        stamp = [row for row in live if _stamp_key(row) in stamp_of]
+        return _Rows(push=push, stamp=stamp, stamp_of=stamp_of)
 
 
 async def _maybe_sync_from(db: AsyncSession, client, device_name: str, device_id: int) -> None:
@@ -1415,12 +1425,7 @@ async def _collect_document_interface(
         if interface_ids
         else []
     )
-    live_attr_by_id = {row.id: row for row in live_attr_rows}
-    attr_stamp_of = {
-        _stamp_key(row): live
-        for row in document_attr_rows
-        if (live := live_attr_by_id.get(row.id)) is not None and intent_state(live) == intent_state(row)
-    }
+    attr_stamp_of = _stamp_join(document_attr_rows, live_attr_rows)
     ip_rows = await source.collect(InterfaceIpIntent, section="interface_config")
     states = (
         (await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id.in_(interface_ids))))

@@ -10820,6 +10820,16 @@
               ],
               "title": "Since Seq"
             }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "title": "Limit",
+              "type": "integer"
+            }
           }
         ],
         "responses": {

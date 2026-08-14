@@ -20,7 +20,7 @@ from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z, latest_refreshed
 from nso_adapter.store import outcome_store
-from nso_adapter.store.models import DbInterface, Device, DeviceSettings, InterfaceIpAddress, InterfaceIpIntent
+from nso_adapter.store.models import DbInterface, Device, InterfaceIpAddress, InterfaceIpIntent
 
 logger = structlog.get_logger(__name__)
 
@@ -302,12 +302,14 @@ async def put_ip_intent(
 
     await db.flush()
 
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
-    apply_requested = bool(settings and settings.auto_apply and count > 0)
-    from nso_adapter.core.generation import request_settlement_cohort
+    from nso_adapter.core.generation import prepare_request_settlement
 
-    settlement_cohort = await request_settlement_cohort(db, int(bool(removed_interfaces)) + int(apply_requested))
+    apply_requested, settlement_cohort = await prepare_request_settlement(
+        db,
+        device_id,
+        mutation_count=count,
+        removal_generation_count=int(bool(removed_interfaces)),
+    )
     # Removal propagation: a merge-PATCH apply can't drop an address the payload removed, so
     # enqueue an interface_config removal (PUT-replace/DELETE per affected interface) — mirrors
     # every other service's replace_on_removal, and always runs (removal is not auto_apply-gated).

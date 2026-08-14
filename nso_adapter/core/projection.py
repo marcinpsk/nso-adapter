@@ -518,7 +518,8 @@ ACTION_APPLY_EXECUTABLE_SECTIONS: frozenset[str] = DOCUMENT_EXECUTED_SECTIONS
 #: No section reads live intent to decide what a generation executes.
 LIVE_READ_SECTIONS: dict[str, str] = {}
 
-INTERFACE_EXECUTION_KEY = "_execution"
+#: Reserved section key for immutable interface and static-route execution metadata.
+EXECUTION_KEY = "_execution"
 INTERFACE_ATTRIBUTE_ELIGIBLE_STATES: frozenset[SyncState] = frozenset(
     {
         SyncState.accepted,
@@ -586,7 +587,7 @@ async def record_interface_execution(db: AsyncSession, device_id: int, document:
         for interface_id, attribute in sorted(attr_keys)
         if state_by_key[(interface_id, attribute)].sync_state in INTERFACE_ATTRIBUTE_ELIGIBLE_STATES
     ]
-    section[INTERFACE_EXECUTION_KEY] = {
+    section[EXECUTION_KEY] = {
         "interfaces": [
             {
                 "id": iface.id,
@@ -606,7 +607,7 @@ async def record_interface_execution(db: AsyncSession, device_id: int, document:
 def hydrate_interface_execution(document: dict) -> InterfaceExecution:
     """Rebuild interface writer context and eligibility from the stored document."""
     section = document.get("interface_config") or {}
-    execution = section.get(INTERFACE_EXECUTION_KEY)
+    execution = section.get(EXECUTION_KEY)
     if execution is None:
         raise ValueError("document section 'interface_config' has no recorded execution context")
     if not isinstance(execution, dict) or set(execution) != {
@@ -762,7 +763,7 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
     rows: dict[type, list] = {}
     row_records: dict[type, list[tuple[dict, object]]] = {}
     for table_name, serialized_rows in tables.items():
-        if table_name == INTERFACE_EXECUTION_KEY and section in {"interface_config", "static_route"}:
+        if table_name == EXECUTION_KEY and section in {"interface_config", "static_route"}:
             continue
         model = _MODEL_BY_TABLE.get(table_name)
         if model is None:
@@ -810,7 +811,7 @@ __all__ = [
     "APPLY_BOOKKEEPING_COLUMNS",
     "DOCUMENT_EXECUTED_SECTIONS",
     "INTERFACE_ATTRIBUTE_ELIGIBLE_STATES",
-    "INTERFACE_EXECUTION_KEY",
+    "EXECUTION_KEY",
     "InterfaceEligibilityUnresolved",
     "LIVE_READ_SECTIONS",
     "hydrate_section",

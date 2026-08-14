@@ -25,6 +25,8 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.core.projection import EXECUTION_KEY
+
 logger = structlog.get_logger(__name__)
 
 #: A destructive replace whose proof is structurally unavailable must not run (§4.4).
@@ -462,12 +464,12 @@ async def record_static_route_execution(
                 context=removal_context or {},
             )
         )
-    section["_execution"] = execution
+    section[EXECUTION_KEY] = execution
 
 
 def _recorded_execution(document: dict) -> dict:
     section = document.get("static_route") or {}
-    execution = section.get("_execution")
+    execution = section.get(EXECUTION_KEY)
     if not isinstance(execution, dict):
         raise ValueError("document section 'static_route' has no recorded execution plan")
     return execution

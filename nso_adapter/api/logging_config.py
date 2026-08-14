@@ -30,7 +30,6 @@ from nso_adapter.store.models import (
     Device,
     DeviceLoggingHost,
     DeviceLoggingLevels,
-    DeviceSettings,
     LoggingHostIntent,
     LoggingLevelsIntent,
 )
@@ -276,13 +275,15 @@ async def put_logging_intent(
         levels_cleared, levels_count, levels_removed = await _sync_local_levels(db, device_id, body.local_levels, now)
 
     await db.flush()
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
     removal_requested = bool(removed or cleared or levels_cleared)
-    apply_requested = bool(settings and settings.auto_apply and (count > 0 or levels_count > 0))
-    from nso_adapter.core.generation import request_settlement_cohort
+    from nso_adapter.core.generation import prepare_request_settlement
 
-    settlement_cohort = await request_settlement_cohort(db, int(removal_requested) + int(apply_requested))
+    apply_requested, settlement_cohort = await prepare_request_settlement(
+        db,
+        device_id,
+        mutation_count=count + levels_count,
+        removal_generation_count=int(removal_requested),
+    )
 
     replaced = False
     if removal_requested:

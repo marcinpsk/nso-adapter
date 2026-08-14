@@ -705,7 +705,12 @@ async def _guarded_apply(client, device, scope: str, context: dict | None, apply
     return await apply_thunk(replace=True)
 
 
-async def _replacement_section_rows(db: AsyncSession, scope: str, job_id: int | None) -> dict[type, list] | None:
+class _ReplacementSection(NamedTuple):
+    document: dict
+    rows: dict[type, list]
+
+
+async def _replacement_section(db: AsyncSession, scope: str, job_id: int | None) -> _ReplacementSection | None:
     """Hydrate one promoted removal section, or select the established live mode."""
     from nso_adapter.core.generation import executing_generation
     from nso_adapter.core.projection import hydrate_section
@@ -719,10 +724,11 @@ async def _replacement_section_rows(db: AsyncSession, scope: str, job_id: int | 
     # execution used by force-removal, the sweeper and the static-route reclaimer.
     if not generation.stream_revisions:
         return None
-    return {
-        model: [row for row in rows if getattr(row, "accepted_at", True)]
-        for model, rows in hydrate_section(generation.document, scope).items()
+    rows = {
+        model: [row for row in model_rows if getattr(row, "accepted_at", True)]
+        for model, model_rows in hydrate_section(generation.document, scope).items()
     }
+    return _ReplacementSection(document=generation.document, rows=rows)
 
 
 async def _replacement_rows(db: AsyncSession, device, scope: str, model, job_id: int | None) -> list:
@@ -734,9 +740,9 @@ async def _replacement_rows(db: AsyncSession, device, scope: str, model, job_id:
     happens to have removed. A promoted generation therefore uses the stored document.
     Reissues and generationless jobs retain the established live-store behavior.
     """
-    document_rows = await _replacement_section_rows(db, scope, job_id)
-    if document_rows is not None:
-        return document_rows.get(model, [])
+    replacement = await _replacement_section(db, scope, job_id)
+    if replacement is not None:
+        return replacement.rows.get(model, [])
     return list(
         (await db.execute(select(model).where(model.device_id == device.id, model.accepted_at.is_not(None))))
         .scalars()
@@ -894,13 +900,6 @@ async def _sr_authorization(db: AsyncSession, device, context: dict, *, job_id: 
         if deployed is not None:
             claimed.add(deployed)
     reclaimed = sorted(authorized & claimed)
-    if reclaimed:
-        logger.warning(
-            "static_route.removal_key_reclaimed",
-            device_id=device.id,
-            job_id=job_id,
-            keys=[list(k) for k in reclaimed],
-        )
     return tombstones, authorized - claimed, claimed, rows, reclaimed
 
 
@@ -1421,8 +1420,9 @@ async def _replace_logging(
     from nso_adapter.nso.apply import apply_logging_config
     from nso_adapter.store.models import LoggingHostIntent, LoggingLevelsIntent
 
-    document_rows = await _replacement_section_rows(db, "logging", job_id)
-    if document_rows is not None:
+    replacement = await _replacement_section(db, "logging", job_id)
+    if replacement is not None:
+        document_rows = replacement.rows
         rows = document_rows.get(LoggingHostIntent, [])
         level_rows = document_rows.get(LoggingLevelsIntent, [])
         levels = level_rows[0] if level_rows else None
@@ -1461,8 +1461,9 @@ async def _replace_ospf(
     # A PUT-replace re-asserts the FULL desired state, so it must include only accepted
     # rows — never not-yet-accepted (imported/staged) intent, which would deploy
     # un-reviewed config to the device (matches _replace_simple / _replace_bgp).
-    document_rows = await _replacement_section_rows(db, "ospf", job_id)
-    if document_rows is not None:
+    replacement = await _replacement_section(db, "ospf", job_id)
+    if replacement is not None:
+        document_rows = replacement.rows
         insts = document_rows.get(OspfInstanceIntent, [])
         ifaces = document_rows.get(OspfInterfaceIntent, [])
         redist = document_rows.get(RedistributionIntent, [])
@@ -1515,8 +1516,9 @@ async def _replace_bgp(
     from nso_adapter.nso.apply import apply_bgp_config
     from nso_adapter.store.models import BgpRouterIntent, RedistributionIntent
 
-    document_rows = await _replacement_section_rows(db, "bgp", job_id)
-    if document_rows is not None:
+    replacement = await _replacement_section(db, "bgp", job_id)
+    if replacement is not None:
+        document_rows = replacement.rows
         routers = document_rows.get(BgpRouterIntent, [])
         redist = document_rows.get(RedistributionIntent, [])
     else:
@@ -1571,15 +1573,14 @@ async def _replace_interface_config(
     everything it created there — the operator wants nothing managed).
     """
     from nso_adapter.core.apply import _nokia_routed_kind
-    from nso_adapter.core.generation import executing_generation
     from nso_adapter.core.projection import hydrate_interface_execution
     from nso_adapter.nso.apply import build_interface_config_entry, delete_interface_config, replace_interface_config
     from nso_adapter.store.models import DbInterface, InterfaceIntent, InterfaceIpIntent
 
-    document_rows = await _replacement_section_rows(db, "interface_config", job_id)
-    if document_rows is not None:
-        generation = await executing_generation(db, job_id)
-        execution = hydrate_interface_execution(generation.document)
+    replacement = await _replacement_section(db, "interface_config", job_id)
+    if replacement is not None:
+        document_rows = replacement.rows
+        execution = hydrate_interface_execution(replacement.document)
         interfaces = {iface.name: iface for iface in execution.interfaces.values()}
         attr_by_iface: dict[int, list] = {}
         ip_by_iface: dict[int, list] = {}
@@ -1595,7 +1596,7 @@ async def _replace_interface_config(
 
     for name in interface_names:
         iface = interfaces.get(name)
-        if document_rows is None:
+        if replacement is None:
             iface = (
                 (
                     await db.execute(
@@ -1608,7 +1609,7 @@ async def _replace_interface_config(
         if iface is None:
             await delete_interface_config(client, device.nso_device_name, name)
             continue
-        if document_rows is None:
+        if replacement is None:
             ip_rows = (
                 (
                     await db.execute(
@@ -1678,8 +1679,9 @@ async def _replace_isis(
         RedistributionIntent,
     )
 
-    document_rows = await _replacement_section_rows(db, "isis", job_id)
-    if document_rows is not None:
+    replacement = await _replacement_section(db, "isis", job_id)
+    if replacement is not None:
+        document_rows = replacement.rows
         ifaces = document_rows.get(IsisInterfaceIntent, [])
         procs = document_rows.get(IsisProcessIntent, [])
         flex = document_rows.get(IsisFlexAlgoIntent, [])
@@ -1722,8 +1724,9 @@ async def _replace_snmp(
         SnmpV3UserIntent,
     )
 
-    document_rows = await _replacement_section_rows(db, "snmp", job_id)
-    if document_rows is not None:
+    replacement = await _replacement_section(db, "snmp", job_id)
+    if replacement is not None:
+        document_rows = replacement.rows
         comms = document_rows.get(SnmpCommunityIntent, [])
         users = document_rows.get(SnmpV3UserIntent, [])
         hosts = document_rows.get(SnmpHostIntent, [])
@@ -1731,18 +1734,16 @@ async def _replace_snmp(
         sysinfo = sysinfo_rows[0] if sysinfo_rows else None
     else:
         device_id = device.id
-        comms = (
-            (await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)))
-            .scalars()
-            .all()
-        )
-        users = (
-            (await db.execute(select(SnmpV3UserIntent).where(SnmpV3UserIntent.device_id == device_id))).scalars().all()
-        )
-        hosts = (await db.execute(select(SnmpHostIntent).where(SnmpHostIntent.device_id == device_id))).scalars().all()
-        sysinfo = (
-            await db.execute(select(SnmpSystemInfoIntent).where(SnmpSystemInfoIntent.device_id == device_id))
-        ).scalar_one_or_none()
+
+        async def _accepted(model):
+            stmt = select(model).where(model.device_id == device_id, model.accepted_at.is_not(None))
+            return (await db.execute(stmt)).scalars().all()
+
+        comms = await _accepted(SnmpCommunityIntent)
+        users = await _accepted(SnmpV3UserIntent)
+        hosts = await _accepted(SnmpHostIntent)
+        sysinfo_rows = await _accepted(SnmpSystemInfoIntent)
+        sysinfo = sysinfo_rows[0] if sysinfo_rows else None
 
     async def _apply(**kwargs):
         return await apply_snmp_config(client, device.nso_device_name, comms, users, hosts, sysinfo, **kwargs)

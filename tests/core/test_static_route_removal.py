@@ -385,6 +385,8 @@ async def test_c4_5_detach_with_a_null_deployed_key_still_drops_the_triple(adapt
 @pytest.mark.parametrize("shape", ["triple", "deployed_key"])
 async def test_c4_6_a_reclaimed_key_is_not_dropped(adapter_client, shape):
     """C4.6 — another route claims ``A``; deleting it would retract a live route's config."""
+    from structlog.testing import capture_logs
+
     device_id = await seed_device(nso_device_name=f"sr-c46-{shape}", netbox_device_id=7406 + len(shape))
     spec = {"triple": A, "route_id": 2} if shape == "triple" else {"triple": D, "route_id": 2, "deployed_key": list(A)}
     await seed_rows(device_id, [spec])
@@ -394,11 +396,14 @@ async def test_c4_6_a_reclaimed_key_is_not_dropped(adapter_client, shape):
     await seed_tomb(device_id, A, job_id=job_id, route_id=1)
     await seed_tomb(device_id, B, job_id=job_id, route_id=3)
 
-    job = await run_removal_job(device_id, job_id, sr_client(fake))
+    with capture_logs() as logs:
+        job = await run_removal_job(device_id, job_id, sr_client(fake))
 
     assert job.status == JobStatus.succeeded
     assert fake.sent_keys() == {A}, "A is claimed by a live row — it is no longer this deletion's to drop"
     assert fake.device_keys == {A}
+    warnings = [log for log in logs if log["event"] == "static_route.removal_key_reclaimed"]
+    assert len(warnings) == 1
 
 
 async def test_c4_7_a_fully_superseded_removal_issues_no_http_at_all(adapter_client):

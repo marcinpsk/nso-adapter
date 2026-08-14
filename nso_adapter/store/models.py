@@ -662,6 +662,11 @@ class DeploymentGeneration(Base):
         UniqueConstraint("device_id", "seq", name="uq_generation_seq_per_device"),
         Index("ix_generation_device_status", "device_id", "status"),
         Index("ix_generation_job", "job_id"),
+        Index(
+            "ix_generation_settlement_cohort",
+            "settlement_cohort",
+            postgresql_where=text("settlement_cohort IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

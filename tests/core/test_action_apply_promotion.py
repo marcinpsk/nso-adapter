@@ -258,6 +258,29 @@ async def test_mixed_promotion_stamps_applied_only_after_the_whole_chain_settles
     assert (stream.desired_revision, stream.authorized_revision, stream.applied_revision) == (2, 2, 2)
 
 
+async def test_request_settlement_preparation_uses_one_auto_apply_predicate(adapter_client):
+    from nso_adapter.core.generation import prepare_request_settlement
+
+    device_id = await seed_device(nso_device_name="request-settlement-helper", netbox_device_id=9989)
+    await seed_settings(device_id, auto_apply=True)
+    async with session() as db:
+        assert await prepare_request_settlement(
+            db,
+            device_id,
+            mutation_count=0,
+            removal_generation_count=1,
+        ) == (False, None)
+        apply_requested, cohort = await prepare_request_settlement(
+            db,
+            device_id,
+            mutation_count=1,
+            removal_generation_count=1,
+        )
+
+    assert apply_requested is True
+    assert isinstance(cohort, int)
+
+
 async def test_request_atomic_cohort_stamps_no_stream_until_every_member_succeeds(adapter_client):
     """One failed cohort member withholds every stream until that member is retried."""
     from nso_adapter.core.claim import terminalize
@@ -767,6 +790,8 @@ async def test_interface_config_generation_records_creation_time_attribute_eligi
 
 async def test_interface_config_generation_refuses_unresolvable_attribute_eligibility(adapter_client):
     """A missing attr-state row refuses generation creation and leaves authority unchanged."""
+    from structlog.testing import capture_logs
+
     from nso_adapter.store.models import DbInterface, InterfaceAttrState
 
     device_id = await seed_device(nso_device_name="interface-unresolved-eligibility", netbox_device_id=9999)
@@ -789,7 +814,8 @@ async def test_interface_config_generation_refuses_unresolvable_attribute_eligib
         await db.execute(sa.delete(InterfaceAttrState).where(InterfaceAttrState.interface_id == iface_id))
         await db.commit()
 
-    response = await _apply(adapter_client, device_id, {"interface_config": 6591})
+    with capture_logs() as logs:
+        response = await _apply(adapter_client, device_id, {"interface_config": 6591})
 
     assert response.status_code == 409
     assert response.json() == {
@@ -802,6 +828,11 @@ async def test_interface_config_generation_refuses_unresolvable_attribute_eligib
     assert await _generations(device_id) == []
     assert await _jobs(device_id) == []
     assert (await _stream(device_id, "interface_config")).authorized_revision == 0
+    warning = next(log for log in logs if log["event"] == "generation.interface_eligibility_unresolved")
+    assert warning["device_id"] == device_id
+    assert f"interface {iface_id}" in warning["detail"]
+    assert "attribute 'description'" in warning["detail"]
+    assert warning["exc_info"] is True
 
 
 async def test_failed_svi_document_send_with_no_stamp_rows_fails_generation(adapter_client):

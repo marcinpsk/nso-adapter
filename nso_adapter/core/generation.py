@@ -79,6 +79,7 @@ from nso_adapter.store.models import (
     DeploymentGeneration,
     DeviceGenerationCounter,
     DeviceProjectionStream,
+    DeviceSettings,
     GenerationMode,
     GenerationStatus,
     IntentPushReceipt,
@@ -258,6 +259,31 @@ async def request_settlement_cohort(db: AsyncSession, generation_count: int) -> 
     if generation_count <= 1 or STORE_ONLY.get():
         return None
     return await allocate_settlement_cohort(db)
+
+
+async def auto_apply_requested(db: AsyncSession, device_id: int, mutation_count: int) -> bool:
+    """Return whether this request has intent and automatic apply is enabled."""
+    if mutation_count < 0:
+        raise ValueError("mutation_count cannot be negative")
+    if mutation_count == 0:
+        return False
+    settings = await db.scalar(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    return bool(settings and settings.auto_apply)
+
+
+async def prepare_request_settlement(
+    db: AsyncSession,
+    device_id: int,
+    *,
+    mutation_count: int,
+    removal_generation_count: int,
+) -> tuple[bool, int | None]:
+    """Derive automatic apply and allocate a cohort for all request promotions."""
+    if removal_generation_count < 0:
+        raise ValueError("removal_generation_count cannot be negative")
+    apply_requested = await auto_apply_requested(db, device_id, mutation_count)
+    cohort = await request_settlement_cohort(db, removal_generation_count + int(apply_requested))
+    return apply_requested, cohort
 
 
 def _compose_document(fragments: dict[str, dict]) -> dict:
@@ -843,7 +869,13 @@ async def _store_generation(
             section.setdefault("interface_ip_intent", [])
         try:
             await record_interface_execution(db, device_id, body)
-        except InterfaceEligibilityUnresolved:
+        except InterfaceEligibilityUnresolved as exc:
+            logger.warning(
+                "generation.interface_eligibility_unresolved",
+                device_id=device_id,
+                detail=str(exc),
+                exc_info=True,
+            )
             raise ApplyUnexecutable({"interface_config": "interface_attribute_eligibility_unresolved"}) from None
         from nso_adapter.core.static_route_plan import record_static_route_execution
 
@@ -1613,6 +1645,7 @@ __all__ = [
     "advance_device_generations",
     "advance_generations_locked",
     "allocate_settlement_cohort",
+    "auto_apply_requested",
     "attach_to_job",
     "require_attach_to_job",
     "consume_last_enqueued_generation_id",
@@ -1627,6 +1660,7 @@ __all__ = [
     "lock_projection",
     "mark_job_generations_running",
     "note_write",
+    "prepare_request_settlement",
     "recover_generations",
     "reconcile_generation",
     "request_settlement_cohort",
