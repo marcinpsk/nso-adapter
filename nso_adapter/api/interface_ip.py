@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
-from nso_adapter.api.intent_push import admit_or_replay, get_intent_delivery
+from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.store import outcome_store
@@ -203,12 +203,9 @@ async def put_ip_intent(
     # Every accepted write records its projection revision, store-only and
     # auto-apply-off included, and takes the device's projection lock before anything is
     # read (#1522 §G2). Only a promotion authorizes a deployment.
-    from nso_adapter.core.generation import note_write
     from nso_adapter.core.receipt import record_response
-    from nso_adapter.core.request_flags import PUSH_SEQ
 
-    await note_write(db, device_id, delivery.stream, push_seq=PUSH_SEQ.get())
-    if (replay := await admit_or_replay(db, device_id, delivery)) is not None:
+    if (replay := await begin_delivery(db, device_id, delivery)) is not None:
         return replay
 
     ifaces_result = await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))
@@ -299,13 +296,6 @@ async def put_ip_intent(
 
     await db.flush()
 
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
-    if settings and settings.auto_apply and count > 0:
-        from nso_adapter.core.apply import enqueue_apply
-
-        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
-
     # Removal propagation: a merge-PATCH apply can't drop an address the payload removed, so
     # enqueue an interface_config removal (PUT-replace/DELETE per affected interface) — mirrors
     # every other service's replace_on_removal, and always runs (removal is not auto_apply-gated).
@@ -313,17 +303,26 @@ async def put_ip_intent(
     if removed_interfaces:
         from nso_adapter.core.removal import enqueue_removal
 
-        await enqueue_removal(
-            db,
-            device_id,
-            "interface_config",
-            # The ADDRESS lane only: an un-promoted store-only write to the attribute lane
-            # is not authorized by an address push (#103).
-            promotes=(delivery.stream,),
-            interfaces=sorted(removed_interfaces),
-            removed={"address": removed_addresses},
+        replaced = (
+            await enqueue_removal(
+                db,
+                device_id,
+                "interface_config",
+                # The ADDRESS lane only: an un-promoted store-only write to the attribute lane
+                # is not authorized by an address push (#103).
+                promotes=(delivery.stream,),
+                interfaces=sorted(removed_interfaces),
+                removed={"address": removed_addresses},
+            )
+            is not None
         )
-        replaced = True
+
+    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    settings = settings_result.scalar_one_or_none()
+    if settings and settings.auto_apply and count > 0:
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
 
     result = {
         "device_id": device_id,

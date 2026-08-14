@@ -22,7 +22,7 @@ from nso_adapter.api.errors import (
     IntentApplyResult,
     api_error,
 )
-from nso_adapter.api.intent_push import admit_or_replay, get_intent_delivery
+from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant
 from nso_adapter.core.importer import get_nso_client
@@ -238,9 +238,7 @@ async def put_vlan_intent(
     sequence replays that response and applies nothing; the same sequence with a different
     body, or an older sequence, is refused.
     """
-    from nso_adapter.core.generation import note_write
     from nso_adapter.core.receipt import record_response
-    from nso_adapter.core.request_flags import PUSH_SEQ
 
     device = await db.get(Device, device_id)
     if device is None:
@@ -249,8 +247,7 @@ async def put_vlan_intent(
     # Takes the device's projection lock BEFORE anything is read, so the rows this request
     # mutates, the document its generation snapshots and the receipt that admits it are all
     # one serialized unit against every other writer of this device.
-    await note_write(db, device_id, delivery.stream, push_seq=PUSH_SEQ.get())
-    if (replay := await admit_or_replay(db, device_id, delivery)) is not None:
+    if (replay := await begin_delivery(db, device_id, delivery)) is not None:
         return replay
 
     existing = await db.execute(select(VlanIntent).where(VlanIntent.device_id == device_id))

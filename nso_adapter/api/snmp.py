@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
-from nso_adapter.api.intent_push import admit_or_replay, get_intent_delivery
+from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.store import outcome_store
@@ -370,12 +370,9 @@ async def put_snmp_intent(
     # Every accepted write records its projection revision, store-only and
     # auto-apply-off included, and takes the device's projection lock before anything is
     # read (#1522 §G2). Only a promotion authorizes a deployment.
-    from nso_adapter.core.generation import note_write
     from nso_adapter.core.receipt import record_response
-    from nso_adapter.core.request_flags import PUSH_SEQ
 
-    await note_write(db, device_id, delivery.stream, push_seq=PUSH_SEQ.get())
-    if (replay := await admit_or_replay(db, device_id, delivery)) is not None:
+    if (replay := await begin_delivery(db, device_id, delivery)) is not None:
         return replay
 
     now = datetime.now(UTC)
@@ -440,14 +437,7 @@ async def put_snmp_intent(
 
     await db.flush()
 
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
     total_count = comm_count + user_count + host_count + (1 if body.system_info else 0)
-    if settings and settings.auto_apply and total_count > 0:
-        from nso_adapter.core.apply import enqueue_apply
-
-        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
-
     # A removal reverts on-device via an ASYNC removal job (like every other scope) — the
     # PUT no longer blocks on a full replace-mode device commit (which could stall the PUT
     # past the plugin client timeout). Enqueue before the commit so the job row lands with
@@ -467,6 +457,13 @@ async def put_snmp_intent(
             removed={"community": removed_comms, "v3-user": removed_users, "host": removed_hosts},
             vault_refs={label: ref for label, ref in removed_comm_refs.items() if ref},
         )
+
+    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    settings = settings_result.scalar_one_or_none()
+    if settings and settings.auto_apply and total_count > 0:
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
 
     result = {
         "device_id": device_id,

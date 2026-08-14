@@ -14,6 +14,8 @@ Three things are pinned here, all against the real app over real HTTP:
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 import sqlalchemy as sa
 from fastapi.routing import iter_route_contexts
@@ -122,6 +124,20 @@ def test_every_in_protocol_put_injects_the_delivery_dependency():
         )
 
 
+def test_every_in_protocol_put_uses_the_shared_delivery_seam():
+    """Projection locking and receipt admission stay ordered in one module."""
+    from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS
+
+    for route in _put_routes():
+        if route.path not in INTENT_PUT_ENDPOINTS:
+            continue
+        module = inspect.getmodule(route.endpoint)
+        assert module is not None
+        source = inspect.getsource(module)
+        assert "await begin_delivery(" in source, f"{route.path} bypasses begin_delivery"
+        assert "note_write" not in source, f"{route.path} owns projection-write ordering again"
+
+
 def test_the_minimal_body_table_covers_every_in_protocol_endpoint():
     from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS
 
@@ -199,6 +215,33 @@ async def test_a_replay_in_the_same_mode_still_returns_the_stored_response(adapt
     receipt = await _receipt(device_id, "vlan")
     assert receipt.store_only is True
     assert receipt.delete_origin is False
+
+
+async def test_a_receipt_without_a_recorded_response_reexecutes_the_delivery(adapter_client):
+    """A partial receipt cannot replay JSON null as a successful intent response."""
+    from nso_adapter.store.models import IntentPushReceipt
+
+    device_id = await seed_device(nso_device_name="rcp-missing-response", netbox_device_id=None)
+    body = {"vlans": [{"vlan_id": 10, "name": "ten"}]}
+    url = f"/api/v1/devices/{device_id}/vlan-intent"
+    headers = {**AUTH, "X-Push-Seq": "5"}
+
+    first = await adapter_client.put(url, json=body, headers=headers)
+    assert first.status_code == 200
+    async with session() as db:
+        receipt = await db.scalar(
+            sa.select(IntentPushReceipt).where(
+                IntentPushReceipt.device_id == device_id,
+                IntentPushReceipt.section == "vlan",
+            )
+        )
+        receipt.response = None
+        await db.commit()
+
+    repeated = await adapter_client.put(url, json=body, headers=headers)
+    assert repeated.status_code == 200
+    assert repeated.json() == first.json()
+    assert (await _receipt(device_id, "vlan")).response == first.json()
 
 
 async def test_the_receipt_records_the_mode_the_delivery_carried(adapter_client):

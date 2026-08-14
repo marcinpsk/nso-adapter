@@ -7,13 +7,13 @@ Two pieces, defined once so the sixteen endpoints cannot each spell them differe
 * :func:`get_intent_delivery` — the FastAPI dependency that resolves WHICH section this
   request lands in (from the matched route, via :mod:`core.intent_protocol`) and WHAT
   identifies the delivery (the ``X-Push-Seq``, the raw-body digest and the request mode);
-* :func:`admit_or_replay` — the admission call itself, with the two refusals mapped onto
-  the wire and the replay turned into a response.
+* :func:`begin_delivery` — the ordered projection write and admission call, with the two
+  refusals mapped onto the wire and the replay turned into a response.
 
-Both run INSIDE the endpoint's mutation transaction, after ``note_write`` has taken the
-device's projection lock. That ordering is the guarantee: two concurrent deliveries of one
-sequence cannot both read "no receipt", and a refused or replayed delivery leaves nothing
-behind because the same transaction is rolled back.
+Both run inside the endpoint's mutation transaction. ``begin_delivery`` takes the device's
+projection lock before admission. That ordering is the guarantee: two concurrent deliveries
+of one sequence cannot both read "no receipt", and a refused or replayed delivery leaves
+nothing behind because the same transaction is rolled back.
 """
 
 from __future__ import annotations
@@ -69,8 +69,19 @@ async def admit_or_replay(db: AsyncSession, device_id: int, delivery: IntentDeli
     if admitted is None:
         return None
     stored, status_code = admitted
+    if stored is None:
+        return None
     await db.rollback()
     return JSONResponse(status_code=status_code, content=stored)
 
 
-__all__ = ["admit_or_replay", "get_intent_delivery"]
+async def begin_delivery(db: AsyncSession, device_id: int, delivery: IntentDelivery) -> JSONResponse | None:
+    """Record and admit one intent delivery under the device projection lock."""
+    from nso_adapter.core.generation import note_write
+    from nso_adapter.core.request_flags import PUSH_SEQ
+
+    await note_write(db, device_id, delivery.stream, push_seq=PUSH_SEQ.get())
+    return await admit_or_replay(db, device_id, delivery)
+
+
+__all__ = ["begin_delivery", "get_intent_delivery"]

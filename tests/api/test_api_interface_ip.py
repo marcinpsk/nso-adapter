@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from sqlalchemy import select
+
 from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -274,6 +276,38 @@ async def test_put_ip_intent_removal_enqueues_interface_config_job(adapter_clien
             "removed": {"address": [["Gi0/3", "10.0.0.2/24", ""]]},
             "detach": True,
         }
+
+
+async def test_store_only_ip_shrink_reports_no_device_replacement(adapter_client):
+    """A store-only shrink removes the row but does not enqueue a device replacement."""
+    from nso_adapter.store.models import InterfaceIpIntent, Job
+
+    device_id = await seed_device(nso_device_name="ip-store-only-shrink", netbox_device_id=907)
+    iface_id = await _seed_interface(device_id, "Gi0/4")
+    initial = {
+        "addresses": [
+            {"interface": "Gi0/4", "address": "198.18.0.1/32", "family": "ipv4"},
+            {"interface": "Gi0/4", "address": "198.18.0.2/32", "family": "ipv4"},
+        ]
+    }
+    await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=initial)
+
+    response = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ip-intent?store_only=true",
+        headers=AUTH,
+        json={"addresses": [initial["addresses"][0]]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["replaced"] is False
+    async with session() as db:
+        rows = (
+            (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface_id)))
+            .scalars()
+            .all()
+        )
+        assert [row.address for row in rows] == ["198.18.0.1/32"]
+        assert (await db.execute(select(Job).where(Job.device_id == device_id))).scalars().all() == []
 
 
 async def test_put_ip_intent_removal_captures_values_per_interface(adapter_client):

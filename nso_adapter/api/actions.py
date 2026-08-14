@@ -22,7 +22,7 @@ from nso_adapter.api.errors import (
     api_error,
 )
 from nso_adapter.core.jobs import enqueue_job
-from nso_adapter.store.models import Device, JobType
+from nso_adapter.store.models import DeploymentGeneration, Device, JobType
 
 router = APIRouter(prefix="/api/v1/devices", tags=["actions"])
 
@@ -209,6 +209,10 @@ async def action_apply(
     db: AsyncSession = Depends(get_db),
 ):
     """Phase 2 — push accepted NetBox intent to NSO via reconcile-commit service."""
+    from nso_adapter.core.request_flags import STORE_ONLY
+
+    if STORE_ONLY.get():
+        raise api_error(422, "validation_error", "store_only is not valid for the Apply action")
     return await _trigger(device_id, JobType.apply, db)
 
 
@@ -224,7 +228,7 @@ class GenerationOut(BaseModel):
 _HEAD_ALREADY_ACTED_ON = "This device's blocked deployment generation was already acted on"
 
 
-async def _blocked_head(db: AsyncSession, device_id: int):
+async def _blocked_head(db: AsyncSession, device_id: int) -> DeploymentGeneration:
     """Return the device's blocked head, or 404/409 explaining why there is nothing to do.
 
     The head is read UNDER the device's projection lock, held to this request's commit. Both

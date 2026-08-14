@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
-from nso_adapter.api.intent_push import admit_or_replay, get_intent_delivery
+from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.core.removal import is_cleared
@@ -607,12 +607,9 @@ async def put_bgp_intent(
     # Every accepted write records its projection revision, store-only and
     # auto-apply-off included, and takes the device's projection lock before anything is
     # read (#1522 §G2). Only a promotion authorizes a deployment.
-    from nso_adapter.core.generation import note_write
     from nso_adapter.core.receipt import record_response
-    from nso_adapter.core.request_flags import PUSH_SEQ
 
-    await note_write(db, device_id, delivery.stream, push_seq=PUSH_SEQ.get())
-    if (replay := await admit_or_replay(db, device_id, delivery)) is not None:
+    if (replay := await begin_delivery(db, device_id, delivery)) is not None:
         return replay
 
     # Snapshot identities AND owned scalar values before the wipe: the rebuild drops the whole
