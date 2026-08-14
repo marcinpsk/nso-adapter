@@ -246,7 +246,7 @@ async def test_store_only_manual_apply_is_rejected_without_a_job(adapter_client)
     stored = await adapter_client.put(
         f"/api/v1/devices/{device_id}/vlan-intent?store_only=true",
         json={"vlans": [{"vlan_id": 10, "name": "ten"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert stored.status_code == 200, stored.text
 

@@ -292,12 +292,12 @@ async def test_store_only_ip_shrink_reports_no_device_replacement(adapter_client
             {"interface": "Gi0/4", "address": "198.18.0.2/32", "family": "ipv4"},
         ]
     }
-    seed = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=initial)
+    seed = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH | push_seq(), json=initial)
     assert seed.status_code == 200, seed.text
 
     response = await adapter_client.put(
         f"/api/v1/devices/{device_id}/ip-intent?store_only=true",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"addresses": [initial["addresses"][0]]},
     )
 
