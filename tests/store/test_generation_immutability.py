@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 import sqlalchemy as sa
 
-from nso_adapter.store.ddl import GENERATION_IMMUTABLE_COLUMNS
+from nso_adapter.store.ddl import GENERATION_IMMUTABLE_COLUMNS, _compare
 
 _DOCUMENT = {"vlan": {"vlan_intent": [{"id": 1, "device_id": 1, "vlan_id": 10, "name": "v"}]}}
 
@@ -69,6 +69,11 @@ def test_the_immutable_column_set_is_exactly_what_the_trigger_guards():
     )
 
 
+def test_an_unknown_immutable_column_uses_the_json_safe_comparison():
+    """A newly guarded JSON column must not generate PostgreSQL's invalid json equality."""
+    assert _compare("future_document") == ("NEW.future_document::text IS DISTINCT FROM OLD.future_document::text")
+
+
 @pytest.mark.parametrize("column", sorted(_REWRITES))
 def test_rewriting_an_identity_column_is_rejected_by_the_database(pg_sync_session, column):
     _device_id, generation_id = _seed(pg_sync_session)
@@ -84,23 +89,29 @@ def test_rewriting_an_identity_column_is_rejected_by_the_database(pg_sync_sessio
 
 def test_the_lifecycle_columns_stay_writable(pg_sync_session):
     """Status, job binding, attempts, error and the timestamps are what execution MOVES."""
+    from nso_adapter.store.models import Job, JobStatus, JobType
+
     _device_id, generation_id = _seed(pg_sync_session)
+    job = Job(job_type=JobType.apply, device_id=_device_id, status=JobStatus.queued)
+    pg_sync_session.add(job)
+    pg_sync_session.flush()
 
     pg_sync_session.execute(
         sa.text(
-            "UPDATE deployment_generation SET status = 'failed', attempts = attempts + 1, "
+            "UPDATE deployment_generation SET status = 'failed', job_id = :job_id, attempts = attempts + 1, "
             'last_error = CAST(\'{"code": "nso_commit_failed"}\' AS json), updated_at = now(), '
             "settled_at = now() WHERE id = :gid"
         ),
-        {"gid": generation_id},
+        {"gid": generation_id, "job_id": job.id},
     )
     pg_sync_session.commit()
 
     row = pg_sync_session.execute(
-        sa.text("SELECT status, attempts, settled_at FROM deployment_generation WHERE id = :gid"),
+        sa.text("SELECT status, job_id, attempts, settled_at FROM deployment_generation WHERE id = :gid"),
         {"gid": generation_id},
     ).one()
     assert row.status == "failed"
+    assert row.job_id == job.id
     assert row.attempts == 1
     assert row.settled_at is not None
 

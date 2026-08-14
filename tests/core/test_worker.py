@@ -38,6 +38,31 @@ async def _get_job(job_id: int) -> Job:
         return await db.get(Job, job_id)
 
 
+async def test_generation_advancement_retries_transient_failures(monkeypatch):
+    """A transient failure does not strand a pending successor until restart."""
+    from nso_adapter.core import generation
+
+    calls = 0
+    delays: list[float] = []
+
+    async def advance(_device_id: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise RuntimeError("transient database failure")
+
+    async def record_delay(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(generation, "advance_device_generations", advance)
+    monkeypatch.setattr(worker.asyncio, "sleep", record_delay)
+
+    await worker._advance_generations(17)
+
+    assert calls == 3
+    assert delays == [0.5, 1.0]
+
+
 # ── _claim_next_job ─────────────────────────────────────────────────────────────
 
 

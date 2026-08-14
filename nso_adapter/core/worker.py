@@ -679,10 +679,26 @@ async def _advance_generations(device_id: int) -> None:
     """Hand the device's next executable generation a job. Never fails the finished run."""
     from nso_adapter.core.generation import advance_device_generations
 
-    try:
-        await advance_device_generations(device_id)
-    except Exception as exc:  # noqa: BLE001 — the run is over; startup recovery re-advances
-        logger.warning("worker.generation_advance_failed", device_id=device_id, error=repr(exc))
+    for attempt in range(1, 4):
+        try:
+            await advance_device_generations(device_id)
+            return
+        except Exception as exc:  # noqa: BLE001 — the finished run must stay terminal
+            if attempt == 3:
+                logger.error(
+                    "worker.generation_advance_failed",
+                    device_id=device_id,
+                    attempts=attempt,
+                    error=repr(exc),
+                )
+                return
+            logger.warning(
+                "worker.generation_advance_retry",
+                device_id=device_id,
+                attempt=attempt,
+                error=repr(exc),
+            )
+            await asyncio.sleep(0.5 * attempt)
 
 
 async def _dispose(job_id: int, job_type: JobType, reg: ClaimRegistration) -> ClaimOutcome:

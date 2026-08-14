@@ -27,19 +27,17 @@ GENERATION_IMMUTABLE_COLUMNS: tuple[str, ...] = (
     "created_at",
 )
 
-#: Of those, the ones typed ``json``. PostgreSQL defines no equality operator for ``json``
-#: (only ``jsonb``), so they are compared as text — which is stricter, not weaker: the stored
-#: bytes are what a retry re-sends and what the digest covers.
-_JSON_COLUMNS = frozenset(
-    {"document", "allowed_removal_keys", "source_push_seq", "stream_revisions", "removal_context"}
-)
+#: Immutable columns with a native equality operator. Every other column is compared as
+#: text. PostgreSQL defines no equality operator for ``json``, so this safe default prevents
+#: a newly guarded JSON column from breaking every lifecycle update at runtime.
+_COMPARABLE_COLUMNS = frozenset({"device_id", "seq", "mode", "digest", "created_at"})
 
 GENERATION_IMMUTABLE_TRIGGER = "deployment_generation_immutable"
 _FUNCTION = "deployment_generation_reject_rewrite"
 
 
 def _compare(col: str) -> str:
-    cast = "::text" if col in _JSON_COLUMNS else ""
+    cast = "" if col in _COMPARABLE_COLUMNS else "::text"
     return f"NEW.{col}{cast} IS DISTINCT FROM OLD.{col}{cast}"
 
 

@@ -62,7 +62,7 @@ def _removal_context(row: StaticRouteTombstone) -> dict:
     }
 
 
-async def reissue_removal_job(conn, device_id: int, row: StaticRouteTombstone) -> Job:
+async def reissue_removal_job(conn: AsyncSession, device_id: int, row: StaticRouteTombstone) -> Job:
     """Re-issue *row*'s removal as a generation and the job that carries it. Caller commits.
 
     Shared by the sweeper and the reclaimer, which are the same operation reached from two

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Deployment generations: the ordered, immutable unit of device deployment (#1522 §G1/§G2/§H2).
 
 Every accepted projection write takes the device's projection lock and bumps the touched
