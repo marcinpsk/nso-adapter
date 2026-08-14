@@ -27,9 +27,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, internal_error, terminalize
-from nso_adapter.core.generation import document_execution_sections, executing_generation, note_write
+from nso_adapter.core.generation import executing_generation, generation_execution_sections, note_write
 from nso_adapter.core.projection import (
     DOCUMENT_EXECUTED_SECTIONS,
+    INTERFACE_ATTRIBUTE_ELIGIBLE_STATES,
+    hydrate_interface_execution,
     hydrate_section,
     intent_state,
     section_models,
@@ -74,12 +76,7 @@ from nso_adapter.store.models import (
 logger = structlog.get_logger(__name__)
 
 # Statuses eligible for apply (decision Q in plan — force=True pushes all of these)
-_FORCE_ELIGIBLE = {
-    SyncState.accepted,
-    SyncState.apply_failed,
-    SyncState.drifted,
-    SyncState.in_sync,
-}
+_FORCE_ELIGIBLE = set(INTERFACE_ATTRIBUTE_ELIGIBLE_STATES)
 # force=False only pushes these
 _NO_FORCE_ELIGIBLE = {
     SyncState.accepted,
@@ -1144,7 +1141,15 @@ def _is_eligible(row, force: bool) -> bool:
 
 async def _collect_eligible(db: AsyncSession, model, device_id: int, force: bool) -> list:
     """All Apply-eligible rows of *model* for this device (one device-scoped query)."""
-    rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
+    if model is InterfaceIpIntent:
+        stmt = (
+            select(InterfaceIpIntent)
+            .join(DbInterface, InterfaceIpIntent.interface_id == DbInterface.id)
+            .where(DbInterface.device_id == device_id)
+        )
+    else:
+        stmt = select(model).where(model.device_id == device_id)
+    rows = (await db.execute(stmt)).scalars().all()
     return [r for r in rows if _is_eligible(r, force)]
 
 
@@ -1287,11 +1292,11 @@ async def _maybe_sync_from(db: AsyncSession, client, device_name: str, device_id
 
 
 async def _collect_attr_eligibility(db: AsyncSession, ifaces: dict, force: bool) -> tuple[list, list]:
-    """Snapshot every interface-attribute intent row; return (snapshot, eligible 3-tuples).
+    """Snapshot every interface-attribute intent row; return (snapshot, eligible sends).
 
     Eligibility for attributes is keyed off the attr_state's sync_state (not last_apply_at):
     every accepted row is snapshotted, but only those whose state is in the force/no-force
-    set are returned as ``(attr_state, intent_row, iface)`` for the per-attribute pass.
+    set are returned for the per-attribute pass.
     """
     eligible_statuses = _FORCE_ELIGIBLE if force else _NO_FORCE_ELIGIBLE
     snapshot: list[dict] = []
@@ -1319,7 +1324,7 @@ async def _collect_attr_eligibility(db: AsyncSession, ifaces: dict, force: bool)
                 }
             )
             if attr_state and attr_state.sync_state in eligible_statuses:
-                eligible.append((attr_state, intent_row, iface))
+                eligible.append(_AttributeApply(attr_state, intent_row, iface, intent_row))
     return snapshot, eligible
 
 
@@ -1349,6 +1354,115 @@ async def _collect_ip_eligibility(db: AsyncSession, ifaces: dict, force: bool) -
     return snapshot, by_iface
 
 
+class _AttributeApply(NamedTuple):
+    """One recorded attribute send and the live rows it may stamp."""
+
+    state: InterfaceAttrState | None
+    push: InterfaceIntent
+    interface: DbInterface
+    stamp: InterfaceIntent | None
+
+
+async def _collect_document_interface(
+    db: AsyncSession,
+    source: _Projection,
+    document: dict,
+) -> tuple[dict, list[dict], list[_AttributeApply], list[dict], dict, _Rows]:
+    """Hydrate interface rows and consume their creation-time execution context."""
+    execution = hydrate_interface_execution(document)
+    document_attr_rows = source._document_rows("interface_config").get(InterfaceIntent, [])
+    interface_ids = list(execution.interfaces)
+    live_attr_rows = (
+        (await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id.in_(interface_ids))))
+        .scalars()
+        .all()
+        if interface_ids
+        else []
+    )
+    live_attr_by_id = {row.id: row for row in live_attr_rows}
+    attr_stamp_of = {
+        _stamp_key(row): live
+        for row in document_attr_rows
+        if (live := live_attr_by_id.get(row.id)) is not None and intent_state(live) == intent_state(row)
+    }
+    ip_rows = await source.collect(InterfaceIpIntent, section="interface_config")
+    states = (
+        (await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id.in_(interface_ids))))
+        .scalars()
+        .all()
+        if interface_ids
+        else []
+    )
+    state_by_key = {(state.interface_id, state.attribute): state for state in states}
+    eligible: list[_AttributeApply] = []
+    intent_snapshot: list[dict] = []
+    for row in document_attr_rows:
+        key = (row.interface_id, row.attribute)
+        iface = execution.interfaces.get(row.interface_id)
+        if iface is None:
+            raise ValueError(f"interface_config document has no context for interface id {row.interface_id}")
+        is_eligible = key in execution.eligible_attributes
+        intent_snapshot.append(
+            {
+                "interface": iface.name,
+                "attribute": row.attribute,
+                "intent_value": row.intent_value,
+                "accepted_at": row.accepted_at.isoformat() if row.accepted_at else None,
+                "status_at_snapshot": "eligible" if is_eligible else "ineligible",
+            }
+        )
+        if not is_eligible:
+            continue
+        stamp = attr_stamp_of.get(_stamp_key(row))
+        eligible.append(_AttributeApply(state_by_key.get(key) if stamp is not None else None, row, iface, stamp))
+
+    ip_by_iface: dict[int, list] = {}
+    ip_snapshot: list[dict] = []
+    for row in ip_rows.push:
+        iface = execution.interfaces.get(row.interface_id)
+        if iface is None:
+            raise ValueError(f"interface_config document has no context for interface id {row.interface_id}")
+        ip_by_iface.setdefault(row.interface_id, []).append(row)
+        ip_snapshot.append(
+            {
+                "interface": iface.name,
+                "address": row.address,
+                "family": row.family,
+                "secondary": row.secondary,
+                "vrf": row.vrf,
+                "accepted_at": row.accepted_at.isoformat() if row.accepted_at else None,
+            }
+        )
+    return execution.interfaces, intent_snapshot, eligible, ip_snapshot, ip_by_iface, ip_rows
+
+
+async def _collect_interface_apply_rows(
+    db: AsyncSession,
+    source: _Projection,
+    generation,
+    execution_sections: frozenset[str] | None,
+    device_id: int,
+    force: bool,
+) -> tuple[dict, list[dict], list, list[dict], dict, dict | None]:
+    """Select no rows, generationless live rows, or the recorded interface document."""
+    if execution_sections is not None and "interface_config" not in execution_sections:
+        return {}, [], [], [], {}, None
+    if generation is not None:
+        ifaces, intent_snapshot, attrs, ip_snapshot, ips, ip_rows = await _collect_document_interface(
+            db,
+            source,
+            generation.document,
+        )
+        return ifaces, intent_snapshot, attrs, ip_snapshot, ips, ip_rows.stamp_of
+    ifaces = {
+        iface.id: iface
+        for iface in (await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))).scalars().all()
+    }
+    intent_snapshot, attrs = await _collect_attr_eligibility(db, ifaces, force)
+    ip_snapshot, ips = await _collect_ip_eligibility(db, ifaces, force)
+    return ifaces, intent_snapshot, attrs, ip_snapshot, ips, None
+
+
 async def _apply_attributes(eligible, apply_fn, *, client, device_name, job_id, now) -> tuple[int, int, list]:
     """Commit each (interface, attribute) individually and transition its attr_state.
 
@@ -1358,7 +1472,8 @@ async def _apply_attributes(eligible, apply_fn, *, client, device_name, job_id, 
     ok = 0
     failed = 0
     failures: list[dict] = []
-    for attr_state, intent_row, iface in eligible:
+    for item in eligible:
+        attr_state, intent_row, iface, stamp = item
         routed_kind = _nokia_attr_kind(iface)
         try:
             await apply_fn(
@@ -1381,8 +1496,9 @@ async def _apply_attributes(eligible, apply_fn, *, client, device_name, job_id, 
                 attribute=intent_row.attribute,
                 error=exc.message,
             )
-            attr_state.sync_state = SyncState.apply_failed
-            intent_row.last_apply_error = {"code": exc.code, "message": exc.message, "detail": exc.detail}
+            if attr_state is not None and stamp is not None:
+                attr_state.sync_state = SyncState.apply_failed
+                stamp.last_apply_error = {"code": exc.code, "message": exc.message, "detail": exc.detail}
             failed += 1
             failures.append({"interface": iface.name, "attribute": intent_row.attribute, "error": exc.message})
         except ClaimLostError:
@@ -1396,21 +1512,33 @@ async def _apply_attributes(eligible, apply_fn, *, client, device_name, job_id, 
                 interface=iface.name,
                 attribute=intent_row.attribute,
             )
-            attr_state.sync_state = SyncState.apply_failed
-            intent_row.last_apply_error = internal_error(exc)
+            if attr_state is not None and stamp is not None:
+                attr_state.sync_state = SyncState.apply_failed
+                stamp.last_apply_error = internal_error(exc)
             failed += 1
             failures.append(
                 {"interface": iface.name, "attribute": intent_row.attribute, "error": internal_error(exc)["message"]}
             )
         else:
-            attr_state.sync_state = SyncState.in_sync
-            intent_row.last_apply_at = now
-            intent_row.last_apply_error = None
+            if attr_state is not None and stamp is not None:
+                attr_state.sync_state = SyncState.in_sync
+                stamp.last_apply_at = now
+                stamp.last_apply_error = None
             ok += 1
     return ok, failed, failures
 
 
-async def _apply_ips(by_iface, ifaces, apply_fn, *, client, device_name, job_id, now) -> tuple[int, int, list]:
+async def _apply_ips(
+    by_iface,
+    ifaces,
+    apply_fn,
+    *,
+    client,
+    device_name,
+    job_id,
+    now,
+    stamp_of: dict | None = None,
+) -> tuple[int, int, list]:
     """Push IP intent one interface at a time (each interface is one commit unit).
 
     Returns (in_sync, apply_failed, failures); the counts are per-row, the failures
@@ -1436,7 +1564,9 @@ async def _apply_ips(by_iface, ifaces, apply_fn, *, client, device_name, job_id,
         except NsoApplyError as exc:
             logger.error("apply.ip_failed", job_id=job_id, device=device_name, interface=iface.name, error=exc.message)
             for row in ip_rows:
-                row.last_apply_error = {"code": exc.code, "message": exc.message, "detail": exc.detail}
+                stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
+                if stamp is not None:
+                    stamp.last_apply_error = {"code": exc.code, "message": exc.message, "detail": exc.detail}
             failed += len(ip_rows)
             failures.append({"interface": iface.name, "error": exc.message})
         except ClaimLostError:
@@ -1446,13 +1576,17 @@ async def _apply_ips(by_iface, ifaces, apply_fn, *, client, device_name, job_id,
         except Exception as exc:
             logger.exception("apply.ip_unexpected_error", job_id=job_id, interface=iface.name)
             for row in ip_rows:
-                row.last_apply_error = internal_error(exc)
+                stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
+                if stamp is not None:
+                    stamp.last_apply_error = internal_error(exc)
             failed += len(ip_rows)
             failures.append({"interface": iface.name, "error": internal_error(exc)["message"]})
         else:
             for row in ip_rows:
-                row.last_apply_at = now
-                row.last_apply_error = None
+                stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
+                if stamp is not None:
+                    stamp.last_apply_at = now
+                    stamp.last_apply_error = None
             ok += len(ip_rows)
     return ok, failed, failures
 
@@ -1473,7 +1607,7 @@ def _build_interface_config_entries(attr_eligible, ip_by_iface, ifaces, device_n
     def _entry(name: str) -> dict:
         return by_name.setdefault(name, {"device": device_name, "interface-name": name})
 
-    for _attr_state, intent_row, iface in attr_eligible:
+    for _attr_state, intent_row, iface, _stamp in attr_eligible:
         entry = _entry(iface.name)
         if intent_row.attribute == "description":
             entry["description"] = intent_row.intent_value if intent_row.intent_value is not None else ""
@@ -1822,32 +1956,38 @@ def _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now,
     """
     ok = failed = 0
     failures: list[dict] = []
-    for attr_state, intent_row, iface in attr_eligible:
+    for attr_state, intent_row, iface, stamp in attr_eligible:
         if commit_error is None:
-            attr_state.sync_state = SyncState.in_sync
-            intent_row.last_apply_at = now
-            intent_row.last_apply_error = None
+            if attr_state is not None and stamp is not None:
+                attr_state.sync_state = SyncState.in_sync
+                stamp.last_apply_at = now
+                stamp.last_apply_error = None
             ok += 1
         elif iface_failed:
-            attr_state.sync_state = SyncState.apply_failed
-            intent_row.last_apply_error = err
+            if attr_state is not None and stamp is not None:
+                attr_state.sync_state = SyncState.apply_failed
+                stamp.last_apply_error = err
             failed += 1
             failures.append({"interface": iface.name, "attribute": intent_row.attribute, "error": msg})
-        else:
+        elif attr_state is not None:
             attr_state.sync_state = snapshot[attr_state]
     return ok, failed, failures
 
 
-def _stamp_ip_atomic(ip_rows_flat, commit_error, iface_failed, err, msg, now) -> tuple[int, int, list]:
+def _stamp_ip_atomic(ip_rows_flat, commit_error, iface_failed, err, msg, now, stamp_of=None) -> tuple[int, int, list]:
     """Stamp IP rows from the single atomic outcome (pending rows untouched, retried next apply)."""
     if commit_error is None:
         for row in ip_rows_flat:
-            row.last_apply_at = now
-            row.last_apply_error = None
+            stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
+            if stamp is not None:
+                stamp.last_apply_at = now
+                stamp.last_apply_error = None
         return len(ip_rows_flat), 0, []
     if iface_failed:
         for row in ip_rows_flat:
-            row.last_apply_error = err
+            stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
+            if stamp is not None:
+                stamp.last_apply_error = err
         return 0, len(ip_rows_flat), ([{"error": msg}] if ip_rows_flat else [])
     return 0, 0, []
 
@@ -2111,8 +2251,13 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
 
     # Snapshot attr states, then mark deploying (parity with the per-scope path); a pending
     # (rolled-back, non-offender) attr is reverted to its snapshot rather than left deploying.
-    snapshot = {attr_state: attr_state.sync_state for attr_state, _ir, _if in attr_eligible}
-    for attr_state, _ir, _if in attr_eligible:
+    attr_stamps = [item.stamp for item in attr_eligible if item.stamp is not None]
+    ip_stamps = list((elig.get("ip_stamp_of") or {}).values())
+    _reject_transient_stamps("interface_config", [*attr_stamps, *ip_stamps])
+    snapshot = {
+        item.state: item.state.sync_state for item in attr_eligible if item.state is not None and item.stamp is not None
+    }
+    for attr_state in snapshot:
         attr_state.sync_state = SyncState.deploying
     await db.commit()
 
@@ -2127,8 +2272,8 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
         # bug, not a scope's own bad intent, which _stage_atomic_modules isolates. Revert the
         # attrs we just marked 'deploying' so they aren't stuck forever, then re-raise so
         # run_apply fails the job with the real error.
-        for attr_state, _ir, _if in attr_eligible:
-            attr_state.sync_state = snapshot[attr_state]
+        for attr_state, state in snapshot.items():
+            attr_state.sync_state = state
         await db.commit()
         raise
 
@@ -2143,7 +2288,15 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
 
     iface_failed = (_IFACE_CONFIG_ROOT in offenders) if iface_entries else False
     attr_outcome = _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot)
-    ip_outcome = _stamp_ip_atomic(ip_rows_flat, commit_error, iface_failed, err, msg, now)
+    ip_outcome = _stamp_ip_atomic(
+        ip_rows_flat,
+        commit_error,
+        iface_failed,
+        err,
+        msg,
+        now,
+        stamp_of=elig.get("ip_stamp_of"),
+    )
     scope_outcomes, scope_failures = _stamp_batch_scopes_atomic(
         staged_sent, staged_stamp, offenders, commit_error, err, msg, now
     )
@@ -2934,29 +3087,30 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     # successor push can commit; without the stored document it would be deployed here, under
     # this generation's identity and settled as this generation's revision.
     generation = await executing_generation(db, job_id)
-    document_sections = await document_execution_sections(db, job_id)
-
-    # ── Step 1: snapshot intent + collect every scope this job is allowed to execute ──
-    if document_sections is None or "interface_config" in document_sections:
-        ifaces = {
-            iface.id: iface
-            for iface in (await db.execute(select(DbInterface).where(DbInterface.device_id == device_id)))
-            .scalars()
-            .all()
-        }
-        intent_snapshot, attr_eligible = await _collect_attr_eligibility(db, ifaces, force)
-        ip_snapshot, ip_eligible_by_iface = await _collect_ip_eligibility(db, ifaces, force)
-    else:
-        ifaces = {}
-        intent_snapshot, attr_eligible = [], []
-        ip_snapshot, ip_eligible_by_iface = [], {}
-
+    execution_sections = await generation_execution_sections(db, job_id)
     source = _Projection(
         db,
         device_id,
         force,
         generation.document if generation is not None else None,
-        document_sections,
+        execution_sections,
+    )
+
+    # ── Step 1: snapshot intent + collect every scope this job is allowed to execute ──
+    (
+        ifaces,
+        intent_snapshot,
+        attr_eligible,
+        ip_snapshot,
+        ip_eligible_by_iface,
+        interface_ip_stamp_of,
+    ) = await _collect_interface_apply_rows(
+        db,
+        source,
+        generation,
+        execution_sections,
+        device_id,
+        force,
     )
 
     snmp_comm_rows = await source.collect(SnmpCommunityIntent, section="snmp")
@@ -2973,7 +3127,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     # #1396 R2 §3: ONE classifier decides the static-route mode and snapshots the rows the
     # body is built from, the rows this pass stamps, the keys the guard may see disappear
     # and the tombstones the body must retain.
-    if document_sections is None or "static_route" in document_sections:
+    if execution_sections is None or "static_route" in execution_sections:
         sr_plan = await build_plan(db, device, eligible_rows=sr_eligible)
     else:
         sr_plan = SrPlan("PATCH", [], set(), [], [], 0)
@@ -3081,6 +3235,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             "ifaces": ifaces,
             "attr": attr_eligible,
             "ip_by_iface": ip_eligible_by_iface,
+            "ip_stamp_of": interface_ip_stamp_of,
             "subif": subif_eligible,
             "snmp_rows": snmp_rows.push,
             "snmp_comm": snmp_comm,
@@ -3144,8 +3299,12 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         return
 
     # ── Step 2: mark attribute states deploying ──
-    for attr_state, _intent_row, _iface in attr_eligible:
-        attr_state.sync_state = SyncState.deploying
+    attr_stamps = [item.stamp for item in attr_eligible if item.stamp is not None]
+    ip_stamps = list((interface_ip_stamp_of or {}).values())
+    _reject_transient_stamps("interface_config", [*attr_stamps, *ip_stamps])
+    for item in attr_eligible:
+        if item.state is not None and item.stamp is not None:
+            item.state.sync_state = SyncState.deploying
     await db.commit()
 
     # ── Step 3–6: per-item attribute + IP passes ──
@@ -3160,6 +3319,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         device_name=device_name,
         job_id=job_id,
         now=now,
+        stamp_of=interface_ip_stamp_of,
     )
 
     deferred_rp_capability: list[NsoApplyError] = []

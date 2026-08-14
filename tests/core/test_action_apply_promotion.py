@@ -61,6 +61,14 @@ async def _put_bgp(client, device_id: int, remote_as: str, *, seq: int, query: s
     )
 
 
+async def _put_interface_attrs(client, device_id: int, value: str, *, seq: int, query: str = ""):
+    return await client.put(
+        f"/api/v1/devices/{device_id}/intent{query}",
+        json={"attributes": [{"interface": "GigabitEthernet0/1", "attribute": "description", "intent_value": value}]},
+        headers=AUTH | {"X-Push-Seq": str(seq)},
+    )
+
+
 async def _put_svis(client, device_id: int, vlan_ids: list[int], *, seq: int, query: str = ""):
     return await client.put(
         f"/api/v1/devices/{device_id}/svi-intent{query}",
@@ -434,6 +442,231 @@ async def test_bgp_action_apply_executes_the_selected_graph(adapter_client):
     assert router["scope"][0]["address-family"] == [{"afi": "ipv4-unicast"}]
     assert router["scope"][0]["peer"][0]["remote-as"] == "64513"
     assert router["scope"][0]["peer"][0]["peer-address-family"] == [{"afi": "ipv4-unicast", "enabled": True}]
+
+
+async def test_interface_config_action_apply_executes_the_selected_document(adapter_client):
+    """A later interface push cannot replace the selected attribute at worker claim time."""
+    from nso_adapter.store.models import JobStatus
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="interface-exact-selection", netbox_device_id=9997)
+    await seed_settings(device_id, auto_apply=False)
+    selected = await _put_interface_attrs(
+        adapter_client,
+        device_id,
+        "selected description",
+        seq=6571,
+        query="?store_only=true",
+    )
+    assert selected.status_code == 200, selected.text
+    response = await _apply(adapter_client, device_id, {"interface_config": 6571})
+    assert response.status_code == 202, response.text
+
+    async def successor():
+        result = await _put_interface_attrs(
+            adapter_client,
+            device_id,
+            "successor description",
+            seq=6572,
+            query="?store_only=true",
+        )
+        assert result.status_code == 200, result.text
+
+    client, recorder = recorded_client("interface-exact-selection", on_sync_from=successor)
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+    job = await job_row(job_id)
+    assert job.status is JobStatus.succeeded
+    bodies = recorder.bodies("interface-reconciler:interface-config")
+    assert [body["interface-reconciler:interface-config"][0]["description"] for body in bodies] == [
+        "selected description"
+    ]
+
+
+async def test_mixed_generation_executes_interface_section_from_its_document(adapter_client):
+    """A live-read static-route lane cannot make the interface lane read live rows."""
+    from nso_adapter.core.generation import attach_to_job, create_generation
+    from nso_adapter.store.models import GenerationMode, Job, JobStatus, JobType
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="interface-mixed-exact-selection", netbox_device_id=9981)
+    await seed_settings(device_id, auto_apply=False)
+    selected = await _put_interface_attrs(
+        adapter_client,
+        device_id,
+        "selected description",
+        seq=6573,
+        query="?store_only=true",
+    )
+    assert selected.status_code == 200, selected.text
+    addresses = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ip-intent?store_only=true",
+        json={"addresses": [{"interface": "GigabitEthernet0/1", "address": "198.18.10.1/30", "family": "ipv4"}]},
+        headers=AUTH | {"X-Push-Seq": "6574"},
+    )
+    assert addresses.status_code == 200, addresses.text
+    routes = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_A, route_id=1, generation=1)],
+        seq=6575,
+        query="?store_only=true",
+    )
+    assert routes.status_code == 200, routes.text
+
+    async with session() as db:
+        generation = await create_generation(
+            db,
+            device_id,
+            streams=("interface_config", "ip", "static_route"),
+            mode=GenerationMode.networked,
+        )
+        job = Job(job_type=JobType.apply, device_id=device_id)
+        db.add(job)
+        await db.flush()
+        assert await attach_to_job(db, generation, job)
+        await db.commit()
+        assert generation.stream_revisions == {"interface_config": 1, "ip": 1, "static_route": 1}
+
+    successor = await _put_interface_attrs(
+        adapter_client,
+        device_id,
+        "live successor description",
+        seq=6576,
+        query="?store_only=true",
+    )
+    assert successor.status_code == 200, successor.text
+
+    client, recorder = recorded_client("interface-mixed-exact-selection")
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+    assert (await job_row(job_id)).status is JobStatus.succeeded
+    bodies = recorder.bodies("interface-reconciler:interface-config")
+    assert [
+        body["interface-reconciler:interface-config"][0]["description"]
+        for body in bodies
+        if "description" in body["interface-reconciler:interface-config"][0]
+    ] == ["selected description"]
+
+
+async def test_interface_config_generation_records_creation_time_attribute_eligibility(adapter_client):
+    """The worker sends the recorded eligible subset after live eligibility changes."""
+    from nso_adapter.store.models import DbInterface, InterfaceAttrState, JobStatus, SyncState
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(
+        nso_device_name="interface-recorded-eligibility",
+        netbox_device_id=9998,
+        attributes=["description", "enabled"],
+    )
+    await seed_settings(device_id, auto_apply=False)
+    stored = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/intent?store_only=true",
+        json={
+            "attributes": [
+                {
+                    "interface": "GigabitEthernet0/1",
+                    "attribute": "description",
+                    "intent_value": "selected description",
+                },
+                {"interface": "GigabitEthernet0/1", "attribute": "enabled", "intent_value": True},
+            ]
+        },
+        headers=AUTH | {"X-Push-Seq": "6581"},
+    )
+    assert stored.status_code == 200, stored.text
+    async with session() as db:
+        iface = await db.scalar(
+            sa.select(DbInterface).where(
+                DbInterface.device_id == device_id,
+                DbInterface.name == "GigabitEthernet0/1",
+            )
+        )
+        enabled_state = await db.scalar(
+            sa.select(InterfaceAttrState).where(
+                InterfaceAttrState.interface_id == iface.id,
+                InterfaceAttrState.attribute == "enabled",
+            )
+        )
+        enabled_state.sync_state = SyncState.error
+        iface_id = iface.id
+        await db.commit()
+
+    response = await _apply(adapter_client, device_id, {"interface_config": 6581})
+
+    assert response.status_code == 202, response.text
+    (generation,) = await _generations(device_id)
+    execution = generation.document["interface_config"]["_execution"]
+    assert execution["eligible_interface_attributes"] == [{"interface_id": iface_id, "attribute": "description"}]
+    async with session() as db:
+        enabled_state = await db.scalar(
+            sa.select(InterfaceAttrState).where(
+                InterfaceAttrState.interface_id == iface_id,
+                InterfaceAttrState.attribute == "enabled",
+            )
+        )
+        description_state = await db.scalar(
+            sa.select(InterfaceAttrState).where(
+                InterfaceAttrState.interface_id == iface_id,
+                InterfaceAttrState.attribute == "description",
+            )
+        )
+        enabled_state.sync_state = SyncState.accepted
+        description_state.sync_state = SyncState.error
+        await db.commit()
+
+    client, recorder = recorded_client("interface-recorded-eligibility")
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+    assert (await job_row(job_id)).status is JobStatus.succeeded
+    bodies = recorder.bodies("interface-reconciler:interface-config")
+    assert [body["interface-reconciler:interface-config"][0] for body in bodies] == [
+        {
+            "device": "interface-recorded-eligibility",
+            "interface-name": "GigabitEthernet0/1",
+            "kind": "base",
+            "description": "selected description",
+        }
+    ]
+
+
+async def test_interface_config_generation_refuses_unresolvable_attribute_eligibility(adapter_client):
+    """A missing attr-state row refuses generation creation and leaves authority unchanged."""
+    from nso_adapter.store.models import DbInterface, InterfaceAttrState
+
+    device_id = await seed_device(nso_device_name="interface-unresolved-eligibility", netbox_device_id=9999)
+    await seed_settings(device_id, auto_apply=False)
+    stored = await _put_interface_attrs(
+        adapter_client,
+        device_id,
+        "selected description",
+        seq=6591,
+        query="?store_only=true",
+    )
+    assert stored.status_code == 200, stored.text
+    async with session() as db:
+        iface_id = await db.scalar(
+            sa.select(DbInterface.id).where(
+                DbInterface.device_id == device_id,
+                DbInterface.name == "GigabitEthernet0/1",
+            )
+        )
+        await db.execute(sa.delete(InterfaceAttrState).where(InterfaceAttrState.interface_id == iface_id))
+        await db.commit()
+
+    response = await _apply(adapter_client, device_id, {"interface_config": 6591})
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": {
+            "code": "apply_unexecutable",
+            "message": "Selected stream(s) cannot be applied faithfully: interface_config",
+            "detail": {"streams": {"interface_config": "interface_attribute_eligibility_unresolved"}},
+        }
+    }
+    assert await _generations(device_id) == []
+    assert await _jobs(device_id) == []
+    assert (await _stream(device_id, "interface_config")).authorized_revision == 0
 
 
 async def test_failed_svi_document_send_with_no_stamp_rows_fails_generation(adapter_client):
@@ -1269,8 +1502,8 @@ async def test_interface_promotion_refuses_an_unresolved_interface_id(adapter_cl
             )
 
 
-async def test_action_apply_refuses_interface_streams_that_execute_from_live_rows(adapter_client):
-    """Interface execution cannot certify the selected stored revision."""
+async def test_action_apply_accepts_ip_stream_that_executes_from_interface_document(adapter_client):
+    """The IP lane is executable because its containing interface section moved to the document."""
     device_id = await seed_device(nso_device_name="apply-interface-list", netbox_device_id=9969)
     await seed_settings(device_id, auto_apply=False)
     first = await adapter_client.put(
@@ -1287,13 +1520,15 @@ async def test_action_apply_refuses_interface_streams_that_execute_from_live_row
 
     response = await _apply(adapter_client, device_id, {"ip": 4901})
 
-    assert response.status_code == 409
-    assert response.json()["error"]["detail"] == {
-        "streams": {"ip": "live_read_execution"},
-    }
-    assert await _generations(device_id) == []
-    assert await _jobs(device_id) == []
-    assert (await _stream(device_id, "ip")).authorized_revision == 0
+    assert response.status_code == 202, response.text
+    (generation,) = await _generations(device_id)
+    assert generation.stream_revisions == {"ip": 1}
+    assert [row["address"] for row in generation.document["interface_config"]["interface_ip_intent"]] == [
+        "198.18.10.1/30",
+        "198.18.10.5/30",
+    ]
+    assert len(await _jobs(device_id)) == 1
+    assert (await _stream(device_id, "ip")).authorized_revision == 1
 
 
 async def test_apply_static_route_removal_keeps_apply_bookkeeping_job(adapter_client):

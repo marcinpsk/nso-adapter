@@ -52,6 +52,7 @@ from nso_adapter.store.models import (
     BgpRouterIntent,
     BgpScopeIntent,
     DbInterface,
+    InterfaceAttrState,
     InterfaceIntent,
     InterfaceIpIntent,
     InterfaceMtuIntent,
@@ -74,6 +75,7 @@ from nso_adapter.store.models import (
     StaticRouteTombstone,
     SubinterfaceIntent,
     SviIntent,
+    SyncState,
     VlanIntent,
 )
 
@@ -502,6 +504,7 @@ DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset(
         "svi",
         "subinterface",
         "bfd",
+        "interface_config",
         "interface_mtu",
         "l2_sap",
         "isis",
@@ -520,10 +523,139 @@ ACTION_APPLY_EXECUTABLE_SECTIONS: frozenset[str] = frozenset({"vlan"})
 #: Why each remaining section still reads live rows at apply time.
 LIVE_READ_SECTIONS: dict[str, str] = {
     "static_route": "build_plan classifies against tombstones, carriers and deployed keys",
-    "interface_config": "eligibility is keyed off InterfaceAttrState, which is not intent",
 }
 
-_MODEL_BY_TABLE: dict[str, Any] = {spec.model.__tablename__: spec.model for spec in _SPEC_BY_MODEL.values()}
+INTERFACE_EXECUTION_KEY = "_execution"
+INTERFACE_ATTRIBUTE_ELIGIBLE_STATES: frozenset[SyncState] = frozenset(
+    {
+        SyncState.accepted,
+        SyncState.apply_failed,
+        SyncState.drifted,
+        SyncState.in_sync,
+    }
+)
+
+
+class InterfaceEligibilityUnresolved(RuntimeError):
+    """Interface intent whose non-intent eligibility state is missing at creation."""
+
+
+class InterfaceExecution(NamedTuple):
+    """Creation-time interface context and the explicit eligible attribute set."""
+
+    interfaces: dict[int, DbInterface]
+    eligible_attributes: frozenset[tuple[int, str]]
+
+
+async def record_interface_execution(db: AsyncSession, device_id: int, document: dict) -> None:
+    """Resolve and record all non-intent facts needed to execute interface_config."""
+    section = document.get("interface_config")
+    if section is None:
+        return
+    attr_rows = section.get(InterfaceIntent.__tablename__, [])
+    ip_rows = section.get(InterfaceIpIntent.__tablename__, [])
+    interface_ids = sorted({row["interface_id"] for row in [*attr_rows, *ip_rows]})
+    interfaces = (
+        (
+            await db.execute(
+                select(DbInterface)
+                .where(DbInterface.device_id == device_id, DbInterface.id.in_(interface_ids))
+                .order_by(DbInterface.id)
+            )
+        )
+        .scalars()
+        .all()
+        if interface_ids
+        else []
+    )
+    by_id = {iface.id: iface for iface in interfaces}
+    missing_interfaces = sorted(set(interface_ids) - set(by_id))
+    if missing_interfaces:
+        raise InterfaceEligibilityUnresolved(f"interface_config references missing interface ids {missing_interfaces}")
+
+    states = (
+        (await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id.in_(interface_ids))))
+        .scalars()
+        .all()
+        if interface_ids
+        else []
+    )
+    state_by_key = {(state.interface_id, state.attribute): state for state in states}
+    attr_keys = [(row["interface_id"], row["attribute"]) for row in attr_rows]
+    unresolved = sorted(key for key in attr_keys if key not in state_by_key)
+    if unresolved:
+        raise InterfaceEligibilityUnresolved(
+            "interface_config attribute eligibility is missing for "
+            + ", ".join(f"interface {interface_id} attribute {attribute!r}" for interface_id, attribute in unresolved)
+        )
+    eligible = [
+        {"interface_id": interface_id, "attribute": attribute}
+        for interface_id, attribute in sorted(attr_keys)
+        if state_by_key[(interface_id, attribute)].sync_state in INTERFACE_ATTRIBUTE_ELIGIBLE_STATES
+    ]
+    section[INTERFACE_EXECUTION_KEY] = {
+        "interfaces": [
+            {
+                "id": iface.id,
+                "name": iface.name,
+                "kind": iface.kind,
+                "parent_binding": iface.parent_binding,
+                "encap_tag": iface.encap_tag,
+                "vrf": iface.vrf,
+                "service": iface.service,
+            }
+            for iface in interfaces
+        ],
+        "eligible_interface_attributes": eligible,
+    }
+
+
+def hydrate_interface_execution(document: dict) -> InterfaceExecution:
+    """Rebuild interface writer context and eligibility from the stored document."""
+    section = document.get("interface_config") or {}
+    execution = section.get(INTERFACE_EXECUTION_KEY)
+    if execution is None:
+        raise ValueError("document section 'interface_config' has no recorded execution context")
+    if not isinstance(execution, dict) or set(execution) != {
+        "interfaces",
+        "eligible_interface_attributes",
+    }:
+        raise ValueError("document section 'interface_config' has invalid execution context")
+    serialized_interfaces = execution.get("interfaces")
+    serialized_eligible = execution.get("eligible_interface_attributes")
+    if not isinstance(serialized_interfaces, list) or not isinstance(serialized_eligible, list):
+        raise ValueError("document section 'interface_config' has invalid execution context")
+    interfaces: dict[int, DbInterface] = {}
+    allowed = {"id", "name", "kind", "parent_binding", "encap_tag", "vrf", "service"}
+    for record in serialized_interfaces:
+        if not isinstance(record, dict) or set(record) != allowed:
+            raise ValueError("document section 'interface_config' has invalid interface context")
+        iface = DbInterface(**record)
+        if iface.id in interfaces:
+            raise ValueError(f"document section 'interface_config' repeats interface id {iface.id}")
+        interfaces[iface.id] = iface
+    eligible: set[tuple[int, str]] = set()
+    for record in serialized_eligible:
+        if not isinstance(record, dict) or set(record) != {"interface_id", "attribute"}:
+            raise ValueError("document section 'interface_config' has invalid eligible attribute")
+        key = (record["interface_id"], record["attribute"])
+        if key in eligible:
+            raise ValueError(f"document section 'interface_config' repeats eligible attribute {key!r}")
+        eligible.add(key)
+    referenced_interfaces = {
+        row["interface_id"]
+        for table in (InterfaceIntent.__tablename__, InterfaceIpIntent.__tablename__)
+        for row in section.get(table, [])
+    }
+    if set(interfaces) != referenced_interfaces:
+        raise ValueError("document section 'interface_config' execution context does not match its rows")
+    attribute_keys = {(row["interface_id"], row["attribute"]) for row in section.get(InterfaceIntent.__tablename__, [])}
+    if not eligible <= attribute_keys:
+        raise ValueError("document section 'interface_config' eligibility does not match its attribute rows")
+    return InterfaceExecution(interfaces, frozenset(eligible))
+
+
+_MODEL_BY_TABLE: dict[str, type] = {spec.model.__tablename__: spec.model for spec in _SPEC_BY_MODEL.values()}
 
 
 def _from_jsonable(value: Any, column) -> Any:
@@ -637,6 +769,8 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
     rows: dict[type, list] = {}
     row_records: dict[type, list[tuple[dict, object]]] = {}
     for table_name, serialized_rows in tables.items():
+        if section == "interface_config" and table_name == INTERFACE_EXECUTION_KEY:
+            continue
         model = _MODEL_BY_TABLE.get(table_name)
         if model is None:
             raise ValueError(f"document section {section!r} names unknown table {table_name!r}")
@@ -682,8 +816,12 @@ __all__ = [
     "ACTION_APPLY_EXECUTABLE_SECTIONS",
     "APPLY_BOOKKEEPING_COLUMNS",
     "DOCUMENT_EXECUTED_SECTIONS",
+    "INTERFACE_ATTRIBUTE_ELIGIBLE_STATES",
+    "INTERFACE_EXECUTION_KEY",
+    "InterfaceEligibilityUnresolved",
     "LIVE_READ_SECTIONS",
     "hydrate_section",
+    "hydrate_interface_execution",
     "intent_state",
     "is_intent_deletion",
     "projection_sections",
@@ -692,6 +830,7 @@ __all__ = [
     "rows_by_intent_identity",
     "section_models",
     "section_streams",
+    "record_interface_execution",
     "snapshot_stream",
     "stream_for_model",
     "stream_section",

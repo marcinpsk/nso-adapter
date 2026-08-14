@@ -27,6 +27,7 @@ _INCREMENT_ONE_SECTIONS = frozenset(
 )
 _INCREMENT_TWO_SECTIONS = frozenset({"snmp", "logging"})
 _INCREMENT_THREE_SECTIONS = frozenset({"bgp"})
+_INCREMENT_FOUR_SECTIONS = frozenset({"interface_config"})
 
 
 def test_every_section_is_either_document_executed_or_names_its_blocker():
@@ -118,6 +119,13 @@ def test_increment_three_sections_are_document_executed():
 
     assert _INCREMENT_THREE_SECTIONS <= DOCUMENT_EXECUTED_SECTIONS
     assert not (_INCREMENT_THREE_SECTIONS & set(LIVE_READ_SECTIONS))
+
+
+def test_increment_four_sections_are_document_executed():
+    from nso_adapter.core.projection import DOCUMENT_EXECUTED_SECTIONS, LIVE_READ_SECTIONS
+
+    assert _INCREMENT_FOUR_SECTIONS <= DOCUMENT_EXECUTED_SECTIONS
+    assert not (_INCREMENT_FOUR_SECTIONS & set(LIVE_READ_SECTIONS))
 
 
 @pytest.mark.parametrize(
@@ -561,6 +569,47 @@ def test_hydrating_a_known_table_under_the_wrong_section_is_refused():
 
     with pytest.raises(ValueError, match="does not belong"):
         hydrate_section({"svi": {"vlan_intent": []}}, "svi")
+
+
+def test_interface_execution_context_hydrates_beside_intent_tables():
+    """Execution metadata is explicit and does not masquerade as an intent table."""
+    from nso_adapter.core.projection import hydrate_interface_execution, hydrate_section
+    from nso_adapter.store.models import InterfaceIntent
+
+    document = {
+        "interface_config": {
+            "interface_intent": [
+                {
+                    "id": 11,
+                    "interface_id": 7,
+                    "attribute": "description",
+                    "intent_value": "selected description",
+                }
+            ],
+            "interface_ip_intent": [],
+            "_execution": {
+                "interfaces": [
+                    {
+                        "id": 7,
+                        "name": "GigabitEthernet0/1",
+                        "kind": None,
+                        "parent_binding": None,
+                        "encap_tag": None,
+                        "vrf": None,
+                        "service": None,
+                    }
+                ],
+                "eligible_interface_attributes": [{"interface_id": 7, "attribute": "description"}],
+            },
+        }
+    }
+
+    rows = hydrate_section(document, "interface_config")
+    execution = hydrate_interface_execution(document)
+
+    assert rows[InterfaceIntent][0].intent_value == "selected description"
+    assert execution.interfaces[7].name == "GigabitEthernet0/1"
+    assert execution.eligible_attributes == frozenset({(7, "description")})
 
 
 # ── stream ownership: the authorization partition ────────────────────────────

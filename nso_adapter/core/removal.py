@@ -706,7 +706,7 @@ async def _guarded_apply(client, device, scope: str, context: dict | None, apply
 
 
 async def _replacement_section_rows(db: AsyncSession, scope: str, job_id: int | None) -> dict[type, list] | None:
-    """Hydrate one removal's document section, or select live mode for legacy scopes."""
+    """Hydrate one promoted removal section, or select the established live mode."""
     from nso_adapter.core.generation import executing_generation
     from nso_adapter.core.projection import DOCUMENT_EXECUTED_SECTIONS, hydrate_section
 
@@ -715,7 +715,9 @@ async def _replacement_section_rows(db: AsyncSession, scope: str, job_id: int | 
     generation = await executing_generation(db, job_id)
     if generation is None:
         raise RuntimeError(f"removal job {job_id} for scope {scope!r} carries no generation to deploy")
-    if not generation.stream_revisions:
+    # A force-removal reissues already-authorized live state for named instances. Its
+    # document orders the operation, but it does not select a promoted projection.
+    if (generation.removal_context or {}).get("force"):
         return None
     return {
         model: [row for row in rows if getattr(row, "accepted_at", True)]
@@ -1530,7 +1532,14 @@ async def _replace_bgp(
     await _guarded_apply(client, device, "bgp", context, _apply)
 
 
-async def _replace_interface_config(db: AsyncSession, device, client, interface_names: list[str]) -> None:
+async def _replace_interface_config(
+    db: AsyncSession,
+    device,
+    client,
+    interface_names: list[str],
+    *,
+    job_id: int | None = None,
+) -> None:
     """Propagate interface attribute/IP removal for each affected interface.
 
     interface-reconciler is keyed by ``(device, interface-name)``, so each interface is its
@@ -1540,42 +1549,72 @@ async def _replace_interface_config(db: AsyncSession, device, client, interface_
     everything it created there — the operator wants nothing managed).
     """
     from nso_adapter.core.apply import _nokia_routed_kind
+    from nso_adapter.core.generation import executing_generation
+    from nso_adapter.core.projection import hydrate_interface_execution
     from nso_adapter.nso.apply import build_interface_config_entry, delete_interface_config, replace_interface_config
     from nso_adapter.store.models import DbInterface, InterfaceIntent, InterfaceIpIntent
 
+    document_rows = await _replacement_section_rows(db, "interface_config", job_id)
+    if document_rows is not None:
+        generation = await executing_generation(db, job_id)
+        execution = hydrate_interface_execution(generation.document)
+        interfaces = {iface.name: iface for iface in execution.interfaces.values()}
+        attr_by_iface: dict[int, list] = {}
+        ip_by_iface: dict[int, list] = {}
+        for row in document_rows.get(InterfaceIntent, []):
+            if row.attribute in ("description", "enabled"):
+                attr_by_iface.setdefault(row.interface_id, []).append(row)
+        for row in document_rows.get(InterfaceIpIntent, []):
+            ip_by_iface.setdefault(row.interface_id, []).append(row)
+    else:
+        interfaces = {}
+        attr_by_iface = {}
+        ip_by_iface = {}
+
     for name in interface_names:
-        iface = (
-            (await db.execute(select(DbInterface).where(DbInterface.device_id == device.id, DbInterface.name == name)))
-            .scalars()
-            .first()
-        )
+        iface = interfaces.get(name)
+        if document_rows is None:
+            iface = (
+                (
+                    await db.execute(
+                        select(DbInterface).where(DbInterface.device_id == device.id, DbInterface.name == name)
+                    )
+                )
+                .scalars()
+                .first()
+            )
         if iface is None:
             await delete_interface_config(client, device.nso_device_name, name)
             continue
-        ip_rows = (
-            (
-                await db.execute(
-                    select(InterfaceIpIntent).where(
-                        InterfaceIpIntent.interface_id == iface.id, InterfaceIpIntent.accepted_at.is_not(None)
+        if document_rows is None:
+            ip_rows = (
+                (
+                    await db.execute(
+                        select(InterfaceIpIntent).where(
+                            InterfaceIpIntent.interface_id == iface.id,
+                            InterfaceIpIntent.accepted_at.is_not(None),
+                        )
                     )
                 )
+                .scalars()
+                .all()
             )
-            .scalars()
-            .all()
-        )
-        attr_rows = (
-            (
-                await db.execute(
-                    select(InterfaceIntent).where(
-                        InterfaceIntent.interface_id == iface.id,
-                        InterfaceIntent.accepted_at.is_not(None),
-                        InterfaceIntent.attribute.in_(("description", "enabled")),
+            attr_rows = (
+                (
+                    await db.execute(
+                        select(InterfaceIntent).where(
+                            InterfaceIntent.interface_id == iface.id,
+                            InterfaceIntent.accepted_at.is_not(None),
+                            InterfaceIntent.attribute.in_(("description", "enabled")),
+                        )
                     )
                 )
+                .scalars()
+                .all()
             )
-            .scalars()
-            .all()
-        )
+        else:
+            ip_rows = ip_by_iface.get(iface.id, [])
+            attr_rows = attr_by_iface.get(iface.id, [])
         if not ip_rows and not attr_rows:
             await delete_interface_config(client, device.nso_device_name, name)
             continue
@@ -1723,7 +1762,13 @@ async def _dispatch_scope(
     elif scope == "logging":
         await _replace_logging(db, device, client, context, job_id=job_id)
     elif scope == "interface_config":
-        await _replace_interface_config(db, device, client, (context or {}).get("interfaces") or [])
+        await _replace_interface_config(
+            db,
+            device,
+            client,
+            (context or {}).get("interfaces") or [],
+            job_id=job_id,
+        )
     elif scope in _SIMPLE_TARGETS:
         await _replace_simple(db, device, client, scope, context, job_id=job_id)
     else:

@@ -64,10 +64,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.projection import (
     ACTION_APPLY_EXECUTABLE_SECTIONS,
-    DOCUMENT_EXECUTED_SECTIONS,
+    InterfaceEligibilityUnresolved,
     is_intent_deletion,
     projection_row_state,
     projection_streams,
+    record_interface_execution,
     rows_by_intent_identity,
     snapshot_stream,
     stream_section,
@@ -831,13 +832,22 @@ async def _store_generation(
     settlement_cohort: int | None,
 ) -> DeploymentGeneration:
     """Allocate the sequence and write the immutable row. The projection lock is held."""
+    body = deepcopy(document)
+    if (removal_context or {}).get("scope") == "interface_config":
+        section = body.setdefault("interface_config", {})
+        section.setdefault("interface_intent", [])
+        section.setdefault("interface_ip_intent", [])
+    try:
+        await record_interface_execution(db, device_id, body)
+    except InterfaceEligibilityUnresolved:
+        raise ApplyUnexecutable({"interface_config": "interface_attribute_eligibility_unresolved"}) from None
     generation = DeploymentGeneration(
         device_id=device_id,
         seq=await _next_seq(db, device_id),
         mode=mode,
         status=GenerationStatus.pending,
-        document=document,
-        digest=digest_document(mode, document, allowed_removal_keys),
+        document=body,
+        digest=digest_document(mode, body, allowed_removal_keys),
         allowed_removal_keys=allowed_removal_keys,
         source_push_seq=source_push_seq,
         stream_revisions=stream_revisions,
@@ -856,7 +866,7 @@ async def _store_generation(
         seq=generation.seq,
         mode=mode.value,
         streams=sorted(stream_revisions),
-        document_sections=sorted(document),
+        document_sections=sorted(body),
         digest=generation.digest[:12],
     )
     return generation
@@ -924,20 +934,18 @@ async def _job_generations(db: AsyncSession, job_id: int) -> list[DeploymentGene
     )
 
 
-async def document_execution_sections(db: AsyncSession, job_id: int) -> frozenset[str] | None:
-    """Return the exact document sections this job can execute without live reads.
+async def generation_execution_sections(db: AsyncSession, job_id: int) -> frozenset[str] | None:
+    """Return the sections carried by this job, or ``None`` when it carries no generation.
 
-    Adjacent generations can share one apply job. Restrict the run only when every stream
-    carried by every generation is document-executed, or an earlier live-read generation
-    could settle without being sent. ``None`` keeps that mixed job on the legacy runner.
+    Adjacent generations can share one apply job. Their sections form the execution boundary.
+    Each section independently selects its source: document-executed sections use the highest
+    generation's complete document, while a live-read section still uses the current store.
     """
-    streams = {
-        stream for generation in await _job_generations(db, job_id) for stream in (generation.stream_revisions or {})
-    }
-    sections = frozenset(stream_section(stream) for stream in streams)
-    if sections and sections <= DOCUMENT_EXECUTED_SECTIONS:
-        return sections
-    return None
+    generations = await _job_generations(db, job_id)
+    if not generations:
+        return None
+    streams = {stream for generation in generations for stream in (generation.stream_revisions or {})}
+    return frozenset(stream_section(stream) for stream in streams)
 
 
 class GenerationTampered(RuntimeError):
@@ -1598,7 +1606,7 @@ __all__ = [
     "create_action_apply",
     "create_reissue_generation",
     "digest_document",
-    "document_execution_sections",
+    "generation_execution_sections",
     "executable_head",
     "executing_generation",
     "job_admissible",

@@ -130,7 +130,7 @@ async def test_apply_attributes_threads_nokia_routed_context():
 
     client, bodies = _capturing_nso_client()
     ok, failed, failures = await _apply_attributes(
-        [(attr_state, intent, iface)],
+        [(attr_state, intent, iface, intent)],
         apply_interface_attribute,
         client=client,
         device_name="ra1",
@@ -160,7 +160,7 @@ async def test_apply_attributes_threads_lag_kind_for_a_nokia_lag():
 
     client, bodies = _capturing_nso_client()
     await _apply_attributes(
-        [(attr_state, intent, iface)],
+        [(attr_state, intent, iface, intent)],
         apply_interface_attribute,
         client=client,
         device_name="ra1",
@@ -186,7 +186,7 @@ async def test_apply_attributes_ios_interface_omits_routed_context():
 
     client, bodies = _capturing_nso_client()
     await _apply_attributes(
-        [(attr_state, intent, iface)],
+        [(attr_state, intent, iface, intent)],
         apply_interface_attribute,
         client=client,
         device_name="core-rtr-01",

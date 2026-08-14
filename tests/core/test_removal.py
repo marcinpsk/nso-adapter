@@ -772,6 +772,54 @@ async def test_dispatch_interface_config_puts_remaining_and_deletes_empty(adapte
     assert delete_fn.await_args.args[1] == "sw3" and delete_fn.await_args.args[2] == "Gi0/1"
 
 
+async def test_interface_config_removal_rows_come_from_the_generation_document(adapter_client):
+    """A successor attribute cannot replace the selected removal document's retained row."""
+    from nso_adapter.store.models import DbInterface, InterfaceAttrState, InterfaceIntent, SyncState
+
+    device_id = await _seed_device(nso_device_name="removal-document-interface-config")
+    async with session() as db:
+        iface = DbInterface(device_id=device_id, name="Gi0/0")
+        db.add(iface)
+        await db.flush()
+        db.add(InterfaceAttrState(interface_id=iface.id, attribute="description", sync_state=SyncState.accepted))
+        db.add(
+            InterfaceIntent(
+                interface_id=iface.id,
+                attribute="description",
+                intent_value="selected description",
+                accepted_at=_NOW,
+            )
+        )
+        iface_id = iface.id
+        await db.commit()
+
+    job_id = await _seed_removal_job(
+        device_id,
+        "interface_config",
+        {"interfaces": ["Gi0/0"]},
+    )
+    async with session() as db:
+        row = await db.scalar(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface_id))
+        row.intent_value = "successor description"
+        await db.commit()
+
+    replace_fn = AsyncMock()
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with patch("nso_adapter.nso.apply.replace_interface_config", replace_fn):
+            await removal_mod._dispatch_scope(
+                db,
+                device,
+                _CLIENT,
+                "interface_config",
+                {"interfaces": ["Gi0/0"]},
+                job_id=job_id,
+            )
+
+    replace_fn.assert_awaited_once()
+    assert replace_fn.await_args.args[3]["description"] == "selected description"
+
+
 async def test_dispatch_scope_unknown_raises(adapter_client):
     device_id = await _seed_device()
     async with session() as db:
