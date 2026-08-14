@@ -623,10 +623,6 @@ async def put_bgp_intent(
         mutation_count=router_count,
         removal_generation_count=int(removal_requested),
     )
-    if apply_requested:
-        from nso_adapter.core.apply import enqueue_apply
-
-        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
     if removal_requested:
         from nso_adapter.core.removal import enqueue_removal, query_flag_marking
 
@@ -648,6 +644,10 @@ async def put_bgp_intent(
             retract=cleared,
             shrank=shrank,
         )
+    if apply_requested:
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
 
     await _maybe_enqueue_apply(db, device_id, router_count, stream=delivery.stream)
 

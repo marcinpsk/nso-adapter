@@ -250,7 +250,7 @@ async def test_put_route_policy_intent_auto_apply_creates_generation(adapter_cli
 
     response = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers={**AUTH, "X-Push-Seq": "7965"},
+        headers=AUTH | push_seq(),
         json={"objects": [_obj("prefix_list", "PL-AUTO", accepted=True)]},
     )
 

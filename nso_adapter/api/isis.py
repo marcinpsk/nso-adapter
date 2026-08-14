@@ -624,10 +624,6 @@ async def put_isis_interface_intent(
         mutation_count=iface_count + proc_count,
         removal_generation_count=int(removal_requested),
     )
-    if apply_requested:
-        from nso_adapter.core.apply import enqueue_apply
-
-        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
     if removal_requested:
         from nso_adapter.core.removal import enqueue_removal, query_flag_marking
 
@@ -646,6 +642,10 @@ async def put_isis_interface_intent(
             retract=cleared,
             shrank=deleted,
         )
+    if apply_requested:
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
 
     result = {"device_id": device_id, "interface_count": iface_count, "process_count": proc_count}
     await record_response(db, device_id, delivery, result)
@@ -766,11 +766,6 @@ async def put_isis_flex_algo_intent(
         mutation_count=count,
         removal_generation_count=int(removal_requested),
     )
-    if apply_requested:
-        from nso_adapter.core.apply import enqueue_apply
-
-        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
-
     # A merge-PATCH apply never drops an omitted flex-algo (and a node-level DELETE can't
     # address an empty-string process-tag key), so retracting one needs a PUT-replace of
     # the whole service. Queue the async ``isis`` removal job — :func:`_replace_isis`
@@ -801,6 +796,11 @@ async def put_isis_flex_algo_intent(
             shrank=bool(removed_keys),
         )
         removal_queued = job is not None
+
+    if apply_requested:
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
 
     result = {"device_id": device_id, "flex_algo_count": count, "removal_queued": removal_queued}
     await record_response(db, device_id, delivery, result)
