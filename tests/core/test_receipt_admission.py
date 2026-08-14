@@ -166,6 +166,31 @@ def test_every_in_protocol_put_uses_the_shared_delivery_seam():
             assert "note_write" not in source, f"{route.path} owns projection-write ordering again"
 
 
+async def test_shared_delivery_seam_records_the_required_delivery_sequence(adapter_client):
+    """Admission records the sequence carried by the immutable delivery object."""
+    from nso_adapter.api.intent_push import begin_delivery
+    from nso_adapter.core.receipt import IntentDelivery, PushIdentity
+
+    device_id = await seed_device(nso_device_name="rcp-shared-sequence", netbox_device_id=None)
+    delivery = IntentDelivery(
+        stream="vlan",
+        identity=PushIdentity(
+            seq=73,
+            digest="0" * 64,
+            store_only=False,
+            delete_origin=False,
+            backfill_only=False,
+        ),
+    )
+
+    async with session() as db:
+        assert await begin_delivery(db, device_id, delivery) is None
+        await db.commit()
+
+    stream = await _projection_stream(device_id, "vlan")
+    assert stream.source_push_seq == 73
+
+
 def test_the_minimal_body_table_covers_every_in_protocol_endpoint():
     from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS
 

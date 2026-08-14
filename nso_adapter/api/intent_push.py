@@ -127,8 +127,7 @@ async def begin_delivery(db: AsyncSession, device_id: int, delivery: IntentDeliv
     """Record and admit one intent delivery under the device projection lock."""
     from nso_adapter.core.generation import note_write
 
-    push_seq = delivery.identity.seq if delivery.identity is not None else None
-    await note_write(db, device_id, delivery.stream, push_seq=push_seq)
+    await note_write(db, device_id, delivery.stream, push_seq=delivery.push_seq)
     return await admit_or_replay(db, device_id, delivery)
 
 
