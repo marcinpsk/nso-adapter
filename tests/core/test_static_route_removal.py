@@ -972,13 +972,28 @@ async def test_any_carried_static_route_generation_makes_unproven_removal_fail(a
     mode = GenerationMode.networked
     async with session() as db:
         for seq, stream_revisions in ((1, {"vlan": 1}), (2, {"static_route": 1})):
+            document = {}
+            if "static_route" in stream_revisions:
+                document = {
+                    "static_route": {
+                        "_execution": {
+                            "removal": {
+                                "authorized_removal_keys": [list(A)],
+                                "claimed_keys": [],
+                                "tombstone_ids": [],
+                                "candidate_clears": [],
+                                "reclaimed_keys": [],
+                            }
+                        }
+                    }
+                }
             db.add(
                 DeploymentGeneration(
                     device_id=device_id,
                     seq=seq,
                     mode=mode,
-                    document={},
-                    digest=digest_document(mode, {}, {}),
+                    document=document,
+                    digest=digest_document(mode, document, {}),
                     allowed_removal_keys={},
                     source_push_seq={},
                     stream_revisions=stream_revisions,
