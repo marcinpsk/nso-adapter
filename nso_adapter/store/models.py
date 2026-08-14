@@ -570,9 +570,9 @@ class IntentPushReceipt(Base):
 
     ``request_digest`` is sha256 over the canonical JSON of the RAW wire body, so two
     deliveries of the same push digest alike whatever the store does with them. The digest
-    does NOT cover the request MODE — the body says nothing about ``?store_only`` or
-    ``?delete_origin``, and one sequence carrying one body under two of those is two
-    different deployments — so the two flags are stored as columns and compared alongside it.
+    does NOT cover the request MODE — the body says nothing about ``?store_only``,
+    ``?delete_origin``, or ``?backfill_only``. The three flags are stored as columns and
+    compared alongside it, because one body under two modes is two different operations.
     ``section`` holds the intent-ENDPOINT vocabulary (:mod:`core.intent_protocol`), one
     receipt per outbox STREAM, which is why ``ip`` and ``interface_config`` are separate rows
     even though they compose into one projection family. The code calls that vocabulary

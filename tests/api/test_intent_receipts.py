@@ -84,17 +84,35 @@ async def test_o2b_9_every_per_key_receipt_is_served_with_both_global_maxima(ada
 async def test_o2b_9_the_receipt_reports_the_mode_it_was_admitted_under(adapter_client):
     """O2b.9 — a restored claim's digest comparison is only decidable beside its mode."""
     device_id = await seed_device(nso_device_name="rcpt-mode", netbox_device_id=None)
+    await seed_intent(device_id, [{"triple": A, "route_id": None}])
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/vlan-intent?store_only=true",
         json={"vlans": []},
         headers={**AUTH, "X-Push-Seq": "3"},
     )
     assert resp.status_code == 200
+    backfill = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/static-route-intent?backfill_only=true",
+        json={"routes": [entry(A, route_id=4242)], "deleted_routes": []},
+        headers={**AUTH, "X-Push-Seq": "4"},
+    )
+    assert backfill.status_code == 200
 
-    row = by_key((await adapter_client.get(URL, headers=AUTH)).json())[(device_id, "vlan")]
+    rows = by_key((await adapter_client.get(URL, headers=AUTH)).json())
+    store_only_row = rows[(device_id, "vlan")]
+    backfill_row = rows[(device_id, "static_route")]
 
-    assert (row["store_only"], row["delete_origin"], row["backfill_only"]) == (True, False, False)
-    assert len(row["request_digest"]) == 64
+    assert (
+        store_only_row["store_only"],
+        store_only_row["delete_origin"],
+        store_only_row["backfill_only"],
+    ) == (True, False, False)
+    assert (
+        backfill_row["store_only"],
+        backfill_row["delete_origin"],
+        backfill_row["backfill_only"],
+    ) == (False, False, True)
+    assert len(store_only_row["request_digest"]) == len(backfill_row["request_digest"]) == 64
 
 
 async def test_o2b_9_the_surface_filters_by_device_and_by_section(adapter_client):

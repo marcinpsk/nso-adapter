@@ -752,10 +752,11 @@ async def _apply_backfill_only(device_id: int, body: StaticRouteIntentUpdate, db
     * it LEAVES every omitted row that carries a ``route_id`` exactly as it is. That is the
       before-image protection, and it is what makes the mode safe for a pending deletion;
     * it PRUNES every omitted row whose ``route_id`` is NULL, reporting each in
-      ``removed_uncorrelated`` (R6-B4). The fence predicate is exactly
-      ``null_route_id_count(rows) == 0``, so pruning those rows is both necessary and
-      sufficient — and safe by definition, because a NULL row correlates with no NetBox pk and
-      can never be the subject of a genuine deletion;
+      ``removed_uncorrelated`` (R6-B4). A matched NULL row must receive an id from the
+      payload, or the pass is refused. The fence predicate is exactly
+      ``null_route_id_count(rows) == 0``, so these two operations are necessary and
+      sufficient — and pruning is safe by definition, because a NULL row correlates with no
+      NetBox pk and can never be the subject of a genuine deletion;
     * it SPAWNS nothing: no removal job, no tombstone, no auto-apply, so the pass can never
       cause a device write. A payload entry matching no row creates no row either — an
       ordinary push does that.
@@ -767,6 +768,25 @@ async def _apply_backfill_only(device_id: int, body: StaticRouteIntentUpdate, db
         (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id))).scalars().all()
     )
     matched, omitted = _match_payload_to_rows(body.routes, existing)
+
+    residual_nulls = [
+        _triple(item)
+        for index, item in enumerate(body.routes)
+        if (row := matched.get(index)) is not None and row.route_id is None and item.route_id is None
+    ]
+    if residual_nulls:
+        raise api_error(
+            422,
+            "validation_error",
+            "A backfill-only pass must assign a route_id to every matched uncorrelated row",
+            {
+                "reason": "backfill_missing_route_id",
+                "routes": [
+                    {"vrf": vrf, "prefix": prefix, "next_hop": next_hop}
+                    for vrf, prefix, next_hop in sorted(residual_nulls)
+                ],
+            },
+        )
 
     adopted: list[StaticRouteIntent] = []
     for index in range(len(body.routes)):

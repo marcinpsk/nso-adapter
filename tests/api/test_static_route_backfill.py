@@ -140,6 +140,29 @@ async def test_o2b_10_the_pass_leaves_a_row_the_payload_still_names(adapter_clie
     assert _row(rows, A) is not None, "the omitted non-NULL row was pruned"
 
 
+async def test_o2b_10_a_backfill_cannot_acknowledge_a_matched_row_without_a_route_id(adapter_client):
+    """A successful backfill must leave no NULL route id behind to hold the fence shut."""
+    device_id = await _seed_fence_shut_key("residual-null", 9949)
+    before = await read_intent_all_columns(device_id)
+
+    response = await put(
+        adapter_client,
+        device_id,
+        [entry(B), entry(C, route_id=101)],
+        deleted_routes=[],
+        query="?backfill_only=true",
+        seq=1,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["detail"] == {
+        "reason": "backfill_missing_route_id",
+        "routes": [wire_triple(B)],
+    }
+    assert await read_intent_all_columns(device_id) == before
+    assert await receipt(device_id) is None
+
+
 async def test_o2b_10_the_pass_writes_no_content_onto_a_matched_row(adapter_client):
     """O2b.10 — the mode adopts ids and NOTHING else, so a drifted row stays drifted.
 
@@ -251,10 +274,11 @@ async def test_o2b_13_an_unverified_deletion_survives_the_backfill_that_prunes_i
     """O2b.13 arm 4 (R10-B3) — a genuine R and an unverified U in one fence-shut request.
 
     The whole request takes ``409 fence_shut`` before U is ever classified, so the backfill
-    then prunes U's row A. Recording only exact lineage matches is how codex's case escapes:
-    ``[C]`` does not match A, and the next ordinary request moots U SILENTLY. The backfill's
+    then prunes the residue row B, the only ``route_id IS NULL`` row. Recording only exact
+    lineage matches is how codex's case escapes: ``[C]`` does not match B, and the next
+    ordinary request moots U SILENTLY. The backfill's
     ``removed_uncorrelated`` is what drives the pusher's request-wide conservative rule, so it
-    must name A's triple — and R's own deletion must still execute afterwards.
+    must name B's triple — and R's own deletion must still execute afterwards.
     """
     device_id = await _seed_fence_shut_key("mixed", 9946)
 

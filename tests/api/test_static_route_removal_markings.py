@@ -33,7 +33,7 @@ pytestmark = pytest.mark.anyio
 
 
 async def read_generations(device_id: int) -> list[dict]:
-    """(seq, mode, status) plus whether the generation carries a removal context."""
+    """Return seq, mode, job_id, and the full removal_context for each generation."""
     from nso_adapter.store.models import DeploymentGeneration
 
     async with session() as db:
