@@ -21,6 +21,7 @@ from nso_adapter.api.config import router as config_router
 from nso_adapter.api.devices import router as devices_router
 from nso_adapter.api.errors import (
     ApiError,
+    api_error,
     api_error_handler,
     framework_http_error_handler,
     projection_gone_handler,
@@ -54,7 +55,7 @@ from nso_adapter.api.vlan import router as vlan_router
 from nso_adapter.config import get_config, get_env_settings
 from nso_adapter.core.generation import DeviceProjectionGone
 from nso_adapter.core.importer import register_nso_client, set_netbox_client
-from nso_adapter.core.request_flags import BACKFILL_ONLY, DELETE_ORIGIN, STORE_ONLY, parse_store_only
+from nso_adapter.core.request_flags import BACKFILL_ONLY, DELETE_ORIGIN, STORE_ONLY, parse_request_flag
 from nso_adapter.core.scheduler import start_scheduler, stop_scheduler
 from nso_adapter.core.worker import start_workers, stop_workers
 from nso_adapter.notifications.persistent_subscriber import persistent_subscriber
@@ -376,7 +377,7 @@ def create_app() -> FastAPI:
     app.add_exception_handler(DeviceProjectionGone, projection_gone_handler)
 
     @app.middleware("http")
-    async def _store_only_flag(request, call_next):
+    async def _request_mode_flags(request, call_next):
         # ?store_only=true → this request must not create device-touching jobs
         # (removal/apply); ?delete_origin=true → this intent push comes from a NetBox
         # object DELETION, so a shrink may retract from the device (unmarked shrinks
@@ -385,12 +386,28 @@ def create_app() -> FastAPI:
         # The third piece of a delivery's identity, X-Push-Seq, is NOT parsed here: it is a
         # declared parameter of every in-protocol intent PUT and nothing else consumes it,
         # so it lives on the delivery dependency where OpenAPI can see it.
-        token = STORE_ONLY.set(parse_store_only(request.query_params.get("store_only")))
-        del_token = DELETE_ORIGIN.set(parse_store_only(request.query_params.get("delete_origin")))
+        modes = {}
+        for parameter in ("store_only", "delete_origin", "backfill_only"):
+            raw = request.query_params.get(parameter)
+            try:
+                modes[parameter] = parse_request_flag(raw)
+            except ValueError:
+                return await api_error_handler(
+                    request,
+                    api_error(
+                        422,
+                        "validation_error",
+                        f"{parameter} must be a boolean",
+                        {"parameter": parameter, "value": raw},
+                    ),
+                )
+
+        token = STORE_ONLY.set(modes["store_only"])
+        del_token = DELETE_ORIGIN.set(modes["delete_origin"])
         # ?backfill_only=true → an id-backfill pass that opens a device's replacement fence and
         # writes nothing else (#1503 §4.4). Parsed here with its two siblings so the three
         # request modes have one spelling; only the static-route stream implements it.
-        backfill_token = BACKFILL_ONLY.set(parse_store_only(request.query_params.get("backfill_only")))
+        backfill_token = BACKFILL_ONLY.set(modes["backfill_only"])
         try:
             return await call_next(request)
         finally:

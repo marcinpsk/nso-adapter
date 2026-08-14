@@ -50,6 +50,7 @@ DETACH_MARKING = "detach"
 REMOVAL_MARKINGS: tuple[str, ...] = (DELETE_ORIGIN_MARKING, DETACH_MARKING)
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
+_FALSY = frozenset({"0", "false", "no", "off"})
 
 #: The admissible ``X-Push-Seq`` domain, and the bounds DECLARED on every in-protocol intent
 #: PUT (:func:`api.intent_push.get_intent_delivery`). The upper bound is the BIGINT the
@@ -60,9 +61,16 @@ MIN_PUSH_SEQ = 1
 MAX_PUSH_SEQ = 2**63 - 1
 
 
-def parse_store_only(raw: str | None) -> bool:
-    """Parse a raw boolean query value (mirrors FastAPI's bool query coercion)."""
-    return raw is not None and raw.strip().lower() in _TRUTHY
+def parse_request_flag(raw: str | None) -> bool:
+    """Parse one request-mode boolean, or refuse an unknown spelling."""
+    if raw is None:
+        return False
+    normalized = raw.strip().lower()
+    if normalized in _TRUTHY:
+        return True
+    if normalized in _FALSY:
+        return False
+    raise ValueError(f"invalid boolean query value {raw!r}")
 
 
 def request_marking() -> str:

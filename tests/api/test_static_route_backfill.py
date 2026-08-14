@@ -208,6 +208,30 @@ async def test_o2b_10_a_backfill_body_carrying_deletion_authority_is_refused(ada
     assert await receipt(device_id) is None
 
 
+async def test_o2b_10_a_malformed_backfill_flag_has_no_effect(adapter_client):
+    """A typo cannot turn a backfill request into an ordinary full replacement."""
+    device_id = await _seed_fence_shut_key("malformed-flag", None)
+    before = await read_intent_all_columns(device_id)
+
+    response = await put(
+        adapter_client,
+        device_id,
+        [entry(C, route_id=101)],
+        deleted_routes=[],
+        query="?backfill_only=tru",
+        seq=1,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["detail"] == {
+        "parameter": "backfill_only",
+        "value": "tru",
+    }
+    assert await read_intent_all_columns(device_id) == before
+    assert await read_jobs(device_id) == []
+    assert await receipt(device_id) is None
+
+
 async def test_o2b_10_a_replay_at_the_same_sequence_returns_the_stored_response(adapter_client):
     """O2b.10 negative — the pass is an admitted operation, so a redelivery applies nothing."""
     device_id = await _seed_fence_shut_key("replay", 9944)

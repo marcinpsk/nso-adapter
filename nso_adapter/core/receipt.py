@@ -74,8 +74,8 @@ class PushSequenceConflict(Exception):
 class PushIdentity:
     """One delivery's identity: the claim sequence, the body digest, and the request MODE.
 
-    The two mode flags are the canonical form of what the middleware parsed off the query
-    string (``core.request_flags.parse_store_only``), so "absent", ``0`` and ``no`` are one
+    The three mode flags are the canonical form of what the middleware parsed off the query
+    string (``core.request_flags.parse_request_flag``), so "absent", ``0`` and ``no`` are one
     identity and cannot be replayed as ``true``.
     """
 
