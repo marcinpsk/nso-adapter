@@ -25,7 +25,7 @@ from functools import cache
 from typing import NamedTuple
 
 import structlog
-from sqlalchemy import delete, select
+from sqlalchemy import delete, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, JobError, error_envelope
@@ -1291,10 +1291,15 @@ async def _finalize_static_route_removal(db, job_id: int, device, client, out: S
     else:
         proven, residue_found, per_field = await _sr_networked_proof(db, client, device, out, result)
 
-    promoted_streams = await db.scalar(
-        select(DeploymentGeneration.stream_revisions).where(DeploymentGeneration.job_id == job_id).limit(1)
+    promotes_static_route = await db.scalar(
+        select(
+            exists().where(
+                DeploymentGeneration.job_id == job_id,
+                DeploymentGeneration.stream_revisions["static_route"].as_string().is_not(None),
+            )
+        )
     )
-    promoted_context = bool(out.authorized) and "static_route" in (promoted_streams or {})
+    promoted_context = bool(out.authorized) and bool(promotes_static_route)
     owns_carrier = bool(out.tombstone_ids) or bool(out.clears) or promoted_context
     consume = proven and not residue_found
 
@@ -2265,6 +2270,10 @@ class PromotionRemovalContext(NamedTuple):
     vault_refs: dict[str, str] | None
 
 
+class PromotionInterfaceUnresolved(ValueError):
+    """A projection delta refers to an interface row that no longer exists."""
+
+
 def _row_keys(rows: dict[str, list[dict]], table: str, *fields: str) -> list:
     values = []
     for row in rows.get(table, []):
@@ -2330,6 +2339,9 @@ async def _promotion_interface_context(
                 )
             ).all()
         )
+    unresolved = sorted(set(interface_ids) - names_by_id.keys())
+    if unresolved:
+        raise PromotionInterfaceUnresolved(f"unresolved interface ids: {unresolved}")
     interfaces = sorted({names_by_id[row["interface_id"]] for row in all_rows if row["interface_id"] in names_by_id})
     address_keys = [
         (names_by_id[row["interface_id"]], row.get("address") or "", row.get("vrf") or "")

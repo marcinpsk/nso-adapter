@@ -29,7 +29,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import Numeric, and_, case, cast, column, func, literal_column, select, true
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_read_db, verify_token
@@ -39,6 +40,30 @@ from nso_adapter.core.intent_protocol import INTENT_STREAMS
 from nso_adapter.store.models import IntentPushReceipt, StaticRouteIntent, StaticRouteTombstone
 
 router = APIRouter(prefix="/api/v1/intent-receipts", tags=["intent-receipts"])
+
+
+async def _max_receipt_route_id(db: AsyncSession) -> int | None:
+    """Return the largest integer route id held in receipt promotion provenance."""
+    response = cast(IntentPushReceipt.response, JSONB)
+    raw_deletions = response["_promotion_deletions"]
+    deletions = case(
+        (func.jsonb_typeof(raw_deletions) == "array", raw_deletions),
+        else_=literal_column("'[]'::jsonb", type_=JSONB),
+    )
+    records = func.jsonb_array_elements(deletions).table_valued(column("value", JSONB)).lateral()
+    route_id = records.c.value["route_id"]
+    route_text = route_id.astext
+    integer_value = case(
+        (
+            and_(
+                func.jsonb_typeof(route_id) == "number",
+                route_text.op("~")(r"^-?[0-9]+$"),
+            ),
+            cast(route_text, Numeric),
+        )
+    )
+    maximum = await db.scalar(select(func.max(integer_value)).select_from(IntentPushReceipt).join(records, true()))
+    return int(maximum) if maximum is not None else None
 
 
 class IntentReceiptOut(BaseModel):
@@ -123,16 +148,9 @@ async def list_intent_receipts(
     max_push_seq = await db.scalar(select(func.max(IntentPushReceipt.push_seq)))
     max_live_route_id = await db.scalar(select(func.max(StaticRouteIntent.route_id)))
     max_tombstoned_route_id = await db.scalar(select(func.max(StaticRouteTombstone.route_id)))
-    receipt_responses = (await db.execute(select(IntentPushReceipt.response))).scalars().all()
-    receipt_route_ids = [
-        record["route_id"]
-        for response in receipt_responses
-        if isinstance(response, dict)
-        for record in response.get("_promotion_deletions") or []
-        if isinstance(record, dict) and isinstance(record.get("route_id"), int)
-    ]
+    max_receipt_route_id = await _max_receipt_route_id(db)
     held_route_ids = [
-        value for value in (max_live_route_id, max_tombstoned_route_id, *receipt_route_ids) if value is not None
+        value for value in (max_live_route_id, max_tombstoned_route_id, max_receipt_route_id) if value is not None
     ]
 
     return {

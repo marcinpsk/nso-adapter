@@ -11,6 +11,8 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from tests.api.test_static_route_deleted_routes import deleted as deleted_route
+from tests.api.test_static_route_identity import entry as route_entry
 from tests.conftest import VALID_TOKEN, seed_device, session
 from tests.core.test_generation_protocol import seed_settings
 
@@ -22,27 +24,6 @@ _A = ("", "198.18.1.0/24", "192.0.2.1")
 _B = ("", "198.18.2.0/24", "192.0.2.2")
 _C = ("", "198.18.3.0/24", "192.0.2.3")
 _D = ("", "198.18.4.0/24", "192.0.2.4")
-
-
-def _route(route_id: int, triple, *, generation: int, metric: int | None = None) -> dict:
-    vrf, prefix, next_hop = triple
-    return {
-        "route_id": route_id,
-        "generation": generation,
-        "vrf": vrf,
-        "prefix": prefix,
-        "next_hop": next_hop,
-        **({"metric": metric} if metric is not None else {}),
-    }
-
-
-def _deleted(route_id: int, triple) -> dict:
-    vrf, prefix, next_hop = triple
-    return {
-        "route_id": route_id,
-        "triples": [{"vrf": vrf, "prefix": prefix, "next_hop": next_hop}],
-        "unverified": False,
-    }
 
 
 async def _put_routes(client, device_id: int, routes: list[dict], *, seq: int, query: str = "", deleted=None):
@@ -160,9 +141,9 @@ async def _mixed_case(client, *, suffix: int):
         client,
         device_id,
         [
-            _route(1, _A, generation=1),
-            _route(2, _B, generation=1),
-            _route(3, _C, generation=1),
+            route_entry(_A, route_id=1, generation=1),
+            route_entry(_B, route_id=2, generation=1),
+            route_entry(_C, route_id=3, generation=1),
         ],
         seq=baseline_seq,
     )
@@ -174,9 +155,9 @@ async def _mixed_case(client, *, suffix: int):
     promoted = await _put_routes(
         client,
         device_id,
-        [_route(1, _A, generation=2, metric=20), _route(4, _D, generation=1)],
+        [route_entry(_A, route_id=1, generation=2, metric=20), route_entry(_D, route_id=4, generation=1)],
         seq=promoted_seq,
-        deleted=[_deleted(2, _B)],
+        deleted=[deleted_route(2, [_B])],
     )
     assert promoted.status_code == 200, promoted.text
     chain = await _generations(device_id)
@@ -272,7 +253,7 @@ async def test_action_apply_does_not_promote_a_later_unselected_push(adapter_cli
 
     response = await _apply(adapter_client, device_id, {"vlan": 4101})
 
-    assert response.status_code == 202
+    assert response.status_code == 200
     assert response.json() == {
         "device_id": device_id,
         "outcome": "no_op",
@@ -333,12 +314,22 @@ async def test_action_apply_endpoint_returns_selected_generation_contract(adapte
     assert body["skipped"] == {}
     assert len(body["generations"]) == 1
     link = body["generations"][0]
+    assert body["job_id"] == link["job_id"]
     assert link["mode"] == "networked"
     assert link["source_push_seq"] == {"vlan": 4301}
     assert link["stream_revisions"] == {"vlan": 1}
     assert len(link["digest"]) == 64
     assert link["job_id"] is not None
     assert (await _generations(device_id))[0].digest == link["digest"]
+
+
+async def test_action_apply_rejects_a_sequence_above_the_receipt_domain(adapter_client):
+    device_id = await seed_device(nso_device_name="apply-sequence-bound", netbox_device_id=None)
+
+    response = await _apply(adapter_client, device_id, {"vlan": 2**63})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
 
 
 async def test_single_mode_selection_creates_one_generation_without_cohort(adapter_client):
@@ -370,7 +361,7 @@ async def test_apply_accumulates_delete_provenance_across_store_only_receipts(ad
     baseline = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=1), _route(2, _B, generation=1)],
+        [route_entry(_A, route_id=1, generation=1), route_entry(_B, route_id=2, generation=1)],
         seq=baseline_seq,
     )
     assert baseline.status_code == 200, baseline.text
@@ -380,17 +371,17 @@ async def test_apply_accumulates_delete_provenance_across_store_only_receipts(ad
     deleted = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=1)],
+        [route_entry(_A, route_id=1, generation=1)],
         seq=deleted_seq,
         query="?store_only=true",
-        deleted=[_deleted(2, _B)],
+        deleted=[deleted_route(2, [_B])],
     )
     assert deleted.status_code == 200, deleted.text
     edited_seq = 4503
     edited = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=2, metric=30)],
+        [route_entry(_A, route_id=1, generation=2, metric=30)],
         seq=edited_seq,
         query="?store_only=true",
     )
@@ -464,7 +455,7 @@ async def test_apply_does_not_reuse_provenance_consumed_by_an_immediate_promotio
     baseline = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=1), _route(2, _B, generation=1)],
+        [route_entry(_A, route_id=1, generation=1), route_entry(_B, route_id=2, generation=1)],
         seq=5301,
     )
     assert baseline.status_code == 200, baseline.text
@@ -473,10 +464,10 @@ async def test_apply_does_not_reuse_provenance_consumed_by_an_immediate_promotio
     marked_delete = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=2)],
+        [route_entry(_A, route_id=1, generation=2)],
         seq=5302,
         query="?delete_origin=true",
-        deleted=[_deleted(2, _B)],
+        deleted=[deleted_route(2, [_B])],
     )
     assert marked_delete.status_code == 200, marked_delete.text
     for generation in (await _generations(device_id))[1:]:
@@ -485,7 +476,7 @@ async def test_apply_does_not_reuse_provenance_consumed_by_an_immediate_promotio
     restored = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=3), _route(2, _B, generation=2)],
+        [route_entry(_A, route_id=1, generation=3), route_entry(_B, route_id=2, generation=2)],
         seq=5303,
     )
     assert restored.status_code == 200, restored.text
@@ -494,7 +485,7 @@ async def test_apply_does_not_reuse_provenance_consumed_by_an_immediate_promotio
     detached_delete = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=4)],
+        [route_entry(_A, route_id=1, generation=4)],
         seq=5304,
         query="?store_only=true",
     )
@@ -517,7 +508,7 @@ async def test_restored_row_retires_accumulated_deletion_provenance(adapter_clie
     baseline = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=1), _route(2, _B, generation=1)],
+        [route_entry(_A, route_id=1, generation=1), route_entry(_B, route_id=2, generation=1)],
         seq=5701,
     )
     assert baseline.status_code == 200, baseline.text
@@ -526,7 +517,7 @@ async def test_restored_row_retires_accumulated_deletion_provenance(adapter_clie
     detached = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=1)],
+        [route_entry(_A, route_id=1, generation=1)],
         seq=5702,
         query="?store_only=true",
     )
@@ -534,7 +525,7 @@ async def test_restored_row_retires_accumulated_deletion_provenance(adapter_clie
     restored = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=1), _route(2, _B, generation=1)],
+        [route_entry(_A, route_id=1, generation=1), route_entry(_B, route_id=2, generation=1)],
         seq=5703,
         query="?store_only=true",
     )
@@ -542,10 +533,10 @@ async def test_restored_row_retires_accumulated_deletion_provenance(adapter_clie
     deleted = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=1)],
+        [route_entry(_A, route_id=1, generation=1)],
         seq=5704,
         query="?store_only=true&delete_origin=true",
-        deleted=[_deleted(2, _B)],
+        deleted=[deleted_route(2, [_B])],
     )
     assert deleted.status_code == 200, deleted.text
 
@@ -666,7 +657,7 @@ async def test_apply_settlement_fields_do_not_block_a_later_detach(adapter_clien
     baseline = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=1, metric=10), _route(2, _B, generation=1)],
+        [route_entry(_A, route_id=1, generation=1, metric=10), route_entry(_B, route_id=2, generation=1)],
         seq=5801,
     )
     assert baseline.status_code == 200, baseline.text
@@ -675,7 +666,7 @@ async def test_apply_settlement_fields_do_not_block_a_later_detach(adapter_clien
     cleared = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=1), _route(2, _B, generation=1)],
+        [route_entry(_A, route_id=1, generation=1), route_entry(_B, route_id=2, generation=1)],
         seq=5802,
     )
     assert cleared.status_code == 200, cleared.text
@@ -718,7 +709,7 @@ async def test_apply_settlement_fields_do_not_block_a_later_detach(adapter_clien
     detached = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=1)],
+        [route_entry(_A, route_id=1, generation=1)],
         seq=5803,
     )
     assert detached.status_code == 200, detached.text
@@ -760,7 +751,7 @@ async def test_action_apply_refuses_static_route_until_it_executes_from_the_docu
     stored = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=1)],
+        [route_entry(_A, route_id=1, generation=1)],
         seq=6001,
         query="?store_only=true",
     )
@@ -787,7 +778,7 @@ async def test_action_apply_reports_every_skipped_selection_reason(adapter_clien
     device_id = await seed_device(nso_device_name="apply-skipped", netbox_device_id=9971)
     await seed_settings(device_id, auto_apply=False)
     no_receipt = await _apply(adapter_client, device_id, {"vlan": 5100})
-    assert no_receipt.status_code == 202, no_receipt.text
+    assert no_receipt.status_code == 200, no_receipt.text
     assert no_receipt.json() == {
         "device_id": device_id,
         "outcome": "no_op",
@@ -801,7 +792,7 @@ async def test_action_apply_reports_every_skipped_selection_reason(adapter_clien
 
     response = await _apply(adapter_client, device_id, {"vlan": 5101})
 
-    assert response.status_code == 202, response.text
+    assert response.status_code == 200, response.text
     assert response.json() == {
         "device_id": device_id,
         "outcome": "no_op",
@@ -809,6 +800,29 @@ async def test_action_apply_reports_every_skipped_selection_reason(adapter_clien
         "skipped": {"vlan": "already_applied"},
         "generations": [],
     }
+
+
+async def test_action_apply_distinguishes_a_projection_sequence_mismatch(adapter_client):
+    from nso_adapter.store.models import DeviceProjectionStream
+
+    device_id = await seed_device(nso_device_name="apply-revision-mismatch", netbox_device_id=None)
+    await seed_settings(device_id, auto_apply=False)
+    assert (await _put_vlans(adapter_client, device_id, [10], seq=5151, query="?store_only=true")).status_code == 200
+    async with session() as db:
+        projection = await db.scalar(
+            sa.select(DeviceProjectionStream).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == "vlan",
+            )
+        )
+        projection.source_push_seq = 5150
+        await db.commit()
+
+    response = await _apply(adapter_client, device_id, {"vlan": 5151})
+
+    assert response.status_code == 200
+    assert response.json()["skipped"] == {"vlan": "revision_mismatch"}
+    assert await _generations(device_id) == []
 
 
 async def test_action_apply_refuses_detach_combined_with_replacement_work(adapter_client):
@@ -838,7 +852,7 @@ async def test_action_apply_refuses_detach_combined_with_replacement_work(adapte
         "error": {
             "code": "apply_unexecutable",
             "message": "Selected stream(s) cannot be applied faithfully: vlan",
-            "detail": {"streams": {"vlan": "the selected delta combines detach-only removal with replacement work"}},
+            "detail": {"streams": {"vlan": "mixed_detach_replacement"}},
         }
     }
     assert len(await _generations(device_id)) == 1
@@ -866,6 +880,24 @@ async def test_apply_non_static_removal_carries_guarded_keys(adapter_client):
         "removed": {"vlan": [20]},
         "detach": True,
     }
+
+
+async def test_interface_promotion_refuses_an_unresolved_interface_id(adapter_client):
+    from nso_adapter.core.removal import promotion_removal_context
+
+    device_id = await seed_device(nso_device_name="apply-unresolved-interface", netbox_device_id=None)
+    async with session() as db:
+        with pytest.raises(ValueError, match="999999"):
+            await promotion_removal_context(
+                db,
+                device_id,
+                "interface_config",
+                {
+                    "interface_ip_intent": [
+                        {"interface_id": 999999, "address": "198.18.9.1/32", "vrf": ""},
+                    ]
+                },
+            )
 
 
 async def test_action_apply_refuses_interface_streams_that_execute_from_live_rows(adapter_client):
@@ -904,7 +936,7 @@ async def test_apply_static_route_removal_keeps_apply_bookkeeping_job(adapter_cl
     baseline = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=1), _route(2, _B, generation=1)],
+        [route_entry(_A, route_id=1, generation=1), route_entry(_B, route_id=2, generation=1)],
         seq=5001,
     )
     assert baseline.status_code == 200, baseline.text
@@ -912,9 +944,9 @@ async def test_apply_static_route_removal_keeps_apply_bookkeeping_job(adapter_cl
     prepared = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=2, metric=40), _route(3, _C, generation=1)],
+        [route_entry(_A, route_id=1, generation=2, metric=40), route_entry(_C, route_id=3, generation=1)],
         seq=5002,
-        deleted=[_deleted(2, _B)],
+        deleted=[deleted_route(2, [_B])],
     )
     assert prepared.status_code == 200, prepared.text
 
@@ -998,7 +1030,7 @@ async def test_promoted_static_route_detach_fails_when_proof_is_inconclusive(ada
 
     device_id = await seed_device(nso_device_name="apply-static-proof-carrier", netbox_device_id=9976)
     await seed_settings(device_id, auto_apply=True)
-    baseline = await _put_routes(adapter_client, device_id, [_route(1, _A, generation=1)], seq=5601)
+    baseline = await _put_routes(adapter_client, device_id, [route_entry(_A, route_id=1, generation=1)], seq=5601)
     assert baseline.status_code == 200, baseline.text
     await _settle((await _generations(device_id))[0].job_id, GenerationStatus.settled)
     removed = await _put_routes(adapter_client, device_id, [], seq=5602, query="?store_only=true")
@@ -1065,7 +1097,7 @@ async def test_consumed_static_route_tombstone_is_not_planned_as_an_intent_delet
     baseline = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=1, metric=10), _route(2, _B, generation=1)],
+        [route_entry(_A, route_id=1, generation=1, metric=10), route_entry(_B, route_id=2, generation=1)],
         seq=6101,
     )
     assert baseline.status_code == 200, baseline.text
@@ -1079,10 +1111,10 @@ async def test_consumed_static_route_tombstone_is_not_planned_as_an_intent_delet
     deleted = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=1, metric=10)],
+        [route_entry(_A, route_id=1, generation=1, metric=10)],
         seq=6102,
         query="?delete_origin=true",
-        deleted=[_deleted(2, _B)],
+        deleted=[deleted_route(2, [_B])],
     )
     assert deleted.status_code == 200, deleted.text
     deletion_generation = (await _generations(device_id))[-1]
@@ -1102,7 +1134,7 @@ async def test_consumed_static_route_tombstone_is_not_planned_as_an_intent_delet
     cleared = await _put_routes(
         adapter_client,
         device_id,
-        [_route(1, _A, generation=2)],
+        [route_entry(_A, route_id=1, generation=2)],
         seq=6103,
         query="?store_only=true",
     )
@@ -1212,12 +1244,14 @@ async def test_action_apply_settlement_between_projection_and_generation_reads_i
 
         job = await settler.get(Job, generation.job_id)
         job.status = JobStatus.succeeded
+        # Settlement must not acquire lock_projection. This transaction runs while Apply
+        # owns that lock, so adding it there would reverse this test's lock order and deadlock.
         await settle_job_generations(settler, generation.job_id, outcome=GenerationStatus.settled)
         await settler.commit()
         await receipt_blocker.commit()
         response = await asyncio.wait_for(applying, timeout=10)
 
-    assert response.status_code == 202, response.text
+    assert response.status_code == 200, response.text
     assert response.json() == {
         "device_id": device_id,
         "outcome": "no_op",

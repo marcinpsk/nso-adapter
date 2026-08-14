@@ -471,8 +471,14 @@ async def _selected_promotions(
         if receipt is None or row is None or receipt.backfill_only:
             skipped[stream] = "no_receipt"
             continue
-        if receipt.push_seq != push_seq or row.source_push_seq != push_seq:
-            skipped[stream] = "superseded" if push_seq < receipt.push_seq else "no_receipt"
+        if push_seq < receipt.push_seq:
+            skipped[stream] = "superseded"
+            continue
+        if receipt.push_seq != push_seq:
+            skipped[stream] = "no_receipt"
+            continue
+        if row.source_push_seq != push_seq:
+            skipped[stream] = "revision_mismatch"
             continue
         if row.desired_revision <= row.applied_revision:
             skipped[stream] = "already_applied"
@@ -523,7 +529,7 @@ def _plan_action_links(
         has_detach = any(promotion.detached.values())
         has_replacement = any(promotion.replacement.values())
         if has_detach and has_replacement:
-            unexecutable[stream] = "the selected delta combines detach-only removal with replacement work"
+            unexecutable[stream] = "mixed_detach_replacement"
             continue
         if has_networked or has_replacement:
             networked_links.append(
@@ -551,21 +557,24 @@ async def _enqueue_action_removal_links(
     intermediate_document: dict,
     final_document: dict,
 ) -> list[DeploymentGeneration]:
-    from nso_adapter.core.removal import enqueue_removal, promotion_removal_context
+    from nso_adapter.core.removal import PromotionInterfaceUnresolved, enqueue_removal, promotion_removal_context
     from nso_adapter.core.request_flags import DELETE_ORIGIN_MARKING, DETACH_MARKING
 
     generations = []
     for link in links:
         scope = stream_section(link.stream)
-        context = await promotion_removal_context(
-            db,
-            device_id,
-            scope,
-            link.removed,
-            replacement_rows=link.replacement,
-        )
+        try:
+            context = await promotion_removal_context(
+                db,
+                device_id,
+                scope,
+                link.removed,
+                replacement_rows=link.replacement,
+            )
+        except PromotionInterfaceUnresolved:
+            raise ApplyUnexecutable({link.stream: "unresolved_interface_identity"}) from None
         if scope == "interface_config" and not context.interfaces:
-            raise ApplyUnexecutable({link.stream: "the interface replacement has no executable interface list"})
+            raise ApplyUnexecutable({link.stream: "no_executable_interface"})
         marking = DELETE_ORIGIN_MARKING if link.mode is GenerationMode.networked and link.removed else None
         if link.mode is GenerationMode.detach:
             marking = DETACH_MARKING

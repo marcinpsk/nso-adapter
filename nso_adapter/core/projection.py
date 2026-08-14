@@ -448,7 +448,7 @@ DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset({"vlan"})
 
 #: Exactly the document-executed boundary. Static-route companion apply and claim subtraction
 #: read live intent, so a later store-only push could execute under the selected generation.
-ACTION_APPLY_EXECUTABLE_SECTIONS: frozenset[str] = DOCUMENT_EXECUTED_SECTIONS
+ACTION_APPLY_EXECUTABLE_SECTIONS: frozenset[str] = frozenset({"vlan"})
 
 #: Why each remaining section still reads live rows at apply time. Most await #1522's
 #: aggregate device-intent builder, which is the general producer of a complete document;

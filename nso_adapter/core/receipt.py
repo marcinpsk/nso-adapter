@@ -377,7 +377,7 @@ async def record_response(
     carried_deletions = [
         record
         for record in previous.get("_promotion_deletions") or []
-        if (identity := _deletion_identity(record)) is not None and identity not in retired
+        if (deletion_identity := _deletion_identity(record)) is not None and deletion_identity not in retired
     ]
     receipt.response = _merge_private_response(previous, response, retired=retired)
     projection = await db.scalar(

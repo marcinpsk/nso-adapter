@@ -508,7 +508,7 @@ async def test_an_abandoned_removal_revision_cannot_be_repromoted_as_a_plain_app
         json={"selected": {"vlan": selected}},
         headers=_AUTH,
     )
-    assert apply.status_code == 202
+    assert apply.status_code == 200
     assert apply.json()["outcome"] == "no_op"
     assert apply.json()["skipped"] == {"vlan": "already_authorized"}
     assert apply.json()["skipped_detail"] == {

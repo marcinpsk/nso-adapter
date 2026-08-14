@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Actions API: async device actions (sync, check-sync_state, connect, apply, sync-notify).
 
-Most actions return 202 with {job_id}. Apply returns its selected generation chain.
+Async actions return 202 with a top-level {job_id}. Apply also returns its generation chain.
 409 is returned if a job is already queued/running for the device.
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel, field_validator
+from fastapi import APIRouter, Depends, Response
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
@@ -24,9 +24,15 @@ from nso_adapter.api.errors import (
     api_error,
 )
 from nso_adapter.core.jobs import enqueue_job
+from nso_adapter.core.request_flags import MAX_PUSH_SEQ, MIN_PUSH_SEQ
 from nso_adapter.store.models import DeploymentGeneration, Device, JobType
 
 router = APIRouter(prefix="/api/v1/devices", tags=["actions"])
+
+SelectedPushSequence = Annotated[
+    int,
+    Field(strict=True, ge=MIN_PUSH_SEQ, le=MAX_PUSH_SEQ),
+]
 
 # All action endpoints emit 401 (token) + 422 (device_id path); the responses fragments
 # below add the ones each endpoint actually raises. The trigger POSTs go through
@@ -51,7 +57,7 @@ class ApplyDiffOut(BaseModel):
 class ActionApplyIn(BaseModel):
     """The exact push sequences this manual Apply is allowed to promote."""
 
-    selected: dict[str, int]
+    selected: dict[str, SelectedPushSequence]
 
     @field_validator("selected")
     @classmethod
@@ -61,9 +67,6 @@ class ActionApplyIn(BaseModel):
         unknown = set(selected) - projection_streams()
         if unknown:
             raise ValueError(f"unknown projection streams: {sorted(unknown)}")
-        invalid = {stream: push_seq for stream, push_seq in selected.items() if push_seq < 1}
-        if invalid:
-            raise ValueError(f"push sequences must be positive: {invalid}")
         return dict(sorted(selected.items()))
 
 
@@ -86,8 +89,12 @@ class ActionApplySkippedDetailOut(BaseModel):
 class ActionApplyOut(BaseModel):
     device_id: int
     outcome: Literal["promoted", "no_op"]
+    job_id: int | None = None
     selected: dict[str, int]
-    skipped: dict[str, Literal["superseded", "already_applied", "already_authorized", "no_receipt"]]
+    skipped: dict[
+        str,
+        Literal["superseded", "already_applied", "already_authorized", "no_receipt", "revision_mismatch"],
+    ]
     skipped_detail: dict[str, ActionApplySkippedDetailOut] | None = None
     generations: list[ActionApplyGenerationOut]
 
@@ -258,11 +265,12 @@ async def sync_notify(
     dependencies=[Depends(verify_token)],
     response_model=ActionApplyOut,
     response_model_exclude_none=True,
-    responses=_TRIGGER_ERRORS,
+    responses={200: {"model": ActionApplyOut, "description": "No selected stream required a job"}, **_TRIGGER_ERRORS},
 )
 async def action_apply(
     device_id: int,
     body: ActionApplyIn,
+    response: Response,
     db: AsyncSession = Depends(get_db),
 ):
     """Atomically promote the selected pushes and enqueue their immutable generation chain."""
@@ -294,24 +302,31 @@ async def action_apply(
             f"Selected stream(s) cannot be applied faithfully: {', '.join(streams)}",
             {"streams": exc.reasons},
         ) from None
+    generations = [
+        {
+            "generation_id": generation.id,
+            "seq": generation.seq,
+            "job_id": generation.job_id,
+            "mode": generation.mode.value,
+            "source_push_seq": generation.source_push_seq,
+            "stream_revisions": generation.stream_revisions,
+            "digest": generation.digest,
+        }
+        for generation in apply_result.generations
+    ]
+    if not generations:
+        response.status_code = 200
+    job_id = generations[0]["job_id"] if generations else None
+    if generations and job_id is None:
+        raise RuntimeError("The promoted generation chain has no executable head job")
     result = {
         "device_id": device_id,
-        "outcome": "promoted" if apply_result.generations else "no_op",
+        "outcome": "promoted" if generations else "no_op",
+        "job_id": job_id,
         "selected": body.selected,
         "skipped": apply_result.skipped,
         "skipped_detail": apply_result.skipped_detail or None,
-        "generations": [
-            {
-                "generation_id": generation.id,
-                "seq": generation.seq,
-                "job_id": generation.job_id,
-                "mode": generation.mode.value,
-                "source_push_seq": generation.source_push_seq,
-                "stream_revisions": generation.stream_revisions,
-                "digest": generation.digest,
-            }
-            for generation in apply_result.generations
-        ],
+        "generations": generations,
     }
     await db.commit()
     return result

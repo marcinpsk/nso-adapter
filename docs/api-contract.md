@@ -653,15 +653,19 @@ to the `X-Push-Seq` that the plugin drained:
 
 The selector uses push sequences, not current revisions, because the plugin already owns
 these values in its drain bookkeeping and the adapter receipts use the same identity. A
-stream is promotable only when its latest durable receipt and projection row both match the
+selected sequence is a strict integer in the receipt domain `1..2^63-1`. A value outside
+that domain returns `422 validation_error`.
+
+A stream is promotable only when its latest durable receipt and projection row both match the
 selected sequence. A later push never rides an earlier selection. Every stale selection is
 reported under `skipped`: `superseded` for an older sequence, `already_applied` when its
 revision settled, `already_authorized` when its generation is still unsettled or was
-abandoned, and `no_receipt` when the adapter has no matching promotable receipt.
+abandoned, `no_receipt` when the adapter has no matching receipt, and `revision_mismatch`
+when the receipt matches but the projection row does not.
 `skipped_detail` identifies the generation that already owns an authorized revision. The
 retry and abandon actions own that generation. Apply cannot replace it with weaker work.
-An empty selection, or a request in which every selection is skipped, returns an explicit
-no-op:
+An empty selection, or a request in which every selection is skipped, returns `200` with an
+explicit no-op and no `job_id`:
 
 ```json
 { "device_id": 1, "outcome": "no_op",
@@ -670,12 +674,14 @@ no-op:
 ```
 
 A promotion returns the complete ordered chain. Each link has its queued job. The success
-barrier decides when each successor job may start.
+barrier decides when each successor job may start. The response returns `202`, and its
+top-level `job_id` is the first job in that chain.
 
 ```json
 {
   "device_id": 1,
   "outcome": "promoted",
+  "job_id": 501,
   "selected": { "vlan": 4711 },
   "skipped": {},
   "generations": [
@@ -696,7 +702,10 @@ A failed head blocks every successor through the ordinary generation success bar
 
 Apply refuses the whole request with `409 apply_unexecutable` when any selected stream cannot
 be routed faithfully through those runners. The refusal names each stream and reason. It does
-not promote or enqueue a subset.
+not promote or enqueue a subset. Reasons are stable machine codes:
+`live_read_execution`, `mixed_detach_replacement`, `no_executable_interface`, and
+`unresolved_interface_identity`. A push can also return `outstanding_deletion_provenance`
+when its receipt still carries deletion work.
 
 The current manual-Apply boundary is exactly `DOCUMENT_EXECUTED_SECTIONS`, which currently
 contains only `vlan`. Every other selected stream refuses with `409 apply_unexecutable` and

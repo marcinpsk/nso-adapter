@@ -956,6 +956,40 @@ async def test_c3_5_a_carrierless_removal_keeps_the_apply_side_leniency(adapter_
     assert job.result["residue_check"] == "unsupported"
 
 
+async def test_c3_5_any_carried_static_route_generation_makes_unproven_removal_fail(adapter_client):
+    """A coalesced non-static generation cannot hide a static-route promotion obligation."""
+    from nso_adapter.core.generation import digest_document
+    from nso_adapter.store.models import DeploymentGeneration, GenerationMode
+
+    device_id = await seed_device(nso_device_name="sr-c35-multi-generation", netbox_device_id=None)
+    await seed_rows(device_id, [{"triple": B, "route_id": None}])
+    job_id = await seed_removal_job(device_id, {"removed": {"route": [list(A)]}})
+    mode = GenerationMode.networked
+    async with session() as db:
+        for seq, stream_revisions in ((1, {"vlan": 1}), (2, {"static_route": 1})):
+            db.add(
+                DeploymentGeneration(
+                    device_id=device_id,
+                    seq=seq,
+                    mode=mode,
+                    document={},
+                    digest=digest_document(mode, {}, {}),
+                    allowed_removal_keys={},
+                    source_push_seq={},
+                    stream_revisions=stream_revisions,
+                    removal_context={"scope": "static_route", "removed": {"route": [list(A)]}},
+                    job_id=job_id,
+                )
+            )
+        await db.commit()
+
+    fake = SrFake("sr-c35-multi-generation", service=[wire(A), wire(B)], section_status="unsupported")
+    job = await run_removal_job(device_id, job_id, sr_client(fake))
+
+    assert job.status == JobStatus.failed
+    assert job.error["code"] == "static_route_removal_unproven"
+
+
 # ── C4.29 — the pure-clear removal's terminal commit is guarded ──────────────
 
 

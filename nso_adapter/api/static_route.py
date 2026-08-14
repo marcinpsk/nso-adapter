@@ -589,7 +589,9 @@ async def _apply_static_route_intent(
     if BACKFILL_ONLY.get():
         return await _apply_backfill_only(device_id, body, db, delivery)
 
-    existing_result = await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id))
+    existing_result = await db.execute(
+        select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id).order_by(StaticRouteIntent.id)
+    )
     existing = list(existing_result.scalars().all())
 
     # The fence is evaluated on the PRE-mutation row set. Post-payload evaluation would

@@ -40,6 +40,7 @@ def test_every_section_is_either_document_executed_or_names_its_blocker():
     assert not (DOCUMENT_EXECUTED_SECTIONS & set(LIVE_READ_SECTIONS)), "a section cannot be both"
     assert all(reason for reason in LIVE_READ_SECTIONS.values()), "every live-read section must state why"
     assert ACTION_APPLY_EXECUTABLE_SECTIONS == DOCUMENT_EXECUTED_SECTIONS
+    assert ACTION_APPLY_EXECUTABLE_SECTIONS is not DOCUMENT_EXECUTED_SECTIONS
 
 
 def test_every_projection_column_has_a_supported_json_round_trip():

@@ -16,6 +16,7 @@ test that injected the value it was supposed to read.
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import select
 
 from tests.api.test_static_route_identity import (
     enable_auto_apply,
@@ -235,6 +236,36 @@ async def test_o2b_9_a_receipt_held_route_id_still_counts_toward_the_maximum(ada
     payload = (await adapter_client.get(URL, headers=AUTH)).json()
 
     assert payload["global_max_route_id"] == 9999
+
+
+async def test_o2b_9_malformed_receipt_provenance_does_not_break_the_maximum(adapter_client):
+    """The database aggregate ignores non-array and non-integer provenance values."""
+    from nso_adapter.store.models import IntentPushReceipt
+
+    device_id = await seed_device(nso_device_name="rcpt-malformed-provenance", netbox_device_id=None)
+    assert (await push_vlan(adapter_client, device_id, 1, [10])).status_code == 200
+    async with session() as db:
+        receipt = await db.scalar(
+            select(IntentPushReceipt).where(
+                IntentPushReceipt.device_id == device_id,
+                IntentPushReceipt.section == "vlan",
+            )
+        )
+        receipt.response = {
+            "_promotion_deletions": [
+                None,
+                {},
+                {"route_id": "200"},
+                {"route_id": 1.5},
+                {"route_id": True},
+                {"route_id": 123},
+            ]
+        }
+        await db.commit()
+
+    payload = (await adapter_client.get(URL, headers=AUTH)).json()
+
+    assert payload["global_max_route_id"] == 123
 
 
 async def test_o2b_9_an_unknown_section_is_refused_rather_than_served_empty(adapter_client):

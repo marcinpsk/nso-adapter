@@ -73,6 +73,8 @@
         "properties": {
           "selected": {
             "additionalProperties": {
+              "maximum": 9.223372036854776e+18,
+              "minimum": 1.0,
               "type": "integer"
             },
             "title": "Selected",
@@ -98,6 +100,17 @@
             "title": "Generations",
             "type": "array"
           },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
           "outcome": {
             "enum": [
               "promoted",
@@ -119,7 +132,8 @@
                 "superseded",
                 "already_applied",
                 "already_authorized",
-                "no_receipt"
+                "no_receipt",
+                "revision_mismatch"
               ],
               "type": "string"
             },
@@ -9432,6 +9446,16 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionApplyOut"
+                }
+              }
+            },
+            "description": "No selected stream required a job"
+          },
           "202": {
             "content": {
               "application/json": {
