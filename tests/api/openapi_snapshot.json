@@ -73,8 +73,8 @@
         "properties": {
           "selected": {
             "additionalProperties": {
-              "maximum": 9.223372036854776e+18,
-              "minimum": 1.0,
+              "maximum": 9223372036854775807,
+              "minimum": 1,
               "type": "integer"
             },
             "title": "Selected",

@@ -112,6 +112,18 @@ def test_no_disambiguation_qualified_component_names(openapi_schema):
     )
 
 
+def test_action_apply_sequence_schema_preserves_the_exact_receipt_bound(openapi_schema):
+    from nso_adapter.core.request_flags import MAX_PUSH_SEQ, MIN_PUSH_SEQ
+
+    selected = openapi_schema["components"]["schemas"]["ActionApplyIn"]["properties"]["selected"]
+    sequence = selected["additionalProperties"]
+
+    assert sequence["minimum"] == MIN_PUSH_SEQ
+    assert sequence["maximum"] == MAX_PUSH_SEQ
+    assert isinstance(sequence["minimum"], int)
+    assert isinstance(sequence["maximum"], int)
+
+
 def _resolve_pointer(doc, ref: str) -> bool:
     """True iff a local ``#/...`` JSON-pointer ``$ref`` resolves in ``doc`` (RFC 6901)."""
     node = doc
