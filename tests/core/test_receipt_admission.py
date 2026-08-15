@@ -131,9 +131,12 @@ def test_every_in_protocol_put_uses_the_shared_delivery_seam():
     for route in _put_routes():
         if route.path not in INTENT_PUT_ENDPOINTS:
             continue
-        module = inspect.getmodule(route.endpoint)
-        assert module is not None
-        source = inspect.getsource(module)
+        source = inspect.getsource(inspect.unwrap(route.endpoint))
+        if route.path == "/api/v1/devices/{device_id}/static-route-intent":
+            from nso_adapter.api.static_route import _apply_static_route_intent
+
+            assert "return await _apply_static_route_intent(" in source
+            source = inspect.getsource(_apply_static_route_intent)
         assert "await begin_delivery(" in source, f"{route.path} bypasses begin_delivery"
         assert "note_write" not in source, f"{route.path} owns projection-write ordering again"
 
@@ -302,3 +305,17 @@ async def test_admission_refuses_a_stream_outside_the_vocabulary(adapter_client)
     async with session() as db:
         with pytest.raises(RuntimeError, match="not an in-protocol intent stream"):
             await admit_push(db, device_id, delivery)
+
+
+async def test_a_keyed_empty_json_body_is_a_validation_error(adapter_client):
+    """The delivery dependency must not turn an unreadable JSON body into a server error."""
+    device_id = await seed_device(nso_device_name="rcp-empty-json", netbox_device_id=None)
+
+    response = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/vlan-intent",
+        content=b"",
+        headers={**AUTH, "Content-Type": "application/json", "X-Push-Seq": "9"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"

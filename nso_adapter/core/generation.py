@@ -906,6 +906,7 @@ async def advance_device_generations(device_id: int) -> int:
     from nso_adapter.store.db import get_session
 
     async for db in get_session():
+        await lock_projection(db, device_id)
         attached = await advance_generations_locked(db, device_id)
         await db.commit()
         return attached

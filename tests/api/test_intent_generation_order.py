@@ -13,6 +13,37 @@ AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 CASES = (
     (
+        "bgp",
+        {
+            "routers": [
+                {"asn": "65100", "scopes": []},
+                {"asn": "65101", "scopes": []},
+            ]
+        },
+        {"routers": [{"asn": "65100", "scopes": []}]},
+    ),
+    (
+        "isis-interface",
+        {
+            "interfaces": [
+                {"interface_name": "Gi0/1", "af": "ipv4"},
+                {"interface_name": "Gi0/2", "af": "ipv4"},
+            ],
+            "processes": [],
+        },
+        {"interfaces": [{"interface_name": "Gi0/1", "af": "ipv4"}], "processes": []},
+    ),
+    (
+        "isis-flex-algo",
+        {
+            "flex_algos": [
+                {"process_tag": "1", "algo_id": 128},
+                {"process_tag": "1", "algo_id": 129},
+            ]
+        },
+        {"flex_algos": [{"process_tag": "1", "algo_id": 128}]},
+    ),
+    (
         "ospf",
         {
             "instances": [

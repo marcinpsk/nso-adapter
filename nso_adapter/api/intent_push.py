@@ -18,11 +18,13 @@ nothing behind because the same transaction is rolled back.
 
 from __future__ import annotations
 
+from json import JSONDecodeError
+
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.api.errors import push_conflict_error
+from nso_adapter.api.errors import api_error, push_conflict_error
 from nso_adapter.core.intent_protocol import intent_endpoint
 from nso_adapter.core.receipt import IntentDelivery, PushIdentity, PushSequenceConflict, admit_push, digest_body
 from nso_adapter.core.request_flags import DELETE_ORIGIN, PUSH_SEQ, STORE_ONLY
@@ -45,9 +47,13 @@ async def get_intent_delivery(request: Request) -> IntentDelivery:
     seq = PUSH_SEQ.get()
     identity = None
     if seq is not None:
+        try:
+            body = await request.json()
+        except JSONDecodeError:
+            raise api_error(422, "validation_error", "Request body must contain valid JSON") from None
         identity = PushIdentity(
             seq=seq,
-            digest=digest_body(await request.json()),
+            digest=digest_body(body),
             store_only=STORE_ONLY.get(),
             delete_origin=DELETE_ORIGIN.get(),
         )

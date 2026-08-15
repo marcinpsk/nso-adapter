@@ -63,6 +63,41 @@ async def test_generation_advancement_retries_transient_failures(monkeypatch):
     assert delays == [0.5, 1.0]
 
 
+async def test_generation_advancement_logs_once_after_retries_are_exhausted(monkeypatch):
+    """A persistent failure is reported once and does not escape the finished run."""
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core import generation
+
+    calls = 0
+
+    async def fail(_device_id: int) -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("persistent database failure")
+
+    async def skip_delay(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(generation, "advance_device_generations", fail)
+    monkeypatch.setattr(worker.asyncio, "sleep", skip_delay)
+
+    with capture_logs() as logs:
+        await worker._advance_generations(18)
+
+    failures = [entry for entry in logs if entry["event"] == "worker.generation_advance_failed"]
+    assert calls == 3
+    assert failures == [
+        {
+            "attempts": 3,
+            "device_id": 18,
+            "error": "RuntimeError('persistent database failure')",
+            "event": "worker.generation_advance_failed",
+            "log_level": "error",
+        }
+    ]
+
+
 # ── _claim_next_job ─────────────────────────────────────────────────────────────
 
 

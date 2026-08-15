@@ -706,6 +706,25 @@ async def test_a_settled_head_hands_its_successor_a_job(adapter_client):
     assert await _job_status(advanced.job_id) is JobStatus.queued
 
 
+async def test_standalone_advancement_takes_the_projection_lock(adapter_client, rival_engine):
+    """Advancement must serialize with a writer before it reads or admits the head."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from nso_adapter.core.generation import advance_device_generations, lock_projection
+
+    device_id = await _device("gen-advance-lock", 9753)
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+
+    async with rival() as holder:
+        await lock_projection(holder, device_id)
+        advancing = asyncio.create_task(advance_device_generations(device_id))
+        await asyncio.sleep(0.1)
+        assert not advancing.done(), "advancement read the chain without the projection lock"
+        await holder.commit()
+
+    assert await asyncio.wait_for(advancing, timeout=2) == 0
+
+
 async def test_f8_abandoning_a_head_hands_the_released_successor_a_job_at_once(adapter_client):
     """#1558 rework 3, finding 3 — the abandon endpoint must advance the chain itself.
 

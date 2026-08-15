@@ -621,8 +621,6 @@ async def put_bgp_intent(
     router_count = await _rebuild_router_intent(db, device_id, body.routers, now)
     removed_redist = await _sync_redistribution(db, device_id, body.routers, now)
 
-    await _maybe_enqueue_apply(db, device_id, router_count, stream=delivery.stream)
-
     removed_asns, removed_peers = _bgp_removed(existing_asns, existing_peers, body.routers)
     cleared = _bgp_cleared(before_values, body.routers)
     shrank = bool(removed_asns or removed_peers or removed_redist)
@@ -643,6 +641,8 @@ async def put_bgp_intent(
             retract=cleared,
             shrank=shrank,
         )
+
+    await _maybe_enqueue_apply(db, device_id, router_count, stream=delivery.stream)
 
     result = {"device_id": device_id, "router_count": router_count}
     await record_response(db, device_id, delivery, result)

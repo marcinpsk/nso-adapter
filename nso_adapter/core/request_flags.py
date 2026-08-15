@@ -71,7 +71,7 @@ def parse_push_seq(raw: str | None) -> int | None:
     try:
         seq = int(raw.strip())
     except ValueError:
-        raise InvalidPushSequence(f"X-Push-Seq must be an integer, got {raw!r}") from None
+        raise InvalidPushSequence("X-Push-Seq must be an integer") from None
     if not MIN_PUSH_SEQ <= seq <= MAX_PUSH_SEQ:
-        raise InvalidPushSequence(f"X-Push-Seq must be between {MIN_PUSH_SEQ} and {MAX_PUSH_SEQ}, got {seq}")
+        raise InvalidPushSequence(f"X-Push-Seq must be between {MIN_PUSH_SEQ} and {MAX_PUSH_SEQ}")
     return seq

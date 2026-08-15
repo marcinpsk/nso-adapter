@@ -820,6 +820,7 @@ async def terminalize_running(
     from nso_adapter.core.generation import requeue_job_generations
 
     coalescible: tuple[int, JobType] | None = None
+    superseded = False
     if status == JobStatus.queued:
         row = (
             await db.execute(
@@ -831,6 +832,7 @@ async def terminalize_running(
             successor_id = await _queued_successor_id(db, *coalescible)
             if successor_id is not None:
                 status, error = JobStatus.failed, _superseded_error(successor_id)
+                superseded = True
 
     if status == JobStatus.queued:
         values: dict = {"started_at": None, "heartbeat_at": None}
@@ -852,6 +854,7 @@ async def terminalize_running(
             successor_id = await _queued_successor_id(db, *coalescible) if coalescible else None
             logger.warning("claim.requeue_raced_a_successor", job_id=job_id, queued_successor_id=successor_id)
             status, error = JobStatus.failed, _superseded_error(successor_id)
+            superseded = True
         else:
             if landed is not None:
                 # The SAME job will re-run the SAME documents, so its generations are
@@ -860,6 +863,16 @@ async def terminalize_running(
                 return JobStatus.queued
             return None
 
+    if superseded:
+        # The elected successor owns the retry. The stale execution no longer represents
+        # an unknown device outcome, so its generation must not block that successor.
+        generation_outcome = GenerationStatus.abandoned
+    elif status is JobStatus.failed:
+        # Recovery did not watch the run. The device write may or may not have landed.
+        generation_outcome = GenerationStatus.outcome_unknown
+    else:
+        generation_outcome = None
+
     write = await terminalize(
         db,
         job_id,
@@ -867,10 +880,7 @@ async def terminalize_running(
         expect=JobStatus.running,
         run_attempt=expected_attempt,
         error=error,
-        # Recovery did not watch the run: the device write may or may not have landed, so
-        # the honest verdict on its generations is unknown, not failed. Both block the
-        # successors; only an explicit reconcile or a settling retry opens the barrier.
-        generation_outcome=GenerationStatus.outcome_unknown if status is JobStatus.failed else None,
+        generation_outcome=generation_outcome,
     )
     return write.status if write is not None else None
 

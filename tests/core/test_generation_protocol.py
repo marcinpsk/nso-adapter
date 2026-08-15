@@ -333,7 +333,9 @@ async def test_f2_b_a_store_only_write_records_its_revision(adapter_client):
     device_id = await seed_device(nso_device_name="gen-atomic-storeonly", netbox_device_id=9804)
     await seed_settings(device_id, auto_apply=False)
 
-    assert (await put_vlans(adapter_client, device_id, [10], query="?store_only=true")).status_code == 200
+    response = await put_vlans(adapter_client, device_id, [10], query="?store_only=true")
+    assert response.status_code == 200
+    assert response.json() == {"device_id": device_id, "count": 1, "removed": 0, "replaced": False}
 
     row = await stream_row(device_id, "vlan")
     assert row is not None, "a store-only write recorded no desired revision"
@@ -592,6 +594,21 @@ async def test_f4_d_a_malformed_or_out_of_domain_push_sequence_is_rejected(adapt
     assert resp.status_code == 422, f"{raw!r} was silently converted to an unkeyed write"
     assert resp.json()["error"]["code"] == "validation_error"
     assert await stream_row(device_id, "vlan") is None
+
+
+async def test_f4_d_a_malformed_push_sequence_is_not_echoed(adapter_client):
+    raw = "private-token-value"
+    device_id = await seed_device(nso_device_name="gen-badseq-redacted", netbox_device_id=None)
+    await seed_settings(device_id)
+
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/vlan-intent",
+        json={"vlans": []},
+        headers={**AUTH, "X-Push-Seq": raw},
+    )
+
+    assert resp.status_code == 422
+    assert raw not in resp.text
 
 
 async def test_f4_e_a_receipt_is_only_durable_when_its_mutation_commits(adapter_client):
