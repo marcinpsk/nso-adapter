@@ -103,13 +103,15 @@ def _nodes_in_scope(scope: ast.AST) -> list[ast.AST]:
 
 def _values_mapping_names(nodes: list[ast.AST]) -> frozenset[str]:
     """Return bound mappings passed to SQLAlchemy's ``values`` writer."""
-    return frozenset(
-        arg.id
-        for node in nodes
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "values"
-        for arg in node.args
-        if isinstance(arg, ast.Name)
-    )
+    names: set[str] = set()
+    for node in nodes:
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "values"):
+            continue
+        names.update(arg.id for arg in node.args if isinstance(arg, ast.Name))
+        names.update(
+            keyword.value.id for keyword in node.keywords if keyword.arg is None and isinstance(keyword.value, ast.Name)
+        )
+    return frozenset(names)
 
 
 def scan_source(source: str, path: str) -> list[Violation]:
@@ -291,6 +293,16 @@ def test_flags_a_double_star_unpacked_dict_literal():
 def test_flags_a_double_star_unpacked_settle_seq():
     src = 'def f(u):\n    u.values(**{"settle_seq": 6})\n'
     assert len(scan_source(src, "t.py")) == 1
+
+
+def test_flags_a_double_star_unpacked_bound_mapping():
+    """``vals`` bound before ``.values(**vals)`` is still a physical row write."""
+    src = 'def f(u):\n    vals = {"status": JobStatus.failed, "settle_seq": 3}\n    u.values(**vals)\n'
+    hits = scan_source(src, "t.py")
+    assert [(hit.line, hit.what) for hit in hits] == [
+        (2, "assigns a terminal JobStatus directly"),
+        (2, "writes Job.settle_seq directly"),
+    ]
 
 
 def test_flags_column_attribute_keys_in_a_values_mapping():
