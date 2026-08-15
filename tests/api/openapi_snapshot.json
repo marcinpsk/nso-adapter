@@ -9505,6 +9505,16 @@
               }
             },
             "description": "Request validation failed (envelope shape)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal adapter invariant failed"
           }
         },
         "security": [

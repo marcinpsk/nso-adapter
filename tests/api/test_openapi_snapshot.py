@@ -124,6 +124,19 @@ def test_action_apply_sequence_schema_preserves_the_exact_receipt_bound(openapi_
     assert isinstance(sequence["maximum"], int)
 
 
+def test_action_apply_documents_its_internal_error_envelope(openapi_schema):
+    responses = openapi_schema["paths"]["/api/v1/devices/{device_id}/actions/apply"]["post"]["responses"]
+
+    assert responses["500"] == {
+        "description": "Internal adapter invariant failed",
+        "content": {
+            "application/json": {
+                "schema": {"$ref": "#/components/schemas/ErrorEnvelope"},
+            }
+        },
+    }
+
+
 def _resolve_pointer(doc, ref: str) -> bool:
     """True iff a local ``#/...`` JSON-pointer ``$ref`` resolves in ``doc`` (RFC 6901)."""
     node = doc

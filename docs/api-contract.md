@@ -643,6 +643,7 @@ A concurrent retry or abandon also returns `409 conflict`, with an empty
 `error.detail` object.
 
 ### `POST /api/v1/devices/{id}/actions/apply` (Phase 2)
+
 Atomically promote the exact intent pushes selected by the caller and enqueue their
 immutable deployment-generation chain. The selector maps the adapter's receipt stream name
 to the `X-Push-Seq` that the plugin drained:
@@ -720,8 +721,9 @@ aggregate document builder lands.
 Deletion provenance from a store-only revision remains an execution obligation. If a later
 ordinary push would promote that stream without executing the carried deletion, the entire
 push refuses with `409 apply_unexecutable` and reason `outstanding_deletion_provenance`.
-The transaction rollback preserves the earlier receipt and its provenance. The caller can
-Apply that receipt when its stream is document-executed, then retry the later push.
+The transaction rollback preserves the earlier receipt and its provenance. The error message
+directs the caller to Apply that receipt when its stream is document-executed, then retry the
+later push.
 
 **Reconcile commit (brownfield guardrail).** Every reconciler-service write (apply,
 update, and removal PUT-replace) is committed with the NSO RESTCONF

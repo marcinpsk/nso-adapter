@@ -21,6 +21,7 @@ from nso_adapter.api.errors import (
     RESP_409,
     RESP_409_ACTIVE_JOB,
     RESP_422_VALIDATION,
+    RESP_500_INTERNAL,
     api_error,
 )
 from nso_adapter.core.jobs import enqueue_job
@@ -265,7 +266,11 @@ async def sync_notify(
     dependencies=[Depends(verify_token)],
     response_model=ActionApplyOut,
     response_model_exclude_none=True,
-    responses={200: {"model": ActionApplyOut, "description": "No selected stream required a job"}, **_TRIGGER_ERRORS},
+    responses={
+        200: {"model": ActionApplyOut, "description": "No selected stream required a job"},
+        **_TRIGGER_ERRORS,
+        **RESP_500_INTERNAL,
+    },
 )
 async def action_apply(
     device_id: int,
@@ -318,7 +323,7 @@ async def action_apply(
         response.status_code = 200
     job_id = generations[0]["job_id"] if generations else None
     if generations and job_id is None:
-        raise RuntimeError("The promoted generation chain has no executable head job")
+        raise api_error(500, "internal", "The promoted generation chain has no executable head job")
     result = {
         "device_id": device_id,
         "outcome": "promoted" if generations else "no_op",

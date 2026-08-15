@@ -74,7 +74,10 @@ class PromotionProvenanceUnexecutable(RuntimeError):
     """A direct promotion would discard deletion work carried from an earlier push."""
 
     def __init__(self, stream: str):
-        super().__init__(f"push cannot promote outstanding deletion provenance for {stream}")
+        super().__init__(
+            f"Push cannot promote outstanding deletion provenance for {stream}. "
+            f"Apply the stored receipt when {stream} is document-executed, then retry this push"
+        )
         self.stream = stream
 
 

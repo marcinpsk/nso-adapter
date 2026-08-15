@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 import sqlalchemy as sa
@@ -323,6 +324,43 @@ async def test_action_apply_endpoint_returns_selected_generation_contract(adapte
     assert (await _generations(device_id))[0].digest == link["digest"]
 
 
+async def test_action_apply_wraps_a_missing_head_job_in_the_error_contract(adapter_client, monkeypatch):
+    from nso_adapter.core import generation as generation_module
+    from nso_adapter.store.models import GenerationMode
+
+    device_id = await seed_device(nso_device_name="apply-missing-head-job", netbox_device_id=None)
+
+    async def create_missing_head(*_args):
+        return SimpleNamespace(
+            generations=[
+                SimpleNamespace(
+                    id=81,
+                    seq=4,
+                    job_id=None,
+                    mode=GenerationMode.networked,
+                    source_push_seq={"vlan": 4301},
+                    stream_revisions={"vlan": 1},
+                    digest="a" * 64,
+                )
+            ],
+            skipped={},
+            skipped_detail={},
+        )
+
+    monkeypatch.setattr(generation_module, "create_action_apply", create_missing_head)
+
+    response = await _apply(adapter_client, device_id, {"vlan": 4301})
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": {
+            "code": "internal",
+            "message": "The promoted generation chain has no executable head job",
+            "detail": {},
+        }
+    }
+
+
 async def test_action_apply_rejects_a_sequence_above_the_receipt_domain(adapter_client):
     device_id = await seed_device(nso_device_name="apply-sequence-bound", netbox_device_id=None)
 
@@ -428,7 +466,10 @@ async def test_auto_apply_refuses_to_discard_carried_deletion_provenance(adapter
     assert promoted.json() == {
         "error": {
             "code": "apply_unexecutable",
-            "message": "Push cannot promote outstanding deletion provenance for vlan",
+            "message": (
+                "Push cannot promote outstanding deletion provenance for vlan. "
+                "Apply the stored receipt when vlan is document-executed, then retry this push"
+            ),
             "detail": {"streams": {"vlan": "outstanding_deletion_provenance"}},
         }
     }

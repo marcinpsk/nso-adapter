@@ -196,7 +196,7 @@ async def promotion_provenance_handler(request: Request, exc: PromotionProvenanc
         content={
             "error": {
                 "code": "apply_unexecutable",
-                "message": f"Push cannot promote outstanding deletion provenance for {stream}",
+                "message": str(exc),
                 "detail": {"streams": {stream: "outstanding_deletion_provenance"}},
             }
         },
@@ -297,6 +297,9 @@ RESP_409_PUSH_SEQ_OR_DEVICE_BUSY: ResponseSpec = {
 }
 RESP_422_VALIDATION: ResponseSpec = {
     422: {**_ENVELOPE_SCHEMA, "description": "Request validation failed (envelope shape)"}
+}
+RESP_500_INTERNAL: ResponseSpec = {
+    500: {**_ENVELOPE_SCHEMA, "description": "Internal adapter invariant failed"}
 }
 RESP_501: ResponseSpec = {501: {**_ENVELOPE_SCHEMA, "description": "Not supported by the configured provider"}}
 RESP_502_NSO: ResponseSpec = {502: {**_ENVELOPE_SCHEMA, "description": "NSO unreachable"}}
