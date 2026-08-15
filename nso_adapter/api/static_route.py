@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import structlog
@@ -476,6 +477,7 @@ async def put_static_route_intent(
     second then applies a plan whose premise is gone, and the deferred identity constraint
     surfaces it as a 500 instead of the sequentially correct answer.
     """
+    delivery = replace(delivery, identity=replace(delivery.identity, delete_origin=False))
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")

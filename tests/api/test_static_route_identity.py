@@ -184,6 +184,39 @@ async def put_intent(
     )
 
 
+@pytest.mark.parametrize(
+    ("first_query", "replay_query", "suffix"),
+    [
+        ("?delete_origin=true", "", "flag-first"),
+        ("", "?delete_origin=true", "flag-replay"),
+    ],
+)
+async def test_delete_origin_is_inert_in_static_route_receipt_identity(
+    adapter_client,
+    first_query,
+    replay_query,
+    suffix,
+):
+    from nso_adapter.core.receipt import latest_receipt
+
+    device_id = await seed_device(nso_device_name=f"sr-replay-{suffix}", netbox_device_id=None)
+    url = f"/api/v1/devices/{device_id}/static-route-intent"
+    body = {"routes": [entry(A, route_id=7)], "deleted_routes": []}
+    headers = AUTH | {"X-Push-Seq": "9001"}
+
+    first = await adapter_client.put(url + first_query, json=body, headers=headers)
+    replay = await adapter_client.put(url + replay_query, json=body, headers=headers)
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert len(await read_intent(device_id)) == 1
+    assert await read_jobs(device_id) == []
+    async with session() as db:
+        receipt = await latest_receipt(db, device_id, "static_route")
+        assert receipt.delete_origin is False
+
+
 async def enable_auto_apply(device_id: int) -> None:
     from nso_adapter.store.models import DeviceSettings
 

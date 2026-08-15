@@ -136,6 +136,11 @@ authorized, with the collateral guard off — so it promotes no stream and marks
   writing no content at all. One sequence carrying one body under two of those is two
   different operations.
 
+  The `static_route` stream normalizes `delete_origin` to false before receipt admission.
+  The query flag does not apply to this stream because each required `deleted_routes`
+  record carries its own deletion authority. The flag is therefore not part of a
+  static-route delivery's mode or replay identity.
+
 **Admission.**
 
 - same sequence, same body, same mode → **200 with the stored response**, nothing
