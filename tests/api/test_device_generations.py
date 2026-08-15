@@ -169,8 +169,12 @@ async def test_generations_list_applies_a_fail_fast_page_limit(adapter_client):
     assert page.status_code == 200, page.text
     assert [(row["generation_id"], row["seq"]) for row in page.json()] == [(early_id, 4)]
     assert invalid.status_code == 422
-    assert invalid.json()["error"]["code"] == "validation_error"
-    assert invalid.json()["error"]["message"] == "limit must be between 1 and 500: 0"
+    error = invalid.json()["error"]
+    assert error["code"] == "validation_error"
+    assert error["message"] == "Request validation failed"
+    assert any(
+        item["loc"] == ["query", "limit"] and item["type"] == "greater_than_equal" for item in error["detail"]["errors"]
+    )
 
 
 async def test_generations_list_returns_not_found_for_an_unknown_device(adapter_client):

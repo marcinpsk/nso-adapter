@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,7 +19,7 @@ from nso_adapter.api.errors import (
     RESP_422_VALIDATION,
     api_error,
 )
-from nso_adapter.api.pagination import DEFAULT_PAGE, validate_page_limit
+from nso_adapter.api.pagination import DEFAULT_PAGE, LIMIT_MAX, LIMIT_MIN, validate_page_limit
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.store.models import (
     DbInterface,
@@ -352,7 +354,7 @@ async def get_device(device_id: int, db: AsyncSession = Depends(get_db)):
 async def list_device_generations(
     device_id: int,
     since_seq: int | None = None,
-    limit: int = DEFAULT_PAGE,
+    limit: Annotated[int, Query(ge=LIMIT_MIN, le=LIMIT_MAX)] = DEFAULT_PAGE,
     db: AsyncSession = Depends(get_read_db),
 ):
     limit = validate_page_limit(limit)

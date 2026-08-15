@@ -510,7 +510,7 @@ def hydrate_static_route_apply_plan(document: dict, *, eligible_rows: list) -> S
         SrCas(
             item["row_id"],
             item["route_id"],
-            tuple(item["sent_triple"]),
+            _sr_key(item["sent_triple"]),
             item["expected_old"],
         )
         for item in record["cas"]

@@ -649,8 +649,6 @@ async def put_bgp_intent(
 
         await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
 
-    await _maybe_enqueue_apply(db, device_id, router_count, stream=delivery.stream)
-
     result = {"device_id": device_id, "router_count": router_count}
     await record_response(db, device_id, delivery, result)
     await db.commit()

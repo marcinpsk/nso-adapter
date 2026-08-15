@@ -50,8 +50,8 @@ def test_every_section_is_either_document_executed_or_names_its_blocker():
     assert ACTION_APPLY_EXECUTABLE_SECTIONS == DOCUMENT_EXECUTED_SECTIONS, (
         "manual Apply may select exactly the sections that execute from their documents"
     )
-    assert ACTION_APPLY_EXECUTABLE_SECTIONS is not DOCUMENT_EXECUTED_SECTIONS, (
-        "selection and execution answer different questions even while their members match"
+    assert ACTION_APPLY_EXECUTABLE_SECTIONS is DOCUMENT_EXECUTED_SECTIONS, (
+        "selection and execution must share one section-set source of truth"
     )
 
 
@@ -142,7 +142,7 @@ def test_increment_five_completes_document_execution():
     assert _INCREMENT_FIVE_SECTIONS <= DOCUMENT_EXECUTED_SECTIONS
     assert LIVE_READ_SECTIONS == {}
     assert ACTION_APPLY_EXECUTABLE_SECTIONS == DOCUMENT_EXECUTED_SECTIONS == projection_sections()
-    assert ACTION_APPLY_EXECUTABLE_SECTIONS is not DOCUMENT_EXECUTED_SECTIONS
+    assert ACTION_APPLY_EXECUTABLE_SECTIONS is DOCUMENT_EXECUTED_SECTIONS
     assert len(projection_streams()) == 16
     assert all(stream_section(stream) in ACTION_APPLY_EXECUTABLE_SECTIONS for stream in projection_streams())
 

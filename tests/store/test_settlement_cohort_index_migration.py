@@ -38,7 +38,9 @@ def test_the_settlement_cohort_index_leads_with_the_global_cohort(pg_admin):
     with private_database(pg_admin, "settlecohortindex") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
 
-        assert _indexes(sync_url)[_INDEX]["column_names"] == ["settlement_cohort"]
+        index = _indexes(sync_url)[_INDEX]
+        assert index["column_names"] == ["settlement_cohort"]
+        assert "settlement_cohort IS NOT NULL" in str(index["dialect_options"]["postgresql_where"])
 
 
 def test_the_settlement_cohort_index_migration_is_reversible(pg_admin):

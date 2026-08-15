@@ -21,6 +21,7 @@ from nso_adapter.core.static_route_plan import (
     SR_CLEAR_FIELDS,
     build_plan,
     fence_open,
+    hydrate_static_route_apply_plan,
     replacement_open,
 )
 from nso_adapter.nso.apply import apply_static_routes, static_route_entry
@@ -606,6 +607,29 @@ async def test_generation_records_the_complete_static_route_apply_plan(adapter_c
         ],
         "tombstone_id_watermark": tomb_id,
     }
+
+
+async def test_recorded_plan_rejects_a_malformed_sent_triple(adapter_client):
+    from nso_adapter.core.generation import create_generation, note_write
+    from nso_adapter.store.models import GenerationMode
+
+    device_id = await seed_device(nso_device_name="sr-malformed-recorded-plan", netbox_device_id=7015)
+    await _seed_rows(device_id, [{"triple": B, "route_id": 2, "deployed_key": list(A)}])
+
+    async with session() as db:
+        await note_write(db, device_id, "static_route")
+        generation = await create_generation(
+            db,
+            device_id,
+            streams=("static_route",),
+            mode=GenerationMode.networked,
+        )
+        document = generation.document
+
+    document["static_route"]["_execution"]["apply"]["cas"][0]["sent_triple"] = list(B[:2])
+
+    with pytest.raises(ValueError):
+        hydrate_static_route_apply_plan(document, eligible_rows=[])
 
 
 async def test_plan_writes_nothing(adapter_client):
