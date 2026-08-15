@@ -194,14 +194,19 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
     ``exc.errors()`` can carry non-JSON-native values (a validator's ValueError
     lands in ``ctx``) — encode through jsonable_encoder like FastAPI's default
     handler does, or a malformed request turns into a 500.
+
+    Pydantic also includes the submitted value under ``input``. Headers and query
+    parameters can contain secrets, so the public boundary keeps the location and
+    failure reason but never reflects that value.
     """
+    errors = [{key: value for key, value in error.items() if key != "input"} for error in exc.errors()]
     return JSONResponse(
         status_code=422,
         content={
             "error": {
                 "code": "validation_error",
                 "message": "Request validation failed",
-                "detail": {"errors": jsonable_encoder(exc.errors())},
+                "detail": {"errors": jsonable_encoder(errors)},
             }
         },
     )
