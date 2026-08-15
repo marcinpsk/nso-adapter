@@ -390,6 +390,36 @@ async def test_a_split_revision_is_applied_when_both_marking_jobs_succeed(adapte
     assert (stream.desired_revision, stream.authorized_revision, stream.applied_revision) == (1, 1, 1)
 
 
+async def test_a_split_revision_is_applied_when_the_failed_sibling_is_abandoned(adapter_client):
+    """A settled cohort member certifies the revision after its failed sibling is abandoned."""
+    from nso_adapter.core.generation import reconcile_generation
+    from nso_adapter.store.models import DeploymentGeneration, DeviceProjectionStream
+
+    device_id = await seed_device(nso_device_name="sr-split-settle-abandon", netbox_device_id=9882)
+    out = await _enqueue_split(device_id, removed={"delete_origin": [A], "detach": [C]})
+    marked, unmarked = out["jobs"]
+
+    fake = SrFake("sr-split-settle-abandon", service=[wire(A), wire(C)])
+    first = await run_removal_job(device_id, marked, sr_client(fake))
+    blind = SrFake("sr-split-settle-abandon", service=[wire(C)], service_status="inconclusive")
+    second = await run_removal_job(device_id, unmarked, sr_client(blind))
+    assert (first.status, second.status) == (JobStatus.succeeded, JobStatus.failed)
+
+    async with session() as db:
+        failed_generation = await db.scalar(select(DeploymentGeneration).where(DeploymentGeneration.job_id == unmarked))
+        assert await reconcile_generation(db, failed_generation.id)
+        await db.commit()
+
+    async with session() as db:
+        stream = await db.scalar(
+            select(DeviceProjectionStream).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == "static_route",
+            )
+        )
+        assert stream.applied_revision == 1
+
+
 async def test_a_homogeneous_removal_still_applies_its_revision(adapter_client):
     """The ordinary one-generation settlement keeps its existing revision behavior."""
     from nso_adapter.store.models import DeviceProjectionStream
