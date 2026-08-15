@@ -70,7 +70,7 @@ def parse_request_flag(raw: str | None) -> bool:
         return True
     if normalized in _FALSY:
         return False
-    raise ValueError(f"invalid boolean query value {raw!r}")
+    raise ValueError("invalid boolean query value")
 
 
 def request_marking() -> str:

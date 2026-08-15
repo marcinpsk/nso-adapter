@@ -398,7 +398,7 @@ def create_app() -> FastAPI:
                         422,
                         "validation_error",
                         f"{parameter} must be a boolean",
-                        {"parameter": parameter, "value": raw},
+                        {"parameter": parameter},
                     ),
                 )
 

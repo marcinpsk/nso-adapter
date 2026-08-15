@@ -86,6 +86,8 @@ async def test_o2b_10_the_whole_fence_withheld_sequence_reaches_the_device(adapt
     assert backfill.status_code == 200, backfill.text
     assert backfill.json()["removed_uncorrelated"] == [wire_triple(B)], "L must be reported, never pruned silently"
     assert backfill.json()["replaced"] is False
+    # An ordinary prune queues a detach. A backfill only repairs correlation, so it must
+    # leave device work and its tombstone carrier absent.
     assert await read_jobs(device_id) == [], "the pass spawned a job"
     assert await read_tombstones(device_id) == [], "the pass wrote a carrier"
 
@@ -212,21 +214,20 @@ async def test_o2b_10_a_malformed_backfill_flag_has_no_effect(adapter_client):
     """A typo cannot turn a backfill request into an ordinary full replacement."""
     device_id = await _seed_fence_shut_key("malformed-flag", None)
     before = await read_intent_all_columns(device_id)
+    raw = "private-mode-value"
 
     response = await put(
         adapter_client,
         device_id,
         [entry(C, route_id=101)],
         deleted_routes=[],
-        query="?backfill_only=tru",
+        query=f"?backfill_only={raw}",
         seq=1,
     )
 
     assert response.status_code == 422
-    assert response.json()["error"]["detail"] == {
-        "parameter": "backfill_only",
-        "value": "tru",
-    }
+    assert response.json()["error"]["detail"] == {"parameter": "backfill_only"}
+    assert raw not in response.text
     assert await read_intent_all_columns(device_id) == before
     assert await read_jobs(device_id) == []
     assert await receipt(device_id) is None
