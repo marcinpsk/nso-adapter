@@ -149,6 +149,10 @@ def scan_source(source: str, path: str) -> list[Violation]:
                 and any(isinstance(target, ast.Name) and target.id in mapping_names for target in targets)
             ):
                 found.extend(_dict_literal_violations(node.value, names, path, node.lineno))
+            # A walrus binds the same mapping from anywhere in an expression — a statement
+            # form is not required, so ``if (vals := {...}):`` reaches the row just as well.
+            if isinstance(node, ast.NamedExpr) and isinstance(node.value, ast.Dict) and node.target.id in mapping_names:
+                found.extend(_dict_literal_violations(node.value, names, path, node.lineno))
 
             if isinstance(node, ast.Call):
                 found.extend(_call_violations(node, names, path))
@@ -324,6 +328,28 @@ def test_flags_a_double_star_unpacked_walrus_mapping():
     """``.values(**(vals := {...}))`` hides the same mapping behind a named expression."""
     src = 'def f(u):\n    u.values(**(vals := {"settle_seq": 3}))\n'
     assert len(scan_source(src, "t.py")) == 1
+
+
+def test_flags_a_walrus_bound_outside_the_call():
+    """``if (vals := {...}):`` binds outside the argument list — ``.values(vals)`` still writes it."""
+    src = 'def f(u):\n    if (vals := {"status": JobStatus.failed, "settle_seq": 3}):\n        u.values(vals)\n'
+    hits = scan_source(src, "t.py")
+    assert [(hit.line, hit.what) for hit in hits] == [
+        (2, "assigns a terminal JobStatus directly"),
+        (2, "writes Job.settle_seq directly"),
+    ]
+
+
+def test_flags_a_walrus_bound_outside_a_double_star_call():
+    """The same binding reaches the row through ``**vals``, which the name path also reads."""
+    src = 'def f(u):\n    if (vals := {"settle_seq": 3}):\n        u.values(**vals)\n'
+    assert [(hit.line, hit.what) for hit in scan_source(src, "t.py")] == [(2, "writes Job.settle_seq directly")]
+
+
+def test_ignores_a_walrus_mapping_that_never_reaches_values():
+    """Binding a mapping is not writing one: without a ``values`` call it stays out of scope."""
+    src = 'def f(report):\n    if (vals := {"settle_seq": 3}):\n        report.log(vals)\n'
+    assert scan_source(src, "t.py") == []
 
 
 def test_flags_column_attribute_keys_in_a_values_mapping():
