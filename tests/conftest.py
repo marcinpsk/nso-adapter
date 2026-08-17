@@ -29,6 +29,17 @@ from nso_adapter.nso.client import NsoClient
 # tests run against real dev data instead of their isolated per-test database.
 os.environ.pop("DATABASE_URL", None)
 
+# Every worker clones its own databases from the one test Postgres.
+MAX_PARALLEL_WORKERS = 8
+
+
+def pytest_xdist_auto_num_workers(config: pytest.Config) -> int:
+    """Cap `-n auto` at the worker count the single test Postgres serves."""
+    from xdist.plugin import pytest_xdist_auto_num_workers as detected_num_workers
+
+    return min(detected_num_workers(config), MAX_PARALLEL_WORKERS)
+
+
 VALID_TOKEN = "test-bearer-token"
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
