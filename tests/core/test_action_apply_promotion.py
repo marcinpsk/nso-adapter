@@ -1348,3 +1348,99 @@ async def test_action_apply_names_a_backfill_only_receipt_by_its_own_skip_code(a
     }
     assert await _generations(device_id) == []
     assert await _jobs(device_id) == []
+
+
+async def _put_ip(client, device_id: int, addresses: list[dict], *, seq: int):
+    return await client.put(
+        f"/api/v1/devices/{device_id}/ip-intent?store_only=true",
+        json={"addresses": addresses},
+        headers=AUTH | {"X-Push-Seq": str(seq)},
+    )
+
+
+async def _rebind_authorized_ip_rows(device_id: int, interface_id) -> None:
+    """Point every authorized ``ip`` row at *interface_id*, the way a lost interface reads."""
+    from nso_adapter.store.models import DeviceProjectionStream
+
+    async with session() as db:
+        row = await db.scalar(
+            sa.select(DeviceProjectionStream).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == "ip",
+            )
+        )
+        document = {
+            table: [dict(entry, interface_id=interface_id) for entry in rows]
+            for table, rows in row.authorized_document.items()
+        }
+        assert document["interface_ip_intent"], "the promotion authorized no address to lose"
+        await db.execute(
+            sa.update(DeviceProjectionStream)
+            .where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == "ip",
+            )
+            .values(authorized_document=document)
+        )
+        await db.commit()
+
+
+async def _authorized_ip_address(client, device_id: int, monkeypatch, *, seq: int) -> None:
+    """Promote and settle one stored address, so the next push decomposes into a removal."""
+    from nso_adapter.store.models import GenerationStatus
+
+    _widen_apply_boundary(monkeypatch, "interface_config")
+    await seed_settings(device_id, auto_apply=False)
+    stored = await _put_ip(
+        client,
+        device_id,
+        [{"interface": "Gi0/1", "address": "198.18.11.1/30", "family": "ipv4"}],
+        seq=seq,
+    )
+    assert stored.status_code == 200, stored.text
+    assert (await _apply(client, device_id, {"ip": seq})).status_code == 202
+    await _settle((await _generations(device_id))[0].job_id, GenerationStatus.settled)
+
+
+async def test_action_apply_refuses_a_removal_whose_interface_identity_is_gone(adapter_client, monkeypatch):
+    """The removal names an interface row that no longer exists, so nothing may execute."""
+    device_id = await seed_device(nso_device_name="apply-interface-gone", netbox_device_id=9985)
+    await _authorized_ip_address(adapter_client, device_id, monkeypatch, seq=6501)
+    await _rebind_authorized_ip_rows(device_id, 999999)
+    assert (await _put_ip(adapter_client, device_id, [], seq=6502)).status_code == 200
+
+    response = await _apply(adapter_client, device_id, {"ip": 6502})
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": {
+            "code": "apply_unexecutable",
+            "message": "Selected stream(s) cannot be applied faithfully: ip",
+            "detail": {"streams": {"ip": "unresolved_interface_identity"}},
+        }
+    }
+    assert len(await _generations(device_id)) == 1, "the refused promotion left a generation behind"
+    assert len(await _jobs(device_id)) == 1, "the refused promotion left a job behind"
+    assert (await _stream(device_id, "ip")).authorized_revision == 1
+
+
+async def test_action_apply_refuses_an_interface_removal_with_no_executable_instance(adapter_client, monkeypatch):
+    """interface-reconciler is keyed per interface, so a nameless removal would send nothing."""
+    device_id = await seed_device(nso_device_name="apply-interface-nameless", netbox_device_id=9986)
+    await _authorized_ip_address(adapter_client, device_id, monkeypatch, seq=6601)
+    await _rebind_authorized_ip_rows(device_id, None)
+    assert (await _put_ip(adapter_client, device_id, [], seq=6602)).status_code == 200
+
+    response = await _apply(adapter_client, device_id, {"ip": 6602})
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": {
+            "code": "apply_unexecutable",
+            "message": "Selected stream(s) cannot be applied faithfully: ip",
+            "detail": {"streams": {"ip": "no_executable_interface"}},
+        }
+    }
+    assert len(await _generations(device_id)) == 1, "the refused promotion left a generation behind"
+    assert len(await _jobs(device_id)) == 1, "the refused promotion left a job behind"
+    assert (await _stream(device_id, "ip")).authorized_revision == 1
