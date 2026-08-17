@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 
 import structlog
 from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -462,7 +463,9 @@ def _reject_double_claimed_triple(routes: list[StaticRouteEntry], matched: dict[
         )
 
 
-async def _apply_static_route_intent(device_id: int, body: StaticRouteIntentUpdate, db: AsyncSession, delivery) -> dict:
+async def _apply_static_route_intent(
+    device_id: int, body: StaticRouteIntentUpdate, db: AsyncSession, delivery
+) -> dict | JSONResponse:
     """Run steps 3-9 of Q8, all under the claim the caller acquired and guard-locked."""
     device = await db.get(Device, device_id)
     if not device:
