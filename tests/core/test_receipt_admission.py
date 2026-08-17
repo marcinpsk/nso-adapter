@@ -476,6 +476,25 @@ async def test_a_keyed_invalid_utf8_body_is_a_validation_error(adapter_client):
     }
 
 
+async def test_a_keyed_undecodable_body_is_a_validation_error(adapter_client):
+    """An undecodable body raises UnicodeDecodeError, which is NOT a JSONDecodeError.
+
+    The content type must not be JSON here. FastAPI parses the body itself before dependency
+    solving only for a JSON content type, so any other type leaves the raw bytes for this
+    dependency to read, and an uncaught decode error there is a 500.
+    """
+    device_id = await seed_device(nso_device_name="rcp-bad-utf8", netbox_device_id=None)
+
+    response = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/vlan-intent",
+        content=b"\x80\x81",
+        headers={**AUTH, "Content-Type": "text/plain", "X-Push-Seq": "9"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
 # ── O2b.7: the header is DECLARED, not an undocumented convention ─────────────
 
 
