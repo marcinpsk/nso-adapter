@@ -78,4 +78,8 @@ def test_the_migration_is_reversible(pg_admin):
         with engine_on(sync_url) as engine:
             names = {c["name"] for c in sa.inspect(engine).get_columns("intent_push_receipt")}
             assert "backfill_only" not in names
+        # And the re-upgrade brings the column back: an upgrade that only works on a
+        # never-downgraded database is not a reversible migration.
         alembic(sync_url, "upgrade", module.revision)
+        with engine_on(sync_url) as engine:
+            assert "backfill_only" in {c["name"] for c in sa.inspect(engine).get_columns("intent_push_receipt")}
