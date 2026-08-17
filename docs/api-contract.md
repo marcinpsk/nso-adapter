@@ -60,6 +60,10 @@
     `code=validation_error` and the field errors under
     `error.detail.errors` — FastAPI's default `{"detail": [...]}` shape is
     never emitted.
+  - An unexpected failure anywhere (no specific handler claimed it) returns the
+    SAME envelope with `code=internal`, a generic message and an empty `detail`.
+    Nothing from the exception is echoed: it can carry the credential, URL or row
+    it failed on. The traceback goes to the adapter log.
 
 ### Call directions
 
