@@ -468,8 +468,13 @@ async def _selected_promotions(
     for stream, push_seq in sorted(selected.items()):
         row = rows.get(stream)
         receipt = await latest_receipt(db, device_id, stream)
-        if receipt is None or row is None or receipt.backfill_only:
+        if receipt is None or row is None:
             skipped[stream] = "no_receipt"
+            continue
+        # A backfill receipt holds the selected sequence, so no client retry can turn it
+        # into a promotion: it repairs correlation and authorizes no device work.
+        if receipt.backfill_only:
+            skipped[stream] = "backfill_only"
             continue
         if push_seq < receipt.push_seq:
             skipped[stream] = "superseded"

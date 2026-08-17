@@ -1300,3 +1300,51 @@ async def test_action_apply_settlement_between_projection_and_generation_reads_i
         "skipped": {"vlan": "already_authorized"},
         "generations": [],
     }
+
+
+def _widen_apply_boundary(monkeypatch, *sections: str) -> None:
+    """Admit *sections* past the live-read gate for one test.
+
+    The gate is a rollout boundary, not the behavior under test: it currently holds every
+    section but ``vlan``, so the paths below are unreachable over HTTP until the aggregate
+    document builder lands. The union keeps the widening additive, so this becomes a no-op
+    once the real boundary already holds the section.
+    """
+    from nso_adapter.core import generation as generation_module
+
+    monkeypatch.setattr(
+        generation_module,
+        "ACTION_APPLY_EXECUTABLE_SECTIONS",
+        generation_module.ACTION_APPLY_EXECUTABLE_SECTIONS | set(sections),
+    )
+
+
+async def test_action_apply_names_a_backfill_only_receipt_by_its_own_skip_code(adapter_client, monkeypatch):
+    """A backfill receipt holds the selected sequence, so 'no_receipt' misdescribes it."""
+    from tests.api.test_static_route_identity import seed_intent
+
+    _widen_apply_boundary(monkeypatch, "static_route")
+    device_id = await seed_device(nso_device_name="apply-backfill-skip", netbox_device_id=9984)
+    await seed_settings(device_id, auto_apply=False)
+    await seed_intent(device_id, [{"triple": _A, "route_id": 1}])
+    backfill = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_A, route_id=1, generation=1)],
+        seq=6401,
+        query="?backfill_only=true",
+    )
+    assert backfill.status_code == 200, backfill.text
+
+    response = await _apply(adapter_client, device_id, {"static_route": 6401})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "device_id": device_id,
+        "outcome": "no_op",
+        "selected": {"static_route": 6401},
+        "skipped": {"static_route": "backfill_only"},
+        "generations": [],
+    }
+    assert await _generations(device_id) == []
+    assert await _jobs(device_id) == []

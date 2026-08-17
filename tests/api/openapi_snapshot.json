@@ -133,6 +133,7 @@
                 "already_applied",
                 "already_authorized",
                 "no_receipt",
+                "backfill_only",
                 "revision_mismatch"
               ],
               "type": "string"

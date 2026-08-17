@@ -94,7 +94,14 @@ class ActionApplyOut(BaseModel):
     selected: dict[str, int]
     skipped: dict[
         str,
-        Literal["superseded", "already_applied", "already_authorized", "no_receipt", "revision_mismatch"],
+        Literal[
+            "superseded",
+            "already_applied",
+            "already_authorized",
+            "no_receipt",
+            "backfill_only",
+            "revision_mismatch",
+        ],
     ]
     skipped_detail: dict[str, ActionApplySkippedDetailOut] | None = None
     generations: list[ActionApplyGenerationOut]

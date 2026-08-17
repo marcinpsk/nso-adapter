@@ -661,8 +661,11 @@ A stream is promotable only when its latest durable receipt and projection row b
 selected sequence. A later push never rides an earlier selection. Every stale selection is
 reported under `skipped`: `superseded` for an older sequence, `already_applied` when its
 revision settled, `already_authorized` when its generation is still unsettled or was
-abandoned, `no_receipt` when the adapter has no matching receipt, and `revision_mismatch`
-when the receipt matches but the projection row does not.
+abandoned, `no_receipt` when the adapter has no matching receipt, `backfill_only` when the
+matching receipt was admitted in backfill-only mode, and `revision_mismatch` when the
+receipt matches but the projection row does not. `backfill_only` is terminal for that
+sequence: the receipt exists and holds it, but a backfill repairs correlation only, so no
+retry of the same selection can promote it.
 `skipped_detail` identifies the generation that already owns an authorized revision. The
 retry and abandon actions own that generation. Apply cannot replace it with weaker work.
 An empty selection, or a request in which every selection is skipped, returns `200` with an
