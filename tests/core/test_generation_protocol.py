@@ -906,6 +906,36 @@ async def test_f5_f_the_barrier_controls_refuse_when_nothing_is_blocked(adapter_
     assert resp.json()["error"]["code"] == "conflict"
 
 
+@pytest.mark.parametrize("action", ["retry-generation", "abandon-generation"])
+async def test_f5_g_an_outcome_unknown_head_answers_both_barrier_exits(adapter_client, action):
+    """A blocked head is not only a ``failed`` one, and both exits must accept the other.
+
+    Recovery never watched the run, so it can report ``outcome_unknown`` alone. An endpoint
+    that keeps its own narrower idea of "blocked" leaves such a head with no exit at all.
+    """
+    from nso_adapter.core import worker as worker_mod
+    from nso_adapter.core.claim import terminalize_running
+    from nso_adapter.store.models import GenerationStatus, JobStatus
+
+    device_id = await seed_device(nso_device_name=f"gen-unknown-{action}", netbox_device_id=None)
+    await seed_settings(device_id)
+    assert (await put_vlans(adapter_client, device_id, [10])).status_code == 200
+
+    # The run starts and nobody observes its end: recovery re-dispositions the orphan.
+    claimed = await worker_mod._claim_next_job()
+    assert claimed is not None, "the push did not queue an apply"
+    job_id, _device, _job_type, reg = claimed
+    async with session() as db:
+        await terminalize_running(db, job_id, status=JobStatus.failed, expected_attempt=reg.run_attempt)
+        await db.commit()
+    (head,) = await generations(device_id)
+    assert head.status is GenerationStatus.outcome_unknown
+
+    resp = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/{action}", headers=AUTH)
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["generation_id"] == head.id
+
+
 # ── #1558 rework 2 — the stamp targets a deployment actually carried ──────────
 
 

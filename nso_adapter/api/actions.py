@@ -241,15 +241,14 @@ async def _blocked_head(db: AsyncSession, device_id: int) -> DeploymentGeneratio
     An offboard committing inside that lock raises ``DeviceProjectionGone``, which the app's
     own handler turns into this same 404 envelope for every route that can hit it.
     """
-    from nso_adapter.core.generation import executable_head, lock_projection
-    from nso_adapter.store.models import GenerationStatus
+    from nso_adapter.core.generation import BLOCKED_STATUSES, executable_head, lock_projection
 
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
     await lock_projection(db, device_id)
     head = await executable_head(db, device_id)
-    if head is None or head.status not in (GenerationStatus.failed, GenerationStatus.outcome_unknown):
+    if head is None or head.status not in BLOCKED_STATUSES:
         raise api_error(
             409,
             "conflict",

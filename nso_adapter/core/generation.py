@@ -528,7 +528,7 @@ async def executable_head(db: AsyncSession, device_id: int) -> DeploymentGenerat
 #: Job types that write to the device. Everything else is a read and is never barred.
 _DEVICE_WRITING = (JobType.apply, JobType.removal)
 #: A head in one of these has not settled and never will without a retry or a reconcile.
-_BLOCKED = (GenerationStatus.failed, GenerationStatus.outcome_unknown)
+BLOCKED_STATUSES = (GenerationStatus.failed, GenerationStatus.outcome_unknown)
 
 
 async def job_admissible(db: AsyncSession, job_id: int, device_id: int) -> bool:
@@ -547,7 +547,7 @@ async def job_admissible(db: AsyncSession, job_id: int, device_id: int) -> bool:
             return True
         blocked = await db.scalar(
             select(DeploymentGeneration.seq)
-            .where(DeploymentGeneration.device_id == device_id, DeploymentGeneration.status.in_(_BLOCKED))
+            .where(DeploymentGeneration.device_id == device_id, DeploymentGeneration.status.in_(BLOCKED_STATUSES))
             .limit(1)
         )
         if blocked is None:
@@ -735,7 +735,7 @@ async def _claim_blocked_head(db: AsyncSession, generation_id: int, outcome: Gen
     """
     claimed = await db.scalar(
         sa_update(DeploymentGeneration)
-        .where(DeploymentGeneration.id == generation_id, DeploymentGeneration.status.in_(_BLOCKED))
+        .where(DeploymentGeneration.id == generation_id, DeploymentGeneration.status.in_(BLOCKED_STATUSES))
         .values(status=outcome, updated_at=_now())
         .returning(DeploymentGeneration.id)
         .execution_options(synchronize_session=False)
@@ -762,7 +762,7 @@ async def retry_generation(db: AsyncSession, generation_id: int) -> Job | None:
     generation = await db.get(DeploymentGeneration, generation_id)
     if generation is None:
         return None
-    if generation.status not in _BLOCKED:
+    if generation.status not in BLOCKED_STATUSES:
         raise GenerationNotBlocked(f"generation {generation_id} is {generation.status.value}, not a blocked head")
     # Digest-verified here too: a retry is precisely the moment the stored bytes are trusted.
     expected = digest_document(generation.mode, generation.document, generation.allowed_removal_keys or {})
@@ -802,7 +802,7 @@ async def reconcile_generation(db: AsyncSession, generation_id: int) -> bool:
     generation = await db.get(DeploymentGeneration, generation_id)
     if generation is None:
         return False
-    if generation.status not in _BLOCKED:
+    if generation.status not in BLOCKED_STATUSES:
         raise GenerationNotBlocked(f"generation {generation_id} is {generation.status.value}, not a blocked head")
     await _claim_blocked_head(db, generation_id, GenerationStatus.abandoned)
     generation.status = GenerationStatus.abandoned
@@ -966,6 +966,7 @@ async def recover_generations() -> int:
 
 
 __all__ = [
+    "BLOCKED_STATUSES",
     "DeviceProjectionGone",
     "GenerationModeConflict",
     "GenerationNotBlocked",
