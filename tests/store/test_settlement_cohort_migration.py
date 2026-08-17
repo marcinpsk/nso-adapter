@@ -51,4 +51,10 @@ def test_the_settlement_cohort_migration_is_reversible(pg_admin):
             names = {c["name"] for c in inspector.get_columns("deployment_generation")}
             assert "settlement_cohort" not in names
             assert not inspector.has_sequence(_SEQUENCE)
+        # Column AND allocator come back: recreating one without the other leaves the
+        # cohort unallocatable, and the re-upgrade is the only place that shows it.
         alembic(sync_url, "upgrade", module.revision)
+        with engine_on(sync_url) as engine:
+            inspector = sa.inspect(engine)
+            assert "settlement_cohort" in {c["name"] for c in inspector.get_columns("deployment_generation")}
+            assert inspector.has_sequence(_SEQUENCE)
