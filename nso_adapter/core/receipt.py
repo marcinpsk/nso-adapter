@@ -190,12 +190,19 @@ def _restored_deletion_identities(previous: dict, authorized: dict, desired: dic
     from nso_adapter.core.projection import rows_by_intent_identity
 
     retired: set[tuple] = set()
+    # One identity index per table, not per accumulated record: rows_by_intent_identity
+    # walks the table's whole identity lineage and caches nothing.
+    desired_index: dict[str, dict[tuple, dict]] = {}
+    authorized_index: dict[str, dict[tuple, dict]] = {}
     for record in previous.get("_promotion_deletions") or []:
         deletion_identity = _deletion_identity(record)
         if deletion_identity is None:
             continue
         table = deletion_identity[0]
-        desired_rows = rows_by_intent_identity(desired, table)
+        if table not in desired_index:
+            desired_index[table] = rows_by_intent_identity(desired, table)
+            authorized_index[table] = rows_by_intent_identity(authorized, table)
+        desired_rows = desired_index[table]
         if deletion_identity[1] != "id" and any(
             _record_matches_row(deletion_identity, row) for row in desired_rows.values()
         ):
@@ -204,7 +211,7 @@ def _restored_deletion_identities(previous: dict, authorized: dict, desired: dic
         previous_identity = next(
             (
                 identity
-                for identity, row in rows_by_intent_identity(authorized, table).items()
+                for identity, row in authorized_index[table].items()
                 if _record_matches_row(deletion_identity, row)
             ),
             None,
