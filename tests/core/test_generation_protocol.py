@@ -769,10 +769,10 @@ async def test_f6_a_manual_apply_creates_a_generation_from_authorized_state(adap
     assert (await put_vlans(adapter_client, device_id, [10])).status_code == 200
     assert await generations(device_id) == []
 
-    push_seq = (await stream_row(device_id, "vlan")).source_push_seq
+    selected_seq = (await stream_row(device_id, "vlan")).source_push_seq
     resp = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/apply",
-        json={"selected": {"vlan": push_seq}},
+        json={"selected": {"vlan": selected_seq}},
         headers=AUTH,
     )
     assert resp.status_code == 202
