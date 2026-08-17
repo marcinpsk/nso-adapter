@@ -36,9 +36,9 @@ from nso_adapter.store.models import (
     RoutePolicyObjectIntent,
     VlanIntent,
 )
+from tests.conftest import SNMP_COMMUNITY as _COMMUNITY
+from tests.conftest import SNMP_VAULT_REF as _REF
 from tests.conftest import session
-from tests.core.conftest import SNMP_COMMUNITY as _COMMUNITY
-from tests.core.conftest import SNMP_VAULT_REF as _REF
 
 _NOW = datetime.now(UTC)
 

@@ -19,7 +19,7 @@ import pytest
 from nso_adapter.core import snmp_verify
 from nso_adapter.core.snmp_verify import _fingerprints_blocking, community_fingerprints
 from nso_adapter.secrets.refs import secret_fingerprint
-from tests.core.conftest import SNMP_COMMUNITY, SNMP_VAULT_REF, FakeVault, community_export_name
+from tests.conftest import SNMP_COMMUNITY, SNMP_VAULT_REF, FakeVault, community_export_name
 
 _PATH = ("network", "netbox/snmp/community/prod-ro")
 
