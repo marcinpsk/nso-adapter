@@ -50,3 +50,4 @@ def test_the_settlement_cohort_index_migration_is_reversible(pg_admin):
         alembic(sync_url, "downgrade", module.down_revision)
         assert _INDEX not in _indexes(sync_url)
         alembic(sync_url, "upgrade", module.revision)
+        assert _INDEX in _indexes(sync_url)
