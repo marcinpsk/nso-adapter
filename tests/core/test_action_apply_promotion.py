@@ -1312,12 +1312,13 @@ def _widen_apply_boundary(monkeypatch, *sections: str) -> None:
     holds the section.
     """
     from nso_adapter.core import generation as generation_module
+    from nso_adapter.core import projection as projection_module
 
-    monkeypatch.setattr(
-        generation_module,
-        "ACTION_APPLY_EXECUTABLE_SECTIONS",
-        generation_module.ACTION_APPLY_EXECUTABLE_SECTIONS | set(sections),
-    )
+    widened = projection_module.ACTION_APPLY_EXECUTABLE_SECTIONS | set(sections)
+    monkeypatch.setattr(projection_module, "ACTION_APPLY_EXECUTABLE_SECTIONS", widened)
+    # `from … import` binds a copy; rebind it only where the consuming module still has one.
+    if hasattr(generation_module, "ACTION_APPLY_EXECUTABLE_SECTIONS"):
+        monkeypatch.setattr(generation_module, "ACTION_APPLY_EXECUTABLE_SECTIONS", widened)
 
 
 async def test_action_apply_names_a_backfill_only_receipt_by_its_own_skip_code(adapter_client, monkeypatch):
