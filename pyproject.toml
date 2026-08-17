@@ -78,7 +78,7 @@ parse_squash_commits = false
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "--cov=nso_adapter --cov-report=term-missing"
+addopts = "--cov=nso_adapter --cov-report=term-missing -n auto"
 
 [tool.coverage.run]
 source = ["nso_adapter"]

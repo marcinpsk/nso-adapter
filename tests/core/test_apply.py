@@ -2622,7 +2622,7 @@ async def test_run_apply_reader_compare_ok_when_key_lands(adapter_client):
         assert row.last_apply_at is not None
 
 
-from tests.core.conftest import SNMP_COMMUNITY, SNMP_VAULT_REF, community_export_name  # noqa: E402
+from tests.conftest import SNMP_COMMUNITY, SNMP_VAULT_REF, community_export_name  # noqa: E402
 
 
 def _community_export_name(secret: str) -> str:

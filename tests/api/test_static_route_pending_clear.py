@@ -45,17 +45,21 @@ async def put_intent(client, device_id: int, routes: list[dict], *, query: str =
     return resp.json()
 
 
-async def carriers(device_id: int) -> dict[tuple, dict | None]:
-    """``{triple: pending_clear}`` for every intent row of the device."""
+async def intent_rows(device_id: int) -> list:
+    """Every ``StaticRouteIntent`` row of the device; each reader below projects one field."""
     from nso_adapter.store.models import StaticRouteIntent
 
     async with session() as db:
-        rows = (
+        return list(
             (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
             .scalars()
             .all()
         )
-        return {(r.vrf, r.prefix, r.next_hop): r.pending_clear for r in rows}
+
+
+async def carriers(device_id: int) -> dict[tuple, dict | None]:
+    """``{triple: pending_clear}`` for every intent row of the device."""
+    return {(r.vrf, r.prefix, r.next_hop): r.pending_clear for r in await intent_rows(device_id)}
 
 
 async def removal_jobs(device_id: int) -> list[dict]:
@@ -339,15 +343,7 @@ async def test_a_new_row_carries_nothing(adapter_client):
 
 async def stored_metrics(device_id: int) -> dict[tuple, int | None]:
     """``{triple: metric}`` for every intent row of the device."""
-    from nso_adapter.store.models import StaticRouteIntent
-
-    async with session() as db:
-        rows = (
-            (await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
-            .scalars()
-            .all()
-        )
-        return {(r.vrf, r.prefix, r.next_hop): r.metric for r in rows}
+    return {(r.vrf, r.prefix, r.next_hop): r.metric for r in await intent_rows(device_id)}
 
 
 async def test_p1_3_a_timos_metric_edit_records_no_clear_and_no_removal(adapter_client):

@@ -501,19 +501,29 @@ def clean_netbox_registry():
 
 
 async def test_lifespan_binds_the_configured_database(clean_netbox_registry, pg_url, tmp_path, monkeypatch):
-    """The one un-patched lifespan run — nothing stubbed, not even init_db/_dispose_engine.
+    """The lifespan run that keeps init_db/_dispose_engine real — the subject here.
 
     ``adapter_client`` patches both out (``store_engine`` owns the process globals, and
     a lifespan disposal there would orphan a sibling session's checked-out connection),
     so this is the only place proving the real lifespan reads ``database_url`` from the
     config file, binds THAT database, and disposes the engine on exit.
+
+    The scheduler is the one thing kept out. ``start_scheduler`` fires an immediate sync
+    kick and ``stop_scheduler`` deliberately does not wait for an in-flight tick, so that
+    tick can still hold a connection when the per-test database is dropped — a straggler
+    that fails the teardown leak check on a loaded runner. Nothing here waits for it either:
+    a fire-and-forget job cannot be drained, so it must not be started.
     """
     from sqlalchemy.engine import make_url
 
+    from nso_adapter import main as main_mod
     from nso_adapter.config import reset_config
     from nso_adapter.main import create_app
     from nso_adapter.store import db as store_db
     from tests.conftest import _write_config
+
+    monkeypatch.setattr(main_mod, "start_scheduler", lambda: None)
+    monkeypatch.setattr(main_mod, "stop_scheduler", lambda: None)
 
     _write_config(tmp_path, monkeypatch, database_url=pg_url)
     reset_config()

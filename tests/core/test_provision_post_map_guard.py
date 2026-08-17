@@ -344,9 +344,12 @@ async def test_a_refused_terminal_write_discards_the_provision_transaction(adapt
     from nso_adapter.core.jobs import _JOB_RUNNERS
     from nso_adapter.store.models import Device, Job, JobStatus, JobType
 
+    ran: list[int] = []
+
     async def _tail_write(db, device_id, client, *, reg=None):
         device = await db.get(Device, device_id)
         device.sw_version = "tail-write"
+        ran.append(device_id)
 
     async with session() as db:
         job = Job(
@@ -376,6 +379,9 @@ async def test_a_refused_terminal_write_discards_the_provision_transaction(adapt
     async with session() as db:
         job = await db.get(Job, job_id)
     device = await _device_by_name("pg-stale-success")
+    # Without this, an unrun stand-in (signature drift, or the call site dropped) leaves
+    # sw_version None for the wrong reason and the assertion below passes vacuously.
+    assert ran, "the tail-write stand-in never ran, so the test no longer models the case"
     assert job.status is JobStatus.running, "the refused write must leave the successor's row alone"
     assert job.run_attempt == 2
     assert job.result is None and job.settle_seq is None

@@ -70,6 +70,13 @@ def _target_attr(node: ast.expr) -> str | None:
     return node.attr if isinstance(node, ast.Attribute) else None
 
 
+def _subscript_key(node: ast.expr) -> str | None:
+    """The column a ``values["status"] = ...`` assignment writes into a bound mapping."""
+    if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+        return node.slice.value if isinstance(node.slice.value, str) else None
+    return None
+
+
 def _called_name(node: ast.Call) -> str | None:
     if isinstance(node.func, ast.Name):
         return node.func.id
@@ -78,38 +85,77 @@ def _called_name(node: ast.Call) -> str | None:
     return None
 
 
+_SCOPE_NODES = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+
+def _nodes_in_scope(scope: ast.AST) -> list[ast.AST]:
+    """Return nodes whose nearest lexical scope is *scope*."""
+    nodes: list[ast.AST] = []
+    pending = list(ast.iter_child_nodes(scope))
+    while pending:
+        node = pending.pop()
+        if isinstance(node, _SCOPE_NODES):
+            continue
+        nodes.append(node)
+        pending.extend(ast.iter_child_nodes(node))
+    return nodes
+
+
+def _values_mapping_names(nodes: list[ast.AST]) -> frozenset[str]:
+    """Return bound mappings passed to SQLAlchemy's ``values`` writer."""
+    names: set[str] = set()
+    for node in nodes:
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "values"):
+            continue
+        names.update(arg.id for arg in node.args if isinstance(arg, ast.Name))
+        names.update(
+            keyword.value.id for keyword in node.keywords if keyword.arg is None and isinstance(keyword.value, ast.Name)
+        )
+    return frozenset(names)
+
+
 def scan_source(source: str, path: str) -> list[Violation]:
     """Every direct terminal-status or settle_seq write in *source*."""
     found: list[Violation] = []
     tree = ast.parse(source)
     names = _enum_names(tree)
-    for node in ast.walk(tree):
-        targets: list[ast.expr] = []
-        if isinstance(node, ast.Assign):
-            targets = list(node.targets)
-        elif isinstance(node, ast.AnnAssign | ast.AugAssign):
-            targets = [node.target]
-        for target in targets:
-            attr = _target_attr(target)
-            if attr == _SEQUENCE_ATTR:
-                found.append(Violation(path, node.lineno, "writes Job.settle_seq directly"))
-            elif attr == "status" and _is_terminal_status(getattr(node, "value", None), names):
-                found.append(Violation(path, node.lineno, "assigns a terminal JobStatus directly"))
-
-        if isinstance(node, ast.Call) and _called_name(node) not in _SANCTIONED_WRITERS:
-            for kw in node.keywords:
-                if kw.arg is None:
-                    # ``**{...}`` carries the same write with no keyword name to read.
-                    if isinstance(kw.value, ast.Dict):
-                        found.extend(_dict_literal_violations(kw.value, names, path, node.lineno))
-                elif kw.arg == _SEQUENCE_ATTR:
+    for scope in (node for node in ast.walk(tree) if isinstance(node, _SCOPE_NODES)):
+        nodes = _nodes_in_scope(scope)
+        mapping_names = _values_mapping_names(nodes)
+        for node in nodes:
+            targets: list[ast.expr] = []
+            if isinstance(node, ast.Assign):
+                targets = list(node.targets)
+            elif isinstance(node, ast.AnnAssign | ast.AugAssign):
+                targets = [node.target]
+            for target in targets:
+                attr = _target_attr(target)
+                if (
+                    attr is None
+                    and isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in mapping_names
+                ):
+                    attr = _subscript_key(target)
+                if attr == _SEQUENCE_ATTR:
                     found.append(Violation(path, node.lineno, "writes Job.settle_seq directly"))
-                elif kw.arg == "status" and _is_terminal_status(kw.value, names):
+                elif attr == "status" and _is_terminal_status(getattr(node, "value", None), names):
                     found.append(Violation(path, node.lineno, "assigns a terminal JobStatus directly"))
-            # SQLAlchemy's .values() equally accepts a mapping: .values({"status": ...}).
-            for arg in node.args:
-                if isinstance(arg, ast.Dict):
-                    found.extend(_dict_literal_violations(arg, names, path, node.lineno))
+            # A mapping bound to a name is a write only if that same binding reaches
+            # SQLAlchemy's ``values`` method in this lexical scope.
+            if (
+                isinstance(node, ast.Assign | ast.AnnAssign)
+                and isinstance(node.value, ast.Dict)
+                and any(isinstance(target, ast.Name) and target.id in mapping_names for target in targets)
+            ):
+                found.extend(_dict_literal_violations(node.value, names, path, node.lineno))
+            # A walrus binds the same mapping from anywhere in an expression — a statement
+            # form is not required, so ``if (vals := {...}):`` reaches the row just as well.
+            if isinstance(node, ast.NamedExpr) and isinstance(node.value, ast.Dict) and node.target.id in mapping_names:
+                found.extend(_dict_literal_violations(node.value, names, path, node.lineno))
+
+            if isinstance(node, ast.Call):
+                found.extend(_call_violations(node, names, path))
     return found
 
 
@@ -128,6 +174,36 @@ def _dict_literal_violations(arg: ast.Dict, names: frozenset[str], path: str, li
             found.append(Violation(path, lineno, "writes Job.settle_seq directly"))
         elif name == "status" and _is_terminal_status(value, names):
             found.append(Violation(path, lineno, "assigns a terminal JobStatus directly"))
+    return found
+
+
+def _mapping_literal(node: ast.expr) -> ast.Dict | None:
+    """The mapping an argument carries, through a named expression (``vals := {...}``) if used."""
+    if isinstance(node, ast.Dict):
+        return node
+    if isinstance(node, ast.NamedExpr) and isinstance(node.value, ast.Dict):
+        return node.value
+    return None
+
+
+def _call_violations(node: ast.Call, names: frozenset[str], path: str) -> list[Violation]:
+    """Every write a call carries: ``status=``/``settle_seq=`` keywords and mapping arguments."""
+    if _called_name(node) in _SANCTIONED_WRITERS:
+        return []
+    found: list[Violation] = []
+    for kw in node.keywords:
+        if kw.arg is None:
+            # ``**{...}`` carries the same write with no keyword name to read.
+            if mapping := _mapping_literal(kw.value):
+                found.extend(_dict_literal_violations(mapping, names, path, node.lineno))
+        elif kw.arg == _SEQUENCE_ATTR:
+            found.append(Violation(path, node.lineno, "writes Job.settle_seq directly"))
+        elif kw.arg == "status" and _is_terminal_status(kw.value, names):
+            found.append(Violation(path, node.lineno, "assigns a terminal JobStatus directly"))
+    # SQLAlchemy's .values() equally accepts a mapping: .values({"status": ...}).
+    for arg in node.args:
+        if mapping := _mapping_literal(arg):
+            found.extend(_dict_literal_violations(mapping, names, path, node.lineno))
     return found
 
 
@@ -190,6 +266,37 @@ def test_flags_a_dict_literal_values_mapping():
     assert len(scan_source(src, "t.py")) == 2
 
 
+def test_flags_a_dict_literal_bound_to_a_name_first():
+    """``vals = {...}`` handed to ``.values(vals)`` is the same physical write, one line up."""
+    src = 'def f(u):\n    vals = {"status": JobStatus.failed, "settle_seq": 3}\n    u.values(vals)\n'
+    hits = scan_source(src, "t.py")
+    assert [(h.line, h.what) for h in hits] == [
+        (2, "assigns a terminal JobStatus directly"),
+        (2, "writes Job.settle_seq directly"),
+    ]
+
+
+def test_flags_a_subscript_write_into_a_bound_mapping():
+    """``vals["settle_seq"] = 3`` reaches the row through the mapping built one line up."""
+    src = 'def f(u):\n    vals = {"job_type": 1}\n    vals["settle_seq"] = 3\n    u.values(vals)\n'
+    assert [(h.line, h.what) for h in scan_source(src, "t.py")] == [(3, "writes Job.settle_seq directly")]
+
+
+def test_ignores_a_returned_read_serialization():
+    """A bound response mapping reads job fields. It does not write them."""
+    src = (
+        "def f(j, update):\n"
+        '    write_values = {"status": JobStatus.failed, "settle_seq": 3}\n'
+        '    response = {"status": JobStatus.failed, "settle_seq": j.settle_seq}\n'
+        "    update.values(write_values)\n"
+        "    return response\n"
+    )
+    assert [(hit.line, hit.what) for hit in scan_source(src, "t.py")] == [
+        (2, "assigns a terminal JobStatus directly"),
+        (2, "writes Job.settle_seq directly"),
+    ]
+
+
 def test_flags_a_double_star_unpacked_dict_literal():
     """``.values(**{...})`` reaches the same write with no keyword the loop can see."""
     src = 'def f(u):\n    u.values(**{"status": JobStatus.failed})\n'
@@ -199,6 +306,50 @@ def test_flags_a_double_star_unpacked_dict_literal():
 def test_flags_a_double_star_unpacked_settle_seq():
     src = 'def f(u):\n    u.values(**{"settle_seq": 6})\n'
     assert len(scan_source(src, "t.py")) == 1
+
+
+def test_flags_a_double_star_unpacked_bound_mapping():
+    """``vals`` bound before ``.values(**vals)`` is still a physical row write."""
+    src = 'def f(u):\n    vals = {"status": JobStatus.failed, "settle_seq": 3}\n    u.values(**vals)\n'
+    hits = scan_source(src, "t.py")
+    assert [(hit.line, hit.what) for hit in hits] == [
+        (2, "assigns a terminal JobStatus directly"),
+        (2, "writes Job.settle_seq directly"),
+    ]
+
+
+def test_flags_a_walrus_bound_values_mapping():
+    """``.values(vals := {...})`` binds and writes the row in one expression."""
+    src = 'def f(u):\n    u.values(vals := {"status": JobStatus.failed, "settle_seq": 3})\n'
+    assert len(scan_source(src, "t.py")) == 2
+
+
+def test_flags_a_double_star_unpacked_walrus_mapping():
+    """``.values(**(vals := {...}))`` hides the same mapping behind a named expression."""
+    src = 'def f(u):\n    u.values(**(vals := {"settle_seq": 3}))\n'
+    assert len(scan_source(src, "t.py")) == 1
+
+
+def test_flags_a_walrus_bound_outside_the_call():
+    """``if (vals := {...}):`` binds outside the argument list — ``.values(vals)`` still writes it."""
+    src = 'def f(u):\n    if (vals := {"status": JobStatus.failed, "settle_seq": 3}):\n        u.values(vals)\n'
+    hits = scan_source(src, "t.py")
+    assert [(hit.line, hit.what) for hit in hits] == [
+        (2, "assigns a terminal JobStatus directly"),
+        (2, "writes Job.settle_seq directly"),
+    ]
+
+
+def test_flags_a_walrus_bound_outside_a_double_star_call():
+    """The same binding reaches the row through ``**vals``, which the name path also reads."""
+    src = 'def f(u):\n    if (vals := {"settle_seq": 3}):\n        u.values(**vals)\n'
+    assert [(hit.line, hit.what) for hit in scan_source(src, "t.py")] == [(2, "writes Job.settle_seq directly")]
+
+
+def test_ignores_a_walrus_mapping_that_never_reaches_values():
+    """Binding a mapping is not writing one: without a ``values`` call it stays out of scope."""
+    src = 'def f(report):\n    if (vals := {"settle_seq": 3}):\n        report.log(vals)\n'
+    assert scan_source(src, "t.py") == []
 
 
 def test_flags_column_attribute_keys_in_a_values_mapping():

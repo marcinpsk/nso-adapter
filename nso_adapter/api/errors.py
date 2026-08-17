@@ -16,11 +16,14 @@ from __future__ import annotations
 
 from typing import Literal
 
+import structlog
 from fastapi import HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+logger = structlog.get_logger(__name__)
 
 # Closed set — every member documented in docs/api-contract.md (§ error body).
 # Core codes first, then per-endpoint codes. Tests enforce both directions.
@@ -132,6 +135,21 @@ def api_error(
 
 async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content=exc.detail)
+
+
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Answer an unexpected failure with the documented envelope instead of a bare 500.
+
+    The message is GENERIC on purpose and the exception never reaches the body: it routinely
+    carries the credential, URL or row it failed on (an hvac error echoes the token path, a
+    driver error the DSN), and a 500 body is the one place nobody redacts before it lands in
+    a log aggregator. The traceback goes to the adapter's own log instead.
+    """
+    logger.exception("api.unhandled_exception", method=request.method, path=request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"error": {"code": "internal", "message": "Internal server error", "detail": {}}},
+    )
 
 
 async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:

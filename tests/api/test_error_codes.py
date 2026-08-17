@@ -68,6 +68,65 @@ async def test_validation_error_with_non_primitive_ctx(adapter_client):
     assert isinstance(err["detail"]["errors"], list)
 
 
+# ------------------------------------------------------- envelope on an unexpected 500
+
+
+async def test_an_unhandled_exception_uses_the_envelope_and_never_echoes_the_exception():
+    """The catch-all: an unexpected failure anywhere still answers the documented shape.
+
+    Its text is deliberately generic. An exception raised deep in a dependency routinely
+    carries the credential (or the URL, or the row) it failed on, and a 500 body is the one
+    place nobody inspects before it reaches a log aggregator — so nothing from the exception
+    crosses the wire; the traceback goes to the adapter log instead.
+
+    ``raise_app_exceptions=False`` because Starlette's ServerErrorMiddleware re-raises after
+    the handler has responded (that is how a server keeps its own traceback), which the
+    default transport would surface as the test's own error.
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    from nso_adapter.main import create_app
+
+    secret = "s3cr3t-vault-token"
+    app = create_app()
+
+    @app.get("/_test/boom")
+    async def _boom():
+        raise RuntimeError(f"vault login failed with token {secret}")
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test"
+    ) as client:
+        resp = await client.get("/_test/boom")
+
+    assert resp.status_code == 500
+    assert resp.json() == {"error": {"code": "internal", "message": "Internal server error", "detail": {}}}
+    assert secret not in resp.text
+
+
+async def test_a_specific_handler_still_wins_over_the_catch_all():
+    """The catch-all is the LAST resort: a raised ApiError keeps its own status and code."""
+    from httpx import ASGITransport, AsyncClient
+
+    from nso_adapter.main import create_app
+
+    app = create_app()
+
+    @app.get("/_test/conflict")
+    async def _conflict():
+        raise api_error(409, "conflict", "a job is already running", {"device_id": 7})
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test"
+    ) as client:
+        resp = await client.get("/_test/conflict")
+
+    assert resp.status_code == 409
+    assert resp.json() == {
+        "error": {"code": "conflict", "message": "a job is already running", "detail": {"device_id": 7}}
+    }
+
+
 # ---------------------------------------------------------------- closed set
 
 
