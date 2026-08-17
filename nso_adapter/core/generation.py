@@ -471,16 +471,16 @@ async def _selected_promotions(
         if receipt is None or row is None:
             skipped[stream] = "no_receipt"
             continue
-        # A backfill receipt holds the selected sequence, so no client retry can turn it
-        # into a promotion: it repairs correlation and authorizes no device work.
-        if receipt.backfill_only:
-            skipped[stream] = "backfill_only"
-            continue
         if push_seq < receipt.push_seq:
             skipped[stream] = "superseded"
             continue
         if receipt.push_seq != push_seq:
             skipped[stream] = "no_receipt"
+            continue
+        # The receipt holds the selected sequence, so no client retry can turn it into a
+        # promotion: a backfill repairs correlation and authorizes no device work.
+        if receipt.backfill_only:
+            skipped[stream] = "backfill_only"
             continue
         if row.source_push_seq != push_seq:
             skipped[stream] = "revision_mismatch"

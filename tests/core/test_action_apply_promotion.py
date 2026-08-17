@@ -1307,8 +1307,9 @@ def _widen_apply_boundary(monkeypatch, *sections: str) -> None:
 
     The gate is a rollout boundary, not the behavior under test: it currently holds every
     section but ``vlan``, so the paths below are unreachable over HTTP until the aggregate
-    document builder lands. The union keeps the widening additive, so this becomes a no-op
-    once the real boundary already holds the section.
+    document builder lands. The widening only unions sections in and never replaces the
+    set, so it degrades to a no-op and these tests run unpatched once the real boundary
+    holds the section.
     """
     from nso_adapter.core import generation as generation_module
 
@@ -1444,3 +1445,36 @@ async def test_action_apply_refuses_an_interface_removal_with_no_executable_inst
     assert len(await _generations(device_id)) == 1, "the refused promotion left a generation behind"
     assert len(await _jobs(device_id)) == 1, "the refused promotion left a job behind"
     assert (await _stream(device_id, "ip")).authorized_revision == 1
+
+
+@pytest.mark.parametrize(
+    ("selected_seq", "expected", "netbox_device_id"),
+    [(6410, "superseded", 9987), (6412, "no_receipt", 9988)],
+)
+async def test_backfill_only_never_answers_for_a_sequence_the_receipt_does_not_hold(
+    adapter_client, monkeypatch, selected_seq, expected, netbox_device_id
+):
+    """A neighboring sequence keeps its own answer: the older one is superseded, the newer retryable."""
+    from tests.api.test_static_route_identity import seed_intent
+
+    _widen_apply_boundary(monkeypatch, "static_route")
+    device_id = await seed_device(
+        nso_device_name=f"apply-backfill-seq-{selected_seq}", netbox_device_id=netbox_device_id
+    )
+    await seed_settings(device_id, auto_apply=False)
+    await seed_intent(device_id, [{"triple": _A, "route_id": 1}])
+    backfill = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_A, route_id=1, generation=1)],
+        seq=6411,
+        query="?backfill_only=true",
+    )
+    assert backfill.status_code == 200, backfill.text
+
+    response = await _apply(adapter_client, device_id, {"static_route": selected_seq})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["skipped"] == {"static_route": expected}
+    assert await _generations(device_id) == []
+    assert await _jobs(device_id) == []
