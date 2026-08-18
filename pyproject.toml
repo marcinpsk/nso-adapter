@@ -38,6 +38,8 @@ dev = [
     "respx>=0.21",
     "ruff>=0.16.1",
     "watchfiles>=1.0",
+    # Keep in step with the pinned zizmor hook rev in .pre-commit-config.yaml.
+    "zizmor==1.29.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -51,13 +53,16 @@ commit_parser = "conventional"
 tag_format = "v{version}"
 version_toml = ["pyproject.toml:project.version"]
 version_variables = ["nso_adapter/__init__.py:__version__"]
-# Staged files join the release commit; the PSR action container has no uv.
+# The PSR action container has no uv, so bootstrap it before locking. Scoped to THIS
+# package on purpose: a bare `uv lock` re-resolves the whole graph, which would fold
+# unrelated dependency upgrades into a release commit nobody reviewed.
 build_command = """
 set -e
 command -v uv >/dev/null || python -m pip install 'uv ~= 0.12.3'
 uv lock --upgrade-package nso-adapter
-git add uv.lock
 """
+# PSR adds these to the release commit, so the tag ships a lock matching its version.
+assets = ["uv.lock"]
 # PSR strips the build env to an allowlist; forward only vars that are safe when
 # empty (PSR passes unset entries as "", which uv rejects for boolish UV_* vars).
 build_command_env = ["http_proxy", "https_proxy", "no_proxy"]

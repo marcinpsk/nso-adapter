@@ -37,6 +37,12 @@ jobs:
       - name: Ruff format check
         run: uv run --native-tls -- ruff format --check .
 
+      # GitHub Actions security audit, from the version pinned in [dependency-groups].dev
+      # that `uv sync` above installed. Scans all of .github so it covers dependabot.yml
+      # too, which is the scope the pre-commit hook uses — the two gates must not disagree.
+      - name: Zizmor (GitHub Actions security audit)
+        run: uv run --native-tls -- zizmor .github
+
   container-smoke:
     name: Container runtime smoke test
     runs-on: ubuntu-latest

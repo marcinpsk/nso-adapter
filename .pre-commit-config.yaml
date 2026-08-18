@@ -28,6 +28,14 @@ repos:
         args: [--fix, --exit-non-zero-on-fix]
       - id: ruff-format
 
+  # GitHub Actions security audit. Offline by default, so it never blocks a commit on
+  # network reachability. Keep in step with the pinned zizmor in [dependency-groups].dev,
+  # which is what the CI job runs over the same tree.
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.29.0
+    hooks:
+      - id: zizmor
+
   # In-house test-quality guard: flag new spec-less MagicMock/Mock used as object
   # stand-ins (see tests/mock_discipline.py). Stdlib-only; scans the whole tests/ tree.
   - repo: local

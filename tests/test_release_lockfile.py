@@ -30,16 +30,15 @@ def test_the_lockfile_records_the_declared_version():
     assert _locked_version() == __version__
 
 
-def test_the_release_refreshes_and_stages_the_lockfile():
+def test_the_release_refreshes_and_ships_the_lockfile():
     """The two halves of the mechanism: regenerate the lock, and put it in the release commit.
 
-    Staging is the load-bearing half — semantic-release only carries staged files into the
-    version commit, so dropping the ``git add`` leaves the lock behind on the tag.
+    Shipping it is the load-bearing half — semantic-release carries only ``assets`` into the
+    version commit, so dropping that entry leaves the refreshed lock behind on the tag.
     """
-    pyproject = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text())
-    build_command = pyproject["tool"]["semantic_release"]["build_command"]
+    release = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text())["tool"]["semantic_release"]
 
-    assert "uv lock" in build_command
-    assert "git add uv.lock" in build_command
+    assert "uv lock" in release["build_command"]
+    assert "uv.lock" in release["assets"]
     # build_command only runs when the release action is asked to build.
     assert "build: true" in (_REPO_ROOT / ".github" / "workflows" / "release.yml").read_text()
