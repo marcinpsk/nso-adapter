@@ -66,22 +66,34 @@ async def _seed_removal_job(device_id: int, scope: str = "vlan", context_extra: 
     body a PUT-replace asserts comes from the generation's document for a document-executed
     scope, and a job with none has nothing to deploy.
     """
-    from nso_adapter.core.generation import attach_to_job, create_generation, note_write
+    from nso_adapter.core.generation import (
+        attach_to_job,
+        create_generation,
+        create_reissue_generation,
+        note_write,
+    )
     from nso_adapter.core.projection import section_streams
     from nso_adapter.store.models import GenerationMode
 
     context = {"scope": scope, **(context_extra or {})}
     stream = section_streams(scope)[0]
+    mode = GenerationMode.detach if context.get("detach") else GenerationMode.networked
     async with session() as db:
-        await note_write(db, device_id, stream)
-        generation = await create_generation(
-            db,
-            device_id,
-            streams=(stream,),
-            mode=GenerationMode.detach if context.get("detach") else GenerationMode.networked,
-            allowed_removal_keys=context.get("removed") or {},
-            removal_context=context,
-        )
+        if context.get("force"):
+            # A force removal PROMOTES NOTHING, so it takes the reissue branch of
+            # enqueue_removal: no accepted write stands behind it (hence no note_write),
+            # stream_revisions stays empty, and it carries no allowed_removal_keys.
+            generation = await create_reissue_generation(db, device_id, mode=mode, removal_context=context)
+        else:
+            await note_write(db, device_id, stream)
+            generation = await create_generation(
+                db,
+                device_id,
+                streams=(stream,),
+                mode=mode,
+                allowed_removal_keys=context.get("removed") or {},
+                removal_context=context,
+            )
         # Started, at attempt 1: run_removal is invoked directly, so nothing else performs
         # the worker head's queued -> running transition its terminal CAS expects.
         j = Job(
