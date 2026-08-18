@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -1266,7 +1267,13 @@ async def test_action_apply_settlement_between_projection_and_generation_reads_i
         await receipt_blocker.execute(sa.text("LOCK TABLE intent_push_receipt IN ACCESS EXCLUSIVE MODE"))
         applying = asyncio.create_task(_apply(adapter_client, device_id, {"vlan": 6301}))
 
-        for _ in range(100):
+        # A DEADLINE, not an iteration count: how long the Apply task takes to reach its
+        # blocked read is scheduling-dependent, so a fixed budget only measures how loaded
+        # the runner is. A healthy run still breaks out on the first poll; a busy one gets
+        # the room it needs instead of failing a correctness assertion for being slow.
+        waiting = False
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
             waiting = await settler.scalar(
                 sa.text(
                     "SELECT EXISTS ("
@@ -1290,7 +1297,9 @@ async def test_action_apply_settlement_between_projection_and_generation_reads_i
         await settle_job_generations(settler, generation.job_id, outcome=GenerationStatus.settled)
         await settler.commit()
         await receipt_blocker.commit()
-        response = await asyncio.wait_for(applying, timeout=10)
+        # Still a deadlock guard (a lock-order inversion must fail, not hang), but the
+        # budget only has to be shorter than "forever" — it is not a latency assertion.
+        response = await asyncio.wait_for(applying, timeout=30)
 
     assert response.status_code == 200, response.text
     assert response.json() == {

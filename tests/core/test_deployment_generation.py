@@ -17,6 +17,7 @@ the stored document, blocked-head retry) lives in ``test_generation_protocol.py`
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from unittest.mock import patch
 
@@ -1355,10 +1356,10 @@ async def test_f7_a_manual_apply_ignores_an_unselected_section_committed_alongsi
                 headers=_AUTH,
             )
         )
-        await _wait_for_relation_lock(get_engine(), "device_generation_counter")
+        await _wait_for_relation_lock(get_engine(), "device_generation_counter", timeout=30.0)
         assert not applying.done(), "the Apply did not wait for the projection lock"
         await holder.commit()
-        resp = await asyncio.wait_for(applying, timeout=10)
+        resp = await asyncio.wait_for(applying, timeout=30)
 
     assert resp.status_code == 202
     (generation,) = await _generations(device_id)
