@@ -77,13 +77,15 @@ async def test_an_unhandled_exception_uses_the_envelope_and_never_echoes_the_exc
     Its text is deliberately generic. An exception raised deep in a dependency routinely
     carries the credential (or the URL, or the row) it failed on, and a 500 body is the one
     place nobody inspects before it reaches a log aggregator — so nothing from the exception
-    crosses the wire; the traceback goes to the adapter log instead.
+    crosses the wire, and the adapter's own log line carries safe metadata only (the ASGI
+    server's re-raise keeps the diagnostic traceback).
 
     ``raise_app_exceptions=False`` because Starlette's ServerErrorMiddleware re-raises after
     the handler has responded (that is how a server keeps its own traceback), which the
     default transport would surface as the test's own error.
     """
     from httpx import ASGITransport, AsyncClient
+    from structlog.testing import capture_logs
 
     from nso_adapter.main import create_app
 
@@ -97,11 +99,17 @@ async def test_an_unhandled_exception_uses_the_envelope_and_never_echoes_the_exc
     async with AsyncClient(
         transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test"
     ) as client:
-        resp = await client.get("/_test/boom")
+        with capture_logs() as logs:
+            resp = await client.get("/_test/boom")
 
     assert resp.status_code == 500
     assert resp.json() == {"error": {"code": "internal", "message": "Internal server error", "detail": {}}}
     assert secret not in resp.text
+
+    (record,) = [log for log in logs if log["event"] == "api.unhandled_exception"]
+    assert record["exception_type"] == "RuntimeError"
+    assert not record.get("exc_info"), "the raw exception reaches the log renderer"
+    assert secret not in repr(logs)
 
 
 async def test_a_specific_handler_still_wins_over_the_catch_all():

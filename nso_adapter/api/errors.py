@@ -176,12 +176,19 @@ async def projection_gone_handler(request: Request, exc: Exception) -> JSONRespo
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Answer an unexpected failure with the documented envelope instead of a bare 500.
 
-    The message is GENERIC on purpose and the exception never reaches the body: it routinely
-    carries the credential, URL or row it failed on (an hvac error echoes the token path, a
-    driver error the DSN), and a 500 body is the one place nobody redacts before it lands in
-    a log aggregator. The traceback goes to the adapter's own log instead.
+    The message is GENERIC on purpose and the exception reaches neither the body nor this
+    log line: it routinely carries the credential, URL or row it failed on (an hvac error
+    echoes the token path, a driver error the DSN), and nobody redacts a 500 body or a
+    structured log field before it lands in an aggregator. This log carries the exception
+    type and the request coordinates only. Starlette re-raises after the response, so the
+    ASGI server's own error log still holds the full traceback for diagnosis.
     """
-    logger.exception("api.unhandled_exception", method=request.method, path=request.url.path)
+    logger.error(
+        "api.unhandled_exception",
+        exception_type=type(exc).__name__,
+        method=request.method,
+        path=request.url.path,
+    )
     return JSONResponse(
         status_code=500,
         content={"error": {"code": "internal", "message": "Internal server error", "detail": {}}},
