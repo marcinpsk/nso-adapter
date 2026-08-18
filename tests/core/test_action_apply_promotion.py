@@ -653,7 +653,7 @@ async def test_apply_routes_a_store_only_scalar_clear_through_replacement(adapte
 
 async def test_apply_delta_ignores_apply_bookkeeping_changes():
     """Finding 2: apply-owned result fields are not operator replacement work."""
-    from nso_adapter.core.generation import _has_positive_delta, _replacement_rows
+    from nso_adapter.core.generation import _content_losing_rows, _has_positive_delta
 
     old = {
         "static_route_intent": [
@@ -684,8 +684,30 @@ async def test_apply_delta_ignores_apply_bookkeeping_changes():
         ]
     }
 
-    assert _replacement_rows(old, desired) == {}
+    assert _content_losing_rows(old, desired) == {}
     assert _has_positive_delta(old, desired) is False
+
+
+async def test_apply_delta_ignores_correlation_only_changes():
+    """``static_route_entry`` renders neither column, so repairing lineage is not device work."""
+    from nso_adapter.core.generation import _has_positive_delta
+
+    row = {
+        "id": 1,
+        "vrf": "",
+        "prefix": "198.18.0.0/24",
+        "next_hop": "192.0.2.1",
+        "route_id": None,
+        "intent_generation": None,
+    }
+    correlated = {**row, "route_id": 77, "intent_generation": 4}
+
+    assert _has_positive_delta({"static_route_intent": [row]}, {"static_route_intent": [correlated]}) is False
+    # A real payload field still reads as a delta.
+    assert (
+        _has_positive_delta({"static_route_intent": [row]}, {"static_route_intent": [{**correlated, "metric": 10}]})
+        is True
+    )
 
 
 async def test_apply_settlement_fields_do_not_block_a_later_detach(adapter_client):
@@ -1116,11 +1138,11 @@ async def test_promoted_static_route_detach_fails_when_proof_is_inconclusive(ada
 async def test_consumed_static_route_tombstone_is_not_planned_as_an_intent_deletion(adapter_client):
     """R6 lifecycle: proof consumption is not a successor operator deletion."""
     from nso_adapter.core.generation import (
+        _content_losing_rows,
         _fragment_deletions,
         _has_positive_delta,
         _plan_action_links,
         _Promotion,
-        _replacement_rows,
     )
     from nso_adapter.core.projection import snapshot_stream
     from nso_adapter.core.receipt import latest_receipt
@@ -1194,7 +1216,7 @@ async def test_consumed_static_route_tombstone_is_not_planned_as_an_intent_delet
         assert projection.authorized_document["static_route_tombstone"]
         assert desired["static_route_tombstone"] == []
         networked, detached = _fragment_deletions(projection.authorized_document, desired, receipt)
-        replacement = _replacement_rows(projection.authorized_document, desired)
+        replacement = _content_losing_rows(projection.authorized_document, desired)
         provenance = (receipt.response or {}).get("_promotion_deletions")
 
     assert (networked, detached, provenance) == ({}, {}, None)
@@ -1211,7 +1233,9 @@ async def test_consumed_static_route_tombstone_is_not_planned_as_an_intent_delet
     networked_links, detach_links, apply_streams = _plan_action_links({"static_route": promotion})
     assert len(networked_links) == 1
     assert detach_links == []
-    assert apply_streams == {"static_route"}
+    # The push clears a metric and bumps the correlation columns; neither ADDS payload, so
+    # the replacement link carries the whole desired state and no apply rides beside it.
+    assert apply_streams == set()
 
 
 async def test_action_apply_job_executes_only_the_selected_generation_document(adapter_client):

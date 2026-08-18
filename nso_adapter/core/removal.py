@@ -1897,6 +1897,10 @@ async def enqueue_removal(
     authorized — and then marked applied — whatever un-promoted store-only state the sibling
     lanes held, for instances this job does not even send (``interface_config`` flushes
     exactly *interfaces*).
+
+    *document* is the composed document the promoted generation deploys, stated by the caller
+    that already built it. A reissue composes its own, so *force* refuses it here rather than
+    dropping it silently — the same refusal *marking* and *promotes* already get.
     """
     from nso_adapter.core.generation import attach_to_job, create_generation, create_reissue_generation
     from nso_adapter.core.request_flags import STORE_ONLY
@@ -1908,6 +1912,8 @@ async def enqueue_removal(
         raise ValueError(f"Unknown removal marking {marking!r}")
     if force and marking is not None:
         raise ValueError(f"a force-removal of {scope!r} carries no deletion marking; got {marking!r}")
+    if force and document is not None:
+        raise ValueError(f"a force-removal of {scope!r} composes its own reissue document; got one to deploy")
     store_only = STORE_ONLY.get()
     context: dict = {"scope": scope}
     if interfaces:

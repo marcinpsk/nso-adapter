@@ -343,6 +343,35 @@ async def test_two_endpoints_of_one_promotion_family_keep_separate_receipts(adap
     assert (await _receipt(device_id, "ip")).push_seq == 3
 
 
+async def test_the_batched_receipt_read_resolves_every_stream_in_one_query(adapter_client):
+    """A manual Apply names several streams at once; one round trip, not one per stream."""
+    from nso_adapter.core.receipt import latest_receipts
+    from tests.conftest import count_queries
+
+    device_id = await seed_device(nso_device_name="rcp-batched", netbox_device_id=None)
+    for path, body, seq in (
+        ("intent", {"attributes": []}, 11),
+        ("ip-intent", {"addresses": []}, 12),
+        ("vlan-intent", {"vlans": []}, 13),
+    ):
+        resp = await adapter_client.put(
+            f"/api/v1/devices/{device_id}/{path}", json=body, headers={**AUTH, "X-Push-Seq": str(seq)}
+        )
+        assert resp.status_code == 200, resp.text
+
+    async with session() as db:
+        with count_queries() as counted:
+            found = await latest_receipts(db, device_id, ("interface_config", "ip", "vlan", "snmp"))
+
+    # snmp was never pushed: absent from the mapping, not a wrong row.
+    assert {stream: receipt.push_seq for stream, receipt in found.items()} == {
+        "interface_config": 11,
+        "ip": 12,
+        "vlan": 13,
+    }
+    assert counted.count == 1, f"four streams cost {counted.count} queries"
+
+
 # ── the generation a push authorized ──────────────────────────────────────────
 
 

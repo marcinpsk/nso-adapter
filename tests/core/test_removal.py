@@ -1752,6 +1752,22 @@ async def test_enqueue_removal_force_refuses_to_promote(adapter_client):
             )
 
 
+async def test_enqueue_removal_force_refuses_a_composed_document(adapter_client):
+    """A reissue composes its own document; accepting one and dropping it deploys the wrong bytes."""
+    device_id = await _seed_device(nso_device_name="sw-force-document")
+    async with session() as db:
+        with pytest.raises(ValueError, match="composes its own reissue document"):
+            await enqueue_removal(
+                db,
+                device_id,
+                "svi",
+                marking=None,
+                defer_retract=False,
+                force=True,
+                document={"svi": {"svi_intent": []}},
+            )
+
+
 async def test_run_removal_detach_syncs_from_and_skips_residue(adapter_client):
     """Detach: device untouched → the removed keys are EXPECTED on the device (they
     must not be reported as residue), and CDB must be re-aligned via sync-from."""

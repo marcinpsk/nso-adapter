@@ -349,7 +349,16 @@ def _identity_fields(spec: _Spec) -> tuple[str, ...]:
     return tuple(field for field in candidates[0] if field != scope)
 
 
-def _row_identity(fragment: dict[str, list[dict]], spec: _Spec, row: dict) -> tuple:
+def _rows_by_id(fragment: dict[str, list[dict]], table: str, by_id: dict[str, dict]) -> dict:
+    """Return *table*'s ``{id: row}`` map, built once per index pass and reused per row."""
+    index = by_id.get(table)
+    if index is None:
+        index = {row.get("id"): row for row in fragment.get(table, [])}
+        by_id[table] = index
+    return index
+
+
+def _row_identity(fragment: dict[str, list[dict]], spec: _Spec, row: dict, by_id: dict[str, dict]) -> tuple:
     parent_identity: tuple = ()
     if spec.parent is not None:
         fk = _fk_column(spec.model, spec.parent)
@@ -359,19 +368,11 @@ def _row_identity(fragment: dict[str, list[dict]], spec: _Spec, row: dict) -> tu
             # DbInterface is outside the projection and is not rebuilt by an intent PUT.
             parent_identity = (parent_id,)
         else:
-            parent_row = next(
-                (
-                    candidate
-                    for candidate in fragment.get(spec.parent.__tablename__, [])
-                    if candidate.get("id") == parent_id
-                ),
-                None,
-            )
+            parent_table = spec.parent.__tablename__
+            parent_row = _rows_by_id(fragment, parent_table, by_id).get(parent_id)
             if parent_row is None:
-                raise RuntimeError(
-                    f"{spec.model.__tablename__} row references missing {spec.parent.__tablename__} id {parent_id!r}"
-                )
-            parent_identity = _row_identity(fragment, parent_spec, parent_row)
+                raise RuntimeError(f"{spec.model.__tablename__} row references missing {parent_table} id {parent_id!r}")
+            parent_identity = _row_identity(fragment, parent_spec, parent_row, by_id)
     return (*parent_identity, *(row.get(field) for field in _identity_fields(spec)))
 
 
@@ -381,13 +382,17 @@ def rows_by_intent_identity(fragment: dict[str, list[dict]], table: str) -> dict
     Root identities come from the model's unique constraint. Child identities prepend the
     logical parent identity, so full-replace writers can mint new database ids without making
     unchanged BGP scopes, peers, or address families look deleted.
+
+    Each parent table is indexed by id ONCE per call: BGP repeats the lineage walk at four
+    levels, so scanning the parent list per row is quadratic in the fragment size.
     """
     spec = _SPEC_BY_TABLE.get(table)
     if spec is None:
         raise ValueError(f"unknown projection table {table!r}")
+    by_id: dict[str, dict] = {}
     indexed: dict[tuple, dict] = {}
     for row in fragment.get(table, []):
-        identity = _row_identity(fragment, spec, row)
+        identity = _row_identity(fragment, spec, row, by_id)
         if identity in indexed:
             raise RuntimeError(f"{table} projection contains duplicate durable identity {identity!r}")
         indexed[identity] = row
@@ -402,12 +407,19 @@ def is_intent_deletion(table: str, identity: tuple, desired_rows: dict[tuple, di
     return not spec.lifecycle and identity not in desired_rows
 
 
+#: NetBox lineage the device payload never renders (:func:`nso.apply.static_route_entry`
+#: writes neither). Kept in the snapshot for settlement correlation, excluded from the
+#: comparison state so a correlation-only repair does not enqueue an apply for an
+#: unchanged wire payload.
+CORRELATION_COLUMNS: frozenset[str] = frozenset({"route_id", "intent_generation"})
+
+
 def projection_row_state(table: str, row: dict) -> dict:
-    """Return device-facing row state without database identity or apply metadata."""
+    """Return device-facing row state without database identity, correlation or apply metadata."""
     spec = _SPEC_BY_TABLE.get(table)
     if spec is None:
         raise ValueError(f"unknown projection table {table!r}")
-    excluded = {"id", "device_id", "accepted_at", *APPLY_BOOKKEEPING_COLUMNS}
+    excluded = {"id", "device_id", "accepted_at", *CORRELATION_COLUMNS, *APPLY_BOOKKEEPING_COLUMNS}
     if spec.parent is not None:
         excluded.add(_fk_column(spec.model, spec.parent).name)
     return {key: value for key, value in row.items() if key not in excluded}
@@ -446,8 +458,10 @@ async def _rows_for(db: AsyncSession, device_id: int, spec: _Spec) -> list[dict]
 #: the protocol unnoticed, and closing a reason without wiring the section fails.
 DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset({"vlan"})
 
-#: Exactly the document-executed boundary. Static-route companion apply and claim subtraction
-#: read live intent, so a later store-only push could execute under the selected generation.
+#: A STRICT SUBSET of :data:`DOCUMENT_EXECUTED_SECTIONS`. Static-route companion apply and
+#: claim subtraction read live intent, so a later store-only push could execute under the
+#: selected generation — which is why ``static_route`` is document-executed but not
+#: selectable here.
 ACTION_APPLY_EXECUTABLE_SECTIONS: frozenset[str] = frozenset({"vlan"})
 
 #: Why each remaining section still reads live rows at apply time. Most await #1522's

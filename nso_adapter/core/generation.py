@@ -368,8 +368,12 @@ def _retain_rows(desired: dict, retained: dict[str, list[dict]]) -> dict:
     return result
 
 
-def _replacement_rows(old: dict | None, desired: dict) -> dict[str, list[dict]]:
-    """Return retained rows whose desired form loses merge-inexpressible content."""
+def _content_losing_rows(old: dict | None, desired: dict) -> dict[str, list[dict]]:
+    """Return retained rows whose desired form loses merge-inexpressible content.
+
+    Named apart from :func:`core.removal._replacement_rows`, which returns the ORM rows a
+    PUT-replace body asserts: this one returns projection rows and answers a predicate.
+    """
     from nso_adapter.core.removal import lost_content
 
     replacement: dict[str, list[dict]] = {}
@@ -447,7 +451,7 @@ async def _selected_promotions(
     selected: dict[str, int],
 ) -> tuple[dict[str, tuple[DeviceProjectionStream, object]], dict[str, str], dict[str, dict]]:
     """Resolve exact selected receipts and report every stale selection."""
-    from nso_adapter.core.receipt import latest_receipt
+    from nso_adapter.core.receipt import latest_receipts
 
     rows = {
         row.stream: row
@@ -467,9 +471,10 @@ async def _selected_promotions(
     promotable: dict[str, tuple[DeviceProjectionStream, object]] = {}
     skipped: dict[str, str] = {}
     skipped_detail: dict[str, dict] = {}
+    receipts = await latest_receipts(db, device_id, selected)
     for stream, push_seq in sorted(selected.items()):
         row = rows.get(stream)
-        receipt = await latest_receipt(db, device_id, stream)
+        receipt = receipts.get(stream)
         if receipt is None or row is None:
             skipped[stream] = "no_receipt"
             continue
@@ -675,7 +680,7 @@ async def create_action_apply(
     for stream, (row, receipt) in selected_rows.items():
         desired = await snapshot_stream(db, device_id, stream)
         networked, detached = _fragment_deletions(row.authorized_document, desired, receipt)
-        replacement = _replacement_rows(row.authorized_document, desired)
+        replacement = _content_losing_rows(row.authorized_document, desired)
         promotions[stream] = _Promotion(
             row,
             receipt,

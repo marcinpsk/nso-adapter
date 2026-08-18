@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -280,12 +281,28 @@ async def latest_receipt(db: AsyncSession, device_id: int, stream: str) -> Inten
     The column is spelled ``section``: the receipt table's shape is pinned, and it has always
     held this same per-endpoint vocabulary.
     """
-    return await db.scalar(
-        select(IntentPushReceipt).where(
-            IntentPushReceipt.device_id == device_id,
-            IntentPushReceipt.section == stream,
+    return (await latest_receipts(db, device_id, (stream,))).get(stream)
+
+
+async def latest_receipts(db: AsyncSession, device_id: int, streams: Iterable[str]) -> dict[str, IntentPushReceipt]:
+    """Return the last admitted receipt per named stream, in one query.
+
+    One row per (device, section) exists by unique constraint, so a caller resolving several
+    streams — a manual Apply naming them all — needs one round trip, not one per stream.
+    """
+    rows = (
+        (
+            await db.execute(
+                select(IntentPushReceipt).where(
+                    IntentPushReceipt.device_id == device_id,
+                    IntentPushReceipt.section.in_(sorted(streams)),
+                )
+            )
         )
+        .scalars()
+        .all()
     )
+    return {row.section: row for row in rows}
 
 
 def _mode(carrier) -> tuple[bool, bool, bool]:
@@ -422,5 +439,6 @@ __all__ = [
     "consume_promotion_provenance",
     "digest_body",
     "latest_receipt",
+    "latest_receipts",
     "record_response",
 ]
