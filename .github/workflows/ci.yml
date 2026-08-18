@@ -25,8 +25,11 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
 
+      # --locked: fail on a lockfile that no longer matches pyproject instead of
+      # silently rewriting it, which is what lets a version bump reach a release
+      # with a stale lock.
       - name: Sync dependencies
-        run: uv sync --all-groups
+        run: uv sync --all-groups --locked
 
       - name: Ruff lint
         run: uv run --native-tls -- ruff check .
@@ -88,8 +91,11 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
 
+      # --locked: fail on a lockfile that no longer matches pyproject instead of
+      # silently rewriting it, which is what lets a version bump reach a release
+      # with a stale lock.
       - name: Sync dependencies
-        run: uv sync --all-groups
+        run: uv sync --all-groups --locked
 
       # NOT a `services:` container: GitHub service containers cannot override the
       # image CMD, so the tmpfs + fsync=off tuning that the per-test
