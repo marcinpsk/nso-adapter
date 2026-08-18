@@ -389,8 +389,9 @@ async def test_o2b_6_a_crash_after_the_tombstone_write_rolls_the_receipt_back_wi
     async def boom(*_args, **_kwargs):
         raise RuntimeError("crash after the tombstone write")
 
-    with patch("nso_adapter.core.removal.enqueue_removal", new=boom), pytest.raises(RuntimeError):
-        await put(adapter_client, device_id, [entry(C, route_id=101)], deleted_routes=[deleted(100, [A])], seq=1)
+    with patch("nso_adapter.core.removal.enqueue_removal", new=boom):
+        resp = await put(adapter_client, device_id, [entry(C, route_id=101)], deleted_routes=[deleted(100, [A])], seq=1)
+    assert resp.status_code == 500, resp.text
 
     assert await read_intent_all_columns(device_id) == before
     assert await read_jobs(device_id) == []
