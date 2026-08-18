@@ -126,8 +126,9 @@ authorized, with the collateral guard off — so it promotes no stream and marks
 - the digest is `sha256` over the canonical JSON of the raw request body
   (`json.dumps(body, sort_keys=True, default=str)`);
 - the mode is the triple (`?store_only=`, `?delete_origin=`, `?backfill_only=`) as
-  parsed — `1`, `true`, `yes`, `on` are true, everything else (absent included) is
-  false. The body does not say what the request does with it: store-only authorizes no
+  parsed: `1`, `true`, `yes`, `on` are true; `0`, `false`, `no`, `off` and an absent
+  flag are false; any other spelling is refused with `422 validation_error`. The
+  body does not say what the request does with it: store-only authorizes no
   device write, delete-origin turns a shrink into a networked retraction, the unmarked
   form detaches instead, and backfill-only adopts ids and prunes uncorrelated rows while
   writing no content at all. One sequence carrying one body under two of those is two
@@ -823,7 +824,7 @@ persisted per device so a process restart does not reset it.
 
 ---
 
-## SNMP Configuration (M11)
+## Intent push receipts
 
 ### `GET /api/v1/intent-receipts` → `200 | 401 | 422`
 
@@ -871,6 +872,8 @@ sequence, so a snapshot taken before pk R existed can re-allocate R while the ad
 holds an unrelated row carrying `route_id = R` — and the deletion partition's first pass
 would bind that row as genuine and authorize removing it. Advancing the pk sequence past this
 value is what closes that. `null` on both means the adapter holds nothing, which is not `0`.
+
+## SNMP Configuration (M11)
 
 ### `GET /api/v1/devices/{id}/snmp-config` → `200 | 404`
 
