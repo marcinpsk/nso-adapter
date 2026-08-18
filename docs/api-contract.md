@@ -581,10 +581,11 @@ Phase 2: the rest activate as M5–M6 land.
 
 ## Actions (async)
 
-All return `202` with `{ "job_id": <int> }`. Only one job per device runs at a
-time: if an action is requested while a `queued`/`running` job exists for that
-device, the adapter returns `409 conflict` with the existing job's id in
-`error.detail.job_id`.
+Unless its section documents otherwise, an action returns `202` with
+`{ "job_id": <int> }`; the generation actions below answer richer bodies. Only
+one job per device runs at a time: if an action is requested while a
+`queued`/`running` job exists for that device, the adapter returns `409
+conflict` with the existing job's id in `error.detail.job_id`.
 
 ### `POST /api/v1/devices/{id}/actions/sync`
 Runs NSO `sync-from`, reads managed attributes, writes them to NetBox,

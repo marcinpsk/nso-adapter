@@ -850,11 +850,12 @@ async def test_f1_c_a_removal_replaces_with_its_generations_document(adapter_cli
 # ── Finding 5 — the two operator exits from the barrier, over real HTTP ──────
 
 
-async def _block_the_head(client, device_id: int):
+async def _block_the_head(client, device_id: int, device_name: str):
     """Push, then fail the run at the device. Returns the now-blocked head."""
     assert (await put_vlans(client, device_id, [10])).status_code == 200
-    failing, _rec = recorded_client("gen-blocked", fail_vlan=True)
+    failing, rec = recorded_client(device_name, fail_vlan=True)
     await run_head(device_id, failing)
+    assert rec.bodies(_VLAN_ROOT), "the injected vlan rejection never fired"
     (head,) = await generations(device_id)
     return head
 
@@ -864,7 +865,7 @@ async def test_f5_d_the_retry_endpoint_re_admits_the_blocked_head(adapter_client
 
     device_id = await seed_device(nso_device_name="gen-retry-api", netbox_device_id=9818)
     await seed_settings(device_id)
-    head = await _block_the_head(adapter_client, device_id)
+    head = await _block_the_head(adapter_client, device_id, "gen-retry-api")
     assert head.status is GenerationStatus.failed
 
     resp = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/retry-generation", headers=AUTH)
@@ -882,7 +883,7 @@ async def test_f5_e_the_abandon_endpoint_releases_the_successors(adapter_client)
 
     device_id = await seed_device(nso_device_name="gen-abandon-api", netbox_device_id=9819)
     await seed_settings(device_id)
-    await _block_the_head(adapter_client, device_id)
+    await _block_the_head(adapter_client, device_id, "gen-abandon-api")
     assert (await put_vlans(adapter_client, device_id, [10, 20])).status_code == 200
 
     resp = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/abandon-generation", headers=AUTH)
