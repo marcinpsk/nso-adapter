@@ -308,6 +308,8 @@ def consume_last_enqueued_generation_id() -> int | None:
     generation_id = LAST_ENQUEUED_GENERATION_ID.get()
     LAST_ENQUEUED_GENERATION_ID.set(None)
     return generation_id
+
+
 def _explicit_deletion_markings(receipt) -> dict[tuple[str, str, object], str]:
     """Return per-row deletion markings carried in a receipt's private response data."""
     response = receipt.response if isinstance(receipt.response, dict) else {}
@@ -1557,7 +1559,6 @@ __all__ = [
     "advance_generations_locked",
     "allocate_settlement_cohort",
     "attach_to_job",
-    "authorized_streams",
     "consume_last_enqueued_generation_id",
     "create_generation",
     "create_action_apply",
