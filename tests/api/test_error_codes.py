@@ -77,12 +77,11 @@ async def test_an_unhandled_exception_uses_the_envelope_and_never_echoes_the_exc
     Its text is deliberately generic. An exception raised deep in a dependency routinely
     carries the credential (or the URL, or the row) it failed on, and a 500 body is the one
     place nobody inspects before it reaches a log aggregator — so nothing from the exception
-    crosses the wire, and the adapter's own log line carries safe metadata only (the ASGI
-    server's re-raise keeps the diagnostic traceback).
+    crosses the wire, and the adapter's own log line carries safe metadata only.
 
-    ``raise_app_exceptions=False`` because Starlette's ServerErrorMiddleware re-raises after
-    the handler has responded (that is how a server keeps its own traceback), which the
-    default transport would surface as the test's own error.
+    The DEFAULT transport is the assertion: the outermost middleware answers and re-raises
+    nothing, so no exception escapes the ASGI app for a server to log a raw traceback from.
+    The redacted ``where`` frames are the whole diagnostic remainder.
     """
     from httpx import ASGITransport, AsyncClient
     from structlog.testing import capture_logs
@@ -96,9 +95,7 @@ async def test_an_unhandled_exception_uses_the_envelope_and_never_echoes_the_exc
     async def _boom():
         raise RuntimeError(f"vault login failed with token {secret}")
 
-    async with AsyncClient(
-        transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test"
-    ) as client:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         with capture_logs() as logs:
             resp = await client.get("/_test/boom")
 
@@ -110,6 +107,12 @@ async def test_an_unhandled_exception_uses_the_envelope_and_never_echoes_the_exc
     assert record["exception_type"] == "RuntimeError"
     assert not record.get("exc_info"), "the raw exception reaches the log renderer"
     assert secret not in repr(logs)
+
+    # Locations only — the frames must name where it broke without quoting anything from it.
+    where = record["where"]
+    assert 0 < len(where) <= 5, where
+    assert where[-1].endswith(" in _boom"), where
+    assert not any(secret in frame for frame in where)
 
 
 async def test_a_specific_handler_still_wins_over_the_catch_all():
@@ -124,9 +127,7 @@ async def test_a_specific_handler_still_wins_over_the_catch_all():
     async def _conflict():
         raise api_error(409, "conflict", "a job is already running", {"device_id": 7})
 
-    async with AsyncClient(
-        transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test"
-    ) as client:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get("/_test/conflict")
 
     assert resp.status_code == 409

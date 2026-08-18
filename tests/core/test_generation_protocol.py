@@ -354,8 +354,9 @@ async def test_f2_c_a_failed_removal_enqueue_rolls_the_mutation_back(adapter_cli
     async def boom(*_args, **_kwargs):
         raise RuntimeError("crash in the gap")
 
-    with patch("nso_adapter.core.removal.enqueue_removal", new=boom), pytest.raises(RuntimeError):
-        await put_vlans(adapter_client, device_id, [10])
+    with patch("nso_adapter.core.removal.enqueue_removal", new=boom):
+        resp = await put_vlans(adapter_client, device_id, [10])
+    assert resp.status_code == 500, resp.text
 
     async with session() as db:
         remaining = sorted(
@@ -622,8 +623,9 @@ async def test_f4_e_a_receipt_is_only_durable_when_its_mutation_commits(adapter_
     async def boom(*_args, **_kwargs):
         raise RuntimeError("crash in the gap")
 
-    with patch("nso_adapter.core.removal.enqueue_removal", new=boom), pytest.raises(RuntimeError):
-        await put_vlans(adapter_client, device_id, [10], seq=4)
+    with patch("nso_adapter.core.removal.enqueue_removal", new=boom):
+        resp = await put_vlans(adapter_client, device_id, [10], seq=4)
+    assert resp.status_code == 500, resp.text
 
     async with session() as db:
         receipt = await latest_receipt(db, device_id, "vlan")

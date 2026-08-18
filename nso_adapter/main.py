@@ -23,7 +23,7 @@ from nso_adapter.api.errors import (
     ApiError,
     api_error_handler,
     projection_gone_handler,
-    unhandled_exception_handler,
+    unhandled_exception_response,
     validation_error_handler,
 )
 from nso_adapter.api.health import router as health_router
@@ -378,9 +378,6 @@ def create_app() -> FastAPI:
     app.add_exception_handler(ApiError, api_error_handler)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(DeviceProjectionGone, projection_gone_handler)
-    # Last resort, after every specific handler above: without it an unexpected exception
-    # leaves Starlette's plain-text 500 and the one documented error shape has a hole.
-    app.add_exception_handler(Exception, unhandled_exception_handler)
 
     @app.middleware("http")
     async def _store_only_flag(request, call_next):
@@ -409,6 +406,19 @@ def create_app() -> FastAPI:
             PUSH_SEQ.reset(seq_token)
             DELETE_ORIGIN.reset(del_token)
             STORE_ONLY.reset(token)
+
+    # Registered LAST so it is the OUTERMOST user middleware — Starlette inserts each one at
+    # the front of the stack — and therefore also covers the middleware above.
+    @app.middleware("http")
+    async def _seal_unhandled_exception(request, call_next):
+        # NOT add_exception_handler(Exception, ...): that routes to ServerErrorMiddleware,
+        # which RE-RAISES after responding, and the ASGI server then logs the raw traceback
+        # — the one copy nobody redacts. Answering here re-raises nothing. Specific handlers
+        # sit deeper (ExceptionMiddleware) and still win; this is the last resort.
+        try:
+            return await call_next(request)
+        except Exception as exc:
+            return unhandled_exception_response(request, exc)
 
     app.include_router(health_router)
     app.include_router(nso_instances_router)

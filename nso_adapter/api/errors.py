@@ -14,6 +14,7 @@ the same envelope by `validation_error_handler` — the framework's default
 
 from __future__ import annotations
 
+import traceback
 from typing import Literal
 
 import structlog
@@ -173,21 +174,36 @@ async def projection_gone_handler(request: Request, exc: Exception) -> JSONRespo
     )
 
 
-async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+#: How many innermost traceback frames the unhandled-exception log keeps.
+_WHERE_FRAMES = 5
+
+
+def _where(exc: BaseException) -> list[str]:
+    """Render the innermost frames as ``file:line in func`` — locations, nothing read from them.
+
+    Never the source text, the exception args or the frame locals: those carry the very
+    credential this path exists to keep out of the logs.
+    """
+    frames = traceback.extract_tb(exc.__traceback__)[-_WHERE_FRAMES:]
+    return [f"{frame.filename}:{frame.lineno} in {frame.name}" for frame in frames]
+
+
+def unhandled_exception_response(request: Request, exc: BaseException) -> JSONResponse:
     """Answer an unexpected failure with the documented envelope instead of a bare 500.
 
     The message is GENERIC on purpose and the exception reaches neither the body nor this
     log line: it routinely carries the credential, URL or row it failed on (an hvac error
     echoes the token path, a driver error the DSN), and nobody redacts a 500 body or a
-    structured log field before it lands in an aggregator. This log carries the exception
-    type and the request coordinates only. Starlette re-raises after the response, so the
-    ASGI server's own error log still holds the full traceback for diagnosis.
+    structured log field before it lands in an aggregator. The redacted ``where`` frames are
+    the diagnostic remainder — see the middleware in ``main`` for why no traceback sink is
+    left behind them.
     """
     logger.error(
         "api.unhandled_exception",
         exception_type=type(exc).__name__,
         method=request.method,
         path=request.url.path,
+        where=_where(exc),
     )
     return JSONResponse(
         status_code=500,

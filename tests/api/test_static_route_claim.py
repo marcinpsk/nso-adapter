@@ -210,17 +210,17 @@ async def test_a_failure_after_the_guard_lock_neither_hangs_nor_leaks_the_claim(
 
     monkeypatch.setattr(sr_mod, "_apply_static_route_intent", _boom)
 
-    # The transport re-raises the unhandled body error; the contract under test is that
-    # the request UNWINDS (no hang on our own lock) and the claim is gone afterwards.
-    with pytest.raises(RuntimeError, match="forced post-lock failure"):
-        await asyncio.wait_for(
-            adapter_client.put(
-                f"/api/v1/devices/{device_id}/static-route-intent",
-                json={"routes": [entry(A)]},
-                headers=AUTH,
-            ),
-            timeout=15,
-        )
+    # The catch-all answers the unhandled body error as a 500; the contract under test is
+    # that the request UNWINDS (no hang on our own lock) and the claim is gone afterwards.
+    resp = await asyncio.wait_for(
+        adapter_client.put(
+            f"/api/v1/devices/{device_id}/static-route-intent",
+            json={"routes": [entry(A)]},
+            headers=AUTH,
+        ),
+        timeout=15,
+    )
+    assert resp.status_code == 500, resp.text
     assert await _claim_row(device_id) is None
 
 
