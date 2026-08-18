@@ -734,6 +734,13 @@ def _attach_hydrated_relationships(
         grouped = {identity: [] for identity in parents}
         child_instance_by_record = {id(record): instance for record, instance in child_pairs}
         local_identity_size = len(_identity_fields(spec))
+        if local_identity_size == 0:
+            # identity[:-0] is the EMPTY tuple, so every child row would report a missing
+            # parent. No table has this shape today; name the real cause if one gains it.
+            raise RuntimeError(
+                f"{spec.model.__tablename__} has no local durable identity, so its parent identity "
+                "cannot be derived by prefix"
+            )
         for identity, record in indexes[spec.model].items():
             parent_identity = identity[:-local_identity_size]
             if parent_identity not in grouped:

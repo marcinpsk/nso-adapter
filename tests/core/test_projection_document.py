@@ -582,6 +582,7 @@ def test_only_the_static_route_tables_carry_a_correlation_column():
     }
     assert carriers == {"static_route_intent", "static_route_tombstone"}
 
+
 def test_hydrating_a_known_table_under_the_wrong_section_is_refused():
     """A document cannot smuggle one section's rows into another section."""
     from nso_adapter.core.projection import hydrate_section
@@ -629,6 +630,21 @@ def test_interface_execution_context_hydrates_beside_intent_tables():
     assert rows[InterfaceIntent][0].intent_value == "selected description"
     assert execution.interfaces[7].name == "GigabitEthernet0/1"
     assert execution.eligible_attributes == frozenset({(7, "description")})
+
+
+def test_every_parented_table_has_a_local_durable_identity():
+    """A child identity is its parent's prefixed by its own; an empty local part slices to ().
+
+    ``identity[:-0]`` is the empty tuple, so such a table would report every child row as
+    referencing a missing parent. :func:`_attach_hydrated_relationships` refuses it; this
+    fails first, on the schema itself.
+    """
+    from nso_adapter.core.projection import _SECTION_TABLES, _SPEC_BY_MODEL, _identity_fields
+
+    for specs in _SECTION_TABLES.values():
+        for spec in specs:
+            if spec.parent in _SPEC_BY_MODEL:
+                assert _identity_fields(spec), f"{spec.model.__tablename__} has no local durable identity"
 
 
 # ── stream ownership: the authorization partition ────────────────────────────

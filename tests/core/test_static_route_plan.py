@@ -628,7 +628,9 @@ async def test_recorded_plan_rejects_a_malformed_sent_triple(adapter_client):
 
     document["static_route"]["_execution"]["apply"]["cas"][0]["sent_triple"] = list(B[:2])
 
-    with pytest.raises(ValueError):
+    # Pinned: the plan raises from four independent checks, and the CAS-coordinate one is a
+    # plausible alternative source with no eligible rows.
+    with pytest.raises(ValueError, match="must contain three values"):
         hydrate_static_route_apply_plan(document, eligible_rows=[])
 
 

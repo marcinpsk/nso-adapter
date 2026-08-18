@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from types import SimpleNamespace
 
@@ -2195,6 +2196,50 @@ async def test_action_apply_settlement_between_projection_and_generation_reads_i
         "skipped_detail": None,
         "generations": [],
     }
+
+
+def test_every_apply_unexecutable_reason_is_documented_and_live():
+    """The reason list is a stable machine contract, so both directions are pinned.
+
+    ``live_read_execution`` sat in the doc with no producer left, and
+    ``interface_attribute_eligibility_unresolved`` was raised without being documented.
+    Neither drift can recur silently: the doc list and the raise sites must match exactly.
+    """
+    import ast
+    from pathlib import Path
+
+    source_dir = Path(__file__).resolve().parents[2] / "nso_adapter"
+    contract = (Path(__file__).resolve().parents[2] / "docs" / "api-contract.md").read_text()
+
+    raised: set[str] = set()
+    for path in source_dir.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            # Both shapes: the literal dict handed to the exception, and the dict a caller
+            # accumulates reasons into before raising.
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "ApplyUnexecutable":
+                raised |= {
+                    value.value
+                    for argument in node.args
+                    if isinstance(argument, ast.Dict)
+                    for value in argument.values
+                    if isinstance(value, ast.Constant) and isinstance(value.value, str)
+                }
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+                and any(
+                    isinstance(target, ast.Subscript) and getattr(target.value, "id", "") == "unexecutable"
+                    for target in node.targets
+                )
+            ):
+                raised.add(node.value.value)
+
+    assert raised, "the reason scan found no raise site — the scan itself has drifted"
+    paragraph = contract.split("Reasons are stable machine codes:")[1].split("A push can also return")[0]
+    documented = set(re.findall(r"`([a-z_]+)`", paragraph))
+    assert documented == raised, f"documented {sorted(documented)} != raised {sorted(raised)}"
 
 
 def _widen_apply_boundary(monkeypatch, *sections: str) -> None:

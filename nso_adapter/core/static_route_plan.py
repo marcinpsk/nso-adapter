@@ -320,8 +320,12 @@ async def build_plan(db: AsyncSession, device, *, eligible_rows: list) -> SrPlan
 
 
 def _removal_keys(value) -> set[Triple]:
-    """Normalize the generation's guarded static-route key set."""
-    return {key for raw in (value or {}).get("route") or () if (key := as_triple(raw)) is not None}
+    """Normalize the generation's guarded static-route key set.
+
+    Through :func:`_sr_key`: these entries come from the stored document too, so a malformed
+    one must name itself rather than raise ``as_triple``'s bare unpack error.
+    """
+    return {_sr_key(raw) for raw in (value or {}).get("route") or ()}
 
 
 def promotion_removal_keys(removed_rows: dict[str, list[dict]]) -> dict[str, list[list[str]]]:
@@ -529,9 +533,14 @@ def hydrate_static_route_apply_plan(document: dict, *, eligible_rows: list) -> S
 
 
 def _sr_key(value) -> Triple:
-    key = as_triple(value)
+    """Return the execution key *value* names, naming a malformed one.
+
+    The length is checked here because ``as_triple`` UNPACKS: a two-element key raised
+    "not enough values to unpack" and said nothing about the document that carried it.
+    """
+    key = as_triple(value) if isinstance(value, (list, tuple)) and len(value) == 3 else None
     if key is None:
-        raise ValueError("a static-route execution key must contain three values")
+        raise ValueError(f"a static-route execution key must contain three values; got {value!r}")
     return key
 
 

@@ -13,8 +13,8 @@ That PUT-replace is a synchronous device commit and can take well over the
 plugin's HTTP client timeout (~30s). So it does NOT run inline in the intent
 PUT anymore — :func:`replace_on_removal` enqueues a ``removal`` job and returns
 immediately; the worker runs :func:`run_removal` in the background. Promoted jobs execute
-their immutable projection document. Reissues and generationless jobs retain live-store
-behavior.
+their immutable projection document. A reissue promotes no projection and retains live-store
+behavior; a job carrying no generation at all is refused, never executed from the store.
 """
 
 from __future__ import annotations
@@ -738,7 +738,9 @@ async def _replacement_rows(db: AsyncSession, device, scope: str, model, job_id:
     worker committing ``running`` and this read, a successor push can commit, and a
     live-store body would retract under this generation's identity whatever the successor
     happens to have removed. A promoted generation therefore uses the stored document.
-    Reissues and generationless jobs retain the established live-store behavior.
+    A reissue promotes no projection and retains the established live-store behavior. A job
+    that carries no generation is refused: every producer attaches one, so its absence is a
+    broken chain, and executing the live store would deploy an unauthorized state.
     """
     replacement = await _replacement_section(db, scope, job_id)
     if replacement is not None:
@@ -925,13 +927,20 @@ def _sr_candidate_clears(rows) -> dict[int, tuple[str, ...]]:
 
 
 async def _sr_execution_plan(db: AsyncSession, device, context: dict, *, job_id: int | None):
-    """Return a promoted removal plan, or classify a reissue or generationless job live."""
+    """Return a promoted removal plan, or classify a reissue (or an unqueued call) live.
+
+    A QUEUED job that carries no generation is refused, exactly as :func:`_replacement_section`
+    refuses it for every other scope: falling through here would classify against the live
+    store and retract whatever it holds now under a job authorized to assert something else.
+    """
     from nso_adapter.core.generation import executing_generation
     from nso_adapter.core.static_route_plan import SrClear, SrRemovalPlan, hydrate_static_route_removal_plan, triple_of
 
     if job_id is not None:
         generation = await executing_generation(db, job_id)
-        if generation is not None and generation.stream_revisions:
+        if generation is None:
+            raise RuntimeError(f"removal job {job_id} for scope 'static_route' carries no generation to deploy")
+        if generation.stream_revisions:
             return hydrate_static_route_removal_plan(generation.document)
     tombstones, authorized, claimed, rows, reclaimed = await _sr_authorization(db, device, context, job_id=job_id)
     candidates = _sr_candidate_clears(rows) if not context.get("detach") and not context.get("retract_deferred") else {}
@@ -2256,8 +2265,8 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
     """Execute a queued ``removal`` job: PUT-replace the scope's reconciler service.
 
     Promoted generations execute their recorded document and classification. Reissues retain
-    live-store execution with job and tombstone bookkeeping. A retry repeats the same selected
-    operation after a restart.
+    live-store execution with job and tombstone bookkeeping; a job carrying no generation is
+    refused. A retry repeats the same selected operation after a restart.
 
     *reg* is the worker's live ``ClaimRegistration`` for this device. Physical continuity
     already existed (the worker holds the claim for the runner's whole lifetime); the

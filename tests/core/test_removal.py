@@ -935,6 +935,44 @@ async def test_run_removal_records_failure(adapter_client):
         assert job.error["code"] == "removal_failed"
 
 
+@pytest.mark.parametrize("scope", ["vlan", "static_route"])
+async def test_run_removal_refuses_a_job_that_carries_no_generation(adapter_client, scope):
+    """Every producer attaches one, so its absence is a broken chain, not a live-store fallback.
+
+    Deploying the live store here would PUT-replace whatever the store holds NOW under a job
+    that was authorized to assert something else. Both scopes, because ``static_route`` reaches
+    its plan through its own classifier and not through ``_replacement_section``.
+    """
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.removal import run_removal
+
+    device_id = await _seed_device(nso_device_name=f"sw-no-generation-{scope}")
+    async with session() as db:
+        job = Job(
+            job_type=JobType.removal,
+            device_id=device_id,
+            status=JobStatus.running,
+            run_attempt=1,
+            context={"scope": scope},
+        )
+        db.add(job)
+        await db.commit()
+        job_id = job.id
+
+    with capture_logs() as logs, patch("nso_adapter.core.importer.get_nso_client", return_value=_CLIENT):
+        await run_removal(job_id=job_id, device_id=device_id)
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.error["code"] == "removal_failed"
+        assert job.error["detail"]["scope"] == scope
+    # The wire message is redacted; the cause is named in the structured log.
+    failures = [entry for entry in logs if entry["event"] == "removal.failed"]
+    assert failures and "carries no generation to deploy" in failures[0]["error"], failures
+
+
 async def test_run_removal_marks_failed_even_when_session_poisoned(adapter_client):
     """A DB-origin error in dispatch poisons the session (needs-rollback); the failure handler
     must rollback before the failed-status commit, or that commit re-raises and the job is
