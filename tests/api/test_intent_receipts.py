@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.api.test_static_route_identity import entry, seed_intent
+from tests.api.test_static_route_identity import enable_auto_apply, entry, seed_intent
 from tests.conftest import VALID_TOKEN, seed_device, session
 
 pytestmark = pytest.mark.anyio
@@ -176,6 +176,35 @@ async def test_o2b_9_a_tombstoned_route_id_still_counts_toward_the_maximum(adapt
     payload = (await adapter_client.get(URL, headers=AUTH)).json()
 
     assert payload["global_max_route_id"] == 8888
+
+
+async def test_o2b_9_the_receipt_names_the_generation_its_push_authorized(adapter_client):
+    """O2b.9 — ``generation_id`` on the wire is the LAST generation the push enqueued.
+
+    The restore reads this to tell a push that reached a deployment from one that only
+    touched the store: a non-authorizing mode has no generation to name and serves null.
+    """
+    from sqlalchemy import select
+
+    from nso_adapter.store.models import DeploymentGeneration
+
+    device_id = await seed_device(nso_device_name="rcpt-generation", netbox_device_id=9961)
+    await enable_auto_apply(device_id)
+
+    assert (await push_vlan(adapter_client, device_id, 21, [10])).status_code == 200
+    store_only = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/static-route-intent?store_only=true",
+        json={"routes": [entry(A, route_id=4243)], "deleted_routes": []},
+        headers={**AUTH, "X-Push-Seq": "22"},
+    )
+    assert store_only.status_code == 200
+
+    async with session() as db:
+        generation = await db.scalar(select(DeploymentGeneration).where(DeploymentGeneration.device_id == device_id))
+
+    rows = by_key((await adapter_client.get(URL, headers=AUTH)).json())
+    assert rows[(device_id, "vlan")]["generation_id"] == generation.id
+    assert rows[(device_id, "static_route")]["generation_id"] is None
 
 
 async def test_o2b_9_an_unknown_section_is_refused_rather_than_served_empty(adapter_client):
