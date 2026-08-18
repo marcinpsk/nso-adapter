@@ -127,10 +127,13 @@ async def test_apply_attributes_threads_nokia_routed_context():
     )
     attr_state = InterfaceAttrState(interface_id=1, attribute="description", sync_state=SyncState.accepted)
     intent = InterfaceIntent(interface_id=1, attribute="description", intent_value="loopback for CRPD-VPN")
+    # The live row differs from the document row, so the PATCH-value assertion below can
+    # tell the document-selected slot from the stamp slot.
+    live = InterfaceIntent(interface_id=1, attribute="description", intent_value="moved-on live description")
 
     client, bodies = _capturing_nso_client()
     ok, failed, failures = await _apply_attributes(
-        [(attr_state, intent, iface, intent)],
+        [(attr_state, intent, iface, live)],
         apply_interface_attribute,
         client=client,
         device_name="ra1",
@@ -146,6 +149,7 @@ async def test_apply_attributes_threads_nokia_routed_context():
     assert entry["parent-binding"] == "lag-99"
     assert entry["encap-tag"] == "10"
     assert entry["description"] == "loopback for CRPD-VPN"
+    assert live.last_apply_at is not None, "the success stamp missed the live row"
 
 
 async def test_apply_attributes_threads_lag_kind_for_a_nokia_lag():
@@ -157,10 +161,11 @@ async def test_apply_attributes_threads_lag_kind_for_a_nokia_lag():
     iface = DbInterface(device_id=1, netbox_interface_id=7003, name="lag-30", kind="lag")
     attr_state = InterfaceAttrState(interface_id=1, attribute="description", sync_state=SyncState.accepted)
     intent = InterfaceIntent(interface_id=1, attribute="description", intent_value="uplink bundle")
+    live = InterfaceIntent(interface_id=1, attribute="description", intent_value="moved-on live description")
 
     client, bodies = _capturing_nso_client()
     await _apply_attributes(
-        [(attr_state, intent, iface, intent)],
+        [(attr_state, intent, iface, live)],
         apply_interface_attribute,
         client=client,
         device_name="ra1",
@@ -183,10 +188,11 @@ async def test_apply_attributes_ios_interface_omits_routed_context():
     iface = DbInterface(device_id=1, netbox_interface_id=7002, name="GigabitEthernet0/0")
     attr_state = InterfaceAttrState(interface_id=1, attribute="enabled", sync_state=SyncState.accepted)
     intent = InterfaceIntent(interface_id=1, attribute="enabled", intent_value="true")
+    live = InterfaceIntent(interface_id=1, attribute="enabled", intent_value="false")
 
     client, bodies = _capturing_nso_client()
     await _apply_attributes(
-        [(attr_state, intent, iface, intent)],
+        [(attr_state, intent, iface, live)],
         apply_interface_attribute,
         client=client,
         device_name="core-rtr-01",

@@ -535,7 +535,7 @@ async def test_dispatch_scope_route_policy_passes_ned_id(adapter_client):
 
 
 @pytest.mark.parametrize(
-    ("scope", "model_name", "values", "changed_field", "successor_value", "apply_target", "rows_arg"),
+    ("scope", "model_name", "values", "changed_field", "successor_value", "apply_target"),
     [
         pytest.param(
             "svi",
@@ -544,7 +544,6 @@ async def test_dispatch_scope_route_policy_passes_ned_id(adapter_client):
             "vlan_id",
             200,
             "apply_svi_config",
-            2,
             id="svi",
         ),
         pytest.param(
@@ -559,7 +558,6 @@ async def test_dispatch_scope_route_policy_passes_ned_id(adapter_client):
             "dot1q_vlan",
             200,
             "apply_subinterface_config",
-            2,
             id="subinterface",
         ),
         pytest.param(
@@ -569,7 +567,6 @@ async def test_dispatch_scope_route_policy_passes_ned_id(adapter_client):
             "min_tx",
             900,
             "apply_bfd_config",
-            2,
             id="bfd",
         ),
         pytest.param(
@@ -579,7 +576,6 @@ async def test_dispatch_scope_route_policy_passes_ned_id(adapter_client):
             "mtu",
             9000,
             "apply_mtu_config",
-            2,
             id="interface_mtu",
         ),
         pytest.param(
@@ -594,7 +590,6 @@ async def test_dispatch_scope_route_policy_passes_ned_id(adapter_client):
             "port",
             "lag-61",
             "apply_l2_saps",
-            2,
             id="l2_sap",
         ),
         pytest.param(
@@ -604,7 +599,6 @@ async def test_dispatch_scope_route_policy_passes_ned_id(adapter_client):
             "metric",
             20,
             "apply_isis_interfaces",
-            2,
             id="isis",
         ),
         pytest.param(
@@ -614,7 +608,6 @@ async def test_dispatch_scope_route_policy_passes_ned_id(adapter_client):
             "entries",
             [{"sequence": 20}],
             "apply_route_policy_config",
-            2,
             id="route_policy",
         ),
         pytest.param(
@@ -624,7 +617,6 @@ async def test_dispatch_scope_route_policy_passes_ned_id(adapter_client):
             "router_id",
             "192.0.2.2",
             "apply_ospf_config",
-            2,
             id="ospf",
         ),
     ],
@@ -637,7 +629,6 @@ async def test_increment_one_removal_rows_come_from_the_generation_document(
     changed_field,
     successor_value,
     apply_target,
-    rows_arg,
 ):
     """A removal PUT-replace asserts its own document after the live store changes."""
     from nso_adapter.store import models
@@ -664,7 +655,8 @@ async def test_increment_one_removal_rows_come_from_the_generation_document(
             await removal_mod._dispatch_scope(db, device, client, scope, job_id=job_id)
 
     apply_fn.assert_awaited_once()
-    rows = apply_fn.await_args.args[rows_arg]
+    # Every scope runner takes (client, device_name, rows, ...): the rows are argument 2.
+    rows = apply_fn.await_args.args[2]
     assert [getattr(row, changed_field) for row in rows] == [original_value]
 
 
