@@ -204,8 +204,18 @@ async def record_response(
     generation_id: int | None = None,
     status_code: int = 200,
 ) -> None:
-    """Store what this push returned, so a redelivery replays it. Caller commits."""
+    """Store what this push returned, so a redelivery replays it. Caller commits.
+
+    Also stamps the generation this push authorized: the LAST one it enqueued (the apply
+    when auto-apply fired, else the final removal), or null when it enqueued none. Taken
+    from the request-scoped var :mod:`core.generation` writes, so none of the fourteen intent
+    PUTs has to thread it back. An explicit *generation_id* wins over that var.
+    """
+    from nso_adapter.core.generation import consume_last_enqueued_generation_id
+
     identity = delivery.identity
+    # Consumed even on an unkeyed delivery, so it cannot outlive the request that enqueued it.
+    enqueued_generation_id = consume_last_enqueued_generation_id()
     if identity is None:
         return
     receipt = await latest_receipt(db, device_id, delivery.stream)
@@ -213,7 +223,7 @@ async def record_response(
         raise RuntimeError(f"no admitted receipt for device {device_id} stream {delivery.stream!r} seq {identity.seq}")
     receipt.response = response
     receipt.status_code = status_code
-    receipt.generation_id = generation_id
+    receipt.generation_id = generation_id if generation_id is not None else enqueued_generation_id
     receipt.updated_at = _now()
     await db.flush()
 

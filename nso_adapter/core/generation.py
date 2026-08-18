@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextvars import ContextVar
 from datetime import UTC, datetime
 
 import structlog
@@ -242,6 +243,27 @@ async def _compose_authorized_document(db: AsyncSession, device_id: int, promote
     return _compose_document(fragments)
 
 
+#: The LAST generation the in-flight request enqueued, or ``None`` when it enqueued none.
+#: Written at the single generation-write point below, read once by
+#: :func:`core.receipt.record_response` through :func:`consume_last_enqueued_generation_id`.
+#: Request-scoped like the flags in :mod:`core.request_flags`, and for the same reason: the
+#: fourteen intent PUTs would otherwise each have to thread a return value back to the
+#: receipt. The action, retry and worker paths create generations and never record a
+#: response, so their value simply dies with their request context.
+LAST_ENQUEUED_GENERATION_ID: ContextVar[int | None] = ContextVar("last_enqueued_generation_id", default=None)
+
+
+def consume_last_enqueued_generation_id() -> int | None:
+    """Take the id of the last generation this request enqueued, clearing it.
+
+    Consuming rather than reading is what keeps a later delivery in the same context from
+    inheriting an earlier one's link.
+    """
+    generation_id = LAST_ENQUEUED_GENERATION_ID.get()
+    LAST_ENQUEUED_GENERATION_ID.set(None)
+    return generation_id
+
+
 async def create_generation(
     db: AsyncSession,
     device_id: int,
@@ -339,6 +361,9 @@ async def _store_generation(
     )
     db.add(generation)
     await db.flush()
+    # The one place a generation row is written, so every path that creates one — both
+    # create_generation callers and the reissue — records its provenance here.
+    LAST_ENQUEUED_GENERATION_ID.set(generation.id)
     logger.info(
         "generation.created",
         device_id=device_id,
@@ -975,6 +1000,7 @@ __all__ = [
     "advance_generations_locked",
     "attach_to_job",
     "authorized_streams",
+    "consume_last_enqueued_generation_id",
     "create_generation",
     "create_reissue_generation",
     "digest_document",

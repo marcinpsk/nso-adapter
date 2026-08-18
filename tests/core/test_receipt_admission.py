@@ -21,6 +21,7 @@ import sqlalchemy as sa
 from fastapi.routing import iter_route_contexts
 
 from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.core.test_generation_protocol import generations, put_vlans, seed_settings
 
 pytestmark = pytest.mark.anyio
 
@@ -281,6 +282,81 @@ async def test_two_endpoints_of_one_promotion_family_keep_separate_receipts(adap
 
     assert (await _receipt(device_id, "interface_config")).push_seq == 40
     assert (await _receipt(device_id, "ip")).push_seq == 3
+
+
+# ── the generation a push authorized ──────────────────────────────────────────
+
+
+async def _stamped_job_type(receipt):
+    """The job type of the generation a receipt names. Proves WHICH link was stamped."""
+    from nso_adapter.store.models import DeploymentGeneration, Job
+
+    async with session() as db:
+        generation = await db.get(DeploymentGeneration, receipt.generation_id)
+        return (await db.get(Job, generation.job_id)).job_type
+
+
+async def test_the_receipt_names_the_apply_generation_an_auto_apply_push_enqueued(adapter_client):
+    """The tail of the chain: a push that reaches its apply is stamped with THAT generation.
+
+    An intent PUT enqueues removals before the apply, so "the last generation this push
+    enqueued" is the apply whenever auto-apply fired.
+    """
+    from nso_adapter.store.models import JobType
+
+    device_id = await seed_device(nso_device_name="rcp-gen-apply", netbox_device_id=9840)
+    await seed_settings(device_id)
+
+    assert (await put_vlans(adapter_client, device_id, [10], seq=1)).status_code == 200
+
+    chain = await generations(device_id)
+    receipt = await _receipt(device_id, "vlan")
+    assert receipt.generation_id == chain[-1].id
+    assert await _stamped_job_type(receipt) is JobType.apply
+
+
+async def test_the_receipt_names_the_removal_generation_when_no_apply_follows(adapter_client):
+    """With auto-apply off, the shrink's removal IS the last generation the push enqueued."""
+    from nso_adapter.store.models import JobType
+
+    device_id = await seed_device(nso_device_name="rcp-gen-removal", netbox_device_id=9841)
+    await seed_settings(device_id, auto_apply=False)
+
+    assert (await put_vlans(adapter_client, device_id, [10, 20], seq=1)).status_code == 200
+    assert (await _receipt(device_id, "vlan")).generation_id is None, "a push that enqueued nothing stamped a link"
+
+    assert (await put_vlans(adapter_client, device_id, [10], seq=2)).status_code == 200
+
+    chain = await generations(device_id)
+    receipt = await _receipt(device_id, "vlan")
+    assert receipt.generation_id == chain[-1].id
+    assert await _stamped_job_type(receipt) is JobType.removal
+
+
+async def test_a_store_only_push_names_no_generation(adapter_client):
+    """Store-only authorizes no deployment, so there is no link to name."""
+    device_id = await seed_device(nso_device_name="rcp-gen-store-only", netbox_device_id=9842)
+    await seed_settings(device_id)
+
+    resp = await put_vlans(adapter_client, device_id, [10], seq=1, query="?store_only=true")
+    assert resp.status_code == 200
+
+    assert await generations(device_id) == []
+    assert (await _receipt(device_id, "vlan")).generation_id is None
+
+
+async def test_a_later_push_that_enqueues_nothing_does_not_inherit_the_earlier_stamp(adapter_client):
+    """The stamp is request-scoped: the second delivery must not read the first one's link."""
+    device_id = await seed_device(nso_device_name="rcp-gen-no-leak", netbox_device_id=9843)
+    await seed_settings(device_id)
+
+    assert (await put_vlans(adapter_client, device_id, [10], seq=1)).status_code == 200
+    assert (await _receipt(device_id, "vlan")).generation_id is not None
+
+    resp = await put_vlans(adapter_client, device_id, [10], seq=2, query="?store_only=true")
+    assert resp.status_code == 200
+
+    assert (await _receipt(device_id, "vlan")).generation_id is None
 
 
 # ── the two boundary refusals ─────────────────────────────────────────────────

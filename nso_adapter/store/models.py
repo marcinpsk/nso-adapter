@@ -598,7 +598,10 @@ class IntentPushReceipt(Base):
     #: The response body this push returned, replayed byte for byte on a repeat delivery.
     response: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     status_code: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("200"), default=200)
-    #: The generation this push authorized, when it authorized one (store-only does not).
+    #: The generation this push authorized: the LAST one it enqueued — the apply generation
+    #: when the push enqueued one, else the final removal generation. NULL when the push
+    #: enqueued none: store-only authorizes no deployment, and a push that changed nothing
+    #: has none to name.
     generation_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("deployment_generation.id", ondelete="SET NULL"), nullable=True
     )
