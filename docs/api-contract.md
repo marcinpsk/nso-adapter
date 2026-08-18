@@ -698,8 +698,9 @@ top-level `job_id` is the first job in that chain.
 
 Promotion, document storage, cohort allocation, generation creation, and job enqueue occur
 in one transaction under the device projection lock. Removal work uses the ordinary
-`enqueue_removal` path and its existing scope runner. Removal generations precede the apply
-generation, and networked removals precede detach removals. The networked intermediate document
+`enqueue_removal` path and its existing scope runner. Networked removal generations precede
+the apply generation; detach removal generations follow it, so the top-level `job_id` names
+the first networked removal when one exists. The networked intermediate document
 retains every detach-only row. The detach generation stores the selected desired document.
 All links in the request share one non-null `settlement_cohort`; a singleton leaves it null.
 A failed head blocks every successor through the ordinary generation success barrier.
