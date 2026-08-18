@@ -90,19 +90,24 @@ async def _enable_auto_apply(device_id: int, *, seed_interface: bool) -> None:
         await db.commit()
 
 
-async def _generation_jobs(device_id: int) -> list[tuple[str, str]]:
+async def _generation_jobs(device_id: int) -> list[tuple[str, str | None]]:
+    """Every generation the device has, with the job carrying it — or None for an unattached one.
+
+    Outer-joined on purpose: an inner join hides a generation whose ``job_id`` is NULL, and the
+    store-only seeding push must create no generation at all.
+    """
     from nso_adapter.store.models import DeploymentGeneration, Job
 
     async with session() as db:
         rows = (
             await db.execute(
                 sa.select(DeploymentGeneration.mode, Job.job_type)
-                .join(Job, Job.id == DeploymentGeneration.job_id)
+                .outerjoin(Job, Job.id == DeploymentGeneration.job_id)
                 .where(DeploymentGeneration.device_id == device_id)
                 .order_by(DeploymentGeneration.seq)
             )
         ).all()
-        return [(mode.value, job_type.value) for mode, job_type in rows]
+        return [(mode.value, job_type.value if job_type is not None else None) for mode, job_type in rows]
 
 
 @pytest.mark.parametrize(("endpoint", "before", "after"), CASES)

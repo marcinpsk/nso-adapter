@@ -415,6 +415,9 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
     Transient on purpose: these carry what the deployment must send, and nothing about them
     may reach the store. The live rows are what an apply stamps — matched back by ``id``,
     which every snapshotted row carries.
+
+    A row that omits the primary key is refused: it would hydrate with ``id`` None, match no
+    live row, and let a successful device write report an all-zero bookkeeping outcome.
     """
     tables = document.get(section) or {}
     rows: dict[type, list] = {}
@@ -423,6 +426,7 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
         if model is None:
             raise ValueError(f"document section {section!r} names unknown table {table_name!r}")
         columns = {column.key: column for column in model.__table__.columns}
+        keys = [column.key for column in model.__table__.primary_key.columns]
         built = []
         for record in records:
             instance = model()
@@ -431,6 +435,8 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
                 if column is None:
                     raise ValueError(f"document row for {table_name!r} names unknown column {key!r}")
                 setattr(instance, key, _from_jsonable(value, column))
+            if any(record.get(key) is None for key in keys):
+                raise ValueError(f"document row for {table_name!r} omits the primary key {keys!r}")
             built.append(instance)
         rows[model] = built
     return rows

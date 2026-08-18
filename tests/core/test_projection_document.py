@@ -67,6 +67,16 @@ def test_hydrating_an_unknown_table_or_column_is_refused():
         hydrate_section({"vlan": {"vlan_intent": [{"nope": 1}]}}, "vlan")
 
 
+def test_hydrating_a_row_without_its_primary_key_is_refused():
+    """An id-less row stamps nothing: the apply would report a (0, 0) success."""
+    from nso_adapter.core.projection import hydrate_section
+
+    with pytest.raises(ValueError, match="primary key"):
+        hydrate_section({"vlan": {"vlan_intent": [{"device_id": 1, "vlan_id": 10}]}}, "vlan")
+    with pytest.raises(ValueError, match="primary key"):
+        hydrate_section({"vlan": {"vlan_intent": [{"id": None, "device_id": 1, "vlan_id": 10}]}}, "vlan")
+
+
 # ── stream ownership: the authorization partition ────────────────────────────
 
 

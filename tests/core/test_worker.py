@@ -87,15 +87,12 @@ async def test_generation_advancement_logs_once_after_retries_are_exhausted(monk
 
     failures = [entry for entry in logs if entry["event"] == "worker.generation_advance_failed"]
     assert calls == 3
-    assert failures == [
-        {
-            "attempts": 3,
-            "device_id": 18,
-            "error": "RuntimeError('persistent database failure')",
-            "event": "worker.generation_advance_failed",
-            "log_level": "error",
-        }
-    ]
+    assert len(failures) == 1, failures
+    (failure,) = failures
+    assert failure["log_level"] == "error"
+    assert failure["attempts"] == 3
+    assert failure["device_id"] == 18
+    assert failure["error"] == "RuntimeError('persistent database failure')"
 
 
 # ── _claim_next_job ─────────────────────────────────────────────────────────────

@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from tests.conftest import VALID_TOKEN, seed_device, session
 from tests.core.test_generation_protocol import (
+    _VLAN_ROOT,
     put_snmp,
     put_vlans,
     recorded_client,
@@ -41,11 +42,16 @@ _AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 #: way the plugin does and a shrink can drop one entry from it.
 _vlans: dict[int, list[int]] = {}
 
+#: Each device's NSO name, so the recorded RESTCONF boundary answers for the device under
+#: test rather than for one fixed name.
+_names: dict[int, str] = {}
+
 
 async def _device(name: str, netbox_device_id: int, *, auto_apply: bool = True) -> int:
     device_id = await seed_device(nso_device_name=name, netbox_device_id=netbox_device_id)
     await seed_settings(device_id, auto_apply=auto_apply)
     _vlans[device_id] = []
+    _names[device_id] = name
     return device_id
 
 
@@ -140,12 +146,17 @@ async def _finish(device_id: int, status) -> int | None:
 
     The outcome is produced by the RESTCONF boundary refusing the commit, not by writing a
     status: a hand-written terminal status settles generations that no execution ever
-    touched.
+    touched. ``failed`` therefore means "failed through the injected VLAN rejection", which
+    is asserted: a head that fails some other way has not run the case the caller asked for.
     """
     from nso_adapter.store.models import JobStatus
 
-    client, _rec = recorded_client("gen-runner", fail_vlan=status is JobStatus.failed)
-    return await run_head(device_id, client)
+    failing = status is JobStatus.failed
+    client, rec = recorded_client(_names[device_id], fail_vlan=failing)
+    job_id = await run_head(device_id, client)
+    if failing:
+        assert rec.bodies(_VLAN_ROOT), "the injected vlan rejection never fired"
+    return job_id
 
 
 async def _job_status(job_id: int):
@@ -877,7 +888,6 @@ async def test_f1_b_retried_apply_runs_past_a_blocked_removal_successor(adapter_
 
     # A marked deletion queues a removal behind the blocked apply. Auto-apply stays off so
     # this push contributes exactly one successor.
-    await _set_auto_apply(device_id, False)
     await _shrink(adapter_client, device_id, delete_origin=True)
     await _set_auto_apply(device_id, False)
 

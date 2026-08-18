@@ -243,11 +243,12 @@ async def test_store_only_skips_auto_apply(adapter_client):
 async def test_store_only_manual_apply_is_rejected_without_a_job(adapter_client):
     """Manual Apply is a device write. It cannot run under a store-only request."""
     device_id = await seed_device(nso_device_name="so-manual-apply", netbox_device_id=988)
-    await adapter_client.put(
+    stored = await adapter_client.put(
         f"/api/v1/devices/{device_id}/vlan-intent?store_only=true",
         json={"vlans": [{"vlan_id": 10, "name": "ten"}]},
         headers=AUTH,
     )
+    assert stored.status_code == 200, stored.text
 
     response = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/apply?store_only=true", headers=AUTH)
 

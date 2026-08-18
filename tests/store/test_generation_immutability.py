@@ -18,8 +18,11 @@ from nso_adapter.store.ddl import GENERATION_IMMUTABLE_COLUMNS, _compare
 _DOCUMENT = {"vlan": {"vlan_intent": [{"id": 1, "device_id": 1, "vlan_id": 10, "name": "v"}]}}
 
 #: (column, a value that differs from the seeded row), one per immutable column.
+#: ``device_id`` names the SECOND seeded device through a bind rather than a literal id: a
+#: literal that happened to equal the generation's OWN device would make the UPDATE a no-op,
+#: which ``IS DISTINCT FROM`` lets through, and the test would fail having proven nothing.
 _REWRITES = {
-    "device_id": "2",
+    "device_id": ":other_device",
     "seq": "99",
     "mode": "'detach'",
     "document": "CAST('{\"vlan\": {}}' AS json)",
@@ -32,9 +35,10 @@ _REWRITES = {
 }
 
 
-def _seed(session) -> tuple[int, int]:
+def _seed(session) -> tuple[int, int, int]:
     """Seed two devices (so a device_id rewrite is not merely an FK failure) and one generation.
 
+    Returns the generation's own device id, the second device's id and the generation id.
     Seeded through the ORM; only the UPDATEs under test are raw SQL, which is where the
     guarantee lives.
     """
@@ -59,7 +63,7 @@ def _seed(session) -> tuple[int, int]:
     )
     session.add(generation)
     session.commit()
-    return devices[0].id, generation.id
+    return devices[0].id, devices[1].id, generation.id
 
 
 def test_the_immutable_column_set_is_exactly_what_the_trigger_guards():
@@ -76,12 +80,12 @@ def test_an_unknown_immutable_column_uses_the_json_safe_comparison():
 
 @pytest.mark.parametrize("column", sorted(_REWRITES))
 def test_rewriting_an_identity_column_is_rejected_by_the_database(pg_sync_session, column):
-    _device_id, generation_id = _seed(pg_sync_session)
+    _device_id, other_device_id, generation_id = _seed(pg_sync_session)
 
     with pytest.raises(sa.exc.IntegrityError) as excinfo:
         pg_sync_session.execute(
             sa.text(f"UPDATE deployment_generation SET {column} = {_REWRITES[column]} WHERE id = :gid"),
-            {"gid": generation_id},
+            {"gid": generation_id, "other_device": other_device_id},
         )
     assert "is immutable" in str(excinfo.value)
     pg_sync_session.rollback()
@@ -91,7 +95,7 @@ def test_the_lifecycle_columns_stay_writable(pg_sync_session):
     """Status, job binding, attempts, error and the timestamps are what execution MOVES."""
     from nso_adapter.store.models import Job, JobStatus, JobType
 
-    _device_id, generation_id = _seed(pg_sync_session)
+    _device_id, _other_device_id, generation_id = _seed(pg_sync_session)
     job = Job(job_type=JobType.apply, device_id=_device_id, status=JobStatus.queued)
     pg_sync_session.add(job)
     pg_sync_session.flush()
@@ -122,7 +126,7 @@ def test_an_update_that_changes_nothing_is_allowed(pg_sync_session):
     ``IS DISTINCT FROM``, not ``<>``: a NULL-to-NULL rewrite of ``removal_context`` is the
     common case (any status write on an apply generation) and would otherwise fail.
     """
-    _device_id, generation_id = _seed(pg_sync_session)
+    _device_id, _other_device_id, generation_id = _seed(pg_sync_session)
 
     pg_sync_session.execute(
         sa.text(
