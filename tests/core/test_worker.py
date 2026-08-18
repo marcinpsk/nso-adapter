@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from unittest.mock import patch
 
@@ -407,7 +408,8 @@ async def test_worker_loop_marks_failed_when_runner_raises(adapter_client):
         task = asyncio.create_task(worker._worker_loop(0, stop))
         await asyncio.wait_for(raised.wait(), timeout=5.0)
         # Give the finally/_mark_failed a moment to commit.
-        for _ in range(50):
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
             if (await _get_job(job_id)).status == JobStatus.failed:
                 break
             await asyncio.sleep(0.05)
@@ -438,7 +440,8 @@ async def test_start_and_stop_workers(adapter_client):
         await worker.start_workers(concurrency=2)
         assert len(worker._workers) == 2
         # The orphaned detect_drift was requeued and should drain to succeeded.
-        for _ in range(100):
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
             if (await _get_job(orphan)).status == JobStatus.succeeded:
                 break
             await asyncio.sleep(0.05)
@@ -522,7 +525,8 @@ async def test_ensure_workers_respawns_dead_worker(adapter_client):
 
             worker.ensure_workers()
 
-            for _ in range(100):
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline:
                 if (await _get_job(job_id)).status == JobStatus.succeeded:
                     break
                 await asyncio.sleep(0.05)

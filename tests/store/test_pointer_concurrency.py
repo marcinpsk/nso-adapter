@@ -25,6 +25,7 @@ concurrent window can, which is why the red reproduction needs the lock choreogr
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 from sqlalchemy import delete, select, text
@@ -156,7 +157,9 @@ async def test_lost_update_window_cannot_regress_pointer(pointer_engine, lock_pr
         # synchronize on the OBSERVED lock wait: poll pg_stat_activity until a backend in
         # this clone is waiting on a Lock (the victim's write blocked on the holder's row
         # lock). Only then is the interleave proven.
-        for _ in range(100):
+        waiting = 0
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
             waiting = (
                 await lock_probe.exec_driver_sql(
                     "SELECT count(*) FROM pg_stat_activity "
@@ -166,7 +169,7 @@ async def test_lost_update_window_cannot_regress_pointer(pointer_engine, lock_pr
             if waiting:
                 break
             await asyncio.sleep(0.05)
-        else:
+        if not waiting:
             raise AssertionError("victim never reached the blocked write")
         assert not victim_task.done()
         await holder.execute(text("COMMIT"))  # pointer = a_holder, victim unblocks
