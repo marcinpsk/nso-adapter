@@ -481,7 +481,8 @@ async def test_a_keyed_undecodable_body_is_a_validation_error(adapter_client):
 
     The content type must not be JSON here. FastAPI parses the body itself before dependency
     solving only for a JSON content type, so any other type leaves the raw bytes for this
-    dependency to read, and an uncaught decode error there is a 500.
+    dependency to read. An uncaught decode error there would be a 500; the dependency catches
+    it and answers the standard ``validation_error`` 422 instead.
     """
     device_id = await seed_device(nso_device_name="rcp-bad-utf8", netbox_device_id=None)
 

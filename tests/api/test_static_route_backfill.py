@@ -24,6 +24,7 @@ from sqlalchemy import select
 
 from tests.api.test_static_route_deleted_routes import deleted, partition_of, put, receipt, wire_triple
 from tests.api.test_static_route_identity import (
+    AUTH,
     A,
     B,
     C,
@@ -33,7 +34,7 @@ from tests.api.test_static_route_identity import (
     read_tombstones,
     seed_intent,
 )
-from tests.conftest import seed_device, session
+from tests.conftest import push_seq, seed_device, session
 
 pytestmark = pytest.mark.anyio
 
@@ -288,7 +289,7 @@ async def test_backfill_only_is_refused_on_a_stream_that_does_not_implement_it(a
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/vlan-intent?backfill_only=true",
         json={"vlans": []},
-        headers={"Authorization": "Bearer test-bearer-token", "X-Push-Seq": "1"},
+        headers=AUTH | push_seq(),
     )
 
     assert resp.status_code == 422
