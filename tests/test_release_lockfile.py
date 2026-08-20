@@ -14,7 +14,24 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+import yaml
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+
+_DECOY_RELEASE_WORKFLOW = """
+jobs:
+  release:
+    steps:
+      - id: release
+        run: |
+          echo "build: true"
+        # build: true
+"""
+
+
+def _release_step(workflow_text: str) -> dict:
+    workflow = yaml.safe_load(workflow_text)
+    return next(step for step in workflow["jobs"]["release"]["steps"] if step.get("id") == "release")
 
 
 def _locked_version() -> str:
@@ -41,4 +58,10 @@ def test_the_release_refreshes_and_ships_the_lockfile():
     assert "uv lock" in release["build_command"]
     assert "uv.lock" in release["assets"]
     # build_command only runs when the release action is asked to build.
-    assert "build: true" in (_REPO_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    workflow_text = (_REPO_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    assert _release_step(workflow_text)["with"]["build"] is True
+
+
+def test_release_build_setting_ignores_decoy_text():
+    assert "build: true" in _DECOY_RELEASE_WORKFLOW
+    assert _release_step(_DECOY_RELEASE_WORKFLOW).get("with", {}).get("build") is not True
