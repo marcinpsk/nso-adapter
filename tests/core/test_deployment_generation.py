@@ -55,7 +55,7 @@ async def _device(name: str, netbox_device_id: int, *, auto_apply: bool = True) 
     return device_id
 
 
-async def _vlan(device_id: int, vid: int, name: str = "v") -> None:
+async def _vlan(device_id: int, vid: int) -> None:
     """Add one VLAN to what the next push will send."""
     _vlans.setdefault(device_id, []).append(vid)
 

@@ -169,7 +169,12 @@ async def test_a_snapshot_is_a_fragment_of_only_the_tables_its_stream_owns(adapt
 def _clear_projection_caches() -> None:
     from nso_adapter.core import projection
 
-    for fn in (projection._stream_tables, projection._stream_section, projection.projection_streams):
+    for fn in (
+        projection._stream_tables,
+        projection._stream_section,
+        projection.projection_streams,
+        projection.projection_sections,
+    ):
         fn.cache_clear()
 
 
