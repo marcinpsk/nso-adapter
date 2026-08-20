@@ -389,7 +389,12 @@ def _from_jsonable(value: Any, column) -> Any:
 
 def section_models(sections) -> frozenset[type]:
     """Return every intent model the named *sections* are built from."""
-    return frozenset(spec.model for section in sections for spec in _SECTION_TABLES[section])
+    models: set[type] = set()
+    for section in sections:
+        if section not in projection_sections():
+            raise ValueError(f"unknown projection section {section!r}")
+        models.update(spec.model for spec in _SECTION_TABLES[section])
+    return frozenset(models)
 
 
 #: Columns an apply pass WRITES onto an intent row: the deployment's outcome, never the
@@ -465,6 +470,7 @@ __all__ = [
     "intent_state",
     "projection_sections",
     "projection_streams",
+    "section_models",
     "section_streams",
     "snapshot_stream",
     "stream_for_model",

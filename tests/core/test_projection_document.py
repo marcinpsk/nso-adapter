@@ -131,6 +131,17 @@ def test_a_name_outside_either_vocabulary_is_refused():
         stream_for_model(Device)
 
 
+def test_section_models_validates_sections_and_is_exported():
+    from nso_adapter.core import projection
+    from nso_adapter.store.models import BfdIntent, VlanIntent
+
+    models = projection.section_models(section for section in ("vlan", "bfd"))
+    assert models == frozenset({VlanIntent, BfdIntent})
+    with pytest.raises(ValueError, match="unknown projection section 'unknown'"):
+        projection.section_models(["unknown"])
+    assert "section_models" in projection.__all__
+
+
 def test_a_model_resolves_to_the_stream_that_owns_it():
     """What ``replace_on_removal`` promotes on: the model, not the family it sits in."""
     from nso_adapter.core.projection import stream_for_model
