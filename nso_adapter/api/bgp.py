@@ -510,8 +510,8 @@ def _iter_redistribution(routers: list[BgpRouterModel]):
 
 async def _sync_redistribution(
     db: AsyncSession, device_id: int, routers: list[BgpRouterModel], now: datetime
-) -> list[tuple]:
-    """Full-replace BGP (dest_protocol=bgp) redistribution intent rows. Returns the removed keys."""
+) -> tuple[list[tuple], bool]:
+    """Full-replace BGP redistribution intent rows. Return removed keys and retained-field clears."""
     existing = (
         (
             await db.execute(
@@ -531,6 +531,7 @@ async def _sync_redistribution(
     for key in removed:
         await db.delete(existing_map[key])
 
+    cleared = False
     for dest_ref, entry in _iter_redistribution(routers):
         key = (dest_ref, entry.source_protocol, entry.source_ref)
         row = existing_map.get(key)
@@ -544,9 +545,11 @@ async def _sync_redistribution(
                 accepted_at=now,
             )
             db.add(row)
+        else:
+            cleared = cleared or is_cleared(row.route_map, entry.route_map) or is_cleared(row.metric, entry.metric)
         row.route_map = entry.route_map
         row.metric = entry.metric
-    return removed
+    return removed, cleared
 
 
 async def _maybe_enqueue_apply(db: AsyncSession, device_id: int, router_count: int, *, stream: str) -> None:
@@ -619,10 +622,10 @@ async def put_bgp_intent(
 
     now = datetime.now(UTC)
     router_count = await _rebuild_router_intent(db, device_id, body.routers, now)
-    removed_redist = await _sync_redistribution(db, device_id, body.routers, now)
+    removed_redist, redistribution_cleared = await _sync_redistribution(db, device_id, body.routers, now)
 
     removed_asns, removed_peers = _bgp_removed(existing_asns, existing_peers, body.routers)
-    cleared = _bgp_cleared(before_values, body.routers)
+    cleared = _bgp_cleared(before_values, body.routers) or redistribution_cleared
     shrank = bool(removed_asns or removed_peers or removed_redist)
     if shrank or cleared:
         from nso_adapter.core.removal import enqueue_removal
