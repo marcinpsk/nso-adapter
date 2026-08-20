@@ -1017,12 +1017,17 @@ async def test_f3_a_two_concurrent_retries_admit_the_head_once(adapter_client):
         first = asyncio.create_task(adapter_client.post(url, headers=_AUTH))
         await asyncio.wait_for(parked.wait(), timeout=3)
         second = asyncio.create_task(adapter_client.post(url, headers=_AUTH))
-        await asyncio.sleep(0.3)
+        # Inside the held window the rival either refuses outright or blocks on the first
+        # request's open transaction; completing here proves the refusal happened in-window.
+        in_window, _ = await asyncio.wait({second}, timeout=5)
+        if in_window:
+            assert second.result().status_code == 409, "the rival finished in the held window without refusing"
         release.set()
         one, two = await asyncio.wait_for(asyncio.gather(first, second), timeout=20)
 
-    codes = sorted([one.status_code, two.status_code])
-    assert codes == [202, 409], f"concurrent retries both re-admitted the head: {codes}"
+    assert (one.status_code, two.status_code) == (202, 409), (
+        f"the parked retry must win and the rival refuse: {one.status_code}, {two.status_code}"
+    )
     assert len(await _queued_jobs(device_id)) == 1, "the head was duplicated across two jobs"
 
 
@@ -1037,19 +1042,21 @@ async def test_f3_b_a_retry_and_an_abandon_cannot_both_win(adapter_client):
         retrying = asyncio.create_task(adapter_client.post(f"{base}/retry-generation", headers=_AUTH))
         await asyncio.wait_for(parked.wait(), timeout=3)
         abandoning = asyncio.create_task(adapter_client.post(f"{base}/abandon-generation", headers=_AUTH))
-        await asyncio.sleep(0.3)
+        # Same window proof as the retry race: an in-window completion must be the refusal.
+        in_window, _ = await asyncio.wait({abandoning}, timeout=5)
+        if in_window:
+            assert abandoning.result().status_code == 409, "the abandon finished in the held window without refusing"
         release.set()
         retry, abandon = await asyncio.wait_for(asyncio.gather(retrying, abandoning), timeout=20)
 
-    codes = sorted([retry.status_code, abandon.status_code])
-    assert codes == [202, 409], f"a retry and an abandon both acted on one head: {codes}"
+    # The parked retry acted on the head first and holds it to its commit, so it wins.
+    assert (retry.status_code, abandon.status_code) == (202, 409), (
+        f"a retry and an abandon both acted on one head: {retry.status_code}, {abandon.status_code}"
+    )
 
     (head,) = await _generations(device_id)
-    if head.status is GenerationStatus.abandoned:
-        assert await _queued_jobs(device_id) == [], "an abandoned generation still has a job to run"
-    else:
-        assert head.status is GenerationStatus.pending
-        assert len(await _queued_jobs(device_id)) == 1
+    assert head.status is GenerationStatus.pending
+    assert len(await _queued_jobs(device_id)) == 1
 
 
 async def test_f6_a_a_reissue_certifies_no_section_revision(adapter_client):
