@@ -1291,14 +1291,15 @@ async def _finalize_static_route_removal(db, job_id: int, device, client, out: S
     else:
         proven, residue_found, per_field = await _sr_networked_proof(db, client, device, out, result)
 
-    promotes_static_route = await db.scalar(
-        select(
-            exists().where(
-                DeploymentGeneration.job_id == job_id,
-                DeploymentGeneration.stream_revisions["static_route"].as_string().is_not(None),
+    with db.no_autoflush:
+        promotes_static_route = await db.scalar(
+            select(
+                exists().where(
+                    DeploymentGeneration.job_id == job_id,
+                    DeploymentGeneration.stream_revisions["static_route"].as_string().is_not(None),
+                )
             )
         )
-    )
     promoted_context = bool(out.authorized) and bool(promotes_static_route)
     owns_carrier = bool(out.tombstone_ids) or bool(out.clears) or promoted_context
     consume = proven and not residue_found
@@ -2348,7 +2349,9 @@ async def _promotion_interface_context(
     unresolved = sorted(set(interface_ids) - names_by_id.keys())
     if unresolved:
         raise PromotionInterfaceUnresolved(f"unresolved interface ids: {unresolved}")
-    interfaces = sorted({names_by_id[row["interface_id"]] for row in all_rows if row["interface_id"] in names_by_id})
+    # Every integer interface id in all_rows is present in names_by_id.
+    interfaces = sorted({names_by_id[row["interface_id"]] for row in all_rows})
+    # Keep this filter for id-less rows, which all_rows excludes.
     address_keys = [
         (names_by_id[row["interface_id"]], row.get("address") or "", row.get("vrf") or "")
         for row in removed_rows.get("interface_ip_intent", [])
@@ -2373,6 +2376,9 @@ async def promotion_removal_context(
     :func:`enqueue_removal`. The runner therefore keeps sole ownership of guard, detach,
     residue, carrier, and proof behavior.
     """
+    if scope not in VALID_REMOVAL_SCOPES:  # pragma: no cover - caller validates first
+        raise ValueError(f"Unknown removal scope {scope!r}")
+
     removed: dict[str, list] = {}
     interfaces: list[str] | None = None
     vault_refs: dict[str, str] | None = None
@@ -2394,8 +2400,6 @@ async def promotion_removal_context(
         vault_refs = refs or None
     if scope == "interface_config":
         interfaces, removed = await _promotion_interface_context(db, device_id, removed_rows, replacement_rows or {})
-    if scope not in VALID_REMOVAL_SCOPES:  # pragma: no cover - caller validates first
-        raise ValueError(f"Unknown removal scope {scope!r}")
 
     return PromotionRemovalContext(interfaces, removed or None, vault_refs)
 

@@ -325,6 +325,30 @@ async def test_action_apply_endpoint_returns_selected_generation_contract(adapte
     assert (await _generations(device_id))[0].digest == link["digest"]
 
 
+async def test_action_apply_endpoint_reports_the_queued_incumbent(adapter_client):
+    from nso_adapter.store.models import Job, JobStatus, JobType
+
+    device_id = await seed_device(nso_device_name="apply-queued-conflict", netbox_device_id=None)
+    await seed_settings(device_id, auto_apply=False)
+    assert (await _put_vlans(adapter_client, device_id, [10], seq=4351, query="?store_only=true")).status_code == 200
+    async with session() as db:
+        incumbent = Job(device_id=device_id, job_type=JobType.apply, status=JobStatus.queued)
+        db.add(incumbent)
+        await db.commit()
+        incumbent_id = incumbent.id
+
+    response = await _apply(adapter_client, device_id, {"vlan": 4351})
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": {
+            "code": "conflict",
+            "message": "A job is already running for this device",
+            "detail": {"job_id": incumbent_id},
+        }
+    }
+
+
 async def test_action_apply_wraps_a_missing_head_job_in_the_error_contract(adapter_client, monkeypatch):
     from nso_adapter.core import generation as generation_module
     from nso_adapter.store.models import GenerationMode
