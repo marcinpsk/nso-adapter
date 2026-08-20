@@ -1155,6 +1155,8 @@ Under it the request:
   **no content** — a row whose adapter state has drifted stays drifted;
 - leaves every omitted row that carries a `route_id` exactly as it is;
 - prunes every omitted row whose `route_id` is NULL, reporting each in `removed_uncorrelated`;
+- refuses with **422** (`reason = "backfill_missing_route_id"`) if a matched row has a NULL
+  `route_id` and its payload entry does not supply one; `detail.routes` names the affected triples;
 - spawns nothing: no removal job, no tombstone, no auto-apply;
 - carries no authority: a non-empty `deleted_routes` is a **422**
   (`reason = "backfill_carries_deletions"`);
@@ -1176,6 +1178,7 @@ is in `error.detail.reason`:
 | `duplicate_route_id` | two entries claim the same non-null `route_id`; `detail.route_id` names it |
 | `duplicate_deleted_route_id` | two `deleted_routes` records claim the same `route_id`; emission is id-oriented, exactly one outcome per id |
 | `backfill_carries_deletions` | a `?backfill_only=true` body carried a non-empty `deleted_routes` |
+| `backfill_missing_route_id` | a `?backfill_only=true` entry matched an uncorrelated row but did not assign a non-null `route_id`; `detail.routes` names the affected triples |
 
 Entries with no `route_id` never collide with each other — a body of routes that all omit
 it is the normal shape and is accepted.

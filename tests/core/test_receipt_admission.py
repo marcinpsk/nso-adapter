@@ -500,7 +500,7 @@ async def test_a_keyed_undecodable_body_is_a_validation_error(adapter_client):
 
 
 def _push_seq_parameters(schema: dict, path: str) -> list[dict]:
-    operation = schema["paths"][path.replace("{device_id}", "{device_id}")]["put"]
+    operation = schema["paths"][path]["put"]
     return [p for p in operation.get("parameters", []) if p["name"] == "X-Push-Seq"]
 
 

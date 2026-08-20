@@ -270,6 +270,45 @@ async def test_o2b_8_f_store_only_is_refused_on_a_fence_open_device_too(adapter_
     assert await read_intent_all_columns(device_id) == before
 
 
+async def test_o2b_8_f_store_only_acknowledges_a_degraded_deletion_without_a_carrier(adapter_client):
+    """O2b.8(f) positive arm: acknowledgement does not depend on a device-work carrier."""
+    device_id = await seed_device(nso_device_name="sr-o2b8-f3", netbox_device_id=9898)
+    await seed_intent(
+        device_id,
+        [
+            {"triple": A, "route_id": None, "deployed_key": list(A)},
+            {"triple": C, "route_id": 101, "deployed_key": list(C)},
+        ],
+    )
+
+    resp = await put(
+        adapter_client,
+        device_id,
+        [entry(C, route_id=101)],
+        deleted_routes=[deleted(7, [A])],
+        query="?store_only=true",
+        seq=1,
+    )
+
+    assert resp.status_code == 200
+    assert {
+        field: resp.json()[field]
+        for field in (
+            "deleted_executed_ids",
+            "deleted_degraded_ids",
+            "deleted_moot_ids",
+            "removed_uncorrelated",
+        )
+    } == {
+        "deleted_executed_ids": [],
+        "deleted_degraded_ids": [7],
+        "deleted_moot_ids": [],
+        "removed_uncorrelated": [],
+    }
+    assert await read_tombstones(device_id) == []
+    assert await read_jobs(device_id) == []
+
+
 async def test_o2b_8_a_genuine_deletion_over_an_open_fence_executes(adapter_client):
     """O2b.8 — the positive control: with the fence open the same id is EXECUTED.
 

@@ -27,7 +27,7 @@ from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z, latest_refreshed
 from nso_adapter.config import get_config
 from nso_adapter.core.claim import ClaimUnavailableError, held_claim, lock_claim
-from nso_adapter.core.deleted_routes import DeletionRecord, classify_deletions
+from nso_adapter.core.deleted_routes import DeletionPartition, DeletionRecord, classify_deletions
 from nso_adapter.core.request_flags import (
     BACKFILL_ONLY,
     DELETE_ORIGIN_MARKING,
@@ -820,12 +820,15 @@ async def _apply_backfill_only(device_id: int, body: StaticRouteIntentUpdate, db
         "removed": len(pruned),
         "replaced": False,
         "routes": [_echo(row) for row in adopted],
-        "deleted_executed_ids": [],
-        "deleted_degraded_ids": [],
-        "deleted_moot_ids": [],
-        "removed_uncorrelated": [
-            {"vrf": vrf, "prefix": prefix, "next_hop": next_hop} for vrf, prefix, next_hop in uncorrelated
-        ],
+        **_acknowledgement(
+            DeletionPartition(
+                executed=(),
+                degraded=(),
+                moot=(),
+                uncorrelated=uncorrelated,
+                genuine_row_ids=frozenset(),
+            )
+        ),
     }
     from nso_adapter.core.receipt import record_response
 

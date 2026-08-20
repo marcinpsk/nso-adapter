@@ -99,12 +99,16 @@ def classify_deletions(records, removed_rows) -> DeletionPartition:
     # different NetBox route entirely.
     remaining = [record for record in records if record.route_id not in genuine]
     residue = [row for row in removed_rows if row.route_id is None]
+    route_ids_by_triple: dict[Triple, set[int]] = {}
+    for record in remaining:
+        for triple in record.triples:
+            route_ids_by_triple.setdefault(triple, set()).add(record.route_id)
 
     degraded: set[int] = set()
     claimed: set[int] = set()
     for row in residue:
         triple = triple_of(row)
-        equivalence_class = [record.route_id for record in remaining if triple in record.triples]
+        equivalence_class = route_ids_by_triple.get(triple)
         if equivalence_class:
             claimed.add(row.id)
             degraded.update(equivalence_class)
