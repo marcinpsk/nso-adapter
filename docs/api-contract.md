@@ -666,15 +666,22 @@ matching receipt was admitted in backfill-only mode, and `revision_mismatch` whe
 receipt matches but the projection row does not. `backfill_only` is terminal for that
 sequence: the receipt exists and holds it, but a backfill repairs correlation only, so no
 retry of the same selection can promote it.
-`skipped_detail` identifies the generation that already owns an authorized revision. The
-retry and abandon actions own that generation. Apply cannot replace it with weaker work.
+`skipped_detail` is conditional and is keyed by stream. It identifies the generation for
+each `already_authorized` skip whose owning generation can be identified. Each member has
+the shape `{ "generation_id": <int>, "seq": <int>, "status": "<status>" }`. The response
+omits `skipped_detail` when no member qualifies. The retry and abandon actions own the
+identified generation. Apply cannot replace it with weaker work.
 An empty selection, or a request in which every selection is skipped, returns `200` with an
 explicit no-op and no `job_id`:
 
 ```json
 { "device_id": 1, "outcome": "no_op",
   "selected": { "vlan": 4711 },
-  "skipped": { "vlan": "superseded" }, "generations": [] }
+  "skipped": { "vlan": "already_authorized" },
+  "skipped_detail": {
+    "vlan": { "generation_id": 80, "seq": 3, "status": "abandoned" }
+  },
+  "generations": [] }
 ```
 
 A promotion returns the complete ordered chain. Each link has its queued job. The success
