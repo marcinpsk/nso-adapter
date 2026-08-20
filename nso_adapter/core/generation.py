@@ -713,6 +713,7 @@ async def _queue_job_for(db: AsyncSession, generation: DeploymentGeneration) -> 
             Job.device_id == generation.device_id,
             Job.job_type == spec.job_type,
             Job.status == JobStatus.queued,
+            select(DeploymentGeneration.id).where(DeploymentGeneration.job_id == Job.id).exists(),
         )
         # Removals are exempt from the queued-job dedupe index, so several can be queued at
         # once; ordered so the takeover target is the OLDEST rather than whatever the planner

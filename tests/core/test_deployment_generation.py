@@ -940,6 +940,38 @@ async def test_f2_a_released_removal_successor_keeps_a_removal_job(adapter_clien
     assert job.context.get("scope") == "vlan"
 
 
+async def test_f2_b_retry_does_not_take_over_a_generationless_removal_job(adapter_client):
+    """A retry must preserve a queued legacy removal's only durable context."""
+    from nso_adapter.store.models import Job, JobStatus, JobType
+
+    device_id = await _blocked_device(adapter_client, "gen-retry-legacy-removal", 9768)
+    (failed,) = await _generations(device_id)
+    retry_context = failed.removal_context
+    legacy_context = {"scope": "bgp"}
+
+    async with session() as db:
+        legacy = Job(
+            job_type=JobType.removal,
+            device_id=device_id,
+            status=JobStatus.queued,
+            context=legacy_context,
+        )
+        db.add(legacy)
+        await db.commit()
+        legacy_id = legacy.id
+
+    retried_id = await _retry_head(device_id)
+
+    async with session() as db:
+        legacy = await db.get(Job, legacy_id)
+        retried = await db.get(Job, retried_id)
+    (generation,) = await _generations(device_id)
+    assert retried_id != legacy_id
+    assert legacy.context == legacy_context
+    assert retried.context == retry_context
+    assert generation.job_id == retried_id
+
+
 async def _blocked_device(client, name: str, netbox_device_id: int) -> int:
     """A device whose head is a FAILED networked removal — the barrier's two exits apply."""
     from nso_adapter.store.models import JobStatus
@@ -962,16 +994,18 @@ async def _first_request_holds_the_head():
     """
     from nso_adapter.core import generation as generation_mod
 
-    gate = asyncio.Event()
+    release = asyncio.Event()
+    parked = asyncio.Event()
     real = generation_mod.retry_generation
 
     async def gated(db, generation_id):
         job = await real(db, generation_id)
-        await gate.wait()
+        parked.set()
+        await release.wait()
         return job
 
     with patch("nso_adapter.core.generation.retry_generation", new=gated):
-        yield gate
+        yield release, parked
 
 
 async def test_f3_a_two_concurrent_retries_admit_the_head_once(adapter_client):
@@ -979,12 +1013,12 @@ async def test_f3_a_two_concurrent_retries_admit_the_head_once(adapter_client):
     device_id = await _blocked_device(adapter_client, "gen-retry-race", 9763)
 
     url = f"/api/v1/devices/{device_id}/actions/retry-generation"
-    async with _first_request_holds_the_head() as gate:
+    async with _first_request_holds_the_head() as (release, parked):
         first = asyncio.create_task(adapter_client.post(url, headers=_AUTH))
-        await asyncio.sleep(0.3)
+        await asyncio.wait_for(parked.wait(), timeout=3)
         second = asyncio.create_task(adapter_client.post(url, headers=_AUTH))
         await asyncio.sleep(0.3)
-        gate.set()
+        release.set()
         one, two = await asyncio.wait_for(asyncio.gather(first, second), timeout=20)
 
     codes = sorted([one.status_code, two.status_code])
@@ -999,12 +1033,12 @@ async def test_f3_b_a_retry_and_an_abandon_cannot_both_win(adapter_client):
     device_id = await _blocked_device(adapter_client, "gen-retry-abandon-race", 9764)
 
     base = f"/api/v1/devices/{device_id}/actions"
-    async with _first_request_holds_the_head() as gate:
+    async with _first_request_holds_the_head() as (release, parked):
         retrying = asyncio.create_task(adapter_client.post(f"{base}/retry-generation", headers=_AUTH))
-        await asyncio.sleep(0.3)
+        await asyncio.wait_for(parked.wait(), timeout=3)
         abandoning = asyncio.create_task(adapter_client.post(f"{base}/abandon-generation", headers=_AUTH))
         await asyncio.sleep(0.3)
-        gate.set()
+        release.set()
         retry, abandon = await asyncio.wait_for(asyncio.gather(retrying, abandoning), timeout=20)
 
     codes = sorted([retry.status_code, abandon.status_code])
