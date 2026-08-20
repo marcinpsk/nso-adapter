@@ -1808,6 +1808,21 @@ async def _dispatch_scope(
     return None
 
 
+def _refuse_force_incompatible(scope, marking, document, allowed_removal_keys, static_route_tombstone_ids) -> None:
+    """Refuse the arguments a reissue cannot honor: it skips the guard and records no plan."""
+    if marking is not None:
+        raise ValueError(f"a force-removal of {scope!r} carries no deletion marking; got {marking!r}")
+    if document is not None:
+        raise ValueError(f"a force-removal of {scope!r} composes its own reissue document; got one to deploy")
+    if allowed_removal_keys is not None:
+        raise ValueError(f"a force-removal of {scope!r} skips the collateral guard; got allowed removal keys")
+    if static_route_tombstone_ids:
+        raise ValueError(
+            f"a force-removal of {scope!r} records no execution plan; got tombstone ids "
+            f"{list(static_route_tombstone_ids)}"
+        )
+
+
 async def _record_pending_clears(
     db: AsyncSession,
     device_id: int,
@@ -2052,10 +2067,8 @@ async def enqueue_removal(
         raise ValueError(f"Unknown removal scope {scope!r}")
     if marking is not None and marking not in REMOVAL_MARKINGS:
         raise ValueError(f"Unknown removal marking {marking!r}")
-    if force and marking is not None:
-        raise ValueError(f"a force-removal of {scope!r} carries no deletion marking; got {marking!r}")
-    if force and document is not None:
-        raise ValueError(f"a force-removal of {scope!r} composes its own reissue document; got one to deploy")
+    if force:
+        _refuse_force_incompatible(scope, marking, document, allowed_removal_keys, static_route_tombstone_ids)
     store_only = STORE_ONLY.get()
     context: dict = {"scope": scope}
     if interfaces:

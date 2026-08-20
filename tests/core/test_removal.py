@@ -2184,6 +2184,29 @@ async def test_enqueue_removal_force_refuses_a_composed_document(adapter_client)
             )
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"allowed_removal_keys": {}}, "skips the collateral guard; got allowed removal keys"),
+        ({"static_route_tombstone_ids": (7,)}, r"records no execution plan; got tombstone ids \[7\]"),
+    ],
+    ids=["allowed-removal-keys", "static-route-tombstone-ids"],
+)
+async def test_enqueue_removal_force_refuses_generation_only_arguments(adapter_client, kwargs, message):
+    device_id = await _seed_device(nso_device_name="sw-force-generation-metadata")
+    async with session() as db:
+        with pytest.raises(ValueError, match=message):
+            await enqueue_removal(
+                db,
+                device_id,
+                "static_route",
+                marking=None,
+                defer_retract=False,
+                force=True,
+                **kwargs,
+            )
+
+
 async def test_run_removal_detach_syncs_from_and_skips_residue(adapter_client):
     """Detach: device untouched → the removed keys are EXPECTED on the device (they
     must not be reported as residue), and CDB must be re-aligned via sync-from."""

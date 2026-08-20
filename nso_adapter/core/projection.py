@@ -520,6 +520,8 @@ LIVE_READ_SECTIONS: dict[str, str] = {}
 
 #: Reserved section key for immutable interface and static-route execution metadata.
 EXECUTION_KEY = "_execution"
+#: The sections that record execution metadata under :data:`EXECUTION_KEY`.
+EXECUTION_METADATA_SECTIONS: frozenset[str] = frozenset({"interface_config", "static_route"})
 INTERFACE_ATTRIBUTE_ELIGIBLE_STATES: frozenset[SyncState] = frozenset(
     {
         SyncState.accepted,
@@ -770,7 +772,7 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
     rows: dict[type, list] = {}
     row_records: dict[type, list[tuple[dict, object]]] = {}
     for table_name, serialized_rows in tables.items():
-        if table_name == EXECUTION_KEY and section in {"interface_config", "static_route"}:
+        if table_name == EXECUTION_KEY and section in EXECUTION_METADATA_SECTIONS:
             continue
         model = _MODEL_BY_TABLE.get(table_name)
         if model is None:
