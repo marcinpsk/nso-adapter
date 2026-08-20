@@ -770,14 +770,7 @@ async def put_isis_flex_algo_intent(
         )
         removal_queued = job is not None
 
-    from nso_adapter.store.models import DeviceSettings
-
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
-    if settings and settings.auto_apply and count > 0:
-        from nso_adapter.core.apply import enqueue_apply
-
-        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
+    await _maybe_enqueue_isis_apply(db, device_id, count, 0, stream=delivery.stream)
 
     result = {"device_id": device_id, "flex_algo_count": count, "removal_queued": removal_queued}
     await record_response(db, device_id, delivery, result)
