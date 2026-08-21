@@ -132,14 +132,15 @@ def test_every_in_protocol_put_uses_the_shared_delivery_seam():
     for route in _put_routes():
         if route.path not in INTENT_PUT_ENDPOINTS:
             continue
-        source = inspect.getsource(inspect.unwrap(route.endpoint))
+        sources = [inspect.getsource(inspect.unwrap(route.endpoint))]
         if route.path == "/api/v1/devices/{device_id}/static-route-intent":
             from nso_adapter.api.static_route import _apply_static_route_intent
 
-            assert "return await _apply_static_route_intent(" in source
-            source = inspect.getsource(_apply_static_route_intent)
-        assert "await begin_delivery(" in source, f"{route.path} bypasses begin_delivery"
-        assert "note_write" not in source, f"{route.path} owns projection-write ordering again"
+            assert "return await _apply_static_route_intent(" in sources[0]
+            sources.append(inspect.getsource(_apply_static_route_intent))
+        assert "await begin_delivery(" in sources[-1], f"{route.path} bypasses begin_delivery"
+        for source in sources:
+            assert "note_write" not in source, f"{route.path} owns projection-write ordering again"
 
 
 def test_the_minimal_body_table_covers_every_in_protocol_endpoint():
