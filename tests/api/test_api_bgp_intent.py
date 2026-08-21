@@ -44,6 +44,23 @@ async def test_put_bgp_intent_requires_auth(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_put_bgp_intent_checks_auth_before_push_sequence(adapter_client):
+    """Missing authentication wins over a malformed sequence.
+
+    test_f4_d_a_malformed_or_out_of_domain_push_sequence_is_rejected pins authenticated 422.
+    """
+    device_id = await seed_device(nso_device_name="bgp-intent-noauth-badseq", netbox_device_id=2099)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent",
+        json={"routers": [MINIMAL_ROUTER]},
+        headers={"X-Push-Seq": "abc"},
+    )
+
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "unauthorized"
+
+
+@pytest.mark.anyio
 async def test_put_bgp_intent_device_not_found(adapter_client):
     """Non-existent device → 404."""
     resp = await adapter_client.put(
