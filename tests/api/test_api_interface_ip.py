@@ -222,7 +222,8 @@ async def test_put_ip_intent_full_replace(adapter_client):
             {"interface": "GigabitEthernet0/2", "address": "10.0.0.2/24", "family": "ipv4"},
         ]
     }
-    await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=payload1)
+    seed = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=payload1)
+    assert seed.status_code == 200, seed.text
 
     # Second PUT: only one address
     payload2 = {
@@ -258,7 +259,8 @@ async def test_put_ip_intent_removal_enqueues_interface_config_job(adapter_clien
             {"interface": "Gi0/3", "address": "10.0.0.2/24", "family": "ipv4"},
         ]
     }
-    await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=p1)
+    seed = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=p1)
+    assert seed.status_code == 200, seed.text
 
     p2 = {"addresses": [{"interface": "Gi0/3", "address": "10.0.0.1/24", "family": "ipv4"}]}
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=p2)
@@ -290,7 +292,8 @@ async def test_store_only_ip_shrink_reports_no_device_replacement(adapter_client
             {"interface": "Gi0/4", "address": "198.18.0.2/32", "family": "ipv4"},
         ]
     }
-    await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=initial)
+    seed = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=initial)
+    assert seed.status_code == 200, seed.text
 
     response = await adapter_client.put(
         f"/api/v1/devices/{device_id}/ip-intent?store_only=true",
@@ -328,7 +331,8 @@ async def test_put_ip_intent_removal_captures_values_per_interface(adapter_clien
             {"interface": "Gi0/6", "address": "10.0.3.1/30", "family": "ipv4"},
         ]
     }
-    await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=p1)
+    seed = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=p1)
+    assert seed.status_code == 200, seed.text
 
     p2 = {"addresses": [{"interface": "Gi0/6", "address": "10.0.3.1/30", "family": "ipv4"}]}
     resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", headers=AUTH, json=p2)
