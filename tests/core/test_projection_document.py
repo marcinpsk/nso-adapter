@@ -521,6 +521,29 @@ async def test_snmp_snapshot_refuses_secret_material_in_a_vault_reference_column
     assert "resolved-secret-placeholder" not in str(exc.value)
 
 
+async def test_snmp_snapshot_refuses_a_keyless_path_reference(adapter_client):
+    """SNMP intent columns require the '#key' form; a path-style reference is not one."""
+    from nso_adapter.core.projection import snapshot_stream
+    from nso_adapter.store.models import SnmpCommunityIntent
+
+    device_id = await seed_device(nso_device_name="projection-snmp-keyless-refusal", netbox_device_id=9827)
+    async with session() as db:
+        db.add(
+            SnmpCommunityIntent(
+                device_id=device_id,
+                label="readonly",
+                vault_ref="network/snmp/communities/readonly",
+                access="RO",
+                accepted_at=datetime(2026, 8, 1, tzinfo=UTC),
+            )
+        )
+        await db.commit()
+
+    async with session() as db:
+        with pytest.raises(ValueError, match="refusing to serialize non-reference secret material"):
+            await snapshot_stream(db, device_id, "snmp")
+
+
 async def test_snmp_snapshot_treats_an_empty_optional_vault_reference_as_absent(adapter_client):
     """The API stores '' for an absent optional v3 leg; serialization must not parse it."""
     from nso_adapter.core.projection import snapshot_stream
