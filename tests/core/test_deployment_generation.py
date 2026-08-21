@@ -17,7 +17,6 @@ the stored document, blocked-head retry) lives in ``test_generation_protocol.py`
 from __future__ import annotations
 
 import asyncio
-import time
 from contextlib import asynccontextmanager
 from unittest.mock import patch
 
