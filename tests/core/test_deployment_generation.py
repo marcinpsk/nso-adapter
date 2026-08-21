@@ -47,6 +47,32 @@ _vlans: dict[int, list[int]] = {}
 _names: dict[int, str] = {}
 
 
+async def _wait_for_relation_lock(engine, relation: str, *, timeout: float = 5.0) -> None:
+    """Wait until another backend is blocked on a statement for ``relation``."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    async with engine.connect() as probe:
+        while asyncio.get_running_loop().time() < deadline:
+            # PostgreSQL can cache statistics for a transaction. Refresh them before
+            # each sample so this connection sees a lock wait that started after it.
+            await probe.execute(sa.text("SELECT pg_stat_clear_snapshot()"))
+            waiting = await probe.scalar(
+                sa.text(
+                    "SELECT EXISTS ("
+                    "SELECT 1 FROM pg_stat_activity "
+                    "WHERE datname = current_database() "
+                    "AND pid <> pg_backend_pid() "
+                    "AND wait_event_type = 'Lock' "
+                    "AND position(:relation IN lower(query)) > 0"
+                    ")"
+                ),
+                {"relation": relation.lower()},
+            )
+            if waiting:
+                return
+            await asyncio.sleep(0.02)
+    raise AssertionError(f"no backend entered a lock wait on {relation!r} within {timeout:g}s")
+
+
 async def _device(name: str, netbox_device_id: int, *, auto_apply: bool = True) -> int:
     device_id = await seed_device(nso_device_name=name, netbox_device_id=netbox_device_id)
     await seed_settings(device_id, auto_apply=auto_apply)
@@ -605,10 +631,14 @@ async def test_a_second_writer_cannot_allocate_until_the_first_commits(adapter_c
     order.
     """
     from nso_adapter.core.apply import enqueue_apply
-    from nso_adapter.core.generation import note_write
+    from nso_adapter.core.generation import lock_projection, note_write
+    from nso_adapter.store.db import get_engine
     from nso_adapter.store.models import VlanIntent
 
     device_id = await _device("gen-concurrent-barrier", 9742)
+    async with session() as db:
+        await lock_projection(db, device_id)
+        await db.commit()
 
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
     async with rival() as holder, rival() as waiter:
@@ -622,7 +652,7 @@ async def test_a_second_writer_cannot_allocate_until_the_first_commits(adapter_c
             await waiter.commit()
 
         blocked = asyncio.create_task(second_writer())
-        await asyncio.sleep(0.2)
+        await _wait_for_relation_lock(get_engine(), "device_generation_counter")
         assert not blocked.done(), "the second promotion allocated a sequence under a held lock"
 
         await holder.commit()
@@ -635,6 +665,7 @@ async def test_a_second_writer_cannot_allocate_until_the_first_commits(adapter_c
 async def test_the_projection_lock_serializes_two_writers(adapter_client, rival_engine):
     """The lock is real: the second writer waits for the first to COMMIT before allocating."""
     from nso_adapter.core.generation import lock_projection
+    from nso_adapter.store.db import get_engine
 
     device_id = await _device("gen-lock", 9741)
     # The counter row must already EXIST, or the two writers would serialize on the insert
@@ -648,7 +679,7 @@ async def test_the_projection_lock_serializes_two_writers(adapter_client, rival_
         await lock_projection(holder, device_id)
 
         blocked = asyncio.create_task(lock_projection(waiter, device_id))
-        await asyncio.sleep(0.2)
+        await _wait_for_relation_lock(get_engine(), "device_generation_counter")
         assert not blocked.done(), "a second projection writer was not serialized"
 
         await holder.commit()
@@ -722,14 +753,18 @@ async def test_standalone_advancement_takes_the_projection_lock(adapter_client, 
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from nso_adapter.core.generation import advance_device_generations, lock_projection
+    from nso_adapter.store.db import get_engine
 
     device_id = await _device("gen-advance-lock", 9753)
+    async with session() as db:
+        await lock_projection(db, device_id)
+        await db.commit()
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
 
     async with rival() as holder:
         await lock_projection(holder, device_id)
         advancing = asyncio.create_task(advance_device_generations(device_id))
-        await asyncio.sleep(0.1)
+        await _wait_for_relation_lock(get_engine(), "device_generation_counter")
         assert not advancing.done(), "advancement read the chain without the projection lock"
         await holder.commit()
 
@@ -1174,6 +1209,7 @@ async def test_f9_an_offboard_under_an_intent_put_answers_not_found(adapter_clie
     mid-transaction: nothing else makes the two overlap deterministically, and the overlap is
     the whole point — a device already gone answers 404 from the endpoint's first lookup.
     """
+    from nso_adapter.store.db import get_engine
     from nso_adapter.store.models import Device, ManagedScope
 
     device_id = await seed_device(nso_device_name="gen-offboard-put", netbox_device_id=9769)
@@ -1185,7 +1221,7 @@ async def test_f9_an_offboard_under_an_intent_put_answers_not_found(adapter_clie
         await offboarding.flush()  # the rows are gone but the delete is UNCOMMITTED
 
         putting = asyncio.create_task(put_vlans(adapter_client, device_id, [10]))
-        await asyncio.sleep(0.3)
+        await _wait_for_relation_lock(get_engine(), "device_generation_counter")
         assert not putting.done(), "the PUT did not reach the projection lock the offboard holds"
 
         await offboarding.commit()
