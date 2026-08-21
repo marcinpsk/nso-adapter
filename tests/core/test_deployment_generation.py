@@ -748,6 +748,28 @@ async def test_a_settled_head_hands_its_successor_a_job(adapter_client):
     assert await _job_status(advanced.job_id) is JobStatus.queued
 
 
+async def test_a_pending_apply_head_replaces_its_terminal_job(adapter_client):
+    from nso_adapter.core.generation import advance_device_generations
+    from nso_adapter.store.models import Job, JobStatus
+
+    device_id = await _device("gen-advance-terminal-apply", 9770)
+    await _vlan(device_id, 93)
+    await _push(adapter_client, device_id)
+    (head,) = await _generations(device_id)
+    stale_job_id = head.job_id
+    assert stale_job_id is not None
+
+    async with session() as db:
+        job = await db.get(Job, stale_job_id)
+        job.status = JobStatus.failed
+        await db.commit()
+
+    assert await advance_device_generations(device_id) == 1
+    (advanced,) = await _generations(device_id)
+    assert advanced.job_id != stale_job_id
+    assert await _job_status(advanced.job_id) is JobStatus.queued
+
+
 async def test_standalone_advancement_takes_the_projection_lock(adapter_client, rival_engine):
     """Advancement must serialize with a writer before it reads or admits the head."""
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -1144,6 +1166,7 @@ async def test_f7_a_manual_apply_promotes_a_section_committed_alongside_it(adapt
     alone and the snmp intent is silently left undeployed.
     """
     from nso_adapter.core.generation import note_write
+    from nso_adapter.store.db import get_engine
 
     device_id = await _device("gen-apply-under-lock", 9766, auto_apply=False)
     await _vlan(device_id, 68)
@@ -1154,7 +1177,8 @@ async def test_f7_a_manual_apply_promotes_a_section_committed_alongside_it(adapt
         await note_write(holder, device_id, "snmp")
 
         applying = asyncio.create_task(adapter_client.post(f"/api/v1/devices/{device_id}/actions/apply", headers=_AUTH))
-        await asyncio.sleep(0.2)
+        await _wait_for_relation_lock(get_engine(), "device_generation_counter")
+        assert not applying.done(), "the Apply did not wait for the projection lock"
         await holder.commit()
         resp = await asyncio.wait_for(applying, timeout=10)
 

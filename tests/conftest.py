@@ -63,7 +63,7 @@ def _url_for(dbname: str, *, driver: str) -> str:
 
 
 #: How long a straggler may take to disappear before it counts as leaked.
-_TEARDOWN_GRACE_S = 5.0
+_TEARDOWN_GRACE_S = 15.0
 
 
 def _client_backends(conn, name: str) -> list:

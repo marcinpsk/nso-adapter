@@ -874,6 +874,9 @@ async def advance_generations_locked(db: AsyncSession, device_id: int) -> int:
         return 0
     if await _live_job(db, head.job_id) is not None:
         return 0
+    if head.job_id is not None:
+        head.job_id = None
+        await db.flush()
     if head.removal_context or head.mode is GenerationMode.detach:
         job = await _queue_job_for(db, head)
         head.job_id = job.id
