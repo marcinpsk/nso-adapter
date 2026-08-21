@@ -876,13 +876,16 @@ async def offboard_device(db: AsyncSession, device: Device) -> None:
     """
     from sqlalchemy import delete, update
 
-    from nso_adapter.core.claim import acquire_claim_or_refuse, terminalize_queued_bulk
+    from nso_adapter.core.claim import (
+        acquire_claim_or_refuse,
+        terminalize_offboard_orphans_bulk,
+        terminalize_queued_bulk,
+    )
     from nso_adapter.store.models import (
         InterfaceAttrState,
         InterfaceIntent,
         InterfaceIpIntent,
         Job,
-        JobStatus,
     )
 
     device_id = device.id
@@ -927,21 +930,14 @@ async def offboard_device(db: AsyncSession, device: Device) -> None:
             },
         )
         # The teardown claim proves residual non-terminal jobs are orphaned executions.
-        await db.execute(
-            update(Job)
-            .where(
-                Job.device_id == device_id,
-                Job.status.not_in((JobStatus.succeeded, JobStatus.failed)),
-            )
-            .values(
-                status=JobStatus.failed,
-                error={
-                    "code": "device_offboarded_orphan",
-                    "message": "The device was offboarded after this job lost its worker",
-                    "detail": {},
-                },
-            )
-            .execution_options(synchronize_session=False)
+        await terminalize_offboard_orphans_bulk(
+            db,
+            device_id,
+            error={
+                "code": "device_offboarded_orphan",
+                "message": "The device was offboarded after this job lost its worker",
+                "detail": {},
+            },
         )
         # Null-out device_id on jobs so history is preserved (device_id is nullable by design)
         await db.execute(update(Job).where(Job.device_id == device_id).values(device_id=None))
