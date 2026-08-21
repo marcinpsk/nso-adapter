@@ -973,6 +973,43 @@ async def test_run_removal_refuses_a_job_that_carries_no_generation(adapter_clie
     assert failures and "carries no generation to deploy" in failures[0]["error"], failures
 
 
+async def test_run_removal_refuses_a_static_route_force_job_that_carries_no_generation(adapter_client):
+    """A static-route force job cannot fall back to deploying the live store."""
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.removal import run_removal
+
+    device_id = await _seed_device(nso_device_name="sw-no-generation-static-route-force")
+    async with session() as db:
+        job = Job(
+            job_type=JobType.removal,
+            device_id=device_id,
+            status=JobStatus.running,
+            run_attempt=1,
+            context={"scope": "static_route", "force": True},
+        )
+        db.add(job)
+        await db.commit()
+        job_id = job.id
+
+    apply_fn = AsyncMock()
+    with (
+        capture_logs() as logs,
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_CLIENT),
+        patch("nso_adapter.nso.apply.apply_static_routes", apply_fn),
+    ):
+        await run_removal(job_id=job_id, device_id=device_id)
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.error["code"] == "removal_failed"
+        assert job.error["detail"]["scope"] == "static_route"
+    failures = [entry for entry in logs if entry["event"] == "removal.failed"]
+    assert failures and "carries no generation to deploy" in failures[0]["error"], failures
+    apply_fn.assert_not_awaited()
+
+
 async def test_run_removal_marks_failed_even_when_session_poisoned(adapter_client):
     """A DB-origin error in dispatch poisons the session (needs-rollback); the failure handler
     must rollback before the failed-status commit, or that commit re-raises and the job is

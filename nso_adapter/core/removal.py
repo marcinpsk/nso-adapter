@@ -1040,7 +1040,7 @@ async def _replace_static_route(
 
     context = context or {}
     if context.get("force"):
-        await _replace_simple(db, device, client, "static_route", context)
+        await _replace_simple(db, device, client, "static_route", context, job_id=job_id)
         return SrRemoval("force", frozenset(), (), frozenset(), True, False, None, {}, {}, ())
 
     plan = await _sr_execution_plan(db, device, context, job_id=job_id)
