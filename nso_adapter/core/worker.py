@@ -689,14 +689,14 @@ async def _advance_generations(device_id: int) -> None:
                     "worker.generation_advance_failed",
                     device_id=device_id,
                     attempts=attempt,
-                    error=repr(exc),
+                    exception_type=type(exc).__name__,
                 )
                 return
             logger.warning(
                 "worker.generation_advance_retry",
                 device_id=device_id,
                 attempt=attempt,
-                error=repr(exc),
+                exception_type=type(exc).__name__,
             )
             await asyncio.sleep(0.5 * attempt)
 
