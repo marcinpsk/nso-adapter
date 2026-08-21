@@ -1338,6 +1338,7 @@ def _job_for(generation: DeploymentGeneration) -> Job:
             job_type=JobType.removal,
             device_id=generation.device_id,
             status=JobStatus.queued,
+            coalescible=False,
             context=dict(generation.removal_context),
         )
     if generation.mode is GenerationMode.detach:
@@ -1345,7 +1346,12 @@ def _job_for(generation: DeploymentGeneration) -> Job:
         # beats the alternative: an apply job would NETWORK the very retraction the detach
         # exists to keep off the device.
         raise RuntimeError(f"detach generation {generation.id} carries no removal context")
-    return Job(job_type=JobType.apply, device_id=generation.device_id, status=JobStatus.queued)
+    return Job(
+        job_type=JobType.apply,
+        device_id=generation.device_id,
+        status=JobStatus.queued,
+        coalescible=False,
+    )
 
 
 async def _queue_job_for(db: AsyncSession, generation: DeploymentGeneration) -> Job:

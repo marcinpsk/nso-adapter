@@ -92,7 +92,13 @@ async def reissue_removal_job(conn: AsyncSession, device_id: int, row: StaticRou
         removal_context=context,
         allowed_removal_keys=context["removed"],
     )
-    job = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued, context=context)
+    job = Job(
+        job_type=JobType.removal,
+        device_id=device_id,
+        status=JobStatus.queued,
+        coalescible=False,
+        context=context,
+    )
     conn.add(job)
     await conn.flush()
     generation.job_id = job.id

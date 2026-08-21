@@ -195,7 +195,13 @@ async def test_deleting_the_owning_job_nulls_job_id_and_keeps_the_claim(adapter_
 
     device_id = await seed_device(nso_device_name="dc-job-null", netbox_device_id=9815)
     async with session() as db:
-        job = Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.running, context={})
+        job = Job(
+            job_type=JobType.sync,
+            device_id=device_id,
+            status=JobStatus.running,
+            coalescible=True,
+            context={},
+        )
         db.add(job)
         await db.commit()
         job_id = job.id

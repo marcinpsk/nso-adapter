@@ -85,11 +85,9 @@ async def get_head_queued_job(device_id: int, db: AsyncSession) -> Job | None:
     return result.scalar_one_or_none()
 
 
-# The dedupe index's predicate, verbatim. ON CONFLICT infers the arbiter from the index
-# columns PLUS this predicate; PostgreSQL requires it to imply the index's own. The index
-# is not a constraint, so `ON CONFLICT ON CONSTRAINT <name>` raises InvalidObjectDefinition
-# rather than returning empty — which is the 500 atomic admission exists to prevent.
-_QUEUED_DEDUPE_PREDICATE = text("status = 'queued' AND job_type <> 'removal'")
+# The inference target must match the queued-coalescible partial index.
+_QUEUED_DEDUPE_ELEMENTS = (Job.device_id, Job.job_type)
+_QUEUED_DEDUPE_PREDICATE = text("status = 'queued' AND coalescible")
 
 # Bounds applied ONLY to a transaction that ends up holding the queued-winner row lock.
 # Production declares no statement or transaction timeout on the engine, so a hung request
@@ -117,7 +115,12 @@ async def _lock_queued_winner(db: AsyncSession, device_id: int, job_type: JobTyp
     """
     return await db.scalar(
         select(Job)
-        .where(Job.device_id == device_id, Job.job_type == job_type, Job.status == JobStatus.queued)
+        .where(
+            Job.device_id == device_id,
+            Job.job_type == job_type,
+            Job.status == JobStatus.queued,
+            Job.coalescible.is_(True),
+        )
         .order_by(Job.created_at, Job.id)
         .limit(1)
         .with_for_update()
@@ -141,7 +144,12 @@ async def admit_queued_job(
     Does NOT commit: the caller owns its transaction boundary.
     """
     for _attempt in range(_ADMISSION_RETRIES):
-        values: dict = {"job_type": job_type, "device_id": device_id, "status": JobStatus.queued}
+        values: dict = {
+            "job_type": job_type,
+            "device_id": device_id,
+            "status": JobStatus.queued,
+            "coalescible": True,
+        }
         if context is not None:
             values["context"] = context
 
@@ -150,7 +158,7 @@ async def admit_queued_job(
                 pg_insert(Job)
                 .values(**values)
                 .on_conflict_do_nothing(
-                    index_elements=[Job.device_id, Job.job_type],
+                    index_elements=_QUEUED_DEDUPE_ELEMENTS,
                     index_where=_QUEUED_DEDUPE_PREDICATE,
                 )
                 .returning(Job.id)
@@ -264,7 +272,13 @@ async def enqueue_provision_job(params: dict, db: AsyncSession) -> tuple[Job, bo
         async with db.begin_nested():
             job_id = await db.scalar(
                 pg_insert(Job)
-                .values(job_type=JobType.provision, device_id=None, status=JobStatus.queued, context=params)
+                .values(
+                    job_type=JobType.provision,
+                    device_id=None,
+                    status=JobStatus.queued,
+                    coalescible=False,
+                    context=params,
+                )
                 .on_conflict_do_nothing(
                     index_elements=_PROVISION_PAIR_ELEMENTS,
                     index_where=_PROVISION_DEDUPE_PREDICATE,

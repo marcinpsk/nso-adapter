@@ -118,6 +118,22 @@ def _alembic_upgrade_head(db_url: str) -> None:
         raise AssertionError(f"alembic upgrade head failed:\n{proc.stdout.decode()}\n{proc.stderr.decode()}")
 
 
+def _assert_job_queue_class_schema(snapshot: dict) -> None:
+    jobs = snapshot["jobs"]
+    assert jobs["cols"]["coalescible"] == ("BOOLEAN", False, None)
+    assert (
+        ("device_id", "job_type"),
+        True,
+        "((status = 'queued'::jobstatus) AND coalescible)",
+    ) in jobs["ixs"]
+    checks = jobs["checks"]
+    assert len(checks) == 4
+    assert sum("removal" in condition and "coalescible" in condition for condition in checks) == 1
+    assert sum("provision" in condition and "coalescible" in condition for condition in checks) == 1
+    assert sum("provision" in condition and "device_id IS NULL" in condition for condition in checks) == 1
+    assert sum("provision" in condition and "device_id IS NOT NULL" in condition for condition in checks) == 1
+
+
 def test_alembic_baseline_matches_create_all(pg_provisioner):
     suffix = uuid.uuid4().hex[:10]
     ca_db = f"parity_ca_{suffix}"
@@ -151,6 +167,7 @@ def test_alembic_baseline_matches_create_all(pg_provisioner):
             assert ca_snap[table] == al_snap[table], (
                 f"schema mismatch in {table!r}:\n  create_all={ca_snap[table]}\n  alembic   ={al_snap[table]}"
             )
+        _assert_job_queue_class_schema(ca_snap)
     finally:
         if ca_engine is not None:
             ca_engine.dispose()

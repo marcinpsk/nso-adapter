@@ -34,7 +34,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from nso_adapter.core.request_flags import PENDING_CLEAR_PROVENANCES, REMOVAL_MARKINGS
-from nso_adapter.store.ddl import generation_immutability_ddl
+from nso_adapter.store.ddl import generation_immutability_ddl, job_coalescible_immutability_ddl
 
 
 class Base(DeclarativeBase):
@@ -359,27 +359,29 @@ class InterfaceAttrState(Base):
 class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
-        # At most one QUEUED job per (device, job_type). Closes the enqueue TOCTOU: the
-        # check-then-insert cannot materialise two queued rows of a type even under
-        # concurrent schedulers/SSE/API.
-        #
-        # Scoped to QUEUED, not queued-or-running: a running job must not refuse its own
-        # successor, because the successor is what carries the newer intent. Execution is
-        # serialized by the per-device claim instead, which is the only gate that can span a
-        # job's whole lifetime — an apply goes terminal while its claim is still held through
-        # the post-apply refresh.
-        #
-        # Removals stay EXEMPT, and that is deliberate rather than an oversight:
-        # enqueue_removal queues one job per scope (bgp/isis/snmp/…) on the same device and
-        # every one of them must run. Their FIFO ordering comes from the worker's per-device
-        # head claim, not from uniqueness. Provision rows carry device_id=NULL (NULLs are
-        # distinct) and dedup by context.
+        CheckConstraint(
+            "job_type <> 'removal' OR NOT coalescible",
+            name="ck_job_removal_not_coalescible",
+        ),
+        CheckConstraint(
+            "job_type <> 'provision' OR NOT coalescible",
+            name="ck_job_provision_not_coalescible",
+        ),
+        CheckConstraint(
+            "job_type <> 'provision' OR status NOT IN ('queued', 'running') OR device_id IS NULL",
+            name="ck_job_active_provision_without_device",
+        ),
+        CheckConstraint(
+            "job_type = 'provision' OR device_id IS NOT NULL OR status IN ('succeeded', 'failed')",
+            name="ck_job_detached_non_provision_terminal",
+        ),
+        # One queued coalescible job per device and type; core.jobs keeps its inference target together.
         Index(
             "uq_job_queued_per_device_type",
             "device_id",
             "job_type",
             unique=True,
-            postgresql_where=text("status = 'queued' AND job_type <> 'removal'"),
+            postgresql_where=text("status = 'queued' AND coalescible"),
         ),
         # At most one ACTIVE provision per (nso_instance, device_name) — the dedupe key for
         # rows the index above cannot reach, because a provision runs before the adapter
@@ -413,6 +415,7 @@ class Job(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     job_type: Mapped[JobType] = mapped_column(Enum(JobType))
     status: Mapped[JobStatus] = mapped_column(Enum(JobStatus), default=JobStatus.queued)
+    coalescible: Mapped[bool] = mapped_column(Boolean, nullable=False)
     device_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("devices.id"), nullable=True)
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -709,9 +712,9 @@ class DeploymentGeneration(Base):
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-# ``create_all`` installs the SAME immutability trigger the migration does, rendered from
-# the one definition in store.ddl — the schema-parity test compares tables, not triggers, so
-# a create_all-only database would otherwise silently accept a rewritten generation.
+# create_all installs the same live triggers as the Alembic schema path.
+for _statement in job_coalescible_immutability_ddl():
+    event.listen(Job.__table__, "after_create", DDL(_statement))
 for _statement in generation_immutability_ddl():
     event.listen(DeploymentGeneration.__table__, "after_create", DDL(_statement))
 

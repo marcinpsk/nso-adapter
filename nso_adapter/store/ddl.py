@@ -35,6 +35,8 @@ _COMPARABLE_COLUMNS = frozenset({"device_id", "seq", "mode", "digest", "created_
 
 GENERATION_IMMUTABLE_TRIGGER = "deployment_generation_immutable"
 _FUNCTION = "deployment_generation_reject_rewrite"
+JOB_COALESCIBLE_IMMUTABLE_TRIGGER = "job_coalescible_immutable"
+_JOB_COALESCIBLE_FUNCTION = "job_reject_coalescible_rewrite"
 
 
 def _compare(col: str) -> str:
@@ -74,4 +76,38 @@ def generation_immutability_drop_ddl() -> tuple[str, ...]:
     return (
         f"DROP TRIGGER IF EXISTS {GENERATION_IMMUTABLE_TRIGGER} ON deployment_generation",
         f"DROP FUNCTION IF EXISTS {_FUNCTION}()",
+    )
+
+
+def job_reject_coalescible_rewrite() -> str:
+    """Return the function that rejects a job queue-class rewrite."""
+    return f"""
+CREATE OR REPLACE FUNCTION {_JOB_COALESCIBLE_FUNCTION}() RETURNS trigger AS $$
+BEGIN
+    IF NEW.coalescible IS DISTINCT FROM OLD.coalescible THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'integrity_constraint_violation',
+            MESSAGE = 'job ' || OLD.id || ' is immutable: coalescible may not be updated';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+""".strip()
+
+
+def job_coalescible_immutability_ddl() -> tuple[str, ...]:
+    """Return the statements that install the job queue-class trigger."""
+    return (
+        job_reject_coalescible_rewrite(),
+        f"DROP TRIGGER IF EXISTS {JOB_COALESCIBLE_IMMUTABLE_TRIGGER} ON jobs",
+        f"CREATE TRIGGER {JOB_COALESCIBLE_IMMUTABLE_TRIGGER} BEFORE UPDATE ON jobs "
+        f"FOR EACH ROW EXECUTE FUNCTION {_JOB_COALESCIBLE_FUNCTION}()",
+    )
+
+
+def job_coalescible_immutability_drop_ddl() -> tuple[str, ...]:
+    """Return the statements that remove the job queue-class trigger."""
+    return (
+        f"DROP TRIGGER IF EXISTS {JOB_COALESCIBLE_IMMUTABLE_TRIGGER} ON jobs",
+        f"DROP FUNCTION IF EXISTS {_JOB_COALESCIBLE_FUNCTION}()",
     )

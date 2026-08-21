@@ -83,9 +83,7 @@ _COLUMNS: list[tuple[str, str]] = [
 _NAIVE = {pair: datetime(2026, 6, 1, 10, 0, 0) + timedelta(minutes=i) for i, pair in enumerate(_COLUMNS)}  # noqa: DTZ001
 _AWARE = {pair: ts.replace(tzinfo=UTC) for pair, ts in _NAIVE.items()}
 
-# One row per affected table, id=1, in FK order. The non-timestamp columns are the NOT NULL
-# ones without a server default at revision b3d7f1a9c204 (that schema is frozen, so these
-# literals are stable). `interfaces` carries no affected column — it is only the FK parent.
+# One row per affected table, id=1, in FK order; _seed selects the columns present in each schema era.
 _SEED_ROWS: list[tuple[str, dict[str, str]]] = [
     (
         "devices",
@@ -103,7 +101,16 @@ _SEED_ROWS: list[tuple[str, dict[str, str]]] = [
         "interface_attr_state",
         {"id": "1", "interface_id": "1", "attribute": "'description'", "sync_state": "'imported'"},
     ),
-    ("jobs", {"id": "1", "job_type": "'apply'", "status": "'queued'"}),
+    (
+        "jobs",
+        {
+            "id": "1",
+            "job_type": "'apply'",
+            "status": "'succeeded'",
+            "device_id": "1",
+            "coalescible": "true",
+        },
+    ),
     ("device_settings", {"id": "1", "device_id": "1", "auto_apply": "false"}),
     ("device_failover", {"id": "1", "device_id": "1"}),
     ("failover_config", {"id": "1"}),
@@ -185,11 +192,14 @@ def _assert_session_timezone(engine) -> None:
 
 def _seed(engine, values: dict[tuple[str, str], datetime]) -> None:
     with engine.begin() as conn:
+        inspector = sa.inspect(conn)
         for table, literals in _SEED_ROWS:
-            cols = dict(literals)
+            live_columns = {column["name"] for column in inspector.get_columns(table)}
+            cols = {name: literal for name, literal in literals.items() if name in live_columns}
             params = {}
             for (tbl, col), ts in values.items():
                 if tbl == table:
+                    assert col in live_columns
                     cols[col] = f":{col}"
                     params[col] = ts
             names = ", ".join(cols)

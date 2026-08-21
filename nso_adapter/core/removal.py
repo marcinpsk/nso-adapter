@@ -2091,6 +2091,7 @@ async def enqueue_removal(
         job_type=JobType.removal,
         device_id=device_id,
         status=JobStatus.queued,
+        coalescible=False,
         context=context,
     )
     db.add(job)
