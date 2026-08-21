@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+
 import sqlalchemy as sa
 
 from tests.store.migration_harness import alembic, engine_on, load_migration, private_database
@@ -51,19 +53,35 @@ def _function_source(statement: str) -> str:
     return statement.partition(" AS $$")[2].partition("$$ LANGUAGE plpgsql")[0]
 
 
-def test_historical_trigger_is_frozen_and_head_trigger_matches_live_ddl(pg_admin):
-    """The live tuple includes settlement_cohort, so helper rendering differs from the frozen SQL."""
+def test_historical_trigger_is_frozen_and_head_trigger_matches_live_ddl(pg_admin, tmp_path, monkeypatch):
+    """An injected live-only column proves that the historical revision uses frozen SQL."""
     from nso_adapter.store.ddl import generation_immutability_ddl
 
     module = load_migration(_MIGRATION)
+    marker = tmp_path / "historical-sitecustomize-loaded"
+    sitecustomize = tmp_path / "sitecustomize.py"
+    sitecustomize.write_text(
+        "from pathlib import Path\n"
+        "from nso_adapter.store import ddl\n"
+        f"Path({str(marker)!r}).touch()\n"
+        "ddl.GENERATION_IMMUTABLE_COLUMNS += ('drifted_column',)\n"
+    )
 
     with private_database(pg_admin, "generation_ddl") as sync_url:
+        old_pythonpath = os.environ.get("PYTHONPATH")
+        pythonpath = str(tmp_path) if old_pythonpath is None else os.pathsep.join((str(tmp_path), old_pythonpath))
+        monkeypatch.setenv("PYTHONPATH", pythonpath)
         alembic(sync_url, "upgrade", module.revision)
+        assert marker.exists(), "the Alembic subprocess did not load sitecustomize"
 
         with engine_on(sync_url) as engine:
             historical_source = _installed_function_source(engine)
         assert historical_source == _FROZEN_FUNCTION_SOURCE
-        assert "settlement_cohort" not in historical_source
+        assert "drifted_column" not in historical_source
+
+        monkeypatch.delenv("PYTHONPATH", raising=False)
+        if old_pythonpath is not None:
+            monkeypatch.setenv("PYTHONPATH", old_pythonpath)
 
         alembic(sync_url, "upgrade", "head")
 

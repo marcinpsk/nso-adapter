@@ -28,9 +28,8 @@ repos:
         args: [--fix, --exit-non-zero-on-fix]
       - id: ruff-format
 
-  # GitHub Actions security audit. Offline by default, so it never blocks a commit on
-  # network reachability. The parity guard keeps this rev equal to the dev pin and verifies
-  # that CI covers every repository file matched by this pinned hook's upstream pattern.
+  # GitHub Actions security audit. The parity guard keeps this rev equal to the dev pin and
+  # verifies that CI covers every repository file matched by this pinned hook's upstream pattern.
   - repo: https://github.com/zizmorcore/zizmor-pre-commit
     rev: v1.29.0
     hooks:
