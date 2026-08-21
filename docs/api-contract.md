@@ -2211,9 +2211,12 @@ tombstone (and no apply job, whatever the device's `auto_apply` setting) — cli
 must not wait for jobs it never creates.
 The `PUT .../static-route-intent?backfill_only=true` path is also an exception: it
 prunes omitted uncorrelated rows but creates neither a removal job nor a tombstone.
-A worker runs each job in the background. A generated job hydrates its exact stored document,
-so a retry repeats the same selected operation after a worker restart. A generationless legacy
-job retains the live-store path. Scope is carried in `Job.context.scope` (one of
+A worker runs each job in the background. A promoted generation hydrates its exact stored
+document and execution plan, so a retry repeats the same selected operation after a worker
+restart. A reissue generation carries no promoted revisions or stored execution plan and
+executes its one removal context's scope from then-current live state. The sweeper, reclaimer,
+and force-removal paths produce reissues. A removal job with no generation is invalid and is
+refused. Scope is carried in `Job.context.scope` (one of
 `route_policy · bfd · svi · subinterface · static_route · interface_mtu · vlan ·
 logging · l2_sap · ospf · bgp · isis · interface_config · snmp`). Job status is
 observable via `GET …/jobs` like any other job; a failed removal records
