@@ -1205,8 +1205,10 @@ an operator un-owning it produce the same shrink, and the two have opposite devi
 | `unverified` | declared by the pusher when the overlay held no acknowledged triple. Never inferred from the lineage's shape — a verified `[C, C]` deduplicates to exactly what an unverified `[C]` produces |
 
 The field is required on every static-route intent PUT. It is always a list. An empty list
-means the push carries no deleted NetBox routes, so any omitted intent rows are marked as
-per-object detaches. `?delete_origin=` does not apply to this scope.
+means the push carries no deleted NetBox routes. For non-backfill pushes, omitted intent rows
+are marked as per-object detaches. `?backfill_only=true` is the exception: omitted rows with a
+`route_id` remain, while omitted uncorrelated rows are pruned and reported in
+`removed_uncorrelated`. `?delete_origin=` does not apply to this scope.
 
 **Classification.** Two ordered passes over the rows this push removes:
 
