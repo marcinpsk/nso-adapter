@@ -54,7 +54,13 @@ def _function_source(statement: str) -> str:
 
 
 def test_historical_trigger_is_frozen_and_head_trigger_matches_live_ddl(pg_admin, tmp_path, monkeypatch):
-    """An injected live-only column proves that the historical revision uses frozen SQL."""
+    """The historical revision must render frozen SQL, not the live helper.
+
+    The injected drifted_column discriminates where the helper reads the module
+    tuple at call time; where the helper captured its default tuple before the
+    injection, the live settlement_cohort column keeps the frozen-literal check
+    discriminating. The marker only proves the subprocess loaded the injection.
+    """
     from nso_adapter.store.ddl import generation_immutability_ddl
 
     module = load_migration(_MIGRATION)
