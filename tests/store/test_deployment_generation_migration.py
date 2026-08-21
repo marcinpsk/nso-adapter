@@ -212,9 +212,12 @@ def test_settlement_cohort_trigger_is_frozen_and_head_trigger_matches_live_ddl(p
     from nso_adapter.store.ddl import generation_immutability_ddl
 
     module = load_migration(_SETTLEMENT_COHORT_MIGRATION)
+    marker = tmp_path / "sitecustomize-loaded"
     sitecustomize = tmp_path / "sitecustomize.py"
     sitecustomize.write_text(
+        "from pathlib import Path\n"
         "from nso_adapter.store import ddl\n"
+        f"Path({str(marker)!r}).touch()\n"
         "ddl.GENERATION_IMMUTABLE_COLUMNS += ('drifted_column',)\n"
         "ddl.generation_immutability_ddl.__defaults__ = (ddl.GENERATION_IMMUTABLE_COLUMNS,)\n"
     )
@@ -224,6 +227,7 @@ def test_settlement_cohort_trigger_is_frozen_and_head_trigger_matches_live_ddl(p
         pythonpath = str(tmp_path) if old_pythonpath is None else os.pathsep.join((str(tmp_path), old_pythonpath))
         monkeypatch.setenv("PYTHONPATH", pythonpath)
         alembic(sync_url, "upgrade", module.revision)
+        assert marker.exists(), "the Alembic subprocess did not load the injected sitecustomize"
 
         with engine_on(sync_url) as engine:
             historical_source = _installed_function_source(engine)
