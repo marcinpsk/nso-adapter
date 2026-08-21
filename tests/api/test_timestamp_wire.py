@@ -50,7 +50,13 @@ async def test_normalized_columns_round_trip_an_aware_instant(store_engine, non_
         device = Device(nso_instance="nso-ts", nso_device_name="ts-roundtrip", last_sync_at=_WRITTEN)
         db.add(device)
         await db.flush()
-        job = Job(job_type=JobType.apply, status=JobStatus.queued, device_id=device.id, started_at=_WRITTEN)
+        job = Job(
+            job_type=JobType.apply,
+            status=JobStatus.queued,
+            device_id=device.id,
+            coalescible=True,
+            started_at=_WRITTEN,
+        )
         db.add(job)
         await db.commit()
         device_id, job_id = device.id, job.id

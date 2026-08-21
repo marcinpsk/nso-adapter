@@ -27,10 +27,16 @@ pytestmark = pytest.mark.anyio
 
 
 async def _add_job(device_id: int, job_type, status, *, context=None):
-    from nso_adapter.store.models import Job
+    from nso_adapter.store.models import Job, JobType
 
     async with session() as db:
-        job = Job(job_type=job_type, device_id=device_id, status=status, context=context or {})
+        job = Job(
+            job_type=job_type,
+            device_id=device_id,
+            status=status,
+            coalescible=job_type not in (JobType.removal, JobType.provision),
+            context=context or {},
+        )
         db.add(job)
         await db.commit()
         return job.id
@@ -107,18 +113,17 @@ async def test_admission_ignores_a_running_job_of_the_same_type(adapter_client):
         await db.commit()
 
 
-async def test_removals_are_never_deduped(adapter_client):
-    """Exempt by design: one per scope, and every one must run."""
-    from nso_adapter.core.jobs import admit_queued_job
-    from nso_adapter.store.models import JobType
+async def test_dedicated_removals_are_not_constrained_by_the_queue_index(adapter_client):
+    """Dedicated removals do not occupy the coalescible uniqueness slot."""
+    from nso_adapter.store.models import JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="q2-removal", netbox_device_id=9803)
 
-    async with session() as db:
-        first, _ = await admit_queued_job(db, device_id, JobType.removal, context={"scope": "bgp"})
-        second, winner = await admit_queued_job(db, device_id, JobType.removal, context={"scope": "isis"})
-        await db.commit()
-    assert first is not None and second is not None and winner is None
+    first = await _add_job(device_id, JobType.removal, JobStatus.queued, context={"scope": "bgp"})
+    second = await _add_job(device_id, JobType.removal, JobStatus.queued, context={"scope": "isis"})
+
+    assert first != second
+    assert await _queued_of_type(device_id, JobType.removal) == [first, second]
 
 
 # ── the savepoint: a conflict must not poison the caller ─────────────────────

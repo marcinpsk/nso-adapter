@@ -24,10 +24,16 @@ AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
 
 async def _add_job(device_id: int, job_type, status, *, context=None):
-    from nso_adapter.store.models import Job
+    from nso_adapter.store.models import Job, JobType
 
     async with session() as db:
-        job = Job(job_type=job_type, device_id=device_id, status=status, context=context or {})
+        job = Job(
+            job_type=job_type,
+            device_id=device_id,
+            status=status,
+            coalescible=job_type not in (JobType.removal, JobType.provision),
+            context=context or {},
+        )
         db.add(job)
         await db.commit()
         return job.id
@@ -197,7 +203,15 @@ async def test_two_queued_applies_are_rejected_by_the_database(adapter_client):
     await _add_job(device_id, JobType.apply, JobStatus.queued)
 
     async with session() as db:
-        db.add(Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.queued, context={}))
+        db.add(
+            Job(
+                job_type=JobType.apply,
+                device_id=device_id,
+                status=JobStatus.queued,
+                coalescible=True,
+                context={},
+            )
+        )
         try:
             await db.commit()
         except IntegrityError:
@@ -214,8 +228,20 @@ async def test_two_queued_removals_are_admitted_by_the_database(adapter_client):
     async with session() as db:
         db.add_all(
             [
-                Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued, context={"scope": "bgp"}),
-                Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued, context={"scope": "isis"}),
+                Job(
+                    job_type=JobType.removal,
+                    device_id=device_id,
+                    status=JobStatus.queued,
+                    coalescible=False,
+                    context={"scope": "bgp"},
+                ),
+                Job(
+                    job_type=JobType.removal,
+                    device_id=device_id,
+                    status=JobStatus.queued,
+                    coalescible=False,
+                    context={"scope": "isis"},
+                ),
             ]
         )
         await db.commit()  # must not raise
@@ -230,7 +256,15 @@ async def test_a_queued_apply_coexists_with_a_running_one(adapter_client):
     await _add_job(device_id, JobType.apply, JobStatus.running)
 
     async with session() as db:
-        db.add(Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.queued, context={}))
+        db.add(
+            Job(
+                job_type=JobType.apply,
+                device_id=device_id,
+                status=JobStatus.queued,
+                coalescible=True,
+                context={},
+            )
+        )
         await db.commit()  # must not raise
 
 

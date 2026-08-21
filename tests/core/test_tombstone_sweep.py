@@ -60,7 +60,14 @@ async def _seed_job(device_id: int, status, job_type=None) -> int:
     from nso_adapter.store.models import Job, JobType
 
     async with session() as db:
-        job = Job(job_type=job_type or JobType.removal, device_id=device_id, status=status, context={})
+        effective_type = job_type or JobType.removal
+        job = Job(
+            job_type=effective_type,
+            device_id=device_id,
+            status=status,
+            coalescible=effective_type not in (JobType.removal, JobType.provision),
+            context={},
+        )
         db.add(job)
         await db.commit()
         return job.id

@@ -26,10 +26,16 @@ pytestmark = pytest.mark.anyio
 
 
 async def _seed_running(device_id: int | None, job_type):
-    from nso_adapter.store.models import Job, JobStatus
+    from nso_adapter.store.models import Job, JobStatus, JobType
 
     async with session() as db:
-        job = Job(job_type=job_type, device_id=device_id, status=JobStatus.running, context={})
+        job = Job(
+            job_type=job_type,
+            device_id=device_id,
+            status=JobStatus.running,
+            coalescible=job_type not in (JobType.removal, JobType.provision),
+            context={},
+        )
         db.add(job)
         await db.commit()
         return job.id

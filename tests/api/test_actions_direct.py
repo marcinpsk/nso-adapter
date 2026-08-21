@@ -46,7 +46,7 @@ async def test_trigger_job_conflict_returns_409(adapter_client):
     """
     device_id = await _seed_device("actions-conflict-01", 1300)
     async with session() as db:
-        existing = Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued)
+        existing = Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued, coalescible=True)
         db.add(existing)
         await db.commit()
         await db.refresh(existing)
@@ -61,7 +61,15 @@ async def test_trigger_is_admitted_while_a_different_type_runs(adapter_client):
     """The narrowing: an unrelated running job must not 409 an operator action."""
     device_id = await _seed_device("actions-conflict-02", 1301)
     async with session() as db:
-        db.add(Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.running, context={"scope": "bgp"}))
+        db.add(
+            Job(
+                job_type=JobType.removal,
+                device_id=device_id,
+                status=JobStatus.running,
+                coalescible=False,
+                context={"scope": "bgp"},
+            )
+        )
         await db.commit()
 
         result = await _trigger(device_id, JobType.sync, db)

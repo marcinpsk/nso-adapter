@@ -317,7 +317,7 @@ async def test_request_atomic_cohort_stamps_no_stream_until_every_member_succeed
             mode=GenerationMode.networked,
             settlement_cohort=cohort,
         )
-        vlan_job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.running)
+        vlan_job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.running, coalescible=True)
         db.add(vlan_job)
         await db.flush()
         await attach_to_job(db, vlan_generation, vlan_job)
@@ -330,7 +330,7 @@ async def test_request_atomic_cohort_stamps_no_stream_until_every_member_succeed
             mode=GenerationMode.networked,
             settlement_cohort=cohort,
         )
-        svi_job = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued)
+        svi_job = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued, coalescible=False)
         db.add(svi_job)
         await db.flush()
         await attach_to_job(db, svi_generation, svi_job)
@@ -680,7 +680,7 @@ async def test_mixed_generation_executes_interface_section_from_its_document(ada
             streams=("interface_config", "ip", "static_route"),
             mode=GenerationMode.networked,
         )
-        job = Job(job_type=JobType.apply, device_id=device_id)
+        job = Job(job_type=JobType.apply, device_id=device_id, coalescible=True)
         db.add(job)
         await db.flush()
         assert await attach_to_job(db, generation, job)
@@ -1062,7 +1062,7 @@ async def test_recorded_static_route_put_is_refused_if_verification_is_disabled_
             streams=("static_route",),
             mode=GenerationMode.networked,
         )
-        job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.queued)
+        job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.queued, coalescible=True)
         db.add(job)
         await db.flush()
         assert await attach_to_job(db, generation, job)
@@ -1201,7 +1201,7 @@ async def test_action_apply_endpoint_reports_the_queued_incumbent(adapter_client
     await seed_settings(device_id, auto_apply=False)
     assert (await _put_vlans(adapter_client, device_id, [10], seq=4351, query="?store_only=true")).status_code == 200
     async with session() as db:
-        incumbent = Job(device_id=device_id, job_type=JobType.apply, status=JobStatus.queued)
+        incumbent = Job(device_id=device_id, job_type=JobType.apply, status=JobStatus.queued, coalescible=True)
         db.add(incumbent)
         await db.commit()
         incumbent_id = incumbent.id

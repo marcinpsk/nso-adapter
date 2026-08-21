@@ -62,6 +62,7 @@ async def _stranded_running_job(device_id: int, job_type: JobType = JobType.appl
             job_type=job_type,
             device_id=device_id,
             status=JobStatus.running,
+            coalescible=job_type not in (JobType.removal, JobType.provision),
             run_attempt=1,
             heartbeat_at=datetime.now(UTC) - timedelta(seconds=worker_mod.PROVISION_STALE_AFTER + 600),
         )
@@ -325,7 +326,13 @@ async def test_a_failed_allocation_never_takes_a_second_terminal_write(adapter_c
 
     device_id = await seed_device(nso_device_name=f"lc-alloc-{failure}", netbox_device_id=8631)
     async with session() as db:
-        job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.running, run_attempt=1)
+        job = Job(
+            job_type=JobType.apply,
+            device_id=device_id,
+            status=JobStatus.running,
+            coalescible=True,
+            run_attempt=1,
+        )
         db.add(job)
         db.add(
             StaticRouteIntent(

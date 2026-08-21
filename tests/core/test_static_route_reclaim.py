@@ -32,6 +32,7 @@ async def seed_succeeded_owner(device_id: int) -> int:
             job_type=JobType.removal,
             device_id=device_id,
             status=JobStatus.succeeded,
+            coalescible=False,
             context={"scope": "static_route"},
             result={"scope": "static_route"},
         )

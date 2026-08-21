@@ -54,6 +54,7 @@ async def _seed_job(device_id: int, status: JobStatus = JobStatus.queued) -> int
             job_type=JobType.sync,
             device_id=device_id,
             status=status,
+            coalescible=True,
             run_attempt=1 if status is JobStatus.running else 0,
         )
         db.add(j)
@@ -149,7 +150,7 @@ async def test_queued_job_partial_unique_index_rejects_a_second_of_the_same_type
     await _seed_job(device_id, JobStatus.queued)
 
     async with session() as db:
-        db.add(Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued))
+        db.add(Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued, coalescible=True))
         with pytest.raises(IntegrityError):
             await db.commit()
         await db.rollback()
@@ -161,7 +162,7 @@ async def test_queued_index_permits_a_successor_while_one_runs(adapter_client):
     await _seed_job(device_id, JobStatus.running)
 
     async with session() as db:
-        db.add(Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued))
+        db.add(Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued, coalescible=True))
         await db.commit()  # must not raise
 
 
@@ -172,8 +173,24 @@ async def test_active_job_index_exempts_removal(adapter_client):
     device_id = await _seed_device("removal-multi", 4103)
 
     async with session() as db:
-        db.add(Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued, context={"scope": "bgp"}))
-        db.add(Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued, context={"scope": "isis"}))
+        db.add(
+            Job(
+                job_type=JobType.removal,
+                device_id=device_id,
+                status=JobStatus.queued,
+                coalescible=False,
+                context={"scope": "bgp"},
+            )
+        )
+        db.add(
+            Job(
+                job_type=JobType.removal,
+                device_id=device_id,
+                status=JobStatus.queued,
+                coalescible=False,
+                context={"scope": "isis"},
+            )
+        )
         await db.commit()  # no IntegrityError — removal is exempt from the active-job index
         actives = (
             (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal)))
@@ -189,7 +206,7 @@ async def test_active_job_index_allows_new_after_terminal(adapter_client):
     await _seed_job(device_id, JobStatus.succeeded)
 
     async with session() as db:
-        db.add(Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued))
+        db.add(Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued, coalescible=True))
         await db.commit()  # no IntegrityError — succeeded job is not "active"
         actives = (
             (await db.execute(select(Job).where(Job.device_id == device_id, Job.status == JobStatus.queued)))
@@ -367,7 +384,15 @@ async def test_run_with_db_marks_failed_even_when_session_poisoned(adapter_clien
     async def poison_factory(dev_id, db):
         # A duplicate PK insert → IntegrityError → AsyncSession enters needs-rollback,
         # exactly like a failed flush mid-sync.
-        db.add(Job(id=job_id, job_type=JobType.sync, device_id=dev_id, status=JobStatus.queued))
+        db.add(
+            Job(
+                id=job_id,
+                job_type=JobType.sync,
+                device_id=dev_id,
+                status=JobStatus.queued,
+                coalescible=True,
+            )
+        )
         await db.flush()
 
     await _run_with_db(job_id, device_id, poison_factory)
@@ -703,7 +728,15 @@ async def test_run_connect_marks_failed_even_when_session_poisoned(adapter_clien
 
     async def poison_connect(client, name):
         db = captured["db"]
-        db.add(Job(id=job_id, job_type=JobType.connect, device_id=device_id, status=JobStatus.queued))
+        db.add(
+            Job(
+                id=job_id,
+                job_type=JobType.connect,
+                device_id=device_id,
+                status=JobStatus.queued,
+                coalescible=True,
+            )
+        )
         await db.flush()  # duplicate PK → session poisoned
 
     with (
@@ -742,6 +775,7 @@ async def test_run_provision_marks_failed_even_when_session_poisoned(adapter_cli
             job_type=JobType.provision,
             device_id=None,
             status=JobStatus.running,
+            coalescible=False,
             run_attempt=1,
             context={"nso_instance": "nso-dev", "device_name": "prov-poison"},
         )
@@ -751,7 +785,7 @@ async def test_run_provision_marks_failed_even_when_session_poisoned(adapter_cli
         job_id = j.id
 
     async def poison_provision(db, **params):
-        db.add(Job(id=job_id, job_type=JobType.provision, status=JobStatus.queued))
+        db.add(Job(id=job_id, job_type=JobType.provision, status=JobStatus.queued, coalescible=False))
         await db.flush()  # duplicate PK → session poisoned
 
     with patch("nso_adapter.core.onboarding.provision_nso_device", poison_provision):
@@ -778,6 +812,7 @@ async def _queue_provision_job(device_name: str) -> int:
             job_type=JobType.provision,
             device_id=None,
             status=JobStatus.running,
+            coalescible=False,
             run_attempt=1,
             context={"nso_instance": "nso-dev", "device_name": device_name},
         )

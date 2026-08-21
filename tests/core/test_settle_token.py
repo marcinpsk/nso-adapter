@@ -25,10 +25,16 @@ pytestmark = pytest.mark.anyio
 
 
 async def _queue(device_id: int | None, job_type, *, context=None) -> int:
-    from nso_adapter.store.models import Job, JobStatus
+    from nso_adapter.store.models import Job, JobStatus, JobType
 
     async with session() as db:
-        job = Job(job_type=job_type, device_id=device_id, status=JobStatus.queued, context=context or {})
+        job = Job(
+            job_type=job_type,
+            device_id=device_id,
+            status=JobStatus.queued,
+            coalescible=job_type not in (JobType.removal, JobType.provision),
+            context=context or {},
+        )
         db.add(job)
         await db.commit()
         return job.id
@@ -448,27 +454,16 @@ async def test_a_successor_inserted_mid_decision_lands_superseded(adapter_client
 # ── S1.5 / S1.7: the writers with no execution, and the device_id sentinel ───
 
 
-async def test_queued_sourced_writers_need_no_token(adapter_client, monkeypatch):
-    """S1.5 — offboarding and the claimless-corruption writer have nothing to name.
+async def test_offboard_queued_writer_needs_no_token(adapter_client, monkeypatch):
+    """S1.5 — offboarding has no execution to name.
 
-    Forbidden: requiring a token from them, which would leave offboard unable to
-    terminalize a queued job at all. Both carry ``expect=queued`` instead, and offboard
-    goes through the dedicated bulk helper — a per-job helper cannot express its
-    unbounded row set.
+    Requiring a token would leave offboard unable to terminalize a queued job. Offboard
+    uses the bulk helper because a per-job helper cannot express its unbounded row set.
     """
     from nso_adapter.core import claim as claim_mod
     from nso_adapter.core.onboarding import offboard_device
     from nso_adapter.store.models import Device, Job, JobStatus, JobType
 
-    # (a) the claimless-corruption writer: a non-provision job with no device.
-    corrupt_id = await _queue(None, JobType.sync)
-    assert await worker_mod._claim_next_claimless_job() is None
-    corrupt = await _row(corrupt_id)
-    assert corrupt.status is JobStatus.failed
-    assert corrupt.error["code"] == "orphaned_claimless"
-    assert corrupt.run_attempt == 0, "a queued-sourced write must not start an execution"
-
-    # (b) offboard, through the bulk helper.
     device_id = await seed_device(nso_device_name="s1-queued-sourced", netbox_device_id=9908)
     queued_id = await _queue(device_id, JobType.sync)
 

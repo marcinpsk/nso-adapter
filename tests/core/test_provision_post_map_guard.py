@@ -65,7 +65,13 @@ async def _seed_provision_job() -> int:
     from nso_adapter.store.models import Job, JobStatus, JobType
 
     async with session() as db:
-        job = Job(job_type=JobType.provision, device_id=None, status=JobStatus.running, context={})
+        job = Job(
+            job_type=JobType.provision,
+            device_id=None,
+            status=JobStatus.running,
+            coalescible=False,
+            context={},
+        )
         db.add(job)
         await db.commit()
         return job.id
@@ -297,6 +303,7 @@ async def test_claim_timeout_fails_provision_retryably(adapter_client_with_nso, 
             job_type=JobType.provision,
             device_id=None,
             status=JobStatus.running,
+            coalescible=False,
             run_attempt=1,
             context={
                 "nso_instance": _INSTANCE,
@@ -356,6 +363,7 @@ async def test_a_refused_terminal_write_discards_the_provision_transaction(adapt
             job_type=JobType.provision,
             device_id=None,
             status=JobStatus.running,
+            coalescible=False,
             run_attempt=2,
             context={
                 "nso_instance": _INSTANCE,
@@ -637,6 +645,7 @@ async def test_the_terminal_write_is_guarded_once_the_run_is_claimed(adapter_cli
             job_type=JobType.provision,
             device_id=None,
             status=JobStatus.queued,
+            coalescible=False,
             context={
                 "nso_instance": _INSTANCE,
                 "device_name": "pg-terminal",

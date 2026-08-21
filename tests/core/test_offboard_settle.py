@@ -35,8 +35,14 @@ async def test_offboard_terminalizes_unsequenced_and_detaches_history(adapter_cl
     device_id = await seed_device(nso_device_name="offboard-settle", netbox_device_id=8501)
 
     async with session() as db:
-        history = Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.running, run_attempt=1)
-        pending = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.queued)
+        history = Job(
+            job_type=JobType.sync,
+            device_id=device_id,
+            status=JobStatus.running,
+            coalescible=True,
+            run_attempt=1,
+        )
+        pending = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.queued, coalescible=True)
         db.add_all([history, pending])
         await db.commit()
         history_id, pending_id = history.id, pending.id

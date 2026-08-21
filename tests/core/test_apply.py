@@ -231,6 +231,7 @@ async def _seed_apply_job(device_id: int, status: JobStatus = JobStatus.running)
             job_type=JobType.apply,
             device_id=device_id,
             status=status,
+            coalescible=True,
             run_attempt=1 if status is JobStatus.running else 0,
         )
         db.add(j)
@@ -2392,7 +2393,15 @@ async def test_run_apply_marks_failed_even_when_session_poisoned(adapter_client,
     async def _poison(db, job, job_id, device_id, force):
         # A real DB error (duplicate PK) puts the AsyncSession into a needs-rollback state,
         # exactly like a failed flush mid-apply; the failure handler must rollback first.
-        db.add(Job(id=job_id, job_type=JobType.apply, device_id=device_id, status=JobStatus.queued))
+        db.add(
+            Job(
+                id=job_id,
+                job_type=JobType.apply,
+                device_id=device_id,
+                status=JobStatus.queued,
+                coalescible=True,
+            )
+        )
         await db.flush()  # IntegrityError → session poisoned; propagates to run_apply's handler
 
     with patch("nso_adapter.core.apply._execute_apply", _poison):

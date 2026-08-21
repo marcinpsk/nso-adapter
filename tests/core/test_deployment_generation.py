@@ -1013,7 +1013,7 @@ async def test_a_job_carrying_no_generation_is_never_blocked(adapter_client):
     assert await _finish(device_id, JobStatus.failed) == removal_job
 
     async with session() as db:
-        sync = Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued)
+        sync = Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued, coalescible=True)
         db.add(sync)
         await db.commit()
         sync_id = sync.id
@@ -1037,7 +1037,7 @@ async def test_a_generationless_device_write_cannot_cross_a_blocked_head(adapter
     assert await _finish(device_id, JobStatus.failed) == removal_job
 
     async with session() as db:
-        manual = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.queued)
+        manual = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.queued, coalescible=True)
         db.add(manual)
         await db.commit()
         manual_id = manual.id
@@ -1182,6 +1182,7 @@ async def test_f2_b_retry_does_not_take_over_a_generationless_removal_job(adapte
             job_type=JobType.removal,
             device_id=device_id,
             status=JobStatus.queued,
+            coalescible=False,
             context=legacy_context,
         )
         db.add(legacy)

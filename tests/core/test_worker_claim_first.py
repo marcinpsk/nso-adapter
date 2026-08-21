@@ -25,10 +25,16 @@ pytestmark = pytest.mark.anyio
 
 
 async def _queue(device_id: int | None, job_type, *, context=None):
-    from nso_adapter.store.models import Job, JobStatus
+    from nso_adapter.store.models import Job, JobStatus, JobType
 
     async with session() as db:
-        job = Job(job_type=job_type, device_id=device_id, status=JobStatus.queued, context=context or {})
+        job = Job(
+            job_type=job_type,
+            device_id=device_id,
+            status=JobStatus.queued,
+            coalescible=job_type not in (JobType.removal, JobType.provision),
+            context=context or {},
+        )
         db.add(job)
         await db.commit()
         return job.id
@@ -134,7 +140,7 @@ async def test_a_claimed_device_is_skipped_for_another(adapter_client):
     assert claimed[1] == d2
 
 
-# ── the claimless lane and its defensive guard ───────────────────────────────
+# ── the claimless lane ──────────────────────────────────────────────────────
 
 
 async def test_provision_runs_without_a_claim(adapter_client):
@@ -153,23 +159,7 @@ async def test_provision_runs_without_a_claim(adapter_client):
     assert await _status(job_id) is JobStatus.running
 
 
-async def test_a_claimless_non_provision_job_is_failed_not_run(adapter_client):
-    """The defensive rule: only provision may be claimless.
-
-    Any other type with no device would be dispatched with ``device_id=None`` against a
-    device that no longer exists, invisible to both the claim machinery and the per-device
-    FIFO. Teardown is specified never to create one, so this is a belt against a bug.
-    """
-    from nso_adapter.store.models import Job, JobStatus, JobType
-
-    job_id = await _queue(None, JobType.sync)
-
-    assert await worker_mod._claim_next_job() is None
-
-    async with session() as db:
-        job = await db.get(Job, job_id)
-        assert job.status is JobStatus.failed
-        assert job.error["code"] == "orphaned_claimless"
+# ck_job_detached_non_provision_terminal makes the old persisted corruption shape unreachable.
 
 
 # ── the association is atomic with the running transition ───────────────────

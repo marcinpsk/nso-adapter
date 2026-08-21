@@ -24,10 +24,16 @@ pytestmark = pytest.mark.anyio
 
 
 async def _seed_running_job(device_id: int | None, job_type):
-    from nso_adapter.store.models import Job, JobStatus
+    from nso_adapter.store.models import Job, JobStatus, JobType
 
     async with session() as db:
-        job = Job(job_type=job_type, device_id=device_id, status=JobStatus.running, context={})
+        job = Job(
+            job_type=job_type,
+            device_id=device_id,
+            status=JobStatus.running,
+            coalescible=job_type not in (JobType.removal, JobType.provision),
+            context={},
+        )
         db.add(job)
         await db.commit()
         return job.id
@@ -83,7 +89,7 @@ async def test_unregistered_tick_refreshes_the_job_only(adapter_client, monkeypa
     from nso_adapter.store.models import JobType
 
     device_id = await seed_device(nso_device_name="hb-jobonly", netbox_device_id=9981)
-    job_id = await _seed_running_job(device_id, JobType.provision)
+    job_id = await _seed_running_job(None, JobType.provision)
     # A claim exists but this run has NOT registered it: the tick must leave it alone.
     await acquire_claim(device_id, "job", job_id=job_id)
     await _backdate_both(device_id, job_id, seconds=600)
@@ -101,7 +107,7 @@ async def test_lane_switches_live_after_registration(adapter_client, monkeypatch
     from nso_adapter.store.models import JobType
 
     device_id = await seed_device(nso_device_name="hb-live", netbox_device_id=9982)
-    job_id = await _seed_running_job(device_id, JobType.provision)
+    job_id = await _seed_running_job(None, JobType.provision)
     reg = ClaimRegistration()
 
     monkeypatch.setattr(worker_mod, "_HEARTBEAT_INTERVAL", 0.01)

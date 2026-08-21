@@ -821,7 +821,7 @@ async def test_f6_c_the_reclaimer_reissue_gives_its_job_a_generation(adapter_cli
     device_id = await seed_device(nso_device_name="gen-reclaim", netbox_device_id=9816)
     async with session() as db:
         # R1's handoff set: the owning removal job SUCCEEDED without proving anything.
-        owner = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.succeeded)
+        owner = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.succeeded, coalescible=False)
         db.add(owner)
         await db.flush()
         db.add(
