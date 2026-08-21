@@ -78,7 +78,6 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 
 from alembic import op
-from nso_adapter.store.ddl import generation_immutability_ddl, generation_immutability_drop_ddl
 
 revision: str = "a4e1c7b09f52"
 down_revision: str | Sequence[str] | None = "d3a7f1c58e42"
@@ -94,6 +93,37 @@ _STATUS = sa.Enum(
     "outcome_unknown",
     "abandoned",
     name="generationstatus",
+)
+
+_GENERATION_IMMUTABILITY_DDL = (
+    """CREATE OR REPLACE FUNCTION deployment_generation_reject_rewrite() RETURNS trigger AS $$
+BEGIN
+    IF NEW.device_id IS DISTINCT FROM OLD.device_id
+        OR NEW.seq IS DISTINCT FROM OLD.seq
+        OR NEW.mode IS DISTINCT FROM OLD.mode
+        OR NEW.document::text IS DISTINCT FROM OLD.document::text
+        OR NEW.digest IS DISTINCT FROM OLD.digest
+        OR NEW.allowed_removal_keys::text IS DISTINCT FROM OLD.allowed_removal_keys::text
+        OR NEW.source_push_seq::text IS DISTINCT FROM OLD.source_push_seq::text
+        OR NEW.stream_revisions::text IS DISTINCT FROM OLD.stream_revisions::text
+        OR NEW.removal_context::text IS DISTINCT FROM OLD.removal_context::text
+        OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'integrity_constraint_violation',
+            MESSAGE = 'deployment_generation ' || OLD.id || ' is immutable: device_id, seq, mode, document, digest, """
+    """allowed_removal_keys, source_push_seq, stream_revisions, removal_context, created_at may not be updated';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;""",
+    "DROP TRIGGER IF EXISTS deployment_generation_immutable ON deployment_generation",
+    "CREATE TRIGGER deployment_generation_immutable BEFORE UPDATE ON deployment_generation "
+    "FOR EACH ROW EXECUTE FUNCTION deployment_generation_reject_rewrite()",
+)
+
+_GENERATION_IMMUTABILITY_DROP_DDL = (
+    "DROP TRIGGER IF EXISTS deployment_generation_immutable ON deployment_generation",
+    "DROP FUNCTION IF EXISTS deployment_generation_reject_rewrite()",
 )
 
 
@@ -174,16 +204,13 @@ def upgrade() -> None:
     )
     op.create_index(op.f("ix_intent_push_receipt_device_id"), "intent_push_receipt", ["device_id"], unique=False)
 
-    # Immutability, enforced by the database (#1522 §G1). A generation's identity is what a
-    # retry re-sends and what settlement stamps; nothing in the application may rewrite it.
-    # Rendered from store.ddl so create_all installs the SAME trigger (schema parity does
-    # not compare triggers, so a second copy here could drift unseen).
-    for statement in generation_immutability_ddl():
+    # Freeze this historical DDL so later helper changes cannot alter the revision.
+    for statement in _GENERATION_IMMUTABILITY_DDL:
         op.execute(statement)
 
 
 def downgrade() -> None:
-    for statement in generation_immutability_drop_ddl():
+    for statement in _GENERATION_IMMUTABILITY_DROP_DDL:
         op.execute(statement)
     op.drop_index(op.f("ix_intent_push_receipt_device_id"), table_name="intent_push_receipt")
     op.drop_table("intent_push_receipt")
