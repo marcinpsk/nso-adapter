@@ -36,6 +36,33 @@ def test_every_section_is_either_document_executed_or_names_its_blocker():
     assert all(reason for reason in LIVE_READ_SECTIONS.values()), "every live-read section must state why"
 
 
+def test_every_projection_column_has_a_supported_json_round_trip():
+    from datetime import date
+    from decimal import Decimal
+
+    from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Integer, String, Text
+    from sqlalchemy.dialects.postgresql import JSONB
+
+    from nso_adapter.core.projection import _SECTION_TABLES
+
+    supported_types = {BigInteger, Boolean, DateTime, Integer, JSON, JSONB, String, Text}
+    supported_python_types = {bool, bytes, date, datetime, Decimal, dict, int, str}
+    models = {spec.model for specs in _SECTION_TABLES.values() for spec in specs}
+    unsupported = []
+    for model in sorted(models, key=lambda candidate: candidate.__name__):
+        for column in model.__table__.columns:
+            try:
+                python_type = column.type.python_type
+            except NotImplementedError:
+                python_type = None
+            if type(column.type) not in supported_types or python_type not in supported_python_types:
+                unsupported.append(
+                    f"{model.__name__}.{column.name}: {type(column.type).__name__}/{getattr(python_type, '__name__', None)}"
+                )
+
+    assert not unsupported, f"projection columns without a proven JSON round trip: {unsupported}"
+
+
 async def test_a_snapshot_hydrates_back_into_the_rows_it_was_taken_from(adapter_client):
     """Round-trip fidelity, including the types JSON cannot hold natively."""
     from nso_adapter.core.projection import hydrate_section, snapshot_stream

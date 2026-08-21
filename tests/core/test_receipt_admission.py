@@ -139,6 +139,7 @@ def test_every_in_protocol_put_uses_the_shared_delivery_seam():
             assert "return await _apply_static_route_intent(" in sources[0]
             sources.append(inspect.getsource(_apply_static_route_intent))
         assert "await begin_delivery(" in sources[-1], f"{route.path} bypasses begin_delivery"
+        assert "await record_response(" in sources[-1], f"{route.path} bypasses record_response"
         for source in sources:
             assert "note_write" not in source, f"{route.path} owns projection-write ordering again"
 

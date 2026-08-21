@@ -205,7 +205,8 @@ async def test_a_failure_after_the_guard_lock_neither_hangs_nor_leaks_the_claim(
 
     device_id = await seed_device(nso_device_name="sr-claim-lockfail", netbox_device_id=9405)
 
-    async def _boom(device_id, body, db, delivery):
+    async def _boom(*args, **kwargs):
+        assert await _claim_row(device_id) is not None
         raise RuntimeError("forced post-lock failure")
 
     monkeypatch.setattr(sr_mod, "_apply_static_route_intent", _boom)
