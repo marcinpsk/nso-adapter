@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-import os
-
 import sqlalchemy as sa
 
 from tests.store.migration_harness import alembic, engine_on, load_migration, private_database
@@ -53,21 +51,13 @@ def _function_source(statement: str) -> str:
     return statement.partition(" AS $$")[2].partition("$$ LANGUAGE plpgsql")[0]
 
 
-def test_historical_trigger_is_frozen_and_head_trigger_matches_live_ddl(pg_admin, tmp_path, monkeypatch):
+def test_historical_trigger_is_frozen_and_head_trigger_matches_live_ddl(pg_admin):
+    """The live tuple includes settlement_cohort, so helper rendering differs from the frozen SQL."""
     from nso_adapter.store.ddl import generation_immutability_ddl
 
     module = load_migration(_MIGRATION)
-    sitecustomize = tmp_path / "sitecustomize.py"
-    sitecustomize.write_text(
-        "from nso_adapter.store import ddl\n"
-        "if 'settlement_cohort' not in ddl.GENERATION_IMMUTABLE_COLUMNS:\n"
-        "    ddl.GENERATION_IMMUTABLE_COLUMNS += ('settlement_cohort',)\n"
-    )
 
     with private_database(pg_admin, "generation_ddl") as sync_url:
-        old_pythonpath = os.environ.get("PYTHONPATH")
-        pythonpath = str(tmp_path) if old_pythonpath is None else os.pathsep.join((str(tmp_path), old_pythonpath))
-        monkeypatch.setenv("PYTHONPATH", pythonpath)
         alembic(sync_url, "upgrade", module.revision)
 
         with engine_on(sync_url) as engine:
@@ -75,9 +65,6 @@ def test_historical_trigger_is_frozen_and_head_trigger_matches_live_ddl(pg_admin
         assert historical_source == _FROZEN_FUNCTION_SOURCE
         assert "settlement_cohort" not in historical_source
 
-        monkeypatch.delenv("PYTHONPATH", raising=False)
-        if old_pythonpath is not None:
-            monkeypatch.setenv("PYTHONPATH", old_pythonpath)
         alembic(sync_url, "upgrade", "head")
 
         with engine_on(sync_url) as engine:
