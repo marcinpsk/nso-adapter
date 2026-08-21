@@ -23,6 +23,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import acquire_claim, claim_session, lock_claim, release_claim
+from nso_adapter.core.static_route_plan import as_triple, triple_of
 from nso_adapter.store.models import Job, JobStatus, JobType, StaticRouteTombstone
 
 logger = structlog.get_logger(__name__)
@@ -55,9 +56,14 @@ def _removal_context(row: StaticRouteTombstone) -> dict:
     **delete-origin** retract into a no-networking retry — a destructive-semantics flip,
     not a cosmetic default.
     """
+    triple = triple_of(row)
+    removed = [triple]
+    deployed = as_triple(row.deployed_key)
+    if deployed is not None and deployed != triple:
+        removed.append(deployed)
     return {
         "scope": "static_route",
-        "removed": {"route": [[row.vrf, row.prefix, row.next_hop]]},
+        "removed": {"route": [list(key) for key in removed]},
         "detach": row.marking == "detach",
     }
 
