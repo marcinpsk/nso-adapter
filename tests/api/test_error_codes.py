@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel, field_validator
 
 from nso_adapter.api.errors import ERROR_CODES, api_error
 from tests.conftest import VALID_TOKEN
@@ -66,6 +67,43 @@ async def test_validation_error_with_non_primitive_ctx(adapter_client):
     assert err["code"] == "validation_error"
     # every leaf of the encoded error list must be JSON-native (it round-tripped)
     assert isinstance(err["detail"]["errors"], list)
+
+
+async def test_validation_error_does_not_echo_validator_text():
+    """A validator can include submitted data in its exception text, so the handler must not."""
+    from fastapi import FastAPI
+    from fastapi.exceptions import RequestValidationError
+    from httpx import ASGITransport, AsyncClient
+
+    from nso_adapter.api.errors import validation_error_handler
+
+    secret = "operator-supplied-secret"
+
+    class SecretBody(BaseModel):
+        value: str
+
+        @field_validator("value")
+        @classmethod
+        def reject(cls, value: str) -> str:
+            raise ValueError(f"rejected {value}")
+
+    app = FastAPI()
+    app.add_exception_handler(RequestValidationError, validation_error_handler)
+
+    async def reject_secret(body):
+        return body
+
+    reject_secret.__annotations__["body"] = SecretBody
+    app.post("/_test/validation-secret")(reject_secret)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/_test/validation-secret", json={"value": secret})
+
+    assert response.status_code == 422
+    assert secret not in response.text
+    assert response.json()["error"]["detail"]["errors"] == [
+        {"type": "value_error", "loc": ["body", "value"], "msg": "Invalid value"}
+    ]
 
 
 # ------------------------------------------------------- envelope on an unexpected 500

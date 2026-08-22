@@ -124,6 +124,7 @@ async def test_put_local_levels_upserts_singleton(adapter_client):
         headers=AUTH,
     )
     assert resp.status_code == 200
+    assert resp.json() == {"device_id": device_id, "count": 1, "removed": 0, "replaced": False}
     row = await _levels_intent(device_id)
     assert row is not None
     assert row.console_severity == "CRITICAL"
@@ -169,6 +170,7 @@ async def test_put_local_levels_null_deletes_and_retracts(adapter_client):
         headers=AUTH,
     )
     assert resp.status_code == 200
+    assert resp.json() == {"device_id": device_id, "count": 0, "removed": 1, "replaced": True}
     assert await _levels_intent(device_id) is None
     jobs = await _logging_removal_jobs(device_id)
     assert len(jobs) == 1

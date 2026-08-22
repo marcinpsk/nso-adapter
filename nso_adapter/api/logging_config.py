@@ -178,8 +178,8 @@ class LoggingIntentUpdate(BaseModel):
 
 async def _sync_local_levels(
     db: AsyncSession, device_id: int, entry: LocalLevelsEntry | None, now: datetime
-) -> tuple[bool, int]:
-    """Replace the levels singleton intent; returns ``(cleared, managed_count)``.
+) -> tuple[bool, int, int]:
+    """Replace the levels singleton intent; return cleared, written, and removed counts.
 
     ``cleared`` reports any previously-set severity going back to unset — the #83
     cleared-owned-scalar shape a merge-PATCH can never revert, so the caller must
@@ -192,16 +192,17 @@ async def _sync_local_levels(
     values = {f: (getattr(entry, f) if entry is not None else None) for f in _LEVEL_FIELDS}
     cleared = before is not None and any(is_cleared(before[f], values[f]) for f in _LEVEL_FIELDS)
     if not any(values.values()):
+        removed = int(existing is not None)
         if existing is not None:
             await db.delete(existing)
-        return cleared, 0
+        return cleared, 0, removed
     if existing is None:
         existing = LoggingLevelsIntent(device_id=device_id)
         db.add(existing)
     for f in _LEVEL_FIELDS:
         setattr(existing, f, values[f])
     existing.accepted_at = entry.accepted_at if entry.accepted_at else now
-    return cleared, 1
+    return cleared, 1, 0
 
 
 @router.put(
@@ -267,8 +268,9 @@ async def put_logging_intent(
 
     levels_cleared = False
     levels_count = 0
+    levels_removed = 0
     if "local_levels" in body.model_fields_set:
-        levels_cleared, levels_count = await _sync_local_levels(db, device_id, body.local_levels, now)
+        levels_cleared, levels_count, levels_removed = await _sync_local_levels(db, device_id, body.local_levels, now)
 
     await db.flush()
 
@@ -288,7 +290,12 @@ async def put_logging_intent(
 
         await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
 
-    result = {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}
+    result = {
+        "device_id": device_id,
+        "count": count + levels_count,
+        "removed": len(removed) + levels_removed,
+        "replaced": replaced,
+    }
     await record_response(db, device_id, delivery, result)
     await db.commit()
     return result

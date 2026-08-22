@@ -214,15 +214,11 @@ def unhandled_exception_response(request: Request, exc: BaseException) -> JSONRe
 async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     """Convert FastAPI request-validation failures to the documented envelope.
 
-    ``exc.errors()`` can carry non-JSON-native values (a validator's ValueError
-    lands in ``ctx``) — encode through jsonable_encoder like FastAPI's default
-    handler does, or a malformed request turns into a 500.
-
-    Pydantic also includes the submitted value under ``input``. Headers and query
-    parameters can contain secrets, so the public boundary keeps the location and
-    failure reason but never reflects that value.
+    Pydantic can include the submitted value under ``input`` and a validator's
+    exception under ``ctx`` and ``msg``. Any of them can contain secrets, so the
+    public boundary keeps only the location and stable error type.
     """
-    errors = [{key: value for key, value in error.items() if key != "input"} for error in exc.errors()]
+    errors = [{"loc": error["loc"], "type": error["type"], "msg": "Invalid value"} for error in exc.errors()]
     return JSONResponse(
         status_code=422,
         content={
