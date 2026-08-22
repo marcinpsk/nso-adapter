@@ -681,7 +681,7 @@ async def test_a_blocked_head_is_never_rebuilt_from_a_store_that_moved_on(adapte
 
 
 async def test_restart_gives_a_pending_uncovered_generation_a_job(adapter_client):
-    """A generation whose admission could not attach it must not be stranded by a restart."""
+    """Repeated restart recovery gives an uncovered head exactly one dedicated carrier."""
     from nso_adapter.core.generation import recover_generations
     from nso_adapter.store.models import DeploymentGeneration, Job, JobStatus
 
@@ -701,10 +701,18 @@ async def test_restart_gives_a_pending_uncovered_generation_a_job(adapter_client
         )
 
     await recover_generations()
+    await recover_generations()
 
     revived = (await _generations(device_id))[0]
     assert revived.job_id is not None, "a pending generation was left with no job to deploy it"
     assert await _job_status(revived.job_id) is JobStatus.queued
+    async with session() as db:
+        carriers = list(
+            (await db.execute(sa.select(Job).where(Job.device_id == device_id, Job.status == JobStatus.queued)))
+            .scalars()
+            .all()
+        )
+    assert [(job.id, job.coalescible) for job in carriers] == [(revived.job_id, False)]
 
 
 async def test_restart_marks_a_stranded_running_generation_unknown(adapter_client):
@@ -906,8 +914,10 @@ async def test_a_pending_apply_head_replaces_its_terminal_job(adapter_client):
         job.status = JobStatus.failed
         await db.commit()
 
-    assert await advance_device_generations(device_id) == 1
+    carrier = await advance_device_generations(device_id)
     (advanced,) = await _generations(device_id)
+    assert carrier is not None and carrier.id == advanced.job_id
+    assert not carrier.coalescible
     assert advanced.job_id != stale_job_id
     assert await _job_status(advanced.job_id) is JobStatus.queued
 
@@ -922,6 +932,29 @@ def test_standalone_advancement_has_no_unreachable_fallback():
 
     function = ast.parse(dedent(inspect.getsource(advance_device_generations))).body[0]
     assert isinstance(function.body[-1], ast.AsyncWith)
+
+
+async def test_a_pending_head_bound_to_a_running_job_is_corruption(adapter_client):
+    from nso_adapter.core.generation import GenerationCarrierCorruption, advance_device_generations
+    from nso_adapter.store.models import Job, JobStatus
+
+    device_id = await _device("gen-advance-running", 9775)
+    await _vlan(device_id, 94)
+    await _push(adapter_client, device_id)
+    (head,) = await _generations(device_id)
+
+    async with session() as db:
+        job = await db.get(Job, head.job_id)
+        job.status = JobStatus.running
+        job.run_attempt = 1
+        await db.commit()
+
+    with pytest.raises(GenerationCarrierCorruption, match="running carrier"):
+        await advance_device_generations(device_id)
+
+    (unchanged,) = await _generations(device_id)
+    assert unchanged.job_id == head.job_id
+    assert await _job_status(head.job_id) is JobStatus.running
 
 
 async def test_standalone_advancement_takes_the_projection_lock(adapter_client, rival_engine):
@@ -944,46 +977,182 @@ async def test_standalone_advancement_takes_the_projection_lock(adapter_client, 
         assert not advancing.done(), "advancement read the chain without the projection lock"
         await holder.commit()
 
-    assert await asyncio.wait_for(advancing, timeout=2) == 0
+    assert await asyncio.wait_for(advancing, timeout=2) is None
 
 
-async def test_f8_abandoning_a_head_hands_the_released_successor_a_job_at_once(adapter_client):
-    """#1558 rework 3, finding 3 — the abandon endpoint must advance the chain itself.
+async def test_concurrent_advancement_creates_one_carrier(adapter_client):
+    """The second recovery revalidates the head after it waits for the projection lock."""
+    from nso_adapter.core import generation as generation_mod
+    from nso_adapter.store.db import get_engine
+    from nso_adapter.store.models import Job, JobStatus
 
-    Generation 3 was refused its job at admission (generation 2 sits in between), so nothing
-    carries it. Advancement otherwise runs only after a worker finishes a job or the process
-    restarts — and abandoning the blocker is exactly the case where no job will finish. The
-    successor sat ``pending`` with no job until some unrelated write happened along.
-    """
+    device_id = await _device("gen-advance-race", 9776)
+    await _vlan(device_id, 95)
+    await _push(adapter_client, device_id)
+    (head,) = await _generations(device_id)
+    async with session() as db:
+        await db.execute(sa.delete(Job).where(Job.id == head.job_id))
+        await db.commit()
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+    real = generation_mod.advance_generations_locked
+
+    async def gated(db, locked_device_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            await release.wait()
+        return await real(db, locked_device_id)
+
+    with patch("nso_adapter.core.generation.advance_generations_locked", new=gated):
+        first = asyncio.create_task(generation_mod.advance_device_generations(device_id))
+        await asyncio.wait_for(entered.wait(), timeout=3)
+        second = asyncio.create_task(generation_mod.advance_device_generations(device_id))
+        await _wait_for_relation_lock(get_engine(), "devices")
+        assert not second.done(), "the second recovery did not wait for the projection lock"
+        release.set()
+        first_carrier, second_carrier = await asyncio.wait_for(asyncio.gather(first, second), timeout=10)
+
+    assert first_carrier is not None and second_carrier is not None
+    assert first_carrier.id == second_carrier.id
+    async with session() as db:
+        carriers = list(
+            (await db.execute(sa.select(Job).where(Job.device_id == device_id, Job.status == JobStatus.queued)))
+            .scalars()
+            .all()
+        )
+    assert [(job.id, job.coalescible) for job in carriers] == [(first_carrier.id, False)]
+    assert (await _generations(device_id))[0].job_id == first_carrier.id
+
+
+async def _g1_g4_wedge(client, name: str, netbox_device_id: int):
+    """Build a blocked G2, uncovered G3, and queued G4 carrier."""
     from nso_adapter.store.models import GenerationStatus, JobStatus
 
-    device_id = await _device("gen-abandon-advance", 9768)
+    device_id = await _device(name, netbox_device_id)
     await _vlan(device_id, 69)
-    await _push(adapter_client, device_id)  # G1 networked -> apply job A
-    removal_job = await _shrink(adapter_client, device_id)  # G2 detach -> removal job R
-    await _push(adapter_client, device_id)  # G3 networked, noncontiguous -> no job
+    await _push(client, device_id)
+    removal_job = await _shrink(client, device_id)
+    await _push(client, device_id)
     first, second, third = await _generations(device_id)
-    assert third.job_id is None, "generation 3 was attached, so nothing needs releasing"
+    assert third.job_id is None
 
     assert await _finish(device_id, JobStatus.succeeded) == first.job_id
     assert await _finish(device_id, JobStatus.failed) == removal_job
     assert (await _generations(device_id))[1].status is GenerationStatus.failed
-    assert await _queued_jobs(device_id) == [], "the released successor already had a job"
 
-    resp = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/abandon-generation", headers=_AUTH)
-    assert resp.status_code == 202
+    await _vlan(device_id, 70)
+    await _push(client, device_id)
+    first, second, third, fourth = await _generations(device_id)
+    assert third.job_id is None
+    assert fourth.job_id is not None
+    return device_id, (first, second, third, fourth)
+
+
+async def test_abandoning_the_g1_g4_wedge_creates_a_fresh_g3_carrier(adapter_client):
+    """Abandon advances G3 without taking over or changing G4's queued carrier."""
+    from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, Job
+
+    device_id, (first, second, third, fourth) = await _g1_g4_wedge(
+        adapter_client,
+        "gen-abandon-wedge",
+        9768,
+    )
+    fourth_before = await _job_snapshot(adapter_client, fourth.job_id)
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/abandon-generation",
+        headers=_AUTH,
+    )
+    assert response.status_code == 202, response.text
+    carrier_id = response.json()["job_id"]
+    assert carrier_id is not None
+    assert carrier_id not in {first.job_id, second.job_id, fourth.job_id}
 
     chain = await _generations(device_id)
     assert chain[1].status is GenerationStatus.abandoned
-    advanced = chain[2]
-    assert advanced.id == third.id and advanced.status is GenerationStatus.pending
-    assert advanced.job_id is not None, "the released successor was left with no job to deploy it"
-    assert await _job_status(advanced.job_id) is JobStatus.queued
-    claimed = await _claim_and_release()
-    assert claimed is not None and claimed[0] == advanced.job_id, (
-        "the successor's job is not the one a worker would pick up next"
+    assert (chain[2].id, chain[2].job_id) == (third.id, carrier_id)
+    assert chain[2].status is GenerationStatus.pending
+    assert (chain[3].id, chain[3].job_id) == (fourth.id, fourth.job_id)
+    assert await _job_snapshot(adapter_client, fourth.job_id) == fourth_before
+    async with session() as db:
+        carrier = await db.get(Job, carrier_id)
+        counts = dict(
+            (
+                await db.execute(
+                    sa.select(DeploymentGeneration.job_id, sa.func.count())
+                    .where(DeploymentGeneration.id.in_([third.id, fourth.id]))
+                    .group_by(DeploymentGeneration.job_id)
+                )
+            ).all()
+        )
+    assert carrier is not None and not carrier.coalescible
+    assert counts == {carrier_id: 1, fourth.job_id: 1}
+    assert response.json() == {"generation_id": second.id, "seq": second.seq, "job_id": carrier_id}
+
+
+async def test_the_g3_recovery_carrier_runs_before_g4(adapter_client):
+    from nso_adapter.store.models import JobStatus
+
+    device_id, (_first, _second, _third, fourth) = await _g1_g4_wedge(
+        adapter_client,
+        "gen-abandon-worker-order",
+        9777,
     )
-    assert second.seq + 1 == advanced.seq, "an unrelated generation was advanced"
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/abandon-generation",
+        headers=_AUTH,
+    )
+    assert response.status_code == 202, response.text
+    carrier_id = response.json()["job_id"]
+
+    assert await _finish(device_id, JobStatus.succeeded) == carrier_id
+    assert await _job_status(fourth.job_id) is JobStatus.queued
+    assert await _finish(device_id, JobStatus.succeeded) == fourth.job_id
+
+
+async def test_abandon_without_a_successor_returns_a_null_job(adapter_client):
+    from nso_adapter.store.models import GenerationStatus
+
+    device_id = await _blocked_device(adapter_client, "gen-abandon-no-successor", 9778)
+    (head,) = await _generations(device_id)
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/abandon-generation",
+        headers=_AUTH,
+    )
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"generation_id": head.id, "seq": head.seq, "job_id": None}
+    assert (await _generations(device_id))[0].status is GenerationStatus.abandoned
+
+
+async def test_abandoning_one_coalesced_failure_does_not_retry_the_other(adapter_client):
+    from nso_adapter.store.models import GenerationStatus, JobStatus
+
+    device_id = await _device("gen-abandon-coalesced-failure", 9779)
+    await _vlan(device_id, 71)
+    await _push(adapter_client, device_id)
+    await _vlan(device_id, 72)
+    await _push(adapter_client, device_id)
+    first, second = await _generations(device_id)
+    assert first.job_id == second.job_id
+    assert await _finish(device_id, JobStatus.failed) == first.job_id
+    first, second = await _generations(device_id)
+    assert (first.status, second.status) == (GenerationStatus.failed, GenerationStatus.failed)
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/abandon-generation",
+        headers=_AUTH,
+    )
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"generation_id": first.id, "seq": first.seq, "job_id": None}
+    first, second = await _generations(device_id)
+    assert (first.status, second.status) == (GenerationStatus.abandoned, GenerationStatus.failed)
 
 
 @pytest.mark.parametrize("action", ["retry", "abandon"])
@@ -1268,6 +1437,136 @@ async def _blocked_device(client, name: str, netbox_device_id: int) -> int:
     removal_job = await _shrink(client, device_id, delete_origin=True)
     assert await _finish(device_id, JobStatus.failed) == removal_job
     return device_id
+
+
+async def _stored_job(job_id: int) -> dict:
+    from nso_adapter.store.models import Job
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        return {column.key: getattr(job, column.key) for column in Job.__table__.columns}
+
+
+def _normalize_stored_value(value, *, key: str | None = None):
+    if key in {"id", "device_id"}:
+        return "identity" if value is not None else None
+    if key and key.endswith("_at"):
+        return "set" if value is not None else None
+    if isinstance(value, dict):
+        return {name: _normalize_stored_value(item, key=name) for name, item in sorted(value.items())}
+    if isinstance(value, list):
+        return [_normalize_stored_value(item) for item in value]
+    return value
+
+
+async def _normalized_barrier_state(device_id: int, *, ignored_job_ids: tuple[int, ...] = ()) -> dict:
+    """Return all generation and carrier fields with storage identities normalized."""
+    from nso_adapter.core.generation import digest_document
+    from nso_adapter.store.models import DeploymentGeneration, Job
+
+    async with session() as db:
+        generations = list(
+            (
+                await db.execute(
+                    sa.select(DeploymentGeneration)
+                    .where(DeploymentGeneration.device_id == device_id)
+                    .order_by(DeploymentGeneration.seq)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        jobs = list(
+            (
+                await db.execute(
+                    sa.select(Job)
+                    .where(Job.device_id == device_id, Job.id.not_in(ignored_job_ids))
+                    .order_by(Job.created_at, Job.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    job_names = {job.id: f"job-{index}" for index, job in enumerate(jobs, start=1)}
+    normalized_jobs = []
+    for job in jobs:
+        row = {}
+        for column in Job.__table__.columns:
+            value = getattr(job, column.key)
+            if column.key == "id":
+                value = job_names[job.id]
+            elif column.key == "device_id":
+                value = "device"
+            else:
+                value = _normalize_stored_value(value, key=column.key)
+            row[column.key] = value
+        normalized_jobs.append(row)
+
+    normalized_generations = []
+    for generation in generations:
+        row = {}
+        valid_digest = generation.digest == digest_document(
+            generation.mode,
+            generation.document,
+            generation.allowed_removal_keys or {},
+        )
+        for column in DeploymentGeneration.__table__.columns:
+            value = getattr(generation, column.key)
+            if column.key == "id":
+                value = f"generation-{generation.seq}"
+            elif column.key == "device_id":
+                value = "device"
+            elif column.key == "job_id":
+                value = job_names.get(value)
+            elif column.key == "digest":
+                value = "valid" if valid_digest else "invalid"
+            elif column.key == "source_push_seq":
+                value = {stream: "push-seq" for stream in sorted(value)}
+            else:
+                value = _normalize_stored_value(value, key=column.key)
+            row[column.key] = value
+        normalized_generations.append(row)
+    return {"jobs": normalized_jobs, "generations": normalized_generations}
+
+
+@pytest.mark.parametrize("action", ["retry", "abandon"])
+@pytest.mark.parametrize("sync_status", ["queued", "running"])
+async def test_green_barrier_actions_ignore_cross_type_sync(adapter_client, action, sync_status):
+    """Retry and abandon preserve queued or running sync work and match a no-sync control."""
+    from nso_adapter.core import worker as worker_mod
+    from nso_adapter.core.claim import release_claim
+
+    control_id = await _blocked_device(adapter_client, f"gen-{action}-{sync_status}-control", 9780)
+    device_id = await _blocked_device(adapter_client, f"gen-{action}-{sync_status}-sync", 9781)
+    response = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/sync", headers=_AUTH)
+    assert response.status_code == 202, response.text
+    sync_id = response.json()["job_id"]
+
+    registration = None
+    if sync_status == "running":
+        claimed = await worker_mod._claim_next_job()
+        assert claimed is not None and claimed[0] == sync_id
+        registration = claimed[3]
+    before = await _stored_job(sync_id)
+
+    try:
+        control = await adapter_client.post(
+            f"/api/v1/devices/{control_id}/actions/{action}-generation",
+            headers=_AUTH,
+        )
+        tested = await adapter_client.post(
+            f"/api/v1/devices/{device_id}/actions/{action}-generation",
+            headers=_AUTH,
+        )
+        assert (control.status_code, tested.status_code) == (202, 202)
+        assert await _stored_job(sync_id) == before
+        assert await _normalized_barrier_state(device_id, ignored_job_ids=(sync_id,)) == (
+            await _normalized_barrier_state(control_id)
+        )
+    finally:
+        if registration is not None:
+            await release_claim(registration)
 
 
 @asynccontextmanager
