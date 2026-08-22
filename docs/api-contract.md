@@ -2170,6 +2170,8 @@ The `PUT .../static-route-intent?store_only=true` path is the exception: it upda
 the mirror without authorizing the drop, so it creates neither a removal job nor a
 tombstone (and no apply job, whatever the device's `auto_apply` setting) — clients
 must not wait for jobs it never creates.
+The `PUT .../static-route-intent?backfill_only=true` path is also an exception: it
+prunes omitted uncorrelated rows but creates neither a removal job nor a tombstone.
 A worker runs each job in the background and PUT-replaces the service. A promoted
 removal in a document-executed section renders from its generation's immutable
 document; a force-reissue renders from the current accepted rows. Either way the
