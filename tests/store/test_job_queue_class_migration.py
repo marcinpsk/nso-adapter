@@ -261,6 +261,72 @@ def test_queued_deduplication_applies_only_to_coalescible_jobs(pg_admin):
         assert landed == {"coalescible-apply": True, "dedicated-apply": False}
 
 
+def test_downgrade_rejects_a_queue_the_old_index_cannot_represent(pg_admin):
+    module = _module()
+    message = (
+        "cannot downgrade job queue classes: multiple queued non-removal jobs "
+        "exist for one device and type; resolve the queue before downgrading"
+    )
+    with private_database(pg_admin, "jobclassdowngradeguard") as sync_url:
+        alembic(sync_url, "upgrade", module.revision)
+        with engine_on(sync_url) as engine, engine.begin() as conn:
+            device_id = _seed_device(conn, "queue-class-downgrade-guard")
+            coalescible_id = _insert_classified_job(conn, "coalescible-apply", "apply", "queued", device_id, True)
+            dedicated_id = _insert_classified_job(conn, "dedicated-retry-apply", "apply", "queued", device_id, False)
+            _seed_generation(conn, device_id, dedicated_id, 1)
+            _seed_generation(conn, device_id, coalescible_id, 2)
+
+        with pytest.raises(AssertionError, match=message):
+            alembic(sync_url, "downgrade", module.down_revision)
+
+        with engine_on(sync_url) as engine, engine.connect() as conn:
+            inspector = sa.inspect(engine)
+            assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == module.revision
+            assert "coalescible" in {item["name"] for item in inspector.get_columns("jobs")}
+            assert {item["name"] for item in inspector.get_check_constraints("jobs")} >= {
+                "ck_job_removal_not_coalescible",
+                "ck_job_provision_not_coalescible",
+                "ck_job_active_provision_without_device",
+                "ck_job_detached_non_provision_terminal",
+            }
+            assert index_predicates(engine, "jobs")["uq_job_queued_per_device_type"][2] == (
+                "((status = 'queued'::jobstatus) AND coalescible)"
+            )
+            assert (
+                conn.scalar(
+                    sa.text(
+                        "SELECT count(*) FROM pg_trigger "
+                        "WHERE tgname = 'job_coalescible_immutable' AND NOT tgisinternal"
+                    )
+                )
+                == 1
+            )
+            assert dict(conn.execute(sa.text("SELECT result #>> '{}', status::text FROM jobs")).all()) == {
+                "coalescible-apply": "queued",
+                "dedicated-retry-apply": "queued",
+            }
+
+        with engine_on(sync_url) as engine, engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE jobs SET status = 'failed' WHERE id = :job_id"),
+                {"job_id": dedicated_id},
+            )
+
+        alembic(sync_url, "downgrade", module.down_revision)
+
+        with engine_on(sync_url) as engine, engine.connect() as conn:
+            inspector = sa.inspect(engine)
+            assert conn.scalar(sa.text("SELECT version_num FROM alembic_version")) == module.down_revision
+            assert "coalescible" not in {item["name"] for item in inspector.get_columns("jobs")}
+            assert index_predicates(engine, "jobs")["uq_job_queued_per_device_type"][2] == (
+                "((status = 'queued'::jobstatus) AND (job_type <> 'removal'::jobtype))"
+            )
+            assert dict(conn.execute(sa.text("SELECT result #>> '{}', status::text FROM jobs")).all()) == {
+                "coalescible-apply": "queued",
+                "dedicated-retry-apply": "failed",
+            }
+
+
 def test_job_queue_class_schema_is_reversible(pg_admin):
     module = _module()
     with private_database(pg_admin, "jobclassesrev") as sync_url:

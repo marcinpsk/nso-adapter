@@ -70,6 +70,26 @@ BEGIN
 END;
 $$
 """
+_VALIDATE_DOWNGRADE_QUEUE_CARDINALITY = """
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+          FROM jobs
+         WHERE status = 'queued'
+           AND job_type <> 'removal'
+           AND device_id IS NOT NULL
+         GROUP BY device_id, job_type
+        HAVING count(*) > 1
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'check_violation',
+            MESSAGE = 'cannot downgrade job queue classes: multiple queued non-removal jobs '
+                      'exist for one device and type; resolve the queue before downgrading';
+    END IF;
+END;
+$$
+"""
 _JOB_COALESCIBLE_IMMUTABILITY_DDL = (
     """CREATE OR REPLACE FUNCTION job_reject_coalescible_rewrite() RETURNS trigger AS $$
 BEGIN
@@ -112,6 +132,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute(_VALIDATE_DOWNGRADE_QUEUE_CARDINALITY)
     for statement in _JOB_COALESCIBLE_IMMUTABILITY_DROP_DDL:
         op.execute(statement)
     op.drop_index(_QUEUED_INDEX, table_name="jobs")
