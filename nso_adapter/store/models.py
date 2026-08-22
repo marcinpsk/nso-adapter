@@ -1450,8 +1450,9 @@ class StaticRouteTombstone(Base):
     prefix: Mapped[str] = mapped_column(String(64), nullable=False)
     next_hop: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     deployed_key: Mapped[list | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
-    # String + CHECK rather than a PG enum: the value set is closed and two-valued, and a
-    # new enum type widens the parity snapshot and needs ALTER TYPE care forever.
+    # String + CHECK rather than a PG enum: the closed value set comes from
+    # REMOVAL_MARKINGS. A new enum type widens the parity snapshot and needs ALTER TYPE
+    # care forever.
     marking: Mapped[str] = mapped_column(String(16), nullable=False)
     # The owning removal job. SET NULL, not CASCADE: a deleted job returns the tombstone
     # to the sweeper rather than destroying the deletion carrier.

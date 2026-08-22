@@ -164,6 +164,25 @@ async def test_o2_1_a_homogeneous_removal_still_produces_exactly_one_job(adapter
     assert await _generations(device_id) == [(1, "detach", out["jobs"][0])]
 
 
+async def test_a_carrier_without_a_matching_removal_job_is_rejected(adapter_client):
+    from nso_adapter.core.removal import enqueue_static_route_removals
+
+    device_id = await seed_device(nso_device_name="sr-unmatched-marking", netbox_device_id=9880)
+    async with session() as db:
+        await note_projection_write(db, device_id, "static_route")
+        tombstone = await _tombstone(db, device_id, B, marking="detach", route_id=101)
+        await db.flush()
+
+        with pytest.raises(RuntimeError, match="carrier marked 'detach' has no job"):
+            await enqueue_static_route_removals(
+                db,
+                device_id,
+                promotes=("static_route",),
+                removed={"delete_origin": [A]},
+                tombstones=[tombstone],
+            )
+
+
 # ── O2.2: run to execution ──────────────────────────────────────────────────
 
 
