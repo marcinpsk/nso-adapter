@@ -58,11 +58,17 @@ async def _wait_for_relation_lock(engine, relation: str, *, timeout: float = 5.0
             waiting = await probe.scalar(
                 sa.text(
                     "SELECT EXISTS ("
-                    "SELECT 1 FROM pg_stat_activity "
-                    "WHERE datname = current_database() "
-                    "AND pid <> pg_backend_pid() "
-                    "AND wait_event_type = 'Lock' "
-                    "AND position(:relation IN lower(query)) > 0"
+                    "SELECT 1 FROM pg_stat_activity AS activity "
+                    "WHERE activity.datname = current_database() "
+                    "AND activity.pid <> pg_backend_pid() "
+                    "AND activity.wait_event_type = 'Lock' "
+                    "AND cardinality(pg_blocking_pids(activity.pid)) > 0 "
+                    "AND position(:relation IN lower(activity.query)) > 0 "
+                    "AND EXISTS ("
+                    "SELECT 1 FROM pg_locks AS lock "
+                    "WHERE lock.pid = activity.pid "
+                    "AND lock.relation = to_regclass(:relation)"
+                    ")"
                     ")"
                 ),
                 {"relation": relation.lower()},
@@ -738,13 +744,18 @@ async def test_concurrent_creation_orders_by_commit_not_by_start(adapter_client,
     from nso_adapter.store.models import VlanIntent
 
     device_id = await _device("gen-concurrent", 9740)
+    # A non-FK update keeps the slow write open without locking the device row first.
+    async with session() as db:
+        db.add(VlanIntent(device_id=device_id, vlan_id=80, name="before"))
+        await db.commit()
 
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
     async with rival() as slow, rival() as fast:
         # The slow transaction starts FIRST and really writes, but has not yet reached the
         # projection lock — a SELECT-only "overlap" would prove nothing about ordering.
-        slow.add(VlanIntent(device_id=device_id, vlan_id=80, name="slow"))
-        await slow.flush()
+        await slow.execute(
+            sa.update(VlanIntent).where(VlanIntent.device_id == device_id, VlanIntent.vlan_id == 80).values(name="slow")
+        )
 
         await note_write(fast, device_id, "snmp")
         await enqueue_apply(fast, device_id, force=True, stream="snmp")
@@ -788,7 +799,7 @@ async def test_a_second_writer_cannot_allocate_until_the_first_commits(adapter_c
             await waiter.commit()
 
         blocked = asyncio.create_task(second_writer())
-        await _wait_for_relation_lock(get_engine(), "device_generation_counter")
+        await _wait_for_relation_lock(get_engine(), "devices")
         assert not blocked.done(), "the second promotion allocated a sequence under a held lock"
 
         await holder.commit()
@@ -804,18 +815,13 @@ async def test_the_projection_lock_serializes_two_writers(adapter_client, rival_
     from nso_adapter.store.db import get_engine
 
     device_id = await _device("gen-lock", 9741)
-    # The counter row must already EXIST, or the two writers would serialize on the insert
-    # conflict alone and the row lock this test is about would never be exercised.
-    async with session() as db:
-        await lock_projection(db, device_id)
-        await db.commit()
 
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
     async with rival() as holder, rival() as waiter:
         await lock_projection(holder, device_id)
 
         blocked = asyncio.create_task(lock_projection(waiter, device_id))
-        await _wait_for_relation_lock(get_engine(), "device_generation_counter")
+        await _wait_for_relation_lock(get_engine(), "devices")
         assert not blocked.done(), "a second projection writer was not serialized"
 
         await holder.commit()
@@ -934,7 +940,7 @@ async def test_standalone_advancement_takes_the_projection_lock(adapter_client, 
     async with rival() as holder:
         await lock_projection(holder, device_id)
         advancing = asyncio.create_task(advance_device_generations(device_id))
-        await _wait_for_relation_lock(get_engine(), "device_generation_counter")
+        await _wait_for_relation_lock(get_engine(), "devices")
         assert not advancing.done(), "advancement read the chain without the projection lock"
         await holder.commit()
 
@@ -1239,6 +1245,8 @@ async def _first_request_holds_the_head():
 
 async def test_f3_a_two_concurrent_retries_admit_the_head_once(adapter_client):
     """Both operator requests target the same blocked head; only one may re-admit it."""
+    from nso_adapter.store.db import get_engine
+
     device_id = await _blocked_device(adapter_client, "gen-retry-race", 9763)
 
     url = f"/api/v1/devices/{device_id}/actions/retry-generation"
@@ -1246,12 +1254,8 @@ async def test_f3_a_two_concurrent_retries_admit_the_head_once(adapter_client):
         first = asyncio.create_task(adapter_client.post(url, headers=_AUTH))
         await asyncio.wait_for(parked.wait(), timeout=3)
         second = asyncio.create_task(adapter_client.post(url, headers=_AUTH))
-        # Inside the held window the rival either refuses outright or blocks on the first
-        # request's open transaction; completing here proves the refusal happened in-window.
-        # Keep this observation window below the database lock timeout.
-        in_window, _ = await asyncio.wait({second}, timeout=1)
-        if in_window:
-            assert second.result().status_code == 409, "the rival finished in the held window without refusing"
+        await _wait_for_relation_lock(get_engine(), "devices")
+        assert not second.done(), "the rival did not wait for the first request's device lock"
         release.set()
         one, two = await asyncio.wait_for(asyncio.gather(first, second), timeout=20)
 
@@ -1263,6 +1267,7 @@ async def test_f3_a_two_concurrent_retries_admit_the_head_once(adapter_client):
 
 async def test_f3_b_a_retry_and_an_abandon_cannot_both_win(adapter_client):
     """One request re-admits the head, the other gives up on it. Never both."""
+    from nso_adapter.store.db import get_engine
     from nso_adapter.store.models import GenerationStatus
 
     device_id = await _blocked_device(adapter_client, "gen-retry-abandon-race", 9764)
@@ -1272,10 +1277,8 @@ async def test_f3_b_a_retry_and_an_abandon_cannot_both_win(adapter_client):
         retrying = asyncio.create_task(adapter_client.post(f"{base}/retry-generation", headers=_AUTH))
         await asyncio.wait_for(parked.wait(), timeout=3)
         abandoning = asyncio.create_task(adapter_client.post(f"{base}/abandon-generation", headers=_AUTH))
-        # Same window proof as the retry race: an in-window completion must be the refusal.
-        in_window, _ = await asyncio.wait({abandoning}, timeout=1)
-        if in_window:
-            assert abandoning.result().status_code == 409, "the abandon finished in the held window without refusing"
+        await _wait_for_relation_lock(get_engine(), "devices")
+        assert not abandoning.done(), "the abandon did not wait for the retry's device lock"
         release.set()
         retry, abandon = await asyncio.wait_for(asyncio.gather(retrying, abandoning), timeout=20)
 
@@ -1356,7 +1359,7 @@ async def test_manual_apply_ignores_an_unselected_section_committed_alongside_it
                 headers=_AUTH,
             )
         )
-        await _wait_for_relation_lock(get_engine(), "device_generation_counter", timeout=30.0)
+        await _wait_for_relation_lock(get_engine(), "devices", timeout=30.0)
         assert not applying.done(), "the Apply did not wait for the projection lock"
         await holder.commit()
         resp = await asyncio.wait_for(applying, timeout=30)
@@ -1422,8 +1425,8 @@ async def test_f9_an_offboard_under_an_intent_put_answers_not_found(adapter_clie
         await offboarding.flush()  # the rows are gone but the delete is UNCOMMITTED
 
         putting = asyncio.create_task(put_vlans(adapter_client, device_id, [10]))
-        await _wait_for_relation_lock(get_engine(), "device_generation_counter")
-        assert not putting.done(), "the PUT did not reach the projection lock the offboard holds"
+        await _wait_for_relation_lock(get_engine(), "devices")
+        assert not putting.done(), "the PUT did not reach the device row lock the offboard holds"
 
         await offboarding.commit()
         resp = await asyncio.wait_for(putting, timeout=10)

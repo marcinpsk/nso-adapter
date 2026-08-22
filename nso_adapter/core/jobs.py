@@ -29,7 +29,7 @@ from nso_adapter.core.claim import (
     lock_claim,
     terminalize,
 )
-from nso_adapter.store.models import Job, JobStatus, JobType
+from nso_adapter.store.models import Device, Job, JobStatus, JobType
 
 logger = structlog.get_logger(__name__)
 
@@ -141,8 +141,13 @@ async def admit_queued_job(
     endpoint calls this with intent rows already mutated and uncommitted, and losing those
     is a silent data loss, not a retryable error.
 
+    Device-bound admission takes ``devices FOR KEY SHARE`` before the insert, so teardown
+    and job creation follow the shared device-before-job lock graph.
+
     Does NOT commit: the caller owns its transaction boundary.
     """
+    if device_id is not None:
+        await db.execute(select(Device.id).where(Device.id == device_id).with_for_update(read=True, key_share=True))
     for _attempt in range(_ADMISSION_RETRIES):
         values: dict = {
             "job_type": job_type,

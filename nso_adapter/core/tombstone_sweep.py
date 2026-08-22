@@ -133,9 +133,10 @@ async def sweep_one_device(device_id: int, *, db: AsyncSession | None = None) ->
     created = 0
     try:
         async with claim_session(db) as conn:
-            # Guard first, then tombstones, then jobs — §3.9's order. No `devices` row
-            # lock: the claim is the exclusion, and a same-device rival already lost.
+            from nso_adapter.core.generation import lock_projection
+
             await lock_claim(conn, reg)
+            await lock_projection(conn, device_id)
             ids = sorted(
                 (
                     await conn.execute(

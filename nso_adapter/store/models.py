@@ -503,10 +503,8 @@ class DeviceGenerationCounter(Base):
     from, which is what gives generation creation the single consistent snapshot §G1 calls
     for without an isolation-level change (see the module docstring).
 
-    Created lazily by an upsert, unlike :class:`DeviceSettleCounter`: generation creation is
-    never a terminal transaction, so the FK check's ``FOR KEY SHARE`` on ``devices`` closes
-    no cycle here — the deadlock that forbids a lazy settle counter does not exist on this
-    path.
+    Created lazily by an upsert, unlike :class:`DeviceSettleCounter`. The caller already
+    holds ``devices FOR UPDATE``, so creation stays on the shared device-before-counter graph.
     """
 
     __tablename__ = "device_generation_counter"

@@ -59,7 +59,6 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.projection import (
@@ -78,6 +77,7 @@ from nso_adapter.store.db import execute_dml
 from nso_adapter.store.models import (
     SETTLEMENT_COHORT_SEQUENCE,
     DeploymentGeneration,
+    Device,
     DeviceGenerationCounter,
     DeviceProjectionStream,
     DeviceSettings,
@@ -156,24 +156,18 @@ async def lock_projection(db: AsyncSession, device_id: int) -> None:
 
     Taken by EVERY accepted write, store-only included: a store-only repair that slipped in
     between two of the document's SELECTs would put state into a generation nobody
-    authorized. The lock is the counter row, so the same acquisition that orders the
-    writers also orders the sequence they allocate.
-
-    The row is created lazily under a SAVEPOINT — this is never a terminal transaction, so
-    the FK check's ``FOR KEY SHARE`` on ``devices`` closes no cycle here (contrast
-    :mod:`store.device_settle`, where a lazy create WOULD deadlock against offboard).
+    authorized. The device row orders projection writers against offboard. The counter row
+    then orders the sequence they allocate.
     """
-    try:
-        async with db.begin_nested():
-            await db.execute(
-                pg_insert(DeviceGenerationCounter)
-                .values(device_id=device_id, last_seq=0)
-                .on_conflict_do_nothing(index_elements=["device_id"])
-            )
-    except IntegrityError:
-        # The FK found no device: it was offboarded under this write. `from None` keeps the
-        # driver's request-echoing exception out of the traceback.
-        raise DeviceProjectionGone(f"device {device_id} no longer exists") from None
+    held_device = await db.scalar(select(Device.id).where(Device.id == device_id).with_for_update())
+    if held_device is None:
+        raise DeviceProjectionGone(f"device {device_id} no longer exists")
+    async with db.begin_nested():
+        await db.execute(
+            pg_insert(DeviceGenerationCounter)
+            .values(device_id=device_id, last_seq=0)
+            .on_conflict_do_nothing(index_elements=["device_id"])
+        )
     held = await db.scalar(
         select(DeviceGenerationCounter.device_id)
         .where(DeviceGenerationCounter.device_id == device_id)
