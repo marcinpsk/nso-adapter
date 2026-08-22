@@ -63,6 +63,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.projection import (
+    EXECUTION_KEY,
     InterfaceEligibilityUnresolved,
     is_intent_deletion,
     projection_row_state,
@@ -864,6 +865,21 @@ async def _store_generation(
     # revisions and keeps its established live-store, job-row and tombstone-row semantics.
     if stream_revisions:
         promoted_sections = {stream_section(stream) for stream in stream_revisions}
+        if "interface_config" in body and "interface_config" not in promoted_sections:
+            # A complete successor document carries the authorized interface section. Keep
+            # its last immutable execution plan instead of resolving changed live state.
+            previous_document = await db.scalar(
+                select(DeploymentGeneration.document)
+                .where(
+                    DeploymentGeneration.device_id == device_id,
+                    DeploymentGeneration.document["interface_config"][EXECUTION_KEY].is_not(None),
+                )
+                .order_by(DeploymentGeneration.seq.desc())
+                .limit(1)
+            )
+            previous_execution = ((previous_document or {}).get("interface_config") or {}).get(EXECUTION_KEY)
+            if previous_execution is not None:
+                body["interface_config"][EXECUTION_KEY] = deepcopy(previous_execution)
         if "interface_config" in promoted_sections:
             if (removal_context or {}).get("scope") == "interface_config":
                 section = body.setdefault("interface_config", {})

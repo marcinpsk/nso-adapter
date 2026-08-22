@@ -836,8 +836,8 @@ async def test_interface_config_generation_refuses_unresolvable_attribute_eligib
     assert warning["exc_info"] is True
 
 
-async def test_unrelated_promotion_does_not_resolve_interface_eligibility(adapter_client):
-    """A VLAN-only promotion does not validate an unselected interface revision."""
+async def test_unrelated_promotion_preserves_recorded_interface_eligibility(adapter_client):
+    """A VLAN-only promotion carries the interface plan without reading changed live state."""
     from nso_adapter.store.models import DbInterface, InterfaceAttrState, JobStatus
     from tests.core.test_generation_protocol import job_row, recorded_client, run_head
 
@@ -852,6 +852,7 @@ async def test_unrelated_promotion_does_not_resolve_interface_eligibility(adapte
     assert stored_interface.status_code == 200, stored_interface.text
     promoted_interface = await _apply(adapter_client, device_id, {"interface_config": 6592})
     assert promoted_interface.status_code == 202, promoted_interface.text
+    interface_execution = (await _generations(device_id))[-1].document["interface_config"]["_execution"]
     client, _ = recorded_client("unselected-interface-eligibility")
     job_id = await run_head(device_id, client)
     assert job_id is not None
@@ -874,7 +875,42 @@ async def test_unrelated_promotion_does_not_resolve_interface_eligibility(adapte
     assert response.status_code == 202, response.text
     generation = (await _generations(device_id))[-1]
     assert generation.stream_revisions == {"vlan": 1}
-    assert "_execution" not in generation.document["interface_config"]
+    assert generation.document["interface_config"]["_execution"] == interface_execution
+
+
+async def test_coalesced_vlan_successor_preserves_interface_execution(adapter_client):
+    """The highest document keeps the immutable plan for every section the shared job executes."""
+    from nso_adapter.core.generation import generation_execution_sections
+    from nso_adapter.store.models import JobStatus
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="coalesced-interface-plan", netbox_device_id=10001)
+    await seed_settings(device_id, auto_apply=True)
+
+    interface_response = await _put_interface_attrs(
+        adapter_client,
+        device_id,
+        "selected description",
+        seq=6594,
+    )
+    assert interface_response.status_code == 200, interface_response.text
+    (interface_generation,) = await _generations(device_id)
+    interface_execution = interface_generation.document["interface_config"]["_execution"]
+
+    vlan_response = await _put_vlans(adapter_client, device_id, [10], seq=6595)
+    assert vlan_response.status_code == 200, vlan_response.text
+    interface_generation, vlan_generation = await _generations(device_id)
+    assert vlan_generation.job_id == interface_generation.job_id
+    assert vlan_generation.document["interface_config"]["_execution"] == interface_execution
+
+    async with session() as db:
+        assert await generation_execution_sections(db, vlan_generation.job_id) == frozenset(
+            {"interface_config", "vlan"}
+        )
+
+    client, _recorder = recorded_client("coalesced-interface-plan")
+    assert await run_head(device_id, client) == vlan_generation.job_id
+    assert (await job_row(vlan_generation.job_id)).status is JobStatus.succeeded
 
 
 async def test_failed_svi_document_send_with_no_stamp_rows_fails_generation(adapter_client):
