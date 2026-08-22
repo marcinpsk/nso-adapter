@@ -432,7 +432,7 @@ async def test_claimed_producers_lock_projection_before_tombstones(adapter_clien
 
 
 async def test_ordinary_admission_takes_device_key_share_before_insert(adapter_client, rival_engine):
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from nso_adapter.store.db import get_engine
     from nso_adapter.store.models import Device, JobType
 
@@ -443,7 +443,7 @@ async def test_ordinary_admission_takes_device_key_share_before_insert(adapter_c
         holder_pid = await _backend_pid(holder)
         writer_pid = await _backend_pid(writer)
         await holder.execute(sa.select(Device.id).where(Device.id == device_id).with_for_update())
-        admitting = asyncio.create_task(admit_queued_job(writer, device_id, JobType.sync))
+        admitting = asyncio.create_task(admit_coalescible_job(writer, device_id, JobType.sync))
         try:
             await _wait_for_blocked_query(
                 get_engine(),

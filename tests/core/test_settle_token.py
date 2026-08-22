@@ -168,7 +168,7 @@ async def test_delayed_recovery_cannot_terminalize_a_successor_run(adapter_clien
 
     S1.2 does not cover this: it drives a stale RUNNER, not a stale recovery actor.
     """
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from nso_adapter.store.models import Job, JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="s1-delayed", netbox_device_id=9903)
@@ -210,7 +210,7 @@ async def test_delayed_recovery_cannot_terminalize_a_successor_run(adapter_clien
             await _start_run(device_id, jid)
             # … and admission commits a queued same-type successor.
             async with rival() as other:
-                created, winner = await admit_queued_job(other, device_id, JobType.sync)
+                created, winner = await admit_coalescible_job(other, device_id, JobType.sync)
                 await other.commit()
                 successor_ids.append((created or winner).id)
         return await real_terminalize(db, jid, **kwargs)
@@ -349,7 +349,7 @@ async def test_a_superseded_requeue_returns_failed_not_queued(adapter_client):
     The caller may never read its requested status: only the returned one is the truth.
     """
     from nso_adapter.core.claim import terminalize_running
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from nso_adapter.store.models import JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="s1-superseded", netbox_device_id=9906)
@@ -357,7 +357,7 @@ async def test_a_superseded_requeue_returns_failed_not_queued(adapter_client):
     _jid, _dev, _jt, reg = await _start_run(device_id, job_id)
 
     async with session() as db:
-        created, winner = await admit_queued_job(db, device_id, JobType.sync)
+        created, winner = await admit_coalescible_job(db, device_id, JobType.sync)
         await db.commit()
         successor_id = (created or winner).id
 
@@ -375,7 +375,7 @@ async def test_a_superseded_requeue_abandons_its_generation(adapter_client):
     """The elected successor can cross a generation the stale run no longer owns."""
     from nso_adapter.core.claim import terminalize_running
     from nso_adapter.core.generation import job_admissible
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="s1-superseded-generation", netbox_device_id=9911)
@@ -385,7 +385,7 @@ async def test_a_superseded_requeue_abandons_its_generation(adapter_client):
     generation_id = await _running_generation(device_id, job_id)
 
     async with session() as db:
-        created, winner = await admit_queued_job(db, device_id, JobType.apply)
+        created, winner = await admit_coalescible_job(db, device_id, JobType.apply)
         await db.commit()
         successor_id = (created or winner).id
 
@@ -409,7 +409,7 @@ async def test_a_successor_inserted_mid_decision_lands_superseded(adapter_client
     transaction stays usable.
     """
     from nso_adapter.core.claim import terminalize_running
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, Job, JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="s1-midrace", netbox_device_id=9907)
@@ -431,7 +431,7 @@ async def test_a_successor_inserted_mid_decision_lands_superseded(adapter_client
             if not fired:
                 fired.append(True)
                 async with rival() as other:
-                    await admit_queued_job(other, device_id, JobType.apply)
+                    await admit_coalescible_job(other, device_id, JobType.apply)
                     await other.commit()
             return out
 

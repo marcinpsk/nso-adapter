@@ -1992,8 +1992,9 @@ async def enqueue_removal(
         create_reissue_generation,
         require_attach_to_job,
     )
+    from nso_adapter.core.jobs import create_dedicated_job
     from nso_adapter.core.request_flags import STORE_ONLY
-    from nso_adapter.store.models import GenerationMode, Job, JobStatus, JobType
+    from nso_adapter.store.models import GenerationMode, JobType
 
     if scope not in VALID_REMOVAL_SCOPES:
         raise ValueError(f"Unknown removal scope {scope!r}")
@@ -2087,15 +2088,7 @@ async def enqueue_removal(
             settlement_cohort=settlement_cohort,
             static_route_tombstone_ids=static_route_tombstone_ids,
         )
-    job = Job(
-        job_type=JobType.removal,
-        device_id=device_id,
-        status=JobStatus.queued,
-        coalescible=False,
-        context=context,
-    )
-    db.add(job)
-    await db.flush()
+    job = await create_dedicated_job(db, device_id, JobType.removal, context=context)
     await require_attach_to_job(db, generation, job)
     await _settle_pending_clears_at_admission(db, device_id, scope, promotes, mode=mode, force=force)
     logger.info("removal.enqueued", device_id=device_id, scope=scope, job_id=job.id, marking=marking)

@@ -407,7 +407,7 @@ async def test_a_superseded_requeue_that_lands_failed_allocates_once(adapter_cli
     or allocating for a requeue that stayed ``queued``, which is not a terminal write at all.
     """
     from nso_adapter.core.claim import terminalize_running
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from tests.core.test_settle_token import _queue, _start_run
 
     device_id = await seed_device(nso_device_name="inv-superseded", netbox_device_id=8320)
@@ -415,7 +415,7 @@ async def test_a_superseded_requeue_that_lands_failed_allocates_once(adapter_cli
     _jid, _dev, _jt, reg = await _start_run(device_id, job_id)
 
     async with session() as db:
-        created, winner = await admit_queued_job(db, device_id, JobType.sync)
+        created, winner = await admit_coalescible_job(db, device_id, JobType.sync)
         await db.commit()
         successor_id = (created or winner).id
 
@@ -446,7 +446,7 @@ async def test_a_rejected_recovery_write_allocates_nothing(adapter_client, monke
 
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from tests.core.test_settle_token import _queue, _recover, _start_run
 
     device_id = await seed_device(nso_device_name="inv-delayed", netbox_device_id=8321)
@@ -487,7 +487,7 @@ async def test_a_rejected_recovery_write_allocates_nothing(adapter_client, monke
                 await other.commit()
             await _start_run(device_id, jid)
             async with rival() as other:
-                await admit_queued_job(other, device_id, JobType.sync)
+                await admit_coalescible_job(other, device_id, JobType.sync)
                 await other.commit()
         return await real_terminalize_running(db, jid, **kwargs)
 

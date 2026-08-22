@@ -154,7 +154,7 @@ async def enqueue_apply(
     site, and moving it there belongs with that change.
     """
     from nso_adapter.core.generation import attach_to_job, create_generation
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from nso_adapter.core.request_flags import STORE_ONLY
     from nso_adapter.store.models import GenerationMode
 
@@ -182,7 +182,7 @@ async def enqueue_apply(
     # A removal is enqueued BEFORE its apply by design, so rejecting on any active job
     # dropped the apply outright; and a running apply must not refuse its successor, because
     # the successor is what carries the newer intent.
-    created, winner = await admit_queued_job(db, device_id, JobType.apply)
+    created, winner = await admit_coalescible_job(db, device_id, JobType.apply)
     job = created or winner
     if job is not None:
         # A refused attachment is not an error: the generation is not contiguous with what

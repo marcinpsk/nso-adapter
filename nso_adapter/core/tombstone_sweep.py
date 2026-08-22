@@ -23,6 +23,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import acquire_claim, claim_session, lock_claim, release_claim
+from nso_adapter.core.jobs import create_dedicated_job
 from nso_adapter.core.request_flags import DETACH_MARKING
 from nso_adapter.core.static_route_plan import as_triple, triple_of
 from nso_adapter.store.models import Job, JobStatus, JobType, StaticRouteTombstone
@@ -92,15 +93,7 @@ async def reissue_removal_job(conn: AsyncSession, device_id: int, row: StaticRou
         removal_context=context,
         allowed_removal_keys=context["removed"],
     )
-    job = Job(
-        job_type=JobType.removal,
-        device_id=device_id,
-        status=JobStatus.queued,
-        coalescible=False,
-        context=context,
-    )
-    conn.add(job)
-    await conn.flush()
+    job = await create_dedicated_job(conn, device_id, JobType.removal, context=context)
     generation.job_id = job.id
     row.job_id = job.id
     await conn.flush()

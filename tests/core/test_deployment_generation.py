@@ -374,7 +374,7 @@ async def test_a_queued_job_coalesces_within_its_mode_and_settles_all_it_carried
 
     A still-queued networked job has sent nothing yet, so the writes that arrive before it
     starts are genuinely part of what it will deploy. The boundary is the job STARTING, not
-    the generation being created: once running, ``admit_queued_job`` hands the next write a
+    the generation being created: once running, ``admit_coalescible_job`` gives the next write a
     successor job instead (proven by the test above).
     """
     from nso_adapter.store.models import GenerationStatus, JobStatus
@@ -1083,6 +1083,37 @@ async def _retry_head(device_id: int) -> int:
         return job.id
 
 
+async def _retry_head_http(client, device_id: int) -> int:
+    response = await client.post(
+        f"/api/v1/devices/{device_id}/actions/retry-generation",
+        headers=_AUTH,
+    )
+    assert response.status_code == 202, response.text
+    return response.json()["job_id"]
+
+
+async def _job_snapshot(client, job_id: int) -> dict:
+    response = await client.get(f"/api/v1/jobs/{job_id}", headers=_AUTH)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def _blocked_apply_with_successor(client, name: str, netbox_device_id: int) -> tuple[int, int, int, int]:
+    from nso_adapter.store.models import JobStatus
+
+    device_id = await _device(name, netbox_device_id)
+    await _vlan(device_id, 66)
+    await _push(client, device_id)
+    (head,) = await _generations(device_id)
+    assert await _finish(device_id, JobStatus.failed) == head.job_id
+
+    await _vlan(device_id, 67)
+    await _push(client, device_id)
+    head, successor = await _generations(device_id)
+    assert successor.job_id is not None
+    return device_id, head.id, successor.id, successor.job_id
+
+
 async def test_f1_a_retried_removal_runs_past_a_blocked_apply_successor(adapter_client):
     """§H2 — a retried head must not wait behind the successor its own failure blocked.
 
@@ -1134,77 +1165,98 @@ async def test_f1_b_retried_apply_runs_past_a_blocked_removal_successor(adapter_
     )
 
 
-async def test_f2_a_released_removal_successor_keeps_a_removal_job(adapter_client):
-    """A retry takeover releases a networked REMOVAL successor; it must not become an apply.
+async def test_f2_a_retry_preserves_force_removal_successor_identity(adapter_client):
+    """Retry creates a new carrier without changing a force-removal job."""
+    from nso_adapter.store.models import JobStatus
 
-    ``advance_device_generations`` routed only ``detach`` down the removal path, so a
-    delete-origin removal was handed an apply job — which settles the generation without
-    ever deleting anything.
-    """
-    from nso_adapter.store.models import GenerationMode, JobStatus, JobType
-
-    device_id = await _device("gen-released-removal", 9762, auto_apply=False)
+    device_id = await _device("gen-force-removal-identity", 9771)
     await _vlan(device_id, 63)
-    await _vlan(device_id, 64)
-    await _push(adapter_client, device_id)
+    removal_job = await _shrink(adapter_client, device_id, delete_origin=True)
+    assert await _finish(device_id, JobStatus.failed) == removal_job
 
-    # Two marked deletions: the first fails, the second queues its own removal job.
-    _vlans[device_id] = [63]
-    assert (await put_vlans(adapter_client, device_id, [63], query="?delete_origin=true")).status_code == 200
-    first_removal = (await _queued_jobs(device_id))[0].id
-    assert await _finish(device_id, JobStatus.failed) == first_removal
+    force = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/force-removal",
+        json={"scope": "vlan"},
+        headers=_AUTH,
+    )
+    assert force.status_code == 202, force.text
+    successor_job_id = force.json()["job_id"]
+    head, successor = await _generations(device_id)
+    assert successor.job_id == successor_job_id
+    before = await _job_snapshot(adapter_client, successor_job_id)
 
-    _vlans[device_id] = []
-    assert (await put_vlans(adapter_client, device_id, [], query="?delete_origin=true")).status_code == 200
-    chain = await _generations(device_id)
-    assert [g.mode for g in chain] == [GenerationMode.networked, GenerationMode.networked]
+    retry_job_id = await _retry_head_http(adapter_client, device_id)
 
-    # The retry takes the successor's queued removal job over, unattaching the successor.
-    retried = await _retry_head(device_id)
-    assert (await _generations(device_id))[1].job_id is None
-    assert await _finish(device_id, JobStatus.succeeded) == retried
+    assert retry_job_id != successor_job_id
+    after = await _job_snapshot(adapter_client, successor_job_id)
+    assert after == before
+    head_after, successor_after = await _generations(device_id)
+    assert (head_after.job_id, successor_after.job_id) == (retry_job_id, successor_job_id)
+    assert [generation.id for generation in (head_after, successor_after) if generation.job_id == retry_job_id] == [
+        head.id
+    ]
 
-    successor = (await _generations(device_id))[1]
-    assert successor.job_id is not None, "the released removal successor was never re-admitted"
+
+async def test_f2_b_retry_preserves_apply_successor_identity(adapter_client):
+    """Retry creates a new carrier without detaching an Apply successor."""
+    device_id, head_id, successor_id, successor_job_id = await _blocked_apply_with_successor(
+        adapter_client,
+        "gen-apply-identity",
+        9772,
+    )
+    before = await _job_snapshot(adapter_client, successor_job_id)
+
+    retry_job_id = await _retry_head_http(adapter_client, device_id)
+
+    assert retry_job_id != successor_job_id
+    after = await _job_snapshot(adapter_client, successor_job_id)
+    assert after == before
+    head, successor = await _generations(device_id)
+    assert (head.id, head.job_id) == (head_id, retry_job_id)
+    assert (successor.id, successor.job_id) == (successor_id, successor_job_id)
+
+
+async def test_f2_c_a_dedicated_job_rejects_a_second_generation(adapter_client):
+    from nso_adapter.core.generation import attach_to_job, create_generation, note_write
+    from nso_adapter.core.jobs import create_dedicated_job
+    from nso_adapter.store.models import GenerationMode, JobType
+
+    device_id = await _device("gen-dedicated-cardinality", 9773, auto_apply=False)
     async with session() as db:
-        from nso_adapter.store.models import Job
+        await note_write(db, device_id, "vlan")
+        first = await create_generation(db, device_id, streams=("vlan",), mode=GenerationMode.networked)
+        carrier = await create_dedicated_job(db, device_id, JobType.apply)
+        assert await attach_to_job(db, first, carrier)
 
-        job = await db.get(Job, successor.job_id)
-    assert job.job_type is JobType.removal, "a delete-origin removal was re-admitted as an apply"
-    assert job.context.get("scope") == "vlan"
-
-
-async def test_f2_b_retry_does_not_take_over_a_generationless_removal_job(adapter_client):
-    """A retry must preserve a queued legacy removal's only durable context."""
-    from nso_adapter.store.models import Job, JobStatus, JobType
-
-    device_id = await _blocked_device(adapter_client, "gen-retry-legacy-removal", 9768)
-    (failed,) = await _generations(device_id)
-    retry_context = failed.removal_context
-    legacy_context = {"scope": "bgp"}
-
-    async with session() as db:
-        legacy = Job(
-            job_type=JobType.removal,
-            device_id=device_id,
-            status=JobStatus.queued,
-            coalescible=False,
-            context=legacy_context,
-        )
-        db.add(legacy)
+        await note_write(db, device_id, "vlan")
+        second = await create_generation(db, device_id, streams=("vlan",), mode=GenerationMode.networked)
+        assert not await attach_to_job(db, second, carrier)
+        carrier_id = carrier.id
         await db.commit()
-        legacy_id = legacy.id
 
-    retried_id = await _retry_head(device_id)
+    first, second = await _generations(device_id)
+    assert first.job_id == carrier_id
+    assert second.job_id is None
+
+
+async def test_f2_d_worker_runs_the_retry_before_its_older_successor(adapter_client):
+    from nso_adapter.core.generation import job_admissible
+    from nso_adapter.store.models import JobStatus
+
+    device_id, _head_id, _successor_id, successor_job_id = await _blocked_apply_with_successor(
+        adapter_client,
+        "gen-retry-worker-order",
+        9774,
+    )
+    retry_job_id = await _retry_head_http(adapter_client, device_id)
 
     async with session() as db:
-        legacy = await db.get(Job, legacy_id)
-        retried = await db.get(Job, retried_id)
-    (generation,) = await _generations(device_id)
-    assert retried_id != legacy_id
-    assert legacy.context == legacy_context
-    assert retried.context == retry_context
-    assert generation.job_id == retried_id
+        assert not await job_admissible(db, successor_job_id, device_id)
+        assert await job_admissible(db, retry_job_id, device_id)
+
+    assert await _finish(device_id, JobStatus.succeeded) == retry_job_id
+    assert await _job_status(successor_job_id) is JobStatus.queued
+    assert await _finish(device_id, JobStatus.succeeded) == successor_job_id
 
 
 async def _blocked_device(client, name: str, netbox_device_id: int) -> int:

@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Job enqueue helpers and background task runners.
+"""Own Job construction, queue admission, and background task runners.
 
-One job per device runs at a time — a second request while a job is
-queued/running returns the existing job id for 409 handling in the API layer.
+Coalescible admission atomically returns the same-type queued winner. Dedicated
+admission always creates a fresh carrier for one removal or recovery generation.
+Provision keeps its separate pre-device context-pair admission.
 
-Execution is handled by the durable worker pool (``core.worker``): ``enqueue_job``
-only inserts a ``queued`` row; a worker claims and runs it.
+Execution is handled by the durable worker pool (``core.worker``): these interfaces
+only insert ``queued`` rows; a worker claims and runs them.
 """
 
 from __future__ import annotations
@@ -127,7 +128,7 @@ async def _lock_queued_winner(db: AsyncSession, device_id: int, job_type: JobTyp
     )
 
 
-async def admit_queued_job(
+async def admit_coalescible_job(
     db: AsyncSession,
     device_id: int,
     job_type: JobType,
@@ -146,8 +147,9 @@ async def admit_queued_job(
 
     Does NOT commit: the caller owns its transaction boundary.
     """
-    if device_id is not None:
-        await db.execute(select(Device.id).where(Device.id == device_id).with_for_update(read=True, key_share=True))
+    if job_type in (JobType.removal, JobType.provision):
+        raise ValueError(f"{job_type.value} jobs are not coalescible")
+    await db.execute(select(Device.id).where(Device.id == device_id).with_for_update(read=True, key_share=True))
     for _attempt in range(_ADMISSION_RETRIES):
         values: dict = {
             "job_type": job_type,
@@ -189,16 +191,38 @@ async def admit_queued_job(
     return None, None
 
 
+async def create_dedicated_job(
+    db: AsyncSession,
+    device_id: int,
+    job_type: JobType,
+    *,
+    context: dict | None = None,
+) -> Job:
+    """Create one queued dedicated removal or recovery carrier. Caller commits."""
+    if job_type not in (JobType.apply, JobType.removal):
+        raise ValueError(f"dedicated jobs must be apply or removal, got {job_type!r}")
+    job = Job(
+        job_type=job_type,
+        device_id=device_id,
+        status=JobStatus.queued,
+        coalescible=False,
+        context=context,
+    )
+    db.add(job)
+    await db.flush()
+    return job
+
+
 async def enqueue_job(
     device_id: int,
     job_type: JobType,
     db: AsyncSession,
 ) -> tuple[Job, bool]:
-    """Create a queued job.  Returns (job, created).
+    """Admit a queued coalescible job. Returns (job, created).
 
-    If an active job already exists for the device, returns that job with
-    created=False so the caller can return 409.  The durable worker pool
-    (``core.worker``) claims and runs the job.
+    If a queued coalescible job of the same type exists, returns that winner with
+    ``created=False`` so the caller can return 409. The durable worker pool claims and
+    runs the job.
     """
     if job_type not in _JOB_RUNNERS:
         raise ValueError(f"No runner registered for job type {job_type!r}")
@@ -207,7 +231,7 @@ async def enqueue_job(
     # window exists and a conflict never surfaces as an IntegrityError the caller must
     # recover from. A queued removal does not refuse a sync, and a running job does not
     # refuse its own successor — the device claim serializes execution.
-    created, winner = await admit_queued_job(db, device_id, job_type)
+    created, winner = await admit_coalescible_job(db, device_id, job_type)
     if winner is not None:
         logger.debug("job.enqueue.race_lost", device_id=device_id, winner_id=winner.id)
         await db.commit()  # release the winner lock; this helper owns its transaction
