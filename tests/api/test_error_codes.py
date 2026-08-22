@@ -193,6 +193,21 @@ async def test_framework_http_errors_use_the_canonical_envelope(
         assert response.headers["allow"]
 
 
+async def test_promotion_provenance_handler_uses_closed_error_factory(monkeypatch):
+    from fastapi import Request
+
+    from nso_adapter.api import errors
+    from nso_adapter.core.receipt import PromotionProvenanceUnexecutable
+
+    monkeypatch.setattr(errors, "ERROR_CODES", errors.ERROR_CODES - {"apply_unexecutable"})
+
+    with pytest.raises(ValueError, match="unknown error code 'apply_unexecutable'"):
+         await errors.promotion_provenance_handler(
+             Request({"type": "http"}),
+             PromotionProvenanceUnexecutable("vlan"),
+         )
+
+
 # ---------------------------------------------------------------- closed set
 
 

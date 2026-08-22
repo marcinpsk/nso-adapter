@@ -191,15 +191,14 @@ async def projection_gone_handler(request: Request, exc: Exception) -> JSONRespo
 async def promotion_provenance_handler(request: Request, exc: PromotionProvenanceUnexecutable) -> JSONResponse:
     """Refuse a push that cannot execute deletion provenance from an earlier revision."""
     stream = exc.stream
-    return JSONResponse(
-        status_code=409,
-        content={
-            "error": {
-                "code": "apply_unexecutable",
-                "message": str(exc),
-                "detail": {"streams": {stream: "outstanding_deletion_provenance"}},
-            }
-        },
+    return await api_error_handler(
+        request,
+        api_error(
+            409,
+            "apply_unexecutable",
+            str(exc),
+            {"streams": {stream: "outstanding_deletion_provenance"}},
+        ),
     )
 
 
