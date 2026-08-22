@@ -836,6 +836,47 @@ async def test_interface_config_generation_refuses_unresolvable_attribute_eligib
     assert warning["exc_info"] is True
 
 
+async def test_unrelated_promotion_does_not_resolve_interface_eligibility(adapter_client):
+    """A VLAN-only promotion does not validate an unselected interface revision."""
+    from nso_adapter.store.models import DbInterface, InterfaceAttrState, JobStatus
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="unselected-interface-eligibility", netbox_device_id=10000)
+    await seed_settings(device_id, auto_apply=False)
+    stored_interface = await _put_interface_attrs(
+        adapter_client,
+        device_id,
+        "unselected description",
+        seq=6592,
+    )
+    assert stored_interface.status_code == 200, stored_interface.text
+    promoted_interface = await _apply(adapter_client, device_id, {"interface_config": 6592})
+    assert promoted_interface.status_code == 202, promoted_interface.text
+    client, _ = recorded_client("unselected-interface-eligibility")
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+    assert (await job_row(job_id)).status is JobStatus.succeeded
+    async with session() as db:
+        interface_id = await db.scalar(
+            sa.select(DbInterface.id).where(
+                DbInterface.device_id == device_id,
+                DbInterface.name == "GigabitEthernet0/1",
+            )
+        )
+        await db.execute(sa.delete(InterfaceAttrState).where(InterfaceAttrState.interface_id == interface_id))
+        await db.commit()
+
+    stored_vlan = await _put_vlans(adapter_client, device_id, [10], seq=6593)
+    assert stored_vlan.status_code == 200, stored_vlan.text
+
+    response = await _apply(adapter_client, device_id, {"vlan": 6593})
+
+    assert response.status_code == 202, response.text
+    generation = (await _generations(device_id))[-1]
+    assert generation.stream_revisions == {"vlan": 1}
+    assert "_execution" not in generation.document["interface_config"]
+
+
 async def test_failed_svi_document_send_with_no_stamp_rows_fails_generation(adapter_client):
     from nso_adapter.store.models import GenerationStatus, JobStatus
     from tests.core.test_generation_protocol import job_row, recorded_client, run_head

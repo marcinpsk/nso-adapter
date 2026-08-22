@@ -863,20 +863,22 @@ async def _store_generation(
     # Only a promotion freezes execution-time store facts. A reissue carries no promoted
     # revisions and keeps its established live-store, job-row and tombstone-row semantics.
     if stream_revisions:
-        if (removal_context or {}).get("scope") == "interface_config":
-            section = body.setdefault("interface_config", {})
-            section.setdefault("interface_intent", [])
-            section.setdefault("interface_ip_intent", [])
-        try:
-            await record_interface_execution(db, device_id, body)
-        except InterfaceEligibilityUnresolved as exc:
-            logger.warning(
-                "generation.interface_eligibility_unresolved",
-                device_id=device_id,
-                detail=str(exc),
-                exc_info=True,
-            )
-            raise ApplyUnexecutable({"interface_config": "interface_attribute_eligibility_unresolved"}) from None
+        promoted_sections = {stream_section(stream) for stream in stream_revisions}
+        if "interface_config" in promoted_sections:
+            if (removal_context or {}).get("scope") == "interface_config":
+                section = body.setdefault("interface_config", {})
+                section.setdefault("interface_intent", [])
+                section.setdefault("interface_ip_intent", [])
+            try:
+                await record_interface_execution(db, device_id, body)
+            except InterfaceEligibilityUnresolved as exc:
+                logger.warning(
+                    "generation.interface_eligibility_unresolved",
+                    device_id=device_id,
+                    detail=str(exc),
+                    exc_info=True,
+                )
+                raise ApplyUnexecutable({"interface_config": "interface_attribute_eligibility_unresolved"}) from None
         from nso_adapter.core.static_route_plan import record_static_route_execution
 
         await record_static_route_execution(
