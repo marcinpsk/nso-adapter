@@ -204,11 +204,23 @@ async def test_a_failure_after_the_guard_lock_neither_hangs_nor_leaks_the_claim(
     from nso_adapter.api import static_route as sr_mod
 
     device_id = await seed_device(nso_device_name="sr-claim-lockfail", netbox_device_id=9405)
+    guard_locked = False
+    body_reached = False
+    lock_claim = sr_mod.lock_claim
+
+    async def _record_guard_lock(*args, **kwargs):
+        nonlocal guard_locked
+        result = await lock_claim(*args, **kwargs)
+        guard_locked = True
+        return result
 
     async def _boom(*args, **kwargs):
-        assert await _claim_row(device_id) is not None
+        nonlocal body_reached
+        body_reached = True
+        assert guard_locked, "the request body ran before its claim-row guard was locked"
         raise RuntimeError("forced post-lock failure")
 
+    monkeypatch.setattr(sr_mod, "lock_claim", _record_guard_lock)
     monkeypatch.setattr(sr_mod, "_apply_static_route_intent", _boom)
 
     # The catch-all answers the unhandled body error as a 500; the contract under test is
@@ -222,6 +234,8 @@ async def test_a_failure_after_the_guard_lock_neither_hangs_nor_leaks_the_claim(
         timeout=15,
     )
     assert resp.status_code == 500, resp.text
+    assert guard_locked, "the failing body stub was never reached after the guard lock"
+    assert body_reached, "the request did not reach the failing body stub"
     assert await _claim_row(device_id) is None
 
 
