@@ -846,7 +846,8 @@ no receipt" and sends the restore down the wrong branch.
       "delete_origin": false,
       "backfill_only": false,
       "status_code": 200,
-      "response": { "device_id": 1, "count": 1, "removed": 0, "replaced": false, "routes": [] },
+      "response": { "device_id": 1, "count": 1, "removed": 0, "replaced": false,
+                    "routes": [{ "route_id": 41, "generation": 12, "fingerprint": "9f2c…" }] },
       "generation_id": 12,
       "created_at": "2026-08-11T10:00:00Z",
       "updated_at": "2026-08-11T10:00:00Z"
