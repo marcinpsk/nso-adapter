@@ -9444,7 +9444,7 @@
     },
     "/api/v1/devices/{device_id}/actions/abandon-generation": {
       "post": {
-        "description": "Give up on this device's blocked generation so its successors may run (#1522 \u00a7H2).\n\nThe other exit. Deliberately destructive of intent: this deployment is recorded as never\ndelivered and the chain moves past it, so the operator is asserting that the device state\nit was meant to establish is either already there or no longer wanted.\n\nA request with no blocked head returns 409 with ``error.detail.head_status``. A\ncompare-and-set race returns 409 with an empty detail.",
+        "description": "Give up on this device's blocked generation so its successors may run (#1522 \u00a7H2).\n\nThe other exit. Deliberately destructive of intent: this deployment is recorded as never\ndelivered and the chain moves past it, so the operator is asserting that the device state\nit was meant to establish is either already there or no longer wanted. The response\n``job_id`` identifies the successor carrier this action released, or is ``null`` when no\nsuccessor is executable.\n\nA request with no blocked head returns 409 with ``error.detail.head_status``. A\ncompare-and-set race returns 409 with an empty detail.",
         "operationId": "action_abandon_generation_api_v1_devices__device_id__actions_abandon_generation_post",
         "parameters": [
           {

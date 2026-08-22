@@ -42,6 +42,10 @@ def _is_job(node: ast.expr, names: frozenset[str]) -> bool:
     return (isinstance(node, ast.Name) and node.id in names) or (isinstance(node, ast.Attribute) and node.attr == "Job")
 
 
+def _is_job_table(node: ast.expr, names: frozenset[str]) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == "__table__" and _is_job(node.value, names)
+
+
 def _called_name(node: ast.Call) -> str | None:
     if isinstance(node.func, ast.Name):
         return node.func.id
@@ -51,12 +55,15 @@ def _called_name(node: ast.Call) -> str | None:
 
 
 def _inserts_job(node: ast.Call, job_names: frozenset[str], insert_names: frozenset[str]) -> bool:
-    if _called_name(node) in insert_names and node.args and _is_job(node.args[0], job_names):
+    if (
+        _called_name(node) in insert_names
+        and node.args
+        and (_is_job(node.args[0], job_names) or _is_job_table(node.args[0], job_names))
+    ):
         return True
     if not (isinstance(node.func, ast.Attribute) and node.func.attr == "insert"):
         return False
-    table = node.func.value
-    return isinstance(table, ast.Attribute) and table.attr == "__table__" and _is_job(table.value, job_names)
+    return _is_job_table(node.func.value, job_names)
 
 
 def scan_source(source: str, path: str) -> list[Violation]:
@@ -101,9 +108,10 @@ def test_flags_direct_and_aliased_construction():
 
 def test_flags_sqlalchemy_insert_forms():
     source = (
-        "from sqlalchemy import insert as sql_insert\nsql_insert(Job)\nsa.insert(models.Job)\nJob.__table__.insert()\n"
+        "from sqlalchemy import insert as sql_insert\nsql_insert(Job)\nsql_insert(Job.__table__)\n"
+        "sa.insert(models.Job)\nJob.__table__.insert()\n"
     )
-    assert [hit.what for hit in scan_source(source, "t.py")] == ["inserts Job directly"] * 3
+    assert [hit.what for hit in scan_source(source, "t.py")] == ["inserts Job directly"] * 4
 
 
 def test_allows_job_reads():

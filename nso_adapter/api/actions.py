@@ -442,7 +442,9 @@ async def action_abandon_generation(
 
     The other exit. Deliberately destructive of intent: this deployment is recorded as never
     delivered and the chain moves past it, so the operator is asserting that the device state
-    it was meant to establish is either already there or no longer wanted.
+    it was meant to establish is either already there or no longer wanted. The response
+    ``job_id`` identifies the successor carrier this action released, or is ``null`` when no
+    successor is executable.
 
     A request with no blocked head returns 409 with ``error.detail.head_status``. A
     compare-and-set race returns 409 with an empty detail.

@@ -155,6 +155,13 @@ def test_action_apply_documents_its_internal_error_envelope(openapi_schema):
     }
 
 
+def test_action_abandon_documents_the_successor_carrier_identity(openapi_schema):
+    operation = openapi_schema["paths"]["/api/v1/devices/{device_id}/actions/abandon-generation"]["post"]
+
+    assert "successor carrier" in operation["description"]
+    assert "null" in operation["description"]
+
+
 def test_action_conflict_descriptions_match_their_admission_rules(openapi_schema):
     queued_action = "A job of the requested type is already queued for this device"
     trigger_paths = (
