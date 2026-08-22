@@ -155,6 +155,22 @@ def test_action_apply_documents_its_internal_error_envelope(openapi_schema):
     }
 
 
+def test_action_conflict_descriptions_match_their_admission_rules(openapi_schema):
+    queued_action = "A job of the requested type is already queued for this device"
+    trigger_paths = (
+        "/api/v1/devices/{device_id}/actions/sync",
+        "/api/v1/devices/{device_id}/actions/sync-from-nso",
+        "/api/v1/devices/{device_id}/actions/detect-drift",
+        "/api/v1/devices/{device_id}/actions/connect",
+        "/api/v1/devices/{device_id}/sync-notify",
+    )
+    for path in trigger_paths:
+        assert openapi_schema["paths"][path]["post"]["responses"]["409"]["description"] == queued_action
+
+    apply = openapi_schema["paths"]["/api/v1/devices/{device_id}/actions/apply"]["post"]
+    assert apply["responses"]["409"]["description"] == "A job is already queued or running for this device"
+
+
 def test_device_generation_limit_schema_matches_the_runtime_bounds(openapi_schema):
     from nso_adapter.api.pagination import LIMIT_MAX, LIMIT_MIN
 

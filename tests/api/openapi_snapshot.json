@@ -9522,7 +9522,7 @@
     },
     "/api/v1/devices/{device_id}/actions/apply": {
       "post": {
-        "description": "Atomically promote the selected pushes and enqueue their immutable generation chain.",
+        "description": "Promote selected pushes.\n\nCheck queued and running jobs only when the selection contains promotable work.",
         "operationId": "action_apply_api_v1_devices__device_id__actions_apply_post",
         "parameters": [
           {
@@ -9594,7 +9594,7 @@
                 }
               }
             },
-            "description": "A job is already running for this device"
+            "description": "A job is already queued or running for this device"
           },
           "422": {
             "content": {
@@ -9769,7 +9769,7 @@
                 }
               }
             },
-            "description": "A job is already running for this device"
+            "description": "A job of the requested type is already queued for this device"
           },
           "422": {
             "content": {
@@ -9846,7 +9846,7 @@
                 }
               }
             },
-            "description": "A job is already running for this device"
+            "description": "A job of the requested type is already queued for this device"
           },
           "422": {
             "content": {
@@ -10089,7 +10089,7 @@
                 }
               }
             },
-            "description": "A job is already running for this device"
+            "description": "A job of the requested type is already queued for this device"
           },
           "422": {
             "content": {
@@ -10166,7 +10166,7 @@
                 }
               }
             },
-            "description": "A job is already running for this device"
+            "description": "A job of the requested type is already queued for this device"
           },
           "422": {
             "content": {
@@ -14273,7 +14273,7 @@
     },
     "/api/v1/devices/{device_id}/sync-notify": {
       "post": {
-        "description": "Handle the NetBox plugin's notification that scope or intent changed for this device.\n\nTriggers an immediate sync job. If a job is already running, returns 409 with\nthe existing job_id so the plugin can poll for the result.",
+        "description": "Handle the NetBox plugin's notification that scope or intent changed for this device.\n\nA queued sync job returns 409 with its job id. A running sync job permits a queued\nsuccessor, and jobs of other types do not refuse the notification.",
         "operationId": "sync_notify_api_v1_devices__device_id__sync_notify_post",
         "parameters": [
           {
@@ -14325,7 +14325,7 @@
                 }
               }
             },
-            "description": "A job is already running for this device"
+            "description": "A job of the requested type is already queued for this device"
           },
           "422": {
             "content": {

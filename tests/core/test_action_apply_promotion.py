@@ -1212,7 +1212,7 @@ async def test_action_apply_endpoint_reports_the_queued_incumbent(adapter_client
     assert response.json() == {
         "error": {
             "code": "conflict",
-            "message": "A job is already running for this device",
+            "message": "A job is already queued or running for this device",
             "detail": {"job_id": incumbent_id},
         }
     }

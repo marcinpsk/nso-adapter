@@ -290,8 +290,11 @@ RESP_400: ResponseSpec = {400: {**_ENVELOPE_SCHEMA, "description": "Bad request"
 RESP_401: ResponseSpec = {401: {**_ENVELOPE_SCHEMA, "description": "Missing or invalid bearer token"}}
 RESP_404_DEVICE: ResponseSpec = {404: {**_ENVELOPE_SCHEMA, "description": "Device not found"}}
 RESP_404: ResponseSpec = {404: {**_ENVELOPE_SCHEMA, "description": "Not found"}}
-RESP_409_ACTIVE_JOB: ResponseSpec = {
-    409: {**_ENVELOPE_SCHEMA, "description": "A job is already running for this device"}
+RESP_409_QUEUED_ACTION: ResponseSpec = {
+    409: {**_ENVELOPE_SCHEMA, "description": "A job of the requested type is already queued for this device"}
+}
+RESP_409_QUEUED_OR_RUNNING_JOB: ResponseSpec = {
+    409: {**_ENVELOPE_SCHEMA, "description": "A job is already queued or running for this device"}
 }
 RESP_409: ResponseSpec = {409: {**_ENVELOPE_SCHEMA, "description": "Conflict"}}
 RESP_409_PUSH_SEQ: ResponseSpec = {

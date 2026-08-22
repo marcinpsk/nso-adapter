@@ -9,7 +9,8 @@ Follows the flow described in docs/nso-adapter.md §7a:
   4. On success: status → in_sync, update last_apply_at
   5. On failure: status → apply_failed, capture error in last_apply_error
 
-Concurrency: relies on the existing one-job-per-device rule in core/jobs.py.
+DeviceClaim serializes execution. Auto-Apply admission joins only queued coalescible
+Apply jobs, so running Apply jobs and other types permit successors.
 """
 
 from __future__ import annotations
@@ -130,7 +131,7 @@ async def enqueue_apply(
     stream: str,
     settlement_cohort: int | None = None,
 ) -> Job | None:
-    """Create an apply job if no active job exists.  Returns Job or None if blocked.
+    """Create or join a queued coalescible Apply carrier for a new generation.
 
     *stream* names the endpoint lane this write touched — the promotion protocol's unit
     (#1522 §G2). It is a required keyword, not an optional one: a call site that cannot say
@@ -142,7 +143,8 @@ async def enqueue_apply(
     *settlement_cohort* groups this generation with other generations created by the same
     request. It stays NULL when this is the request's only promoted generation.
 
-    Also returns ``None`` on a store-only request (the plugin's intent re-sync,
+    Returns the new job, or ``None`` when admission finds a queued winner. It also returns
+    ``None`` on a store-only request (the plugin's intent re-sync,
     tracker #103): reconciling the intent store must never trigger a device commit,
     so the auto-apply enqueue is suppressed alongside the shrink-removal one. The
     stream's ``desired_revision`` is still bumped — the store DID change — but nothing is

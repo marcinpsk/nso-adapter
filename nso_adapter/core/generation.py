@@ -109,11 +109,11 @@ class GenerationModeConflict(RuntimeError):
     """
 
 
-class ApplyAlreadyQueued(RuntimeError):
-    """The selected promotion cannot attach to a new apply job."""
+class ApplyJobConflict(RuntimeError):
+    """The selected promotion observed a queued or running device job."""
 
     def __init__(self, job_id: int):
-        super().__init__(f"apply job {job_id} is already queued")
+        super().__init__(f"job {job_id} is already queued or running")
         self.job_id = job_id
 
 
@@ -670,7 +670,7 @@ async def _enqueue_action_apply_job(
     )
     created, winner = await admit_coalescible_job(db, device_id, JobType.apply)
     if winner is not None:
-        raise ApplyAlreadyQueued(winner.id)
+        raise ApplyJobConflict(winner.id)
     if created is None:  # pragma: no cover - bounded admission retries exhausted
         raise RuntimeError(f"could not admit an apply job for device {device_id}")
     await require_attach_to_job(db, generation, created)
@@ -696,7 +696,7 @@ async def create_action_apply(
         .limit(1)
     )
     if active_job_id is not None:
-        raise ApplyAlreadyQueued(active_job_id)
+        raise ApplyJobConflict(active_job_id)
 
     if "static_route" in selected_rows:
         await _promote_static_route_clears(db, device_id)
@@ -1565,7 +1565,7 @@ async def recover_generations() -> int:
 
 __all__ = [
     "ActionApplyResult",
-    "ApplyAlreadyQueued",
+    "ApplyJobConflict",
     "ApplyUnexecutable",
     "BLOCKED_STATUSES",
     "DeviceProjectionGone",

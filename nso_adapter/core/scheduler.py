@@ -24,9 +24,9 @@ _OFFBOARD_MAX_FRACTION = 0.5
 async def _scheduled_sync_all() -> None:
     """Sync every device that has at least one attribute in scope.
 
-    Enqueues a ``queued`` sync job per device; the durable worker pool
-    (``core.worker``) drains them.  ``enqueue_job`` enforces the one-per-device
-    constraint, so a device whose previous job is still queued/running is skipped.
+    Enqueue one sync job per device for the durable worker pool. A queued sync winner
+    skips this request. A running sync permits a queued successor, and other job types
+    coexist.
     """
     from sqlalchemy import select
 
@@ -46,7 +46,7 @@ async def _scheduled_sync_all() -> None:
                     logger.debug(
                         "scheduler.sync_skipped",
                         device_id=device.id,
-                        reason="job_already_active",
+                        reason="same_type_job_queued",
                         job_id=job.id,
                     )
             except Exception as exc:

@@ -220,9 +220,9 @@ async def enqueue_job(
 ) -> tuple[Job, bool]:
     """Admit a queued coalescible job. Returns (job, created).
 
-    If a queued coalescible job of the same type exists, returns that winner with
-    ``created=False`` so the caller can return 409. The durable worker pool claims and
-    runs the job.
+    A queued coalescible job of the same type returns as the winner with
+    ``created=False``. A running job permits a queued successor, and jobs of other types
+    coexist. The durable worker pool serializes execution with the device claim.
     """
     if job_type not in _JOB_RUNNERS:
         raise ValueError(f"No runner registered for job type {job_type!r}")

@@ -54,6 +54,9 @@ async def test_trigger_job_conflict_returns_409(adapter_client):
         with pytest.raises(ApiError) as exc_info:
             await _trigger(device_id, JobType.sync, db)
         assert exc_info.value.status_code == 409
+        assert exc_info.value.detail["error"]["message"] == (
+            "A job of the requested type is already queued for this device"
+        )
         assert exc_info.value.detail["error"]["detail"] == {"job_id": existing.id}
 
 
@@ -127,8 +130,8 @@ async def test_action_sync_from_nso_404_unknown_device(adapter_client):
             assert exc.status_code == 404
 
 
-async def test_action_sync_from_nso_409_on_active_job(adapter_client):
-    """An active job for the device 409s with the incumbent id (shared _trigger)."""
+async def test_action_sync_from_nso_409_on_queued_same_type_job(adapter_client):
+    """A queued action of the requested type returns its job id."""
     from fastapi import HTTPException
 
     from nso_adapter.api.actions import action_sync_from_nso
@@ -141,6 +144,7 @@ async def test_action_sync_from_nso_409_on_active_job(adapter_client):
             raise AssertionError("expected HTTPException")
         except HTTPException as exc:
             assert exc.status_code == 409
+            assert exc.detail["error"]["message"] == ("A job of the requested type is already queued for this device")
             assert exc.detail["error"]["detail"]["job_id"] == first["job_id"]
 
 

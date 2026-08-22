@@ -43,11 +43,7 @@ async def _add_job(device_id: int, job_type, status, *, context=None):
 
 
 async def test_two_queued_removals_do_not_break_admission(adapter_client):
-    """Q1's headline pin. Today ``get_active_job`` raises MultipleResultsFound here.
-
-    Two scope pushes on one device legitimately queue two removals, and every caller of the
-    old helper then blew up — the API 409 path, the failover gate and the apply admission.
-    """
+    """Two queued dedicated removals do not prevent same-type admission checks."""
     from nso_adapter.core.jobs import get_head_queued_job, get_queued_job_of_type, has_any_active_job
     from nso_adapter.store.models import JobStatus, JobType
 
@@ -127,10 +123,7 @@ async def test_get_active_job_is_gone(adapter_client):
 
 
 async def test_409_names_the_conflicting_job_of_that_type(adapter_client):
-    """B7 — with an older queued removal present, a duplicate sync must name the SYNC.
-
-    Today the lookup either raises or reports whichever single row it happened to find.
-    """
+    """With an older queued removal present, a duplicate sync names the sync job."""
     from nso_adapter.store.models import JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="q1-409", netbox_device_id=9705)
@@ -140,6 +133,7 @@ async def test_409_names_the_conflicting_job_of_that_type(adapter_client):
 
     resp = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/sync", headers=AUTH)
     assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["message"] == "A job of the requested type is already queued for this device"
     detail = resp.json()["error"]["detail"]
     assert detail["job_id"] == sync_now_id, f"named {detail['job_id']}, not the queued sync_now {sync_now_id}"
     assert detail["job_id"] != removal_id
@@ -160,11 +154,7 @@ async def test_a_different_type_is_admitted_alongside_a_queued_removal(adapter_c
 
 
 async def test_apply_admitted_while_removal_queued(adapter_client):
-    """Q2 — today ``enqueue_apply`` rejects on ANY active job, removals included.
-
-    That is the bug the queue contract exists to remove: a removal is enqueued BEFORE its
-    apply by design, so letting it block the apply drops the apply entirely.
-    """
+    """A queued dedicated removal does not block a coalescible Apply carrier."""
     from nso_adapter.core.apply import enqueue_apply
     from nso_adapter.store.models import JobStatus, JobType
 

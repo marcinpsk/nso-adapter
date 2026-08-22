@@ -282,7 +282,7 @@ async def _seed_interface_with_intent(
 
 
 async def test_enqueue_apply_creates_job(adapter_client):
-    """enqueue_apply creates an apply job when no active job exists."""
+    """enqueue_apply creates an Apply job when no queued Apply exists."""
     device_id = await _seed_device("rtr-a01", 101)
     async with session() as db:
         await note_projection_write(db, device_id, "vlan")
