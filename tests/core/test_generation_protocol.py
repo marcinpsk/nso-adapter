@@ -879,7 +879,7 @@ async def test_f5_d_the_retry_endpoint_re_admits_the_blocked_head(adapter_client
 
     resp = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/retry-generation", headers=AUTH)
     assert resp.status_code == 202
-    assert resp.json()["generation_id"] == head.id
+    assert set(resp.json()) == {"job_id"}
 
     good, rec = recorded_client("gen-retry-api")
     await run_head(device_id, good)
@@ -897,6 +897,7 @@ async def test_f5_e_the_abandon_endpoint_releases_the_successors(adapter_client)
 
     resp = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/abandon-generation", headers=AUTH)
     assert resp.status_code == 202
+    assert set(resp.json()) == {"job_id"}
 
     chain = await generations(device_id)
     assert chain[0].status is GenerationStatus.abandoned

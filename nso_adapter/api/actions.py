@@ -216,11 +216,9 @@ async def action_apply(
     return await _trigger(device_id, JobType.apply, db)
 
 
-class GenerationOut(BaseModel):
-    """The blocked head a retry or an abandon acted on."""
+class BarrierActionOut(BaseModel):
+    """The job admitted after retrying or abandoning a blocked head."""
 
-    generation_id: int
-    seq: int
     job_id: int | None = None
 
 
@@ -262,7 +260,7 @@ async def _blocked_head(db: AsyncSession, device_id: int) -> DeploymentGeneratio
     "/{device_id}/actions/retry-generation",
     status_code=202,
     dependencies=[Depends(verify_token)],
-    response_model=GenerationOut,
+    response_model=BarrierActionOut,
     responses={**RESP_401, **RESP_404_DEVICE, **RESP_409, **RESP_422_VALIDATION},
 )
 async def action_retry_generation(
@@ -289,14 +287,14 @@ async def action_retry_generation(
         await db.rollback()
         raise api_error(409, "conflict", _HEAD_ALREADY_ACTED_ON) from None
     await db.commit()
-    return {"generation_id": head.id, "seq": head.seq, "job_id": job.id if job else None}
+    return {"job_id": job.id if job else None}
 
 
 @router.post(
     "/{device_id}/actions/abandon-generation",
     status_code=202,
     dependencies=[Depends(verify_token)],
-    response_model=GenerationOut,
+    response_model=BarrierActionOut,
     responses={**RESP_401, **RESP_404_DEVICE, **RESP_409, **RESP_422_VALIDATION},
 )
 async def action_abandon_generation(
@@ -321,7 +319,7 @@ async def action_abandon_generation(
         await db.rollback()
         raise api_error(409, "conflict", _HEAD_ALREADY_ACTED_ON) from None
     await db.commit()
-    return {"generation_id": head.id, "seq": head.seq, "job_id": head.job_id}
+    return {"job_id": head.job_id}
 
 
 @router.get(

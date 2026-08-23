@@ -582,7 +582,7 @@ Phase 2: the rest activate as M5–M6 land.
 ## Actions (async)
 
 Unless its section documents otherwise, an action returns `202` with
-`{ "job_id": <int> }`; the generation actions below answer richer bodies. Only
+`{ "job_id": <int|null> }`. Only
 one job per device runs at a time: if an action is requested while a
 `queued`/`running` job exists for that device, the adapter returns `409
 conflict` with the existing job's id in `error.detail.job_id`.
@@ -611,7 +611,7 @@ generation, and only one of these two moves it:
   move past it. Deliberately destructive of intent: the operator is asserting
   that the device state it was to establish is already there or no longer wanted.
 
-Both → `202 { "generation_id": <int>, "seq": <int>, "job_id": <int|null> }`, and
+Both → `202 { "job_id": <int|null> }`, and
 both → `409 conflict` when the device has no blocked generation.
 
 ### `POST /api/v1/devices/{id}/actions/apply` (Phase 2)

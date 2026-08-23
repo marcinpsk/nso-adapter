@@ -123,6 +123,24 @@
         "title": "ApplyPreflightUnsupported",
         "type": "object"
       },
+      "BarrierActionOut": {
+        "description": "The job admitted after retrying or abandoning a blocked head.",
+        "properties": {
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          }
+        },
+        "title": "BarrierActionOut",
+        "type": "object"
+      },
       "BfdConfigOut": {
         "properties": {
           "device_id": {
@@ -1975,36 +1993,6 @@
           "scope"
         ],
         "title": "ForceRemovalBody",
-        "type": "object"
-      },
-      "GenerationOut": {
-        "description": "The blocked head a retry or an abandon acted on.",
-        "properties": {
-          "generation_id": {
-            "title": "Generation Id",
-            "type": "integer"
-          },
-          "job_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Job Id"
-          },
-          "seq": {
-            "title": "Seq",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "generation_id",
-          "seq"
-        ],
-        "title": "GenerationOut",
         "type": "object"
       },
       "HTTPValidationError": {
@@ -8901,7 +8889,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenerationOut"
+                  "$ref": "#/components/schemas/BarrierActionOut"
                 }
               }
             },
@@ -9387,7 +9375,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenerationOut"
+                  "$ref": "#/components/schemas/BarrierActionOut"
                 }
               }
             },
