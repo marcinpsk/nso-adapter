@@ -74,6 +74,8 @@ def test_openapi_matches_committed_snapshot(openapi_schema):
 
 
 def test_generation_actions_document_both_conflict_details(openapi_schema):
+    assert openapi_schema["components"]["schemas"]["BarrierActionOut"]["required"] == ["job_id"]
+
     for action in ("retry-generation", "abandon-generation"):
         operation = openapi_schema["paths"][f"/api/v1/devices/{{device_id}}/actions/{action}"]["post"]
         description = operation["description"]

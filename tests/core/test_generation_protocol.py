@@ -897,9 +897,9 @@ async def test_f5_e_the_abandon_endpoint_releases_the_successors(adapter_client)
 
     resp = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/abandon-generation", headers=AUTH)
     assert resp.status_code == 202
-    assert set(resp.json()) == {"job_id"}
 
     chain = await generations(device_id)
+    assert resp.json() == {"job_id": chain[1].job_id}
     assert chain[0].status is GenerationStatus.abandoned
     client, rec = recorded_client("gen-abandon-api")
     await run_head(device_id, client)
@@ -944,7 +944,11 @@ async def test_f5_g_an_outcome_unknown_head_answers_both_barrier_exits(adapter_c
 
     resp = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/{action}", headers=AUTH)
     assert resp.status_code == 202, resp.text
-    assert resp.json()["generation_id"] == head.id
+    assert set(resp.json()) == {"job_id"}
+    if action == "retry-generation":
+        assert resp.json()["job_id"] is not None
+    else:
+        assert resp.json()["job_id"] is None
 
 
 # ── #1558 rework 2 — the stamp targets a deployment actually carried ──────────

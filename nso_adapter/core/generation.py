@@ -834,8 +834,8 @@ async def retry_generation(db: AsyncSession, generation_id: int) -> Job | None:
     return job
 
 
-async def reconcile_generation(db: AsyncSession, generation_id: int) -> bool:
-    """Abandon a blocked head so its successors may run. Caller commits.
+async def reconcile_generation(db: AsyncSession, generation_id: int) -> Job | None:
+    """Abandon a blocked head and return the released successor's live job. Caller commits.
 
     The explicit exit §H2 names. Only a ``failed`` or ``outcome_unknown`` generation can be
     abandoned: settling one by decree would claim a device write that never happened, and
@@ -849,7 +849,7 @@ async def reconcile_generation(db: AsyncSession, generation_id: int) -> bool:
     """
     generation = await db.get(DeploymentGeneration, generation_id)
     if generation is None:
-        return False
+        return None
     generation = await _require_locked_executable_head(db, generation)
     if generation.status not in BLOCKED_STATUSES:
         raise GenerationNotBlocked(f"generation {generation_id} is {generation.status.value}, not a blocked head")
@@ -864,7 +864,10 @@ async def reconcile_generation(db: AsyncSession, generation_id: int) -> bool:
         seq=generation.seq,
     )
     await advance_generations_locked(db, generation.device_id)
-    return True
+    successor = await executable_head(db, generation.device_id)
+    if successor is None or successor.status is not GenerationStatus.pending:
+        return None
+    return await _live_job(db, successor.job_id)
 
 
 async def _live_job(db: AsyncSession, job_id: int | None) -> Job | None:

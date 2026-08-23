@@ -219,7 +219,7 @@ async def action_apply(
 class BarrierActionOut(BaseModel):
     """The job admitted after retrying or abandoning a blocked head."""
 
-    job_id: int | None = None
+    job_id: int | None
 
 
 #: What both barrier exits report when the head moved under them.
@@ -314,12 +314,12 @@ async def action_abandon_generation(
 
     head = await _blocked_head(db, device_id)
     try:
-        await reconcile_generation(db, head.id)
+        successor = await reconcile_generation(db, head.id)
     except GenerationNotBlocked:
         await db.rollback()
         raise api_error(409, "conflict", _HEAD_ALREADY_ACTED_ON) from None
     await db.commit()
-    return {"job_id": head.job_id}
+    return {"job_id": successor.id if successor else None}
 
 
 @router.get(

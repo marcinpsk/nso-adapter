@@ -138,6 +138,9 @@
             "title": "Job Id"
           }
         },
+        "required": [
+          "job_id"
+        ],
         "title": "BarrierActionOut",
         "type": "object"
       },

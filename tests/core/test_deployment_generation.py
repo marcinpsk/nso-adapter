@@ -492,7 +492,8 @@ async def test_a_reconciled_head_releases_its_successor(adapter_client):
 
     async with session() as db:
         head = (await _generations(device_id))[0]
-        assert await reconcile_generation(db, head.id)
+        successor = await reconcile_generation(db, head.id)
+        assert successor is not None and successor.id == second.job_id
         await db.commit()
 
     claimed = await _claim_and_release()
@@ -1231,7 +1232,7 @@ async def test_f3_c_a_lost_status_race_refuses_instead_of_acting_twice(adapter_c
         assert cached.status is GenerationStatus.failed
 
         async with session() as other:
-            assert await reconcile_generation(other, head.id) is True
+            assert await reconcile_generation(other, head.id) is None
             await other.commit()
 
         with pytest.raises(GenerationNotBlocked, match="not the executable head"):
