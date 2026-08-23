@@ -1808,7 +1808,14 @@ async def _dispatch_scope(
     return None
 
 
-def _refuse_force_incompatible(scope, marking, document, allowed_removal_keys, static_route_tombstone_ids) -> None:
+def _refuse_force_incompatible(
+    scope,
+    marking,
+    document,
+    allowed_removal_keys,
+    settlement_cohort,
+    static_route_tombstone_ids,
+) -> None:
     """Refuse the arguments a reissue cannot honor: it skips the guard and records no plan."""
     if marking is not None:
         raise ValueError(f"a force-removal of {scope!r} carries no deletion marking; got {marking!r}")
@@ -1816,6 +1823,10 @@ def _refuse_force_incompatible(scope, marking, document, allowed_removal_keys, s
         raise ValueError(f"a force-removal of {scope!r} composes its own reissue document; got one to deploy")
     if allowed_removal_keys is not None:
         raise ValueError(f"a force-removal of {scope!r} skips the collateral guard; got allowed removal keys")
+    if settlement_cohort is not None:
+        raise ValueError(
+            f"a force-removal of {scope!r} settles no promoted revisions; got settlement cohort {settlement_cohort}"
+        )
     if static_route_tombstone_ids:
         raise ValueError(
             f"a force-removal of {scope!r} records no execution plan; got tombstone ids "
@@ -2068,7 +2079,14 @@ async def enqueue_removal(
     if marking is not None and marking not in REMOVAL_MARKINGS:
         raise ValueError(f"Unknown removal marking {marking!r}")
     if force:
-        _refuse_force_incompatible(scope, marking, document, allowed_removal_keys, static_route_tombstone_ids)
+        _refuse_force_incompatible(
+            scope,
+            marking,
+            document,
+            allowed_removal_keys,
+            settlement_cohort,
+            static_route_tombstone_ids,
+        )
     store_only = STORE_ONLY.get()
     context: dict = {"scope": scope}
     if interfaces:

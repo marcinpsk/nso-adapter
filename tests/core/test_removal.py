@@ -2226,8 +2226,9 @@ async def test_enqueue_removal_force_refuses_a_composed_document(adapter_client)
     [
         ({"allowed_removal_keys": {}}, "skips the collateral guard; got allowed removal keys"),
         ({"static_route_tombstone_ids": (7,)}, r"records no execution plan; got tombstone ids \[7\]"),
+        ({"settlement_cohort": 42}, "settles no promoted revisions; got settlement cohort 42"),
     ],
-    ids=["allowed-removal-keys", "static-route-tombstone-ids"],
+    ids=["allowed-removal-keys", "static-route-tombstone-ids", "settlement-cohort"],
 )
 async def test_enqueue_removal_force_refuses_generation_only_arguments(adapter_client, kwargs, message):
     device_id = await _seed_device(nso_device_name="sw-force-generation-metadata")
