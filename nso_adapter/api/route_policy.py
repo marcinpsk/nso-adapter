@@ -29,6 +29,7 @@ from nso_adapter.store.models import (
     DeviceRoutePolicyPrefixListEntry,
     DeviceRoutePolicyRouteMap,
     DeviceRoutePolicyRouteMapEntry,
+    DeviceSettings,
     RoutePolicyObjectIntent,
 )
 
@@ -488,6 +489,13 @@ async def put_route_policy_intent(
             apply_route_policy_config,
             retract=cleared,
         )
+
+    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    settings = settings_result.scalar_one_or_none()
+    if settings and settings.auto_apply and upserted > 0:
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
 
     # Which community-list members can this device's NED NOT hold? The apply path
     # silently skips them (a wildcard color on Nokia has no exact ext-community), which
