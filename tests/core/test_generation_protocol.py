@@ -610,7 +610,13 @@ async def test_f4_d_a_malformed_push_sequence_is_not_echoed(adapter_client):
     )
 
     assert resp.status_code == 422
-    assert raw not in resp.text
+    assert resp.json() == {
+        "error": {
+            "code": "validation_error",
+            "message": "X-Push-Seq must be an integer between 1 and 9223372036854775807",
+            "detail": {},
+        }
+    }
 
 
 async def test_f4_e_a_receipt_is_only_durable_when_its_mutation_commits(adapter_client):

@@ -46,6 +46,7 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 #: mistake, after part of the request has already run.
 MIN_PUSH_SEQ = 1
 MAX_PUSH_SEQ = 2**63 - 1
+PUSH_SEQ_VALIDATION_MESSAGE = f"X-Push-Seq must be an integer between {MIN_PUSH_SEQ} and {MAX_PUSH_SEQ}"
 
 
 class InvalidPushSequence(ValueError):
@@ -71,7 +72,7 @@ def parse_push_seq(raw: str | None) -> int | None:
     try:
         seq = int(raw.strip())
     except ValueError:
-        raise InvalidPushSequence("X-Push-Seq must be an integer") from None
+        raise InvalidPushSequence(PUSH_SEQ_VALIDATION_MESSAGE) from None
     if not MIN_PUSH_SEQ <= seq <= MAX_PUSH_SEQ:
-        raise InvalidPushSequence(f"X-Push-Seq must be between {MIN_PUSH_SEQ} and {MAX_PUSH_SEQ}")
+        raise InvalidPushSequence(PUSH_SEQ_VALIDATION_MESSAGE)
     return seq

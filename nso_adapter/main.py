@@ -55,6 +55,7 @@ from nso_adapter.core.importer import register_nso_client, set_netbox_client
 from nso_adapter.core.request_flags import (
     DELETE_ORIGIN,
     PUSH_SEQ,
+    PUSH_SEQ_VALIDATION_MESSAGE,
     STORE_ONLY,
     InvalidPushSequence,
     parse_push_seq,
@@ -392,10 +393,10 @@ def create_app() -> FastAPI:
         # this delivery's replay protection.
         try:
             seq = parse_push_seq(request.headers.get("X-Push-Seq"))
-        except InvalidPushSequence as exc:
+        except InvalidPushSequence:
             return JSONResponse(
                 status_code=422,
-                content={"error": {"code": "validation_error", "message": str(exc), "detail": {}}},
+                content={"error": {"code": "validation_error", "message": PUSH_SEQ_VALIDATION_MESSAGE, "detail": {}}},
             )
         token = STORE_ONLY.set(parse_store_only(request.query_params.get("store_only")))
         del_token = DELETE_ORIGIN.set(parse_store_only(request.query_params.get("delete_origin")))
