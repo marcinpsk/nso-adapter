@@ -1188,7 +1188,7 @@ async def test_abandoning_the_g1_g4_wedge_creates_a_fresh_g3_carrier(adapter_cli
         )
     assert carrier is not None and not carrier.coalescible
     assert counts == {carrier_id: 1, fourth.job_id: 1}
-    assert response.json() == {"generation_id": second.id, "seq": second.seq, "job_id": carrier_id}
+    assert response.json() == {"job_id": carrier_id}
 
 
 async def test_the_g3_recovery_carrier_runs_before_g4(adapter_client):
@@ -1223,7 +1223,7 @@ async def test_abandon_without_a_successor_returns_a_null_job(adapter_client):
     )
 
     assert response.status_code == 202, response.text
-    assert response.json() == {"generation_id": head.id, "seq": head.seq, "job_id": None}
+    assert response.json() == {"job_id": None}
     assert (await _generations(device_id))[0].status is GenerationStatus.abandoned
 
 
@@ -1247,7 +1247,7 @@ async def test_abandoning_one_coalesced_failure_does_not_retry_the_other(adapter
     )
 
     assert response.status_code == 202, response.text
-    assert response.json() == {"generation_id": first.id, "seq": first.seq, "job_id": None}
+    assert response.json() == {"job_id": None}
     first, second = await _generations(device_id)
     assert (first.status, second.status) == (GenerationStatus.abandoned, GenerationStatus.failed)
 
