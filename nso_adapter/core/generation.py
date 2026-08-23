@@ -1348,7 +1348,7 @@ async def _create_dedicated_carrier(db: AsyncSession, generation: DeploymentGene
         # Unreachable through enqueue_removal, which always records the context. Raising
         # beats the alternative: an apply job would NETWORK the very retraction the detach
         # exists to keep off the device.
-        raise RuntimeError(f"detach generation {generation.id} carries no removal context")
+        raise GenerationCarrierCorruption(f"detach generation {generation.id} carries no removal context")
     else:
         job = await create_dedicated_job(db, generation.device_id, JobType.apply)
     if not await attach_to_job(db, generation, job):
@@ -1563,6 +1563,8 @@ async def recover_generations() -> int:
             await advance_device_generations(device_id)
         except GenerationCarrierCorruption:
             logger.error("generation.carrier_corruption_on_restart", device_id=device_id, exc_info=True)
+        except (DeviceProjectionGone, GenerationModeConflict):
+            logger.error("generation.recovery_failed_on_restart", device_id=device_id, exc_info=True)
     return len(stranded)
 
 

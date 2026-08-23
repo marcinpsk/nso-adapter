@@ -1018,6 +1018,42 @@ async def test_startup_recovery_isolates_a_corrupt_device(adapter_client):
     assert await _job_status(recovered_healthy.job_id) is JobStatus.queued
 
 
+async def test_startup_recovery_isolates_a_detach_head_without_context(adapter_client):
+    from nso_adapter.core.generation import create_generation, note_write, recover_generations
+    from nso_adapter.store.models import GenerationMode, JobStatus
+
+    corrupt_device = await _device("gen-recover-missing-context", 9796)
+    healthy_device = await _device("gen-recover-after-context", 9797)
+    for device_id, vlan_id in ((corrupt_device, 97), (healthy_device, 98)):
+        await _vlan(device_id, vlan_id)
+
+    async with session() as db:
+        await note_write(db, corrupt_device, "vlan")
+        corrupt = await create_generation(
+            db,
+            corrupt_device,
+            streams=("vlan",),
+            mode=GenerationMode.detach,
+        )
+        await note_write(db, healthy_device, "vlan")
+        healthy = await create_generation(
+            db,
+            healthy_device,
+            streams=("vlan",),
+            mode=GenerationMode.networked,
+        )
+        await db.commit()
+
+    assert corrupt.job_id is None and healthy.job_id is None
+    await recover_generations()
+
+    (unchanged_corrupt,) = await _generations(corrupt_device)
+    (recovered_healthy,) = await _generations(healthy_device)
+    assert unchanged_corrupt.job_id is None
+    assert recovered_healthy.job_id is not None
+    assert await _job_status(recovered_healthy.job_id) is JobStatus.queued
+
+
 async def test_standalone_advancement_takes_the_projection_lock(adapter_client, rival_engine):
     """Advancement must serialize with a writer before it reads or admits the head."""
     from sqlalchemy.ext.asyncio import async_sessionmaker
