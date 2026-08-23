@@ -31,7 +31,7 @@ import sqlalchemy as sa
 from nso_adapter.core import worker as worker_mod
 from nso_adapter.store.device_settle import MissingSettleCounter
 from nso_adapter.store.models import Device, DeviceSettleCounter, Job, JobStatus, JobType
-from tests.conftest import _drop_database, _url_for, seed_device, session
+from tests.conftest import _drop_database, _url_for, attach_apply_generation, seed_device, session
 
 pytestmark = pytest.mark.anyio
 
@@ -342,6 +342,7 @@ async def test_a_failed_allocation_never_takes_a_second_terminal_write(adapter_c
         await db.commit()
         job_id = job.id
 
+    await attach_apply_generation(job_id, device_id)
     if failure == "missing_row":
         await _drop_counter(device_id)  # a concurrent offboard cascaded it away
     else:

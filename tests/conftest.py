@@ -632,6 +632,48 @@ async def note_projection_write(db, device_id: int, stream: str) -> None:
     await note_write(db, device_id, stream)
 
 
+async def attach_apply_generation(job_id: int, device_id: int) -> int:
+    """Attach a complete immutable generation to a directly seeded Apply job.
+
+    Older worker tests seed intent before invoking the runner but bypass the production
+    admission path. Promote every stream after that setup so the real worker receives the
+    same generation-backed carrier as production.
+    """
+    from sqlalchemy import select
+
+    from nso_adapter.core.generation import (
+        attach_to_job,
+        create_generation,
+        mark_job_generations_running,
+        note_write,
+    )
+    from nso_adapter.core.projection import projection_streams
+    from nso_adapter.store.models import DeploymentGeneration, GenerationMode, Job, JobStatus
+
+    async with session() as db:
+        existing = await db.scalar(
+            select(DeploymentGeneration.id).where(DeploymentGeneration.job_id == job_id).limit(1)
+        )
+        if existing is not None:
+            return existing
+        job = await db.get(Job, job_id)
+        assert job is not None and job.device_id == device_id
+        streams = tuple(sorted(projection_streams()))
+        for stream in streams:
+            await note_write(db, device_id, stream)
+        generation = await create_generation(
+            db,
+            device_id,
+            streams=streams,
+            mode=GenerationMode.networked,
+        )
+        assert await attach_to_job(db, generation, job)
+        if job.status is JobStatus.running:
+            await mark_job_generations_running(db, job.id)
+        await db.commit()
+        return generation.id
+
+
 async def start_job(job_id: int) -> int:
     """Stand in for the worker head's ``queued -> running`` transition. Returns the attempt.
 

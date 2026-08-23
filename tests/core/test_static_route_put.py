@@ -23,7 +23,7 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.store.models import Job, JobStatus, JobType
-from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
+from tests.conftest import VALID_TOKEN, attach_apply_generation, push_seq, seed_device, session
 
 pytestmark = pytest.mark.anyio
 
@@ -107,7 +107,9 @@ async def seed_apply_job(device_id: int) -> int:
         )
         db.add(job)
         await db.commit()
-        return job.id
+        job_id = job.id
+    await attach_apply_generation(job_id, device_id)
+    return job_id
 
 
 async def read_job(job_id: int) -> Job:

@@ -28,7 +28,7 @@ from nso_adapter.store.models import (
     JobType,
     SyncState,
 )
-from tests.conftest import note_projection_write, session
+from tests.conftest import attach_apply_generation, note_projection_write, session
 
 # ── _nokia_routed_kind (pure: derives SR OS router context from kind/service/vrf) ──
 
@@ -243,34 +243,10 @@ async def _seed_apply_job(device_id: int, status: JobStatus = JobStatus.running)
 
 async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -> None:
     """Attach the immutable fixture document, then invoke the real Apply worker."""
-    from nso_adapter.core.generation import (
-        attach_to_job,
-        create_generation,
-        mark_job_generations_running,
-        note_write,
-    )
-    from nso_adapter.core.projection import projection_streams
-    from nso_adapter.store.models import DeploymentGeneration, GenerationMode
-
     async with session() as db:
         job = await db.get(Job, job_id)
-        generation_id = await db.scalar(
-            select(DeploymentGeneration.id).where(DeploymentGeneration.job_id == job_id).limit(1)
-        )
-        if job is not None and generation_id is None:
-            streams = tuple(sorted(projection_streams()))
-            for stream in streams:
-                await note_write(db, job.device_id, stream)
-            generation = await create_generation(
-                db,
-                job.device_id,
-                streams=streams,
-                mode=GenerationMode.networked,
-            )
-            assert await attach_to_job(db, generation, job)
-            if job.status is JobStatus.running:
-                await mark_job_generations_running(db, job.id)
-            await db.commit()
+    if job is not None:
+        await attach_apply_generation(job_id, job.device_id)
     await _run_apply_worker(job_id=job_id, device_id=device_id, force=force, reg=reg)
 
 

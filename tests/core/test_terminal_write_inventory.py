@@ -27,7 +27,7 @@ from nso_adapter.core import jobs as jobs_mod
 from nso_adapter.core import worker as worker_mod
 from nso_adapter.core.claim import ClaimRegistration, acquire_claim, release_claim
 from nso_adapter.store.models import DeviceSettleCounter, Job, JobStatus, JobType
-from tests.conftest import seed_device, session
+from tests.conftest import attach_apply_generation, seed_device, session
 from tests.core.test_jobs import _nso_client_for_connect
 from tests.core.test_static_route_put import A, B, wire
 from tests.core.test_static_route_removal import SrFake, run_removal_job, seed_removal_job, seed_tomb, sr_client
@@ -209,6 +209,7 @@ async def _t11_apply_nothing_eligible() -> tuple[int, int]:
 
     device_id = await seed_device(nso_device_name="inv-t11", netbox_device_id=8311)
     job_id = await _apply_job(device_id)
+    await attach_apply_generation(job_id, device_id)
     reg = await _claim_for(device_id, job_id)
     try:
         with (
@@ -244,6 +245,7 @@ async def _t12_apply_all_ok() -> tuple[int, int]:
     device_id = await seed_device(nso_device_name="inv-t12", netbox_device_id=8312)
     job_id = await _apply_job(device_id)
     await _seed_accepted_static_route(device_id)
+    await attach_apply_generation(job_id, device_id)
     reg = await _claim_for(device_id, job_id)
     try:
         with (
@@ -267,6 +269,7 @@ async def _t13_apply_any_failed() -> tuple[int, int]:
     device_id = await seed_device(nso_device_name="inv-t13", netbox_device_id=8313)
     job_id = await _apply_job(device_id)
     await _seed_accepted_static_route(device_id)
+    await attach_apply_generation(job_id, device_id)
     err = NsoApplyError(code="nso_error", message="route rejected", detail={})
     reg = await _claim_for(device_id, job_id)
     try:
@@ -289,6 +292,7 @@ async def _t14_run_apply_fallback() -> tuple[int, int]:
 
     device_id = await seed_device(nso_device_name="inv-t14", netbox_device_id=8314)
     job_id = await _apply_job(device_id)
+    await attach_apply_generation(job_id, device_id)
     reg = await _claim_for(device_id, job_id)
     try:
         # The device the apply is pointed at does not exist, so _execute_apply raises out.
