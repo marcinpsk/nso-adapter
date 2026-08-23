@@ -1099,7 +1099,8 @@ async def test_f3_a_two_concurrent_retries_admit_the_head_once(adapter_client):
         second = asyncio.create_task(adapter_client.post(url, headers=_AUTH))
         # Inside the held window the rival either refuses outright or blocks on the first
         # request's open transaction; completing here proves the refusal happened in-window.
-        in_window, _ = await asyncio.wait({second}, timeout=5)
+        # Keep this observation window below the database lock timeout.
+        in_window, _ = await asyncio.wait({second}, timeout=1)
         if in_window:
             assert second.result().status_code == 409, "the rival finished in the held window without refusing"
         release.set()
@@ -1123,7 +1124,7 @@ async def test_f3_b_a_retry_and_an_abandon_cannot_both_win(adapter_client):
         await asyncio.wait_for(parked.wait(), timeout=3)
         abandoning = asyncio.create_task(adapter_client.post(f"{base}/abandon-generation", headers=_AUTH))
         # Same window proof as the retry race: an in-window completion must be the refusal.
-        in_window, _ = await asyncio.wait({abandoning}, timeout=5)
+        in_window, _ = await asyncio.wait({abandoning}, timeout=1)
         if in_window:
             assert abandoning.result().status_code == 409, "the abandon finished in the held window without refusing"
         release.set()
