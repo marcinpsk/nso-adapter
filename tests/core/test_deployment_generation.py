@@ -832,6 +832,29 @@ async def test_f8_abandoning_a_head_hands_the_released_successor_a_job_at_once(a
     assert second.seq + 1 == advanced.seq, "an unrelated generation was advanced"
 
 
+@pytest.mark.parametrize("action", ["retry", "abandon"])
+async def test_a_later_coalesced_failure_is_not_an_operator_exit_target(adapter_client, action):
+    from nso_adapter.core.generation import GenerationNotBlocked, reconcile_generation, retry_generation
+    from nso_adapter.store.models import GenerationStatus, JobStatus
+
+    device_id = await _device(f"gen-non-head-{action}", 9782)
+    await _vlan(device_id, 73)
+    await _push(adapter_client, device_id)
+    await _vlan(device_id, 74)
+    await _push(adapter_client, device_id)
+    first, second = await _generations(device_id)
+    assert first.job_id == second.job_id
+    assert await _finish(device_id, JobStatus.failed) == first.job_id
+
+    operation = retry_generation if action == "retry" else reconcile_generation
+    async with session() as db:
+        with pytest.raises(GenerationNotBlocked, match="executable head"):
+            await operation(db, second.id)
+
+    first, second = await _generations(device_id)
+    assert (first.status, second.status) == (GenerationStatus.failed, GenerationStatus.failed)
+
+
 async def test_a_job_carrying_no_generation_is_never_blocked(adapter_client):
     """Reads must not queue behind a blocked write: a sync carries no document."""
     from nso_adapter.store.models import Job, JobStatus, JobType
@@ -1190,7 +1213,7 @@ async def test_f7_a_manual_apply_promotes_a_section_committed_alongside_it(adapt
 
 
 async def test_f3_c_a_lost_status_race_refuses_instead_of_acting_twice(adapter_client):
-    """The compare-and-set is the second half of the guarantee, for a caller without the lock.
+    """The locked head re-read refuses a stale caller before it can reach the compare-and-set.
 
     One session holds a stale read of the blocked head — the exact state a second process
     reaches — while another abandons it. The retry must refuse rather than re-admit a
@@ -1210,7 +1233,7 @@ async def test_f3_c_a_lost_status_race_refuses_instead_of_acting_twice(adapter_c
             assert await reconcile_generation(other, head.id) is True
             await other.commit()
 
-        with pytest.raises(GenerationNotBlocked, match="no longer a blocked head"):
+        with pytest.raises(GenerationNotBlocked, match="not the executable head"):
             await retry_generation(stale, head.id)
         await stale.rollback()
 

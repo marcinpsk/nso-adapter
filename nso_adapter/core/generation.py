@@ -550,6 +550,27 @@ async def executable_head(db: AsyncSession, device_id: int) -> DeploymentGenerat
     )
 
 
+async def _locked_executable_head(db: AsyncSession, device_id: int) -> DeploymentGeneration | None:
+    """Re-read and lock the executable head after the caller takes the projection lock."""
+    return await db.scalar(
+        select(DeploymentGeneration)
+        .where(DeploymentGeneration.device_id == device_id, DeploymentGeneration.status.not_in(_CROSSABLE))
+        .order_by(DeploymentGeneration.seq)
+        .limit(1)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+
+
+async def _require_locked_executable_head(db: AsyncSession, generation: DeploymentGeneration) -> DeploymentGeneration:
+    """Return *generation* as the locked executable head, or refuse the operator exit."""
+    await lock_projection(db, generation.device_id)
+    head = await _locked_executable_head(db, generation.device_id)
+    if head is None or head.id != generation.id:
+        raise GenerationNotBlocked(f"generation {generation.id} is not the executable head")
+    return head
+
+
 #: Job types that write to the device. Everything else is a read and is never barred.
 _DEVICE_WRITING = (JobType.apply, JobType.removal)
 #: A head in one of these has not settled and never will without a retry or a reconcile.
@@ -788,6 +809,7 @@ async def retry_generation(db: AsyncSession, generation_id: int) -> Job | None:
     generation = await db.get(DeploymentGeneration, generation_id)
     if generation is None:
         return None
+    generation = await _require_locked_executable_head(db, generation)
     if generation.status not in BLOCKED_STATUSES:
         raise GenerationNotBlocked(f"generation {generation_id} is {generation.status.value}, not a blocked head")
     # Digest-verified here too: a retry is precisely the moment the stored bytes are trusted.
@@ -828,6 +850,7 @@ async def reconcile_generation(db: AsyncSession, generation_id: int) -> bool:
     generation = await db.get(DeploymentGeneration, generation_id)
     if generation is None:
         return False
+    generation = await _require_locked_executable_head(db, generation)
     if generation.status not in BLOCKED_STATUSES:
         raise GenerationNotBlocked(f"generation {generation_id} is {generation.status.value}, not a blocked head")
     await _claim_blocked_head(db, generation_id, GenerationStatus.abandoned)
