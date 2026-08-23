@@ -614,7 +614,9 @@ generation, and only one of these two moves it:
 Both → `202 { "job_id": <int|null> }`. Retry returns the fresh job that carries
 the blocked head. Abandon returns the released successor's live job, or `null`
 when no successor is executable. Both → `409 conflict` when the device has no
-blocked generation.
+blocked generation; `error.detail.head_status` reports the current head status.
+A concurrent retry or abandon also returns `409 conflict`, with an empty
+`error.detail` object.
 
 ### `POST /api/v1/devices/{id}/actions/apply` (Phase 2)
 Push accepted NetBox intent to NSO via the reconcile-commit service (Spike

@@ -84,6 +84,18 @@ def test_generation_actions_document_both_conflict_details(openapi_schema):
         assert "empty detail" in description
 
 
+def test_api_contract_documents_both_generation_action_conflicts():
+    contract = (SNAPSHOT_PATH.parents[2] / "docs" / "api-contract.md").read_text()
+    section = contract.split(
+        "### `POST /api/v1/devices/{id}/actions/{retry,abandon}-generation`",
+        maxsplit=1,
+    )[1].split("\n### ", maxsplit=1)[0]
+    section = " ".join(section.split())
+
+    assert "error.detail.head_status" in section
+    assert "empty `error.detail`" in section
+
+
 def test_no_disambiguation_qualified_component_names(openapi_schema):
     schemas = openapi_schema["components"]["schemas"]
     # A same-name/different-shape collision is the only thing that makes
