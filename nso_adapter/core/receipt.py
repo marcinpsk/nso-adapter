@@ -208,8 +208,8 @@ async def record_response(
 
     Also stamps the generation this push authorized: the LAST one it enqueued (the apply
     when auto-apply fired, else the final removal), or null when it enqueued none. Taken
-    from the request-scoped var :mod:`core.generation` writes, so none of the fourteen intent
-    PUTs has to thread it back. An explicit *generation_id* wins over that var.
+    from the request-scoped var :mod:`core.generation` writes, so no intent PUT has to thread
+    it back. An explicit *generation_id* wins over that var.
     """
     from nso_adapter.core.generation import consume_last_enqueued_generation_id
 

@@ -247,7 +247,7 @@ async def _compose_authorized_document(db: AsyncSession, device_id: int, promote
 #: Written at the single generation-write point below, read once by
 #: :func:`core.receipt.record_response` through :func:`consume_last_enqueued_generation_id`.
 #: Request-scoped like the flags in :mod:`core.request_flags`, and for the same reason: the
-#: fourteen intent PUTs would otherwise each have to thread a return value back to the
+#: intent PUTs would otherwise each have to thread a return value back to the
 #: receipt. The action, retry and worker paths create generations and never record a
 #: response, so their value simply dies with their request context.
 LAST_ENQUEUED_GENERATION_ID: ContextVar[int | None] = ContextVar("last_enqueued_generation_id", default=None)

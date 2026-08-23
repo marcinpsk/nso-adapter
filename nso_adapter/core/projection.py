@@ -424,7 +424,9 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
     A row that omits the primary key is refused: it would hydrate with ``id`` None, match no
     live row, and let a successful device write report an all-zero bookkeeping outcome.
     """
-    tables = document.get(section) or {}
+    if section not in document:
+        raise ValueError(f"document does not carry section {section!r}")
+    tables = document[section] or {}
     rows: dict[type, list] = {}
     for table_name, records in tables.items():
         model = _MODEL_BY_TABLE.get(table_name)

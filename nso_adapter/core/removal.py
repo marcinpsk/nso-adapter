@@ -687,8 +687,9 @@ async def _replacement_rows(db: AsyncSession, device, scope: str, model, job_id:
     A removal is a full-document write too, so the same race applies (#1522 §G1): between the
     worker committing ``running`` and this read, a successor push can commit, and a
     live-store body would retract under this generation's identity whatever the successor
-    happens to have removed. For a document-executed section the body therefore comes from
-    the stored document. Everything else still reads the store — see
+    happens to have removed. For a promoted document-executed section the body therefore
+    comes from the stored document. A force reissue promotes no stream and retains the live
+    store used by the operator override. Everything else still reads the store. See
     :data:`core.projection.LIVE_READ_SECTIONS`.
     """
     from nso_adapter.core.generation import executing_generation
@@ -698,7 +699,8 @@ async def _replacement_rows(db: AsyncSession, device, scope: str, model, job_id:
         generation = await executing_generation(db, job_id)
         if generation is None:
             raise RuntimeError(f"removal job {job_id} for scope {scope!r} carries no generation to deploy")
-        return [row for row in hydrate_section(generation.document, scope).get(model, []) if row.accepted_at]
+        if generation.stream_revisions:
+            return [row for row in hydrate_section(generation.document, scope).get(model, []) if row.accepted_at]
     return list(
         (await db.execute(select(model).where(model.device_id == device.id, model.accepted_at.is_not(None))))
         .scalars()
@@ -1616,7 +1618,7 @@ async def enqueue_removal(
     device_id: int,
     scope: str,
     *,
-    promotes: tuple[str, ...] = (),
+    promotes: tuple[str, ...],
     interfaces: list[str] | None = None,
     removed: dict[str, list] | None = None,
     vault_refs: dict[str, str] | None = None,

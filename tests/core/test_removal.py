@@ -12,6 +12,7 @@ stubbed with a spy.
 
 from __future__ import annotations
 
+import inspect
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
@@ -160,6 +161,12 @@ async def test_replace_on_removal_unknown_model_returns_false(adapter_client):
 
 
 # ── enqueue_removal ───────────────────────────────────────────────────────────
+
+
+def test_enqueue_removal_requires_a_promotion_disposition():
+    parameter = inspect.signature(enqueue_removal).parameters["promotes"]
+
+    assert parameter.default is inspect.Parameter.empty
 
 
 async def test_enqueue_removal_rejects_unknown_scope(adapter_client):
@@ -1643,7 +1650,7 @@ async def test_enqueue_removal_delete_origin_is_real_retraction(adapter_client):
 async def test_enqueue_removal_force_is_real_retraction(adapter_client):
     device_id = await _seed_device(nso_device_name="sw-detach")
     async with session() as db:
-        job = await enqueue_removal(db, device_id, "svi", removed={"interface": [["Vlan9"]]}, force=True)
+        job = await enqueue_removal(db, device_id, "svi", promotes=(), removed={"interface": [["Vlan9"]]}, force=True)
         await db.commit()
         assert job.context.get("force") is True
         assert "detach" not in job.context

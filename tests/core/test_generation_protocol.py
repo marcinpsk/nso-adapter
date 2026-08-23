@@ -307,6 +307,7 @@ async def test_f1_b_a_tampered_document_is_refused_rather_than_executed(adapter_
 
     client, rec = recorded_client("gen-doc-digest")
     job_id = await run_head(device_id, client)
+    assert job_id is not None
     job = await job_row(job_id)
 
     assert rec.vlan_ids() == [], "a document whose digest no longer matches was executed anyway"

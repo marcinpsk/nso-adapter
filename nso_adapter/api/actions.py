@@ -111,7 +111,7 @@ async def action_force_removal(
             "force-removal of interface_config requires 'interfaces': the interface-reconciler "
             "is keyed per interface, so with none named the job would flush nothing.",
         )
-    job = await enqueue_removal(db, device_id, body.scope, interfaces=body.interfaces, force=True)
+    job = await enqueue_removal(db, device_id, body.scope, promotes=(), interfaces=body.interfaces, force=True)
     await db.commit()
     return {"job_id": job.id}
 
@@ -274,6 +274,9 @@ async def action_retry_generation(
     One of the two explicit exits from the success barrier. The head is re-queued with the
     SAME document, mode and digest — it is re-sent, never rebuilt — and its successors go
     back to waiting behind it. Use it after fixing whatever the device refused.
+
+    A request with no blocked head returns 409 with ``error.detail.head_status``. A
+    compare-and-set race returns 409 with an empty detail.
     """
     from nso_adapter.core.generation import GenerationNotBlocked, retry_generation
 
@@ -305,6 +308,9 @@ async def action_abandon_generation(
     The other exit. Deliberately destructive of intent: this deployment is recorded as never
     delivered and the chain moves past it, so the operator is asserting that the device state
     it was meant to establish is either already there or no longer wanted.
+
+    A request with no blocked head returns 409 with ``error.detail.head_status``. A
+    compare-and-set race returns 409 with an empty detail.
     """
     from nso_adapter.core.generation import GenerationNotBlocked, reconcile_generation
 

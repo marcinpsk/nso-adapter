@@ -73,6 +73,15 @@ def test_openapi_matches_committed_snapshot(openapi_schema):
         )
 
 
+def test_generation_actions_document_both_conflict_details(openapi_schema):
+    for action in ("retry-generation", "abandon-generation"):
+        operation = openapi_schema["paths"][f"/api/v1/devices/{{device_id}}/actions/{action}"]["post"]
+        description = operation["description"]
+
+        assert "error.detail.head_status" in description
+        assert "empty detail" in description
+
+
 def test_no_disambiguation_qualified_component_names(openapi_schema):
     schemas = openapi_schema["components"]["schemas"]
     # A same-name/different-shape collision is the only thing that makes

@@ -8883,7 +8883,7 @@
     },
     "/api/v1/devices/{device_id}/actions/abandon-generation": {
       "post": {
-        "description": "Give up on this device's blocked generation so its successors may run (#1522 \u00a7H2).\n\nThe other exit. Deliberately destructive of intent: this deployment is recorded as never\ndelivered and the chain moves past it, so the operator is asserting that the device state\nit was meant to establish is either already there or no longer wanted.",
+        "description": "Give up on this device's blocked generation so its successors may run (#1522 \u00a7H2).\n\nThe other exit. Deliberately destructive of intent: this deployment is recorded as never\ndelivered and the chain moves past it, so the operator is asserting that the device state\nit was meant to establish is either already there or no longer wanted.\n\nA request with no blocked head returns 409 with ``error.detail.head_status``. A\ncompare-and-set race returns 409 with an empty detail.",
         "operationId": "action_abandon_generation_api_v1_devices__device_id__actions_abandon_generation_post",
         "parameters": [
           {
@@ -9369,7 +9369,7 @@
     },
     "/api/v1/devices/{device_id}/actions/retry-generation": {
       "post": {
-        "description": "Re-admit this device's blocked deployment generation (#1522 \u00a7H2).\n\nOne of the two explicit exits from the success barrier. The head is re-queued with the\nSAME document, mode and digest \u2014 it is re-sent, never rebuilt \u2014 and its successors go\nback to waiting behind it. Use it after fixing whatever the device refused.",
+        "description": "Re-admit this device's blocked deployment generation (#1522 \u00a7H2).\n\nOne of the two explicit exits from the success barrier. The head is re-queued with the\nSAME document, mode and digest \u2014 it is re-sent, never rebuilt \u2014 and its successors go\nback to waiting behind it. Use it after fixing whatever the device refused.\n\nA request with no blocked head returns 409 with ``error.detail.head_status``. A\ncompare-and-set race returns 409 with an empty detail.",
         "operationId": "action_retry_generation_api_v1_devices__device_id__actions_retry_generation_post",
         "parameters": [
           {

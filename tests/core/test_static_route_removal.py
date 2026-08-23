@@ -1036,6 +1036,7 @@ async def test_a_superseded_run_attempt_refuses_the_removal_terminal_write(adapt
 
     job = await run_removal_job(device_id, job_id, client)
 
+    client.run_device_state_read.assert_awaited_once()
     assert job.status == JobStatus.running, "a superseded execution must not write a terminal status"
     assert job.result is None and job.settle_seq is None
     assert await tombstone_ids(device_id) == [tomb], "the refused write must discard its consumption"

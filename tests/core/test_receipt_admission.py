@@ -102,6 +102,15 @@ def test_the_stream_vocabulary_is_the_sixteen_endpoint_streams():
     assert {"ip", "isis_flex_algo"} <= INTENT_STREAMS
 
 
+def test_protocol_docs_do_not_copy_the_endpoint_count():
+    from nso_adapter.core import generation, receipt
+
+    for module in (generation, receipt):
+        source = inspect.getsource(module)
+        assert "fourteen intent PUT" not in source
+        assert "sixteen intent PUT" not in source
+
+
 def test_every_intent_stream_promotes_a_real_projection_family():
     from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS
     from nso_adapter.core.projection import projection_sections, projection_streams
