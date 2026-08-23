@@ -2,8 +2,8 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """One static-route replacement classifier, one plan — #1396 R2 §3.
 
-Generation creation classifies the store snapshot and records the result. Generated workers
-hydrate that result. Preview and generationless jobs use :func:`build_plan` over live rows.
+Generation creation classifies the store snapshot and records the result. Workers hydrate
+that result. Preview uses :func:`build_plan` over live rows.
 Two predicates decide the apply plan:
 
 * ``FENCE_OPEN(rows)``    — no row of the device carries ``route_id IS NULL``. Only the
@@ -310,7 +310,7 @@ def classify_apply_plan(all_rows: list, tombstones: list, *, eligible_rows: list
 
 
 async def build_plan(db: AsyncSession, device, *, eligible_rows: list) -> SrPlan:
-    """Build the live plan used by preview and generationless apply jobs."""
+    """Build the live plan used by preview."""
     from nso_adapter.store.models import StaticRouteIntent, StaticRouteTombstone
 
     device_id = device.id

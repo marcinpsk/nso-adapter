@@ -30,7 +30,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, JobError, internal_error, terminalize
 from nso_adapter.core.generation import executing_generation, generation_execution_sections, note_write
 from nso_adapter.core.projection import (
-    INTERFACE_ATTRIBUTE_ELIGIBLE_STATES,
     hydrate_interface_execution,
     hydrate_section,
     intent_state,
@@ -80,15 +79,6 @@ from nso_adapter.store.models import (
 )
 
 logger = structlog.get_logger(__name__)
-
-# Statuses eligible for apply (decision Q in plan — force=True pushes all of these)
-_FORCE_ELIGIBLE = set(INTERFACE_ATTRIBUTE_ELIGIBLE_STATES)
-# force=False only pushes these
-_NO_FORCE_ELIGIBLE = {
-    SyncState.accepted,
-    SyncState.apply_failed,
-    SyncState.drifted,
-}
 
 
 def _nokia_routed_kind(iface) -> str | None:
@@ -1147,14 +1137,13 @@ class _Scope(NamedTuple):
     #: lists differ whenever a successor moved a row (#1522 §G1).
     push: list | None = None
     #: Where a finding about a PUSHED row is recorded: ``{row id -> the live row}``. ``None``
-    #: for a generationless scope, where the pushed row IS the live row. A pushed row absent from
-    #: the map has no live counterpart left — it still fails the scope, it simply leaves no
-    #: bookkeeping behind, because a transient hydrated row's stamp goes nowhere.
+    #: means the pushed rows are already the live rows. A pushed row absent from the map has
+    #: no live counterpart left — it still fails the scope, but has no bookkeeping target.
     stamp_of: dict | None = None
 
     @property
     def sent(self) -> list:
-        """Return the rows this scope's body carries. Equal to ``rows`` for a generationless scope.
+        """Return the rows this scope's body carries. Equal to ``rows`` when no override exists.
 
         Whether the scope RUNS is decided by this and never by ``rows``, and so is what the
         post-apply presence check looks for: an empty stamp list means the deployment records
@@ -1196,12 +1185,10 @@ class _Rows(NamedTuple):
     """One model's contribution to an apply pass, split by what each half is FOR.
 
     *push* is what reaches the device AND what the post-apply presence check looks for;
-    *stamp* is what records the outcome. They are the same list for a generationless job. For
-    a generated one they differ on purpose: *push* is rebuilt from the generation's
-    immutable document (transient rows that must never reach the store), while *stamp* is the
-    LIVE rows this deployment actually carried — a row the successor added, changed or
-    re-authorized after this generation was cut is not stamped by a deployment that never
-    carried it.
+    *stamp* is what records the outcome. For document execution they differ on purpose:
+    *push* is rebuilt from the generation's immutable document (transient rows that must
+    never reach the store), while *stamp* is the LIVE rows this deployment actually carried.
+    A row the successor changed is not stamped by a deployment that never carried it.
 
     *stamp_of* joins the two: pushed-row model and id -> the live row a finding about it
     is recorded on. The model is part of the key because aggregate sections contain tables
@@ -1265,8 +1252,8 @@ class _Projection:
     stored document, so a successor committing between the worker's ``running`` commit and
     this read cannot be deployed under the wrong generation's identity.
 
-    A ``document`` of None is the one job that carries no generation: an Apply on a device
-    nothing was ever written for. Its live read returns nothing either, so the two agree.
+    The worker refuses an Apply without a generation before constructing this source. Every
+    selected section is therefore hydrated from one immutable document.
     """
 
     def __init__(
@@ -1274,8 +1261,8 @@ class _Projection:
         db: AsyncSession,
         device_id: int,
         force: bool,
-        document: dict | None,
-        sections: frozenset[str] | None = None,
+        document: dict,
+        sections: frozenset[str],
     ):
         self._db = db
         self._device_id = device_id
@@ -1295,7 +1282,7 @@ class _Projection:
     async def collect(self, model, *, section: str, force: bool | None = None) -> _Rows:
         if model not in section_models({section}):
             raise ValueError(f"{model.__name__} does not belong to projection section {section!r}")
-        if self._sections is not None and section not in self._sections:
+        if section not in self._sections:
             return _Rows(push=[], stamp=[])
         effective_force = self._force if force is None else force
         live_key = (model, effective_force)
@@ -1304,10 +1291,6 @@ class _Projection:
         live = self._live[live_key]
         if model is RedistributionIntent:
             live = [row for row in live if row.dest_protocol == section]
-        if self._document is None:
-            return _Rows(push=live, stamp=live)
-        if self._sections is None and section not in self._document:
-            return _Rows(push=[], stamp=[])
         document_rows = self._document_rows(section).get(model, [])
         push = [row for row in document_rows if _is_eligible(row, effective_force)]
         # Matched on CONTENT, not on the id alone. A successor push rewrites a row in place,
@@ -1339,69 +1322,6 @@ async def _maybe_sync_from(db: AsyncSession, client, device_name: str, device_id
         logger.info("apply.sync_from.done", device=device_name)
     except Exception as exc:
         logger.warning("apply.sync_from.failed", device=device_name, error=str(exc))
-
-
-async def _collect_attr_eligibility(db: AsyncSession, ifaces: dict, force: bool) -> tuple[list, list]:
-    """Snapshot every interface-attribute intent row; return (snapshot, eligible sends).
-
-    Eligibility for attributes is keyed off the attr_state's sync_state (not last_apply_at):
-    every accepted row is snapshotted, but only those whose state is in the force/no-force
-    set are returned for the per-attribute pass.
-    """
-    eligible_statuses = _FORCE_ELIGIBLE if force else _NO_FORCE_ELIGIBLE
-    snapshot: list[dict] = []
-    eligible: list[tuple] = []
-    for iface in ifaces.values():
-        intent_rows = (
-            (await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface.id))).scalars().all()
-        )
-        for intent_row in intent_rows:
-            attr_state = (
-                await db.execute(
-                    select(InterfaceAttrState).where(
-                        InterfaceAttrState.interface_id == iface.id,
-                        InterfaceAttrState.attribute == intent_row.attribute,
-                    )
-                )
-            ).scalar_one_or_none()
-            snapshot.append(
-                {
-                    "interface": iface.name,
-                    "attribute": intent_row.attribute,
-                    "intent_value": intent_row.intent_value,
-                    "accepted_at": intent_row.accepted_at.isoformat() if intent_row.accepted_at else None,
-                    "status_at_snapshot": attr_state.sync_state.value if attr_state else "unknown",
-                }
-            )
-            if attr_state and attr_state.sync_state in eligible_statuses:
-                eligible.append(_AttributeApply(attr_state, intent_row, iface, intent_row))
-    return snapshot, eligible
-
-
-async def _collect_ip_eligibility(db: AsyncSession, ifaces: dict, force: bool) -> tuple[list, dict]:
-    """Snapshot every IP intent row; return (snapshot, {iface_id: [eligible rows]})."""
-    snapshot: list[dict] = []
-    by_iface: dict[int, list] = {}
-    for iface in ifaces.values():
-        ip_rows = (
-            (await db.execute(select(InterfaceIpIntent).where(InterfaceIpIntent.interface_id == iface.id)))
-            .scalars()
-            .all()
-        )
-        for row in ip_rows:
-            snapshot.append(
-                {
-                    "interface": iface.name,
-                    "address": row.address,
-                    "family": row.family,
-                    "secondary": row.secondary,
-                    "vrf": row.vrf,
-                    "accepted_at": row.accepted_at.isoformat() if row.accepted_at else None,
-                }
-            )
-            if _is_eligible(row, force):
-                by_iface.setdefault(iface.id, []).append(row)
-    return snapshot, by_iface
 
 
 class _AttributeApply(NamedTuple):
@@ -1485,27 +1405,17 @@ async def _collect_interface_apply_rows(
     db: AsyncSession,
     source: _Projection,
     generation,
-    execution_sections: frozenset[str] | None,
-    device_id: int,
-    force: bool,
+    execution_sections: frozenset[str],
 ) -> tuple[dict, list[dict], list, list[dict], dict, dict | None]:
-    """Select no rows, generationless live rows, or the recorded interface document."""
-    if execution_sections is not None and "interface_config" not in execution_sections:
+    """Select no rows or the recorded interface document."""
+    if "interface_config" not in execution_sections:
         return {}, [], [], [], {}, None
-    if generation is not None:
-        ifaces, intent_snapshot, attrs, ip_snapshot, ips, ip_rows = await _collect_document_interface(
-            db,
-            source,
-            generation.document,
-        )
-        return ifaces, intent_snapshot, attrs, ip_snapshot, ips, ip_rows.stamp_of
-    ifaces = {
-        iface.id: iface
-        for iface in (await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))).scalars().all()
-    }
-    intent_snapshot, attrs = await _collect_attr_eligibility(db, ifaces, force)
-    ip_snapshot, ips = await _collect_ip_eligibility(db, ifaces, force)
-    return ifaces, intent_snapshot, attrs, ip_snapshot, ips, None
+    ifaces, intent_snapshot, attrs, ip_snapshot, ips, ip_rows = await _collect_document_interface(
+        db,
+        source,
+        generation.document,
+    )
+    return ifaces, intent_snapshot, attrs, ip_snapshot, ips, ip_rows.stamp_of
 
 
 async def _apply_attributes(eligible, apply_fn, *, client, device_name, job_id, now) -> tuple[int, int, list]:
@@ -3110,7 +3020,7 @@ def _refuse_unverifiable_recorded_put(generation, execution_sections) -> None:
     """Refuse a recorded destructive PUT when verification is disabled at execution."""
     from nso_adapter.nso import apply as nso_apply
 
-    if generation is None or "static_route" not in (execution_sections or ()):
+    if "static_route" not in execution_sections:
         return
     if recorded_static_route_apply_mode(generation.document) == "PUT" and not nso_apply.VERIFY_AFTER_APPLY:
         raise JobError(
@@ -3118,6 +3028,20 @@ def _refuse_unverifiable_recorded_put(generation, execution_sections) -> None:
             "Static-route PUT verification is disabled at worker execution. "
             "The recorded destructive replace was not sent.",
         )
+
+
+async def _required_apply_generation(db: AsyncSession, job_id: int):
+    """Return one Apply carrier's generation and execution boundary, or fail closed."""
+    generation = await executing_generation(db, job_id)
+    if generation is None:
+        raise JobError(
+            "apply_generation_missing",
+            f"Apply job {job_id} carries no generation to deploy.",
+        )
+    execution_sections = await generation_execution_sections(db, job_id)
+    if execution_sections is None:  # pragma: no cover - the generation above came from this job
+        raise RuntimeError(f"apply job {job_id} lost its generation while selecting execution sections")
+    return generation, execution_sections
 
 
 async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int, force: bool, *, reg=None) -> None:
@@ -3155,8 +3079,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     # it stands now (#1522 §G1). Between the worker committing `running` and this point a
     # successor push can commit; without the stored document it would be deployed here, under
     # this generation's identity and settled as this generation's revision.
-    generation = await executing_generation(db, job_id)
-    execution_sections = await generation_execution_sections(db, job_id)
+    generation, execution_sections = await _required_apply_generation(db, job_id)
     _refuse_unverifiable_recorded_put(generation, execution_sections)
 
     client = get_nso_client(device.nso_instance)
@@ -3169,7 +3092,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         db,
         device_id,
         force,
-        generation.document if generation is not None else None,
+        generation.document,
         execution_sections,
     )
 
@@ -3186,8 +3109,6 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         source,
         generation,
         execution_sections,
-        device_id,
-        force,
     )
 
     snmp_comm_rows = await source.collect(SnmpCommunityIntent, section="snmp")
@@ -3202,18 +3123,13 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
 
     sr_eligible_rows = await source.collect(StaticRouteIntent, section="static_route")
     sr_eligible = sr_eligible_rows.push
-    if generation is not None and "static_route" in (execution_sections or ()):
+    if "static_route" in execution_sections:
         sr_all_rows = await source.collect(StaticRouteIntent, section="static_route", force=True)
         sr_plan = hydrate_static_route_apply_plan(generation.document, eligible_rows=sr_eligible)
         sr_stamp_of = sr_all_rows.stamp_of
         sr_stamp_rows = [
             stamp for row in sr_plan.rows if (stamp := (sr_stamp_of or {}).get(_stamp_key(row))) is not None
         ]
-    elif generation is None:
-        # Generationless jobs predate document execution and still serve explicit local runs.
-        sr_plan = await build_plan(db, device, eligible_rows=sr_eligible)
-        sr_stamp_rows = sr_plan.rows
-        sr_stamp_of = None
     else:
         sr_plan = SrPlan("PATCH", [], set(), [], [], 0)
         sr_stamp_rows = []

@@ -1294,12 +1294,11 @@ async def test_a_job_carrying_no_generation_is_never_blocked(adapter_client):
     assert claimed is not None and claimed[0] == sync_id
 
 
-async def test_a_generationless_device_write_cannot_cross_a_blocked_head(adapter_client):
-    """A device-writing job carrying no generation must still respect the barrier.
+async def test_a_corrupt_device_write_without_a_generation_cannot_cross_a_blocked_head(adapter_client):
+    """An invalid device-writing carrier must still respect the barrier.
 
-    Every producer now creates one, but a job can still reach a worker without a generation:
-    an Apply on a device with nothing written, or a job whose generation was abandoned.
-    Admitting one behind a blocked head would deploy over a device state nobody established.
+    Every producer attaches a generation. This direct row represents database corruption;
+    admitting it behind a blocked head must not bypass generation order.
     """
     from nso_adapter.store.models import Job, JobStatus, JobType
 

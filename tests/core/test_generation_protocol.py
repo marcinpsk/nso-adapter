@@ -758,7 +758,7 @@ async def test_f5_c_a_detach_head_is_re_admittable(adapter_client):
     assert (await generations(device_id))[-1].status is GenerationStatus.pending
 
 
-# ── Finding 6 — the three generation-less producers ──────────────────────────
+# ── Finding 6 — every device-writing producer attaches a generation ──────────
 
 
 async def test_f6_a_manual_apply_creates_a_generation_from_authorized_state(adapter_client):

@@ -994,7 +994,7 @@ async def _job_generations(db: AsyncSession, job_id: int) -> list[DeploymentGene
 
 
 async def generation_execution_sections(db: AsyncSession, job_id: int) -> frozenset[str] | None:
-    """Return the sections carried by this job, or ``None`` when it carries no generation.
+    """Return the sections carried by this job, or ``None`` for an invalid carrier.
 
     Adjacent generations can share one apply job. Their streams form the execution boundary,
     and every selected section uses the highest generation's complete document.
@@ -1011,7 +1011,10 @@ class GenerationTampered(RuntimeError):
 
 
 async def executing_generation(db: AsyncSession, job_id: int) -> DeploymentGeneration | None:
-    """Return the generation a job must deploy, digest verified. ``None`` if it carries none.
+    """Return the generation a job must deploy, digest verified.
+
+    ``None`` identifies a job that carries no generation. Reads do not call this function,
+    and device-writing runners refuse that invalid state before sending device config.
 
     A job may carry several ADJACENT generations of the same mode (the queued-winner
     coalescing that already exists). Each document is the COMPLETE outbound device document,
@@ -1144,10 +1147,8 @@ async def job_admissible(db: AsyncSession, job_id: int, device_id: int) -> bool:
     """Ask the success barrier whether a worker may start *job_id* now (§H2).
 
     A READ carrying no generation is unaffected: a sync never deploys a document and must
-    not queue behind a blocked write. A device-WRITING job carrying no generation is a
-    different matter — an Apply on a device nothing was ever written for, or a job whose
-    generation was abandoned — and it may not cross a blocked head either, or it deploys
-    over a device state nobody established.
+    not queue behind a blocked write. A device-WRITING carrier without a generation is
+    invalid. Its runner fails closed, but it still cannot cross a blocked head.
     """
     carried = await _job_generations(db, job_id)
     if not carried:
@@ -1162,7 +1163,7 @@ async def job_admissible(db: AsyncSession, job_id: int, device_id: int) -> bool:
         if blocked is None:
             return True
         logger.warning(
-            "generation.blocked_generationless_write",
+            "generation.blocked_write_without_generation",
             job_id=job_id,
             device_id=device_id,
             job_type=str(job_type),

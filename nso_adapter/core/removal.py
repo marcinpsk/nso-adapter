@@ -1008,8 +1008,8 @@ async def _replace_static_route(
     Promoted generation creation records the removal classification under the projection lock:
 
     1. every tombstone owned by THIS job contributes ``{triple} ∪ {deployed_key}`` (X6);
-       a job that owns none falls back to ``context["removed"]["route"]`` (fence-shut and
-       legacy jobs);
+       a job that owns none falls back to ``context["removed"]["route"]`` (including a
+       fence-shut removal);
     2. supersession subtracts every key the selected plan claims as its ``triple`` or
        its ``deployed_key``. A promotion uses the recorded document. A reissue uses current
        accepted intent;
