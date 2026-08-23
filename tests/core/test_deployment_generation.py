@@ -65,9 +65,15 @@ async def _wait_for_relation_lock(engine, relation: str, *, timeout: float = 5.0
                     "AND cardinality(pg_blocking_pids(activity.pid)) > 0 "
                     "AND position(:relation IN lower(activity.query)) > 0 "
                     "AND EXISTS ("
-                    "SELECT 1 FROM pg_locks AS lock "
-                    "WHERE lock.pid = activity.pid "
-                    "AND lock.relation = to_regclass(:relation)"
+                    "SELECT 1 FROM pg_locks AS wait_lock "
+                    "WHERE wait_lock.pid = activity.pid "
+                    "AND NOT wait_lock.granted"
+                    ") "
+                    "AND EXISTS ("
+                    "SELECT 1 FROM pg_locks AS blocker_lock "
+                    "WHERE blocker_lock.pid = ANY(pg_blocking_pids(activity.pid)) "
+                    "AND blocker_lock.granted "
+                    "AND blocker_lock.relation = to_regclass(:relation)"
                     ")"
                     ")"
                 ),
@@ -77,6 +83,30 @@ async def _wait_for_relation_lock(engine, relation: str, *, timeout: float = 5.0
                 return
             await asyncio.sleep(0.02)
     raise AssertionError(f"no backend entered a lock wait on {relation!r} within {timeout:g}s")
+
+
+async def test_relation_lock_wait_requires_an_ungranted_lock(rival_engine):
+    """A granted lock on one relation must not impersonate a wait on that relation."""
+    from nso_adapter.store.db import get_engine
+
+    async with rival_engine.connect() as blocker, get_engine().connect() as waiter:
+        blocker_tx = await blocker.begin()
+        waiter_tx = await waiter.begin()
+        await blocker.execute(sa.text("LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE"))
+        await waiter.execute(sa.text("LOCK TABLE devices IN ACCESS SHARE MODE"))
+        blocked = asyncio.create_task(
+            waiter.execute(
+                sa.text("SELECT count(*) FROM jobs WHERE EXISTS (SELECT 1 FROM devices WHERE devices.id < 0)")
+            )
+        )
+        try:
+            await _wait_for_relation_lock(get_engine(), "jobs")
+            with pytest.raises(AssertionError, match="no backend entered a lock wait"):
+                await _wait_for_relation_lock(get_engine(), "devices", timeout=0.2)
+        finally:
+            await blocker_tx.rollback()
+            await blocked
+            await waiter_tx.rollback()
 
 
 async def _device(name: str, netbox_device_id: int, *, auto_apply: bool = True) -> int:
@@ -955,6 +985,37 @@ async def test_a_pending_head_bound_to_a_running_job_is_corruption(adapter_clien
     (unchanged,) = await _generations(device_id)
     assert unchanged.job_id == head.job_id
     assert await _job_status(head.job_id) is JobStatus.running
+
+
+async def test_startup_recovery_isolates_a_corrupt_device(adapter_client):
+    from nso_adapter.core.generation import recover_generations
+    from nso_adapter.store.models import Job, JobStatus
+
+    corrupt_device = await _device("gen-recover-corrupt", 9794)
+    healthy_device = await _device("gen-recover-healthy", 9795)
+    for device_id, vlan_id in ((corrupt_device, 95), (healthy_device, 96)):
+        await _vlan(device_id, vlan_id)
+        await _push(adapter_client, device_id)
+    (corrupt_head,) = await _generations(corrupt_device)
+    (healthy_head,) = await _generations(healthy_device)
+    old_healthy_job_id = healthy_head.job_id
+
+    async with session() as db:
+        corrupt_job = await db.get(Job, corrupt_head.job_id)
+        corrupt_job.status = JobStatus.running
+        corrupt_job.run_attempt = 1
+        healthy_job = await db.get(Job, old_healthy_job_id)
+        healthy_job.status = JobStatus.failed
+        await db.commit()
+
+    await recover_generations()
+
+    (unchanged_corrupt,) = await _generations(corrupt_device)
+    (recovered_healthy,) = await _generations(healthy_device)
+    assert unchanged_corrupt.job_id == corrupt_head.job_id
+    assert await _job_status(corrupt_head.job_id) is JobStatus.running
+    assert recovered_healthy.job_id != old_healthy_job_id
+    assert await _job_status(recovered_healthy.job_id) is JobStatus.queued
 
 
 async def test_standalone_advancement_takes_the_projection_lock(adapter_client, rival_engine):

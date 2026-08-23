@@ -1559,7 +1559,10 @@ async def recover_generations() -> int:
     if stranded:
         logger.error("generation.outcome_unknown_on_restart", count=len(stranded), devices=sorted(set(stranded)))
     for device_id in devices:
-        await advance_device_generations(device_id)
+        try:
+            await advance_device_generations(device_id)
+        except GenerationCarrierCorruption:
+            logger.error("generation.carrier_corruption_on_restart", device_id=device_id, exc_info=True)
     return len(stranded)
 
 
