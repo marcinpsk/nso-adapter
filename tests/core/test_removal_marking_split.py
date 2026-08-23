@@ -407,7 +407,7 @@ async def test_a_split_revision_is_applied_when_the_failed_sibling_is_abandoned(
 
     async with session() as db:
         failed_generation = await db.scalar(select(DeploymentGeneration).where(DeploymentGeneration.job_id == unmarked))
-        assert await reconcile_generation(db, failed_generation.id)
+        assert await reconcile_generation(db, failed_generation.id) is None
         await db.commit()
 
     async with session() as db:
