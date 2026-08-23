@@ -208,6 +208,34 @@ async def test_promotion_provenance_handler_uses_closed_error_factory(monkeypatc
          )
 
 
+async def test_promotion_provenance_error_is_dispatched_through_the_application():
+    from httpx import ASGITransport, AsyncClient
+
+    from nso_adapter.core.receipt import PromotionProvenanceUnexecutable
+    from nso_adapter.main import create_app
+
+    app = create_app()
+
+    @app.get("/_test/promotion-provenance")
+    async def _promotion_provenance():
+        raise PromotionProvenanceUnexecutable("vlan")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/_test/promotion-provenance")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": {
+            "code": "apply_unexecutable",
+            "message": (
+                "Push cannot promote outstanding deletion provenance for vlan. "
+                "Apply the stored receipt when vlan is document-executed, then retry this push"
+            ),
+            "detail": {"streams": {"vlan": "outstanding_deletion_provenance"}},
+        }
+    }
+
+
 # ---------------------------------------------------------------- closed set
 
 
