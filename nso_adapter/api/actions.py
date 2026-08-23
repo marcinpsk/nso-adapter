@@ -20,8 +20,8 @@ from nso_adapter.api.errors import (
     RESP_401,
     RESP_404_DEVICE,
     RESP_409,
+    RESP_409_APPLY_CONFLICT,
     RESP_409_QUEUED_ACTION,
-    RESP_409_QUEUED_OR_RUNNING_JOB,
     RESP_422_VALIDATION,
     RESP_500_INTERNAL,
     api_error,
@@ -281,7 +281,7 @@ async def sync_notify(
     responses={
         200: {"model": ActionApplyOut, "description": "No selected stream required a job"},
         **_ACTION_ERRORS,
-        **RESP_409_QUEUED_OR_RUNNING_JOB,
+        **RESP_409_APPLY_CONFLICT,
         **RESP_500_INTERNAL,
     },
 )

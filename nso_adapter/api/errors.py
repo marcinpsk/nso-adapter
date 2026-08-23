@@ -293,8 +293,13 @@ RESP_404: ResponseSpec = {404: {**_ENVELOPE_SCHEMA, "description": "Not found"}}
 RESP_409_QUEUED_ACTION: ResponseSpec = {
     409: {**_ENVELOPE_SCHEMA, "description": "A job of the requested type is already queued for this device"}
 }
-RESP_409_QUEUED_OR_RUNNING_JOB: ResponseSpec = {
-    409: {**_ENVELOPE_SCHEMA, "description": "A job is already queued or running for this device"}
+RESP_409_APPLY_CONFLICT: ResponseSpec = {
+    409: {
+        **_ENVELOPE_SCHEMA,
+        "description": (
+            "A job is already queued or running for this device, or a selected stream cannot be applied faithfully"
+        ),
+    }
 }
 RESP_409: ResponseSpec = {409: {**_ENVELOPE_SCHEMA, "description": "Conflict"}}
 RESP_409_PUSH_SEQ: ResponseSpec = {

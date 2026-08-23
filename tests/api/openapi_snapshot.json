@@ -9594,7 +9594,7 @@
                 }
               }
             },
-            "description": "A job is already queued or running for this device"
+            "description": "A job is already queued or running for this device, or a selected stream cannot be applied faithfully"
           },
           "422": {
             "content": {

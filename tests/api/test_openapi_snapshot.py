@@ -175,7 +175,9 @@ def test_action_conflict_descriptions_match_their_admission_rules(openapi_schema
         assert openapi_schema["paths"][path]["post"]["responses"]["409"]["description"] == queued_action
 
     apply = openapi_schema["paths"]["/api/v1/devices/{device_id}/actions/apply"]["post"]
-    assert apply["responses"]["409"]["description"] == "A job is already queued or running for this device"
+    assert apply["responses"]["409"]["description"] == (
+        "A job is already queued or running for this device, or a selected stream cannot be applied faithfully"
+    )
 
 
 def test_device_generation_limit_schema_matches_the_runtime_bounds(openapi_schema):
