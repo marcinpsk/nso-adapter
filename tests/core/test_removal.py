@@ -2239,6 +2239,7 @@ async def test_enqueue_removal_force_refuses_generation_only_arguments(adapter_c
                 "static_route",
                 marking=None,
                 defer_retract=False,
+                promotes=(),
                 force=True,
                 **kwargs,
             )
