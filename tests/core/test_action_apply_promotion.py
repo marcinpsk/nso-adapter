@@ -1322,6 +1322,7 @@ async def test_action_apply_settlement_between_projection_and_generation_reads_i
         waiting = False
         deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline:
+            await settler.execute(sa.text("SELECT pg_stat_clear_snapshot()"))
             waiting = await settler.scalar(
                 sa.text(
                     "SELECT EXISTS ("
