@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import warnings
 from contextlib import asynccontextmanager
@@ -61,20 +62,39 @@ def _url_for(dbname: str, *, driver: str) -> str:
     return make_url(ADMIN_URL).set(drivername=driver, database=dbname).render_as_string(hide_password=False)
 
 
+#: How long a straggler may take to disappear before it counts as leaked.
+_TEARDOWN_GRACE_S = 15.0
+
+
+def _client_backends(conn, name: str) -> list:
+    # backend_type filter: PG's own autovacuum worker can be inside the clone at DROP
+    # time and is not a leaked test session — only client backends count as stragglers.
+    return conn.exec_driver_sql(
+        "SELECT pid, state, left(query, 120) FROM pg_stat_activity "
+        f"WHERE datname = '{name}' AND pid <> pg_backend_pid() "
+        "AND backend_type = 'client backend'"
+    ).fetchall()
+
+
 def _drop_database(admin, name: str, *, expect_clean: bool) -> None:
     """Report stragglers BEFORE forcing. FORCE is last-resort cleanup, not the mechanism.
 
     A surviving connection means a fixture failed to close a session — a test bug we want
     visible. Silently FORCE-ing it away is how that bug stays invisible forever.
+
+    Closing is not instantaneous, though: a pooled connection the test already released
+    stays in ``pg_stat_activity`` until its backend actually exits, so a single sample can
+    catch one mid-disposal (``idle``, last query ``ROLLBACK``) and call it a leak. Sample to
+    a deadline instead. NO state is excluded — an ``idle`` connection that never goes away
+    IS the leak this guard exists to catch, and filtering on state would hide exactly that.
     """
     with admin.connect() as conn:
-        # backend_type filter: PG's own autovacuum worker can be inside the clone at DROP
-        # time and is not a leaked test session — only client backends count as stragglers.
-        rows = conn.exec_driver_sql(
-            "SELECT pid, state, left(query, 120) FROM pg_stat_activity "
-            f"WHERE datname = '{name}' AND pid <> pg_backend_pid() "
-            "AND backend_type = 'client backend'"
-        ).fetchall()
+        rows = _client_backends(conn, name)
+        if rows and expect_clean:
+            deadline = time.monotonic() + _TEARDOWN_GRACE_S
+            while rows and time.monotonic() < deadline:
+                time.sleep(0.05)
+                rows = _client_backends(conn, name)
         if rows and expect_clean:
             msg = f"{name}: {len(rows)} connection(s) survived teardown: {rows}"
             if STRICT_TEARDOWN:
@@ -569,6 +589,18 @@ async def seed_device(
         await db.commit()
         await db.refresh(d)
         return d.id
+
+
+async def note_projection_write(db, device_id: int, stream: str) -> None:
+    """Record the projection write an intent endpoint performs before it enqueues (#1522 §G2).
+
+    Production never reaches ``enqueue_apply``/``enqueue_removal`` without it — the mutation
+    site records the revision the enqueue then promotes — so a test that drives those choke
+    points directly has to perform it too, or the promotion has nothing to authorize.
+    """
+    from nso_adapter.core.generation import note_write
+
+    await note_write(db, device_id, stream)
 
 
 async def start_job(job_id: int) -> int:

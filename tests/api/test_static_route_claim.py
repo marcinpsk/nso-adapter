@@ -126,8 +126,26 @@ async def test_a_held_claim_turns_the_put_into_a_409(adapter_client, monkeypatch
 
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "conflict"
+    assert resp.json()["error"]["detail"]["reason"] == "device_claimed"
     # Refused, not half-applied.
     assert await _triples_by_route_id(device_id) == {}
+
+    # The published 409 must name the cause the endpoint just refused on. It refuses on ANY
+    # competing device claim — here a plain "job" claim with no job row behind it — so the
+    # fragment saying "a job is already running for this device" documented a narrower
+    # condition than the one that fires (#1558 rework 3, finding 5).
+    described = _published_409_description()
+    assert "busy with another operation" in described, described
+    assert "job is already running" not in described, described
+
+
+def _published_409_description() -> str:
+    """The 409 description the OpenAPI schema publishes for the static-route intent PUT."""
+    from nso_adapter.main import create_app
+
+    schema = create_app().openapi()
+    put = schema["paths"]["/api/v1/devices/{device_id}/static-route-intent"]["put"]
+    return put["responses"]["409"]["description"]
 
 
 async def test_the_put_waits_for_the_claim_instead_of_reading_around_it(adapter_client, monkeypatch):
@@ -186,23 +204,38 @@ async def test_a_failure_after_the_guard_lock_neither_hangs_nor_leaks_the_claim(
     from nso_adapter.api import static_route as sr_mod
 
     device_id = await seed_device(nso_device_name="sr-claim-lockfail", netbox_device_id=9405)
+    guard_locked = False
+    body_reached = False
+    lock_claim = sr_mod.lock_claim
 
-    async def _boom(device_id, body, db):
+    async def _record_guard_lock(*args, **kwargs):
+        nonlocal guard_locked
+        result = await lock_claim(*args, **kwargs)
+        guard_locked = True
+        return result
+
+    async def _boom(*args, **kwargs):
+        nonlocal body_reached
+        body_reached = True
+        assert guard_locked, "the request body ran before its claim-row guard was locked"
         raise RuntimeError("forced post-lock failure")
 
+    monkeypatch.setattr(sr_mod, "lock_claim", _record_guard_lock)
     monkeypatch.setattr(sr_mod, "_apply_static_route_intent", _boom)
 
-    # The transport re-raises the unhandled body error; the contract under test is that
-    # the request UNWINDS (no hang on our own lock) and the claim is gone afterwards.
-    with pytest.raises(RuntimeError, match="forced post-lock failure"):
-        await asyncio.wait_for(
-            adapter_client.put(
-                f"/api/v1/devices/{device_id}/static-route-intent",
-                json={"routes": [entry(A)]},
-                headers=AUTH,
-            ),
-            timeout=15,
-        )
+    # The catch-all answers the unhandled body error as a 500; the contract under test is
+    # that the request UNWINDS (no hang on our own lock) and the claim is gone afterwards.
+    resp = await asyncio.wait_for(
+        adapter_client.put(
+            f"/api/v1/devices/{device_id}/static-route-intent",
+            json={"routes": [entry(A)]},
+            headers=AUTH,
+        ),
+        timeout=15,
+    )
+    assert resp.status_code == 500, resp.text
+    assert guard_locked, "the failing body stub was never reached after the guard lock"
+    assert body_reached, "the request did not reach the failing body stub"
     assert await _claim_row(device_id) is None
 
 

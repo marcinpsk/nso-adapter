@@ -14,7 +14,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, IntentApplyResult, api_error
+from nso_adapter.api.errors import (
+    RESP_401,
+    RESP_404_DEVICE,
+    RESP_409_PUSH_SEQ,
+    RESP_422_VALIDATION,
+    IntentApplyResult,
+    api_error,
+)
+from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant
 from nso_adapter.core.importer import get_nso_client
@@ -210,18 +218,37 @@ class VlanIntentUpdate(BaseModel):
     "/{device_id}/vlan-intent",
     dependencies=[Depends(verify_token)],
     response_model=IntentApplyResult,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_PUSH_SEQ, **RESP_422_VALIDATION},
 )
-async def put_vlan_intent(device_id: int, body: VlanIntentUpdate, db: AsyncSession = Depends(get_db)):
+async def put_vlan_intent(
+    device_id: int,
+    body: VlanIntentUpdate,
+    db: AsyncSession = Depends(get_db),
+    delivery=Depends(get_intent_delivery),
+):
     """Replace the adapter's VLAN-database intent mirror for this device atomically.
 
     Full-replace: rows not in the body are deleted. ``accepted_at`` defaults to now.
     If ``auto_apply`` is enabled on the device, an apply job is enqueued. The single
     device Apply commits these via the vlan-reconciler.
+
+    ONE transaction covers the whole delivery (#1522 §G1/§G2): the receipt that admits this
+    ``X-Push-Seq``, the row changes, the projection revision, the deployment generations the
+    change authorizes, their jobs, and the stored response. A re-delivery of the same
+    sequence replays that response and applies nothing; the same sequence with a different
+    body, or an older sequence, is refused.
     """
+    from nso_adapter.core.receipt import record_response
+
     device = await db.get(Device, device_id)
     if device is None:
         raise api_error(404, "not_found", "Device not found")
+
+    # Takes the device's projection lock BEFORE anything is read, so the rows this request
+    # mutates, the document its generation snapshots and the receipt that admits it are all
+    # one serialized unit against every other writer of this device.
+    if (replay := await begin_delivery(db, device_id, delivery)) is not None:
+        return replay
 
     existing = await db.execute(select(VlanIntent).where(VlanIntent.device_id == device_id))
     existing_rows: dict[int, VlanIntent] = {r.vlan_id: r for r in existing.scalars().all()}
@@ -249,18 +276,11 @@ async def put_vlan_intent(device_id: int, body: VlanIntentUpdate, db: AsyncSessi
         count += 1
 
     await db.flush()
-    settings = (
-        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    ).scalar_one_or_none()
-    if settings and settings.auto_apply and count > 0:
-        from nso_adapter.core.apply import enqueue_apply
 
-        await enqueue_apply(db, device_id, force=True)
-
-    await db.commit()
-
-    # Removal propagation: a dropped vid won't be removed by the next merge-PATCH
-    # apply, so PUT-replace the vlan-reconciler instance with the remaining list.
+    # Removal propagation: a dropped vid won't be removed by the next merge-PATCH apply, so
+    # PUT-replace the vlan-reconciler instance with the remaining list. Enqueued BEFORE the
+    # apply so it carries the lower job id and the worker runs it first, and inside THIS
+    # transaction so the shrink cannot outlive the generation that authorizes it.
     replaced = False
     if removed_vids or cleared:
         from nso_adapter.core.removal import replace_on_removal
@@ -268,4 +288,15 @@ async def put_vlan_intent(device_id: int, body: VlanIntentUpdate, db: AsyncSessi
 
         replaced = await replace_on_removal(db, device, removed_vids, VlanIntent, apply_vlan_config, retract=cleared)
 
-    return {"device_id": device_id, "count": count, "removed": len(removed_vids), "replaced": replaced}
+    settings = (
+        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    ).scalar_one_or_none()
+    if settings and settings.auto_apply and count > 0:
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
+
+    result = {"device_id": device_id, "count": count, "removed": len(removed_vids), "replaced": replaced}
+    await record_response(db, device_id, delivery, result)
+    await db.commit()
+    return result

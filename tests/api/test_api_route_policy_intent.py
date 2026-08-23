@@ -226,6 +226,44 @@ async def test_put_route_policy_intent_creates_objects(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_put_route_policy_intent_auto_apply_creates_generation(adapter_client):
+    from nso_adapter.store.models import DeploymentGeneration, DeviceSettings, IntentPushReceipt, Job, JobType
+
+    device_id = await seed_device(nso_device_name="rp-auto-apply", netbox_device_id=7965)
+    async with session() as db:
+        db.add(DeviceSettings(device_id=device_id, auto_apply=True))
+        await db.commit()
+
+    response = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/route-policy-intent",
+        headers={**AUTH, "X-Push-Seq": "7965"},
+        json={"objects": [_obj("prefix_list", "PL-AUTO", accepted=True)]},
+    )
+
+    assert response.status_code == 200, response.text
+    async with session() as db:
+        generations = (
+            await db.execute(
+                select(DeploymentGeneration, Job)
+                .join(Job, Job.id == DeploymentGeneration.job_id)
+                .where(DeploymentGeneration.device_id == device_id)
+            )
+        ).all()
+        receipt = await db.scalar(
+            select(IntentPushReceipt).where(
+                IntentPushReceipt.device_id == device_id,
+                IntentPushReceipt.section == "route_policy",
+            )
+        )
+    assert len(generations) == 1
+    generation, job = generations[0]
+    assert generation.stream_revisions == {"route_policy": 1}
+    assert job.job_type is JobType.apply
+    assert receipt is not None
+    assert receipt.generation_id == generation.id
+
+
+@pytest.mark.anyio
 async def test_put_route_policy_intent_updates_in_place(adapter_client):
     device_id = await seed_device(nso_device_name="rp-update", netbox_device_id=7955)
     await adapter_client.put(

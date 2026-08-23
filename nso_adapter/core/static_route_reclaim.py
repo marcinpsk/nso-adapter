@@ -34,7 +34,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import acquire_claim, claim_session, lock_claim, release_claim
-from nso_adapter.store.models import Device, Job, JobStatus, JobType, StaticRouteTombstone
+from nso_adapter.store.models import Device, Job, JobStatus, StaticRouteTombstone
 
 logger = structlog.get_logger(__name__)
 
@@ -134,7 +134,7 @@ async def reclaim_one_device(device_id: int, *, db: AsyncSession | None = None) 
     so a kill mid-pass can neither strand a consumed carrier nor leave an ownerless job.
     """
     from nso_adapter.core.importer import get_nso_client
-    from nso_adapter.core.tombstone_sweep import _removal_context
+    from nso_adapter.core.tombstone_sweep import reissue_removal_job
     from nso_adapter.store.tombstone_store import delete_tombstones
 
     reg = await acquire_claim(device_id, "sweep", db=db)
@@ -180,15 +180,7 @@ async def reclaim_one_device(device_id: int, *, db: AsyncSession | None = None) 
                 if _delete_origin_proven(row, proof) if row.marking == "delete_origin" else _detach_proven(row, proof):
                     consumable.append(row.id)
                 else:
-                    job = Job(
-                        job_type=JobType.removal,
-                        device_id=device_id,
-                        status=JobStatus.queued,
-                        context=_removal_context(row),
-                    )
-                    conn.add(job)
-                    await conn.flush()
-                    row.job_id = job.id
+                    await reissue_removal_job(conn, device_id, row)
                     reissued += 1
             if consumable:
                 consumed = await delete_tombstones(conn, consumable, device_id=device_id, claim_token=reg.token)

@@ -14,7 +14,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
+from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.core.removal import is_cleared
@@ -319,7 +320,7 @@ async def _sync_ospf_redistribution(
     return removed, cleared
 
 
-async def _maybe_enqueue_apply(db: AsyncSession, device_id: int, count: int) -> None:
+async def _maybe_enqueue_apply(db: AsyncSession, device_id: int, count: int, *, stream: str) -> None:
     """Enqueue an apply job when the payload is non-empty and the device has auto_apply on."""
     if count <= 0:
         return
@@ -329,7 +330,7 @@ async def _maybe_enqueue_apply(db: AsyncSession, device_id: int, count: int) -> 
     if settings and settings.auto_apply:
         from nso_adapter.core.apply import enqueue_apply
 
-        await enqueue_apply(db, device_id, force=True)
+        await enqueue_apply(db, device_id, force=True, stream=stream)
 
 
 class OspfIntentResult(BaseModel):
@@ -342,9 +343,14 @@ class OspfIntentResult(BaseModel):
     "/{device_id}/ospf-intent",
     dependencies=[Depends(verify_token)],
     response_model=OspfIntentResult,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_PUSH_SEQ, **RESP_422_VALIDATION},
 )
-async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSession = Depends(get_db)):
+async def put_ospf_intent(
+    device_id: int,
+    payload: OspfIntentUpdate,
+    db: AsyncSession = Depends(get_db),
+    delivery=Depends(get_intent_delivery),
+):
     """Replace the adapter's OSPF intent mirror for this device atomically.
 
     Full-replace semantics per device for instances, interfaces and (instance-scoped)
@@ -357,6 +363,14 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+
+    # Every accepted write records its projection revision, store-only and
+    # auto-apply-off included, and takes the device's projection lock before anything is
+    # read (#1522 §G2). Only a promotion authorizes a deployment.
+    from nso_adapter.core.receipt import record_response
+
+    if (replay := await begin_delivery(db, device_id, delivery)) is not None:
+        return replay
 
     now = datetime.now(UTC)
 
@@ -388,8 +402,6 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
     )
     removed_redist, redist_cleared = await _sync_ospf_redistribution(db, device_id, payload.instances, now)
 
-    await _maybe_enqueue_apply(db, device_id, len(payload.instances) + len(payload.interfaces))
-
     # Same two-cause split as IS-IS (see api/isis.py): a DROPPED row is an un-own and must
     # not strip config off the device absent ?delete_origin (#106 → detach), while a
     # CLEARED scalar on a retained, still-owned row is an explicit operator retraction that
@@ -408,15 +420,19 @@ async def put_ospf_intent(device_id: int, payload: OspfIntentUpdate, db: AsyncSe
             db,
             device_id,
             "ospf",
+            promotes=(delivery.stream,),
             removed={"interface-config": removed_iface, "process-config": removed_inst},
             retract=cleared,
             shrank=deleted,
         )
 
-    await db.commit()
+    await _maybe_enqueue_apply(db, device_id, len(payload.instances) + len(payload.interfaces), stream=delivery.stream)
 
-    return {
+    result = {
         "device_id": device_id,
         "instance_count": len(payload.instances),
         "interface_count": len(payload.interfaces),
     }
+    await record_response(db, device_id, delivery, result)
+    await db.commit()
+    return result

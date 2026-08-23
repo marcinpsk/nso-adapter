@@ -38,7 +38,7 @@ from nso_adapter.store.models import (
 )
 from tests.conftest import SNMP_COMMUNITY as _COMMUNITY
 from tests.conftest import SNMP_VAULT_REF as _REF
-from tests.conftest import session
+from tests.conftest import note_projection_write, session
 
 _NOW = datetime.now(UTC)
 
@@ -60,7 +60,40 @@ async def _seed_device(*, nso_device_name: str = "sw3", netbox_device_id: int = 
 
 
 async def _seed_removal_job(device_id: int, scope: str = "vlan", context_extra: dict | None = None) -> int:
+    """Seed a started removal job WITH the generation it deploys, as enqueue_removal does.
+
+    A removal job without a generation is not a state production can reach (#1522 §G1): the
+    body a PUT-replace asserts comes from the generation's document for a document-executed
+    scope, and a job with none has nothing to deploy.
+    """
+    from nso_adapter.core.generation import (
+        attach_to_job,
+        create_generation,
+        create_reissue_generation,
+        note_write,
+    )
+    from nso_adapter.core.projection import section_streams
+    from nso_adapter.store.models import GenerationMode
+
+    context = {"scope": scope, **(context_extra or {})}
+    stream = section_streams(scope)[0]
+    mode = GenerationMode.detach if context.get("detach") else GenerationMode.networked
     async with session() as db:
+        if context.get("force"):
+            # A force removal PROMOTES NOTHING, so it takes the reissue branch of
+            # enqueue_removal: no accepted write stands behind it (hence no note_write),
+            # stream_revisions stays empty, and it carries no allowed_removal_keys.
+            generation = await create_reissue_generation(db, device_id, mode=mode, removal_context=context)
+        else:
+            await note_write(db, device_id, stream)
+            generation = await create_generation(
+                db,
+                device_id,
+                streams=(stream,),
+                mode=mode,
+                allowed_removal_keys=context.get("removed") or {},
+                removal_context=context,
+            )
         # Started, at attempt 1: run_removal is invoked directly, so nothing else performs
         # the worker head's queued -> running transition its terminal CAS expects.
         j = Job(
@@ -68,9 +101,11 @@ async def _seed_removal_job(device_id: int, scope: str = "vlan", context_extra: 
             device_id=device_id,
             status=JobStatus.running,
             run_attempt=1,
-            context={"scope": scope, **(context_extra or {})},
+            context=context,
         )
         db.add(j)
+        await db.flush()
+        await attach_to_job(db, generation, j)
         await db.commit()
         await db.refresh(j)
         return j.id
@@ -94,8 +129,10 @@ async def test_replace_on_removal_enqueues_job_and_commits(adapter_client):
     device_id = await _seed_device()
     async with session() as db:
         device = await db.get(Device, device_id)
+        await note_projection_write(db, device_id, "vlan")
         ok = await replace_on_removal(db, device, [3366], VlanIntent)
         assert ok is True
+        await db.commit()  # the shim no longer commits: the caller owns the boundary
 
     # Re-read in a fresh session to prove it was committed, not merely flushed.
     async with session() as db:
@@ -128,17 +165,20 @@ async def test_replace_on_removal_unknown_model_returns_false(adapter_client):
 async def test_enqueue_removal_rejects_unknown_scope(adapter_client):
     async with session() as db:
         with pytest.raises(ValueError, match="Unknown removal scope"):
-            await enqueue_removal(db, 1, "bogus")
+            await enqueue_removal(db, 1, "bogus", promotes=("vlan",))
 
 
 async def test_enqueue_removal_creates_job_for_each_valid_scope(adapter_client):
     """Every reconciler scope (incl ospf/bgp) maps to a removal job."""
+    from nso_adapter.core.projection import section_streams
     from nso_adapter.core.removal import VALID_REMOVAL_SCOPES
 
     device_id = await _seed_device()
     for scope in VALID_REMOVAL_SCOPES:
         async with session() as db:
-            job = await enqueue_removal(db, device_id, scope)
+            stream = section_streams(scope)[0]
+            await note_projection_write(db, device_id, stream)
+            job = await enqueue_removal(db, device_id, scope, promotes=(stream,))
             await db.commit()
             assert job.job_type == JobType.removal
             assert job.context == {"scope": scope, "detach": True}
@@ -848,8 +888,10 @@ async def test_replace_on_removal_threads_removed_keys(adapter_client):
     device_id = await _seed_device(nso_device_name="sw-shim")
     async with session() as db:
         device = await db.get(Device, device_id)
+        await note_projection_write(db, device_id, "vlan")
         ok = await replace_on_removal(db, device, [3366, 3377], VlanIntent)
         assert ok is True
+        await db.commit()
     async with session() as db:
         job = (await db.execute(select(Job))).scalars().one()
         assert job.context == {"scope": "vlan", "removed": {"vlan": [3366, 3377]}, "detach": True}
@@ -861,10 +903,12 @@ async def test_replace_on_removal_maps_route_policy_families(adapter_client):
     device_id = await _seed_device(nso_device_name="sw-shim-rp")
     async with session() as db:
         device = await db.get(Device, device_id)
+        await note_projection_write(db, device_id, "route_policy")
         ok = await replace_on_removal(
             db, device, [("community_list", "example-comm"), ("route_map", "RM-IN")], RoutePolicyObjectIntent
         )
         assert ok is True
+        await db.commit()
     async with session() as db:
         job = (await db.execute(select(Job))).scalars().one()
         assert job.context == {
@@ -878,8 +922,13 @@ async def test_enqueue_removal_serializes_removed_tuples(adapter_client):
     """Tuple keys (compound) become JSON-safe arrays in the job context."""
     device_id = await _seed_device(nso_device_name="sw-enq")
     async with session() as db:
+        await note_projection_write(db, device_id, "static_route")
         job = await enqueue_removal(
-            db, device_id, "static_route", removed={"route": [("", "10.0.0.0/24", "192.0.2.1")]}
+            db,
+            device_id,
+            "static_route",
+            promotes=("static_route",),
+            removed={"route": [("", "10.0.0.0/24", "192.0.2.1")]},
         )
         await db.commit()
         assert job.context == {
@@ -1570,7 +1619,8 @@ async def test_run_removal_failure_skips_residue_and_sync(adapter_client):
 async def test_enqueue_removal_unmarked_shrink_defaults_to_detach(adapter_client):
     device_id = await _seed_device(nso_device_name="sw-detach")
     async with session() as db:
-        job = await enqueue_removal(db, device_id, "svi", removed={"interface": [["Vlan9"]]})
+        await note_projection_write(db, device_id, "svi")
+        job = await enqueue_removal(db, device_id, "svi", promotes=("svi",), removed={"interface": [["Vlan9"]]})
         await db.commit()
         assert job.context["detach"] is True
 
@@ -1582,7 +1632,8 @@ async def test_enqueue_removal_delete_origin_is_real_retraction(adapter_client):
     token = DELETE_ORIGIN.set(True)
     try:
         async with session() as db:
-            job = await enqueue_removal(db, device_id, "svi", removed={"interface": [["Vlan9"]]})
+            await note_projection_write(db, device_id, "svi")
+            job = await enqueue_removal(db, device_id, "svi", promotes=("svi",), removed={"interface": [["Vlan9"]]})
             await db.commit()
             assert "detach" not in (job.context or {})
     finally:
@@ -1596,6 +1647,19 @@ async def test_enqueue_removal_force_is_real_retraction(adapter_client):
         await db.commit()
         assert job.context.get("force") is True
         assert "detach" not in job.context
+
+
+async def test_enqueue_removal_force_refuses_to_promote(adapter_client):
+    """A force flush re-deploys authorized state; a caller naming streams contradicts that.
+
+    Silently ignoring them is the shape of the bug: the promotion would authorize (and its
+    settlement certify) whatever the named lanes hold, none of which this job sends.
+    """
+    device_id = await _seed_device(nso_device_name="sw-force-promotes")
+    async with session() as db:
+        await note_projection_write(db, device_id, "svi")
+        with pytest.raises(ValueError, match="promotes nothing"):
+            await enqueue_removal(db, device_id, "svi", promotes=("svi",), force=True)
 
 
 async def test_run_removal_detach_syncs_from_and_skips_residue(adapter_client):

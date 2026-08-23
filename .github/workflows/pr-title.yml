@@ -5,7 +5,11 @@ name: Validate PR title
 # squash merges that commit is the PR title, so the title has to be a valid
 # conventional commit or the release is silently derived from nothing.
 on:
-  pull_request_target:
+  # pull_request_target is what makes this gate authoritative: it runs the BASE repo's
+  # definition, so a PR cannot disable its own title check by editing this file. The trigger
+  # is only dangerous when the privileged context meets PR-authored code — this job never
+  # checks anything out and reads the title from the event payload.
+  pull_request_target:  # zizmor: ignore[dangerous-triggers]
     types: [opened, edited, synchronize]
 
 permissions: {}

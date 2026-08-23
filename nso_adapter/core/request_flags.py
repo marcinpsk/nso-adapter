@@ -32,9 +32,46 @@ STORE_ONLY: ContextVar[bool] = ContextVar("store_only", default=False)
 # endpoint without each one threading a flag.
 DELETE_ORIGIN: ContextVar[bool] = ContextVar("delete_origin", default=False)
 
+# ``PUSH_SEQ`` carries the plugin's ``X-Push-Seq`` header: the identity of the outbox claim
+# this request delivers. It is the key receipt admission dedupes on (#1522 §G2) and the
+# provenance recorded on every projection write and on the generation a normal write
+# promotes. Request-scoped at the same layer as the two flags above, for the same reason.
+PUSH_SEQ: ContextVar[int | None] = ContextVar("push_seq", default=None)
+
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+#: The admissible ``X-Push-Seq`` domain. The upper bound is the BIGINT the receipt and the
+#: projection row store it in: a wider value must be refused at the boundary, because the
+#: alternative is an asyncpg range error deep inside the mutation — a 500 for a client
+#: mistake, after part of the request has already run.
+MIN_PUSH_SEQ = 1
+MAX_PUSH_SEQ = 2**63 - 1
+
+
+class InvalidPushSequence(ValueError):
+    """The request carried an ``X-Push-Seq`` that cannot identify a claim."""
 
 
 def parse_store_only(raw: str | None) -> bool:
     """Parse a raw boolean query value (mirrors FastAPI's bool query coercion)."""
     return raw is not None and raw.strip().lower() in _TRUTHY
+
+
+def parse_push_seq(raw: str | None) -> int | None:
+    """Parse the ``X-Push-Seq`` header. Absent → None; present and unusable → raises.
+
+    A PRESENT header that cannot be a claim identity is a client error and is refused, not
+    downgraded: silently treating it as absent turns a keyed, replay-protected delivery into
+    an unkeyed one, and the plugin's retry then applies a second time under a receipt nobody
+    wrote. Absence itself stays legal — the ratified #1503 contract keeps lacp/switchport
+    out of the protocol as claim-less direct-apply deliveries.
+    """
+    if raw is None:
+        return None
+    try:
+        seq = int(raw.strip())
+    except ValueError:
+        raise InvalidPushSequence("X-Push-Seq must be an integer") from None
+    if not MIN_PUSH_SEQ <= seq <= MAX_PUSH_SEQ:
+        raise InvalidPushSequence(f"X-Push-Seq must be between {MIN_PUSH_SEQ} and {MAX_PUSH_SEQ}")
+    return seq

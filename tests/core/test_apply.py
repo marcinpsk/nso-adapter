@@ -27,7 +27,7 @@ from nso_adapter.store.models import (
     JobType,
     SyncState,
 )
-from tests.conftest import session
+from tests.conftest import note_projection_write, session
 
 # ── _nokia_routed_kind (pure: derives SR OS router context from kind/service/vrf) ──
 
@@ -278,7 +278,8 @@ async def test_enqueue_apply_creates_job(adapter_client):
     """enqueue_apply creates an apply job when no active job exists."""
     device_id = await _seed_device("rtr-a01", 101)
     async with session() as db:
-        job = await enqueue_apply(db, device_id=device_id)
+        await note_projection_write(db, device_id, "vlan")
+        job = await enqueue_apply(db, device_id=device_id, stream="vlan")
         assert job is not None
         assert job.job_type == JobType.apply
         assert job.status == JobStatus.queued
@@ -290,7 +291,8 @@ async def test_enqueue_apply_blocked_by_a_queued_apply(adapter_client):
     await _seed_apply_job(device_id, JobStatus.queued)
 
     async with session() as db:
-        assert await enqueue_apply(db, device_id=device_id) is None
+        await note_projection_write(db, device_id, "vlan")
+        assert await enqueue_apply(db, device_id=device_id, stream="vlan") is None
 
 
 async def test_enqueue_apply_admitted_while_an_apply_runs(adapter_client):
@@ -300,7 +302,8 @@ async def test_enqueue_apply_admitted_while_an_apply_runs(adapter_client):
     await _seed_apply_job(device_id, JobStatus.running)
 
     async with session() as db:
-        assert await enqueue_apply(db, device_id=device_id) is not None
+        await note_projection_write(db, device_id, "vlan")
+        assert await enqueue_apply(db, device_id=device_id, stream="vlan") is not None
 
 
 # ── run_apply ─────────────────────────────────────────────────────────────────

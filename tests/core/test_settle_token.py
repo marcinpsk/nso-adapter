@@ -82,6 +82,28 @@ async def _recover(device_id: int) -> None:
     assert [r.device_id for r in revoked] == [device_id]
 
 
+async def _running_generation(device_id: int, job_id: int) -> int:
+    """Give *job_id* the running generation an executing write carries. Returns its id."""
+    from nso_adapter.store.models import DeploymentGeneration, GenerationMode, GenerationStatus
+
+    async with session() as db:
+        generation = DeploymentGeneration(
+            device_id=device_id,
+            seq=1,
+            mode=GenerationMode.networked,
+            status=GenerationStatus.running,
+            document={},
+            digest="0" * 64,
+            allowed_removal_keys={},
+            source_push_seq={},
+            stream_revisions={},
+            job_id=job_id,
+        )
+        db.add(generation)
+        await db.commit()
+        return generation.id
+
+
 # ── S1.1 / S1.2 (P0.7): an abandoned runner may not write terminal ───────────
 
 
@@ -343,6 +365,35 @@ async def test_a_superseded_requeue_returns_failed_not_queued(adapter_client):
     assert await _status(successor_id) is JobStatus.queued
 
 
+async def test_a_superseded_requeue_abandons_its_generation(adapter_client):
+    """The elected successor can cross a generation the stale run no longer owns."""
+    from nso_adapter.core.claim import terminalize_running
+    from nso_adapter.core.generation import job_admissible
+    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, JobStatus, JobType
+
+    device_id = await seed_device(nso_device_name="s1-superseded-generation", netbox_device_id=9911)
+    # Apply is device-WRITING. A sync is admissible before the barrier is ever consulted.
+    job_id = await _queue(device_id, JobType.apply)
+    _jid, _dev, _jt, reg = await _start_run(device_id, job_id)
+    generation_id = await _running_generation(device_id, job_id)
+
+    async with session() as db:
+        created, winner = await admit_queued_job(db, device_id, JobType.apply)
+        await db.commit()
+        successor_id = (created or winner).id
+
+    async with session() as db:
+        landed = await terminalize_running(db, job_id, status=JobStatus.queued, expected_attempt=reg.run_attempt)
+        await db.commit()
+
+    async with session() as db:
+        generation = await db.get(DeploymentGeneration, generation_id)
+        assert landed is JobStatus.failed
+        assert generation.status is GenerationStatus.abandoned
+        assert await job_admissible(db, successor_id, device_id)
+
+
 async def test_a_successor_inserted_mid_decision_lands_superseded(adapter_client, monkeypatch, rival_engine):
     """S1.4b (M7) — admission commits a successor BETWEEN the lookup and the UPDATE.
 
@@ -353,11 +404,12 @@ async def test_a_successor_inserted_mid_decision_lands_superseded(adapter_client
     """
     from nso_adapter.core.claim import terminalize_running
     from nso_adapter.core.jobs import admit_queued_job
-    from nso_adapter.store.models import Job, JobStatus, JobType
+    from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, Job, JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="s1-midrace", netbox_device_id=9907)
-    job_id = await _queue(device_id, JobType.sync)
+    job_id = await _queue(device_id, JobType.apply)
     _jid, _dev, _jt, reg = await _start_run(device_id, job_id)
+    generation_id = await _running_generation(device_id, job_id)
 
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
     fired: list[bool] = []
@@ -373,7 +425,7 @@ async def test_a_successor_inserted_mid_decision_lands_superseded(adapter_client
             if not fired:
                 fired.append(True)
                 async with rival() as other:
-                    await admit_queued_job(other, device_id, JobType.sync)
+                    await admit_queued_job(other, device_id, JobType.apply)
                     await other.commit()
             return out
 
@@ -388,6 +440,9 @@ async def test_a_successor_inserted_mid_decision_lands_superseded(adapter_client
     assert landed is JobStatus.failed, "the mid-decision successor was not absorbed into a superseded failure"
     assert await _status(job_id) is JobStatus.failed
     assert (await _row(job_id)).error["code"] == "superseded"
+    async with session() as db:
+        generation = await db.get(DeploymentGeneration, generation_id)
+        assert generation.status is GenerationStatus.abandoned, "the absorbed requeue left its generation blocking"
 
 
 # ── S1.5 / S1.7: the writers with no execution, and the device_id sentinel ───

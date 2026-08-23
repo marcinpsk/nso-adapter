@@ -15,7 +15,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, IntentApplyResult, api_error
+from nso_adapter.api.errors import (
+    RESP_401,
+    RESP_404_DEVICE,
+    RESP_409_PUSH_SEQ,
+    RESP_422_VALIDATION,
+    IntentApplyResult,
+    api_error,
+)
+from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant
 from nso_adapter.core.removal import is_cleared
@@ -113,9 +121,14 @@ class InterfaceMtuIntentUpdate(BaseModel):
     "/{device_id}/interface-mtu-intent",
     dependencies=[Depends(verify_token)],
     response_model=IntentApplyResult,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_PUSH_SEQ, **RESP_422_VALIDATION},
 )
-async def put_interface_mtu_intent(device_id: int, body: InterfaceMtuIntentUpdate, db: AsyncSession = Depends(get_db)):
+async def put_interface_mtu_intent(
+    device_id: int,
+    body: InterfaceMtuIntentUpdate,
+    db: AsyncSession = Depends(get_db),
+    delivery=Depends(get_intent_delivery),
+):
     """Replace the adapter's per-interface MTU intent mirror for this device atomically.
 
     Full-replace: rows not in the body are deleted (and the device MTU reverted via
@@ -125,6 +138,14 @@ async def put_interface_mtu_intent(device_id: int, body: InterfaceMtuIntentUpdat
     device = await db.get(Device, device_id)
     if device is None:
         raise api_error(404, "not_found", "Device not found")
+
+    # Every accepted write records its projection revision, store-only and
+    # auto-apply-off included, and takes the device's projection lock before anything is
+    # read (#1522 §G2). Only a promotion authorizes a deployment.
+    from nso_adapter.core.receipt import record_response
+
+    if (replay := await begin_delivery(db, device_id, delivery)) is not None:
+        return replay
 
     existing = await db.execute(select(InterfaceMtuIntent).where(InterfaceMtuIntent.device_id == device_id))
     existing_rows: dict[str, InterfaceMtuIntent] = {r.interface_name: r for r in existing.scalars().all()}
@@ -154,16 +175,6 @@ async def put_interface_mtu_intent(device_id: int, body: InterfaceMtuIntentUpdat
         count += 1
 
     await db.flush()
-    settings = (
-        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    ).scalar_one_or_none()
-    if settings and settings.auto_apply and count > 0:
-        from nso_adapter.core.apply import enqueue_apply
-
-        await enqueue_apply(db, device_id, force=True)
-
-    await db.commit()
-
     replaced = False
     if removed or cleared:
         from nso_adapter.core.removal import replace_on_removal
@@ -171,4 +182,15 @@ async def put_interface_mtu_intent(device_id: int, body: InterfaceMtuIntentUpdat
 
         replaced = await replace_on_removal(db, device, removed, InterfaceMtuIntent, apply_mtu_config, retract=cleared)
 
-    return {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}
+    settings = (
+        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    ).scalar_one_or_none()
+    if settings and settings.auto_apply and count > 0:
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
+
+    result = {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}
+    await record_response(db, device_id, delivery, result)
+    await db.commit()
+    return result

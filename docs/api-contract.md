@@ -56,6 +56,10 @@
     `nso_unavailable` (secrets probe), `secrets_write_unsupported`,
     `vault_error`, and route-policy intent validation:
     `invalid_payload`, `invalid_family`, `invalid_name`, `invalid_entries`.
+  - Keyed intent pushes (`X-Push-Seq`, see below): `sequence_reuse` (409 — the
+    same sequence was already admitted for this stream with a different body or
+    a different request mode) and `stale` (409 — the sequence is older than the
+    admitted one).
   - Request-body validation failures (Pydantic) return the SAME envelope with
     `code=validation_error` and the field errors under
     `error.detail.errors` — FastAPI's default `{"detail": [...]}` shape is
@@ -64,6 +68,89 @@
     SAME envelope with `code=internal`, a generic message and an empty `detail`.
     Nothing from the exception is echoed: it can carry the credential, URL or row
     it failed on. The traceback goes to the adapter log.
+
+### `X-Push-Seq` — keyed intent pushes
+
+An intent PUT delivered by the plugin's outbox carries `X-Push-Seq`: the claim's
+identity. Delivery is at-least-once, so the adapter keeps one receipt per
+(device, **stream**) and admits by it.
+
+**Which endpoints.** Every in-protocol intent PUT, with no exceptions — the sixteen
+listed below. The stream is a property of the ENDPOINT, not of the removal scopes:
+the plugin runs one claim sequence per intent family, so two families that share a
+projection document still get separate receipts.
+
+| stream | endpoint | promotes |
+|---|---|---|
+| `bfd` | `PUT /api/v1/devices/{id}/bfd-intent` | `bfd` |
+| `bgp` | `PUT /api/v1/devices/{id}/bgp-intent` | `bgp` |
+| `interface_config` | `PUT /api/v1/devices/{id}/intent` | `interface_config` |
+| `interface_mtu` | `PUT /api/v1/devices/{id}/interface-mtu-intent` | `interface_mtu` |
+| `ip` | `PUT /api/v1/devices/{id}/ip-intent` | `interface_config` |
+| `isis` | `PUT /api/v1/devices/{id}/isis-interface-intent` | `isis` |
+| `isis_flex_algo` | `PUT /api/v1/devices/{id}/isis-flex-algo-intent` | `isis` |
+| `l2_sap` | `PUT /api/v1/devices/{id}/l2-sap-intent` | `l2_sap` |
+| `logging` | `PUT /api/v1/devices/{id}/logging-intent` | `logging` |
+| `ospf` | `PUT /api/v1/devices/{id}/ospf-intent` | `ospf` |
+| `route_policy` | `PUT /api/v1/devices/{id}/route-policy-intent` | `route_policy` |
+| `snmp` | `PUT /api/v1/devices/{id}/snmp-intent` | `snmp` |
+| `static_route` | `PUT /api/v1/devices/{id}/static-route-intent` | `static_route` |
+| `subinterface` | `PUT /api/v1/devices/{id}/subinterface-intent` | `subinterface` |
+| `svi` | `PUT /api/v1/devices/{id}/svi-intent` | `svi` |
+| `vlan` | `PUT /api/v1/devices/{id}/vlan-intent` | `vlan` |
+
+`interface_config` keeps that spelling because the plugin maps its `interface`
+family onto it; `ip` and `isis_flex_algo` are the plugin's own names. The
+`promotes` column is the projection family the write composes into — two endpoints
+may share one, which is why the receipt key and the projection section are
+different vocabularies.
+
+**What a push authorizes.** The stream is also the AUTHORIZATION unit, and it owns an
+explicit, disjoint subset of its family's intent tables: `interface_config` owns the
+interface attributes and `ip` owns the addresses; `isis` owns the IS-IS processes,
+interfaces and levels and `isis_flex_algo` owns the flex-algorithms. A push authorizes
+its own stream's tables and no others, so a normal push on one lane never carries out
+the state an un-promoted `?store_only=true` push left in the sibling lane. The document
+the deployment sends is still the COMPLETE device document: each family is composed from
+its streams' last-authorized fragments, with the just-promoted stream's fresh snapshot
+overlaid.
+
+An intent push is the only thing that authorizes. `POST …/actions/force-removal` authorizes
+nothing: it re-issues a deployment of one scope, of state an earlier push already
+authorized, with the collateral guard off — so it promotes no stream and marks none applied.
+
+**What identifies a delivery.** The sequence, the body digest AND the request mode:
+
+- the digest is `sha256` over the canonical JSON of the raw request body
+  (`json.dumps(body, sort_keys=True, default=str)`);
+- the mode is the pair (`?store_only=`, `?delete_origin=`) as parsed — `1`, `true`,
+  `yes`, `on` are true, everything else (absent included) is false. The body does
+  not say what the request does with it: store-only authorizes no device write,
+  delete-origin turns a shrink into a networked retraction, and the unmarked form
+  detaches instead. One sequence carrying one body under two of those is two
+  different deployments.
+
+**Admission.**
+
+- same sequence, same body, same mode → **200 with the stored response**, nothing
+  applied again;
+- same sequence with a different body OR a different mode → **409 `sequence_reuse`**;
+- a lower sequence than the admitted one → **409 `stale`**;
+- a higher sequence → admitted; it becomes that stream's receipt.
+
+The receipt is written in the same transaction as the mutation it admits, under the
+device's projection lock, so a refused or replayed delivery leaves nothing behind and
+two concurrent deliveries of one sequence cannot both proceed. A device offboarded
+INSIDE that lock answers **404 `not_found`**, the same as a push for a device that was
+already gone — the outbox retrying a push while an operator removes the device is a
+race, not a server error.
+
+The sequence domain is `1 … 2^63-1`; a present header that is malformed or outside it
+is **422**, never a silent downgrade to an unkeyed write. An ABSENT header is accepted
+and simply gets no receipt — the direct-apply families (lacp, switchport) are
+deliberately claim-less, and they are POSTs, not intent PUTs. The two remaining PUTs
+(`/api/v1/config/failover` and `PUT /api/v1/devices/{id}/scope`) are adapter
+configuration rather than intent deliveries and carry no claim either.
 
 ### Call directions
 
@@ -78,6 +165,7 @@ fire-and-forget notifications that carry no state and are never read back.
 | plugin → adapter | `PUT /api/v1/devices/{id}/scope` | push scope on save | 1+ |
 | plugin → adapter | `PUT /api/v1/devices/{id}/intent` (+ the per-scope `PUT …/*-intent` family) | **push intent on accept** | 2 |
 | plugin → adapter | `POST /api/v1/devices/{id}/actions/{sync,detect-drift,connect,apply}` | trigger jobs | 1+, `apply` is 2 |
+| operator → adapter | `POST /api/v1/devices/{id}/actions/{retry,abandon}-generation` | clear a blocked deployment generation | 2 |
 | plugin → adapter | `GET /api/v1/devices/{id}/{interfaces,state,intent,intent-summary,scope}` (+ the per-scope read mirrors), `GET /api/v1/jobs/...` | read state | 1+, `intent` is 2 |
 | adapter → NetBox | `GET /api/plugins/nso/device-management/` | reconcile mirrored scope (pull) | 1+ |
 | adapter → NetBox | `GET /api/plugins/nso/interface-state/` | **reconcile mirrored intent (pull)** | 2 |
@@ -493,10 +581,11 @@ Phase 2: the rest activate as M5–M6 land.
 
 ## Actions (async)
 
-All return `202` with `{ "job_id": <int> }`. Only one job per device runs at a
-time: if an action is requested while a `queued`/`running` job exists for that
-device, the adapter returns `409 conflict` with the existing job's id in
-`error.detail.job_id`.
+Unless its section documents otherwise, an action returns `202` with
+`{ "job_id": <int> }`; the generation actions below answer richer bodies. Only
+one job per device runs at a time: if an action is requested while a
+`queued`/`running` job exists for that device, the adapter returns `409
+conflict` with the existing job's id in `error.detail.job_id`.
 
 ### `POST /api/v1/devices/{id}/actions/sync`
 Runs NSO `sync-from`, reads managed attributes, writes them to NetBox,
@@ -508,6 +597,22 @@ NetBox. Used to detect out-of-band changes (job type `detect-drift`).
 
 ### `POST /api/v1/devices/{id}/actions/connect`
 NSO `connect` — connectivity test only.
+
+### `POST /api/v1/devices/{id}/actions/{retry,abandon}-generation`
+
+The two explicit exits from the deployment-generation success barrier. A device
+whose head generation FAILED or whose outcome is UNKNOWN blocks every later
+generation, and only one of these two moves it:
+
+- `retry-generation` re-queues the head with the **same** document, mode and
+  digest — it is re-sent, never rebuilt from a store that has moved on. Its
+  successors go back to waiting behind it.
+- `abandon-generation` records the head as never delivered and lets the chain
+  move past it. Deliberately destructive of intent: the operator is asserting
+  that the device state it was to establish is already there or no longer wanted.
+
+Both → `202 { "generation_id": <int>, "seq": <int>, "job_id": <int|null> }`, and
+both → `409 conflict` when the device has no blocked generation.
 
 ### `POST /api/v1/devices/{id}/actions/apply` (Phase 2)
 Push accepted NetBox intent to NSO via the reconcile-commit service (Spike

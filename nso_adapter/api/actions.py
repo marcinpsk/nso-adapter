@@ -16,12 +16,13 @@ from nso_adapter.api.errors import (
     RESP_400,
     RESP_401,
     RESP_404_DEVICE,
+    RESP_409,
     RESP_409_ACTIVE_JOB,
     RESP_422_VALIDATION,
     api_error,
 )
 from nso_adapter.core.jobs import enqueue_job
-from nso_adapter.store.models import Device, JobType
+from nso_adapter.store.models import DeploymentGeneration, Device, JobType
 
 router = APIRouter(prefix="/api/v1/devices", tags=["actions"])
 
@@ -89,6 +90,12 @@ async def action_force_removal(
     the job succeeds having pushed NOTHING, telling the operator their orphaned addresses
     were flushed while the config is still live on the device. Reject that rather than
     succeed at nothing.
+
+    It PROMOTES NOTHING (#1522 §G2). The flush re-deploys state an earlier push already
+    authorized, with the guard off, so ``enqueue_removal`` gives it a reissue generation.
+    Treating it as an operator write instead authorized every stream of the family, and its
+    settlement then certified them applied — the sibling lane's un-promoted store-only state
+    included, on interfaces this job never sends.
     """
     from nso_adapter.core.removal import VALID_REMOVAL_SCOPES, enqueue_removal
 
@@ -202,7 +209,113 @@ async def action_apply(
     db: AsyncSession = Depends(get_db),
 ):
     """Phase 2 — push accepted NetBox intent to NSO via reconcile-commit service."""
+    from nso_adapter.core.request_flags import STORE_ONLY
+
+    if STORE_ONLY.get():
+        raise api_error(422, "validation_error", "store_only is not valid for the Apply action")
     return await _trigger(device_id, JobType.apply, db)
+
+
+class GenerationOut(BaseModel):
+    """The blocked head a retry or an abandon acted on."""
+
+    generation_id: int
+    seq: int
+    job_id: int | None = None
+
+
+#: What both barrier exits report when the head moved under them.
+_HEAD_ALREADY_ACTED_ON = "This device's blocked deployment generation was already acted on"
+
+
+async def _blocked_head(db: AsyncSession, device_id: int) -> DeploymentGeneration:
+    """Return the device's blocked head, or 404/409 explaining why there is nothing to do.
+
+    The head is read UNDER the device's projection lock, held to this request's commit. Both
+    exits act on "the current head", so two operator requests that read it unlocked can each
+    decide it is theirs: two retries duplicate the removal, and a retry racing an abandon
+    leaves a queued job executing a generation the operator gave up on. The lock also orders
+    these against the intent pushes that create successors, which is the same lock every
+    accepted projection write already takes.
+
+    An offboard committing inside that lock raises ``DeviceProjectionGone``, which the app's
+    own handler turns into this same 404 envelope for every route that can hit it.
+    """
+    from nso_adapter.core.generation import BLOCKED_STATUSES, executable_head, lock_projection
+
+    device = await db.get(Device, device_id)
+    if not device:
+        raise api_error(404, "not_found", "Device not found")
+    await lock_projection(db, device_id)
+    head = await executable_head(db, device_id)
+    if head is None or head.status not in BLOCKED_STATUSES:
+        raise api_error(
+            409,
+            "conflict",
+            "This device has no blocked deployment generation",
+            {"head_status": head.status.value if head is not None else None},
+        )
+    return head
+
+
+@router.post(
+    "/{device_id}/actions/retry-generation",
+    status_code=202,
+    dependencies=[Depends(verify_token)],
+    response_model=GenerationOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409, **RESP_422_VALIDATION},
+)
+async def action_retry_generation(
+    device_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-admit this device's blocked deployment generation (#1522 §H2).
+
+    One of the two explicit exits from the success barrier. The head is re-queued with the
+    SAME document, mode and digest — it is re-sent, never rebuilt — and its successors go
+    back to waiting behind it. Use it after fixing whatever the device refused.
+    """
+    from nso_adapter.core.generation import GenerationNotBlocked, retry_generation
+
+    head = await _blocked_head(db, device_id)
+    try:
+        job = await retry_generation(db, head.id)
+    except GenerationNotBlocked:
+        # The compare-and-set behind the lock: unreachable while this request holds it, and
+        # kept as the guarantee's second half for any caller that does not.
+        await db.rollback()
+        raise api_error(409, "conflict", _HEAD_ALREADY_ACTED_ON) from None
+    await db.commit()
+    return {"generation_id": head.id, "seq": head.seq, "job_id": job.id if job else None}
+
+
+@router.post(
+    "/{device_id}/actions/abandon-generation",
+    status_code=202,
+    dependencies=[Depends(verify_token)],
+    response_model=GenerationOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409, **RESP_422_VALIDATION},
+)
+async def action_abandon_generation(
+    device_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Give up on this device's blocked generation so its successors may run (#1522 §H2).
+
+    The other exit. Deliberately destructive of intent: this deployment is recorded as never
+    delivered and the chain moves past it, so the operator is asserting that the device state
+    it was meant to establish is either already there or no longer wanted.
+    """
+    from nso_adapter.core.generation import GenerationNotBlocked, reconcile_generation
+
+    head = await _blocked_head(db, device_id)
+    try:
+        await reconcile_generation(db, head.id)
+    except GenerationNotBlocked:
+        await db.rollback()
+        raise api_error(409, "conflict", _HEAD_ALREADY_ACTED_ON) from None
+    await db.commit()
+    return {"generation_id": head.id, "seq": head.seq, "job_id": head.job_id}
 
 
 @router.get(

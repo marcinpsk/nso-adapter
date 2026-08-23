@@ -28,6 +28,13 @@ repos:
         args: [--fix, --exit-non-zero-on-fix]
       - id: ruff-format
 
+  # GitHub Actions security audit. The parity guard keeps this rev equal to the dev pin and
+  # verifies that CI covers every repository file matched by this pinned hook's upstream pattern.
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.29.0
+    hooks:
+      - id: zizmor
+
   # In-house test-quality guard: flag new spec-less MagicMock/Mock used as object
   # stand-ins (see tests/mock_discipline.py). Stdlib-only; scans the whole tests/ tree.
   - repo: local

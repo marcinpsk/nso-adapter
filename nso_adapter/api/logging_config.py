@@ -13,7 +13,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, IntentApplyResult, api_error
+from nso_adapter.api.errors import (
+    RESP_401,
+    RESP_404_DEVICE,
+    RESP_409_PUSH_SEQ,
+    RESP_422_VALIDATION,
+    IntentApplyResult,
+    api_error,
+)
+from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.core.removal import is_cleared
@@ -170,8 +178,8 @@ class LoggingIntentUpdate(BaseModel):
 
 async def _sync_local_levels(
     db: AsyncSession, device_id: int, entry: LocalLevelsEntry | None, now: datetime
-) -> tuple[bool, int]:
-    """Replace the levels singleton intent; returns ``(cleared, managed_count)``.
+) -> tuple[bool, int, int]:
+    """Replace the levels singleton intent; return cleared, written, and removed counts.
 
     ``cleared`` reports any previously-set severity going back to unset — the #83
     cleared-owned-scalar shape a merge-PATCH can never revert, so the caller must
@@ -184,25 +192,31 @@ async def _sync_local_levels(
     values = {f: (getattr(entry, f) if entry is not None else None) for f in _LEVEL_FIELDS}
     cleared = before is not None and any(is_cleared(before[f], values[f]) for f in _LEVEL_FIELDS)
     if not any(values.values()):
+        removed = int(existing is not None)
         if existing is not None:
             await db.delete(existing)
-        return cleared, 0
+        return cleared, 0, removed
     if existing is None:
         existing = LoggingLevelsIntent(device_id=device_id)
         db.add(existing)
     for f in _LEVEL_FIELDS:
         setattr(existing, f, values[f])
     existing.accepted_at = entry.accepted_at if entry.accepted_at else now
-    return cleared, 1
+    return cleared, 1, 0
 
 
 @router.put(
     "/{device_id}/logging-intent",
     dependencies=[Depends(verify_token)],
     response_model=IntentApplyResult,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_PUSH_SEQ, **RESP_422_VALIDATION},
 )
-async def put_logging_intent(device_id: int, body: LoggingIntentUpdate, db: AsyncSession = Depends(get_db)):
+async def put_logging_intent(
+    device_id: int,
+    body: LoggingIntentUpdate,
+    db: AsyncSession = Depends(get_db),
+    delivery=Depends(get_intent_delivery),
+):
     """Replace the adapter's remote-syslog + local-levels intent mirror atomically.
 
     Full-replace semantics for ``hosts``: rows not present in the request body are
@@ -213,6 +227,14 @@ async def put_logging_intent(device_id: int, body: LoggingIntentUpdate, db: Asyn
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+
+    # Every accepted write records its projection revision, store-only and
+    # auto-apply-off included, and takes the device's projection lock before anything is
+    # read (#1522 §G2). Only a promotion authorizes a deployment.
+    from nso_adapter.core.receipt import record_response
+
+    if (replay := await begin_delivery(db, device_id, delivery)) is not None:
+        return replay
 
     existing_result = await db.execute(select(LoggingHostIntent).where(LoggingHostIntent.device_id == device_id))
     existing_rows: dict[str, LoggingHostIntent] = {r.address: r for r in existing_result.scalars().all()}
@@ -246,19 +268,11 @@ async def put_logging_intent(device_id: int, body: LoggingIntentUpdate, db: Asyn
 
     levels_cleared = False
     levels_count = 0
+    levels_removed = 0
     if "local_levels" in body.model_fields_set:
-        levels_cleared, levels_count = await _sync_local_levels(db, device_id, body.local_levels, now)
+        levels_cleared, levels_count, levels_removed = await _sync_local_levels(db, device_id, body.local_levels, now)
 
     await db.flush()
-
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
-    if settings and settings.auto_apply and (count > 0 or levels_count > 0):
-        from nso_adapter.core.apply import enqueue_apply
-
-        await enqueue_apply(db, device_id, force=True)
-
-    await db.commit()
 
     replaced = False
     if removed or cleared or levels_cleared:
@@ -269,4 +283,19 @@ async def put_logging_intent(device_id: int, body: LoggingIntentUpdate, db: Asyn
             db, device, removed, LoggingHostIntent, apply_logging_config, retract=cleared or levels_cleared
         )
 
-    return {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}
+    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    settings = settings_result.scalar_one_or_none()
+    if settings and settings.auto_apply and (count > 0 or levels_count > 0):
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
+
+    result = {
+        "device_id": device_id,
+        "count": count + levels_count,
+        "removed": len(removed) + levels_removed,
+        "replaced": replaced,
+    }
+    await record_response(db, device_id, delivery, result)
+    await db.commit()
+    return result
