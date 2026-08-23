@@ -27,11 +27,14 @@ ROUTE_OPTIONAL_KEYS = {"interface_next_hop", "metric", "permanent", "tag", "name
 
 
 def test_receipt_contract_example_echoes_every_counted_route():
+    from nso_adapter.api.static_route import StaticRouteIntentResult
+
     document = Path("docs/api-contract.md").read_text(encoding="utf-8")
     receipt_section = document.split("## Intent push receipts", 1)[1]
     example = json.loads(receipt_section.split("```json", 1)[1].split("```", 1)[0])
     response = example["receipts"][0]["response"]
 
+    StaticRouteIntentResult.model_validate(response)
     assert response["count"] == len(response["routes"])
 
 
