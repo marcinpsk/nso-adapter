@@ -101,6 +101,22 @@ async def _settlement_cohorts(device_id: int) -> list[int | None]:
         return [generation.settlement_cohort for generation in generations]
 
 
+async def _generation_document_sections(device_id: int) -> list[set[str]]:
+    from sqlalchemy import select
+
+    from nso_adapter.store.models import DeploymentGeneration
+
+    async with session() as db:
+        documents = (
+            await db.scalars(
+                select(DeploymentGeneration.document)
+                .where(DeploymentGeneration.device_id == device_id)
+                .order_by(DeploymentGeneration.seq)
+            )
+        ).all()
+        return [set(document) for document in documents]
+
+
 async def test_removal_precedes_apply_at_the_endpoint(adapter_client):
     """M7.1 — asserted before any worker runs; the endpoint's own ordering is the contract."""
     device_id = await seed_device(nso_device_name="sr-m7-1", netbox_device_id=9780)
@@ -193,7 +209,7 @@ async def test_detach_and_companion_apply_stamp_the_revision_after_both_succeed(
 
 
 async def test_an_apply_only_put_keeps_independent_settlement(adapter_client):
-    """A request that creates one promoted generation keeps a NULL cohort."""
+    """A single-stream generation executes without inventing absent document sections."""
     from nso_adapter.store.models import JobStatus
     from tests.core.test_static_route_put import wire
     from tests.core.test_static_route_removal import SrFake, sr_client
@@ -207,6 +223,7 @@ async def test_an_apply_only_put_keeps_independent_settlement(adapter_client):
     ordered = await _jobs_ordered(device_id)
     assert [kind for _id, kind in ordered] == ["apply"]
     assert await _settlement_cohorts(device_id) == [None]
+    assert await _generation_document_sections(device_id) == [{"static_route"}]
 
     fake = SrFake("sr-single-apply", service=[wire(B)])
     apply = await _run_apply_job(device_id, ordered[0][0], sr_client(fake))
