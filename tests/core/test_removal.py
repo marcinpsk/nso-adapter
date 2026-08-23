@@ -1763,6 +1763,7 @@ async def test_enqueue_removal_force_refuses_a_composed_document(adapter_client)
                 "svi",
                 marking=None,
                 defer_retract=False,
+                promotes=(),
                 force=True,
                 document={"svi": {"svi_intent": []}},
             )
