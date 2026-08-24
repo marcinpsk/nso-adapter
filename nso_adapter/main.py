@@ -11,6 +11,7 @@ import structlog
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from nso_adapter import __version__
 from nso_adapter.api.actions import router as actions_router
@@ -22,6 +23,7 @@ from nso_adapter.api.devices import router as devices_router
 from nso_adapter.api.errors import (
     ApiError,
     api_error_handler,
+    framework_http_error_handler,
     projection_gone_handler,
     unhandled_exception_response,
     validation_error_handler,
@@ -377,6 +379,7 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="NSO Adapter", version=__version__, lifespan=lifespan)
     app.add_exception_handler(ApiError, api_error_handler)
+    app.add_exception_handler(StarletteHTTPException, framework_http_error_handler)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(DeviceProjectionGone, projection_gone_handler)
 

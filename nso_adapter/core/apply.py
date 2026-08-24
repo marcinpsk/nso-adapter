@@ -2003,7 +2003,7 @@ async def _static_route_followon_put(
     return send_failed, evidence
 
 
-def _stamp_batch_scopes_atomic(scope_rows, offenders, commit_error, err, msg, now) -> tuple[dict, dict]:
+def _stamp_batch_scopes_atomic(sent_rows, stamp_rows, offenders, commit_error, err, msg, now) -> tuple[dict, dict]:
     """Stamp every batch scope from the single atomic outcome → (scope_outcomes, scope_failures).
 
     Offending scopes fail; non-offending scopes are pending (rows untouched, retried next apply).
@@ -2011,19 +2011,20 @@ def _stamp_batch_scopes_atomic(scope_rows, offenders, commit_error, err, msg, no
     scope_outcomes: dict[str, tuple[int, int]] = {key: (0, 0) for key in _SCOPE_RESULT_ORDER}
     scope_failures: dict[str, list] = {}
     for root_key, scope_key in _ATOMIC_SCOPE_ROOTS.items():
-        rows = scope_rows.get(scope_key) or []
-        if not rows:
+        sent = sent_rows.get(scope_key) or []
+        if not sent:
             continue
-        _reject_transient_stamps(scope_key, rows)
+        stamped = stamp_rows.get(scope_key) or []
+        _reject_transient_stamps(scope_key, stamped)
         if commit_error is None:
-            for row in rows:
+            for row in stamped:
                 row.last_apply_at = now
                 row.last_apply_error = None
-            scope_outcomes[scope_key] = (len(rows), 0)
+            scope_outcomes[scope_key] = (len(sent), 0)
         elif root_key in offenders:
-            for row in rows:
+            for row in stamped:
                 row.last_apply_error = err
-            scope_outcomes[scope_key] = (0, len(rows))
+            scope_outcomes[scope_key] = (0, len(sent))
             scope_failures[scope_key] = [{"error": msg}]
     return scope_outcomes, scope_failures
 
@@ -2083,7 +2084,9 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
     iface_failed = (_IFACE_CONFIG_ROOT in offenders) if iface_entries else False
     attr_outcome = _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot)
     ip_outcome = _stamp_ip_atomic(ip_rows_flat, commit_error, iface_failed, err, msg, now)
-    scope_outcomes, scope_failures = _stamp_batch_scopes_atomic(staged_stamp, offenders, commit_error, err, msg, now)
+    scope_outcomes, scope_failures = _stamp_batch_scopes_atomic(
+        staged_sent, staged_stamp, offenders, commit_error, err, msg, now
+    )
 
     # A scope whose body could not be built failed on its own terms — it never reached the
     # device, so the commit outcome says nothing about it. Fail exactly its rows.

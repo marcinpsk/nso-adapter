@@ -406,3 +406,23 @@ async def test_a_keyed_empty_json_body_is_a_validation_error(adapter_client):
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "validation_error"
+
+
+async def test_a_keyed_invalid_utf8_body_is_a_validation_error(adapter_client):
+    """Undecodable JSON is a client error, not an internal server failure."""
+    device_id = await seed_device(nso_device_name="rcp-invalid-utf8", netbox_device_id=None)
+
+    response = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/vlan-intent",
+        content=b"\xff\xfe{",
+        headers={**AUTH, "Content-Type": "application/json", "X-Push-Seq": "10"},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "validation_error",
+            "message": "Request body must contain valid JSON",
+            "detail": {},
+        }
+    }

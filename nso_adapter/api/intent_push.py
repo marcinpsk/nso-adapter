@@ -18,8 +18,6 @@ nothing behind because the same transaction is rolled back.
 
 from __future__ import annotations
 
-from json import JSONDecodeError
-
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -49,7 +47,7 @@ async def get_intent_delivery(request: Request) -> IntentDelivery:
     if seq is not None:
         try:
             body = await request.json()
-        except JSONDecodeError:
+        except ValueError:
             raise api_error(422, "validation_error", "Request body must contain valid JSON") from None
         identity = PushIdentity(
             seq=seq,

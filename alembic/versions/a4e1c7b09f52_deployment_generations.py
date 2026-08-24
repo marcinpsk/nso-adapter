@@ -126,8 +126,28 @@ _GENERATION_IMMUTABILITY_DROP_DDL = (
     "DROP FUNCTION IF EXISTS deployment_generation_reject_rewrite()",
 )
 
+_VALIDATE_REMOVAL_QUIESCENCE = """
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+          FROM jobs
+         WHERE job_type = 'removal'
+           AND status IN ('queued', 'running')
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'object_not_in_prerequisite_state',
+            MESSAGE = 'deployment-generation upgrade requires the operator to drain active removal jobs';
+    END IF;
+END $$;
+"""
+
 
 def upgrade() -> None:
+    # Active removals created before generations have no immutable document to execute.
+    # Refuse the cutover instead of letting the new runner fail them after deployment.
+    op.execute(_VALIDATE_REMOVAL_QUIESCENCE)
+
     op.create_table(
         "device_generation_counter",
         sa.Column("device_id", sa.Integer(), nullable=False),

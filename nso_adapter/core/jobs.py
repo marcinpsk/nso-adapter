@@ -206,6 +206,8 @@ async def enqueue_job(
     created, winner = await admit_queued_job(db, device_id, job_type)
     if winner is not None:
         logger.debug("job.enqueue.race_lost", device_id=device_id, winner_id=winner.id)
+        if job_type is JobType.apply and device_id is not None:
+            await _authorize_apply_job(db, device_id, winner)
         await db.commit()  # release the winner lock; this helper owns its transaction
         return winner, False
     if created is None:  # pragma: no cover - retries exhausted under sustained contention

@@ -20,9 +20,11 @@ from typing import Literal
 import structlog
 from fastapi import HTTPException, Request
 from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 logger = structlog.get_logger(__name__)
 
@@ -157,6 +159,22 @@ def push_conflict_error(code: str, message: str, detail: dict | None = None) -> 
 
 async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content=exc.detail)
+
+
+async def framework_http_error_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    """Normalize a body-decoding failure that occurs before dependencies execute."""
+    if exc.status_code == 400 and isinstance(exc.__cause__, ValueError):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "validation_error",
+                    "message": "Request body must contain valid JSON",
+                    "detail": {},
+                }
+            },
+        )
+    return await http_exception_handler(request, exc)
 
 
 async def projection_gone_handler(request: Request, exc: Exception) -> JSONResponse:

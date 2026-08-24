@@ -773,6 +773,50 @@ async def test_f6_a_manual_apply_creates_a_generation_from_authorized_state(adap
     assert [row["vlan_id"] for row in chain[0].document["vlan"]["vlan_intent"]] == [10]
 
 
+async def test_manual_apply_authorizes_a_store_only_repair_on_its_queued_winner(adapter_client):
+    """A deduplicated Apply must update the queued job's immutable deployment document."""
+    device_id = await seed_device(nso_device_name="gen-queued-repair", netbox_device_id=9860)
+    await seed_settings(device_id)
+    stamp = "2026-08-01T00:00:00Z"
+    first = await put_vlans(
+        adapter_client,
+        device_id,
+        [10],
+        seq=98601,
+        names={10: "before"},
+        accepted={10: stamp},
+    )
+    assert first.status_code == 200
+    (first_generation,) = await generations(device_id)
+    first_job_id = first_generation.job_id
+    assert first_job_id is not None
+
+    repaired = await put_vlans(
+        adapter_client,
+        device_id,
+        [10],
+        seq=98602,
+        query="?store_only=true",
+        names={10: "after"},
+        accepted={10: stamp},
+    )
+    assert repaired.status_code == 200
+
+    response = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/apply", headers=AUTH)
+    assert response.status_code == 409
+    assert response.json()["error"]["detail"]["job_id"] == first_job_id
+
+    chain = await generations(device_id)
+    assert len(chain) == 2, "the deduplicated Apply did not authorize the repaired projection"
+    assert [generation.job_id for generation in chain] == [first_job_id, first_job_id]
+    assert chain[-1].document["vlan"]["vlan_intent"][0]["name"] == "after"
+
+    client, rec = recorded_client("gen-queued-repair")
+    assert await run_head(device_id, client) == first_job_id
+    [body] = rec.bodies(_VLAN_ROOT)
+    assert body[_VLAN_ROOT][0]["vlan"] == [{"vlan-id": 10, "name": "after"}]
+
+
 async def test_f6_b_the_tombstone_sweeper_gives_its_job_a_generation(adapter_client):
     from nso_adapter.core.tombstone_sweep import sweep_tombstones
     from nso_adapter.store.models import GenerationMode, StaticRouteTombstone
@@ -1113,6 +1157,46 @@ async def test_f9_a_a_rejected_send_fails_the_job_even_with_nothing_to_stamp(ada
 
     job = await job_row(job_id)
     assert job.status.value == "failed", "a rejected deployment reported success"
+    assert job.result["vlan_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
+    assert (await _generation_statuses(device_id))[0] == "failed"
+
+
+async def test_atomic_rejected_send_fails_the_job_even_with_nothing_to_stamp(adapter_client, monkeypatch):
+    """Atomic failure accounting follows the sent document when no live row is stampable."""
+    monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
+
+    device_id = await seed_device(nso_device_name="gen-atomic-rejected-sent", netbox_device_id=9861)
+    await seed_settings(device_id)
+    stamp = "2026-08-01T00:00:00Z"
+    assert (
+        await put_vlans(
+            adapter_client,
+            device_id,
+            [10],
+            seq=98611,
+            names={10: "before"},
+            accepted={10: stamp},
+        )
+    ).status_code == 200
+
+    async def successor():
+        response = await put_vlans(
+            adapter_client,
+            device_id,
+            [10],
+            seq=98612,
+            names={10: "after"},
+            accepted={10: stamp},
+        )
+        assert response.status_code == 200
+
+    client, rec = recorded_client("gen-atomic-rejected-sent", on_sync_from=successor, fail_vlan=True)
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+    assert rec.vlan_ids() == [[10]]
+
+    job = await job_row(job_id)
+    assert job.status.value == "failed", "a rejected atomic document reported success"
     assert job.result["vlan_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
     assert (await _generation_statuses(device_id))[0] == "failed"
 

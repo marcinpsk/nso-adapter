@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 
+import pytest
 import sqlalchemy as sa
 
 from tests.store.migration_harness import alembic, engine_on, load_migration, private_database
@@ -51,6 +52,23 @@ def _installed_function_source(engine) -> str:
 
 def _function_source(statement: str) -> str:
     return statement.partition(" AS $$")[2].partition("$$ LANGUAGE plpgsql")[0]
+
+
+def test_upgrade_refuses_active_generationless_removals(pg_admin):
+    """The operator must drain old removal work before generation execution starts."""
+    module = load_migration(_MIGRATION)
+    with private_database(pg_admin, "generation_removal_gate") as sync_url:
+        alembic(sync_url, "upgrade", module.down_revision)
+        with engine_on(sync_url) as engine, engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO jobs (job_type, status, context, created_at, updated_at) "
+                    "VALUES ('removal', 'queued', CAST('{}' AS json), now(), now())"
+                )
+            )
+
+        with pytest.raises(AssertionError, match="drain active removal jobs"):
+            alembic(sync_url, "upgrade", module.revision)
 
 
 def test_historical_trigger_is_frozen_and_head_trigger_matches_live_ddl(pg_admin, tmp_path, monkeypatch):
