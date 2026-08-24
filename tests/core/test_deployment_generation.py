@@ -1077,8 +1077,9 @@ async def test_standalone_advancement_takes_the_projection_lock(adapter_client, 
     assert await asyncio.wait_for(advancing, timeout=2) is None
 
 
-async def test_concurrent_advancement_creates_one_carrier(adapter_client):
-    """The second recovery revalidates the head after it waits for the projection lock."""
+@pytest.mark.parametrize("fail_early", [False, True], ids=["success", "early-failure"])
+async def test_concurrent_advancement_creates_one_carrier(adapter_client, fail_early):
+    """The second recovery revalidates the head and every exit closes both transactions."""
     from nso_adapter.core import generation as generation_mod
     from nso_adapter.store.db import get_engine
     from nso_adapter.store.models import Job, JobStatus
@@ -1095,6 +1096,14 @@ async def test_concurrent_advancement_creates_one_carrier(adapter_client):
     release = asyncio.Event()
     calls = 0
     real = generation_mod.advance_generations_locked
+    tasks: list[asyncio.Task] = []
+
+    async def cleanup_tasks():
+        release.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def gated(db, locked_device_id):
         nonlocal calls
@@ -1104,14 +1113,33 @@ async def test_concurrent_advancement_creates_one_carrier(adapter_client):
             await release.wait()
         return await real(db, locked_device_id)
 
-    with patch("nso_adapter.core.generation.advance_generations_locked", new=gated):
-        first = asyncio.create_task(generation_mod.advance_device_generations(device_id))
-        await asyncio.wait_for(entered.wait(), timeout=3)
-        second = asyncio.create_task(generation_mod.advance_device_generations(device_id))
-        await _wait_for_relation_lock(get_engine(), "devices")
-        assert not second.done(), "the second recovery did not wait for the projection lock"
-        release.set()
-        first_carrier, second_carrier = await asyncio.wait_for(asyncio.gather(first, second), timeout=10)
+    async def run_race():
+        with patch("nso_adapter.core.generation.advance_generations_locked", new=gated):
+            first = asyncio.create_task(generation_mod.advance_device_generations(device_id))
+            tasks.append(first)
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=3)
+                second = asyncio.create_task(generation_mod.advance_device_generations(device_id))
+                tasks.append(second)
+                await _wait_for_relation_lock(get_engine(), "devices")
+                if fail_early:
+                    raise RuntimeError("injected early failure")
+                assert not second.done(), "the second recovery did not wait for the projection lock"
+                release.set()
+                return await asyncio.wait_for(asyncio.gather(first, second), timeout=10)
+            finally:
+                await cleanup_tasks()
+
+    if fail_early:
+        try:
+            with pytest.raises(RuntimeError, match="injected early failure"):
+                await run_race()
+            assert tasks and all(task.done() for task in tasks)
+        finally:
+            await cleanup_tasks()
+        return
+
+    first_carrier, second_carrier = await run_race()
 
     assert first_carrier is not None and second_carrier is not None
     assert first_carrier.id == second_carrier.id
