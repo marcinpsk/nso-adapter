@@ -112,6 +112,7 @@ async def test_the_removal_job_and_the_delete_roll_back_together(adapter_client,
 
     resp = await put_intent(adapter_client, device_id, [])
     assert resp.status_code == 500, resp.text
+    assert resp.json() == {"error": {"code": "internal", "message": "Internal server error", "detail": {}}}
 
     assert [(r["id"], r["triple"]) for r in await read_intent(device_id)] == [(ids[A], A)]
     assert await read_tombstones(device_id) == []

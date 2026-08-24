@@ -182,6 +182,9 @@ async def _finish(device_id: int, status) -> int | None:
     job_id = await run_head(device_id, client)
     if failing:
         assert rec.bodies(_VLAN_ROOT), "the injected vlan rejection never fired"
+    if job_id is not None:
+        actual = await _job_status(job_id)
+        assert actual is status, f"the head reached {actual}, not the {status} this case needs"
     return job_id
 
 

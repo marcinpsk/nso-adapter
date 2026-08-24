@@ -351,6 +351,7 @@ async def test_delete_and_tombstone_roll_back_together(adapter_client, monkeypat
 
     resp = await put_intent(adapter_client, device_id, [entry(A, route_id=7)])
     assert resp.status_code == 500, resp.text
+    assert resp.json() == {"error": {"code": "internal", "message": "Internal server error", "detail": {}}}
 
     # Row 8 is still live, and nothing claims authority to delete it.
     rows = await read_intent(device_id)

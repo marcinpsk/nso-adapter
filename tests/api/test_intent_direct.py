@@ -160,8 +160,23 @@ async def test_put_intent_replaces_existing_intent(adapter_client):
     )
     assert second.status_code == 200
     assert second.json()["attribute_count"] == 1
+
+    other_device_id, _ = await _seed_device_with_interface("intent-dev-06-other", 1251)
+    other = await adapter_client.put(
+        f"/api/v1/devices/{other_device_id}/intent",
+        json={"attributes": [{"interface": "GigabitEthernet0/2", "attribute": "description", "intent_value": "other"}]},
+        headers=AUTH,
+    )
+    assert other.status_code == 200
+
     async with session() as db:
-        values = (await db.scalars(select(InterfaceIntent.intent_value))).all()
+        values = (
+            await db.scalars(
+                select(InterfaceIntent.intent_value)
+                .join(DbInterface, InterfaceIntent.interface_id == DbInterface.id)
+                .where(DbInterface.device_id == device_id)
+            )
+        ).all()
         assert values == ["second"]
 
 

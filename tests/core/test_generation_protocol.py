@@ -85,7 +85,7 @@ def recorded_client(device_name: str, *, on_sync_from=None, fail_vlan: bool = Fa
     be seen. Left out, the action answers nothing and every check classifies ``error``, which
     never fails an apply.
     """
-    from nso_adapter.nso.client import NsoClient
+    from nso_adapter.nso.client import NsoClient, ServiceInstanceState
 
     rec = _Recorder(device_name, fail_vlan=fail_vlan)
     http = AsyncMock()
@@ -102,6 +102,7 @@ def recorded_client(device_name: str, *, on_sync_from=None, fail_vlan: bool = Fa
     client = MagicMock(spec=NsoClient)
     client._base = "http://nso"
     client._action_timeout = 120.0
+    client.service_instance_state = AsyncMock(return_value=ServiceInstanceState("absent", None))
     cm = client._client.return_value
     cm.__aenter__.return_value = http
     cm.__aexit__.return_value = False
@@ -1090,6 +1091,30 @@ async def test_f9_a_a_dropped_key_fails_the_job_even_with_nothing_to_stamp(adapt
     assert (await _generation_statuses(device_id))[0] == "failed", (
         "a generation whose keys never landed settled and released its successors"
     )
+
+
+async def test_f9_a_a_rejected_send_fails_the_job_even_with_nothing_to_stamp(adapter_client):
+    """Default path: a rejected document still counts what it sent after a successor rewrite."""
+    device_id = await seed_device(nso_device_name="gen-rejected-sent", netbox_device_id=9842)
+    await seed_settings(device_id)
+    stamp = "2026-08-01T00:00:00Z"
+    assert (
+        await put_vlans(adapter_client, device_id, [10], names={10: "before"}, accepted={10: stamp})
+    ).status_code == 200
+
+    async def successor():
+        resp = await put_vlans(adapter_client, device_id, [10], names={10: "after"}, accepted={10: stamp})
+        assert resp.status_code == 200
+
+    client, rec = recorded_client("gen-rejected-sent", on_sync_from=successor, fail_vlan=True)
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+    assert rec.vlan_ids() == [[10]], "the rejected send did not carry generation 1's document"
+
+    job = await job_row(job_id)
+    assert job.status.value == "failed", "a rejected deployment reported success"
+    assert job.result["vlan_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
+    assert (await _generation_statuses(device_id))[0] == "failed"
 
 
 async def test_f9_b_atomic_mode_verifies_the_document_it_sent(adapter_client, monkeypatch):

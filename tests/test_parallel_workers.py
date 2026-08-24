@@ -8,6 +8,8 @@ workers and each one clones its own databases from the single test Postgres.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from tests.conftest import MAX_PARALLEL_WORKERS, pytest_xdist_auto_num_workers
@@ -20,5 +22,6 @@ from tests.conftest import MAX_PARALLEL_WORKERS, pytest_xdist_auto_num_workers
 def test_auto_worker_count_never_exceeds_the_ceiling(monkeypatch, detected_workers, expected):
     """xdist's own detector reads this env var first, so it stands in for the host's CPU count."""
     monkeypatch.setenv("PYTEST_XDIST_AUTO_NUM_WORKERS", detected_workers)
+    config = SimpleNamespace(option=SimpleNamespace(numprocesses="auto"))
 
-    assert pytest_xdist_auto_num_workers(None) == expected
+    assert pytest_xdist_auto_num_workers(config) == expected

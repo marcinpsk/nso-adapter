@@ -2543,13 +2543,16 @@ async def _reader_compare_default_path(client, device, sc, scope_ok, *, remainin
         return scope_ok, 0, [], "unknown", [], {}
 
 
-async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_error=None) -> tuple[int, int, list]:
+async def _run_scope(
+    log_label, coro, rows, *, sent_rows=None, job_id, device_name, now, on_nso_error=None
+) -> tuple[int, int, list]:
     """Push one scope's batch coroutine and stamp the outcome onto every row in *rows*.
 
-    Returns (in_sync, apply_failed, failures). Success stamps last_apply_at and clears
-    the error on every row; an NsoApplyError or any other exception records the error
-    payload on every row and reports a single failure. ``on_nso_error`` is a best-effort
-    side-effect (route-policy uses it to record a device-parser capability rejection).
+    Returns (in_sync, apply_failed, failures), counted from *sent_rows*. Success stamps
+    last_apply_at and clears the error on every row; an NsoApplyError or any other
+    exception records the error payload on every row and reports a single failure.
+    ``on_nso_error`` is a best-effort side-effect (route-policy uses it to record a
+    device-parser capability rejection).
 
     A collateral block (the static-route PUT-replace, §4.1) gets its own clause ahead of
     the broad one: it is a REFUSAL with a machine-readable orphan report and a preview of
@@ -2559,17 +2562,26 @@ async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_
     from nso_adapter.core.removal import RemovalBlockedError
 
     _reject_transient_stamps(log_label, rows)
+    accounted_rows = rows if sent_rows is None else sent_rows
+
+    def _record_current_error(err: dict) -> None:
+        # ``rows`` are the live stamps. ``accounted_rows`` are what the body sent and can
+        # be immutable document rows with no live counterpart. The result needs the latter
+        # even when there is deliberately nothing safe to persist.
+        for row in rows:
+            row.last_apply_error = err
+        for row in accounted_rows:
+            row.last_apply_error = err
 
     try:
         await coro
     except NsoApplyError as exc:
         logger.error(f"apply.{log_label}_failed", job_id=job_id, device=device_name, error=exc.message)
         err = {"code": exc.code, "message": exc.message, "detail": exc.detail}
-        for row in rows:
-            row.last_apply_error = err
+        _record_current_error(err)
         if on_nso_error is not None:
             await on_nso_error(exc)
-        return 0, len(rows), [{"error": exc.message}]
+        return 0, len(accounted_rows), [{"error": exc.message}]
     except ClaimLostError:
         # Revocation is not a runner error: recovery already owns the disposition.
         raise
@@ -2580,14 +2592,13 @@ async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_
             "message": str(exc),
             "detail": {"orphans": exc.orphans, "preview": exc.preview},
         }
-        for row in rows:
-            row.last_apply_error = err
+        _record_current_error(err)
         # The preview rides the JOB failure too, not just the rows: it is the would-be device
         # delta the operator has to review before deciding to force the replacement, and
         # GET /jobs/{id} is where they read it (the removal path already reports it there).
         return (
             0,
-            len(rows),
+            len(accounted_rows),
             [
                 {
                     "error": str(exc),
@@ -2605,13 +2616,12 @@ async def _run_scope(log_label, coro, rows, *, job_id, device_name, now, on_nso_
     except Exception as exc:
         logger.exception(f"apply.{log_label}_unexpected_error", job_id=job_id)
         err = internal_error(exc)
-        for row in rows:
-            row.last_apply_error = err
-        return 0, len(rows), [{"error": internal_error(exc)["message"]}]
+        _record_current_error(err)
+        return 0, len(accounted_rows), [{"error": internal_error(exc)["message"]}]
     for row in rows:
         row.last_apply_at = now
         row.last_apply_error = None
-    return len(rows), 0, []
+    return len(accounted_rows), 0, []
 
 
 async def _record_rp_capability_now(db, client, device, device_name, errors, *, job_id: int) -> None:
@@ -3155,6 +3165,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             sc.log_label,
             sc.make_coro(),
             sc.rows,
+            sent_rows=sc.sent,
             job_id=job_id,
             device_name=device_name,
             now=now,
