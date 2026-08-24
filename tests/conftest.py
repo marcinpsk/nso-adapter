@@ -551,7 +551,7 @@ async def seed_device(
     *,
     nso_instance: str = "nso-dev",
     nso_device_name: str = "core-rtr-01",
-    netbox_device_id: int = 42,
+    netbox_device_id: int | None = 42,
     attributes: list[str] | None = None,
 ):
     """Insert a Device + ManagedScope rows and return the Device id.

@@ -174,6 +174,24 @@ async def test_a_specific_handler_still_wins_over_the_catch_all():
     }
 
 
+@pytest.mark.parametrize(
+    ("method", "path", "status_code", "code", "message"),
+    [
+        ("GET", "/api/v1/route-that-does-not-exist", 404, "not_found", "Not Found"),
+        ("TRACE", "/api/v1/devices", 405, "method_not_allowed", "Method Not Allowed"),
+    ],
+)
+async def test_framework_http_errors_use_the_canonical_envelope(
+    adapter_client, method, path, status_code, code, message
+):
+    response = await adapter_client.request(method, path, headers=AUTH)
+
+    assert response.status_code == status_code
+    assert response.json() == {"error": {"code": code, "message": message, "detail": {}}}
+    if status_code == 405:
+        assert response.headers["allow"]
+
+
 # ---------------------------------------------------------------- closed set
 
 

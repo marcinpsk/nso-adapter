@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from typing import get_args, get_type_hints
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from nso_adapter.store import db as store_db
 from nso_adapter.store.models import Job, JobStatus, JobType
-from tests.conftest import session, start_job
+from tests.conftest import seed_device, session, start_job
 
 _TESTS_ROOT = Path(__file__).resolve().parent
 
@@ -40,6 +41,10 @@ async def test_start_job_returns_the_attempt_under_an_expiring_session(store_eng
     async with session() as db:
         started = await db.get(Job, job_id)
         assert started.status is JobStatus.running and started.run_attempt == 1
+
+
+def test_seed_device_type_contract_allows_no_netbox_identity():
+    assert type(None) in get_args(get_type_hints(seed_device)["netbox_device_id"])
 
 
 def _fixtures_defined_in(path: Path) -> list[str]:

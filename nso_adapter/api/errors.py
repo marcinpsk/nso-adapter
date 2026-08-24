@@ -15,12 +15,12 @@ the same envelope by `validation_error_handler` — the framework's default
 from __future__ import annotations
 
 import traceback
+from http import HTTPStatus
 from typing import Literal
 
 import structlog
 from fastapi import HTTPException, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -35,6 +35,7 @@ ERROR_CODES: frozenset[str] = frozenset(
         # phase-1/2 core
         "unauthorized",
         "not_found",
+        "method_not_allowed",
         "validation_error",
         "nso_unreachable",
         "netbox_unreachable",
@@ -67,6 +68,7 @@ ERROR_CODES: frozenset[str] = frozenset(
 ErrorCode = Literal[
     "unauthorized",
     "not_found",
+    "method_not_allowed",
     "validation_error",
     "nso_unreachable",
     "netbox_unreachable",
@@ -162,7 +164,7 @@ async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
 
 
 async def framework_http_error_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
-    """Normalize a body-decoding failure that occurs before dependencies execute."""
+    """Normalize framework-generated failures that occur outside endpoint handlers."""
     if exc.status_code == 400 and isinstance(exc.__cause__, ValueError):
         return JSONResponse(
             status_code=422,
@@ -173,8 +175,25 @@ async def framework_http_error_handler(request: Request, exc: StarletteHTTPExcep
                     "detail": {},
                 }
             },
+            headers=exc.headers,
         )
-    return await http_exception_handler(request, exc)
+    codes: dict[int, ErrorCode] = {
+        401: "unauthorized",
+        404: "not_found",
+        405: "method_not_allowed",
+        409: "conflict",
+        422: "validation_error",
+        501: "not_implemented",
+    }
+    code = codes.get(exc.status_code, "internal" if exc.status_code >= 500 else "bad_request")
+    message = (
+        "Internal server error" if exc.status_code >= 500 else str(exc.detail or HTTPStatus(exc.status_code).phrase)
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"code": code, "message": message, "detail": {}}},
+        headers=exc.headers,
+    )
 
 
 async def projection_gone_handler(request: Request, exc: Exception) -> JSONResponse:

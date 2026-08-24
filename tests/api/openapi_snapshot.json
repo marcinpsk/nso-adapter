@@ -1589,6 +1589,7 @@
             "enum": [
               "unauthorized",
               "not_found",
+              "method_not_allowed",
               "validation_error",
               "nso_unreachable",
               "netbox_unreachable",

@@ -43,7 +43,7 @@
   Codes (closed set — `/openapi.json` enum must match; mechanically enforced
   by `nso_adapter/api/errors.py::ERROR_CODES` + `tests/api/test_error_codes.py`,
   which pin call sites ⊆ ERROR_CODES ⊆ this document):
-  - Phase 1: `unauthorized`, `not_found`, `validation_error`,
+  - Phase 1: `unauthorized`, `not_found`, `method_not_allowed`, `validation_error`,
     `nso_unreachable`, `netbox_unreachable`, `conflict`, `internal`.
   - Phase 2: `not_implemented` (apply endpoint pre-M4),
     `nso_commit_failed` (M5+, reconcile-commit refused or partially

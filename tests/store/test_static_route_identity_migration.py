@@ -280,7 +280,11 @@ def test_downgrade_restores_the_previous_shape(pg_admin):
             cols = {c["name"] for c in sa.inspect(engine).get_columns("static_route_intent")}
             assert "route_id" in cols
             assert "deployed_key" in cols
-            assert "uq_sr_intent_device_route_id" in _index_predicates(engine, "static_route_intent")
+            assert _index_predicates(engine, "static_route_intent")["uq_sr_intent_device_route_id"] == (
+                ("device_id", "route_id"),
+                True,
+                _PARTIAL_UNIQUE_PREDICATE,
+            )
             assert _deferrability(engine, "uq_staticrouteintent_identity") == (True, True)
 
 
