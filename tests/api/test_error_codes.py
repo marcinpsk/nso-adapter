@@ -202,10 +202,10 @@ async def test_promotion_provenance_handler_uses_closed_error_factory(monkeypatc
     monkeypatch.setattr(errors, "ERROR_CODES", errors.ERROR_CODES - {"apply_unexecutable"})
 
     with pytest.raises(ValueError, match="unknown error code 'apply_unexecutable'"):
-         await errors.promotion_provenance_handler(
-             Request({"type": "http"}),
-             PromotionProvenanceUnexecutable("vlan"),
-         )
+        await errors.promotion_provenance_handler(
+            Request({"type": "http"}),
+            PromotionProvenanceUnexecutable("vlan"),
+        )
 
 
 async def test_promotion_provenance_error_is_dispatched_through_the_application():
