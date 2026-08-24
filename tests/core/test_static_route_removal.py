@@ -1045,13 +1045,29 @@ async def test_non_static_generation_does_not_make_carrierless_removal_fail(adap
     job_id = await seed_removal_job(device_id, {"removed": {"route": [list(A)]}})
     mode = GenerationMode.networked
     async with session() as db:
+        base = await db.scalar(
+            select(func.max(DeploymentGeneration.seq)).where(DeploymentGeneration.device_id == device_id)
+        )
+        document = {
+            "static_route": {
+                "_execution": {
+                    "removal": {
+                        "authorized_removal_keys": [list(A)],
+                        "claimed_keys": [],
+                        "tombstone_ids": [],
+                        "candidate_clears": [],
+                        "reclaimed_keys": [],
+                    }
+                }
+            }
+        }
         db.add(
             DeploymentGeneration(
                 device_id=device_id,
-                seq=1,
+                seq=base + 1,
                 mode=mode,
-                document={},
-                digest=digest_document(mode, {}, {}),
+                document=document,
+                digest=digest_document(mode, document, {}),
                 allowed_removal_keys={},
                 source_push_seq={},
                 stream_revisions={"vlan": 1},
