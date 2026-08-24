@@ -200,8 +200,18 @@ async def test_delete_origin_is_inert_in_static_route_receipt_identity(
     from nso_adapter.core.receipt import latest_receipt
 
     device_id = await seed_device(nso_device_name=f"sr-replay-{suffix}", netbox_device_id=None)
+    await seed_intent(
+        device_id,
+        [
+            {"triple": A, "route_id": 7, "deployed_key": list(A)},
+            {"triple": B, "route_id": 8, "deployed_key": list(B)},
+        ],
+    )
     url = f"/api/v1/devices/{device_id}/static-route-intent"
-    body = {"routes": [entry(A, route_id=7)], "deleted_routes": []}
+    body = {
+        "routes": [],
+        "deleted_routes": [{"route_id": 7, "triples": [entry(A)], "unverified": False}],
+    }
     headers = AUTH | {"X-Push-Seq": "9001"}
 
     first = await adapter_client.put(url + first_query, json=body, headers=headers)
@@ -210,8 +220,12 @@ async def test_delete_origin_is_inert_in_static_route_receipt_identity(
     assert first.status_code == 200
     assert replay.status_code == 200
     assert replay.json() == first.json()
-    assert len(await read_intent(device_id)) == 1
-    assert await read_jobs(device_id) == []
+    assert await read_intent(device_id) == []
+    assert {row["route_id"]: row["marking"] for row in await read_tombstones(device_id)} == {
+        7: "delete_origin",
+        8: "detach",
+    }
+    assert len(await read_jobs(device_id)) == 2
     async with session() as db:
         receipt = await latest_receipt(db, device_id, "static_route")
         assert receipt.delete_origin is False
@@ -377,16 +391,33 @@ async def test_delete_and_tombstone_roll_back_together(adapter_client, monkeypat
     )
 
     boom = RuntimeError("forced failure after the tombstone/delete DML")
+    seen_markings = []
 
-    async def _explode(*args, **kwargs):
+    async def _explode(db, *args, **kwargs):
+        from nso_adapter.store.models import StaticRouteTombstone
+
+        tombstones = (
+            await db.scalars(
+                select(StaticRouteTombstone)
+                .where(StaticRouteTombstone.device_id == device_id)
+                .order_by(StaticRouteTombstone.id)
+            )
+        ).all()
+        seen_markings.extend((row.route_id, row.marking) for row in tombstones)
         raise boom
 
     # Imported inside the handler, so patch it at its source module.
     monkeypatch.setattr("nso_adapter.core.apply.enqueue_apply", _explode)
 
-    resp = await put_intent(adapter_client, device_id, [entry(A, route_id=7)])
+    resp = await put_intent(
+        adapter_client,
+        device_id,
+        [entry(A, route_id=7)],
+        deleted_routes=[{"route_id": 8, "triples": [entry(B)], "unverified": False}],
+    )
     assert resp.status_code == 500, resp.text
     assert resp.json() == {"error": {"code": "internal", "message": "Internal server error", "detail": {}}}
+    assert seen_markings == [(8, "delete_origin")]
 
     # Row 8 is still live, and nothing claims authority to delete it.
     rows = await read_intent(device_id)

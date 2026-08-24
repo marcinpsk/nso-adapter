@@ -294,15 +294,23 @@ async def test_the_removal_job_and_the_delete_roll_back_together(adapter_client,
     """
     device_id = await seed_device(nso_device_name="sr-m7-3", netbox_device_id=9783)
     ids = await seed_intent(device_id, [{"triple": A, "route_id": 7, "deployed_key": list(A)}])
+    seen_removals = []
 
     async def _explode(*args, **kwargs):
+        seen_removals.append((kwargs["marking"], kwargs["removed"]))
         raise RuntimeError("forced failure at the removal enqueue")
 
     monkeypatch.setattr("nso_adapter.core.removal.enqueue_removal", _explode)
 
-    resp = await put_intent(adapter_client, device_id, [])
+    resp = await put_intent(
+        adapter_client,
+        device_id,
+        [],
+        deleted_routes=[{"route_id": 7, "triples": [entry(A)], "unverified": False}],
+    )
     assert resp.status_code == 500, resp.text
     assert resp.json() == {"error": {"code": "internal", "message": "Internal server error", "detail": {}}}
+    assert seen_removals == [("delete_origin", {"route": [A]})]
 
     assert [(r["id"], r["triple"]) for r in await read_intent(device_id)] == [(ids[A], A)]
     assert await read_tombstones(device_id) == []
