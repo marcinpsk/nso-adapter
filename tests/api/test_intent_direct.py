@@ -123,7 +123,7 @@ async def test_put_intent_transitions_imported_to_accepted(adapter_client):
 
 async def test_put_intent_auto_apply_triggers_enqueue(adapter_client):
     """A non-empty push queues Apply when auto-apply is enabled."""
-    from nso_adapter.store.models import Job, JobStatus, JobType
+    from nso_adapter.store.models import DeploymentGeneration, Job, JobStatus, JobType
 
     device_id, _ = await _seed_device_with_interface("intent-dev-05", 1240)
     async with session() as db:
@@ -140,6 +140,13 @@ async def test_put_intent_auto_apply_triggers_enqueue(adapter_client):
         job = await db.scalar(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.apply))
         assert job is not None
         assert job.status is JobStatus.queued
+        generations = (
+            (await db.execute(select(DeploymentGeneration).where(DeploymentGeneration.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        assert len(generations) == 1
+        assert generations[0].job_id == job.id
 
 
 async def test_put_intent_replaces_existing_intent(adapter_client):

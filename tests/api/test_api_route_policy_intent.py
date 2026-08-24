@@ -9,6 +9,8 @@ validation 422s, and the removal-propagation that enqueues a `removal` job.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 from sqlalchemy import select
 
@@ -227,7 +229,15 @@ async def test_put_route_policy_intent_creates_objects(adapter_client):
 
 @pytest.mark.anyio
 async def test_put_route_policy_intent_auto_apply_creates_generation(adapter_client):
-    from nso_adapter.store.models import DeploymentGeneration, DeviceSettings, IntentPushReceipt, Job, JobType
+    from nso_adapter.core.apply import run_apply
+    from nso_adapter.store.models import (
+        DeploymentGeneration,
+        DeviceSettings,
+        IntentPushReceipt,
+        Job,
+        JobStatus,
+        JobType,
+    )
 
     device_id = await seed_device(nso_device_name="rp-auto-apply", netbox_device_id=7965)
     async with session() as db:
@@ -258,9 +268,30 @@ async def test_put_route_policy_intent_auto_apply_creates_generation(adapter_cli
     assert len(generations) == 1
     generation, job = generations[0]
     assert generation.stream_revisions == {"route_policy": 1}
+    assert generation.source_push_seq == {"route_policy": 7965}
     assert job.job_type is JobType.apply
     assert receipt is not None
+    assert receipt.push_seq == 7965
     assert receipt.generation_id == generation.id
+
+    async with session() as db:
+        running = await db.get(Job, job.id)
+        running.status = JobStatus.running
+        running.run_attempt = 1
+        await db.commit()
+
+    nso_client = AsyncMock()
+    nso_client.get_device_state_doc.return_value = None
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=nso_client),
+        patch("nso_adapter.nso.apply.apply_route_policy_config", new_callable=AsyncMock) as apply_route_policy,
+    ):
+        await run_apply(job_id=job.id, device_id=device_id, force=True)
+
+    apply_route_policy.assert_awaited_once()
+    async with session() as db:
+        completed = await db.get(Job, job.id)
+    assert completed.status is JobStatus.succeeded
 
 
 @pytest.mark.anyio

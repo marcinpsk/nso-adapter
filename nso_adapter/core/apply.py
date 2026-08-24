@@ -1185,7 +1185,7 @@ class _Projection:
     def _document_rows(self) -> dict[type, list]:
         if self._hydrated is None:
             rows: dict[type, list] = {}
-            for section in DOCUMENT_EXECUTED_SECTIONS:
+            for section in DOCUMENT_EXECUTED_SECTIONS.intersection(self._document):
                 rows.update(hydrate_section(self._document, section))
             self._hydrated = rows
         return self._hydrated
