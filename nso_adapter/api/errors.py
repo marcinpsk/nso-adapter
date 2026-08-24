@@ -109,7 +109,7 @@ def api_error(
     detail: dict | None = None,
 ) -> ApiError:
     if code not in ERROR_CODES:
-        raise ValueError(f"unknown error code {code!r} — add it to ERROR_CODES and api-contract.md")
+        raise ValueError(f"unknown error code {code!r}: add it to ErrorCode and api-contract.md")
     return ApiError(
         status_code=status_code,
         detail={"error": {"code": code, "message": message, "detail": detail or {}}},

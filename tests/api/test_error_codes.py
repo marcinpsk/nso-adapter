@@ -197,8 +197,11 @@ async def test_framework_http_errors_use_the_canonical_envelope(
 
 
 def test_api_error_rejects_unknown_code():
-    with pytest.raises(ValueError, match="unknown error code"):
+    with pytest.raises(ValueError) as exc_info:
         api_error(400, "definitely_not_a_code", "boom")
+    assert str(exc_info.value) == (
+        "unknown error code 'definitely_not_a_code': add it to ErrorCode and api-contract.md"
+    )
 
 
 def test_runtime_error_codes_match_openapi_enum():
@@ -213,7 +216,7 @@ def test_every_code_roundtrips_envelope():
 
 def test_call_site_codes_are_subset_of_error_codes():
     """Every literal code passed to api_error() anywhere in the package is in the
-    closed set — a new code must be added to ERROR_CODES (and the doc) first."""
+    closed set. A new code must be added to ErrorCode and the contract first."""
     seen: dict[str, str] = {}
     for path in _PKG_DIR.rglob("*.py"):
         src = path.read_text()
