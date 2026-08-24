@@ -83,6 +83,12 @@ def test_hydrate_section_accepts_an_explicitly_empty_section():
     assert hydrate_section({"vlan": {}}, "vlan") == {}
 
 
+def test_composing_an_empty_promoted_stream_preserves_its_section():
+    from nso_adapter.core.generation import _compose_document
+
+    assert _compose_document({"vlan": {}}) == {"vlan": {}}
+
+
 async def test_a_snapshot_hydrates_back_into_the_rows_it_was_taken_from(adapter_client):
     """Round-trip fidelity, including the types JSON cannot hold natively."""
     from nso_adapter.core.projection import hydrate_section, snapshot_stream

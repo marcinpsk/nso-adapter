@@ -214,7 +214,7 @@ async def test_o2b_9_the_receipt_names_the_generation_its_push_authorized(adapte
     assert rows[(device_id, "static_route")]["generation_id"] is None
 
 
-async def test_o2b_9_a_receipt_held_route_id_still_counts_toward_the_maximum(adapter_client):
+async def test_receipt_held_route_id_still_counts_toward_the_maximum(adapter_client):
     """A store-only deletion leaves its route id in the receipt as the sole carrier."""
     device_id = await seed_device(nso_device_name="rcpt-pending-deletion", netbox_device_id=9964)
     await seed_intent(device_id, [{"triple": A, "route_id": 9999, "deployed_key": list(A)}])
@@ -238,7 +238,7 @@ async def test_o2b_9_a_receipt_held_route_id_still_counts_toward_the_maximum(ada
     assert payload["global_max_route_id"] == 9999
 
 
-async def test_o2b_9_malformed_receipt_provenance_does_not_break_the_maximum(adapter_client):
+async def test_malformed_receipt_provenance_does_not_break_the_maximum(adapter_client):
     """The database aggregate ignores non-array and non-integer provenance values."""
     from nso_adapter.store.models import IntentPushReceipt
 

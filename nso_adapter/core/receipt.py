@@ -140,7 +140,8 @@ def _private_response(response: object) -> dict:
     return {key: value for key, value in response.items() if key.startswith("_")}
 
 
-def _deletion_identity(record: object) -> tuple | None:
+def promotion_deletion_identity(record: object) -> tuple | None:
+    """Return the durable identity encoded by one promotion-deletion record."""
     if not isinstance(record, dict) or not isinstance(record.get("table"), str):
         return None
     if isinstance(record.get("route_id"), int):
@@ -164,12 +165,12 @@ def _merge_private_response(previous: dict, response: dict, *, retired: frozense
         by_identity = {
             identity: record
             for record in old_deletions
-            if (identity := _deletion_identity(record)) is not None and identity not in retired
+            if (identity := promotion_deletion_identity(record)) is not None and identity not in retired
         }
         # A continuously absent row keeps its first marking. Restoration retires that
         # provenance before a later disappearance records a new marking.
         for record in new_deletions:
-            identity = _deletion_identity(record)
+            identity = promotion_deletion_identity(record)
             if identity is not None:
                 by_identity.setdefault(identity, record)
         if by_identity:
@@ -196,7 +197,7 @@ def _restored_deletion_identities(previous: dict, authorized: dict, desired: dic
     desired_index: dict[str, dict[tuple, dict]] = {}
     authorized_index: dict[str, dict[tuple, dict]] = {}
     for record in previous.get("_promotion_deletions") or []:
-        deletion_identity = _deletion_identity(record)
+        deletion_identity = promotion_deletion_identity(record)
         if deletion_identity is None:
             continue
         table = deletion_identity[0]
@@ -248,7 +249,7 @@ async def _record_projection_deletions(
     explicit = {
         identity: record
         for record in response.get("_promotion_deletions") or []
-        if (identity := _deletion_identity(record)) is not None
+        if (identity := promotion_deletion_identity(record)) is not None
     }
     marking = DELETE_ORIGIN_MARKING if receipt.delete_origin else DETACH_MARKING
     for table, previous in projection.authorized_document.items():
@@ -288,7 +289,7 @@ async def latest_receipts(db: AsyncSession, device_id: int, streams: Iterable[st
     """Return the last admitted receipt per named stream, in one query.
 
     One row per (device, section) exists by unique constraint, so a caller resolving several
-    streams — a manual Apply naming them all — needs one round trip, not one per stream.
+    streams, such as a manual Apply naming them all, needs one round trip, not one per stream.
     """
     rows = (
         (
@@ -404,7 +405,7 @@ async def record_response(
     carried_deletions = [
         record
         for record in previous.get("_promotion_deletions") or []
-        if (deletion_identity := _deletion_identity(record)) is not None and deletion_identity not in retired
+        if (deletion_identity := promotion_deletion_identity(record)) is not None and deletion_identity not in retired
     ]
     receipt.response = _merge_private_response(previous, response, retired=retired)
     projection = await db.scalar(

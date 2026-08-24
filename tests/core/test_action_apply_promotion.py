@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
-"""#1558 slice 2a: selected manual-Apply promotion and mixed decomposition."""
+"""Selected manual-Apply promotion and mixed decomposition."""
 
 from __future__ import annotations
 
@@ -412,7 +412,7 @@ async def test_single_mode_selection_creates_one_generation_without_cohort(adapt
 
 
 async def test_apply_accumulates_delete_provenance_across_store_only_receipts(adapter_client):
-    """Finding 1: a later edit must not hide an earlier marked deletion."""
+    """A later edit must not hide an earlier marked deletion."""
     from nso_adapter.core.generation import _fragment_deletions
     from nso_adapter.core.projection import snapshot_stream
     from nso_adapter.core.receipt import latest_receipt
@@ -472,7 +472,7 @@ async def test_apply_accumulates_delete_provenance_across_store_only_receipts(ad
 
 
 async def test_auto_apply_refuses_to_discard_carried_deletion_provenance(adapter_client):
-    """R5 finding 3: a direct promotion cannot strand an earlier store-only deletion."""
+    """A direct promotion cannot strand an earlier store-only deletion."""
     from nso_adapter.core.receipt import latest_receipt
     from nso_adapter.store.models import GenerationStatus
 
@@ -512,7 +512,7 @@ async def test_auto_apply_refuses_to_discard_carried_deletion_provenance(adapter
 
 
 async def test_apply_does_not_reuse_provenance_consumed_by_an_immediate_promotion(adapter_client):
-    """Finding 1: delivered provenance cannot mark a later deletion of the same route."""
+    """Delivered provenance cannot mark a later deletion of the same route."""
     from nso_adapter.core.receipt import latest_receipt
     from nso_adapter.store.models import GenerationStatus
 
@@ -565,7 +565,7 @@ async def test_apply_does_not_reuse_provenance_consumed_by_an_immediate_promotio
 
 
 async def test_restored_row_retires_accumulated_deletion_provenance(adapter_client):
-    """R4 P1: a restored route takes its next deletion's current marking."""
+    """A restored route takes its next deletion's current marking."""
     from nso_adapter.core.receipt import latest_receipt
     from nso_adapter.store.models import GenerationStatus
 
@@ -644,7 +644,7 @@ async def test_deletion_retirement_uses_durable_identity_for_internal_row_ids():
 
 
 async def test_apply_routes_a_store_only_scalar_clear_through_replacement(adapter_client):
-    """Finding 2: a clear cannot settle on the merge-writer path."""
+    """A clear cannot settle on the merge-writer path."""
     from nso_adapter.store.models import GenerationStatus, JobType
 
     device_id = await seed_device(nso_device_name="apply-clear", netbox_device_id=9966)
@@ -676,7 +676,7 @@ async def test_apply_routes_a_store_only_scalar_clear_through_replacement(adapte
 
 
 async def test_apply_delta_ignores_apply_bookkeeping_changes():
-    """Finding 2: apply-owned result fields are not operator replacement work."""
+    """Apply-owned result fields are not operator replacement work."""
     from nso_adapter.core.generation import _content_losing_rows, _has_positive_delta
 
     old = {
@@ -735,7 +735,7 @@ async def test_apply_delta_ignores_correlation_only_changes():
 
 
 async def test_apply_settlement_fields_do_not_block_a_later_detach(adapter_client):
-    """R4 P2: settled clear bookkeeping is not successor replacement work."""
+    """Settled clear bookkeeping is not successor replacement work."""
     from nso_adapter.store.models import DeviceSettings, GenerationMode, GenerationStatus, JobStatus, JobType
     from tests.core.test_static_route_put import wire
     from tests.core.test_static_route_removal import SrFake, run_removal_job, sr_client
@@ -810,7 +810,7 @@ async def test_apply_settlement_fields_do_not_block_a_later_detach(adapter_clien
 
 
 async def test_action_apply_refuses_a_live_read_stream_without_promoting_an_executable_subset(adapter_client):
-    """R5 boundary: one live-read selection refuses the whole mixed request."""
+    """One live-read selection refuses the whole mixed request."""
     device_id = await seed_device(nso_device_name="apply-live-read-refusal", netbox_device_id=9967)
     await seed_settings(device_id, auto_apply=False)
     assert (await _put_vlans(adapter_client, device_id, [10], seq=4701, query="?store_only=true")).status_code == 200
@@ -833,7 +833,7 @@ async def test_action_apply_refuses_a_live_read_stream_without_promoting_an_exec
 
 
 async def test_action_apply_refuses_static_route_until_it_executes_from_the_document(adapter_client):
-    """R6 boundary: static-route workers still read live intent at execution time."""
+    """Static-route workers still read live intent at execution time."""
     device_id = await seed_device(nso_device_name="apply-static-live-read-refusal", netbox_device_id=9980)
     await seed_settings(device_id, auto_apply=False)
     stored = await _put_routes(
@@ -948,7 +948,7 @@ async def test_action_apply_refuses_detach_combined_with_replacement_work(adapte
 
 
 async def test_apply_non_static_removal_carries_guarded_keys(adapter_client):
-    """Finding 4: composed non-static removals retain collateral-guard authority."""
+    """Composed non-static removals retain collateral-guard authority."""
     from nso_adapter.store.models import GenerationStatus
 
     device_id = await seed_device(nso_device_name="apply-guard-keys", netbox_device_id=9968)
@@ -989,7 +989,7 @@ async def test_interface_promotion_refuses_an_unresolved_interface_id(adapter_cl
 
 
 async def test_action_apply_refuses_interface_streams_that_execute_from_live_rows(adapter_client):
-    """R5 rescope: interface execution cannot certify the selected stored revision."""
+    """Interface execution cannot certify the selected stored revision."""
     device_id = await seed_device(nso_device_name="apply-interface-list", netbox_device_id=9969)
     await seed_settings(device_id, auto_apply=False)
     first = await adapter_client.put(
@@ -1016,7 +1016,7 @@ async def test_action_apply_refuses_interface_streams_that_execute_from_live_row
 
 
 async def test_apply_static_route_removal_keeps_apply_bookkeeping_job(adapter_client):
-    """Finding 6: removal uses SrRemoval and additions retain the apply CAS/results path."""
+    """Removal uses SrRemoval, and additions retain the apply CAS and results path."""
     from nso_adapter.store.models import GenerationStatus, JobType
 
     device_id = await seed_device(nso_device_name="apply-static-bookkeeping", netbox_device_id=9970)
@@ -1052,7 +1052,7 @@ async def test_apply_static_route_removal_keeps_apply_bookkeeping_job(adapter_cl
 
 
 async def test_non_static_detach_mix_keeps_positive_delta_on_apply_link(adapter_client):
-    """R3 P1-1: a VLAN replacement must detach 10 and still network 20."""
+    """A VLAN replacement must detach 10 and still network 20."""
     from nso_adapter.store.models import GenerationMode, GenerationStatus, JobType
 
     device_id = await seed_device(nso_device_name="apply-vlan-detach-mix", netbox_device_id=9974)
@@ -1083,7 +1083,7 @@ async def test_non_static_detach_mix_keeps_positive_delta_on_apply_link(adapter_
 
 
 async def test_action_apply_refuses_bgp_until_its_graph_executes_from_the_document(adapter_client):
-    """R5 rescope: the live-read BGP graph cannot execute an exact selected revision."""
+    """The live-read BGP graph cannot execute an exact selected revision."""
     device_id = await seed_device(nso_device_name="apply-bgp-rebuild", netbox_device_id=9975)
     await seed_settings(device_id, auto_apply=False)
     first = await adapter_client.put(
@@ -1105,7 +1105,7 @@ async def test_action_apply_refuses_bgp_until_its_graph_executes_from_the_docume
 
 
 async def test_promoted_static_route_detach_fails_when_proof_is_inconclusive(adapter_client):
-    """R3 P1-3: job context is a proof carrier even after provenance consumption."""
+    """Job context is a proof carrier even after provenance consumption."""
     from nso_adapter.core.generation import (
         _compose_authorized_document,
         _enqueue_action_removal_links,
@@ -1160,7 +1160,7 @@ async def test_promoted_static_route_detach_fails_when_proof_is_inconclusive(ada
 
 
 async def test_consumed_static_route_tombstone_is_not_planned_as_an_intent_deletion(adapter_client):
-    """R6 lifecycle: proof consumption is not a successor operator deletion."""
+    """Proof consumption is not a successor operator deletion."""
     from nso_adapter.core.generation import (
         _content_losing_rows,
         _fragment_deletions,
@@ -1263,7 +1263,7 @@ async def test_consumed_static_route_tombstone_is_not_planned_as_an_intent_delet
 
 
 async def test_action_apply_job_executes_only_the_selected_generation_document(adapter_client):
-    """R7 item 1: an unselected live row must not ride a document-executed Apply."""
+    """An unselected live row must not ride a document-executed Apply."""
     from nso_adapter.store.models import SnmpCommunityIntent
     from tests.core.test_generation_protocol import recorded_client, run_head
 
@@ -1300,7 +1300,7 @@ async def test_action_apply_settlement_between_projection_and_generation_reads_i
     adapter_client,
     rival_engine,
 ):
-    """R7 item 2: a concurrent settlement is already-authorized, never a 500."""
+    """A concurrent settlement is already authorized. It must never cause a 500."""
     from nso_adapter.core.generation import settle_job_generations
     from nso_adapter.store.models import GenerationStatus, Job, JobStatus
 
@@ -1347,7 +1347,7 @@ async def test_action_apply_settlement_between_projection_and_generation_reads_i
         await settler.commit()
         await receipt_blocker.commit()
         # Still a deadlock guard (a lock-order inversion must fail, not hang), but the
-        # budget only has to be shorter than "forever" — it is not a latency assertion.
+        # budget only has to be shorter than "forever". It is not a latency assertion.
         response = await asyncio.wait_for(applying, timeout=30)
 
     assert response.status_code == 200, response.text

@@ -250,7 +250,11 @@ async def test_store_only_manual_apply_is_rejected_without_a_job(adapter_client)
     )
     assert stored.status_code == 200, stored.text
 
-    response = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/apply?store_only=true", headers=AUTH)
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/apply?store_only=true",
+        json={"selected": {}},
+        headers=AUTH,
+    )
 
     assert response.status_code == 422
     assert response.json() == {

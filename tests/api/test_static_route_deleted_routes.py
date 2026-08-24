@@ -216,7 +216,7 @@ async def test_o2b_8_e_a_request_mixing_a_genuine_and_a_degraded_id_is_refused_w
     assert await receipt(device_id) is None
 
 
-async def test_o2b_8_f_store_only_carries_a_genuine_deletion_with_the_fence_shut(adapter_client):
+async def test_store_only_carries_a_genuine_deletion_with_the_fence_shut(adapter_client):
     """A store-only receipt preserves provenance without creating a tombstone or job."""
     device_id = await seed_device(nso_device_name="sr-o2b8-f", netbox_device_id=9894)
     await seed_intent(
@@ -247,7 +247,7 @@ async def test_o2b_8_f_store_only_carries_a_genuine_deletion_with_the_fence_shut
     assert await read_jobs(device_id) == []
 
 
-async def test_o2b_8_f_store_only_carries_a_genuine_deletion_with_the_fence_open(adapter_client):
+async def test_store_only_carries_a_genuine_deletion_with_the_fence_open(adapter_client):
     """The same receipt carrier works after the immediate-removal fence opens."""
     device_id = await seed_device(nso_device_name="sr-o2b8-f2", netbox_device_id=9895)
     await seed_intent(

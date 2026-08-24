@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
-"""GET /api/v1/intent-receipts — what the pusher's restore path reads (#1503 §4.4/§4.6).
+"""GET /api/v1/intent-receipts: what the pusher's restore path reads.
 
 The receipt is the only durable record of which logical operation the adapter last admitted
 for a ``(device, stream)``. A pusher restored from a snapshot has lost that knowledge on its
 own side, so before it resolves a single outstanding claim it reads this surface and learns:
 
 * every per-key receipt — its sequence, the body digest, the request mode and the STORED
-  RESPONSE, which is what §4.6's same-sequence arm re-validates the claim's exact set
+  RESPONSE, which lets a replay re-validate the claim's exact set
   against;
 * ``global_max_push_seq``, the fleet-wide highest admitted sequence, so the restored pusher
   allocates ABOVE it and never re-uses one;
@@ -16,7 +16,7 @@ own side, so before it resolves a single outstanding claim it reads this surface
   pk R existed can re-allocate R while the adapter still holds an acknowledged, unrelated row
   carrying ``route_id = R``. The deletion partition's first pass would then bind that row as
   GENUINE and authorize removing it: a device write with no authority behind it. Advancing the
-  pk sequence past this value is what closes it (R9-B4), and the value therefore counts both
+  pk sequence past this value closes that risk. The value therefore counts both
   TOMBSTONES and receipt-held promotion deletions. Either carrier can hold the pk of a route
   whose deletion is still in flight.
 

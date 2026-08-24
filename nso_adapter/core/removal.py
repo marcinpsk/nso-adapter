@@ -1251,14 +1251,14 @@ async def _commit_terminal_removal(db: AsyncSession, job_id: int) -> None:
 
 
 async def _finalize_static_route_removal(db, job_id: int, device, client, out: SrRemoval, *, reg) -> bool:
-    """Prove the write, then consume and finalize in ONE claim-guarded transaction (§4.4/§4.6).
+    """Prove the write, then consume and finalize in one claim-guarded transaction.
 
     The status-coupling rule is the most breakable invariant in R2: R1's sweeper only re-issues
     a tombstone whose owner is NULL or ``failed`` (G17), so a job that leaves a tombstone
     unconsumed must NOT end ``succeeded`` — the carrier would be stranded with no retry path.
     An Apply-promoted context is also a carrier: its attached generation and job context are
     the only durable retry obligation after enqueue consumes receipt provenance. A removal
-    that owns none of these carriers keeps OQ-R2-1's leniency and records that it proved nothing.
+    that owns none of these carriers keeps the apply-side leniency and records that it proved nothing.
 
     Returns whether the job ended ``succeeded``.
     """
@@ -1901,7 +1901,7 @@ async def enqueue_removal(
 
     *document* is the composed document the promoted generation deploys, stated by the caller
     that already built it. A reissue composes its own, so *force* refuses it here rather than
-    dropping it silently — the same refusal *marking* and *promotes* already get.
+    dropping it silently. The same refusal applies to *marking* and *promotes*.
     """
     from nso_adapter.core.generation import attach_to_job, create_generation, create_reissue_generation
     from nso_adapter.core.request_flags import STORE_ONLY

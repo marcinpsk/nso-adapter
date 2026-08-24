@@ -1330,8 +1330,8 @@ async def test_f6_a_a_reissue_certifies_no_section_revision(adapter_client):
     )
 
 
-async def test_f7_a_manual_apply_ignores_an_unselected_section_committed_alongside_it(adapter_client, rival_engine):
-    """§H4: the caller's selected push remains the authorization boundary under the lock.
+async def test_manual_apply_ignores_an_unselected_section_committed_alongside_it(adapter_client, rival_engine):
+    """The caller's selected push remains the authorization boundary under the lock.
 
     The rival commits an SNMP write before the Apply acquires the projection lock. The Apply
     still promotes only the VLAN push the caller selected.

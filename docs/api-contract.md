@@ -2150,8 +2150,8 @@ stream in the affected section in the same transaction. It records no new row.
 That PUT-replace is a synchronous device commit that can exceed the plugin's HTTP
 client timeout (~30s). So it does **not** run inline in the intent PUT: when an
 intent PUT drops one or more rows it enqueues **`removal`** jobs (a `jobtype`
-enum value) — one per deletion-marking group, so a request whose drops carry both
-delete-origin and detach markings produces a networked job and a detach job —
+enum value), one per deletion-marking group. A request whose drops carry both
+delete-origin and detach markings produces a networked job and a detach job
 atomically with the row deletes, and returns immediately.
 `?store_only=true` is the exception: it updates the mirror without authorizing the
 drop on the device, so it enqueues no removal jobs (and no apply job, whatever the

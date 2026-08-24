@@ -956,7 +956,7 @@ async def test_c3_5_a_carrierless_removal_keeps_the_apply_side_leniency(adapter_
     assert job.result["residue_check"] == "unsupported"
 
 
-async def test_c3_5_any_carried_static_route_generation_makes_unproven_removal_fail(adapter_client):
+async def test_any_carried_static_route_generation_makes_unproven_removal_fail(adapter_client):
     """A coalesced non-static generation cannot hide a static-route promotion obligation."""
     from nso_adapter.core.generation import digest_document
     from nso_adapter.store.models import DeploymentGeneration, GenerationMode

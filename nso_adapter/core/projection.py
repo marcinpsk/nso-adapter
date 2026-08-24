@@ -460,7 +460,7 @@ DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset({"vlan"})
 
 #: A STRICT SUBSET of :data:`DOCUMENT_EXECUTED_SECTIONS`. Static-route companion apply and
 #: claim subtraction read live intent, so a later store-only push could execute under the
-#: selected generation — which is why ``static_route`` is document-executed but not
+#: selected generation. This is why ``static_route`` is document-executed but not
 #: selectable here.
 ACTION_APPLY_EXECUTABLE_SECTIONS: frozenset[str] = frozenset({"vlan"})
 

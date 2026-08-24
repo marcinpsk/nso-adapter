@@ -164,9 +164,13 @@ async def test_replace_on_removal_unknown_model_returns_false(adapter_client):
 
 
 def test_enqueue_removal_requires_a_promotion_disposition():
-    parameter = inspect.signature(enqueue_removal).parameters["promotes"]
+    parameters = inspect.signature(enqueue_removal).parameters
 
-    assert parameter.default is inspect.Parameter.empty
+    for name in ("promotes", "marking", "defer_retract"):
+        assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameters[name].default is inspect.Parameter.empty, (
+            f"{name} gained a default; a silent default misdispatches the removal"
+        )
 
 
 async def test_enqueue_removal_rejects_unknown_scope(adapter_client):

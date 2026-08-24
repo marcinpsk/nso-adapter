@@ -72,6 +72,7 @@ from nso_adapter.core.projection import (
     snapshot_stream,
     stream_section,
 )
+from nso_adapter.core.receipt import promotion_deletion_identity
 from nso_adapter.store.db import execute_dml
 from nso_adapter.store.models import (
     SETTLEMENT_COHORT_SEQUENCE,
@@ -255,8 +256,7 @@ def _compose_document(fragments: dict[str, dict]) -> dict:
     """
     document: dict[str, dict] = {}
     for stream, fragment in sorted(fragments.items()):
-        if fragment:
-            document.setdefault(stream_section(stream), {}).update(fragment)
+        document.setdefault(stream_section(stream), {}).update(fragment)
     return document
 
 
@@ -316,18 +316,13 @@ def _explicit_deletion_markings(receipt) -> dict[tuple[str, str, object], str]:
     records = response.get("_promotion_deletions") or []
     result: dict[tuple[str, str, object], str] = {}
     for record in records:
-        if not isinstance(record, dict) or not isinstance(record.get("table"), str):
+        identity = promotion_deletion_identity(record)
+        if identity is None or not isinstance(record, dict):
             continue
         marking = record.get("marking")
         if not isinstance(marking, str):
             continue
-        if isinstance(record.get("route_id"), int):
-            result[(record["table"], "route_id", record["route_id"])] = marking
-        if isinstance(record.get("id"), int):
-            result[(record["table"], "id", record["id"])] = marking
-        key = record.get("key")
-        if isinstance(key, list):
-            result[(record["table"], "key", tuple(key))] = marking
+        result[identity] = marking
     return result
 
 
