@@ -176,7 +176,7 @@ async def test_put_intent_replaces_existing_intent(adapter_client):
     other = await adapter_client.put(
         f"/api/v1/devices/{other_device_id}/intent",
         json={"attributes": [{"interface": "GigabitEthernet0/2", "attribute": "description", "intent_value": "other"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert other.status_code == 200
 

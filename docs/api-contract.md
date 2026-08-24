@@ -1113,9 +1113,10 @@ an operator un-owning it produce the same shrink, and the two have opposite devi
 | `triples` | its LINEAGE, most-authoritative-first: the last acknowledged triple, then the current one. Deduplicated. Empty is a **422**, and so is a third triple — the ceiling is enforced at request validation, not assumed |
 | `unverified` | declared by the pusher when the overlay held no acknowledged triple. Never inferred from the lineage's shape — a verified `[C, C]` deduplicates to exactly what an unverified `[C]` produces |
 
-The field is optional today and its absence is the PRE-ACTIVATION shape: the scope is still
-marked for the whole request by `?delete_origin=`. A list — empty included — means the push
-marks **per object**, and `?delete_origin=` no longer applies to this scope.
+The field is optional today. Omission or an explicit `null` is the PRE-ACTIVATION shape:
+the scope is still marked for the whole request by `?delete_origin=`. A list (empty
+included) means the push marks **per object**, and `?delete_origin=` no longer applies to
+this scope.
 
 **Classification.** Two ordered passes over the rows this push removes:
 

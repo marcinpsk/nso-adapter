@@ -38,6 +38,13 @@ def test_receipt_contract_example_echoes_every_counted_route():
     assert response["count"] == len(response["routes"])
 
 
+def test_deleted_routes_contract_defines_the_nullable_pre_activation_shape():
+    document = Path("docs/api-contract.md").read_text(encoding="utf-8")
+    section = document.split("#### `deleted_routes`", 1)[1].split("#### ", 1)[0]
+
+    assert "Omission or an explicit `null` is the PRE-ACTIVATION shape" in section
+
+
 @pytest.mark.anyio
 async def test_static_routes_contract(adapter_client):
     from nso_adapter.store.models import DeviceStaticRoute
