@@ -323,10 +323,22 @@ async def test_o2_6_the_sweeper_reissues_each_carrier_at_its_own_marking(adapter
 
     assert (first.status, second.status) == (JobStatus.succeeded, JobStatus.failed)
     assert await _tombstone_rows(device_id) == {C: ("detach", unmarked)}, "consumption stays job-scoped"
+    async with session() as db:
+        tombstone_id = await db.scalar(
+            select(StaticRouteTombstone.id).where(
+                StaticRouteTombstone.device_id == device_id,
+                StaticRouteTombstone.prefix == C[1],
+            )
+        )
 
     assert await sweep_one_device(device_id) == 1
     contexts = await _contexts(device_id)
-    assert contexts[2] == {"scope": "static_route", "removed": {"route": [list(C)]}, "detach": True}
+    assert contexts[2] == {
+        "scope": "static_route",
+        "removed": {"route": [list(C)]},
+        "detach": True,
+        "tombstone_ids": [tombstone_id],
+    }
     assert len(contexts) == 3, "the succeeded job's keys must not be re-issued"
 
 
