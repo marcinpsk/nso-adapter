@@ -96,6 +96,16 @@ def test_api_contract_documents_both_generation_action_conflicts():
     assert "empty `error.detail`" in section
 
 
+def test_api_contract_documents_the_skipped_detail_null_shape():
+    contract = (SNAPSHOT_PATH.parents[2] / "docs" / "api-contract.md").read_text()
+    section = contract.split("### `POST /api/v1/devices/{id}/actions/apply`", maxsplit=1)[1].split(
+        "\n### ", maxsplit=1
+    )[0]
+
+    assert "always present and is `null`" in section
+    assert '"skipped_detail": null' in section
+
+
 def test_no_disambiguation_qualified_component_names(openapi_schema):
     schemas = openapi_schema["components"]["schemas"]
     # A same-name/different-shape collision is the only thing that makes

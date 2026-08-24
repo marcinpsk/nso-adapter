@@ -668,8 +668,8 @@ sequence: the receipt exists and holds it, but a backfill repairs correlation on
 retry of the same selection can promote it.
 `skipped_detail` is conditional and is keyed by stream. It identifies the generation for
 each `already_authorized` skip whose owning generation can be identified. Each member has
-the shape `{ "generation_id": <int>, "seq": <int>, "status": "<status>" }`. The response
-omits `skipped_detail` when no member qualifies. The retry and abandon actions own the
+the shape `{ "generation_id": <int>, "seq": <int>, "status": "<status>" }`. The key is
+always present and is `null` when no member qualifies. The retry and abandon actions own the
 identified generation. Apply cannot replace it with weaker work.
 An empty selection, or a request in which every selection is skipped, returns `200` with an
 explicit no-op and no `job_id`:
@@ -695,6 +695,7 @@ top-level `job_id` is the first job in that chain.
   "job_id": 501,
   "selected": { "vlan": 4711 },
   "skipped": {},
+  "skipped_detail": null,
   "generations": [
     { "generation_id": 81, "seq": 4, "job_id": 501, "mode": "networked",
       "source_push_seq": { "vlan": 4711 },
