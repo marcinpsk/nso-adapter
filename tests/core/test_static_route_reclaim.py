@@ -100,7 +100,12 @@ async def test_c4_22_i_delete_origin_with_device_residue_is_reissued(adapter_cli
     assert len(jobs) == 1
     assert jobs[0].id != owner, "a FRESH job id — the succeeded owner is what made it unsweepable"
     assert (await owners(device_id))[tomb] == jobs[0].id
-    assert jobs[0].context == {"scope": "static_route", "removed": {"route": [list(A)]}, "detach": False}
+    assert jobs[0].context == {
+        "scope": "static_route",
+        "removed": {"route": [list(A)]},
+        "detach": False,
+        "tombstone_ids": [tomb],
+    }
 
 
 async def test_c4_22_ii_delete_origin_with_a_clean_device_is_consumed(adapter_client):

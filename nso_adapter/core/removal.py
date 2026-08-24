@@ -786,9 +786,10 @@ def _sr_triple(key) -> tuple[str, str, str]:
 async def _sr_authorization(db: AsyncSession, device, context: dict, *, job_id: int | None):
     """Return ``(tombstones, authorized, claimed, rows, reclaimed)`` — §4.3's steps 1 and 2.
 
-    ``authorized`` is what this job may drop: its OWN tombstones' ``{triple} ∪ {deployed_key}``
-    (X6; a NULL ``deployed_key`` contributes nothing), or ``context["removed"]["route"]`` when
-    it owns none — minus every key a live intent row still claims. That subtraction is
+    ``authorized`` is what this job may drop: the exact tombstones named by a reissue
+    generation, otherwise its OWN tombstones' ``{triple} ∪ {deployed_key}`` (X6; a NULL
+    ``deployed_key`` contributes nothing), or ``context["removed"]["route"]`` when it has no
+    tombstone carrier — minus every key a live intent row still claims. That subtraction is
     ownership, not eligibility: another route reclaiming the key means the key is no longer
     this deletion's to drop.
     """
@@ -796,7 +797,28 @@ async def _sr_authorization(db: AsyncSession, device, context: dict, *, job_id: 
     from nso_adapter.store.models import StaticRouteIntent, StaticRouteTombstone
 
     tombstones = []
-    if job_id is not None:
+    context_has_tombstones = "tombstone_ids" in context
+    if context_has_tombstones:
+        tombstone_ids = context["tombstone_ids"]
+        if not isinstance(tombstone_ids, list) or not all(
+            isinstance(tombstone_id, int) and not isinstance(tombstone_id, bool) for tombstone_id in tombstone_ids
+        ):
+            raise ValueError("static_route removal context carries invalid tombstone_ids")
+        tombstones = list(
+            (
+                await db.execute(
+                    select(StaticRouteTombstone)
+                    .where(
+                        StaticRouteTombstone.device_id == device.id,
+                        StaticRouteTombstone.id.in_(sorted(set(tombstone_ids))),
+                    )
+                    .order_by(StaticRouteTombstone.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    elif job_id is not None:
         tombstones = list(
             (
                 await db.execute(
@@ -815,7 +837,7 @@ async def _sr_authorization(db: AsyncSession, device, context: dict, *, job_id: 
         deployed = as_triple(tomb.deployed_key)
         if deployed is not None:
             authorized.add(deployed)
-    if not tombstones:
+    if not tombstones and not context_has_tombstones:
         for key in (context.get("removed") or {}).get("route") or []:
             authorized.add(_sr_triple(key))
 

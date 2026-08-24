@@ -179,7 +179,7 @@ async def test_the_reissued_job_runs_with_the_marking_the_tombstone_recorded(ada
 
 async def test_a_failed_sweep_retry_removes_the_tombstone_and_deployed_keys(adapter_client):
     from nso_adapter.core.generation import retry_generation
-    from nso_adapter.store.models import DeploymentGeneration, JobStatus
+    from nso_adapter.store.models import DeploymentGeneration, JobStatus, StaticRouteTombstone
     from tests.core.test_static_route_removal import SrFake, run_removal_job, sr_client, wire
 
     device_name = "sw-m5-retry-divergent"
@@ -203,6 +203,11 @@ async def test_a_failed_sweep_retry_removes_the_tombstone_and_deployed_keys(adap
 
     assert succeeded.status is JobStatus.succeeded
     assert fake.sent_keys() == {C}, "the retry kept a key recorded only as deployed_key"
+    async with session() as db:
+        remaining = (
+            await db.scalars(sa.select(StaticRouteTombstone).where(StaticRouteTombstone.device_id == device_id))
+        ).all()
+    assert remaining == [], "the proven retry left its deletion carrier behind"
 
 
 @pytest.mark.parametrize("status_name", ["queued", "running", "succeeded"])
@@ -223,13 +228,14 @@ async def test_a_live_or_succeeded_owner_is_not_swept(adapter_client, status_nam
 async def test_the_swept_job_context_comes_from_the_tombstone(adapter_client):
     """Q12 — never from ambient request state: the sweeper has no originating request."""
     device_id = await seed_device(nso_device_name="sw-m5-ctx", netbox_device_id=9602)
-    await _seed_tombstone(device_id, B, marking="delete_origin")
+    tombstone_id = await _seed_tombstone(device_id, B, marking="delete_origin")
 
     assert await sweep_tombstones() == 1
 
     context = (await _removal_jobs(device_id))[0]["context"]
     assert context["scope"] == "static_route"
     assert context["removed"] == {"route": [list(B)]}
+    assert context["tombstone_ids"] == [tombstone_id]
     # The flip this guards: with an unset DELETE_ORIGIN ContextVar, a delete-origin
     # retract would silently become a no-networking detach retry.
     assert context["detach"] is False

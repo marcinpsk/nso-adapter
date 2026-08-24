@@ -65,6 +65,7 @@ def _removal_context(row: StaticRouteTombstone) -> dict:
         "scope": "static_route",
         "removed": {"route": [list(key) for key in removed]},
         "detach": row.marking == "detach",
+        "tombstone_ids": [row.id],
     }
 
 
