@@ -207,14 +207,21 @@ async def enqueue_job(
     if winner is not None:
         logger.debug("job.enqueue.race_lost", device_id=device_id, winner_id=winner.id)
         if job_type is JobType.apply and device_id is not None:
-            await _authorize_apply_job(db, device_id, winner)
+            attached = await _authorize_apply_job(db, device_id, winner)
+            if not attached:
+                logger.debug(
+                    "job.enqueue.winner_cannot_carry_generation",
+                    device_id=device_id,
+                    winner_id=winner.id,
+                )
         await db.commit()  # release the winner lock; this helper owns its transaction
         return winner, False
     if created is None:  # pragma: no cover - retries exhausted under sustained contention
         raise RuntimeError(f"could not admit a {job_type} job for device {device_id}")
 
     if job_type is JobType.apply and device_id is not None:
-        await _authorize_apply_job(db, device_id, created)
+        if not await _authorize_apply_job(db, device_id, created):  # pragma: no cover - an empty job always accepts
+            raise RuntimeError(f"new apply job {created.id} refused its first generation")
 
     # This helper owns the outer commit and its API/scheduler callers depend on that:
     # get_db does not auto-commit.
@@ -223,7 +230,7 @@ async def enqueue_job(
     return created, True
 
 
-async def _authorize_apply_job(db: AsyncSession, device_id: int, job: Job) -> None:
+async def _authorize_apply_job(db: AsyncSession, device_id: int, job: Job) -> bool:
     """Give an operator-triggered Apply its deployment generation (#1522 §G1/§H4).
 
     Here rather than in the API handler, and inside the SAME transaction as the job insert:
@@ -246,9 +253,15 @@ async def _authorize_apply_job(db: AsyncSession, device_id: int, job: Job) -> No
     if not streams:
         # Nothing has ever been written for this device: the apply has nothing to deploy, and
         # a generation over an empty document would order a device write that does not exist.
-        return
-    generation = await create_generation(db, device_id, streams=streams, mode=GenerationMode.networked)
-    await attach_to_job(db, generation, job)
+        return True
+    async with db.begin_nested() as authorization:
+        generation = await create_generation(db, device_id, streams=streams, mode=GenerationMode.networked)
+        if not await attach_to_job(db, generation, job):
+            # The action returns 409 naming *job*. If that job cannot carry this generation,
+            # leave the projection unpromoted so the response remains a truthful refusal.
+            await authorization.rollback()
+            return False
+    return True
 
 
 # The provision dedupe index's expressions and predicate, verbatim and defined ONCE: the
