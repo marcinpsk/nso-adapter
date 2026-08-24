@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import traceback
 from http import HTTPStatus
-from typing import Literal
+from typing import Literal, get_args
 
 import structlog
 from fastapi import HTTPException, Request
@@ -28,44 +28,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 logger = structlog.get_logger(__name__)
 
-# Closed set — every member documented in docs/api-contract.md (§ error body).
-# Core codes first, then per-endpoint codes. Tests enforce both directions.
-ERROR_CODES: frozenset[str] = frozenset(
-    {
-        # phase-1/2 core
-        "unauthorized",
-        "not_found",
-        "method_not_allowed",
-        "validation_error",
-        "nso_unreachable",
-        "netbox_unreachable",
-        "conflict",
-        "internal",
-        "not_implemented",
-        "nso_commit_failed",
-        # per-endpoint
-        "ambiguous_device",
-        "bad_request",
-        "community_not_found",
-        "harvest_unsupported_ned",
-        "invalid_entries",
-        "invalid_family",
-        "invalid_name",
-        "invalid_payload",
-        "invalid_vault_ref",
-        "no_ned_id",
-        "no_nso_client",
-        "nso_unavailable",
-        "secrets_write_unsupported",
-        # Receipt admission on a keyed intent push (#1522 §G2): the same X-Push-Seq
-        # re-delivered with a different body, and a sequence older than the admitted one.
-        "sequence_reuse",
-        "stale",
-        "vault_error",
-    }
-)
-
+# Closed set. Every member is documented in docs/api-contract.md (error body).
+# Core codes come first, followed by per-endpoint codes.
 ErrorCode = Literal[
+    # phase-1/2 core
     "unauthorized",
     "not_found",
     "method_not_allowed",
@@ -76,6 +42,7 @@ ErrorCode = Literal[
     "internal",
     "not_implemented",
     "nso_commit_failed",
+    # per-endpoint
     "ambiguous_device",
     "bad_request",
     "community_not_found",
@@ -89,10 +56,15 @@ ErrorCode = Literal[
     "no_nso_client",
     "nso_unavailable",
     "secrets_write_unsupported",
+    # Receipt admission on a keyed intent push (#1522 §G2): the same X-Push-Seq
+    # re-delivered with a different body, and a sequence older than the admitted one.
     "sequence_reuse",
     "stale",
     "vault_error",
 ]
+
+# Derive runtime validation from the OpenAPI/Pydantic enum.
+ERROR_CODES: frozenset[str] = frozenset(get_args(ErrorCode))
 
 
 class ErrorBody(BaseModel):

@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import get_args
 
 import pytest
 from pydantic import BaseModel, field_validator
 
-from nso_adapter.api.errors import ERROR_CODES, api_error
+from nso_adapter.api.errors import ERROR_CODES, ErrorCode, api_error
 from tests.conftest import VALID_TOKEN
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -198,6 +199,10 @@ async def test_framework_http_errors_use_the_canonical_envelope(
 def test_api_error_rejects_unknown_code():
     with pytest.raises(ValueError, match="unknown error code"):
         api_error(400, "definitely_not_a_code", "boom")
+
+
+def test_runtime_error_codes_match_openapi_enum():
+    assert ERROR_CODES == frozenset(get_args(ErrorCode))
 
 
 def test_every_code_roundtrips_envelope():
