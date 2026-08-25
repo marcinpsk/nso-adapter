@@ -371,7 +371,14 @@ async def _sync_keyed_intent(
             row = make_row(entry)
             db.add(row)
         apply_fields(row, entry, accepted)
-        if before is not None and any(is_cleared(before[f], getattr(row, f)) for f in state_fields):
+        if before is not None and any(
+            is_cleared(
+                before[f],
+                getattr(row, f),
+                emission_field=(model.__tablename__, f),
+            )
+            for f in state_fields
+        ):
             cleared = True
         count += 1
     return count, deleted, cleared

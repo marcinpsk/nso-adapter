@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Clearing an owned scalar must reach the device — on EVERY scope, not just IS-IS/OSPF.
+"""Clearing a device-effective owned scalar must reach the device across intent scopes.
 
 A normal apply is a merge-PATCH (``_send_service_config`` picks ``method="patch"`` when
 ``replace=False``), and every writer emits its optional leaves only when they are set
@@ -15,6 +15,10 @@ reconcile then flipped the overlay to ``changed``, and re-clearing did nothing.
 
 These drive the real FastAPI routes through the real PostgreSQL session. No NSO is needed: the
 whole assertion is about which JOB the PUT queues, and with what semantics.
+
+L2 SAP port/tag metadata is excluded. It is informational, key-derived, and ignored by the
+planner, so its omission has no device effect. Its regression lives in
+``test_api_l2_service.py::test_omitting_key_derived_sap_metadata_does_not_retract``.
 
     detach absent  → the replace really networks (a clear is not an un-own: the row stays
                      owned and accepted, only the leaf was blanked)
@@ -72,12 +76,6 @@ _CASES = [
         "logging-intent",
         {"hosts": [{"address": "10.9.1.1", "severity": "warning", "port": 514}]},
         {"hosts": [{"address": "10.9.1.1"}]},  # severity -> "" (NOT NULL default), port -> None
-    ),
-    (
-        "l2_sap",
-        "l2-sap-intent",
-        {"saps": [{"service_name": "EPIPE-1", "service_type": "epipe", "sap_id": "1/1/1", "outer_tag": 100}]},
-        {"saps": [{"service_name": "EPIPE-1", "service_type": "epipe", "sap_id": "1/1/1"}]},
     ),
     (
         "vlan",

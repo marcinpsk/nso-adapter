@@ -1889,6 +1889,29 @@ def test_is_cleared(before, after, expected):
 
 
 @pytest.mark.parametrize(
+    "emission_field",
+    [
+        ("isis_interface_intent", "bfd_enabled"),
+        ("isis_interface_intent", "frr_enabled"),
+        ("isis_process_intent", "overload_bit"),
+        ("isis_process_intent", "microloop_avoidance"),
+        ("isis_level_intent", "wide_metrics_only"),
+        ("isis_level_intent", "disabled"),
+    ],
+)
+def test_false_to_none_is_a_clear_for_explicit_false_isis_fields(emission_field):
+    from nso_adapter.core.removal import is_cleared
+
+    assert is_cleared(False, None, emission_field=emission_field) is True
+
+
+def test_false_to_none_stays_an_update_for_ospf_enabled():
+    from nso_adapter.core.removal import is_cleared
+
+    assert is_cleared(False, None, emission_field=("ospf_instance_intent", "enabled")) is False
+
+
+@pytest.mark.parametrize(
     ("before", "after", "expected"),
     [
         # keyed list entries: a dropped term is not deletable by a merge

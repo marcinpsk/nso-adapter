@@ -25,7 +25,7 @@ from functools import cache
 from typing import NamedTuple
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, JobError, error_envelope
@@ -222,7 +222,19 @@ def _guard_specs() -> dict[str, _GuardSpec]:
     }
 
 
-def is_cleared(before, after) -> bool:
+_EXPLICIT_FALSE_EMISSION_FIELDS = frozenset(
+    {
+        ("isis_interface_intent", "bfd_enabled"),
+        ("isis_interface_intent", "frr_enabled"),
+        ("isis_process_intent", "overload_bit"),
+        ("isis_process_intent", "microloop_avoidance"),
+        ("isis_level_intent", "wide_metrics_only"),
+        ("isis_level_intent", "disabled"),
+    }
+)
+
+
+def is_cleared(before, after, *, emission_field: tuple[str, str] | None = None) -> bool:
     """Whether an owned scalar went from SET to UNSET — the #83 retract trigger.
 
     A merge-PATCH apply never drops a leaf the writer omits, so a value that goes back to
@@ -236,13 +248,15 @@ def is_cleared(before, after) -> bool:
       writers emit these only when truthy (``if row.vrf:``), so an empty string is just as
       undroppable as a None.
 
-    A boolean flipping ``True -> False`` is NOT a clear: the writers emit ``False``
-    explicitly (isis ``microloop-avoidance: false``), so the merge-PATCH does carry it and
-    no retract is needed. Treating it as one would fire a real device PUT-replace on every
-    toggle-off.
+    A boolean flipping ``True -> False`` is NOT a clear. The audited IS-IS tri-state
+    fields in ``_EXPLICIT_FALSE_EMISSION_FIELDS`` emit both boolean values and omit only
+    ``None``, so ``False -> None`` is a clear for those fields. Other callers keep the
+    general rule that a prior ``False`` is unset.
     """
-    if before is None or before is False or before == "":
+    if before is None or before == "":
         return False  # was already unset — nothing to retract
+    if before is False:
+        return after is None and emission_field in _EXPLICIT_FALSE_EMISSION_FIELDS
     if after is None:
         return True
     if isinstance(before, str) and isinstance(after, str):
@@ -1641,6 +1655,170 @@ async def _dispatch_scope(
     return None
 
 
+async def _record_pending_clears(
+    db: AsyncSession,
+    device_id: int,
+    streams: tuple[str, ...],
+    *,
+    provenance: str,
+) -> None:
+    """Record pending clears without weakening an existing authorization."""
+    from nso_adapter.store.models import DeviceProjectionStream, StreamPendingClear
+
+    for stream in sorted(set(streams)):
+        revision = await db.scalar(
+            select(DeviceProjectionStream.desired_revision).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == stream,
+            )
+        )
+        if revision is None:
+            raise RuntimeError(f"device {device_id} stream {stream!r} has no accepted write to record")
+        pending_rows = list(
+            (
+                await db.execute(
+                    select(StreamPendingClear).where(
+                        StreamPendingClear.device_id == device_id,
+                        StreamPendingClear.stream == stream,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        authorized = next((row for row in pending_rows if row.provenance == "authorized"), None)
+        store_only = next((row for row in pending_rows if row.provenance == "store_only"), None)
+
+        if provenance == "store_only":
+            if authorized is not None:
+                if store_only is not None:
+                    await db.delete(store_only)
+                continue
+            if store_only is None:
+                db.add(
+                    StreamPendingClear(
+                        device_id=device_id,
+                        stream=stream,
+                        provenance="store_only",
+                        revision=revision,
+                    )
+                )
+            else:
+                store_only.revision = max(store_only.revision, revision)
+            continue
+
+        previous_revision = max((row.revision for row in pending_rows), default=revision)
+        previous_since = min((row.recorded_at for row in pending_rows), default=None)
+        if store_only is not None:
+            await db.delete(store_only)
+        if authorized is None:
+            authorized = StreamPendingClear(
+                device_id=device_id,
+                stream=stream,
+                provenance="authorized",
+                revision=max(revision, previous_revision),
+            )
+            if previous_since is not None:
+                authorized.recorded_at = previous_since
+            db.add(authorized)
+        else:
+            authorized.revision = max(revision, previous_revision)
+    await db.flush()
+
+
+async def _promote_parked_clears(
+    db: AsyncSession,
+    device_id: int,
+    streams: tuple[str, ...],
+) -> None:
+    """Authorize parked rows for streams this authorized push re-asserts; never create."""
+    from nso_adapter.store.models import DeviceProjectionStream, StreamPendingClear
+
+    for stream in sorted(set(streams)):
+        rows = list(
+            (
+                await db.execute(
+                    select(StreamPendingClear).where(
+                        StreamPendingClear.device_id == device_id,
+                        StreamPendingClear.stream == stream,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not rows:
+            continue
+        revision = await db.scalar(
+            select(DeviceProjectionStream.desired_revision).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == stream,
+            )
+        )
+        top = max((row.revision for row in rows), default=0)
+        if revision is not None:
+            top = max(top, revision)
+        authorized = next((row for row in rows if row.provenance == "authorized"), None)
+        store_only = next((row for row in rows if row.provenance == "store_only"), None)
+        if authorized is None:
+            store_only.provenance = "authorized"
+            store_only.revision = top
+        else:
+            authorized.revision = top
+            if store_only is not None:
+                await db.delete(store_only)
+    await db.flush()
+
+
+async def _settle_pending_clears_at_admission(
+    db: AsyncSession,
+    device_id: int,
+    scope: str,
+    promotes: tuple[str, ...],
+    *,
+    mode,
+    force: bool,
+) -> None:
+    """Settle stream obligations for the carrier this admission created.
+
+    Keyed off the admitted carrier's MODE, not the request's retract: a networked
+    replace of the stream delivers every recorded omission (discharge); a detach
+    re-asserts the omitting store state and authorizes a parked row (promote).
+    """
+    from nso_adapter.store.models import GenerationMode
+
+    if force:
+        await _discharge_pending_clears(db, device_id, scope)
+    elif scope != "static_route":
+        if mode is GenerationMode.networked:
+            await _discharge_pending_clear_streams(db, device_id, promotes)
+        else:
+            await _promote_parked_clears(db, device_id, promotes)
+
+
+async def _discharge_pending_clear_streams(
+    db: AsyncSession,
+    device_id: int,
+    streams: tuple[str, ...],
+) -> None:
+    """Delete obligations whose clears have gained a networked carrier."""
+    from nso_adapter.store.models import StreamPendingClear
+
+    await db.execute(
+        delete(StreamPendingClear).where(
+            StreamPendingClear.device_id == device_id,
+            StreamPendingClear.stream.in_(streams),
+        )
+    )
+
+
+async def _discharge_pending_clears(db: AsyncSession, device_id: int, scope: str) -> None:
+    """Discharge every stream the operator's force-removal flush affects."""
+    from nso_adapter.core.projection import section_streams
+
+    await _discharge_pending_clear_streams(db, device_id, section_streams(scope))
+
+
 async def enqueue_removal(
     db: AsyncSession,
     device_id: int,
@@ -1719,9 +1897,7 @@ async def enqueue_removal(
         raise ValueError(f"Unknown removal marking {marking!r}")
     if force and marking is not None:
         raise ValueError(f"a force-removal of {scope!r} carries no deletion marking; got {marking!r}")
-    if STORE_ONLY.get() and not force:
-        logger.info("removal.skipped_store_only", device_id=device_id, scope=scope)
-        return None
+    store_only = STORE_ONLY.get()
     context: dict = {"scope": scope}
     if interfaces:
         context["interfaces"] = interfaces
@@ -1749,6 +1925,18 @@ async def enqueue_removal(
     if retract and defer_retract:
         context["retract_deferred"] = True
         logger.warning("removal.retract_deferred", device_id=device_id, scope=scope)
+    # Record only when this admission gives the clear no networked carrier. A pure clear
+    # gets a networked job below and needs no durable pending-clear row.
+    if retract and scope != "static_route" and (defer_retract or store_only):
+        await _record_pending_clears(
+            db,
+            device_id,
+            promotes,
+            provenance="store_only" if store_only else "authorized",
+        )
+    if store_only and not force:
+        logger.info("removal.skipped_store_only", device_id=device_id, scope=scope)
+        return None
     if force:
         context["force"] = True
     elif marking == DETACH_MARKING and not (retract and not deletes):
@@ -1786,6 +1974,7 @@ async def enqueue_removal(
     db.add(job)
     await db.flush()
     await attach_to_job(db, generation, job)
+    await _settle_pending_clears_at_admission(db, device_id, scope, promotes, mode=mode, force=force)
     logger.info("removal.enqueued", device_id=device_id, scope=scope, job_id=job.id, marking=marking)
     return job
 

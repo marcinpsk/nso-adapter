@@ -554,6 +554,26 @@ class DeviceProjectionStream(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
 
+class StreamPendingClear(Base):
+    """A stream whose unset intent is not yet known to have reached the device."""
+
+    __tablename__ = "stream_pending_clear"
+    __table_args__ = (
+        UniqueConstraint("device_id", "stream", "provenance", name="uq_stream_pending_clear"),
+        CheckConstraint(
+            "provenance IN ('authorized', 'store_only')",
+            name="ck_stream_pending_clear_provenance",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False)
+    stream: Mapped[str] = mapped_column(Text, nullable=False)
+    provenance: Mapped[str] = mapped_column(Text, nullable=False)
+    revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
+
+
 class IntentPushReceipt(Base):
     """The last admitted keyed push per (device, section) — the replay boundary (#1522 §G2).
 

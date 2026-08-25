@@ -194,6 +194,37 @@ async def test_clearing_an_owned_ospf_instance_scalar_retracts(adapter_client):
     assert jobs[0].context.get("detach") is None
 
 
+async def test_ospf_enabled_false_to_none_is_an_update_not_a_clear(adapter_client):
+    """The writer maps None to explicit enabled=true, so no replace is needed."""
+    from nso_adapter.store.models import StreamPendingClear
+
+    device_id = await seed_device(nso_device_name="ospf-enabled-update", netbox_device_id=934)
+    url = f"/api/v1/devices/{device_id}/ospf-intent"
+    assert (
+        await adapter_client.put(
+            url,
+            headers=AUTH | push_seq(),
+            json={"instances": [{"process_id": "1", "enabled": False, "areas": []}], "interfaces": []},
+        )
+    ).status_code == 200
+    assert (
+        await adapter_client.put(
+            url,
+            headers=AUTH | push_seq(),
+            json={"instances": [{"process_id": "1", "areas": []}], "interfaces": []},
+        )
+    ).status_code == 200
+
+    assert await _ospf_removal_jobs(device_id) == []
+    async with session() as db:
+        pending = (
+            (await db.execute(select(StreamPendingClear).where(StreamPendingClear.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+    assert pending == []
+
+
 async def test_ospf_unown_riding_along_with_a_clear_defers_the_retract(adapter_client):
     """An un-own in the same push cannot be networked (it would strip the dropped process off
     the device) — safety wins, and the deferred retract is recorded, not silently dropped."""

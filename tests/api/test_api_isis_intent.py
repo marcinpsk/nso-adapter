@@ -540,6 +540,75 @@ async def test_clearing_bfd_enabled_enqueues_isis_removal(adapter_client):
     assert len(await _isis_removal_jobs(device_id)) == 1
 
 
+@pytest.mark.anyio
+async def test_clearing_explicit_false_bfd_enabled_retracts_for_real(adapter_client):
+    """False is emitted device state for this tri-state field, not an unset value."""
+    from nso_adapter.store.models import StreamPendingClear
+
+    device_id = await seed_device(nso_device_name="isis-bfd-false-clear", netbox_device_id=998)
+    url = f"/api/v1/devices/{device_id}/isis-interface-intent"
+    assert (
+        await adapter_client.put(
+            url,
+            headers=AUTH | push_seq(),
+            json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4", "bfd_enabled": False}]},
+        )
+    ).status_code == 200
+    response = await adapter_client.put(
+        url,
+        headers=AUTH | push_seq(),
+        json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4"}]},
+    )
+    assert response.status_code == 200
+
+    jobs = await _isis_removal_jobs(device_id)
+    assert len(jobs) == 1
+    assert jobs[0].context.get("detach") is None
+    async with session() as db:
+        pending = (
+            (await db.execute(select(StreamPendingClear).where(StreamPendingClear.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+    assert pending == []
+
+
+@pytest.mark.anyio
+async def test_mixed_false_bfd_clear_and_unown_records_the_isis_stream(adapter_client):
+    """A detach cannot carry the False-to-None clear, so the obligation is durable."""
+    from nso_adapter.store.models import StreamPendingClear
+
+    device_id = await seed_device(nso_device_name="isis-bfd-false-mixed", netbox_device_id=999)
+    url = f"/api/v1/devices/{device_id}/isis-interface-intent"
+    assert (
+        await adapter_client.put(
+            url,
+            headers=AUTH | push_seq(),
+            json={
+                "interfaces": [
+                    {"interface_name": "Gi0/0", "af": "ipv4", "bfd_enabled": False},
+                    {"interface_name": "Gi0/1", "af": "ipv4", "metric": 20},
+                ]
+            },
+        )
+    ).status_code == 200
+    assert (
+        await adapter_client.put(
+            url,
+            headers=AUTH | push_seq(),
+            json={"interfaces": [{"interface_name": "Gi0/0", "af": "ipv4"}]},
+        )
+    ).status_code == 200
+
+    jobs = await _isis_removal_jobs(device_id)
+    assert len(jobs) == 1
+    assert jobs[0].context["detach"] is True
+    assert jobs[0].context["retract_deferred"] is True
+    async with session() as db:
+        row = await db.scalar(select(StreamPendingClear).where(StreamPendingClear.device_id == device_id))
+    assert (row.stream, row.provenance, row.revision) == ("isis", "authorized", 2)
+
+
 # ── #83 (retract cleared owned scalars) vs #106 (un-own detaches) ────────────
 #
 # Both produce an "isis" removal job, but they are DIFFERENT operations and the

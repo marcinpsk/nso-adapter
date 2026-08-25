@@ -505,12 +505,20 @@ their parent and skipped.
   "scopes": {
     "static_route_intent":  { "count": 4, "applied": 4, "failed": 0 },
     "vlan_intent":          { "count": 12, "applied": 0, "failed": 0 }
+  },
+  "pending_clear": {
+    "ospf": { "provenance": "authorized", "since": "2026-08-25T10:30:00Z" }
   } }
 ```
 
 - `count` — intent rows the adapter holds for this device.
-- `applied` — rows with a non-null `last_apply_at`.
+- `applied`: rows with a non-null `last_apply_at`. This counts timestamps. It is not proof
+  that the current intent is on the device.
 - `failed` — rows with a non-null `last_apply_error`.
+- `pending_clear`: streams with a recorded clear that has no admitted networked carrier.
+  The field is absent when no row exists. Each value reports only its provenance and the
+  time the obligation was first recorded. It never reports leaf names or paths. A listed
+  stream can still hold a device leaf that the intent store says is unset.
 
 Cheap by design (one count query per table): the plugin calls it on every
 device-tab render to detect intent split-brain (next section).
@@ -2033,6 +2041,30 @@ from the intent store would otherwise leave the config orphaned on the device. T
 revert it, the owning `*-reconciler` service instance is **PUT-replaced** with the
 full remaining accepted state, which lets NSO FASTMAP delete the dropped entries.
 
+The same rule applies to a device-effective scalar that changes from emitted state to
+omitted state. A clear with no un-own gets a networked removal job, so that admission
+discharges any pending-clear row for the promoted stream. If an un-own rides with the
+clear, the existing detach job still admits and the clear is deferred. The adapter then
+records one `stream_pending_clear` row for each promoted stream at its current desired
+revision. Static routes use their own per-route pending-clear mechanism and never use this
+table. L2 SAP `port`, `outer_tag`, and `inner_tag` are informational and key-derived, so
+omitting them is not a device-effective clear.
+
+The recording provenance comes from the request mode. An ordinary deferred clear records
+`authorized`. A clear detected under `?store_only=true` records `store_only`, creates no
+job, and creates no deployment generation. A later authorized recording for the same
+stream replaces its store-only row and keeps the highest revision. A later store-only push
+never demotes or advances an authorized row. A parked row can leave store-only provenance
+only when a later authorized push of the same stream reaches the removal choke. The
+Apply-action promotion-release hook is follow-on work above this branch, so this core does
+not release a parked row from an unrelated Apply.
+Recording is per stream, not per document section. An `isis` push cannot create or promote
+an `isis_flex_algo` row.
+
+`POST /api/v1/devices/{id}/actions/force-removal` is the operator discharge. When its
+promotion-free removal job admits, it deletes the device's pending-clear rows for every
+stream in the affected section in the same transaction. It records no new row.
+
 That PUT-replace is a synchronous device commit that can exceed the plugin's HTTP
 client timeout (~30s). So it does **not** run inline in the intent PUT: when an
 intent PUT drops one or more rows it enqueues a **`removal`** job (a new
@@ -2041,8 +2073,9 @@ A worker runs the job in the background, re-reading the **current** accepted row
 and PUT-replacing the service — so the job is idempotent and is requeued (not
 failed) after a worker restart. Scope is carried in `Job.context.scope` (one of
 `route_policy · bfd · svi · subinterface · static_route · interface_mtu · vlan ·
-logging · l2_sap · ospf · bgp`). Job status is observable via `GET …/jobs` like
-any other job; a failed removal records `error.code = "removal_failed"`.
+logging · l2_sap · ospf · bgp · isis · interface_config · snmp`). Job status is
+observable via `GET …/jobs` like any other job; a failed removal records
+`error.code = "removal_failed"`.
 
 `static_route` is the one scope that does **not** rebuild its body from the remaining accepted
 rows — it drops exactly what it is authorized to drop and keeps the rest of the live service

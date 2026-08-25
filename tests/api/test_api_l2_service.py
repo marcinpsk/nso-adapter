@@ -143,3 +143,61 @@ async def test_put_l2_sap_intent_unknown_device_404(adapter_client):
 async def test_put_l2_sap_intent_requires_auth(adapter_client):
     resp = await adapter_client.put("/api/v1/devices/1/l2-sap-intent", json={"saps": []})
     assert resp.status_code == 401
+
+
+async def test_omitting_key_derived_sap_metadata_does_not_retract(adapter_client):
+    """The informational SAP trio has no device-effective clear."""
+    from sqlalchemy import func, select
+
+    from nso_adapter.store.models import Job, JobType, StreamPendingClear
+
+    device_id = await seed_device(nso_device_name="l2-informational-clear", netbox_device_id=882)
+    url = f"/api/v1/devices/{device_id}/l2-sap-intent"
+    assert (
+        await adapter_client.put(
+            url,
+            headers=AUTH | push_seq(),
+            json={
+                "saps": [
+                    {
+                        "service_name": "svc-1",
+                        "service_type": "epipe",
+                        "sap_id": "lag-60:3999.10",
+                        "port": "lag-60",
+                        "outer_tag": 3999,
+                        "inner_tag": 10,
+                    }
+                ]
+            },
+        )
+    ).status_code == 200
+    response = await adapter_client.put(
+        url,
+        headers=AUTH | push_seq(),
+        json={
+            "saps": [
+                {
+                    "service_name": "svc-1",
+                    "service_type": "epipe",
+                    "sap_id": "lag-60:3999.10",
+                }
+            ]
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["replaced"] is False
+
+    async with session() as db:
+        jobs = await db.scalar(
+            select(func.count())
+            .select_from(Job)
+            .where(
+                Job.device_id == device_id,
+                Job.job_type == JobType.removal,
+            )
+        )
+        carriers = await db.scalar(
+            select(func.count()).select_from(StreamPendingClear).where(StreamPendingClear.device_id == device_id)
+        )
+    assert jobs == 0
+    assert carriers == 0

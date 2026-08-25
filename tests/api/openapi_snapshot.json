@@ -2595,11 +2595,18 @@
         "type": "object"
       },
       "IntentSummaryOut": {
-        "description": "GET /intent-summary \u2014 a {scope_name: {count, applied, failed}} map, non-empty scopes only.",
+        "description": "GET /intent-summary with owned-intent counts and unresolved stream clears.",
         "properties": {
           "device_id": {
             "title": "Device Id",
             "type": "integer"
+          },
+          "pending_clear": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/PendingClearSummary"
+            },
+            "title": "Pending Clear",
+            "type": "object"
           },
           "scopes": {
             "additionalProperties": {
@@ -2611,7 +2618,8 @@
         },
         "required": [
           "device_id",
-          "scopes"
+          "scopes",
+          "pending_clear"
         ],
         "title": "IntentSummaryOut",
         "type": "object"
@@ -5966,6 +5974,30 @@
           "auth_present"
         ],
         "title": "OspfInterfaceOut",
+        "type": "object"
+      },
+      "PendingClearSummary": {
+        "description": "A stream with a clear that has no admitted networked carrier.",
+        "properties": {
+          "provenance": {
+            "enum": [
+              "authorized",
+              "store_only"
+            ],
+            "title": "Provenance",
+            "type": "string"
+          },
+          "since": {
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$",
+            "title": "Since",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provenance",
+          "since"
+        ],
+        "title": "PendingClearSummary",
         "type": "object"
       },
       "PreflightRequest": {
