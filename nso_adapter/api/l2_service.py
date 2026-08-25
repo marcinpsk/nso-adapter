@@ -196,7 +196,7 @@ async def put_l2_sap_intent(
         db,
         device_id,
         mutation_count=count,
-        removal_generation_count=int(bool(removed or cleared)),
+        removal_generation_count=int(bool(removed)),
     )
 
     replaced = False
