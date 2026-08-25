@@ -54,6 +54,7 @@ from contextvars import ContextVar
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import NamedTuple
+from uuid import UUID
 
 import structlog
 from sqlalchemy import select
@@ -606,6 +607,7 @@ async def _enqueue_action_removal_links(
     device_id: int,
     links: list[_RemovalLink],
     *,
+    apply_attempt_id: UUID,
     cohort: int | None,
     intermediate_document: dict,
     final_document: dict,
@@ -653,6 +655,7 @@ async def _enqueue_action_removal_links(
             retract=bool(link.replacement),
             shrank=bool(link.removed),
             document=intermediate_document if link.mode is GenerationMode.networked else final_document,
+            apply_attempt_id=apply_attempt_id,
         )
         generation = await db.scalar(
             select(DeploymentGeneration).where(DeploymentGeneration.job_id == job.id).order_by(DeploymentGeneration.seq)
@@ -668,6 +671,7 @@ async def _enqueue_action_apply_job(
     device_id: int,
     streams: set[str],
     *,
+    apply_attempt_id: UUID,
     document: dict,
     cohort: int | None,
 ) -> DeploymentGeneration:
@@ -680,6 +684,7 @@ async def _enqueue_action_apply_job(
         mode=GenerationMode.networked,
         document=document,
         settlement_cohort=cohort,
+        apply_attempt_id=apply_attempt_id,
     )
     created, winner = await admit_coalescible_job(db, device_id, JobType.apply)
     if winner is not None:
@@ -694,6 +699,7 @@ async def create_action_apply(
     db: AsyncSession,
     device_id: int,
     selected: dict[str, int],
+    apply_attempt_id: UUID,
 ) -> ActionApplyResult:
     """Promote selected streams and compose removal work with the established runners."""
     from nso_adapter.core.receipt import consume_promotion_provenance
@@ -746,6 +752,7 @@ async def create_action_apply(
         db,
         device_id,
         networked_links,
+        apply_attempt_id=apply_attempt_id,
         cohort=cohort,
         intermediate_document=intermediate_document,
         final_document=final_document,
@@ -756,6 +763,7 @@ async def create_action_apply(
             db,
             device_id,
             apply_streams,
+            apply_attempt_id=apply_attempt_id,
             document=intermediate_document,
             cohort=cohort,
         )
@@ -766,6 +774,7 @@ async def create_action_apply(
             db,
             device_id,
             detach_links,
+            apply_attempt_id=apply_attempt_id,
             cohort=cohort,
             intermediate_document=intermediate_document,
             final_document=final_document,
@@ -789,6 +798,7 @@ async def create_generation(
     removal_context: dict | None = None,
     settlement_cohort: int | None = None,
     static_route_tombstone_ids: tuple[int, ...] = (),
+    apply_attempt_id: UUID | None = None,
 ) -> DeploymentGeneration:
     """Promote *streams* and store the immutable generation they authorize. Caller commits.
 
@@ -850,6 +860,7 @@ async def create_generation(
         removal_context=removal_context,
         settlement_cohort=settlement_cohort,
         static_route_tombstone_ids=static_route_tombstone_ids,
+        apply_attempt_id=apply_attempt_id,
     )
 
 
@@ -865,6 +876,7 @@ async def _store_generation(
     removal_context: dict | None,
     settlement_cohort: int | None,
     static_route_tombstone_ids: tuple[int, ...],
+    apply_attempt_id: UUID | None,
 ) -> DeploymentGeneration:
     """Allocate the sequence and write the immutable row. The projection lock is held."""
     body = deepcopy(document)
@@ -924,6 +936,7 @@ async def _store_generation(
         stream_revisions=stream_revisions,
         removal_context=removal_context,
         settlement_cohort=settlement_cohort,
+        apply_attempt_id=apply_attempt_id,
     )
     db.add(generation)
     await db.flush()
@@ -989,6 +1002,7 @@ async def create_reissue_generation(
         removal_context=removal_context,
         settlement_cohort=None,
         static_route_tombstone_ids=(),
+        apply_attempt_id=None,
     )
 
 

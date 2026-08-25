@@ -8,6 +8,7 @@ import asyncio
 import re
 import time
 from types import SimpleNamespace
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -82,10 +83,10 @@ async def _put_svis(client, device_id: int, vlan_ids: list[int], *, seq: int, qu
     )
 
 
-async def _apply(client, device_id: int, selected: dict[str, int]):
+async def _apply(client, device_id: int, selected: dict[str, int], *, attempt_id=None):
     return await client.post(
         f"/api/v1/devices/{device_id}/actions/apply",
-        json={"selected": selected},
+        json={"apply_attempt_id": str(attempt_id or uuid4()), "selected": selected},
         headers=AUTH,
     )
 
@@ -1162,7 +1163,7 @@ async def test_action_apply_rolls_back_promotion_when_generation_flush_fails(ada
 
     async with session() as db:
         with pytest.raises(IntegrityError):
-            await create_action_apply(db, device_id, {"vlan": 4201})
+            await create_action_apply(db, device_id, {"vlan": 4201}, uuid4())
         await db.rollback()
 
     assert (await _stream(device_id, "vlan")).authorized_revision == 0
@@ -2026,6 +2027,7 @@ async def test_promoted_static_route_detach_fails_when_proof_is_inconclusive(ada
         _RemovalLink,
     )
     from nso_adapter.core.projection import snapshot_stream
+    from nso_adapter.store.apply_attempt_store import begin_apply_attempt, complete_apply_attempt
     from nso_adapter.store.models import DeviceProjectionStream, GenerationMode, GenerationStatus, JobStatus
     from tests.core.test_static_route_put import wire
     from tests.core.test_static_route_removal import SrFake, run_removal_job, sr_client
@@ -2046,6 +2048,8 @@ async def test_promoted_static_route_detach_fails_when_proof_is_inconclusive(ada
         )
         desired = await snapshot_stream(db, device_id, "static_route")
         document = await _compose_authorized_document(db, device_id, {"static_route": desired})
+        attempt_id = uuid4()
+        assert await begin_apply_attempt(db, attempt_id, device_id, {"static_route": 5602}) is None
         (generation,) = await _enqueue_action_removal_links(
             db,
             device_id,
@@ -2057,9 +2061,17 @@ async def test_promoted_static_route_detach_fails_when_proof_is_inconclusive(ada
                     {},
                 )
             ],
+            apply_attempt_id=attempt_id,
             cohort=None,
             intermediate_document=document,
             final_document=document,
+        )
+        await complete_apply_attempt(
+            db,
+            attempt_id,
+            admission_state="admitted",
+            http_status=202,
+            response={"generations": [{"generation_id": generation.id}]},
         )
         await db.commit()
 

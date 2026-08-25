@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -772,7 +773,7 @@ async def test_f6_a_manual_apply_creates_a_generation_from_authorized_state(adap
     selected_seq = (await stream_row(device_id, "vlan")).source_push_seq
     resp = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/apply",
-        json={"selected": {"vlan": selected_seq}},
+        json={"apply_attempt_id": str(uuid4()), "selected": {"vlan": selected_seq}},
         headers=AUTH,
     )
     assert resp.status_code == 202

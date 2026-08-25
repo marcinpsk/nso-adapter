@@ -297,7 +297,8 @@ RESP_409_APPLY_CONFLICT: ResponseSpec = {
     409: {
         **_ENVELOPE_SCHEMA,
         "description": (
-            "A job is already queued or running for this device, or a selected stream cannot be applied faithfully"
+            "The Apply UUID identifies a different request, a job is already queued or running, "
+            "or a selected stream cannot be applied faithfully"
         ),
     }
 }

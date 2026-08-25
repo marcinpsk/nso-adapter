@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 from contextlib import asynccontextmanager
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 import sqlalchemy as sa
@@ -690,7 +691,7 @@ async def test_an_abandoned_removal_revision_cannot_be_repromoted_as_a_plain_app
     selected = (await _stream(device_id, "vlan")).source_push_seq
     first_apply = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/apply",
-        json={"selected": {"vlan": selected}},
+        json={"apply_attempt_id": str(uuid4()), "selected": {"vlan": selected}},
         headers=_AUTH,
     )
     assert first_apply.status_code == 202
@@ -706,7 +707,7 @@ async def test_an_abandoned_removal_revision_cannot_be_repromoted_as_a_plain_app
 
     apply = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/apply",
-        json={"selected": {"vlan": selected}},
+        json={"apply_attempt_id": str(uuid4()), "selected": {"vlan": selected}},
         headers=_AUTH,
     )
     assert apply.status_code == 200
@@ -2228,7 +2229,7 @@ async def test_manual_apply_ignores_an_unselected_section_committed_alongside_it
         applying = asyncio.create_task(
             adapter_client.post(
                 f"/api/v1/devices/{device_id}/actions/apply",
-                json={"selected": {"vlan": selected}},
+                json={"apply_attempt_id": str(uuid4()), "selected": {"vlan": selected}},
                 headers=_AUTH,
             )
         )

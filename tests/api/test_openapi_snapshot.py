@@ -104,6 +104,18 @@ def test_action_apply_requires_skipped_detail(openapi_schema):
     assert {"type": "null"} in schema["properties"]["skipped_detail"]["anyOf"]
 
 
+def test_action_apply_requires_an_attempt_id(openapi_schema):
+    schema = openapi_schema["components"]["schemas"]["ActionApplyIn"]
+
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["apply_attempt_id", "selected"]
+    assert schema["properties"]["apply_attempt_id"] == {
+        "format": "uuid",
+        "title": "Apply Attempt Id",
+        "type": "string",
+    }
+
+
 def test_api_contract_documents_the_generation_action_cas():
     contract = (SNAPSHOT_PATH.parents[2] / "docs" / "api-contract.md").read_text()
     actions_table = contract.split("### Execution and admission", maxsplit=1)[1].split(
@@ -139,6 +151,22 @@ def test_api_contract_documents_the_skipped_detail_null_shape():
     assert "only its CONTENT is conditional" in section
     assert "The value is\n`null` when no member qualifies" in section
     assert '"skipped_detail": null' in section
+
+
+def test_api_contract_documents_apply_attempt_identity_and_recovery():
+    contract = (SNAPSHOT_PATH.parents[2] / "docs" / "api-contract.md").read_text()
+    section = contract.split("### `POST /api/v1/devices/{id}/actions/apply`", maxsplit=1)[1].split(
+        "\n### ", maxsplit=1
+    )[0]
+    section = " ".join(section.split())
+
+    assert '"apply_attempt_id": "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8"' in section
+    assert "`apply_attempt_id` is required" in section
+    assert "same device and complete canonical `selected`" in section
+    assert "stored HTTP status and response body byte for byte" in section
+    assert "`error.detail.mismatch` is `device_id` or `selected`" in section
+    assert "re-POST the identical request with the same UUID and selection" in section
+    assert "No revision field is accepted" in section
 
 
 def test_no_disambiguation_qualified_component_names(openapi_schema):
@@ -203,7 +231,8 @@ def test_action_conflict_descriptions_match_their_admission_rules(openapi_schema
 
     apply = openapi_schema["paths"]["/api/v1/devices/{device_id}/actions/apply"]["post"]
     assert apply["responses"]["409"]["description"] == (
-        "A job is already queued or running for this device, or a selected stream cannot be applied faithfully"
+        "The Apply UUID identifies a different request, a job is already queued or running, "
+        "or a selected stream cannot be applied faithfully"
     )
 
 

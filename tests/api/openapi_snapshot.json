@@ -62,8 +62,14 @@
         "type": "object"
       },
       "ActionApplyIn": {
+        "additionalProperties": false,
         "description": "The exact push sequences this manual Apply is allowed to promote.",
         "properties": {
+          "apply_attempt_id": {
+            "format": "uuid",
+            "title": "Apply Attempt Id",
+            "type": "string"
+          },
           "selected": {
             "additionalProperties": {
               "maximum": 9223372036854775807,
@@ -75,6 +81,7 @@
           }
         },
         "required": [
+          "apply_attempt_id",
           "selected"
         ],
         "title": "ActionApplyIn",
@@ -9983,7 +9990,7 @@
                 }
               }
             },
-            "description": "A job is already queued or running for this device, or a selected stream cannot be applied faithfully"
+            "description": "The Apply UUID identifies a different request, a job is already queued or running, or a selected stream cannot be applied faithfully"
           },
           "422": {
             "content": {

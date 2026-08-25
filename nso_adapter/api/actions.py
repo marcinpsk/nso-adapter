@@ -8,10 +8,12 @@ and running jobs after it finds promotable work, and barrier actions ignore unre
 
 from __future__ import annotations
 
+import json
 from typing import Annotated, Literal
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
@@ -59,17 +61,21 @@ class ApplyDiffOut(BaseModel):
 class ActionApplyIn(BaseModel):
     """The exact push sequences this manual Apply is allowed to promote."""
 
+    model_config = ConfigDict(extra="forbid")
+
+    apply_attempt_id: UUID
     selected: dict[str, SelectedPushSequence]
 
     @field_validator("selected")
     @classmethod
     def _validate_selected(cls, selected: dict[str, int]) -> dict[str, int]:
         from nso_adapter.core.projection import projection_streams
+        from nso_adapter.store.apply_attempt_store import canonical_selected
 
         unknown = set(selected) - projection_streams()
         if unknown:
             raise ValueError(f"unknown projection streams: {sorted(unknown)}")
-        return dict(sorted(selected.items()))
+        return canonical_selected(selected)
 
 
 class ActionApplyGenerationOut(BaseModel):
@@ -106,6 +112,12 @@ class ActionApplyOut(BaseModel):
     ]
     skipped_detail: dict[str, ActionApplySkippedDetailOut] | None
     generations: list[ActionApplyGenerationOut]
+
+
+def _apply_http_response(status_code: int, body: dict) -> Response:
+    """Serialize first delivery and replay with one byte-stable representation."""
+    content = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return Response(content=content, status_code=status_code, media_type="application/json")
 
 
 async def _trigger(
@@ -288,41 +300,94 @@ async def sync_notify(
 async def action_apply(
     device_id: int,
     body: ActionApplyIn,
-    response: Response,
     db: AsyncSession = Depends(get_db),
 ):
     """Promote selected pushes.
 
     Check queued and running jobs only when the selection contains promotable work.
     """
-    from nso_adapter.core.generation import ApplyJobConflict, ApplyUnexecutable, create_action_apply
+    from nso_adapter.core.generation import ApplyJobConflict, ApplyUnexecutable, create_action_apply, lock_projection
     from nso_adapter.core.request_flags import STORE_ONLY
+    from nso_adapter.store.apply_attempt_store import (
+        ApplyAttemptIdentityMismatch,
+        begin_apply_attempt,
+        complete_apply_attempt,
+        replay_apply_attempt,
+    )
 
     if STORE_ONLY.get():
         raise api_error(422, "validation_error", "store_only is not valid for the Apply action")
 
-    device = await db.get(Device, device_id)
-    if not device:
-        raise api_error(404, "not_found", "Device not found")
+    # The UUID identity outranks the device lookup: an existing attempt POSTed at any
+    # other device (even a nonexistent one) is an identity conflict, not a 404.
     try:
-        apply_result = await create_action_apply(db, device_id, body.selected)
-    except ApplyJobConflict as exc:
+        stored = await replay_apply_attempt(db, body.apply_attempt_id, device_id, body.selected)
+    except ApplyAttemptIdentityMismatch as exc:
         await db.rollback()
         raise api_error(
             409,
             "conflict",
-            "A job is already queued or running for this device",
-            {"job_id": exc.job_id},
+            "Apply attempt UUID belongs to a different request identity",
+            {"mismatch": exc.mismatch},
         ) from None
-    except ApplyUnexecutable as exc:
+    if stored is not None:
         await db.rollback()
-        streams = sorted(exc.reasons)
+        return _apply_http_response(stored.http_status, stored.response)
+    device = await db.get(Device, device_id)
+    if not device:
+        raise api_error(404, "not_found", "Device not found")
+    await lock_projection(db, device_id)
+    try:
+        stored = await begin_apply_attempt(db, body.apply_attempt_id, device_id, body.selected)
+    except ApplyAttemptIdentityMismatch as exc:
+        await db.rollback()
         raise api_error(
             409,
-            "apply_unexecutable",
-            f"Selected stream(s) cannot be applied faithfully: {', '.join(streams)}",
-            {"streams": exc.reasons},
+            "conflict",
+            "Apply attempt UUID belongs to a different request identity",
+            {"mismatch": exc.mismatch},
         ) from None
+    if stored is not None:
+        await db.rollback()
+        return _apply_http_response(stored.http_status, stored.response)
+    try:
+        async with db.begin_nested():
+            apply_result = await create_action_apply(db, device_id, body.selected, body.apply_attempt_id)
+    except ApplyJobConflict as exc:
+        result = {
+            "error": {
+                "code": "conflict",
+                "message": "A job is already queued or running for this device",
+                "detail": {"job_id": exc.job_id},
+            }
+        }
+        await complete_apply_attempt(
+            db,
+            body.apply_attempt_id,
+            admission_state="rejected",
+            http_status=409,
+            response=result,
+        )
+        await db.commit()
+        return _apply_http_response(409, result)
+    except ApplyUnexecutable as exc:
+        streams = sorted(exc.reasons)
+        result = {
+            "error": {
+                "code": "apply_unexecutable",
+                "message": f"Selected stream(s) cannot be applied faithfully: {', '.join(streams)}",
+                "detail": {"streams": exc.reasons},
+            }
+        }
+        await complete_apply_attempt(
+            db,
+            body.apply_attempt_id,
+            admission_state="rejected",
+            http_status=409,
+            response=result,
+        )
+        await db.commit()
+        return _apply_http_response(409, result)
     generations = [
         {
             "generation_id": generation.id,
@@ -335,22 +400,29 @@ async def action_apply(
         }
         for generation in apply_result.generations
     ]
-    if not generations:
-        response.status_code = 200
+    status_code = 202 if generations else 200
     job_id = generations[0]["job_id"] if generations else None
     if generations and job_id is None:
         raise api_error(500, "internal", "The promoted generation chain has no executable head job")
     result = {
         "device_id": device_id,
         "outcome": "promoted" if generations else "no_op",
-        "job_id": job_id,
         "selected": body.selected,
         "skipped": apply_result.skipped,
         "skipped_detail": apply_result.skipped_detail or None,
         "generations": generations,
     }
+    if job_id is not None:
+        result["job_id"] = job_id
+    await complete_apply_attempt(
+        db,
+        body.apply_attempt_id,
+        admission_state="admitted",
+        http_status=status_code,
+        response=result,
+    )
     await db.commit()
-    return result
+    return _apply_http_response(status_code, result)
 
 
 class BarrierActionIn(BaseModel):

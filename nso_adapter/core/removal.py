@@ -23,6 +23,7 @@ import ipaddress
 import json
 from functools import cache
 from typing import NamedTuple
+from uuid import UUID
 
 import structlog
 from sqlalchemy import delete, exists, select
@@ -1927,6 +1928,7 @@ async def enqueue_removal(
     shrank: bool = False,
     document: dict | None = None,
     static_route_tombstone_ids: tuple[int, ...] = (),
+    apply_attempt_id: UUID | None = None,
 ):
     """Queue an async ``removal`` job that PUT-replaces *scope*'s service.
 
@@ -2087,6 +2089,7 @@ async def enqueue_removal(
             removal_context=context,
             settlement_cohort=settlement_cohort,
             static_route_tombstone_ids=static_route_tombstone_ids,
+            apply_attempt_id=apply_attempt_id,
         )
     job = await create_dedicated_job(db, device_id, JobType.removal, context=context)
     await require_attach_to_job(db, generation, job)
