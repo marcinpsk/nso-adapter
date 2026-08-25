@@ -2,6 +2,237 @@
 
 <!-- version list -->
 
+## v0.4.0 (2026-08-25)
+
+### Bug Fixes
+
+- **api**: Answer an unexpected exception with the error envelope
+  ([`60b2c8a`](https://github.com/marcinpsk/nso-adapter/commit/60b2c8a9900bb61c0c78f34355d5ee7ff7c64c05))
+
+- **api**: Close validation and logging review gaps
+  ([`ecb64fd`](https://github.com/marcinpsk/nso-adapter/commit/ecb64fdcc6c9c1f892467ec07c347685e07fbfed))
+
+- **api**: Correct the static-route replay annotation
+  ([`eb5a0df`](https://github.com/marcinpsk/nso-adapter/commit/eb5a0dfca76effbca588d786b08f6fd0466c2f69))
+
+- **api**: Derive runtime error codes from schema
+  ([`4f2e98f`](https://github.com/marcinpsk/nso-adapter/commit/4f2e98fd4923bb39691a173fe7d60c7799001270))
+
+- **api**: Keep sequence exceptions out of responses
+  ([`b21f51f`](https://github.com/marcinpsk/nso-adapter/commit/b21f51fe666adf22961249e0fe34f1c6446191a4))
+
+- **api**: Log only safe metadata for an unhandled exception
+  ([`88edb8f`](https://github.com/marcinpsk/nso-adapter/commit/88edb8f99c12dc9f1c1ca340d316d869df3c3f52))
+
+- **api**: Normalize framework HTTP errors
+  ([`e124ee8`](https://github.com/marcinpsk/nso-adapter/commit/e124ee84fb71a998753be98943dbb68bdae9a093))
+
+- **api**: Point error additions to schema
+  ([`f25e19c`](https://github.com/marcinpsk/nso-adapter/commit/f25e19ced4f44a80a6a1cc1850ca88604f9a0188))
+
+- **api**: Redact validation inputs
+  ([`b3e0966`](https://github.com/marcinpsk/nso-adapter/commit/b3e096601b0bf92091af1323d690548d443d164b))
+
+- **api**: Return only the admitted barrier job
+  ([`aa52008`](https://github.com/marcinpsk/nso-adapter/commit/aa5200866ddd49bcf34720dba468a1090b81a62b))
+
+- **api**: Return the released successor job
+  ([`a1f4b94`](https://github.com/marcinpsk/nso-adapter/commit/a1f4b944e91f649472297efd9a87cb8089d859ae))
+
+- **api**: Seal the unhandled-exception traceback at the outermost middleware
+  ([`7e03945`](https://github.com/marcinpsk/nso-adapter/commit/7e039455979cb01da2b126db07c5ad7eef97c2a6))
+
+- **apply**: Count document send outcomes
+  ([`4f87006`](https://github.com/marcinpsk/nso-adapter/commit/4f87006eb8dd43cfb5becd51794236bcb268db0c))
+
+- **apply**: Hydrate only carried document sections
+  ([`edaa0da`](https://github.com/marcinpsk/nso-adapter/commit/edaa0da55a5471782e7722d6ac962e61393a2178))
+
+- **bgp**: Enqueue the retracting removal when redistribution fields clear
+  ([`4bfca20`](https://github.com/marcinpsk/nso-adapter/commit/4bfca2092a945ff7418250bd315e48db83b72a44))
+
+- **generation**: Clear a terminal job binding before attaching a fresh job
+  ([`5fa8d6c`](https://github.com/marcinpsk/nso-adapter/commit/5fa8d6cc20a2b800a0b138e440ca21b85101c5de))
+
+- **generation**: Close admission and outcome gaps
+  ([`1f636a4`](https://github.com/marcinpsk/nso-adapter/commit/1f636a4076286ebbf4b49d94d208d59cebb0b836))
+
+- **generation**: Close review admission gaps
+  ([`2dd69c7`](https://github.com/marcinpsk/nso-adapter/commit/2dd69c7c6cd703a60ce9f6d4c9570f351d455833))
+
+- **generation**: Harden advancement and immutable DDL
+  ([`43b089a`](https://github.com/marcinpsk/nso-adapter/commit/43b089ac51617c54eb0ea84bf575afa1b2a96d73))
+
+- **generation**: Keep queued conflicts truthful
+  ([`d93201f`](https://github.com/marcinpsk/nso-adapter/commit/d93201f76f7798cf478c0ad180577d6cdeee591a))
+
+- **generation**: Keep takeover off generation-less queued removals
+  ([`fd3f6bc`](https://github.com/marcinpsk/nso-adapter/commit/fd3f6bc35d105c6a7a0d167eb14c7a52b1d377d0))
+
+- **generation**: Reject non-head operator exits
+  ([`320b42f`](https://github.com/marcinpsk/nso-adapter/commit/320b42f7cfe72dbd76a142c1cdfe970c86ceb5a0))
+
+- **guard**: Track values mapping provenance
+  ([`e713828`](https://github.com/marcinpsk/nso-adapter/commit/e713828c5c0bacc2b3e1003306da3a923df32219))
+
+- **intent**: Centralize delivery admission and job ordering
+  ([`a7b4e68`](https://github.com/marcinpsk/nso-adapter/commit/a7b4e685fbfd6438eeb9f05e01859d2e556e4604))
+
+- **migration**: Serialize the removal-quiescence gate with jobs writers
+  ([`82d21cd`](https://github.com/marcinpsk/nso-adapter/commit/82d21cd4cee16602926ec061688e61d20c7960df))
+
+- **migrations**: Freeze the deployment-generation trigger DDL in its revision
+  ([`fd8ddde`](https://github.com/marcinpsk/nso-adapter/commit/fd8ddde3053947ec05d41a63dc06a92ccd3ac741))
+
+- **projection**: Give section_models the siblings' error contract
+  ([`0cbdd72`](https://github.com/marcinpsk/nso-adapter/commit/0cbdd724d3c3cf88f7038c35cd6aade62b9ec68b))
+
+- **projection**: Refuse a document row without its primary key
+  ([`0d60bce`](https://github.com/marcinpsk/nso-adapter/commit/0d60bce48174b4e33d851104ccb7b35aa9f2f51a))
+
+- **removal**: Preserve tombstone authority across retries
+  ([`4e1c99e`](https://github.com/marcinpsk/nso-adapter/commit/4e1c99eaba93760d6bb29b724ec40460f6b8169a))
+
+- **review**: Harden generation boundaries
+  ([`6c25129`](https://github.com/marcinpsk/nso-adapter/commit/6c25129df06c01fd11f1fada32800eee73e15e3c))
+
+- **review**: Pin the injected rejection and scope the action contract
+  ([`fe88dcd`](https://github.com/marcinpsk/nso-adapter/commit/fe88dcd1b59e0067d4676c9a8fd33855e2c66e9c))
+
+- **review**: Truthful trace-context doc and deterministic test fixtures
+  ([`342f03d`](https://github.com/marcinpsk/nso-adapter/commit/342f03d36dcbfe75e0a88553f37fdbc6cfa44c52))
+
+- **route-policy**: Enqueue auto-apply generation
+  ([`d9ca81b`](https://github.com/marcinpsk/nso-adapter/commit/d9ca81bffb1d8cd861894124914205cc114af15a))
+
+- **tests**: Omit SQL from teardown diagnostics
+  ([`c2c5926`](https://github.com/marcinpsk/nso-adapter/commit/c2c5926d9e24413bfa53f857452afc5826c24618))
+
+- **tombstone**: Include a divergent deployed_key in the sweep fallback removal set
+  ([`5a64663`](https://github.com/marcinpsk/nso-adapter/commit/5a646634f1d7bc74ce7b45e92887cfda16f1de8b))
+
+- **worker**: Log the exception type, not its text
+  ([`a2aa856`](https://github.com/marcinpsk/nso-adapter/commit/a2aa8562e34d3bd8ece4fdbe6729b5a5180129ff))
+
+### Chores
+
+- **ci**: Bump astral-sh/setup-uv in the actions group
+  ([`3a4a62a`](https://github.com/marcinpsk/nso-adapter/commit/3a4a62af3f86fec4d3d44d23cbf9b76d5163ab08))
+
+- **ci**: Bump the actions group with 2 updates
+  ([`1891c52`](https://github.com/marcinpsk/nso-adapter/commit/1891c52232e535732eab1c4a0d981c1a201618e7))
+
+- **deps**: Bump the python-minor-patch group with 2 updates
+  ([`a607e93`](https://github.com/marcinpsk/nso-adapter/commit/a607e93b5f0976712c41c5d2ccf5d50d65d83431))
+
+- **deps**: Bump the python-minor-patch group with 4 updates
+  ([`fc5fec0`](https://github.com/marcinpsk/nso-adapter/commit/fc5fec07730c9873a59724ec2135c7eadb70405f))
+
+- **test**: Cap auto-detected xdist workers at 8
+  ([`659ab0e`](https://github.com/marcinpsk/nso-adapter/commit/659ab0e2dfdd09eebf8e0efbe9c3c6e0f1eef38c))
+
+- **test**: Run the suite on xdist workers by default
+  ([`1da2ad6`](https://github.com/marcinpsk/nso-adapter/commit/1da2ad6176e175199ff590c63cd31d8e8123a5ef))
+
+### Continuous Integration
+
+- Audit GitHub Actions with zizmor in pre-commit and CI
+  ([`b2146c8`](https://github.com/marcinpsk/nso-adapter/commit/b2146c87369aa7d0d7f98d734204ad947b7d9853))
+
+- Fail on lockfile drift instead of silently rewriting it
+  ([`c40592b`](https://github.com/marcinpsk/nso-adapter/commit/c40592b7fdc9d6967c0390ccf5e9cc5010ef3223))
+
+### Features
+
+- **1558**: Deployment-generation and promotion foundation
+  ([`50bb078`](https://github.com/marcinpsk/nso-adapter/commit/50bb078d435a51dfa7529ce4740c52288f01ba41))
+
+- **receipts**: Stamp the generation each intent push authorized
+  ([`2e67874`](https://github.com/marcinpsk/nso-adapter/commit/2e6787425bf6af9b2e66b1ae0d09e1dded616a2e))
+
+### Refactoring
+
+- **generation**: Export the blocked-status set
+  ([`2a81379`](https://github.com/marcinpsk/nso-adapter/commit/2a8137994e8e405410e15d23c2579097f826c74b))
+
+- **isis**: Reuse the auto-apply helper in the flex-algo route
+  ([`f977459`](https://github.com/marcinpsk/nso-adapter/commit/f9774598b75fb888c9f45bad103d9897f32d5aaf))
+
+### Testing
+
+- Drop the dead _vlan name and clear every projection cache
+  ([`3b4c198`](https://github.com/marcinpsk/nso-adapter/commit/3b4c19886a0fbc1d564775ceb799f20f4a8729c9))
+
+- Enforce the zizmor parity claim and three review-driven guards
+  ([`cf6204c`](https://github.com/marcinpsk/nso-adapter/commit/cf6204cbe903ae3ec1881c29d5ace05dba951616))
+
+- Resolve PR #18 review findings
+  ([`fffae05`](https://github.com/marcinpsk/nso-adapter/commit/fffae05c2a5e50ebb8e81d570a76d6d32c28dcd2))
+
+- **api**: Pin generation action responses
+  ([`b3464e9`](https://github.com/marcinpsk/nso-adapter/commit/b3464e9d13c4ad00a477d1b75a388c364ea3f0d1))
+
+- **db**: Let the teardown guard wait out disposal latency
+  ([`eefef15`](https://github.com/marcinpsk/nso-adapter/commit/eefef1502bc23d55e4a12ae5ac815992a185d90f))
+
+- **flake**: Remove the two timing flakes that CPU contention decides
+  ([`8d3c678`](https://github.com/marcinpsk/nso-adapter/commit/8d3c678133d57070d59e89399e3facec4cb21c83))
+
+- **generation**: Bound race below lock timeout
+  ([`4ef7403`](https://github.com/marcinpsk/nso-adapter/commit/4ef740394daefa55aef330d99ffcbe32796d2cc6))
+
+- **generation**: Make the lock-overlap windows deterministic
+  ([`90d7c4f`](https://github.com/marcinpsk/nso-adapter/commit/90d7c4fc98a7deda01720d6a4db58a1454ad5d64))
+
+- **generation**: Prove the contention window without a timing sleep
+  ([`413e77b`](https://github.com/marcinpsk/nso-adapter/commit/413e77bda3cdeb09118ecbbad72f229d842cab24))
+
+- **generation**: Strengthen protocol review coverage
+  ([`2fe8af5`](https://github.com/marcinpsk/nso-adapter/commit/2fe8af5d1da6e9223d76365d5e0cb30ee21d649a))
+
+- **guards**: Detect named-expression mappings in terminal-write scan
+  ([`48dabf5`](https://github.com/marcinpsk/nso-adapter/commit/48dabf53d740301c08717a1b426bf706de4ea2a4))
+
+- **guards**: Flag a walrus mapping bound outside the values call
+  ([`77ed342`](https://github.com/marcinpsk/nso-adapter/commit/77ed342a7b22b10a705e2ee0d1180a46ac10e34a))
+
+- **interface-ip**: Assert every seeding PUT lands
+  ([`f386395`](https://github.com/marcinpsk/nso-adapter/commit/f386395fcc9fb9af3cca44c99be0a36fde1c99ad))
+
+- **receipts**: Cover unpacked terminal writes
+  ([`2d1d991`](https://github.com/marcinpsk/nso-adapter/commit/2d1d991415d67b16ed1f1cc188286d6154f6aea1))
+
+- **release**: Parse the workflow instead of substring-matching build: true
+  ([`bc36808`](https://github.com/marcinpsk/nso-adapter/commit/bc368087df0c418c8667a0aae371b0212d0c4149))
+
+- **removal**: Isolate the vault fixture from collection order
+  ([`abaeaac`](https://github.com/marcinpsk/nso-adapter/commit/abaeaac1d1c973dc1b4de17a69770689c4d1bf3b))
+
+- **removal**: Seed force jobs through the reissue generation
+  ([`6532bac`](https://github.com/marcinpsk/nso-adapter/commit/6532bace8ecd570ec7edd2f41fc0f36733c9572f))
+
+- **review**: Check the outer static-route handler for note_write too
+  ([`605961f`](https://github.com/marcinpsk/nso-adapter/commit/605961f1b6666de67fd6d2c07877e1a2e446be06))
+
+- **settle-token**: Exercise the write barrier with a device-writing job
+  ([`f5590e8`](https://github.com/marcinpsk/nso-adapter/commit/f5590e86d8f7b06e94b34507eb8c169855cca1f6))
+
+- **static-route**: Prove the claim guard precedes the body
+  ([`1dcc28c`](https://github.com/marcinpsk/nso-adapter/commit/1dcc28cf523f043404237532095c572d37d27f52))
+
+- **store**: Assert every dropped object returns on the re-upgrade
+  ([`f307014`](https://github.com/marcinpsk/nso-adapter/commit/f30701498484ad8e80db5e7339fa00144db65188))
+
+- **store**: Drop the dead sitecustomize from the historical DDL-freeze test
+  ([`c510b62`](https://github.com/marcinpsk/nso-adapter/commit/c510b62417ee83d9974e0d199a288c34c80ddae9))
+
+- **store**: Make the historical DDL-freeze test discriminating at this level
+  ([`c12d27c`](https://github.com/marcinpsk/nso-adapter/commit/c12d27c8fcf0767ec9009b9ff8b01f61b36a65d5))
+
+- **store**: State both freeze discriminators in the docstring
+  ([`db6fac3`](https://github.com/marcinpsk/nso-adapter/commit/db6fac34c785fa20a561f79e3aefa57bfd314142))
+
+
 ## v0.3.0 (2026-08-10)
 
 ### Bug Fixes
