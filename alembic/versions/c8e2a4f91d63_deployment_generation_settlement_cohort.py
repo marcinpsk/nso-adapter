@@ -7,7 +7,7 @@ generations keep NULL, so a historical generation with the same device, stream a
 cannot block a later deployment from certifying that revision.
 
 Revision ID: c8e2a4f91d63
-Revises: b7d5e2f18c40
+Revises: e3a7c9d1b504
 Create Date: 2026-08-11
 """
 
@@ -20,7 +20,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "c8e2a4f91d63"
-down_revision: str | None = "b7d5e2f18c40"
+down_revision: str | None = "e3a7c9d1b504"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
