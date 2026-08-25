@@ -90,7 +90,7 @@ class ActionApplySkippedDetailOut(BaseModel):
 class ActionApplyOut(BaseModel):
     device_id: int
     outcome: Literal["promoted", "no_op"]
-    job_id: int | None = None
+    job_id: int | None = Field(default=None, exclude_if=lambda value: value is None)
     selected: dict[str, int]
     skipped: dict[
         str,
@@ -103,7 +103,7 @@ class ActionApplyOut(BaseModel):
             "revision_mismatch",
         ],
     ]
-    skipped_detail: dict[str, ActionApplySkippedDetailOut] | None = None
+    skipped_detail: dict[str, ActionApplySkippedDetailOut] | None
     generations: list[ActionApplyGenerationOut]
 
 
@@ -272,7 +272,6 @@ async def sync_notify(
     status_code=202,
     dependencies=[Depends(verify_token)],
     response_model=ActionApplyOut,
-    response_model_exclude_none=True,
     responses={
         200: {"model": ActionApplyOut, "description": "No selected stream required a job"},
         **_TRIGGER_ERRORS,

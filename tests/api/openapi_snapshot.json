@@ -161,6 +161,7 @@
           "outcome",
           "selected",
           "skipped",
+          "skipped_detail",
           "generations"
         ],
         "title": "ActionApplyOut",

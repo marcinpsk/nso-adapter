@@ -261,6 +261,7 @@ async def test_action_apply_does_not_promote_a_later_unselected_push(adapter_cli
         "outcome": "no_op",
         "selected": {"vlan": 4101},
         "skipped": {"vlan": "superseded"},
+        "skipped_detail": None,
         "generations": [],
     }
     assert await _generations(device_id) == []
@@ -314,6 +315,7 @@ async def test_action_apply_endpoint_returns_selected_generation_contract(adapte
     assert body["outcome"] == "promoted"
     assert body["selected"] == {"vlan": 4301}
     assert body["skipped"] == {}
+    assert body["skipped_detail"] is None
     assert len(body["generations"]) == 1
     link = body["generations"][0]
     assert body["job_id"] == link["job_id"]
@@ -872,6 +874,7 @@ async def test_action_apply_reports_every_skipped_selection_reason(adapter_clien
         "outcome": "no_op",
         "selected": {"vlan": 5100},
         "skipped": {"vlan": "no_receipt"},
+        "skipped_detail": None,
         "generations": [],
     }
     assert (await _put_vlans(adapter_client, device_id, [10], seq=5101, query="?store_only=true")).status_code == 200
@@ -886,6 +889,7 @@ async def test_action_apply_reports_every_skipped_selection_reason(adapter_clien
         "outcome": "no_op",
         "selected": {"vlan": 5101},
         "skipped": {"vlan": "already_applied"},
+        "skipped_detail": None,
         "generations": [],
     }
 
@@ -1356,6 +1360,7 @@ async def test_action_apply_settlement_between_projection_and_generation_reads_i
         "outcome": "no_op",
         "selected": {"vlan": 6301},
         "skipped": {"vlan": "already_authorized"},
+        "skipped_detail": None,
         "generations": [],
     }
 
@@ -1404,6 +1409,7 @@ async def test_action_apply_names_a_backfill_only_receipt_by_its_own_skip_code(a
         "outcome": "no_op",
         "selected": {"static_route": 6401},
         "skipped": {"static_route": "backfill_only"},
+        "skipped_detail": None,
         "generations": [],
     }
     assert await _generations(device_id) == []

@@ -84,6 +84,13 @@ def test_generation_actions_document_both_conflict_details(openapi_schema):
         assert "empty detail" in description
 
 
+def test_action_apply_requires_skipped_detail(openapi_schema):
+    schema = openapi_schema["components"]["schemas"]["ActionApplyOut"]
+
+    assert "skipped_detail" in schema["required"]
+    assert {"type": "null"} in schema["properties"]["skipped_detail"]["anyOf"]
+
+
 def test_api_contract_documents_both_generation_action_conflicts():
     contract = (SNAPSHOT_PATH.parents[2] / "docs" / "api-contract.md").read_text()
     section = contract.split(
