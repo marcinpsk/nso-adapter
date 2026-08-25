@@ -145,7 +145,10 @@ END $$;
 
 def upgrade() -> None:
     # Active removals created before generations have no immutable document to execute.
-    # Refuse the cutover instead of letting the new runner fail them after deployment.
+    # Serialize the check with every jobs writer, including an older adapter process that
+    # stays live while a replacement starts. Refuse the cutover instead of letting the new
+    # runner fail generationless work after deployment.
+    op.execute("LOCK TABLE jobs IN SHARE ROW EXCLUSIVE MODE")
     op.execute(_VALIDATE_REMOVAL_QUIESCENCE)
 
     op.create_table(

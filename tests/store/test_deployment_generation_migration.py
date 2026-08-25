@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import os
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import pytest
 import sqlalchemy as sa
@@ -54,6 +56,32 @@ def _function_source(statement: str) -> str:
     return statement.partition(" AS $$")[2].partition("$$ LANGUAGE plpgsql")[0]
 
 
+def _wait_until_migration_reaches_jobs(engine, upgrade: Future[str]) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        with engine.connect() as conn:
+            waiting = conn.execute(
+                sa.text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                          FROM pg_locks AS lock
+                          JOIN pg_class AS relation ON relation.oid = lock.relation
+                          JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+                         WHERE lock.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                           AND namespace.nspname = 'public'
+                           AND relation.relname = 'jobs'
+                           AND NOT lock.granted
+                    )
+                    """
+                )
+            ).scalar_one()
+        if waiting or upgrade.done():
+            return
+        time.sleep(0.05)
+    raise AssertionError("the migration neither completed nor waited for the jobs table")
+
+
 def test_upgrade_refuses_active_generationless_removals(pg_admin):
     """The operator must drain old removal work before generation execution starts."""
     module = load_migration(_MIGRATION)
@@ -69,6 +97,51 @@ def test_upgrade_refuses_active_generationless_removals(pg_admin):
 
         with pytest.raises(AssertionError, match="drain active removal jobs"):
             alembic(sync_url, "upgrade", module.revision)
+
+
+def test_upgrade_serializes_removal_gate_against_a_concurrent_enqueue(pg_admin):
+    """A removal committed during cutover must be visible to the quiescence gate."""
+    module = load_migration(_MIGRATION)
+    with private_database(pg_admin, "generation_removal_race") as sync_url:
+        alembic(sync_url, "upgrade", module.down_revision)
+        with engine_on(sync_url) as engine, engine.connect() as enqueue_conn:
+            enqueue_tx = enqueue_conn.begin()
+            enqueue_conn.execute(
+                sa.text(
+                    "INSERT INTO jobs (job_type, status, context, created_at, updated_at) "
+                    "VALUES ('removal', 'queued', CAST('{}' AS json), now(), now())"
+                )
+            )
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                upgrade = pool.submit(alembic, sync_url, "upgrade", module.revision)
+                try:
+                    _wait_until_migration_reaches_jobs(engine, upgrade)
+                finally:
+                    enqueue_tx.commit()
+
+                try:
+                    upgrade.result(timeout=30)
+                except AssertionError as exc:
+                    assert "drain active removal jobs" in str(exc)
+                else:
+                    with engine.connect() as conn:
+                        ungoverned = conn.execute(
+                            sa.text(
+                                """
+                                SELECT count(*)
+                                  FROM jobs AS job
+                                  LEFT JOIN deployment_generation AS generation ON generation.job_id = job.id
+                                 WHERE job.job_type = 'removal'
+                                   AND job.status IN ('queued', 'running')
+                                   AND generation.id IS NULL
+                                """
+                            )
+                        ).scalar_one()
+                    pytest.fail(
+                        f"migration committed across a concurrent enqueue and left {ungoverned} "
+                        "active removal job(s) without a generation"
+                    )
 
 
 def test_historical_trigger_is_frozen_and_head_trigger_matches_live_ddl(pg_admin, tmp_path, monkeypatch):
