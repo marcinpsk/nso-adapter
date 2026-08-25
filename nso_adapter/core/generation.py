@@ -93,6 +93,13 @@ logger = structlog.get_logger(__name__)
 
 #: Statuses a successor may cross. Everything else is a head that blocks.
 _CROSSABLE = (GenerationStatus.settled, GenerationStatus.abandoned)
+#: Statuses that preserve the current carrier as durable terminal evidence.
+_TERMINAL = (
+    GenerationStatus.settled,
+    GenerationStatus.failed,
+    GenerationStatus.outcome_unknown,
+    GenerationStatus.abandoned,
+)
 #: A job that is still going to run (or is running) covers its generations.
 _LIVE_JOB = (JobStatus.queued, JobStatus.running)
 #: PostgreSQL ``lock_not_available``: what a refused ``FOR UPDATE NOWAIT`` reports.
@@ -1221,18 +1228,7 @@ async def settle_job_generations(
     if not carried:
         return
     now = _now()
-    values: dict = {"status": outcome, "updated_at": now}
-    if outcome is GenerationStatus.settled:
-        values["settled_at"] = now
-        values["last_error"] = None
-    elif error is not None:
-        values["last_error"] = error
-    await db.execute(
-        sa_update(DeploymentGeneration)
-        .where(DeploymentGeneration.id.in_([g.id for g in carried]))
-        .values(**values)
-        .execution_options(synchronize_session=False)
-    )
+    await _terminalize_generations(db, carried, outcome=outcome, error=error, now=now)
     if outcome is not GenerationStatus.settled:
         logger.warning(
             "generation.unsettled",
@@ -1265,6 +1261,63 @@ async def settle_job_generations(
         {generation.settlement_cohort for generation in carried if generation.settlement_cohort is not None}
     ):
         await _stamp_settled_cohort(db, settlement_cohort, now)
+
+
+async def _terminalize_generations(
+    db: AsyncSession,
+    generations: list[DeploymentGeneration],
+    *,
+    outcome: GenerationStatus,
+    error: dict | None = None,
+    expected_statuses: tuple[GenerationStatus, ...] | None = None,
+    now: datetime | None = None,
+) -> set[int]:
+    """Set terminal status and snapshot each generation's current carrier. Caller commits."""
+    if outcome not in _TERMINAL:
+        raise ValueError(f"generation terminalization requires a terminal status, not {outcome.value}")
+    if not generations:
+        return set()
+
+    carrier_ids = sorted({generation.job_id for generation in generations if generation.job_id is not None})
+    carriers = {
+        row.id: row
+        for row in (
+            await db.execute(select(Job.id, Job.status, Job.result, Job.error).where(Job.id.in_(carrier_ids)))
+        ).all()
+    }
+    terminalized_at = now or _now()
+    landed: set[int] = set()
+    for generation in generations:
+        values: dict = {"status": outcome, "updated_at": terminalized_at}
+        if outcome is GenerationStatus.settled:
+            values["settled_at"] = terminalized_at
+            values["last_error"] = None
+        elif error is not None:
+            values["last_error"] = error
+        carrier = carriers.get(generation.job_id)
+        if carrier is not None:
+            values.update(
+                carrier_job_id=carrier.id,
+                carrier_job_status=carrier.status.value,
+                carrier_job_result=carrier.result,
+                carrier_job_error=carrier.error,
+            )
+        conditions = [
+            DeploymentGeneration.id == generation.id,
+            DeploymentGeneration.job_id.is_not_distinct_from(generation.job_id),
+        ]
+        if expected_statuses is not None:
+            conditions.append(DeploymentGeneration.status.in_(expected_statuses))
+        terminalized_id = await db.scalar(
+            sa_update(DeploymentGeneration)
+            .where(*conditions)
+            .values(**values)
+            .returning(DeploymentGeneration.id)
+            .execution_options(synchronize_session=False)
+        )
+        if terminalized_id is not None:
+            landed.add(terminalized_id)
+    return landed
 
 
 async def _stamp_applied_revisions(
@@ -1376,14 +1429,24 @@ async def _claim_blocked_head(db: AsyncSession, generation_id: int, outcome: Gen
     a deployment the operator gave up on. Only one ``failed``/``outcome_unknown`` row can
     leave that state.
     """
-    claimed = await db.scalar(
-        sa_update(DeploymentGeneration)
-        .where(DeploymentGeneration.id == generation_id, DeploymentGeneration.status.in_(BLOCKED_STATUSES))
-        .values(status=outcome, updated_at=_now())
-        .returning(DeploymentGeneration.id)
-        .execution_options(synchronize_session=False)
-    )
-    if claimed is None:
+    if outcome in _TERMINAL:
+        generation = await db.get(DeploymentGeneration, generation_id)
+        claimed = await _terminalize_generations(
+            db,
+            [generation] if generation is not None else [],
+            outcome=outcome,
+            expected_statuses=BLOCKED_STATUSES,
+        )
+    else:
+        claimed_id = await db.scalar(
+            sa_update(DeploymentGeneration)
+            .where(DeploymentGeneration.id == generation_id, DeploymentGeneration.status.in_(BLOCKED_STATUSES))
+            .values(status=outcome, updated_at=_now())
+            .returning(DeploymentGeneration.id)
+            .execution_options(synchronize_session=False)
+        )
+        claimed = {claimed_id} if claimed_id is not None else set()
+    if generation_id not in claimed:
         raise GenerationNotBlocked(f"generation {generation_id} is no longer a blocked head")
 
 
@@ -1448,9 +1511,7 @@ async def reconcile_generation(db: AsyncSession, generation_id: int) -> Job | No
     if generation.status not in BLOCKED_STATUSES:
         raise GenerationNotBlocked(f"generation {generation_id} is {generation.status.value}, not a blocked head")
     await _claim_blocked_head(db, generation_id, GenerationStatus.abandoned)
-    generation.status = GenerationStatus.abandoned
-    generation.updated_at = _now()
-    await db.flush()
+    await db.refresh(generation)
     if generation.settlement_cohort is not None:
         await _stamp_settled_cohort(db, generation.settlement_cohort, generation.updated_at)
     logger.warning(
@@ -1564,11 +1625,14 @@ async def recover_generations() -> int:
             .scalars()
             .all()
         )
-        for generation in rows:
-            generation.status = GenerationStatus.outcome_unknown
-            generation.updated_at = _now()
-            stranded.append(generation.device_id)
-        devices = list(
+        terminalized = await _terminalize_generations(
+            db,
+            rows,
+            outcome=GenerationStatus.outcome_unknown,
+            expected_statuses=(GenerationStatus.running,),
+        )
+        stranded.extend(generation.device_id for generation in rows if generation.id in terminalized)
+        devices = (
             (
                 await db.execute(
                     select(DeploymentGeneration.device_id)

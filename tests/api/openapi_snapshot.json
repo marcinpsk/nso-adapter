@@ -1343,6 +1343,298 @@
         "title": "DeletedRoute",
         "type": "object"
       },
+      "DeploymentEvidenceAttemptOut": {
+        "properties": {
+          "admission_state": {
+            "title": "Admission State",
+            "type": "string"
+          },
+          "apply_attempt_id": {
+            "format": "uuid",
+            "title": "Apply Attempt Id",
+            "type": "string"
+          },
+          "generations": {
+            "items": {
+              "$ref": "#/components/schemas/DeploymentEvidenceGenerationOut"
+            },
+            "title": "Generations",
+            "type": "array"
+          },
+          "http_status": {
+            "title": "Http Status",
+            "type": "integer"
+          },
+          "response": {
+            "additionalProperties": true,
+            "title": "Response",
+            "type": "object"
+          }
+        },
+        "required": [
+          "apply_attempt_id",
+          "admission_state",
+          "http_status",
+          "response",
+          "generations"
+        ],
+        "title": "DeploymentEvidenceAttemptOut",
+        "type": "object"
+      },
+      "DeploymentEvidenceGenerationOut": {
+        "properties": {
+          "carrier_job_error": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Carrier Job Error"
+          },
+          "carrier_job_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Carrier Job Id"
+          },
+          "carrier_job_result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Carrier Job Result"
+          },
+          "carrier_job_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Carrier Job Status"
+          },
+          "generation_id": {
+            "title": "Generation Id",
+            "type": "integer"
+          },
+          "sections": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Sections",
+            "type": "array"
+          },
+          "seq": {
+            "title": "Seq",
+            "type": "integer"
+          },
+          "source_push_seq": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "description": "Plugin X-Push-Seq keyed by intent stream.",
+            "title": "Source Push Seq",
+            "type": "object"
+          },
+          "status": {
+            "$ref": "#/components/schemas/GenerationStatus"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "generation_id",
+          "seq",
+          "status",
+          "sections",
+          "source_push_seq",
+          "carrier_job_id",
+          "carrier_job_status",
+          "carrier_job_result",
+          "carrier_job_error",
+          "updated_at"
+        ],
+        "title": "DeploymentEvidenceGenerationOut",
+        "type": "object"
+      },
+      "DeploymentEvidenceHeadOut": {
+        "properties": {
+          "apply_attempt_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Apply Attempt Id"
+          },
+          "carrier_job_error": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Carrier Job Error"
+          },
+          "carrier_job_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Carrier Job Id"
+          },
+          "carrier_job_result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Carrier Job Result"
+          },
+          "carrier_job_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Carrier Job Status"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "generation_id": {
+            "title": "Generation Id",
+            "type": "integer"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/GenerationMode"
+          },
+          "sections": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Sections",
+            "type": "array"
+          },
+          "seq": {
+            "title": "Seq",
+            "type": "integer"
+          },
+          "settlement_cohort": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Settlement Cohort"
+          },
+          "source_push_seq": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "description": "Plugin X-Push-Seq keyed by intent stream.",
+            "title": "Source Push Seq",
+            "type": "object"
+          },
+          "status": {
+            "$ref": "#/components/schemas/GenerationStatus"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "generation_id",
+          "seq",
+          "status",
+          "mode",
+          "settlement_cohort",
+          "sections",
+          "source_push_seq",
+          "apply_attempt_id",
+          "carrier_job_id",
+          "carrier_job_status",
+          "carrier_job_result",
+          "carrier_job_error",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "DeploymentEvidenceHeadOut",
+        "type": "object"
+      },
+      "DeploymentEvidenceIn": {
+        "properties": {
+          "apply_attempt_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Apply Attempt Ids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "apply_attempt_ids"
+        ],
+        "title": "DeploymentEvidenceIn",
+        "type": "object"
+      },
       "DeviceCreate": {
         "properties": {
           "netbox_device_id": {
@@ -1364,6 +1656,70 @@
           "netbox_device_id"
         ],
         "title": "DeviceCreate",
+        "type": "object"
+      },
+      "DeviceDeploymentEvidenceOut": {
+        "properties": {
+          "attempts": {
+            "items": {
+              "$ref": "#/components/schemas/DeploymentEvidenceAttemptOut"
+            },
+            "title": "Attempts",
+            "type": "array"
+          },
+          "blocked": {
+            "title": "Blocked",
+            "type": "boolean"
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": "integer"
+          },
+          "head": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeploymentEvidenceHeadOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "held_jobs": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Held Jobs",
+            "type": "array"
+          },
+          "pending_generations": {
+            "title": "Pending Generations",
+            "type": "integer"
+          },
+          "unknown_apply_attempt_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Unknown Apply Attempt Ids",
+            "type": "array"
+          },
+          "write_work_pending": {
+            "title": "Write Work Pending",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "device_id",
+          "head",
+          "blocked",
+          "write_work_pending",
+          "held_jobs",
+          "pending_generations",
+          "attempts",
+          "unknown_apply_attempt_ids"
+        ],
+        "title": "DeviceDeploymentEvidenceOut",
         "type": "object"
       },
       "DeviceFailoverOut": {
@@ -10789,6 +11145,94 @@
         "summary": "Refresh Capability",
         "tags": [
           "capability"
+        ]
+      }
+    },
+    "/api/v1/devices/{device_id}/deployment-evidence": {
+      "post": {
+        "description": "Return durable deployment facts for the requested Apply attempts.\n\nAn ID listed under ``unknown_apply_attempt_ids`` is NON-ACTIONABLE. The caller must\nre-submit the identical Apply request and must not settle or roll back local intent from\nan unknown ID alone. A deterministic rejection can omit ``generations`` or set it to null\nwhen the attempt stamped none. Any other mismatch between a stored response and its stamped\ngenerations is corrupt and NON-ACTIONABLE. It returns the internal invariant error envelope.",
+        "operationId": "deployment_evidence_api_v1_devices__device_id__deployment_evidence_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeploymentEvidenceIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceDeploymentEvidenceOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Device not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request validation failed (envelope shape)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal adapter invariant failed"
+          }
+        },
+        "security": [
+          {
+            "_OptionalBearer": []
+          }
+        ],
+        "summary": "Deployment Evidence",
+        "tags": [
+          "devices"
         ]
       }
     },

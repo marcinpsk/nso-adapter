@@ -25,13 +25,14 @@ GENERATION_IMMUTABLE_COLUMNS: tuple[str, ...] = (
     "stream_revisions",
     "removal_context",
     "settlement_cohort",
+    "apply_attempt_id",
     "created_at",
 )
 
 #: Immutable columns with a native equality operator. Every other column is compared as
 #: text. PostgreSQL defines no equality operator for ``json``, so this safe default prevents
 #: a newly guarded JSON column from breaking every lifecycle update at runtime.
-_COMPARABLE_COLUMNS = frozenset({"device_id", "seq", "mode", "digest", "created_at"})
+_COMPARABLE_COLUMNS = frozenset({"device_id", "seq", "mode", "digest", "apply_attempt_id", "created_at"})
 
 GENERATION_IMMUTABLE_TRIGGER = "deployment_generation_immutable"
 _FUNCTION = "deployment_generation_reject_rewrite"

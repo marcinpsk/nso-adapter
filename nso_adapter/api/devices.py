@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,12 +18,14 @@ from nso_adapter.api.errors import (
     RESP_404_DEVICE,
     RESP_409,
     RESP_422_VALIDATION,
+    RESP_500_INTERNAL,
     api_error,
 )
 from nso_adapter.api.pagination import DEFAULT_PAGE, LIMIT_MAX, LIMIT_MIN, validate_page_limit
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.store.models import (
     DbInterface,
+    DeploymentApplyAttempt,
     DeploymentGeneration,
     Device,
     DeviceFailover,
@@ -189,6 +192,130 @@ class DeviceGenerationOut(BaseModel):
     source_push_seq: dict[str, int | None]
     created_at: str
     updated_at: str
+
+
+class DeploymentEvidenceIn(BaseModel):
+    apply_attempt_ids: list[UUID] = Field(max_length=100)
+
+
+class DeploymentEvidenceGenerationOut(BaseModel):
+    generation_id: int
+    seq: int
+    status: GenerationStatus
+    sections: list[str]
+    source_push_seq: dict[str, int | None] = Field(description="Plugin X-Push-Seq keyed by intent stream.")
+    carrier_job_id: int | None
+    carrier_job_status: str | None
+    carrier_job_result: dict | None
+    carrier_job_error: dict | None
+    updated_at: str
+
+
+class DeploymentEvidenceAttemptOut(BaseModel):
+    apply_attempt_id: UUID
+    admission_state: str
+    http_status: int
+    response: dict
+    generations: list[DeploymentEvidenceGenerationOut]
+
+
+class DeploymentEvidenceHeadOut(BaseModel):
+    generation_id: int
+    seq: int
+    status: GenerationStatus
+    mode: GenerationMode
+    settlement_cohort: int | None
+    sections: list[str]
+    source_push_seq: dict[str, int | None] = Field(description="Plugin X-Push-Seq keyed by intent stream.")
+    apply_attempt_id: UUID | None
+    carrier_job_id: int | None
+    carrier_job_status: str | None
+    carrier_job_result: dict | None
+    carrier_job_error: dict | None
+    created_at: str
+    updated_at: str
+
+
+class DeviceDeploymentEvidenceOut(BaseModel):
+    device_id: int
+    head: DeploymentEvidenceHeadOut | None
+    blocked: bool
+    write_work_pending: bool
+    held_jobs: list[int]
+    pending_generations: int
+    attempts: list[DeploymentEvidenceAttemptOut]
+    unknown_apply_attempt_ids: list[UUID]
+
+
+class DeploymentEvidenceInvariantError(RuntimeError):
+    """The durable Apply response disagrees with its stamped generations."""
+
+
+def _validate_attempt_generation_evidence(
+    attempt: DeploymentApplyAttempt,
+    generations: list[DeploymentGeneration],
+) -> None:
+    response_generations = attempt.response.get("generations")
+    if response_generations is None:
+        if generations:
+            raise DeploymentEvidenceInvariantError(
+                f"Apply attempt {attempt.id} replay body has no generation list for its stamped generations"
+            )
+        return
+    if not isinstance(response_generations, list):
+        raise DeploymentEvidenceInvariantError(f"Apply attempt {attempt.id} replay body has an invalid generation list")
+
+    response_ids: list[int] = []
+    for item in response_generations:
+        generation_id = item.get("generation_id") if isinstance(item, dict) else None
+        if not isinstance(generation_id, int) or isinstance(generation_id, bool):
+            raise DeploymentEvidenceInvariantError(
+                f"Apply attempt {attempt.id} replay body has an invalid generation ID"
+            )
+        response_ids.append(generation_id)
+
+    stored_ids = [generation.id for generation in generations]
+    if len(response_ids) != len(set(response_ids)) or set(response_ids) != set(stored_ids):
+        raise DeploymentEvidenceInvariantError(
+            f"Apply attempt {attempt.id} replay body does not match its stamped generations"
+        )
+
+
+def _generation_sections(generation: DeploymentGeneration) -> list[str]:
+    from nso_adapter.core.projection import stream_section
+
+    return sorted({stream_section(stream) for stream in (generation.stream_revisions or {})})
+
+
+def _generation_source_push_seq(generation: DeploymentGeneration) -> dict[str, int | None]:
+    return dict(sorted((generation.source_push_seq or {}).items()))
+
+
+def _attempt_generation_out(generation: DeploymentGeneration) -> dict:
+    return {
+        "generation_id": generation.id,
+        "seq": generation.seq,
+        "status": generation.status,
+        "sections": _generation_sections(generation),
+        "source_push_seq": _generation_source_push_seq(generation),
+        "carrier_job_id": generation.carrier_job_id,
+        "carrier_job_status": generation.carrier_job_status,
+        "carrier_job_result": generation.carrier_job_result,
+        "carrier_job_error": generation.carrier_job_error,
+        "updated_at": iso_z(generation.updated_at),
+    }
+
+
+def _evidence_head_out(generation: DeploymentGeneration | None) -> dict | None:
+    if generation is None:
+        return None
+    return {
+        **_attempt_generation_out(generation),
+        "mode": generation.mode,
+        "settlement_cohort": generation.settlement_cohort,
+        "apply_attempt_id": generation.apply_attempt_id,
+        "created_at": iso_z(generation.created_at),
+    }
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -399,6 +526,135 @@ async def list_device_generations(
         }
         for row in rows
     ]
+
+
+@router.post(
+    "/{device_id}/deployment-evidence",
+    dependencies=[Depends(verify_token)],
+    response_model=DeviceDeploymentEvidenceOut,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION, **RESP_500_INTERNAL},
+)
+async def deployment_evidence(
+    device_id: int,
+    body: DeploymentEvidenceIn,
+    db: AsyncSession = Depends(get_read_db),
+):
+    """Return durable deployment facts for the requested Apply attempts.
+
+    An ID listed under ``unknown_apply_attempt_ids`` is NON-ACTIONABLE. The caller must
+    re-submit the identical Apply request and must not settle or roll back local intent from
+    an unknown ID alone. A deterministic rejection can omit ``generations`` or set it to null
+    when the attempt stamped none. Any other mismatch between a stored response and its stamped
+    generations is corrupt and NON-ACTIONABLE. It returns the internal invariant error envelope.
+    """
+    from nso_adapter.core.generation import (
+        _CROSSABLE,
+        _DEVICE_WRITING,
+        _LIVE_JOB,
+        BLOCKED_STATUSES,
+        executable_head,
+        job_admissible,
+    )
+
+    if not await db.get(Device, device_id):
+        raise api_error(404, "not_found", "Device not found")
+
+    head = await executable_head(db, device_id)
+    live_jobs = (
+        await db.execute(
+            select(Job.id, Job.status)
+            .where(
+                Job.device_id == device_id,
+                Job.job_type.in_(_DEVICE_WRITING),
+                Job.status.in_(_LIVE_JOB),
+            )
+            .order_by(Job.created_at, Job.id)
+        )
+    ).all()
+    write_work_pending = False
+    held_jobs: list[int] = []
+    for job in live_jobs:
+        admissible = await job_admissible(db, job.id, device_id)
+        write_work_pending = write_work_pending or admissible
+        if job.status.value == "queued" and not admissible:
+            held_jobs.append(job.id)
+
+    pending_generations = 0
+    if head is not None:
+        pending_generations = await db.scalar(
+            select(func.count())
+            .select_from(DeploymentGeneration)
+            .where(
+                DeploymentGeneration.device_id == device_id,
+                DeploymentGeneration.seq > head.seq,
+                DeploymentGeneration.status.not_in(_CROSSABLE),
+            )
+        )
+
+    requested_ids = body.apply_attempt_ids
+    attempts_by_id: dict[UUID, DeploymentApplyAttempt] = {}
+    generations_by_attempt: dict[UUID, list[DeploymentGeneration]] = {}
+    if requested_ids:
+        attempts_by_id = {
+            attempt.id: attempt
+            for attempt in (
+                (
+                    await db.execute(
+                        select(DeploymentApplyAttempt).where(
+                            DeploymentApplyAttempt.device_id == device_id,
+                            DeploymentApplyAttempt.id.in_(requested_ids),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        }
+        generation_rows = (
+            (
+                await db.execute(
+                    select(DeploymentGeneration)
+                    .where(
+                        DeploymentGeneration.device_id == device_id,
+                        DeploymentGeneration.apply_attempt_id.in_(requested_ids),
+                    )
+                    .order_by(DeploymentGeneration.seq)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for generation in generation_rows:
+            generations_by_attempt.setdefault(generation.apply_attempt_id, []).append(generation)
+
+        for attempt in attempts_by_id.values():
+            _validate_attempt_generation_evidence(
+                attempt,
+                generations_by_attempt.get(attempt.id, []),
+            )
+
+    return {
+        "device_id": device_id,
+        "head": _evidence_head_out(head),
+        "blocked": head is not None and head.status in BLOCKED_STATUSES,
+        "write_work_pending": write_work_pending,
+        "held_jobs": held_jobs,
+        "pending_generations": pending_generations,
+        "attempts": [
+            {
+                "apply_attempt_id": attempt.id,
+                "admission_state": attempt.admission_state,
+                "http_status": attempt.http_status,
+                "response": attempt.response,
+                "generations": [
+                    _attempt_generation_out(generation) for generation in generations_by_attempt.get(attempt.id, [])
+                ],
+            }
+            for attempt_id in requested_ids
+            if (attempt := attempts_by_id.get(attempt_id)) is not None
+        ],
+        "unknown_apply_attempt_ids": [attempt_id for attempt_id in requested_ids if attempt_id not in attempts_by_id],
+    }
 
 
 class DevicePatch(BaseModel):

@@ -446,6 +446,97 @@ settlement cohort. `status` is one of `pending`, `running`, `settled`, `failed`,
 
 `404 not_found` if the device does not exist.
 
+### `POST /api/v1/devices/{id}/deployment-evidence`
+
+Return one unpaged snapshot of the device deployment barrier and the requested durable
+Apply attempts. The request accepts at most 100 attempt UUIDs:
+
+```json
+{
+  "apply_attempt_ids": ["8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8"]
+}
+```
+
+The response contains:
+
+```json
+{
+  "device_id": 17,
+  "head": {
+    "generation_id": 301,
+    "seq": 44,
+    "status": "failed",
+    "mode": "networked",
+    "settlement_cohort": null,
+    "sections": ["vlan"],
+    "source_push_seq": {"vlan": 501},
+    "apply_attempt_id": "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8",
+    "carrier_job_id": 900,
+    "carrier_job_status": "failed",
+    "carrier_job_result": null,
+    "carrier_job_error": {"code": "nso_commit_failed", "message": "commit failed", "detail": {}},
+    "created_at": "2026-08-25T10:00:00Z",
+    "updated_at": "2026-08-25T10:01:00Z"
+  },
+  "blocked": true,
+  "write_work_pending": false,
+  "held_jobs": [901],
+  "pending_generations": 1,
+  "attempts": [
+    {
+      "apply_attempt_id": "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8",
+      "admission_state": "admitted",
+      "http_status": 202,
+      "response": {
+        "outcome": "promoted",
+        "skipped": {},
+        "skipped_detail": null,
+        "generations": [{"generation_id": 301}]
+      },
+      "generations": [
+        {
+          "generation_id": 301,
+          "seq": 44,
+          "status": "failed",
+          "sections": ["vlan"],
+          "source_push_seq": {"vlan": 501},
+          "carrier_job_id": 900,
+          "carrier_job_status": "failed",
+          "carrier_job_result": null,
+          "carrier_job_error": {"code": "nso_commit_failed", "message": "commit failed", "detail": {}},
+          "updated_at": "2026-08-25T10:01:00Z"
+        }
+      ]
+    }
+  ],
+  "unknown_apply_attempt_ids": []
+}
+```
+
+`head` is the device-wide executable head, not a cohort-scoped generation. `blocked` is
+true when that head is `failed` or `outcome_unknown`. `write_work_pending` counts only a
+queued or running device-writing job that the generation barrier admits. A queued
+device-writing job that the barrier refuses appears in `held_jobs` and does not make
+`write_work_pending` true. `pending_generations` counts non-crossable generations after
+the head. No part of this response is paginated.
+
+`sections` contains unique document section names. `source_push_seq` is keyed by intent stream.
+This preserves both stream values when `interface_config` and `ip` map to the
+`interface_config` section, or when `isis` and `isis_flex_algo` map to the `isis` section.
+
+The stored attempt `response` is the complete replay body. Terminal generation evidence
+uses the carrier snapshot, so it remains available after the job row is pruned. An attempt
+referenced by a generation is never deleted. A deterministic rejection that stamps no
+generation is valid when its replay body omits `generations` or stores it as `null`.
+
+An ID in `unknown_apply_attempt_ids` is non-actionable. The caller must re-submit the
+identical Apply request. It must not settle or roll back local intent from an unknown ID
+alone. A generation-bearing replay body is corrupt when it omits the generation list, uses
+a non-list value, contains invalid or duplicate IDs, or does not name exactly the generations
+stamped to its attempt. Corrupt evidence is also non-actionable. The endpoint returns the
+`500 internal` error envelope for this invariant failure. More than 100 IDs returns
+`422 validation_error`. A missing device returns `404 not_found`.
+
 ### `PATCH /api/v1/devices/{id}` — correct the mapping
 Request (any subset):
 ```json

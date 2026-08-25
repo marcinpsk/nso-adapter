@@ -241,6 +241,156 @@ async def _job_status(job_id: int):
         return (await db.get(Job, job_id)).status
 
 
+@pytest.mark.parametrize(
+    ("job_status", "generation_status"),
+    [
+        pytest.param("succeeded", "settled", id="worker-success"),
+        pytest.param("failed", "failed", id="worker-failure"),
+    ],
+)
+async def test_worker_terminalization_snapshots_the_carrier(
+    adapter_client,
+    job_status: str,
+    generation_status: str,
+):
+    from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, Job, JobStatus
+
+    device_id = await _device(f"gen-carrier-{job_status}", 16110 if job_status == "succeeded" else 16111)
+    await _vlan(device_id, 111)
+    await _push(adapter_client, device_id)
+    job_id = await _finish(device_id, JobStatus(job_status))
+
+    async with session() as db:
+        generation = await db.scalar(sa.select(DeploymentGeneration).where(DeploymentGeneration.device_id == device_id))
+        job = await db.get(Job, job_id)
+
+    assert generation.status is GenerationStatus(generation_status)
+    assert (
+        generation.carrier_job_id,
+        generation.carrier_job_status,
+        generation.carrier_job_result,
+        generation.carrier_job_error,
+    ) == (job.id, job.status.value, job.result, job.error)
+
+
+async def test_restart_outcome_unknown_snapshots_the_current_carrier(adapter_client):
+    from nso_adapter.core.generation import recover_generations
+    from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, Job, JobStatus
+
+    device_id = await _device("gen-carrier-outcome-unknown", 16112)
+    await _vlan(device_id, 112)
+    await _push(adapter_client, device_id)
+    (generation,) = await _generations(device_id)
+    result = {"observed": "before-restart"}
+    error = {"code": "lost_observer", "message": "runner disappeared", "detail": {}}
+    async with session() as db:
+        await db.execute(
+            sa.update(DeploymentGeneration)
+            .where(DeploymentGeneration.id == generation.id)
+            .values(status=GenerationStatus.running)
+        )
+        await db.execute(
+            sa.update(Job)
+            .where(Job.id == generation.job_id)
+            .values(status=JobStatus.failed, result=result, error=error)
+        )
+        await db.commit()
+
+    assert await recover_generations() == 1
+
+    async with session() as db:
+        recovered = await db.get(DeploymentGeneration, generation.id)
+    assert recovered.status is GenerationStatus.outcome_unknown
+    assert (
+        recovered.carrier_job_id,
+        recovered.carrier_job_status,
+        recovered.carrier_job_result,
+        recovered.carrier_job_error,
+    ) == (generation.job_id, "failed", result, error)
+
+
+async def test_stale_terminalization_cannot_stamp_a_newer_carrier(adapter_client, rival_engine):
+    from nso_adapter.core.generation import _terminalize_generations
+    from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, Job, JobStatus, JobType
+
+    device_id = await _device("gen-stale-terminalization", 16114)
+    await _vlan(device_id, 114)
+    await _push(adapter_client, device_id)
+
+    rival_session = async_sessionmaker(rival_engine, expire_on_commit=False)
+    async with session() as stale_db:
+        stale_generation = await stale_db.scalar(
+            sa.select(DeploymentGeneration).where(DeploymentGeneration.device_id == device_id)
+        )
+        old_job_id = stale_generation.job_id
+
+        async with rival_session() as rival_db:
+            newer_job = Job(
+                job_type=JobType.apply,
+                status=JobStatus.running,
+                coalescible=False,
+                device_id=device_id,
+                result={"execution": "newer"},
+            )
+            rival_db.add(newer_job)
+            await rival_db.flush()
+            await rival_db.execute(
+                sa.update(DeploymentGeneration)
+                .where(DeploymentGeneration.id == stale_generation.id)
+                .values(job_id=newer_job.id, status=GenerationStatus.running)
+            )
+            await rival_db.commit()
+
+        assert stale_generation.job_id == old_job_id
+        landed = await _terminalize_generations(
+            stale_db,
+            [stale_generation],
+            outcome=GenerationStatus.outcome_unknown,
+            expected_statuses=(GenerationStatus.running,),
+        )
+        await stale_db.commit()
+
+    assert landed == set()
+    async with session() as db:
+        current = await db.get(DeploymentGeneration, stale_generation.id)
+    assert current.status is GenerationStatus.running
+    assert current.job_id == newer_job.id
+    assert (
+        current.carrier_job_id,
+        current.carrier_job_status,
+        current.carrier_job_result,
+        current.carrier_job_error,
+    ) == (None, None, None, None)
+
+
+async def test_abandon_snapshots_the_current_carrier(adapter_client):
+    from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, Job
+
+    device_id = await _blocked_device(adapter_client, "gen-carrier-abandon", 16113)
+    (generation,) = await _generations(device_id)
+    result = {"operator_evidence": "current"}
+    error = {"code": "device_refused", "message": "current carrier evidence", "detail": {}}
+    async with session() as db:
+        await db.execute(sa.update(Job).where(Job.id == generation.job_id).values(result=result, error=error))
+        await db.commit()
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/abandon-generation",
+        headers=_AUTH,
+    )
+
+    assert response.status_code == 202, response.text
+    async with session() as db:
+        abandoned = await db.get(DeploymentGeneration, generation.id)
+    assert abandoned.status is GenerationStatus.abandoned
+    assert (
+        abandoned.carrier_job_id,
+        abandoned.carrier_job_status,
+        abandoned.carrier_job_result,
+        abandoned.carrier_job_error,
+    ) == (generation.job_id, "failed", result, error)
+
+
 # ── §G1: one generation per authorized write, ordered, immutable ─────────────
 
 
@@ -1844,7 +1994,7 @@ async def _normalized_barrier_state(device_id: int, *, ignored_job_ids: tuple[in
                 value = f"generation-{generation.seq}"
             elif column.key == "device_id":
                 value = "device"
-            elif column.key == "job_id":
+            elif column.key in {"job_id", "carrier_job_id"}:
                 value = job_names.get(value)
             elif column.key == "digest":
                 value = "valid" if valid_digest else "invalid"
