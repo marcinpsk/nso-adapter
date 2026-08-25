@@ -10,6 +10,8 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from nso_adapter import __version__
 from nso_adapter.api.actions import router as actions_router
@@ -18,7 +20,14 @@ from nso_adapter.api.bgp import router as bgp_router
 from nso_adapter.api.capability import router as capability_router
 from nso_adapter.api.config import router as config_router
 from nso_adapter.api.devices import router as devices_router
-from nso_adapter.api.errors import ApiError, api_error_handler, validation_error_handler
+from nso_adapter.api.errors import (
+    ApiError,
+    api_error_handler,
+    framework_http_error_handler,
+    projection_gone_handler,
+    unhandled_exception_response,
+    validation_error_handler,
+)
 from nso_adapter.api.health import router as health_router
 from nso_adapter.api.intent import router as intent_router
 from nso_adapter.api.interface_ip import router as interface_ip_router
@@ -43,8 +52,17 @@ from nso_adapter.api.subinterface import router as subinterface_router
 from nso_adapter.api.svi import router as svi_router
 from nso_adapter.api.vlan import router as vlan_router
 from nso_adapter.config import get_config, get_env_settings
+from nso_adapter.core.generation import DeviceProjectionGone
 from nso_adapter.core.importer import register_nso_client, set_netbox_client
-from nso_adapter.core.request_flags import DELETE_ORIGIN, STORE_ONLY, parse_store_only
+from nso_adapter.core.request_flags import (
+    DELETE_ORIGIN,
+    PUSH_SEQ,
+    PUSH_SEQ_VALIDATION_MESSAGE,
+    STORE_ONLY,
+    InvalidPushSequence,
+    parse_push_seq,
+    parse_store_only,
+)
 from nso_adapter.core.scheduler import start_scheduler, stop_scheduler
 from nso_adapter.core.worker import start_workers, stop_workers
 from nso_adapter.notifications.persistent_subscriber import persistent_subscriber
@@ -361,7 +379,9 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="NSO Adapter", version=__version__, lifespan=lifespan)
     app.add_exception_handler(ApiError, api_error_handler)
+    app.add_exception_handler(StarletteHTTPException, framework_http_error_handler)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
+    app.add_exception_handler(DeviceProjectionGone, projection_gone_handler)
 
     @app.middleware("http")
     async def _store_only_flag(request, call_next):
@@ -370,13 +390,39 @@ def create_app() -> FastAPI:
         # object DELETION, so a shrink may retract from the device (unmarked shrinks
         # detach instead, #106). Both guarded at the enqueue choke points in core.
         # See core/request_flags.py for why these are request-scoped, not per-endpoint.
+        # X-Push-Seq is the plugin claim's identity: the key receipt admission dedupes on
+        # (#1522 §G2). A present header that cannot be a claim identity is refused HERE,
+        # before any handler runs — downgrading it to an unkeyed write would silently drop
+        # this delivery's replay protection.
+        try:
+            seq = parse_push_seq(request.headers.get("X-Push-Seq"))
+        except InvalidPushSequence:
+            return JSONResponse(
+                status_code=422,
+                content={"error": {"code": "validation_error", "message": PUSH_SEQ_VALIDATION_MESSAGE, "detail": {}}},
+            )
         token = STORE_ONLY.set(parse_store_only(request.query_params.get("store_only")))
         del_token = DELETE_ORIGIN.set(parse_store_only(request.query_params.get("delete_origin")))
+        seq_token = PUSH_SEQ.set(seq)
         try:
             return await call_next(request)
         finally:
+            PUSH_SEQ.reset(seq_token)
             DELETE_ORIGIN.reset(del_token)
             STORE_ONLY.reset(token)
+
+    # Registered LAST so it is the OUTERMOST user middleware — Starlette inserts each one at
+    # the front of the stack — and therefore also covers the middleware above.
+    @app.middleware("http")
+    async def _seal_unhandled_exception(request, call_next):
+        # NOT add_exception_handler(Exception, ...): that routes to ServerErrorMiddleware,
+        # which RE-RAISES after responding, and the ASGI server then logs the raw traceback
+        # — the one copy nobody redacts. Answering here re-raises nothing. Specific handlers
+        # sit deeper (ExceptionMiddleware) and still win; this is the last resort.
+        try:
+            return await call_next(request)
+        except Exception as exc:
+            return unhandled_exception_response(request, exc)
 
     app.include_router(health_router)
     app.include_router(nso_instances_router)

@@ -38,6 +38,75 @@ async def _get_job(job_id: int) -> Job:
         return await db.get(Job, job_id)
 
 
+async def test_generation_advancement_retries_transient_failures(monkeypatch):
+    """A transient failure does not strand a pending successor until restart."""
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core import generation
+
+    calls = 0
+    delays: list[float] = []
+    secret_marker = "placeholder-secret-marker"
+
+    async def advance(_device_id: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise RuntimeError(f"transient database failure: {secret_marker}")
+
+    async def record_delay(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(generation, "advance_device_generations", advance)
+    monkeypatch.setattr(worker.asyncio, "sleep", record_delay)
+
+    with capture_logs() as logs:
+        await worker._advance_generations(17)
+
+    assert calls == 3
+    assert delays == [0.5, 1.0]
+    retries = [entry for entry in logs if entry["event"] == "worker.generation_advance_retry"]
+    assert [entry["attempt"] for entry in retries] == [1, 2]
+    assert all(entry["exception_type"] == "RuntimeError" for entry in retries)
+    assert all("error" not in entry for entry in retries)
+    assert secret_marker not in repr(logs)
+
+
+async def test_generation_advancement_logs_once_after_retries_are_exhausted(monkeypatch):
+    """A persistent failure is reported once and does not escape the finished run."""
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core import generation
+
+    calls = 0
+    secret_marker = "placeholder-secret-marker"
+
+    async def fail(_device_id: int) -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError(f"persistent database failure: {secret_marker}")
+
+    async def skip_delay(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(generation, "advance_device_generations", fail)
+    monkeypatch.setattr(worker.asyncio, "sleep", skip_delay)
+
+    with capture_logs() as logs:
+        await worker._advance_generations(18)
+
+    failures = [entry for entry in logs if entry["event"] == "worker.generation_advance_failed"]
+    assert calls == 3
+    assert len(failures) == 1, failures
+    (failure,) = failures
+    assert failure["log_level"] == "error"
+    assert failure["attempts"] == 3
+    assert failure["device_id"] == 18
+    assert failure["exception_type"] == "RuntimeError"
+    assert "error" not in failure
+    assert secret_marker not in repr(logs)
+
+
 # ── _claim_next_job ─────────────────────────────────────────────────────────────
 
 

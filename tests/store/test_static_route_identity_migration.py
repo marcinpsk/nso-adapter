@@ -272,9 +272,19 @@ def test_downgrade_restores_the_previous_shape(pg_admin):
             assert "uq_sr_intent_device_route_id" not in _index_predicates(engine, "static_route_intent")
             assert _deferrability(engine, "uq_staticrouteintent_identity") == (False, False)
 
+        # Every object the downgrade removed comes back: a re-upgrade that recreates only
+        # some of them is the half-reversible migration this test exists to catch.
         _alembic(sync_url, "upgrade", module.revision)
         with _engine_on(sync_url) as engine:
             assert "static_route_tombstone" in sa.inspect(engine).get_table_names()
+            cols = {c["name"] for c in sa.inspect(engine).get_columns("static_route_intent")}
+            assert "route_id" in cols
+            assert "deployed_key" in cols
+            assert _index_predicates(engine, "static_route_intent")["uq_sr_intent_device_route_id"] == (
+                ("device_id", "route_id"),
+                True,
+                _PARTIAL_UNIQUE_PREDICATE,
+            )
             assert _deferrability(engine, "uq_staticrouteintent_identity") == (True, True)
 
 

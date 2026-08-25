@@ -25,7 +25,9 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
-      - name: Check out main with full history
+      # Credentials MUST persist here: the baseline step below pushes a tag and
+      # semantic-release pushes the version commit through this same git remote.
+      - name: Check out main with full history  # zizmor: ignore[artipacked]
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.ref_name }}

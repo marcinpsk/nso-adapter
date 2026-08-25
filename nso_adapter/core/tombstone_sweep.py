@@ -23,6 +23,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import acquire_claim, claim_session, lock_claim, release_claim
+from nso_adapter.core.static_route_plan import as_triple, triple_of
 from nso_adapter.store.models import Job, JobStatus, JobType, StaticRouteTombstone
 
 logger = structlog.get_logger(__name__)
@@ -55,11 +56,46 @@ def _removal_context(row: StaticRouteTombstone) -> dict:
     **delete-origin** retract into a no-networking retry — a destructive-semantics flip,
     not a cosmetic default.
     """
+    triple = triple_of(row)
+    removed = [triple]
+    deployed = as_triple(row.deployed_key)
+    if deployed is not None and deployed != triple:
+        removed.append(deployed)
     return {
         "scope": "static_route",
-        "removed": {"route": [[row.vrf, row.prefix, row.next_hop]]},
+        "removed": {"route": [list(key) for key in removed]},
         "detach": row.marking == "detach",
+        "tombstone_ids": [row.id],
     }
+
+
+async def reissue_removal_job(conn: AsyncSession, device_id: int, row: StaticRouteTombstone) -> Job:
+    """Re-issue *row*'s removal as a generation and the job that carries it. Caller commits.
+
+    Shared by the sweeper and the reclaimer, which are the same operation reached from two
+    directions: a deletion an earlier push already authorized still has no proof of delivery.
+    It PROMOTES NOTHING — there is no new operator intent — but it does take a place in the
+    device's ordered chain, so it cannot cross a blocked head and a later push cannot cross
+    it (#1522 §H2).
+    """
+    from nso_adapter.core.generation import create_reissue_generation
+    from nso_adapter.store.models import GenerationMode
+
+    context = _removal_context(row)
+    generation = await create_reissue_generation(
+        conn,
+        device_id,
+        mode=GenerationMode.detach if context["detach"] else GenerationMode.networked,
+        removal_context=context,
+        allowed_removal_keys=context["removed"],
+    )
+    job = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued, context=context)
+    conn.add(job)
+    await conn.flush()
+    generation.job_id = job.id
+    row.job_id = job.id
+    await conn.flush()
+    return job
 
 
 async def _devices_with_eligible_tombstones(db: AsyncSession | None = None) -> list[int]:
@@ -124,15 +160,7 @@ async def sweep_one_device(device_id: int, *, db: AsyncSession | None = None) ->
                 .all()
             )
             for row in rows:
-                job = Job(
-                    job_type=JobType.removal,
-                    device_id=device_id,
-                    status=JobStatus.queued,
-                    context=_removal_context(row),
-                )
-                conn.add(job)
-                await conn.flush()
-                row.job_id = job.id
+                await reissue_removal_job(conn, device_id, row)
                 created += 1
             await conn.commit()
     finally:

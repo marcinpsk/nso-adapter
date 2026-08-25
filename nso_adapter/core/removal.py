@@ -29,6 +29,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, JobError, error_envelope
+from nso_adapter.core.projection import stream_for_model
 
 logger = structlog.get_logger(__name__)
 
@@ -680,7 +681,36 @@ async def _guarded_apply(client, device, scope: str, context: dict | None, apply
     return await apply_thunk(replace=True)
 
 
-async def _replace_simple(db: AsyncSession, device, client, scope: str, context: dict | None = None) -> None:
+async def _replacement_rows(db: AsyncSession, device, scope: str, model, job_id: int | None) -> list:
+    """Return the rows the PUT-replace body asserts: the generation's document, or the store.
+
+    A removal is a full-document write too, so the same race applies (#1522 §G1): between the
+    worker committing ``running`` and this read, a successor push can commit, and a
+    live-store body would retract under this generation's identity whatever the successor
+    happens to have removed. For a promoted document-executed section the body therefore
+    comes from the stored document. A force reissue promotes no stream and retains the live
+    store used by the operator override. Everything else still reads the store. See
+    :data:`core.projection.LIVE_READ_SECTIONS`.
+    """
+    from nso_adapter.core.generation import executing_generation
+    from nso_adapter.core.projection import DOCUMENT_EXECUTED_SECTIONS, hydrate_section
+
+    if scope in DOCUMENT_EXECUTED_SECTIONS and job_id is not None:
+        generation = await executing_generation(db, job_id)
+        if generation is None:
+            raise RuntimeError(f"removal job {job_id} for scope {scope!r} carries no generation to deploy")
+        if generation.stream_revisions:
+            return [row for row in hydrate_section(generation.document, scope).get(model, []) if row.accepted_at]
+    return list(
+        (await db.execute(select(model).where(model.device_id == device.id, model.accepted_at.is_not(None))))
+        .scalars()
+        .all()
+    )
+
+
+async def _replace_simple(
+    db: AsyncSession, device, client, scope: str, context: dict | None = None, *, job_id: int | None = None
+) -> None:
     """PUT-replace a single-model service with its remaining accepted rows."""
     from nso_adapter.nso import apply as nso_apply
     from nso_adapter.store import models as store_models
@@ -688,11 +718,7 @@ async def _replace_simple(db: AsyncSession, device, client, scope: str, context:
     model_name, apply_name = _SIMPLE_TARGETS[scope]
     model = getattr(store_models, model_name)
     apply_fn = getattr(nso_apply, apply_name)
-    rows = (
-        (await db.execute(select(model).where(model.device_id == device.id, model.accepted_at.is_not(None))))
-        .scalars()
-        .all()
-    )
+    rows = await _replacement_rows(db, device, scope, model, job_id)
     extra: dict = {}
     if scope in _NED_DIALECT_SCOPES:
         extra["ned_id"] = device.ned_id
@@ -760,9 +786,10 @@ def _sr_triple(key) -> tuple[str, str, str]:
 async def _sr_authorization(db: AsyncSession, device, context: dict, *, job_id: int | None):
     """Return ``(tombstones, authorized, claimed, rows, reclaimed)`` — §4.3's steps 1 and 2.
 
-    ``authorized`` is what this job may drop: its OWN tombstones' ``{triple} ∪ {deployed_key}``
-    (X6; a NULL ``deployed_key`` contributes nothing), or ``context["removed"]["route"]`` when
-    it owns none — minus every key a live intent row still claims. That subtraction is
+    ``authorized`` is what this job may drop: the exact tombstones named by a reissue
+    generation, otherwise its OWN tombstones' ``{triple} ∪ {deployed_key}`` (X6; a NULL
+    ``deployed_key`` contributes nothing), or ``context["removed"]["route"]`` when it has no
+    tombstone carrier — minus every key a live intent row still claims. That subtraction is
     ownership, not eligibility: another route reclaiming the key means the key is no longer
     this deletion's to drop.
     """
@@ -770,7 +797,28 @@ async def _sr_authorization(db: AsyncSession, device, context: dict, *, job_id: 
     from nso_adapter.store.models import StaticRouteIntent, StaticRouteTombstone
 
     tombstones = []
-    if job_id is not None:
+    context_has_tombstones = "tombstone_ids" in context
+    if context_has_tombstones:
+        tombstone_ids = context["tombstone_ids"]
+        if not isinstance(tombstone_ids, list) or not all(
+            isinstance(tombstone_id, int) and not isinstance(tombstone_id, bool) for tombstone_id in tombstone_ids
+        ):
+            raise ValueError("static_route removal context carries invalid tombstone_ids")
+        tombstones = list(
+            (
+                await db.execute(
+                    select(StaticRouteTombstone)
+                    .where(
+                        StaticRouteTombstone.device_id == device.id,
+                        StaticRouteTombstone.id.in_(sorted(set(tombstone_ids))),
+                    )
+                    .order_by(StaticRouteTombstone.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    elif job_id is not None:
         tombstones = list(
             (
                 await db.execute(
@@ -789,7 +837,7 @@ async def _sr_authorization(db: AsyncSession, device, context: dict, *, job_id: 
         deployed = as_triple(tomb.deployed_key)
         if deployed is not None:
             authorized.add(deployed)
-    if not tombstones:
+    if not tombstones and not context_has_tombstones:
         for key in (context.get("removed") or {}).get("route") or []:
             authorized.add(_sr_triple(key))
 
@@ -1581,7 +1629,7 @@ async def _dispatch_scope(
     elif scope == "interface_config":
         await _replace_interface_config(db, device, client, (context or {}).get("interfaces") or [])
     elif scope in _SIMPLE_TARGETS:
-        await _replace_simple(db, device, client, scope, context)
+        await _replace_simple(db, device, client, scope, context, job_id=job_id)
     else:
         raise ValueError(f"Unknown removal scope {scope!r}")
     return None
@@ -1592,6 +1640,7 @@ async def enqueue_removal(
     device_id: int,
     scope: str,
     *,
+    promotes: tuple[str, ...],
     interfaces: list[str] | None = None,
     removed: dict[str, list] | None = None,
     vault_refs: dict[str, str] | None = None,
@@ -1603,6 +1652,12 @@ async def enqueue_removal(
 
     Non-blocking: the intent PUT returns immediately and the worker runs the
     (potentially slow) device commit in the background via :func:`run_removal`.
+
+    *promotes* names the projection STREAMS this removal authorizes, and it is stated by the
+    caller rather than derived from *scope*: two endpoints share the ``interface_config``
+    scope and two share ``isis``, so promoting the whole section would authorize the sibling
+    lane's un-promoted store-only state (#103). An endpoint passes its own delivery stream.
+    *force* names none — see below.
     *interfaces* scopes an ``interface_config`` removal to the affected interface names.
     *removed* maps each YANG list to the keys the trigger JUST deleted so the
     collateral guard can tell an intended retraction from an orphaned service row;
@@ -1623,9 +1678,18 @@ async def enqueue_removal(
     intent re-sync, tracker #103): a store shrink then reconciles the intent mirror
     only and must never retract FASTMAP-owned config from the device. *force* is
     exempt — the operator force-removal action is an explicit device flush.
+
+    *force* is also the one caller that PROMOTES NOTHING. It re-deploys state an earlier
+    push already authorized, with the collateral guard off, so its generation is a reissue
+    (:func:`core.generation.create_reissue_generation`) carrying ``stream_revisions={}``: no
+    store write stands behind it to authorize, and there is nothing for its settlement to
+    certify. Promoting the family's streams instead authorized — and then marked applied —
+    whatever un-promoted store-only state the sibling lanes held, for instances this job does
+    not even send (``interface_config`` flushes exactly *interfaces*).
     """
+    from nso_adapter.core.generation import attach_to_job, create_generation, create_reissue_generation
     from nso_adapter.core.request_flags import DELETE_ORIGIN, STORE_ONLY
-    from nso_adapter.store.models import Job, JobStatus, JobType
+    from nso_adapter.store.models import GenerationMode, Job, JobStatus, JobType
 
     if scope not in VALID_REMOVAL_SCOPES:
         raise ValueError(f"Unknown removal scope {scope!r}")
@@ -1667,6 +1731,25 @@ async def enqueue_removal(
         # owned scalar (#83, above) or the operator's force-removal may retract config
         # from the live device.
         context["detach"] = True
+    # The mode is part of the generation's identity, so it is decided HERE, with the push
+    # that authorized it, and frozen. A later job may not reinterpret an un-own as a
+    # networked retraction (#106) or a marked deletion as a detach (the lost deletion).
+    mode = GenerationMode.detach if context.get("detach") else GenerationMode.networked
+    # The context rides the GENERATION either way, not only the job: a retry of a blocked
+    # head has to rebuild a job that commits the same operation, down to the detach flag.
+    if force:
+        if promotes:
+            raise ValueError(f"a force-removal of {scope!r} promotes nothing; got {promotes!r}")
+        generation = await create_reissue_generation(db, device_id, mode=mode, removal_context=context)
+    else:
+        generation = await create_generation(
+            db,
+            device_id,
+            streams=promotes,
+            mode=mode,
+            allowed_removal_keys=context.get("removed") or {},
+            removal_context=context,
+        )
     job = Job(
         job_type=JobType.removal,
         device_id=device_id,
@@ -1675,6 +1758,7 @@ async def enqueue_removal(
     )
     db.add(job)
     await db.flush()
+    await attach_to_job(db, generation, job)
     logger.info("removal.enqueued", device_id=device_id, scope=scope, job_id=job.id)
     return job
 
@@ -1879,9 +1963,10 @@ async def replace_on_removal(
     rather than detaching (#106's default). Without this the nine simple scopes would
     detect a clear and still commit it ``no-networking`` — a no-op.
 
-    These callers invoke this AFTER committing their row deletes, so the enqueued
-    job is committed here. (OSPF/BGP call :func:`enqueue_removal` directly, before
-    their own commit, to persist the deletes and the job atomically.)
+    Does NOT commit, and must be called BEFORE the caller's own commit (#1522 §G1): the
+    shrink, the deployment generation that authorizes it and the job that carries it are one
+    transaction. The previous shape — commit the deletes, then enqueue — had a crash
+    boundary in between that left a mutation with nothing authorized to deploy it.
     """
     if not removed and not retract:
         return False
@@ -1893,11 +1978,11 @@ async def replace_on_removal(
         db,
         device.id,
         scope,
+        # The stream comes from the same model the scope does, so a model that later moves
+        # into a split section promotes ITS lane and not its sibling's.
+        promotes=(stream_for_model(store_model),),
         removed=removed_map(scope, removed) if removed else None,
         retract=retract,
         shrank=bool(removed),
     )
-    if job is None:  # store-only request — the shrink stays store-side
-        return False
-    await db.commit()
-    return True
+    return job is not None  # None = store-only request; the shrink stays store-side

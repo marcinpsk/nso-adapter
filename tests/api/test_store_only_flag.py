@@ -239,6 +239,30 @@ async def test_store_only_skips_auto_apply(adapter_client):
     assert await _jobs(device_id) == []
 
 
+@pytest.mark.anyio
+async def test_store_only_manual_apply_is_rejected_without_a_job(adapter_client):
+    """Manual Apply is a device write. It cannot run under a store-only request."""
+    device_id = await seed_device(nso_device_name="so-manual-apply", netbox_device_id=988)
+    stored = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/vlan-intent?store_only=true",
+        json={"vlans": [{"vlan_id": 10, "name": "ten"}]},
+        headers=AUTH,
+    )
+    assert stored.status_code == 200, stored.text
+
+    response = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/apply?store_only=true", headers=AUTH)
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "validation_error",
+            "message": "store_only is not valid for the Apply action",
+            "detail": {},
+        }
+    }
+    assert await _jobs(device_id) == []
+
+
 # ── flag parsing + the force-removal exemption ──────────────────────────────
 
 

@@ -14,7 +14,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
+from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.store import outcome_store
@@ -181,9 +182,14 @@ class IpIntentResult(BaseModel):
     "/{device_id}/ip-intent",
     dependencies=[Depends(verify_token)],
     response_model=IpIntentResult,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_PUSH_SEQ, **RESP_422_VALIDATION},
 )
-async def put_ip_intent(device_id: int, body: IpIntentUpdate, db: AsyncSession = Depends(get_db)):
+async def put_ip_intent(
+    device_id: int,
+    body: IpIntentUpdate,
+    db: AsyncSession = Depends(get_db),
+    delivery=Depends(get_intent_delivery),
+):
     """Replace the adapter's IP intent mirror for this device atomically.
 
     Full-replace semantics: rows not present in the request body are deleted.
@@ -193,6 +199,14 @@ async def put_ip_intent(device_id: int, body: IpIntentUpdate, db: AsyncSession =
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+
+    # Every accepted write records its projection revision, store-only and
+    # auto-apply-off included, and takes the device's projection lock before anything is
+    # read (#1522 §G2). Only a promotion authorizes a deployment.
+    from nso_adapter.core.receipt import record_response
+
+    if (replay := await begin_delivery(db, device_id, delivery)) is not None:
+        return replay
 
     ifaces_result = await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))
     ifaces = {iface.name: iface for iface in ifaces_result.scalars().all()}
@@ -282,13 +296,6 @@ async def put_ip_intent(device_id: int, body: IpIntentUpdate, db: AsyncSession =
 
     await db.flush()
 
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
-    if settings and settings.auto_apply and count > 0:
-        from nso_adapter.core.apply import enqueue_apply
-
-        await enqueue_apply(db, device_id, force=True)
-
     # Removal propagation: a merge-PATCH apply can't drop an address the payload removed, so
     # enqueue an interface_config removal (PUT-replace/DELETE per affected interface) — mirrors
     # every other service's replace_on_removal, and always runs (removal is not auto_apply-gated).
@@ -296,23 +303,37 @@ async def put_ip_intent(device_id: int, body: IpIntentUpdate, db: AsyncSession =
     if removed_interfaces:
         from nso_adapter.core.removal import enqueue_removal
 
-        await enqueue_removal(
-            db,
-            device_id,
-            "interface_config",
-            interfaces=sorted(removed_interfaces),
-            removed={"address": removed_addresses},
+        replaced = (
+            await enqueue_removal(
+                db,
+                device_id,
+                "interface_config",
+                # The ADDRESS lane only: an un-promoted store-only write to the attribute lane
+                # is not authorized by an address push (#103).
+                promotes=(delivery.stream,),
+                interfaces=sorted(removed_interfaces),
+                removed={"address": removed_addresses},
+            )
+            is not None
         )
-        replaced = True
 
-    await db.commit()
-    logger.info(
-        "ip_intent.put.ok", device_id=device_id, address_count=count, removed_interfaces=len(removed_interfaces)
-    )
-    return {
+    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    settings = settings_result.scalar_one_or_none()
+    if settings and settings.auto_apply and count > 0:
+        from nso_adapter.core.apply import enqueue_apply
+
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
+
+    result = {
         "device_id": device_id,
         "address_count": count,
         "removed_interfaces": len(removed_interfaces),
         "replaced": replaced,
         "updated_at": iso_z(now),
     }
+    await record_response(db, device_id, delivery, result)
+    await db.commit()
+    logger.info(
+        "ip_intent.put.ok", device_id=device_id, address_count=count, removed_interfaces=len(removed_interfaces)
+    )
+    return result

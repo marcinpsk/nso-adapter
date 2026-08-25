@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, note_projection_write, seed_device, session
 
 pytestmark = pytest.mark.anyio
 
@@ -166,7 +166,8 @@ async def test_apply_admitted_while_removal_queued(adapter_client):
     await _add_job(device_id, JobType.removal, JobStatus.queued, context={"scope": "static_route"})
 
     async with session() as db:
-        job = await enqueue_apply(db, device_id, force=True)
+        await note_projection_write(db, device_id, "static_route")
+        job = await enqueue_apply(db, device_id, force=True, stream="static_route")
         await db.commit()
     assert job is not None, "a queued removal blocked the apply"
 
@@ -179,7 +180,8 @@ async def test_second_queued_apply_is_refused(adapter_client):
     await _add_job(device_id, JobType.apply, JobStatus.queued)
 
     async with session() as db:
-        assert await enqueue_apply(db, device_id, force=True) is None
+        await note_projection_write(db, device_id, "vlan")
+        assert await enqueue_apply(db, device_id, force=True, stream="vlan") is None
 
 
 # ── Q4: the index enforces it at the database ────────────────────────────────

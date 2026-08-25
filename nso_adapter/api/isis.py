@@ -14,7 +14,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
+from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.core.removal import is_cleared
@@ -481,7 +482,7 @@ async def _sync_isis_redistribution(
     return deleted, cleared
 
 
-async def _maybe_enqueue_isis_apply(db, device_id: int, iface_count: int, proc_count: int) -> None:
+async def _maybe_enqueue_isis_apply(db, device_id: int, iface_count: int, proc_count: int, *, stream: str) -> None:
     """Enqueue an apply job when auto_apply is on and the payload changed something."""
     from nso_adapter.store.models import DeviceSettings
 
@@ -491,7 +492,7 @@ async def _maybe_enqueue_isis_apply(db, device_id: int, iface_count: int, proc_c
     if settings and settings.auto_apply and (iface_count > 0 or proc_count > 0):
         from nso_adapter.core.apply import enqueue_apply
 
-        await enqueue_apply(db, device_id, force=True)
+        await enqueue_apply(db, device_id, force=True, stream=stream)
 
 
 class IsisInterfaceIntentResult(BaseModel):
@@ -504,10 +505,13 @@ class IsisInterfaceIntentResult(BaseModel):
     "/{device_id}/isis-interface-intent",
     dependencies=[Depends(verify_token)],
     response_model=IsisInterfaceIntentResult,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_PUSH_SEQ, **RESP_422_VALIDATION},
 )
 async def put_isis_interface_intent(
-    device_id: int, body: IsisInterfaceIntentUpdate, db: AsyncSession = Depends(get_db)
+    device_id: int,
+    body: IsisInterfaceIntentUpdate,
+    db: AsyncSession = Depends(get_db),
+    delivery=Depends(get_intent_delivery),
 ):
     """Replace the adapter's IS-IS interface and process intent mirror for this device atomically.
 
@@ -518,6 +522,14 @@ async def put_isis_interface_intent(
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+
+    # Every accepted write records its projection revision, store-only and
+    # auto-apply-off included, and takes the device's projection lock before anything is
+    # read (#1522 §G2). Only a promotion authorizes a deployment.
+    from nso_adapter.core.receipt import record_response
+
+    if (replay := await begin_delivery(db, device_id, delivery)) is not None:
+        return replay
 
     now = datetime.now(UTC)
 
@@ -594,7 +606,6 @@ async def put_isis_interface_intent(
         state_fields=("wide_metrics_only", "labeled_preference", "disabled"),
     )
     redist_deleted, redist_cleared = await _sync_isis_redistribution(db, device_id, body.processes, now)
-    await _maybe_enqueue_isis_apply(db, device_id, iface_count, proc_count)
 
     # A merge-PATCH apply never drops a cleared/deleted leaf, so retracting owned IS-IS
     # intent needs a PUT-replace. Queue the async ``isis`` removal job — it re-asserts the
@@ -619,13 +630,18 @@ async def put_isis_interface_intent(
             db,
             device_id,
             "isis",
+            promotes=(delivery.stream,),
             removed={"interface-config": removed_ifaces, "process-config": removed_procs},
             retract=cleared,
             shrank=deleted,
         )
 
+    await _maybe_enqueue_isis_apply(db, device_id, iface_count, proc_count, stream=delivery.stream)
+
+    result = {"device_id": device_id, "interface_count": iface_count, "process_count": proc_count}
+    await record_response(db, device_id, delivery, result)
     await db.commit()
-    return {"device_id": device_id, "interface_count": iface_count, "process_count": proc_count}
+    return result
 
 
 class IsisFlexAlgoEntry(BaseModel):
@@ -653,9 +669,14 @@ class IsisFlexAlgoIntentResult(BaseModel):
     "/{device_id}/isis-flex-algo-intent",
     dependencies=[Depends(verify_token)],
     response_model=IsisFlexAlgoIntentResult,
-    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_409_PUSH_SEQ, **RESP_422_VALIDATION},
 )
-async def put_isis_flex_algo_intent(device_id: int, body: IsisFlexAlgoIntentUpdate, db: AsyncSession = Depends(get_db)):
+async def put_isis_flex_algo_intent(
+    device_id: int,
+    body: IsisFlexAlgoIntentUpdate,
+    db: AsyncSession = Depends(get_db),
+    delivery=Depends(get_intent_delivery),
+):
     """Replace the adapter's IS-IS Flex-Algorithm intent mirror for this device atomically.
 
     Full-replace semantics: rows not present in the request body are deleted.
@@ -665,6 +686,14 @@ async def put_isis_flex_algo_intent(device_id: int, body: IsisFlexAlgoIntentUpda
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+
+    # Every accepted write records its projection revision, store-only and
+    # auto-apply-off included, and takes the device's projection lock before anything is
+    # read (#1522 §G2). Only a promotion authorizes a deployment.
+    from nso_adapter.core.receipt import record_response
+
+    if (replay := await begin_delivery(db, device_id, delivery)) is not None:
+        return replay
 
     now = datetime.now(UTC)
 
@@ -719,15 +748,6 @@ async def put_isis_flex_algo_intent(device_id: int, body: IsisFlexAlgoIntentUpda
 
     await db.flush()
 
-    from nso_adapter.store.models import DeviceSettings
-
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
-    if settings and settings.auto_apply and count > 0:
-        from nso_adapter.core.apply import enqueue_apply
-
-        await enqueue_apply(db, device_id, force=True)
-
     # A merge-PATCH apply never drops an omitted flex-algo (and a node-level DELETE can't
     # address an empty-string process-tag key), so retracting one needs a PUT-replace of
     # the whole service. Queue the async ``isis`` removal job — :func:`_replace_isis`
@@ -745,9 +765,14 @@ async def put_isis_flex_algo_intent(device_id: int, body: IsisFlexAlgoIntentUpda
     if removed_keys or cleared:
         from nso_adapter.core.removal import enqueue_removal
 
-        job = await enqueue_removal(db, device_id, "isis", retract=cleared, shrank=bool(removed_keys))
+        job = await enqueue_removal(
+            db, device_id, "isis", promotes=(delivery.stream,), retract=cleared, shrank=bool(removed_keys)
+        )
         removal_queued = job is not None
 
-    await db.commit()
+    await _maybe_enqueue_isis_apply(db, device_id, count, 0, stream=delivery.stream)
 
-    return {"device_id": device_id, "flex_algo_count": count, "removal_queued": removal_queued}
+    result = {"device_id": device_id, "flex_algo_count": count, "removal_queued": removal_queued}
+    await record_response(db, device_id, delivery, result)
+    await db.commit()
+    return result

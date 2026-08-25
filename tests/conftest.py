@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import os
 import subprocess
 import sys
+import threading
+import time
 import uuid
 import warnings
 from contextlib import asynccontextmanager
@@ -29,6 +32,17 @@ from nso_adapter.nso.client import NsoClient
 # tests run against real dev data instead of their isolated per-test database.
 os.environ.pop("DATABASE_URL", None)
 
+# Every worker clones its own databases from the one test Postgres.
+MAX_PARALLEL_WORKERS = 8
+
+
+def pytest_xdist_auto_num_workers(config: pytest.Config) -> int:
+    """Cap `-n auto` at the worker count the single test Postgres serves."""
+    from xdist.plugin import pytest_xdist_auto_num_workers as detected_num_workers
+
+    return min(detected_num_workers(config), MAX_PARALLEL_WORKERS)
+
+
 VALID_TOKEN = "test-bearer-token"
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -48,20 +62,39 @@ def _url_for(dbname: str, *, driver: str) -> str:
     return make_url(ADMIN_URL).set(drivername=driver, database=dbname).render_as_string(hide_password=False)
 
 
+#: How long a straggler may take to disappear before it counts as leaked.
+_TEARDOWN_GRACE_S = 15.0
+
+
+def _client_backends(conn, name: str) -> list:
+    # backend_type filter: PG's own autovacuum worker can be inside the clone at DROP
+    # time and is not a leaked test session — only client backends count as stragglers.
+    return conn.exec_driver_sql(
+        "SELECT pid, state FROM pg_stat_activity "
+        f"WHERE datname = '{name}' AND pid <> pg_backend_pid() "
+        "AND backend_type = 'client backend'"
+    ).fetchall()
+
+
 def _drop_database(admin, name: str, *, expect_clean: bool) -> None:
     """Report stragglers BEFORE forcing. FORCE is last-resort cleanup, not the mechanism.
 
     A surviving connection means a fixture failed to close a session — a test bug we want
     visible. Silently FORCE-ing it away is how that bug stays invisible forever.
+
+    Closing is not instantaneous, though: a pooled connection the test already released
+    stays in ``pg_stat_activity`` until its backend actually exits, so a single sample can
+    catch an idle backend mid-disposal and call it a leak. Sample to a deadline instead. NO
+    state is excluded — an ``idle`` connection that never goes away IS the leak this guard
+    exists to catch, and filtering on state would hide exactly that.
     """
     with admin.connect() as conn:
-        # backend_type filter: PG's own autovacuum worker can be inside the clone at DROP
-        # time and is not a leaked test session — only client backends count as stragglers.
-        rows = conn.exec_driver_sql(
-            "SELECT pid, state, left(query, 120) FROM pg_stat_activity "
-            f"WHERE datname = '{name}' AND pid <> pg_backend_pid() "
-            "AND backend_type = 'client backend'"
-        ).fetchall()
+        rows = _client_backends(conn, name)
+        if rows and expect_clean:
+            deadline = time.monotonic() + _TEARDOWN_GRACE_S
+            while rows and time.monotonic() < deadline:
+                time.sleep(0.05)
+                rows = _client_backends(conn, name)
         if rows and expect_clean:
             msg = f"{name}: {len(rows)} connection(s) survived teardown: {rows}"
             if STRICT_TEARDOWN:
@@ -422,6 +455,74 @@ def fake_netbox_client():
     return m
 
 
+# ── the SNMP community Vault fake (CR-A17) ───────────────────────────────────
+# In the ROOT conftest on purpose: pytest parses a subdirectory conftest's fixtures against the
+# Directory node collected at that moment, and an argument list that leaves that directory and
+# comes back rebuilds the node — the fixtures then vanish at setup. See tests/test_conftest_helpers.
+
+# The one community both integrity checks have to reason about, and the ref that names it.
+SNMP_COMMUNITY = "s3cr3t-ro"
+SNMP_VAULT_REF = "network/netbox/snmp/community/prod-ro#community"
+_SNMP_VAULT_PATH = ("network", "netbox/snmp/community/prod-ro")
+
+
+def community_export_name(secret: str) -> str:
+    """The EXPORT's community key — sha256(community string)[:16], never the intent label.
+
+    Deliberately reimplemented here rather than imported from the adapter: this is the
+    network-state-export side of the contract, and a test that computes the expected value with the
+    very function under test proves only that the function agrees with itself.
+    """
+    return hashlib.sha256(secret.encode()).hexdigest()[:16]
+
+
+class FakeVault:
+    """The mount-explicit read surface of VaultSecretsProvider — a real object, not a Mock.
+
+    A MagicMock would answer ``read_path`` with a MagicMock, whose ``.get(key)`` is another
+    MagicMock: ``secret_fingerprint`` would happily hash its repr and the test would go green
+    against a digest that matches nothing on any device. The point of these tests is that two
+    independent code paths derive the SAME digest from the SAME plaintext, so the fake must hold
+    real bytes.
+    """
+
+    def __init__(self, secrets: dict[tuple[str, str], dict[str, str]], *, fail: bool = False):
+        self._secrets = secrets
+        self._fail = fail
+        self.reads = 0
+        self.read_threads: list[int] = []
+
+    def read_path(self, mount: str, path: str) -> dict[str, str]:
+        self.reads += 1
+        # CR-A13: hvac is blocking `requests`. A read that happens on the event-loop thread freezes
+        # the whole adapter for the round-trip — /health stops answering (a liveness probe can then
+        # kill the container mid-write) and the scheduler tick driving failover probes stalls.
+        # Recording the thread is what lets a test PROVE the to_thread hop is really there.
+        self.read_threads.append(threading.get_ident())
+        if self._fail:
+            raise RuntimeError("vault: connection refused")
+        return dict(self._secrets.get((mount, path), {}))
+
+
+@pytest.fixture
+def vault():
+    """Register a Vault provider for the WORKERS (they run outside the request scope), then clear it.
+
+    Call the yielded factory to install one: ``vault()`` for a healthy Vault, ``vault(fail=True)``
+    for an outage. Not calling it at all models the local/env provider — no ``read_path`` — which
+    must land on the same "unverifiable" verdict as an outage.
+    """
+    from nso_adapter.core import snmp_verify
+
+    def _register(**kwargs) -> FakeVault:
+        provider = FakeVault({_SNMP_VAULT_PATH: {"community": SNMP_COMMUNITY}}, **kwargs)
+        snmp_verify.register_secrets_provider(provider)
+        return provider
+
+    yield _register
+    snmp_verify.register_secrets_provider(None)
+
+
 # READSEM S4 golden determinism: the store incarnation is a random per-DB (uuid, born)
 # pair riding every read_state block; golden tests pin it to these fixed values first.
 GOLDEN_INCARNATION = "00000000-0000-0000-0000-000000000001"
@@ -450,7 +551,7 @@ async def seed_device(
     *,
     nso_instance: str = "nso-dev",
     nso_device_name: str = "core-rtr-01",
-    netbox_device_id: int = 42,
+    netbox_device_id: int | None = 42,
     attributes: list[str] | None = None,
 ):
     """Insert a Device + ManagedScope rows and return the Device id.
@@ -490,6 +591,18 @@ async def seed_device(
         return d.id
 
 
+async def note_projection_write(db, device_id: int, stream: str) -> None:
+    """Record the projection write an intent endpoint performs before it enqueues (#1522 §G2).
+
+    Production never reaches ``enqueue_apply``/``enqueue_removal`` without it — the mutation
+    site records the revision the enqueue then promotes — so a test that drives those choke
+    points directly has to perform it too, or the promotion has nothing to authorize.
+    """
+    from nso_adapter.core.generation import note_write
+
+    await note_write(db, device_id, stream)
+
+
 async def start_job(job_id: int) -> int:
     """Stand in for the worker head's ``queued -> running`` transition. Returns the attempt.
 
@@ -507,7 +620,11 @@ async def start_job(job_id: int) -> int:
         if job.status is JobStatus.queued:
             job.status = JobStatus.running
             job.run_attempt = job.run_attempt + 1
+            # Read before the commit: an expire_on_commit session would lazy-load the
+            # expired attribute afterwards, outside the greenlet, and raise MissingGreenlet.
+            attempt = job.run_attempt
             await db.commit()
+            return attempt
         return job.run_attempt
 
 

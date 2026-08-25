@@ -25,14 +25,23 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
 
+      # --locked: fail on a lockfile that no longer matches pyproject instead of
+      # silently rewriting it, which is what lets a version bump reach a release
+      # with a stale lock.
       - name: Sync dependencies
-        run: uv sync --all-groups
+        run: uv sync --all-groups --locked
 
       - name: Ruff lint
         run: uv run --native-tls -- ruff check .
 
       - name: Ruff format check
         run: uv run --native-tls -- ruff format --check .
+
+      # GitHub Actions security audit, from the version pinned in [dependency-groups].dev
+      # that `uv sync` above installed. The parity guard verifies that this target covers
+      # every repository file matched by the pinned hook's upstream pattern.
+      - name: Zizmor (GitHub Actions security audit)
+        run: uv run --native-tls -- zizmor .github
 
   container-smoke:
     name: Container runtime smoke test
@@ -88,8 +97,11 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
 
+      # --locked: fail on a lockfile that no longer matches pyproject instead of
+      # silently rewriting it, which is what lets a version bump reach a release
+      # with a stale lock.
       - name: Sync dependencies
-        run: uv sync --all-groups
+        run: uv sync --all-groups --locked
 
       # NOT a `services:` container: GitHub service containers cannot override the
       # image CMD, so the tmpfs + fsync=off tuning that the per-test

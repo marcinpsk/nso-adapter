@@ -458,6 +458,74 @@ async def test_put_bgp_intent_redistribution_removal_enqueues_removal_job(adapte
     assert job is not None  # redistribution removal alone triggers the bgp removal job
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("field", "cleared_value", "case"),
+    [
+        ("route_map", None, "route-map-none"),
+        ("metric", None, "metric-none"),
+        ("route_map", "", "route-map-empty"),
+    ],
+)
+async def test_clearing_retained_redistribution_retracts_only_that_leaf(adapter_client, field, cleared_value, case):
+    """A retained redistribution clear executes one full BGP PUT without the cleared leaf."""
+    from nso_adapter.store.models import DeploymentGeneration, GenerationMode, Job, JobType, RedistributionIntent
+    from tests.core.test_generation_protocol import recorded_client, run_head
+
+    seq_tag = {"route-map-none": "0", "metric-none": "1", "route-map-empty": "2"}[case]
+    device_name = f"bgp-redist-clear-{case}"
+    device_id = await seed_device(nso_device_name=device_name, netbox_device_id=None)
+    entry = {"source_protocol": "ospf", "source_ref": "1", "route_map": "RM-A", "metric": 100}
+    first = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent",
+        json={"routers": [_router_with_redist([entry])]},
+        headers=AUTH | {"X-Push-Seq": f"91{seq_tag}1"},
+    )
+    assert first.status_code == 200
+
+    cleared = {**entry, field: cleared_value}
+    second = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent",
+        json={"routers": [_router_with_redist([cleared])]},
+        headers=AUTH | {"X-Push-Seq": f"91{seq_tag}2"},
+    )
+    assert second.status_code == 200
+
+    async with session() as db:
+        row = await db.scalar(select(RedistributionIntent).where(RedistributionIntent.device_id == device_id))
+        jobs = list(
+            (await db.execute(select(Job).where(Job.device_id == device_id, Job.job_type == JobType.removal)))
+            .scalars()
+            .all()
+        )
+        generations = list(
+            (await db.execute(select(DeploymentGeneration).where(DeploymentGeneration.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+    assert getattr(row, field) == cleared_value
+    assert len(jobs) == 1
+    assert jobs[0].context["scope"] == "bgp"
+    assert jobs[0].context.get("detach") is not True
+    assert len(generations) == 1
+    assert generations[0].mode is GenerationMode.networked
+    assert generations[0].job_id == jobs[0].id
+
+    nso_client, recorder = recorded_client(device_name)
+    assert await run_head(device_id, nso_client) == jobs[0].id
+    calls = [call for call in recorder.commits if "bgp-reconciler:bgp-config" in (call["body"] or {})]
+    assert len(calls) == 1
+    assert calls[0]["method"] == "put"
+    sent = calls[0]["body"]["bgp-reconciler:bgp-config"][0]
+    redistribution = sent["router"][0]["scope"][0]["address-family"][0]["redistribute"]
+    expected = {"source-protocol": "ospf", "source-ref": "1"}
+    if field == "route_map":
+        expected["metric"] = 100
+    else:
+        expected["route-map"] = "RM-A"
+    assert redistribution == [expected]
+
+
 # ── cleared owned scalars must retract (#83, the BGP leg) ─────────────────────
 #
 # The BGP PUT DELETEs the whole router→scope→peer→af tree and re-inserts it, so unlike every

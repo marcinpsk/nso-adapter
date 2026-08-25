@@ -141,12 +141,19 @@ async def test_a_slow_vault_write_does_not_stall_the_event_loop(vault_client):
 
     real_write = kv.create_or_update_secret
     gate = threading.Event()
+    entered = threading.Event()
     timeline: dict[str, float] = {}
+    released_by_health: list[bool] = []
+    # Escape hatch, NOT the measurement: /healthz releases the gate in milliseconds whenever
+    # the loop is free, so the bound only has to outlast a loaded runner's scheduling delay —
+    # and it is what makes the broken (on-loop) path terminate instead of hanging the suite.
+    escape_s = 30.0
 
     def _blocking_write(*args, **kwargs):
+        entered.set()
         # Hold the hvac call open exactly as a slow Vault would. A real thread must release
         # it, because on the broken (on-loop) path nothing else can run to do so.
-        gate.wait(timeout=3)
+        released_by_health.append(gate.wait(timeout=escape_s))
         timeline["write_unblocked"] = time.monotonic()
         return real_write(*args, **kwargs)
 
@@ -160,23 +167,23 @@ async def test_a_slow_vault_write_does_not_stall_the_event_loop(vault_client):
         )
 
     async def _health_while_writing():
-        await asyncio.sleep(0.05)  # let the write reach the blocking hvac call
+        assert await asyncio.to_thread(entered.wait, escape_s)
         resp = await client.get("/healthz")
         timeline["health_served"] = time.monotonic()
         gate.set()  # only reachable if the loop was never frozen
         return resp
 
-    started = time.monotonic()
     write_resp, health_resp = await asyncio.gather(_write(), _health_while_writing())
-    elapsed = time.monotonic() - started
 
     assert write_resp.status_code == 200
     assert health_resp.status_code == 200
+    assert released_by_health == [True], (
+        "the Vault write was released by its escape timeout, not by /healthz — the loop never ran while it was parked"
+    )
     # /healthz must be answered while the Vault write is still parked in the thread-pool.
     assert timeline["health_served"] < timeline["write_unblocked"], (
         "/healthz was only served AFTER the Vault write released — the blocking hvac call ran on the event loop"
     )
-    assert elapsed < 1.0, f"the event loop was frozen for {elapsed:.2f}s by a slow Vault write"
 
 
 # ── POST /api/v1/secrets (set) ────────────────────────────────────────────────
