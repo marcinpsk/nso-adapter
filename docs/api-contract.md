@@ -733,8 +733,9 @@ Phase 2: the rest activate as M5–M6 land.
 ## Actions
 
 Unless an endpoint says otherwise, a job-producing action returns `202` with
-`{ "job_id": <int> }`. The generation actions allow the nullable value documented
-below. `apply-diff` is synchronous and creates no job.
+`{ "job_id": <int> }`. The generation actions also identify the generation they
+acted on and allow the nullable job value documented below. `apply-diff` is
+synchronous and creates no job.
 
 ### Execution and admission
 
@@ -750,8 +751,8 @@ queued job from starting.
 | `actions/sync`, `actions/sync-from-nso`, `actions/detect-drift`, `actions/connect`, and `sync-notify` | Return `409 conflict` only when a queued job of the same requested job type already exists. `error.detail.job_id` identifies that queued job. A running job of that type permits a queued successor. Jobs of other types do not cause this conflict. |
 | `actions/force-removal` | Every valid request creates a new removal generation and a new dedicated removal job. The endpoint does not inspect active jobs and does not deduplicate repeated requests, including requests for the same scope. |
 | `actions/apply` | Evaluate the selection first. If no selected stream is promotable, return the documented `200` no-op without checking active jobs. If at least one stream is promotable, inspect queued and running jobs once. Return `409 conflict` with the first observed job by `(created_at, id)` in `error.detail.job_id` when any exists. Otherwise, promote and enqueue the generation chain. This is a point-in-time check in the device-locked transaction. A later action can enqueue after Apply commits. |
-| `actions/retry-generation` | Return `409 conflict` only when there is no blocked executable head or another barrier action already acted on it. Otherwise, create a fresh dedicated job for the blocked head and return `202`. Existing jobs and successor bindings remain unchanged. Unrelated queued or running jobs do not cause a conflict. |
-| `actions/abandon-generation` | Return `409 conflict` only when there is no blocked executable head or another barrier action already acted on it. Otherwise, abandon the head, ensure the next executable generation has a live carrier, and return `202`. Unrelated queued or running jobs do not cause a conflict. |
+| `actions/retry-generation` | Return `409 conflict` only when there is no blocked executable head or another barrier action already acted on it. Otherwise, create a fresh dedicated job for the blocked head and return `202`. Existing jobs and successor bindings remain unchanged. Unrelated queued or running jobs do not cause a conflict. The request names the generation to act on; when it is not the current head, the 409 carries `error.detail.head_generation_id` naming the head. |
+| `actions/abandon-generation` | Return `409 conflict` only when there is no blocked executable head or another barrier action already acted on it. Otherwise, abandon the head, ensure the next executable generation has a live carrier, and return `202`. Unrelated queued or running jobs do not cause a conflict. The request names the generation to act on; when it is not the current head, the 409 carries `error.detail.head_generation_id` naming the head. |
 | `actions/apply-diff` | Create no job and apply no queue-admission rule. |
 
 ### `POST /api/v1/devices/{id}/actions/sync`
@@ -787,6 +788,8 @@ job.
 These actions are the two explicit exits from the deployment-generation success
 barrier. A failed or outcome-unknown head blocks every successor.
 
+The required request body is `{ "generation_id": <int> }`.
+
 - `retry-generation` creates a fresh dedicated job that executes the head's exact
   stored document under its stored mode, verifies the stored digest before
   execution, and reconstructs removal execution from the stored removal context.
@@ -795,19 +798,19 @@ barrier. A failed or outcome-unknown head blocks every successor.
   chain. The operator asserts that the state the generation was to establish is
   already present or is no longer required.
 
-Both return:
+Both return `202 { "generation_id": <int>, "seq": <int>, "job_id": <int|null> }`.
 
-`202 { "job_id": <int|null> }`
-
-For retry, `job_id` identifies the fresh job that will execute the blocked head.
-For abandon, `job_id` identifies the carrier of the successor made executable.
-It is `null` when abandoning the head makes no successor executable. This includes
+`generation_id` and `seq` identify the head that the action changed. For retry,
+`job_id` identifies the fresh job that will execute the blocked head. For abandon,
+`job_id` identifies the carrier of the successor made executable. It is `null` when
+abandoning the head makes no successor executable, including
 when a successor exists but is itself failed (for example the adjacent generation
 of the same failed carrier). Both actions return `409 conflict` when
 the device has no blocked generation; `error.detail.head_status` reports the
-current head status. A concurrent retry or abandon that loses the
-compare-and-set race returns `409 conflict`, with an empty `error.detail` object.
-Queued or running jobs of any type do not otherwise refuse these barrier actions.
+current head status. A request that names a generation other than the current
+blocked head returns `409 conflict`; `error.detail.head_generation_id` and
+`error.detail.head_status` identify that head. Queued or running jobs of any type
+do not otherwise refuse these barrier actions.
 
 ### `POST /api/v1/devices/{id}/actions/apply` (Phase 2)
 

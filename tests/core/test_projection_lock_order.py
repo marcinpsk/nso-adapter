@@ -282,8 +282,15 @@ async def _prepare_offboard_loser(kind: str, adapter_client, device_id: int) -> 
 
 async def _run_offboard_loser(kind: str, adapter_client, device_id: int):
     if kind == "retry_carrier":
+        from nso_adapter.store.models import DeploymentGeneration
+
+        async with session() as db:
+            generation_id = await db.scalar(
+                sa.select(DeploymentGeneration.id).where(DeploymentGeneration.device_id == device_id)
+            )
         return await adapter_client.post(
             f"/api/v1/devices/{device_id}/actions/retry-generation",
+            json={"generation_id": generation_id},
             headers=_AUTH,
         )
     if kind == "auto_apply_put":
