@@ -1142,10 +1142,11 @@ push removed at least one uncorrelated row — then it is degraded, attributed t
 The response carries the three id lists plus `removed_uncorrelated`, the triples of the
 removed `route_id IS NULL` rows no requested id claimed. The three lists PARTITION the
 requested set: unique within each, pairwise disjoint, no unknown id, exact coverage. All four
-fields are emitted on **every** mode — normal, store-only and backfill-only.
+fields are emitted on **every** mode — normal, store-only, backfill-only and delete_origin.
 
-Request order never reaches the wire: every list is sorted, so two orderings of one request
-produce byte-identical responses and byte-identical stored receipts.
+Response lists are sorted and do not preserve request order. The receipt's
+`request_digest` covers the body as sent — array order included — so two orderings of one
+request are different delivery identities, not one replayed receipt.
 
 #### `409` before any effect: `fence_shut` and `store_only_deletion`
 
