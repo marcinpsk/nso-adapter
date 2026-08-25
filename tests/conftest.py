@@ -70,7 +70,7 @@ def _client_backends(conn, name: str) -> list:
     # backend_type filter: PG's own autovacuum worker can be inside the clone at DROP
     # time and is not a leaked test session — only client backends count as stragglers.
     return conn.exec_driver_sql(
-        "SELECT pid, state, left(query, 120) FROM pg_stat_activity "
+        "SELECT pid, state FROM pg_stat_activity "
         f"WHERE datname = '{name}' AND pid <> pg_backend_pid() "
         "AND backend_type = 'client backend'"
     ).fetchall()
@@ -84,9 +84,9 @@ def _drop_database(admin, name: str, *, expect_clean: bool) -> None:
 
     Closing is not instantaneous, though: a pooled connection the test already released
     stays in ``pg_stat_activity`` until its backend actually exits, so a single sample can
-    catch one mid-disposal (``idle``, last query ``ROLLBACK``) and call it a leak. Sample to
-    a deadline instead. NO state is excluded — an ``idle`` connection that never goes away
-    IS the leak this guard exists to catch, and filtering on state would hide exactly that.
+    catch an idle backend mid-disposal and call it a leak. Sample to a deadline instead. NO
+    state is excluded — an ``idle`` connection that never goes away IS the leak this guard
+    exists to catch, and filtering on state would hide exactly that.
     """
     with admin.connect() as conn:
         rows = _client_backends(conn, name)

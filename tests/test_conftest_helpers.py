@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from nso_adapter.store import db as store_db
 from nso_adapter.store.models import Job, JobStatus, JobType
-from tests.conftest import seed_device, session, start_job
+from tests.conftest import _client_backends, seed_device, session, start_job
 
 _TESTS_ROOT = Path(__file__).resolve().parent
 
@@ -41,6 +41,18 @@ async def test_start_job_returns_the_attempt_under_an_expiring_session(store_eng
     async with session() as db:
         started = await db.get(Job, job_id)
         assert started.status is JobStatus.running and started.run_attempt == 1
+
+
+async def test_client_backend_diagnostics_exclude_query_text(store_engine, pg_admin):
+    """A leaked session's last statement can contain a secret literal."""
+    async with store_engine.connect() as leaked:
+        await leaked.exec_driver_sql("SELECT 'review-secret-literal'")
+        with pg_admin.connect() as admin:
+            rows = _client_backends(admin, store_engine.url.database)
+
+    assert rows
+    assert all(len(row) == 2 for row in rows)
+    assert "review-secret-literal" not in repr(rows)
 
 
 def test_seed_device_type_contract_allows_no_netbox_identity():
