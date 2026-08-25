@@ -67,7 +67,9 @@
   - An unexpected failure anywhere (no specific handler claimed it) returns the
     SAME envelope with `code=internal`, a generic message and an empty `detail`.
     Nothing from the exception is echoed: it can carry the credential, URL or row
-    it failed on. The traceback goes to the adapter log.
+    it failed on. The adapter log retains only redacted trace context: the exception
+    type, request method and path, and safe frame locations. It excludes exception
+    arguments, source text, and frame locals.
 
 ### `X-Push-Seq` — keyed intent pushes
 

@@ -96,6 +96,14 @@ async def _set_auto_apply(device_id: int, value: bool) -> None:
         await db.commit()
 
 
+async def _auto_apply(device_id: int) -> bool:
+    from nso_adapter.store.models import DeviceSettings
+
+    async with session() as db:
+        result = await db.execute(sa.select(DeviceSettings.auto_apply).where(DeviceSettings.device_id == device_id))
+        return result.scalar_one()
+
+
 async def _generations(device_id: int) -> list:
     from nso_adapter.store.models import DeploymentGeneration
 
@@ -150,6 +158,7 @@ async def _shrink(client, device_id: int, *, delete_origin: bool = False) -> int
     from nso_adapter.store.models import Job, JobType
 
     kept = _vlans.get(device_id) or []
+    previous = await _auto_apply(device_id)
     await _set_auto_apply(device_id, False)
     try:
         planted = await put_vlans(client, device_id, [*kept, _SHRUNK_VID])
@@ -157,7 +166,7 @@ async def _shrink(client, device_id: int, *, delete_origin: bool = False) -> int
         resp = await put_vlans(client, device_id, kept, query="?delete_origin=true" if delete_origin else "")
         assert resp.status_code == 200, resp.text
     finally:
-        await _set_auto_apply(device_id, True)
+        await _set_auto_apply(device_id, previous)
     async with session() as db:
         return await db.scalar(
             sa.select(Job.id)
@@ -196,6 +205,14 @@ async def _job_status(job_id: int):
 
 
 # ── §G1: one generation per authorized write, ordered, immutable ─────────────
+
+
+async def test_shrink_restores_the_previous_auto_apply_setting(adapter_client):
+    device_id = await _device("gen-shrink-setting", 9704, auto_apply=False)
+
+    await _shrink(adapter_client, device_id)
+
+    assert await _auto_apply(device_id) is False
 
 
 async def test_a_normal_push_promotes_and_stores_its_document(adapter_client):

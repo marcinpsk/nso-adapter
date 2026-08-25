@@ -141,6 +141,7 @@ async def test_a_slow_vault_write_does_not_stall_the_event_loop(vault_client):
 
     real_write = kv.create_or_update_secret
     gate = threading.Event()
+    entered = threading.Event()
     timeline: dict[str, float] = {}
     released_by_health: list[bool] = []
     # Escape hatch, NOT the measurement: /healthz releases the gate in milliseconds whenever
@@ -149,6 +150,7 @@ async def test_a_slow_vault_write_does_not_stall_the_event_loop(vault_client):
     escape_s = 30.0
 
     def _blocking_write(*args, **kwargs):
+        entered.set()
         # Hold the hvac call open exactly as a slow Vault would. A real thread must release
         # it, because on the broken (on-loop) path nothing else can run to do so.
         released_by_health.append(gate.wait(timeout=escape_s))
@@ -165,7 +167,7 @@ async def test_a_slow_vault_write_does_not_stall_the_event_loop(vault_client):
         )
 
     async def _health_while_writing():
-        await asyncio.sleep(0.05)  # let the write reach the blocking hvac call
+        assert await asyncio.to_thread(entered.wait, escape_s)
         resp = await client.get("/healthz")
         timeline["health_served"] = time.monotonic()
         gate.set()  # only reachable if the loop was never frozen
