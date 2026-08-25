@@ -116,7 +116,11 @@ async def test_get_intent_summary_golden(adapter_client):
         await db.commit()
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/intent-summary", headers=AUTH)).json()
-    assert body == {"device_id": device_id, "scopes": {"vlan_intent": {"count": 1, "applied": 1, "failed": 1}}}
+    assert body == {
+        "device_id": device_id,
+        "scopes": {"vlan_intent": {"count": 1, "applied": 1, "failed": 1}},
+        "pending_clear": {},
+    }
 
 
 def test_frozen_now_is_fixed():
