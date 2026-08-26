@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import sqlalchemy as sa
 
-from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
+from tests.conftest import VALID_TOKEN, note_projection_write, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -26,6 +26,36 @@ async def _pending_clears(device_id: int):
             .scalars()
             .all()
         )
+
+
+async def test_record_pending_clears_replaces_store_only_with_authorized(adapter_client):
+    from nso_adapter.core.removal import _record_pending_clears
+    from nso_adapter.store.models import StreamPendingClear
+
+    device_id = await seed_device(nso_device_name="pending-clear-replace", netbox_device_id=14758)
+    async with session() as db:
+        await note_projection_write(db, device_id, "ospf")
+        db.add(
+            StreamPendingClear(
+                device_id=device_id,
+                stream="ospf",
+                provenance="store_only",
+                revision=1,
+            )
+        )
+        await db.commit()
+
+    async with session() as db:
+        await _record_pending_clears(
+            db,
+            device_id,
+            ("ospf",),
+            provenance="authorized",
+        )
+        await db.commit()
+
+    (pending,) = await _pending_clears(device_id)
+    assert (pending.stream, pending.provenance, pending.revision) == ("ospf", "authorized", 1)
 
 
 async def test_mixed_ospf_clear_records_one_authorized_stream_obligation(adapter_client):

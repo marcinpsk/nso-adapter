@@ -1711,6 +1711,7 @@ async def _record_pending_clears(
         previous_since = min((row.recorded_at for row in pending_rows), default=None)
         if store_only is not None:
             await db.delete(store_only)
+            await db.flush()
         if authorized is None:
             authorized = StreamPendingClear(
                 device_id=device_id,

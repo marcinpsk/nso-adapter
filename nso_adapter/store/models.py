@@ -559,7 +559,7 @@ class StreamPendingClear(Base):
 
     __tablename__ = "stream_pending_clear"
     __table_args__ = (
-        UniqueConstraint("device_id", "stream", "provenance", name="uq_stream_pending_clear"),
+        UniqueConstraint("device_id", "stream", name="uq_stream_pending_clear"),
         CheckConstraint(
             "provenance IN ('authorized', 'store_only')",
             name="ck_stream_pending_clear_provenance",

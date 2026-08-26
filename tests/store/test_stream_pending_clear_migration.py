@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import pytest
 import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
 
 from tests.store.migration_harness import (
     alembic,
@@ -63,3 +65,34 @@ def test_stream_pending_clear_migration_is_reversible(pg_admin):
         alembic(sync_url, "upgrade", module.revision)
         with engine_on(sync_url) as engine:
             assert "stream_pending_clear" in sa.inspect(engine).get_table_names()
+
+
+def test_stream_pending_clear_allows_only_one_provenance_per_stream(pg_sync_session):
+    from nso_adapter.store.models import Device, StreamPendingClear
+
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="pending-clear-unique",
+        netbox_device_id=14757,
+    )
+    pg_sync_session.add(device)
+    pg_sync_session.flush()
+    pg_sync_session.add_all(
+        [
+            StreamPendingClear(
+                device_id=device.id,
+                stream="ospf",
+                provenance="store_only",
+                revision=1,
+            ),
+            StreamPendingClear(
+                device_id=device.id,
+                stream="ospf",
+                provenance="authorized",
+                revision=2,
+            ),
+        ]
+    )
+
+    with pytest.raises(IntegrityError):
+        pg_sync_session.flush()
