@@ -516,7 +516,8 @@ their parent and skipped.
   that the current intent is on the device.
 - `failed` — rows with a non-null `last_apply_error`.
 - `pending_clear`: streams with a recorded clear that has no admitted networked carrier.
-  The field is absent when no row exists. Each value reports only its provenance and the
+  The map itself is always present (`{}` when no row exists); only a stream's entry inside
+  it is absent. Each value reports only its provenance and the
   time the obligation was first recorded. It never reports leaf names or paths. A listed
   stream can still hold a device leaf that the intent store says is unset.
 

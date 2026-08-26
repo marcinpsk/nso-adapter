@@ -208,11 +208,13 @@ async def _job_status(job_id: int):
 
 
 async def test_shrink_restores_the_previous_auto_apply_setting(adapter_client):
-    device_id = await _device("gen-shrink-setting", 9704, auto_apply=False)
+    # Start ENABLED: the helper forces auto-apply off for its pushes, so only a real
+    # restore can bring True back - a False start passes even with the restore broken.
+    device_id = await _device("gen-shrink-setting", 9704, auto_apply=True)
 
     await _shrink(adapter_client, device_id)
 
-    assert await _auto_apply(device_id) is False
+    assert await _auto_apply(device_id) is True
 
 
 async def test_a_normal_push_promotes_and_stores_its_document(adapter_client):
