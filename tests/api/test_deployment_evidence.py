@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import sys
+import time
 import uuid
 
 import pytest
@@ -612,6 +614,80 @@ async def test_corrupt_attempt_generation_evidence_returns_the_internal_error_en
     assert invariant["response_generation_ids"] == [999999]
     assert invariant["stamped_generation_ids"] == []
     assert invariant["log_level"] == "error"
+
+
+def test_evidence_deduplicates_valid_attempt_ids_and_preserves_invalid_items_for_validation():
+    from pydantic import ValidationError
+
+    from nso_adapter.api.devices import DeploymentEvidenceIn
+
+    first_id = uuid.uuid4()
+    second_id = uuid.uuid4()
+    evidence = DeploymentEvidenceIn(
+        apply_attempt_ids=[str(first_id), second_id, first_id, str(second_id)],
+    )
+
+    assert evidence.apply_attempt_ids == [first_id, second_id]
+
+    with pytest.raises(ValidationError) as exc_info:
+        DeploymentEvidenceIn(
+            apply_attempt_ids=[
+                str(first_id),
+                first_id,
+                "not-an-attempt-id",
+                "not-an-attempt-id",
+                [],
+                [],
+            ],
+        )
+
+    errors = exc_info.value.errors()
+    assert [error["loc"] for error in errors] == [
+        ("apply_attempt_ids", 1),
+        ("apply_attempt_ids", 2),
+        ("apply_attempt_ids", 3),
+        ("apply_attempt_ids", 4),
+    ]
+    assert [error["type"] for error in errors] == [
+        "uuid_parsing",
+        "uuid_parsing",
+        "uuid_type",
+        "uuid_type",
+    ]
+
+
+def test_evidence_enforces_attempt_id_bound_with_linear_validation_time():
+    from pydantic import ValidationError
+
+    from nso_adapter.api.devices import DeploymentEvidenceIn
+
+    attempt_ids = [str(uuid.UUID(int=value)) for value in range(30_000)]
+
+    started = time.perf_counter()
+    with pytest.raises(ValidationError) as exc_info:
+        DeploymentEvidenceIn(apply_attempt_ids=attempt_ids)
+    elapsed = time.perf_counter() - started
+
+    assert [error["type"] for error in exc_info.value.errors()] == ["too_long"]
+    assert elapsed < 5.0
+
+
+def test_evidence_enforces_attempt_id_bound_for_colliding_uuids():
+    from pydantic import ValidationError
+
+    from nso_adapter.api.devices import DeploymentEvidenceIn
+
+    colliding_ints = [value * sys.hash_info.modulus for value in range(1, 20_001)]
+    assert all(value < 2**128 for value in colliding_ints)
+    attempt_ids = [str(uuid.UUID(int=value)) for value in colliding_ints]
+
+    started = time.perf_counter()
+    with pytest.raises(ValidationError) as exc_info:
+        DeploymentEvidenceIn(apply_attempt_ids=attempt_ids)
+    elapsed = time.perf_counter() - started
+
+    assert [error["type"] for error in exc_info.value.errors()] == ["too_long"]
+    assert elapsed < 5.0
 
 
 async def test_evidence_deduplicates_attempt_ids_before_applying_the_request_bound(adapter_client):

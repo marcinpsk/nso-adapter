@@ -196,8 +196,11 @@ class DeviceGenerationOut(BaseModel):
     updated_at: str
 
 
+_DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT = 100
+
+
 class DeploymentEvidenceIn(BaseModel):
-    apply_attempt_ids: list[UUID] = Field(max_length=100)
+    apply_attempt_ids: list[UUID] = Field(max_length=_DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT)
 
     @field_validator("apply_attempt_ids", mode="before")
     @classmethod
@@ -205,16 +208,22 @@ class DeploymentEvidenceIn(BaseModel):
         if not isinstance(value, list):
             return value
         unique = []
-        identities = []
+        identities = set()
         for item in value:
             try:
                 identity = UUID(item) if isinstance(item, str) else item
-            except ValueError:
-                identity = item
+                hash(identity)
+            except (TypeError, ValueError):
+                unique.append(item)
+                if len(unique) > _DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT:
+                    return value
+                continue
             if identity in identities:
                 continue
             unique.append(item)
-            identities.append(identity)
+            identities.add(identity)
+            if len(unique) > _DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT:
+                return value
         return unique
 
 
