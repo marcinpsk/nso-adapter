@@ -572,6 +572,8 @@ async def test_rejection_envelope_without_generation_list_is_corrupt_when_a_gene
 async def test_corrupt_attempt_generation_evidence_returns_the_internal_error_envelope(
     adapter_client,
 ):
+    from structlog.testing import capture_logs
+
     from nso_adapter.store.models import DeploymentApplyAttempt
 
     device_id = await seed_device(nso_device_name="evidence-corrupt-attempt", netbox_device_id=16235)
@@ -596,14 +598,49 @@ async def test_corrupt_attempt_generation_evidence_returns_the_internal_error_en
         )
         await db.commit()
 
-    response = await adapter_client.post(
-        f"/api/v1/devices/{device_id}/deployment-evidence",
-        headers=AUTH,
-        json={"apply_attempt_ids": [str(attempt_id)]},
-    )
+    with capture_logs() as logs:
+        response = await adapter_client.post(
+            f"/api/v1/devices/{device_id}/deployment-evidence",
+            headers=AUTH,
+            json={"apply_attempt_ids": [str(attempt_id)]},
+        )
 
     assert response.status_code == 500
     assert response.json() == {"error": {"code": "internal", "message": "Internal server error", "detail": {}}}
+    invariant = next(log for log in logs if log["event"] == "deployment_evidence.invariant_violation")
+    assert invariant["apply_attempt_id"] == attempt_id
+    assert invariant["response_generation_ids"] == [999999]
+    assert invariant["stamped_generation_ids"] == []
+    assert invariant["log_level"] == "error"
+
+
+async def test_evidence_deduplicates_attempt_ids_before_applying_the_request_bound(adapter_client):
+    from nso_adapter.store.apply_attempt_store import begin_apply_attempt, complete_apply_attempt
+
+    device_id = await seed_device(nso_device_name="evidence-duplicate-attempts", netbox_device_id=16236)
+    attempt_id = uuid.uuid4()
+    unknown_id = uuid.uuid4()
+    replay = {"generations": None}
+    async with session() as db:
+        assert await begin_apply_attempt(db, attempt_id, device_id, {}) is None
+        await complete_apply_attempt(
+            db,
+            attempt_id,
+            admission_state="rejected",
+            http_status=409,
+            response=replay,
+        )
+        await db.commit()
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/deployment-evidence",
+        headers=AUTH,
+        json={"apply_attempt_ids": [str(attempt_id), str(unknown_id)] * 51},
+    )
+
+    assert response.status_code == 200, response.text
+    assert [attempt["apply_attempt_id"] for attempt in response.json()["attempts"]] == [str(attempt_id)]
+    assert response.json()["unknown_apply_attempt_ids"] == [str(unknown_id)]
 
 
 async def test_evidence_rejects_more_than_100_attempt_ids(adapter_client):
@@ -645,6 +682,15 @@ async def test_evidence_requires_authentication(adapter_client):
             "detail": {},
         }
     }
+
+
+def test_evidence_barrier_state_names_are_public():
+    from nso_adapter.core.generation import CROSSABLE_STATUSES, DEVICE_WRITING_JOB_TYPES, LIVE_JOB_STATUSES
+    from nso_adapter.store.models import GenerationStatus, JobStatus, JobType
+
+    assert CROSSABLE_STATUSES == (GenerationStatus.settled, GenerationStatus.abandoned)
+    assert DEVICE_WRITING_JOB_TYPES == (JobType.apply, JobType.removal)
+    assert LIVE_JOB_STATUSES == (JobStatus.queued, JobStatus.running)
 
 
 def test_evidence_openapi_pins_the_bound_and_non_actionable_contract():

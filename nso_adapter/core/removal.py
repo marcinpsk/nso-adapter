@@ -1735,6 +1735,7 @@ def _refuse_force_incompatible(
     settlement_cohort,
     static_route_tombstone_ids,
     promotes,
+    apply_attempt_id,
 ) -> None:
     """Refuse the arguments a reissue cannot honor: it skips the guard and records no plan."""
     if promotes:
@@ -1749,6 +1750,8 @@ def _refuse_force_incompatible(
         raise ValueError(
             f"a force-removal of {scope!r} settles no promoted revisions; got settlement cohort {settlement_cohort}"
         )
+    if apply_attempt_id is not None:
+        raise ValueError(f"a force-removal of {scope!r} carries no Apply attempt; got {apply_attempt_id}")
     if static_route_tombstone_ids:
         raise ValueError(
             f"a force-removal of {scope!r} records no execution plan; got tombstone ids "
@@ -1987,7 +1990,8 @@ async def enqueue_removal(
 
     *document* is the composed document the promoted generation deploys, stated by the caller
     that already built it. A reissue composes its own, so *force* refuses it here rather than
-    dropping it silently. The same refusal applies to *marking* and *promotes*.
+    dropping it silently. The same refusal applies to *apply_attempt_id*, *marking*, and
+    *promotes*.
     """
     from nso_adapter.core.generation import (
         create_generation,
@@ -2011,6 +2015,7 @@ async def enqueue_removal(
             settlement_cohort,
             static_route_tombstone_ids,
             promotes,
+            apply_attempt_id,
         )
     store_only = STORE_ONLY.get()
     context: dict = {"scope": scope}

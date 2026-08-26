@@ -1139,13 +1139,16 @@ async def test_action_apply_does_not_promote_a_later_unselected_push(adapter_cli
 
 async def test_action_apply_rolls_back_promotion_when_generation_flush_fails(adapter_client):
     from nso_adapter.core.generation import create_action_apply, digest_document
+    from nso_adapter.store.apply_attempt_store import begin_apply_attempt
     from nso_adapter.store.models import DeploymentGeneration, GenerationMode, GenerationStatus
 
     device_id = await seed_device(nso_device_name="apply-atomic-rollback", netbox_device_id=9962)
     await seed_settings(device_id, auto_apply=False)
     assert (await _put_vlans(adapter_client, device_id, [10], seq=4201, query="?store_only=true")).status_code == 200
 
+    attempt_id = uuid4()
     async with session() as db:
+        assert await begin_apply_attempt(db, attempt_id, device_id, {"vlan": 4201}) is None
         db.add(
             DeploymentGeneration(
                 device_id=device_id,
@@ -1162,8 +1165,9 @@ async def test_action_apply_rolls_back_promotion_when_generation_flush_fails(ada
         await db.commit()
 
     async with session() as db:
-        with pytest.raises(IntegrityError):
-            await create_action_apply(db, device_id, {"vlan": 4201}, uuid4())
+        with pytest.raises(IntegrityError) as exc_info:
+            await create_action_apply(db, device_id, {"vlan": 4201}, attempt_id)
+        assert "uq_generation_seq_per_device" in str(exc_info.value)
         await db.rollback()
 
     assert (await _stream(device_id, "vlan")).authorized_revision == 0
@@ -2285,6 +2289,87 @@ async def test_action_apply_settlement_between_projection_and_generation_reads_i
         "skipped_detail": None,
         "generations": [],
     }
+
+
+async def test_settlement_stamps_only_generations_whose_terminalization_cas_lands(
+    adapter_client,
+    rival_engine,
+):
+    from nso_adapter.core.generation import settle_job_generations
+    from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, Job, JobStatus, JobType
+
+    device_id = await seed_device(nso_device_name="apply-settlement-carrier-swap", netbox_device_id=9984)
+    await seed_settings(device_id, auto_apply=True)
+    assert (await _put_vlans(adapter_client, device_id, [30], seq=6311)).status_code == 200
+    assert (await _put_snmp(adapter_client, device_id, ["selected"], seq=6312)).status_code == 200
+    carried = await _generations(device_id)
+    assert len(carried) == 2
+    assert carried[0].job_id == carried[1].job_id
+    carrier_job_id = carried[0].job_id
+    landed_generation, moved_generation = carried
+    landed_stream = next(iter(landed_generation.stream_revisions))
+    moved_stream = next(iter(moved_generation.stream_revisions))
+
+    async with session() as db:
+        carrier = await db.get(Job, carrier_job_id)
+        carrier.status = JobStatus.succeeded
+        await db.commit()
+
+    async def settle() -> None:
+        async with session() as db:
+            await settle_job_generations(db, carrier_job_id, outcome=GenerationStatus.settled)
+            await db.commit()
+
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+    async with rival() as mover:
+        await mover.execute(sa.text("LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE"))
+        replacement = Job(
+            job_type=JobType.apply,
+            status=JobStatus.running,
+            coalescible=False,
+            device_id=device_id,
+        )
+        mover.add(replacement)
+        await mover.flush()
+        await mover.execute(
+            sa.update(DeploymentGeneration)
+            .where(DeploymentGeneration.id == moved_generation.id)
+            .values(job_id=replacement.id, status=GenerationStatus.running)
+        )
+
+        settling = asyncio.create_task(settle())
+        waiting = False
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            await mover.execute(sa.text("SELECT pg_stat_clear_snapshot()"))
+            waiting = await mover.scalar(
+                sa.text(
+                    "SELECT EXISTS ("
+                    "SELECT 1 FROM pg_stat_activity "
+                    "WHERE datname = current_database() "
+                    "AND pid <> pg_backend_pid() "
+                    "AND wait_event_type = 'Lock' "
+                    "AND position('jobs' IN lower(query)) > 0"
+                    ")"
+                )
+            )
+            if waiting:
+                break
+            await asyncio.sleep(0.02)
+        assert waiting, "settlement did not read the carried generations before the job swap"
+        await mover.commit()
+        await asyncio.wait_for(settling, timeout=30)
+        replacement_job_id = replacement.id
+
+    async with session() as db:
+        landed = await db.get(DeploymentGeneration, landed_generation.id)
+        moved = await db.get(DeploymentGeneration, moved_generation.id)
+    assert landed.status is GenerationStatus.settled
+    assert landed.job_id == carrier_job_id
+    assert moved.status is GenerationStatus.running
+    assert moved.job_id == replacement_job_id
+    assert (await _stream(device_id, landed_stream)).applied_revision == 1
+    assert (await _stream(device_id, moved_stream)).applied_revision == 0
 
 
 def test_every_apply_unexecutable_reason_is_documented_and_live():

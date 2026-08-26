@@ -3,11 +3,12 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Never
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -38,6 +39,7 @@ from nso_adapter.store.models import (
 )
 
 router = APIRouter(prefix="/api/v1/devices", tags=["devices"])
+logger = structlog.get_logger(__name__)
 
 
 # ── Response helpers ──────────────────────────────────────────────────────────
@@ -197,6 +199,24 @@ class DeviceGenerationOut(BaseModel):
 class DeploymentEvidenceIn(BaseModel):
     apply_attempt_ids: list[UUID] = Field(max_length=100)
 
+    @field_validator("apply_attempt_ids", mode="before")
+    @classmethod
+    def deduplicate_attempt_ids(cls, value):
+        if not isinstance(value, list):
+            return value
+        unique = []
+        identities = []
+        for item in value:
+            try:
+                identity = UUID(item) if isinstance(item, str) else item
+            except ValueError:
+                identity = item
+            if identity in identities:
+                continue
+            unique.append(item)
+            identities.append(identity)
+        return unique
+
 
 class DeploymentEvidenceGenerationOut(BaseModel):
     generation_id: int
@@ -251,33 +271,61 @@ class DeploymentEvidenceInvariantError(RuntimeError):
     """The durable Apply response disagrees with its stamped generations."""
 
 
+def _raise_attempt_generation_evidence_invariant(
+    attempt: DeploymentApplyAttempt,
+    *,
+    response_generation_ids: list | None,
+    stamped_generation_ids: list[int],
+    message: str,
+) -> Never:
+    logger.error(
+        "deployment_evidence.invariant_violation",
+        apply_attempt_id=attempt.id,
+        response_generation_ids=response_generation_ids,
+        stamped_generation_ids=stamped_generation_ids,
+    )
+    raise DeploymentEvidenceInvariantError(message)
+
+
 def _validate_attempt_generation_evidence(
     attempt: DeploymentApplyAttempt,
     generations: list[DeploymentGeneration],
 ) -> None:
+    stamped_ids = [generation.id for generation in generations]
     response_generations = attempt.response.get("generations")
     if response_generations is None:
         if generations:
-            raise DeploymentEvidenceInvariantError(
-                f"Apply attempt {attempt.id} replay body has no generation list for its stamped generations"
+            _raise_attempt_generation_evidence_invariant(
+                attempt,
+                response_generation_ids=None,
+                stamped_generation_ids=stamped_ids,
+                message=f"Apply attempt {attempt.id} replay body has no generation list for its stamped generations",
             )
         return
     if not isinstance(response_generations, list):
-        raise DeploymentEvidenceInvariantError(f"Apply attempt {attempt.id} replay body has an invalid generation list")
+        _raise_attempt_generation_evidence_invariant(
+            attempt,
+            response_generation_ids=None,
+            stamped_generation_ids=stamped_ids,
+            message=f"Apply attempt {attempt.id} replay body has an invalid generation list",
+        )
 
-    response_ids: list[int] = []
-    for item in response_generations:
-        generation_id = item.get("generation_id") if isinstance(item, dict) else None
+    response_ids = [item.get("generation_id") if isinstance(item, dict) else None for item in response_generations]
+    for generation_id in response_ids:
         if not isinstance(generation_id, int) or isinstance(generation_id, bool):
-            raise DeploymentEvidenceInvariantError(
-                f"Apply attempt {attempt.id} replay body has an invalid generation ID"
+            _raise_attempt_generation_evidence_invariant(
+                attempt,
+                response_generation_ids=response_ids,
+                stamped_generation_ids=stamped_ids,
+                message=f"Apply attempt {attempt.id} replay body has an invalid generation ID",
             )
-        response_ids.append(generation_id)
 
-    stored_ids = [generation.id for generation in generations]
-    if len(response_ids) != len(set(response_ids)) or set(response_ids) != set(stored_ids):
-        raise DeploymentEvidenceInvariantError(
-            f"Apply attempt {attempt.id} replay body does not match its stamped generations"
+    if len(response_ids) != len(set(response_ids)) or set(response_ids) != set(stamped_ids):
+        _raise_attempt_generation_evidence_invariant(
+            attempt,
+            response_generation_ids=response_ids,
+            stamped_generation_ids=stamped_ids,
+            message=f"Apply attempt {attempt.id} replay body does not match its stamped generations",
         )
 
 
@@ -548,10 +596,10 @@ async def deployment_evidence(
     generations is corrupt and NON-ACTIONABLE. It returns the internal invariant error envelope.
     """
     from nso_adapter.core.generation import (
-        _CROSSABLE,
-        _DEVICE_WRITING,
-        _LIVE_JOB,
         BLOCKED_STATUSES,
+        CROSSABLE_STATUSES,
+        DEVICE_WRITING_JOB_TYPES,
+        LIVE_JOB_STATUSES,
         executable_head,
         job_admissible,
     )
@@ -565,8 +613,8 @@ async def deployment_evidence(
             select(Job.id, Job.status)
             .where(
                 Job.device_id == device_id,
-                Job.job_type.in_(_DEVICE_WRITING),
-                Job.status.in_(_LIVE_JOB),
+                Job.job_type.in_(DEVICE_WRITING_JOB_TYPES),
+                Job.status.in_(LIVE_JOB_STATUSES),
             )
             .order_by(Job.created_at, Job.id)
         )
@@ -587,7 +635,7 @@ async def deployment_evidence(
             .where(
                 DeploymentGeneration.device_id == device_id,
                 DeploymentGeneration.seq > head.seq,
-                DeploymentGeneration.status.not_in(_CROSSABLE),
+                DeploymentGeneration.status.not_in(CROSSABLE_STATUSES),
             )
         )
 

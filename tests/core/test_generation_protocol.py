@@ -910,14 +910,16 @@ async def test_barrier_actions_require_a_valid_generation_id_body(
     assert response.json()["error"]["code"] == "validation_error"
 
 
-async def test_retry_generation_refuses_a_stale_generation_id(adapter_client):
-    device_id = await seed_device(nso_device_name="gen-retry-stale", netbox_device_id=None)
+@pytest.mark.parametrize("action", ["retry-generation", "abandon-generation"])
+async def test_barrier_action_refuses_a_stale_generation_id(adapter_client, action):
+    device_name = f"gen-{action}-stale"
+    device_id = await seed_device(nso_device_name=device_name, netbox_device_id=None)
     await seed_settings(device_id)
-    head = await _block_the_head(adapter_client, device_id, "gen-retry-stale")
+    head = await _block_the_head(adapter_client, device_id, device_name)
     before = (head.status, head.job_id)
 
     response = await adapter_client.post(
-        f"/api/v1/devices/{device_id}/actions/retry-generation",
+        f"/api/v1/devices/{device_id}/actions/{action}",
         json={"generation_id": head.id + 1},
         headers=AUTH,
     )
@@ -959,31 +961,6 @@ async def test_barrier_action_names_the_current_head_even_when_it_is_not_blocked
     detail = response.json()["error"]["detail"]
     assert detail["head_generation_id"] == successor.id
     assert detail["head_status"] == successor.status.value
-
-
-async def test_abandon_generation_refuses_a_stale_generation_id(adapter_client):
-    device_id = await seed_device(nso_device_name="gen-abandon-stale", netbox_device_id=None)
-    await seed_settings(device_id)
-    head = await _block_the_head(adapter_client, device_id, "gen-abandon-stale")
-    before = (head.status, head.job_id)
-
-    response = await adapter_client.post(
-        f"/api/v1/devices/{device_id}/actions/abandon-generation",
-        json={"generation_id": head.id + 1},
-        headers=AUTH,
-    )
-
-    assert response.status_code == 409
-    assert response.json()["error"] == {
-        "code": "conflict",
-        "message": "This request names a generation that is not the device's current head",
-        "detail": {
-            "head_generation_id": head.id,
-            "head_status": head.status.value,
-        },
-    }
-    current = (await generations(device_id))[0]
-    assert (current.status, current.job_id) == before
 
 
 async def test_f5_d_the_retry_endpoint_re_admits_the_blocked_head(adapter_client):

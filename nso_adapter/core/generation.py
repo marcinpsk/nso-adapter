@@ -94,6 +94,7 @@ logger = structlog.get_logger(__name__)
 
 #: Statuses a successor may cross. Everything else is a head that blocks.
 _CROSSABLE = (GenerationStatus.settled, GenerationStatus.abandoned)
+CROSSABLE_STATUSES = _CROSSABLE
 #: Statuses that preserve the current carrier as durable terminal evidence.
 _TERMINAL = (
     GenerationStatus.settled,
@@ -105,6 +106,7 @@ _TERMINAL = (
 _LIVE_JOB = (JobStatus.queued, JobStatus.running)
 #: PostgreSQL ``lock_not_available``: what a refused ``FOR UPDATE NOWAIT`` reports.
 _LOCK_NOT_AVAILABLE = "55P03"
+LIVE_JOB_STATUSES = _LIVE_JOB
 
 
 class DeviceProjectionGone(RuntimeError):
@@ -1166,6 +1168,7 @@ async def _require_locked_executable_head(db: AsyncSession, generation: Deployme
 
 #: Job types that write to the device. Everything else is a read and is never barred.
 _DEVICE_WRITING = (JobType.apply, JobType.removal)
+DEVICE_WRITING_JOB_TYPES = _DEVICE_WRITING
 #: A head in one of these has not settled and never will without a retry or a reconcile.
 BLOCKED_STATUSES = (GenerationStatus.failed, GenerationStatus.outcome_unknown)
 
@@ -1242,16 +1245,18 @@ async def settle_job_generations(
     if not carried:
         return
     now = _now()
-    await _terminalize_generations(db, carried, outcome=outcome, error=error, now=now)
+    landed_ids = await _terminalize_generations(db, carried, outcome=outcome, error=error, now=now)
+    landed = [generation for generation in carried if generation.id in landed_ids]
     if outcome is not GenerationStatus.settled:
-        logger.warning(
-            "generation.unsettled",
-            job_id=job_id,
-            outcome=outcome.value,
-            seqs=[g.seq for g in carried],
-        )
+        if landed:
+            logger.warning(
+                "generation.unsettled",
+                job_id=job_id,
+                outcome=outcome.value,
+                seqs=[generation.seq for generation in landed],
+            )
         return
-    cohorts = {generation.settlement_cohort for generation in carried if generation.settlement_cohort is not None}
+    cohorts = {generation.settlement_cohort for generation in landed if generation.settlement_cohort is not None}
     cohort_generations = []
     if cohorts:
         cohort_generations = list(
@@ -1263,7 +1268,7 @@ async def settle_job_generations(
             .scalars()
             .all()
         )
-    target_generations = [generation for generation in carried if generation.settlement_cohort is None]
+    target_generations = [generation for generation in landed if generation.settlement_cohort is None]
     target_generations.extend(cohort_generations)
     targets = {
         (generation.device_id, stream, revision, generation.settlement_cohort)
@@ -1675,11 +1680,14 @@ __all__ = [
     "ApplyJobConflict",
     "ApplyUnexecutable",
     "BLOCKED_STATUSES",
+    "CROSSABLE_STATUSES",
+    "DEVICE_WRITING_JOB_TYPES",
     "DeviceProjectionGone",
     "GenerationCarrierCorruption",
     "GenerationModeConflict",
     "GenerationNotBlocked",
     "GenerationTampered",
+    "LIVE_JOB_STATUSES",
     "advance_device_generations",
     "advance_generations_locked",
     "allocate_settlement_cohort",

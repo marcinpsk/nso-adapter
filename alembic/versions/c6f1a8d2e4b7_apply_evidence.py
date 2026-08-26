@@ -138,7 +138,9 @@ def upgrade() -> None:
         "deployment_apply_attempt",
         ["apply_attempt_id", "device_id"],
         ["id", "device_id"],
-        ondelete="RESTRICT",
+        ondelete="NO ACTION",
+        deferrable=True,
+        initially="DEFERRED",
     )
     op.create_index(
         _INDEX,

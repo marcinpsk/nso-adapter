@@ -95,6 +95,7 @@ def test_apply_evidence_trigger_is_frozen_for_upgrade_and_downgrade(pg_admin, tm
         f"Path({str(marker)!r}).touch()\n"
         "ddl.GENERATION_IMMUTABLE_COLUMNS += ('drifted_column',)\n"
         "ddl.generation_immutability_ddl.__defaults__ = (ddl.GENERATION_IMMUTABLE_COLUMNS,)\n"
+        "assert 'drifted_column' in ddl.generation_immutability_ddl()[0]\n"
     )
 
     with private_database(pg_admin, "apply_evidence_ddl") as sync_url:
@@ -148,7 +149,16 @@ def test_apply_evidence_schema_and_attempt_retention(pg_admin):
                 assert generation_columns[name]["nullable"] is True
 
             assert delete_rules(engine, "deployment_apply_attempt")["device_id"] == "CASCADE"
-            assert delete_rules(engine, "deployment_generation")["apply_attempt_id"] == "RESTRICT"
+            assert delete_rules(engine, "deployment_generation")["apply_attempt_id"] == "NO ACTION"
+            attempt_fk = next(
+                fk
+                for fk in inspector.get_foreign_keys("deployment_generation")
+                if fk["name"] == "fk_generation_apply_attempt"
+            )
+            assert attempt_fk["options"] == {
+                "initially": "DEFERRED",
+                "deferrable": True,
+            }
             assert index_predicates(engine, "deployment_generation")["ix_generation_device_apply_attempt"] == (
                 ("device_id", "apply_attempt_id"),
                 False,
@@ -208,28 +218,27 @@ def test_generation_attempt_must_belong_to_the_same_device(pg_admin):
     module = _module()
     with private_database(pg_admin, "apply_evidence_device_fk") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
-        with engine_on(sync_url) as engine, engine.begin() as conn:
-            attempt_device_id = conn.exec_driver_sql(
-                "INSERT INTO devices "
-                "(nso_instance, nso_device_name, mapping_status, created_at, updated_at) "
-                "VALUES ('nso-dev', 'attempt-device', 'mapped', now(), now()) RETURNING id"
-            ).scalar_one()
-            generation_device_id = conn.exec_driver_sql(
-                "INSERT INTO devices "
-                "(nso_instance, nso_device_name, mapping_status, created_at, updated_at) "
-                "VALUES ('nso-dev', 'generation-device', 'mapped', now(), now()) RETURNING id"
-            ).scalar_one()
-            attempt_id = uuid.uuid4()
-            conn.execute(
-                sa.text(
-                    "INSERT INTO deployment_apply_attempt "
-                    "(id, device_id, selected, admission_state, http_status, response, created_at) "
-                    "VALUES (:id, :device_id, CAST('{}' AS jsonb), 'admitted', 202, CAST('{}' AS jsonb), now())"
-                ),
-                {"id": attempt_id, "device_id": attempt_device_id},
-            )
-
-            with pytest.raises(sa.exc.IntegrityError):
+        with engine_on(sync_url) as engine:
+            with pytest.raises(sa.exc.IntegrityError) as exc_info, engine.begin() as conn:
+                attempt_device_id = conn.exec_driver_sql(
+                    "INSERT INTO devices "
+                    "(nso_instance, nso_device_name, mapping_status, created_at, updated_at) "
+                    "VALUES ('nso-dev', 'attempt-device', 'mapped', now(), now()) RETURNING id"
+                ).scalar_one()
+                generation_device_id = conn.exec_driver_sql(
+                    "INSERT INTO devices "
+                    "(nso_instance, nso_device_name, mapping_status, created_at, updated_at) "
+                    "VALUES ('nso-dev', 'generation-device', 'mapped', now(), now()) RETURNING id"
+                ).scalar_one()
+                attempt_id = uuid.uuid4()
+                conn.execute(
+                    sa.text(
+                        "INSERT INTO deployment_apply_attempt "
+                        "(id, device_id, selected, admission_state, http_status, response, created_at) "
+                        "VALUES (:id, :device_id, CAST('{}' AS jsonb), 'admitted', 202, CAST('{}' AS jsonb), now())"
+                    ),
+                    {"id": attempt_id, "device_id": attempt_device_id},
+                )
                 conn.execute(
                     sa.text(
                         "INSERT INTO deployment_generation "
@@ -244,6 +253,7 @@ def test_generation_attempt_must_belong_to_the_same_device(pg_admin):
                         "attempt_id": attempt_id,
                     },
                 )
+            assert "fk_generation_apply_attempt" in str(exc_info.value)
 
 
 def test_apply_evidence_migration_is_reversible(pg_admin):
