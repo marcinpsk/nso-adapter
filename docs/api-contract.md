@@ -666,10 +666,11 @@ matching receipt was admitted in backfill-only mode, and `revision_mismatch` whe
 receipt matches but the projection row does not. `backfill_only` is terminal for that
 sequence: the receipt exists and holds it, but a backfill repairs correlation only, so no
 retry of the same selection can promote it.
-`skipped_detail` is conditional and is keyed by stream. It identifies the generation for
+`skipped_detail` is keyed by stream; only its CONTENT is conditional — the key itself is
+always present. It identifies the generation for
 each `already_authorized` skip whose owning generation can be identified. Each member has
-the shape `{ "generation_id": <int>, "seq": <int>, "status": "<status>" }`. The key is
-always present and is `null` when no member qualifies. The retry and abandon actions own the
+the shape `{ "generation_id": <int>, "seq": <int>, "status": "<status>" }`. The value is
+`null` when no member qualifies. The retry and abandon actions own the
 identified generation. Apply cannot replace it with weaker work.
 An empty selection, or a request in which every selection is skipped, returns `200` with an
 explicit no-op and no `job_id`:
@@ -2157,9 +2158,10 @@ atomically with the row deletes, and returns immediately.
 `?store_only=true` is the exception: it updates the mirror without authorizing the
 drop on the device, so it enqueues no removal jobs (and no apply job, whatever the
 device's `auto_apply` setting) — clients must not wait for jobs it never creates.
-A worker runs each job in the background, re-reading the **current** accepted rows
-and PUT-replacing the service — so the job is idempotent and is requeued (not
-failed) after a worker restart. Scope is carried in `Job.context.scope` (one of
+A worker runs each job in the background and PUT-replaces the service. A promoted
+removal in a document-executed section renders from its generation's immutable
+document; a force-reissue renders from the current accepted rows. Either way the
+job is idempotent and is requeued (not failed) after a worker restart. Scope is carried in `Job.context.scope` (one of
 `route_policy · bfd · svi · subinterface · static_route · interface_mtu · vlan ·
 logging · l2_sap · ospf · bgp · isis · interface_config · snmp`). Job status is
 observable via `GET …/jobs` like any other job; a failed removal records

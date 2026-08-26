@@ -109,7 +109,8 @@ def test_api_contract_documents_the_skipped_detail_null_shape():
         "\n### ", maxsplit=1
     )[0]
 
-    assert "always present and is `null`" in section
+    assert "only its CONTENT is conditional" in section
+    assert "The value is\n`null` when no member qualifies" in section
     assert '"skipped_detail": null' in section
 
 
