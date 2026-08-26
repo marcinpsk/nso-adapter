@@ -175,6 +175,25 @@ async def test_enqueue_removal_rejects_unknown_scope(adapter_client):
             await enqueue_removal(db, 1, "bogus", marking="detach", defer_retract=False, promotes=("vlan",))
 
 
+async def test_enqueue_removal_rejects_unmarked_deletion(adapter_client):
+    device_id = await _seed_device(nso_device_name="sw-unmarked-delete")
+    async with session() as db:
+        await note_projection_write(db, device_id, "svi")
+        with pytest.raises(
+            ValueError,
+            match="an unmarked deletion of 'svi' would commit networked instead of detaching",
+        ):
+            await enqueue_removal(
+                db,
+                device_id,
+                "svi",
+                marking=None,
+                defer_retract=False,
+                promotes=("svi",),
+                shrank=True,
+            )
+
+
 async def test_enqueue_removal_creates_job_for_each_valid_scope(adapter_client):
     """Every reconciler scope (incl ospf/bgp) maps to a removal job."""
     from nso_adapter.core.projection import section_streams

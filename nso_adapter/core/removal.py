@@ -1922,6 +1922,8 @@ async def enqueue_removal(
     # carries no un-own retracts it. `_replace_static_route` reads the flag back and builds
     # a body without the clear, so a NETWORKED job of a mixed request defers it too.
     deletes = shrank or bool(context.get("removed"))
+    if marking is None and deletes and not force:
+        raise ValueError(f"an unmarked deletion of {scope!r} would commit networked instead of detaching")
     if retract and defer_retract:
         context["retract_deferred"] = True
         logger.warning("removal.retract_deferred", device_id=device_id, scope=scope)
