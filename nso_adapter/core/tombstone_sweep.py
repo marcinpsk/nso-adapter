@@ -82,7 +82,7 @@ async def reissue_removal_job(conn: AsyncSession, device_id: int, row: StaticRou
     device's ordered chain, so it cannot cross a blocked head and a later push cannot cross
     it (#1522 §H2).
     """
-    from nso_adapter.core.generation import attach_to_job, create_reissue_generation
+    from nso_adapter.core.generation import GenerationCarrierCorruption, attach_to_job, create_reissue_generation
     from nso_adapter.store.models import GenerationMode
 
     context = _removal_context(row)
@@ -94,7 +94,8 @@ async def reissue_removal_job(conn: AsyncSession, device_id: int, row: StaticRou
         allowed_removal_keys=context["removed"],
     )
     job = await create_dedicated_job(conn, device_id, JobType.removal, context=context)
-    await attach_to_job(conn, generation, job)
+    if not await attach_to_job(conn, generation, job):
+        raise GenerationCarrierCorruption(f"dedicated carrier {job.id} rejected generation {generation.id}")
     row.job_id = job.id
     await conn.flush()
     return job

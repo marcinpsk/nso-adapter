@@ -230,15 +230,57 @@ def test_lane_checks_reject_rows_outside_the_four_classes(pg_admin):
             device_id = _seed_device(conn, "queue-class-checks")
 
         invalid_cases = (
-            ("coalescible-removal", "removal", "succeeded", device_id, True),
-            ("coalescible-provision", "provision", "succeeded", device_id, True),
-            ("queued-attached-provision", "provision", "queued", device_id, False),
-            ("running-attached-provision", "provision", "running", device_id, False),
-            ("queued-detached-sync", "sync", "queued", None, True),
-            ("running-detached-connect", "connect", "running", None, False),
+            (
+                "coalescible-removal",
+                "removal",
+                "succeeded",
+                device_id,
+                True,
+                "ck_job_removal_not_coalescible",
+            ),
+            (
+                "coalescible-provision",
+                "provision",
+                "succeeded",
+                device_id,
+                True,
+                "ck_job_provision_not_coalescible",
+            ),
+            (
+                "queued-attached-provision",
+                "provision",
+                "queued",
+                device_id,
+                False,
+                "ck_job_active_provision_without_device",
+            ),
+            (
+                "running-attached-provision",
+                "provision",
+                "running",
+                device_id,
+                False,
+                "ck_job_active_provision_without_device",
+            ),
+            (
+                "queued-detached-sync",
+                "sync",
+                "queued",
+                None,
+                True,
+                "ck_job_detached_non_provision_terminal",
+            ),
+            (
+                "running-detached-connect",
+                "connect",
+                "running",
+                None,
+                False,
+                "ck_job_detached_non_provision_terminal",
+            ),
         )
-        for case in invalid_cases:
-            with pytest.raises(sa.exc.IntegrityError):
+        for *case, constraint in invalid_cases:
+            with pytest.raises(sa.exc.IntegrityError, match=constraint):
                 with engine_on(sync_url) as engine, engine.begin() as conn:
                     _insert_classified_job(conn, *case)
 
