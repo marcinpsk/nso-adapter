@@ -209,20 +209,25 @@ async def test_promotion_provenance_handler_uses_closed_error_factory(monkeypatc
 
 
 async def test_promotion_provenance_error_is_dispatched_through_the_application():
+    from fastapi import Depends
     from httpx import ASGITransport, AsyncClient
 
+    from nso_adapter.api.deps import verify_token
     from nso_adapter.core.receipt import PromotionProvenanceUnexecutable
     from nso_adapter.main import create_app
 
     app = create_app()
+    app.state.adapter_token = VALID_TOKEN
 
-    @app.get("/_test/promotion-provenance")
+    @app.get("/_test/promotion-provenance", dependencies=[Depends(verify_token)])
     async def _promotion_provenance():
         raise PromotionProvenanceUnexecutable("vlan")
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.get("/_test/promotion-provenance")
+        unauthenticated = await client.get("/_test/promotion-provenance")
+        response = await client.get("/_test/promotion-provenance", headers=AUTH)
 
+    assert unauthenticated.status_code == 401
     assert response.status_code == 409
     assert response.json() == {
         "error": {

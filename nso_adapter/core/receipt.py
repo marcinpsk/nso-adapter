@@ -252,7 +252,7 @@ async def _record_projection_deletions(
         if (identity := promotion_deletion_identity(record)) is not None
     }
     marking = DELETE_ORIGIN_MARKING if receipt.delete_origin else DETACH_MARKING
-    for table, previous in projection.authorized_document.items():
+    for table in projection.authorized_document:
         desired_identities = rows_by_intent_identity(desired, table)
         for identity, row in rows_by_intent_identity(projection.authorized_document, table).items():
             row_id = row.get("id")
