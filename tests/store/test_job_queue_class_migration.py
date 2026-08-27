@@ -104,9 +104,9 @@ def test_job_queue_class_migration_chains_off_the_previous_head():
     assert_single_head_containing(module.revision)
 
 
-def test_job_queue_class_schema_matches_the_lane_contract(pg_admin):
+def test_job_queue_class_schema_matches_the_lane_contract(pg_provisioner):
     module = _module()
-    with private_database(pg_admin, "jobclasses") as sync_url:
+    with private_database(pg_provisioner, "jobclasses") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         with engine_on(sync_url) as engine:
             inspector = sa.inspect(engine)
@@ -127,9 +127,9 @@ def test_job_queue_class_schema_matches_the_lane_contract(pg_admin):
             )
 
 
-def test_existing_jobs_use_their_construction_lane_for_backfill(pg_admin):
+def test_existing_jobs_use_their_construction_lane_for_backfill(pg_provisioner):
     module = _module()
-    with private_database(pg_admin, "jobclassfill") as sync_url:
+    with private_database(pg_provisioner, "jobclassfill") as sync_url:
         alembic(sync_url, "upgrade", module.down_revision)
         with engine_on(sync_url) as engine, engine.begin() as conn:
             device_id = _seed_device(conn, "queue-class-backfill")
@@ -184,9 +184,9 @@ def test_existing_jobs_use_their_construction_lane_for_backfill(pg_admin):
         assert landed == expected
 
 
-def test_migration_rejects_a_removal_job_with_multiple_generations(pg_admin):
+def test_migration_rejects_a_removal_job_with_multiple_generations(pg_provisioner):
     module = _module()
-    with private_database(pg_admin, "jobclassbadremoval") as sync_url:
+    with private_database(pg_provisioner, "jobclassbadremoval") as sync_url:
         alembic(sync_url, "upgrade", module.down_revision)
         with engine_on(sync_url) as engine, engine.begin() as conn:
             device_id = _seed_device(conn, "queue-class-corrupt-removal")
@@ -203,12 +203,12 @@ def test_migration_rejects_a_removal_job_with_multiple_generations(pg_admin):
 
 @pytest.mark.parametrize(("job_status", "generation_status"), (("queued", "pending"), ("running", "running")))
 def test_migration_rejects_an_active_device_bound_apply_retry(
-    pg_admin,
+    pg_provisioner,
     job_status: str,
     generation_status: str,
 ):
     module = _module()
-    with private_database(pg_admin, f"jobclassactiveapply{job_status}") as sync_url:
+    with private_database(pg_provisioner, f"jobclassactiveapply{job_status}") as sync_url:
         alembic(sync_url, "upgrade", module.down_revision)
         with engine_on(sync_url) as engine, engine.begin() as conn:
             device_id = _seed_device(conn, f"queue-class-active-apply-{job_status}")
@@ -222,9 +222,9 @@ def test_migration_rejects_an_active_device_bound_apply_retry(
             assert "coalescible" not in {item["name"] for item in sa.inspect(engine).get_columns("jobs")}
 
 
-def test_lane_checks_reject_rows_outside_the_four_classes(pg_admin):
+def test_lane_checks_reject_rows_outside_the_four_classes(pg_provisioner):
     module = _module()
-    with private_database(pg_admin, "jobclasschecks") as sync_url:
+    with private_database(pg_provisioner, "jobclasschecks") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         with engine_on(sync_url) as engine, engine.begin() as conn:
             device_id = _seed_device(conn, "queue-class-checks")
@@ -285,9 +285,9 @@ def test_lane_checks_reject_rows_outside_the_four_classes(pg_admin):
                     _insert_classified_job(conn, *case)
 
 
-def test_queued_deduplication_applies_only_to_coalescible_jobs(pg_admin):
+def test_queued_deduplication_applies_only_to_coalescible_jobs(pg_provisioner):
     module = _module()
-    with private_database(pg_admin, "jobclassdedupe") as sync_url:
+    with private_database(pg_provisioner, "jobclassdedupe") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         with engine_on(sync_url) as engine, engine.begin() as conn:
             device_id = _seed_device(conn, "queue-class-dedupe")
@@ -303,13 +303,13 @@ def test_queued_deduplication_applies_only_to_coalescible_jobs(pg_admin):
         assert landed == {"coalescible-apply": True, "dedicated-apply": False}
 
 
-def test_downgrade_rejects_a_queue_the_old_index_cannot_represent(pg_admin):
+def test_downgrade_rejects_a_queue_the_old_index_cannot_represent(pg_provisioner):
     module = _module()
     message = (
         "cannot downgrade job queue classes: multiple queued non-removal jobs "
         "exist for one device and type; resolve the queue before downgrading"
     )
-    with private_database(pg_admin, "jobclassdowngradeguard") as sync_url:
+    with private_database(pg_provisioner, "jobclassdowngradeguard") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         with engine_on(sync_url) as engine, engine.begin() as conn:
             device_id = _seed_device(conn, "queue-class-downgrade-guard")
@@ -369,9 +369,9 @@ def test_downgrade_rejects_a_queue_the_old_index_cannot_represent(pg_admin):
             }
 
 
-def test_job_queue_class_schema_is_reversible(pg_admin):
+def test_job_queue_class_schema_is_reversible(pg_provisioner):
     module = _module()
-    with private_database(pg_admin, "jobclassesrev") as sync_url:
+    with private_database(pg_provisioner, "jobclassesrev") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         alembic(sync_url, "downgrade", module.down_revision)
         with engine_on(sync_url) as engine:

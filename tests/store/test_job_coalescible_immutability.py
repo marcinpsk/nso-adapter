@@ -241,23 +241,23 @@ async def test_offboard_detaches_jobs_without_reclassifying_them(adapter_client)
     assert pending.error["code"] == "device_offboarded"
 
 
-def test_alembic_installs_the_frozen_job_function(pg_admin):
+def test_alembic_installs_the_frozen_job_function(pg_provisioner):
     module = load_migration(_MIGRATION)
     migration_source = _function_source(module._JOB_COALESCIBLE_IMMUTABILITY_DDL[0])
     assert migration_source == _FROZEN_FUNCTION_SOURCE
 
-    with private_database(pg_admin, "job_immutable_frozen") as sync_url:
+    with private_database(pg_provisioner, "job_immutable_frozen") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         with engine_on(sync_url) as engine:
             installed_source = _installed_function_source(engine)
     assert installed_source == migration_source
 
 
-def test_create_all_installs_the_live_job_trigger_in_a_fresh_database(pg_admin):
+def test_create_all_installs_the_live_job_trigger_in_a_fresh_database(pg_provisioner):
     from nso_adapter.store.ddl import job_coalescible_immutability_ddl
     from nso_adapter.store.models import Base
 
-    with private_database(pg_admin, "job_immutable_create_all") as sync_url:
+    with private_database(pg_provisioner, "job_immutable_create_all") as sync_url:
         with engine_on(sync_url) as engine:
             assert not sa.inspect(engine).has_table("jobs")
             assert _installed_function_source(engine) is None
@@ -272,7 +272,7 @@ def test_create_all_installs_the_live_job_trigger_in_a_fresh_database(pg_admin):
     assert installed_trigger_function == _FUNCTION
 
 
-def test_historical_job_trigger_does_not_track_the_live_helper(pg_admin, tmp_path, monkeypatch):
+def test_historical_job_trigger_does_not_track_the_live_helper(pg_provisioner, tmp_path, monkeypatch):
     module = load_migration(_MIGRATION)
     marker = tmp_path / "job-sitecustomize-loaded"
     sitecustomize = tmp_path / "sitecustomize.py"
@@ -287,7 +287,7 @@ def test_historical_job_trigger_does_not_track_the_live_helper(pg_admin, tmp_pat
         "ddl.job_coalescible_immutability_ddl = _drifted\n"
     )
 
-    with private_database(pg_admin, "job_immutable_drift") as sync_url:
+    with private_database(pg_provisioner, "job_immutable_drift") as sync_url:
         old_pythonpath = os.environ.get("PYTHONPATH")
         pythonpath = str(tmp_path) if old_pythonpath is None else os.pathsep.join((str(tmp_path), old_pythonpath))
         monkeypatch.setenv("PYTHONPATH", pythonpath)
