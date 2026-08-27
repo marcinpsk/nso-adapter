@@ -22,6 +22,17 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     op.execute(
         """
+        UPDATE stream_pending_clear AS authorized
+        SET revision = GREATEST(authorized.revision, store_only.revision)
+        FROM stream_pending_clear AS store_only
+        WHERE authorized.device_id = store_only.device_id
+          AND authorized.stream = store_only.stream
+          AND authorized.provenance = 'authorized'
+          AND store_only.provenance = 'store_only'
+        """
+    )
+    op.execute(
+        """
         DELETE FROM stream_pending_clear AS store_only
         WHERE store_only.provenance = 'store_only'
           AND EXISTS (

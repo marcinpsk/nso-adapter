@@ -44,7 +44,7 @@ def _seed_pending_clear_rows(engine) -> None:
                 "VALUES (:device_id, :stream, :provenance, :revision, now())"
             ),
             [
-                {"device_id": device_id, "stream": "isis", "provenance": "store_only", "revision": 1},
+                {"device_id": device_id, "stream": "isis", "provenance": "store_only", "revision": 4},
                 {"device_id": device_id, "stream": "isis", "provenance": "authorized", "revision": 2},
                 {"device_id": device_id, "stream": "ospf", "provenance": "store_only", "revision": 3},
             ],
@@ -70,7 +70,7 @@ def test_stream_pending_clear_uniqueness_repairs_pairs_before_upgrade(pg_admin):
                 rows = conn.execute(
                     sa.text("SELECT stream, provenance, revision FROM stream_pending_clear ORDER BY stream, provenance")
                 ).all()
-            assert rows == [("isis", "authorized", 2), ("ospf", "store_only", 3)]
+            assert rows == [("isis", "authorized", 4), ("ospf", "store_only", 3)]
             assert _unique_constraints(engine)["uq_stream_pending_clear"] == ("device_id", "stream")
 
 
