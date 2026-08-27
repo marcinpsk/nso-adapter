@@ -33,9 +33,9 @@ def test_the_settlement_cohort_index_migration_chains_off_the_previous_head():
     assert_single_head_containing(module.revision)
 
 
-def test_the_settlement_cohort_index_leads_with_the_global_cohort(pg_admin):
+def test_the_settlement_cohort_index_leads_with_the_global_cohort(pg_provisioner):
     module = _module()
-    with private_database(pg_admin, "settlecohortindex") as sync_url:
+    with private_database(pg_provisioner, "settlecohortindex") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
 
         index = _indexes(sync_url)[_INDEX]
@@ -43,9 +43,9 @@ def test_the_settlement_cohort_index_leads_with_the_global_cohort(pg_admin):
         assert "settlement_cohort IS NOT NULL" in str(index["dialect_options"]["postgresql_where"])
 
 
-def test_the_settlement_cohort_index_migration_is_reversible(pg_admin):
+def test_the_settlement_cohort_index_migration_is_reversible(pg_provisioner):
     module = _module()
-    with private_database(pg_admin, "settlecohortindexrev") as sync_url:
+    with private_database(pg_provisioner, "settlecohortindexrev") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         alembic(sync_url, "downgrade", module.down_revision)
         assert _INDEX not in _indexes(sync_url)
