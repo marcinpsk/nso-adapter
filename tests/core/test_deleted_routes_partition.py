@@ -121,3 +121,18 @@ async def test_o2b_12_a_genuine_binding_takes_its_row_out_of_the_triple_pool(ada
     assert partition.executed == (1,)
     assert partition.moot == (2,), "id 2 matched a row pass 1 had already consumed"
     assert partition.uncorrelated == (D,), "D was removed and nobody claimed it"
+
+
+async def test_o2b_12_an_unverified_unmatched_id_conservatively_degrades_with_uncorrelated_residue(adapter_client):
+    """An unverified lineage attributes an otherwise unclaimed removal instead of going moot."""
+    from nso_adapter.core.deleted_routes import classify_deletions
+
+    device_id = await seed_device(nso_device_name="sr-o2b12-conservative", netbox_device_id=9884)
+    await seed_intent(device_id, [{"triple": D, "route_id": None}])
+    rows = await removed_rows(device_id, [D])
+
+    partition = classify_deletions([record(6, [A], unverified=True)], rows)
+
+    assert partition.degraded == (6,), "only the conservative branch can attribute the unmatched id"
+    assert partition.moot == ()
+    assert partition.uncorrelated == (D,), "the unverified id does not claim a non-matching row"

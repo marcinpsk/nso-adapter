@@ -213,7 +213,7 @@ def _alembic(db_url: str, *args: str) -> None:
         raise AssertionError(f"alembic {args} failed:\n{proc.stdout.decode()}\n{proc.stderr.decode()}")
 
 
-def test_every_device_insert_path_creates_a_counter_migration(pg_admin):
+def test_every_device_insert_path_creates_a_counter_migration(pg_provisioner):
     """S2.9 — the migration backfills a counter for every device that predates it.
 
     Driven through the real migration chain: a device inserted at the revision BEFORE the
@@ -222,7 +222,7 @@ def test_every_device_insert_path_creates_a_counter_migration(pg_admin):
     terminal write.
     """
     dbname = f"settle_backfill_{uuid.uuid4().hex[:10]}"
-    with pg_admin.connect() as conn:
+    with pg_provisioner.connect() as conn:
         conn.exec_driver_sql(f'CREATE DATABASE "{dbname}"')
     try:
         url = _url_for(dbname, driver="postgresql+psycopg2")
@@ -248,7 +248,7 @@ def test_every_device_insert_path_creates_a_counter_migration(pg_admin):
 
         assert backfilled == 0, "the migration left a pre-existing device without a counter"
     finally:
-        _drop_database(pg_admin, dbname, expect_clean=False)
+        _drop_database(pg_provisioner, dbname, expect_clean=False)
 
 
 # ── S2.9b (r2-M3): the sweep precedes EVERY terminal recovery ────────────────

@@ -23,7 +23,8 @@ def upgrade() -> None:
     op.execute(
         """
         UPDATE stream_pending_clear AS authorized
-        SET revision = GREATEST(authorized.revision, store_only.revision)
+        SET revision = GREATEST(authorized.revision, store_only.revision),
+            recorded_at = LEAST(authorized.recorded_at, store_only.recorded_at)
         FROM stream_pending_clear AS store_only
         WHERE authorized.device_id = store_only.device_id
           AND authorized.stream = store_only.stream

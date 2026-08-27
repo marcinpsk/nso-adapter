@@ -148,15 +148,15 @@ def _alembic(sync_url: str, *args: str) -> str:
 
 
 @contextmanager
-def _private_database(pg_admin, tag: str):
+def _private_database(pg_provisioner, tag: str):
     """A database of our own — the template clone is useless here (already at head)."""
     name = f"nsoadp_ts{tag}_{uuid.uuid4().hex[:8]}"
-    with pg_admin.connect() as conn:
+    with pg_provisioner.connect() as conn:
         conn.exec_driver_sql(f'CREATE DATABASE "{name}"')
     try:
         yield _url_for(name, driver="postgresql+psycopg2")
     finally:
-        _drop_database(pg_admin, name, expect_clean=False)
+        _drop_database(pg_provisioner, name, expect_clean=False)
 
 
 @contextmanager
@@ -206,11 +206,11 @@ def _reflected_tz_flags(engine) -> dict[tuple[str, str], bool]:
     return {(t, c): bool(by_table[t][c].timezone) for t, c in _COLUMNS}
 
 
-def test_migration_converts_every_naive_column_to_the_same_utc_instant(pg_admin, monkeypatch):
+def test_migration_converts_every_naive_column_to_the_same_utc_instant(pg_provisioner, monkeypatch):
     module = _load_migration()
     monkeypatch.setenv("PGOPTIONS", f"-c timezone={_TZ}")  # same mechanism the subprocess uses
 
-    with _private_database(pg_admin, "conv") as sync_url:
+    with _private_database(pg_provisioner, "conv") as sync_url:
         _alembic(sync_url, "upgrade", module.down_revision)
 
         with _engine_on(sync_url) as engine:
@@ -260,11 +260,11 @@ def test_migration_declares_all_25_columns_with_an_explicit_utc_using_clause():
         )
 
 
-def test_downgrade_restores_naive_utc_and_re_upgrade_is_idempotent(pg_admin, monkeypatch):
+def test_downgrade_restores_naive_utc_and_re_upgrade_is_idempotent(pg_provisioner, monkeypatch):
     module = _load_migration()  # fail with the same import error as the others when it is missing
     monkeypatch.setenv("PGOPTIONS", f"-c timezone={_TZ}")
 
-    with _private_database(pg_admin, "down") as sync_url:
+    with _private_database(pg_provisioner, "down") as sync_url:
         _alembic(sync_url, "upgrade", "head")
 
         with _engine_on(sync_url) as engine:

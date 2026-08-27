@@ -30,7 +30,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, JobError, error_envelope
 from nso_adapter.core.projection import stream_for_model
-from nso_adapter.core.request_flags import DELETE_ORIGIN_MARKING, DETACH_MARKING, REMOVAL_MARKINGS, request_marking
+from nso_adapter.core.request_flags import (
+    AUTHORIZED_PROVENANCE,
+    DELETE_ORIGIN_MARKING,
+    DETACH_MARKING,
+    REMOVAL_MARKINGS,
+    STORE_ONLY_PROVENANCE,
+    request_marking,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -1686,10 +1693,10 @@ async def _record_pending_clears(
             .scalars()
             .all()
         )
-        authorized = next((row for row in pending_rows if row.provenance == "authorized"), None)
-        store_only = next((row for row in pending_rows if row.provenance == "store_only"), None)
+        authorized = next((row for row in pending_rows if row.provenance == AUTHORIZED_PROVENANCE), None)
+        store_only = next((row for row in pending_rows if row.provenance == STORE_ONLY_PROVENANCE), None)
 
-        if provenance == "store_only":
+        if provenance == STORE_ONLY_PROVENANCE:
             if authorized is not None:
                 if store_only is not None:
                     await db.delete(store_only)
@@ -1699,7 +1706,7 @@ async def _record_pending_clears(
                     StreamPendingClear(
                         device_id=device_id,
                         stream=stream,
-                        provenance="store_only",
+                        provenance=STORE_ONLY_PROVENANCE,
                         revision=revision,
                     )
                 )
@@ -1716,7 +1723,7 @@ async def _record_pending_clears(
             authorized = StreamPendingClear(
                 device_id=device_id,
                 stream=stream,
-                provenance="authorized",
+                provenance=AUTHORIZED_PROVENANCE,
                 revision=max(revision, previous_revision),
             )
             if previous_since is not None:
@@ -1759,10 +1766,10 @@ async def _promote_parked_clears(
         top = max((row.revision for row in rows), default=0)
         if revision is not None:
             top = max(top, revision)
-        authorized = next((row for row in rows if row.provenance == "authorized"), None)
-        store_only = next((row for row in rows if row.provenance == "store_only"), None)
+        authorized = next((row for row in rows if row.provenance == AUTHORIZED_PROVENANCE), None)
+        store_only = next((row for row in rows if row.provenance == STORE_ONLY_PROVENANCE), None)
         if authorized is None:
-            store_only.provenance = "authorized"
+            store_only.provenance = AUTHORIZED_PROVENANCE
             store_only.revision = top
         else:
             authorized.revision = top
@@ -1940,7 +1947,7 @@ async def enqueue_removal(
             db,
             device_id,
             promotes,
-            provenance="store_only" if store_only else "authorized",
+            provenance=STORE_ONLY_PROVENANCE if store_only else AUTHORIZED_PROVENANCE,
         )
     if store_only and not force:
         logger.info("removal.skipped_store_only", device_id=device_id, scope=scope)

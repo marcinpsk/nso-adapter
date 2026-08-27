@@ -49,6 +49,12 @@ DELETE_ORIGIN_MARKING = "delete_origin"
 DETACH_MARKING = "detach"
 REMOVAL_MARKINGS: tuple[str, ...] = (DELETE_ORIGIN_MARKING, DETACH_MARKING)
 
+#: The provenance one pending-clear obligation carries. ``authorized`` was promoted by a
+#: normal claim. ``store_only`` is parked and never deploys.
+AUTHORIZED_PROVENANCE = "authorized"
+STORE_ONLY_PROVENANCE = "store_only"
+PENDING_CLEAR_PROVENANCES: tuple[str, ...] = (AUTHORIZED_PROVENANCE, STORE_ONLY_PROVENANCE)
+
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off"})
 

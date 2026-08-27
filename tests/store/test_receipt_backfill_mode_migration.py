@@ -37,10 +37,10 @@ def test_the_migration_chains_off_the_deployment_generation_revision():
     assert_single_head_containing(module.revision)
 
 
-def test_backfill_only_is_a_not_null_boolean_defaulting_to_false(pg_admin):
+def test_backfill_only_is_a_not_null_boolean_defaulting_to_false(pg_provisioner):
     """O2b.1 — every receipt admitted before the mode existed was an ordinary delivery."""
     module = _module()
-    with private_database(pg_admin, "rcpbf") as sync_url:
+    with private_database(pg_provisioner, "rcpbf") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         with engine_on(sync_url) as engine:
             column = {c["name"]: c for c in sa.inspect(engine).get_columns("intent_push_receipt")}["backfill_only"]
@@ -48,10 +48,10 @@ def test_backfill_only_is_a_not_null_boolean_defaulting_to_false(pg_admin):
             assert "false" in str(column["default"]).lower()
 
 
-def test_a_receipt_written_before_the_mode_existed_reads_as_an_ordinary_delivery(pg_admin):
+def test_a_receipt_written_before_the_mode_existed_reads_as_an_ordinary_delivery(pg_provisioner):
     """O2b.1 — the default is asserted on a real pre-migration row, not on the DDL alone."""
     module = _module()
-    with private_database(pg_admin, "rcpbfrow") as sync_url:
+    with private_database(pg_provisioner, "rcpbfrow") as sync_url:
         alembic(sync_url, "upgrade", module.down_revision)
         with engine_on(sync_url) as engine, engine.begin() as conn:
             conn.exec_driver_sql(
@@ -69,10 +69,10 @@ def test_a_receipt_written_before_the_mode_existed_reads_as_an_ordinary_delivery
             assert conn.exec_driver_sql("SELECT backfill_only FROM intent_push_receipt").scalar() is False
 
 
-def test_the_migration_is_reversible(pg_admin):
+def test_the_migration_is_reversible(pg_provisioner):
     """O2b.1 — irreversibility is the forbidden outcome."""
     module = _module()
-    with private_database(pg_admin, "rcpbfrev") as sync_url:
+    with private_database(pg_provisioner, "rcpbfrev") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         alembic(sync_url, "downgrade", module.down_revision)
         with engine_on(sync_url) as engine:

@@ -122,7 +122,7 @@ def _drop_database(admin, name: str, *, expect_clean: bool) -> None:
 
 
 @pytest.fixture(scope="session")
-def pg_admin():
+def pg_provisioner():
     """AUTOCOMMIT admin engine for CREATE/DROP DATABASE. Sync + session-scoped on purpose:
     an asyncpg pool created on a session-scoped loop and used from per-test loops is UB."""
     engine = sa.create_engine(ADMIN_URL, isolation_level="AUTOCOMMIT", poolclass=sa.pool.NullPool)
@@ -135,12 +135,12 @@ def pg_admin():
 
 
 @pytest.fixture(scope="session")
-def pg_template(pg_admin):
+def pg_template(pg_provisioner):
     """Build the schema ONCE — via alembic, the schema production runs — into a database
     used only as a clone source. Wrapped so a SETUP failure (broken migration chain, bad
     ALTER) still drops the half-built template instead of leaking it."""
     name = f"nsoadp_{_RUN}_tmpl"
-    with pg_admin.connect() as conn:
+    with pg_provisioner.connect() as conn:
         conn.exec_driver_sql(f'CREATE DATABASE "{name}"')
     try:
         try:
@@ -156,18 +156,18 @@ def pg_template(pg_admin):
             raise RuntimeError(f"template build failed:\n{exc.stderr.decode()}") from exc
         yield name
     finally:
-        _drop_database(pg_admin, name, expect_clean=False)  # build connections are ours
+        _drop_database(pg_provisioner, name, expect_clean=False)  # build connections are ours
 
 
 @pytest.fixture
-def pg_database(pg_admin, pg_template):
+def pg_database(pg_provisioner, pg_template):
     """A PRIVATE database per test, cloned from the template."""
     worker = os.environ.get("PYTEST_XDIST_WORKER", "m")  # xdist-ready, xdist-optional
     name = f"nsoadp_{_RUN}_{worker}_{next(_clone_seq):05d}"  # always << 63 bytes
-    with pg_admin.connect() as conn:
+    with pg_provisioner.connect() as conn:
         conn.exec_driver_sql(f'CREATE DATABASE "{name}" TEMPLATE "{pg_template}"')
     try:
-        with pg_admin.connect() as conn:
+        with pg_provisioner.connect() as conn:
             # Fail fast instead of wedging: the family fence is real on PG and can block.
             # CREATE DATABASE ... TEMPLATE does NOT copy pg_db_role_setting — set per clone.
             for stmt in (
@@ -179,7 +179,7 @@ def pg_database(pg_admin, pg_template):
         yield name
     finally:
         # An ALTER failure above must not leak the clone — hence the try wrapping it.
-        _drop_database(pg_admin, name, expect_clean=True)
+        _drop_database(pg_provisioner, name, expect_clean=True)
 
 
 @pytest.fixture

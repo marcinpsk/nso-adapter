@@ -32,7 +32,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from nso_adapter.core.request_flags import REMOVAL_MARKINGS
+from nso_adapter.core.request_flags import PENDING_CLEAR_PROVENANCES, REMOVAL_MARKINGS
 from nso_adapter.store.ddl import generation_immutability_ddl
 
 
@@ -561,7 +561,7 @@ class StreamPendingClear(Base):
     __table_args__ = (
         UniqueConstraint("device_id", "stream", name="uq_stream_pending_clear"),
         CheckConstraint(
-            "provenance IN ('authorized', 'store_only')",
+            f"provenance IN ({', '.join(repr(provenance) for provenance in PENDING_CLEAR_PROVENANCES)})",
             name="ck_stream_pending_clear_provenance",
         ),
     )

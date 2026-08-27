@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import sqlalchemy as sa
 
 from tests.store.migration_harness import (
@@ -15,6 +17,8 @@ from tests.store.migration_harness import (
 )
 
 _MIGRATION = "a6d4f2c8e1b3_stream_pending_clear_uniqueness.py"
+_EARLIER = datetime(2026, 8, 25, 10, 0, tzinfo=UTC)
+_LATER = datetime(2026, 8, 26, 10, 0, tzinfo=UTC)
 
 
 def _module():
@@ -41,12 +45,30 @@ def _seed_pending_clear_rows(engine) -> None:
             sa.text(
                 "INSERT INTO stream_pending_clear "
                 "(device_id, stream, provenance, revision, recorded_at) "
-                "VALUES (:device_id, :stream, :provenance, :revision, now())"
+                "VALUES (:device_id, :stream, :provenance, :revision, :recorded_at)"
             ),
             [
-                {"device_id": device_id, "stream": "isis", "provenance": "store_only", "revision": 4},
-                {"device_id": device_id, "stream": "isis", "provenance": "authorized", "revision": 2},
-                {"device_id": device_id, "stream": "ospf", "provenance": "store_only", "revision": 3},
+                {
+                    "device_id": device_id,
+                    "stream": "isis",
+                    "provenance": "store_only",
+                    "revision": 4,
+                    "recorded_at": _EARLIER,
+                },
+                {
+                    "device_id": device_id,
+                    "stream": "isis",
+                    "provenance": "authorized",
+                    "revision": 2,
+                    "recorded_at": _LATER,
+                },
+                {
+                    "device_id": device_id,
+                    "stream": "ospf",
+                    "provenance": "store_only",
+                    "revision": 3,
+                    "recorded_at": _LATER,
+                },
             ],
         )
 
@@ -57,9 +79,9 @@ def test_stream_pending_clear_uniqueness_chains_off_the_table_migration():
     assert_single_head_containing(module.revision)
 
 
-def test_stream_pending_clear_uniqueness_repairs_pairs_before_upgrade(pg_admin):
+def test_stream_pending_clear_uniqueness_repairs_pairs_before_upgrade(pg_provisioner):
     module = _module()
-    with private_database(pg_admin, "pending_clear_unique") as sync_url:
+    with private_database(pg_provisioner, "pending_clear_unique") as sync_url:
         alembic(sync_url, "upgrade", module.down_revision)
         with engine_on(sync_url) as engine:
             _seed_pending_clear_rows(engine)
@@ -68,15 +90,21 @@ def test_stream_pending_clear_uniqueness_repairs_pairs_before_upgrade(pg_admin):
         with engine_on(sync_url) as engine:
             with engine.connect() as conn:
                 rows = conn.execute(
-                    sa.text("SELECT stream, provenance, revision FROM stream_pending_clear ORDER BY stream, provenance")
+                    sa.text(
+                        "SELECT stream, provenance, revision, recorded_at "
+                        "FROM stream_pending_clear ORDER BY stream, provenance"
+                    )
                 ).all()
-            assert rows == [("isis", "authorized", 4), ("ospf", "store_only", 3)]
+            assert rows == [
+                ("isis", "authorized", 4, _EARLIER),
+                ("ospf", "store_only", 3, _LATER),
+            ]
             assert _unique_constraints(engine)["uq_stream_pending_clear"] == ("device_id", "stream")
 
 
-def test_stream_pending_clear_uniqueness_downgrade_restores_provenance_identity(pg_admin):
+def test_stream_pending_clear_uniqueness_downgrade_restores_provenance_identity(pg_provisioner):
     module = _module()
-    with private_database(pg_admin, "pending_clear_unique_down") as sync_url:
+    with private_database(pg_provisioner, "pending_clear_unique_down") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         alembic(sync_url, "downgrade", module.down_revision)
         with engine_on(sync_url) as engine:

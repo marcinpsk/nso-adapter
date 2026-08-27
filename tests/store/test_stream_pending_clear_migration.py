@@ -30,9 +30,11 @@ def test_stream_pending_clear_migration_chains_off_the_current_branch_head():
     assert_single_head_containing(module.revision)
 
 
-def test_stream_pending_clear_table_shape(pg_admin):
+def test_stream_pending_clear_table_shape(pg_provisioner):
+    from nso_adapter.core.request_flags import PENDING_CLEAR_PROVENANCES
+
     module = _module()
-    with private_database(pg_admin, "pending_clear") as sync_url:
+    with private_database(pg_provisioner, "pending_clear") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         with engine_on(sync_url) as engine:
             inspector = sa.inspect(engine)
@@ -50,13 +52,13 @@ def test_stream_pending_clear_table_shape(pg_admin):
             }
             assert ("device_id", "stream", "provenance") in unique_columns
             checks = [constraint["sqltext"] for constraint in inspector.get_check_constraints("stream_pending_clear")]
-            assert any("authorized" in check and "store_only" in check for check in checks)
+            assert any(all(repr(provenance) in check for provenance in PENDING_CLEAR_PROVENANCES) for check in checks)
             assert delete_rules(engine, "stream_pending_clear")["device_id"] == "CASCADE"
 
 
-def test_stream_pending_clear_migration_is_reversible(pg_admin):
+def test_stream_pending_clear_migration_is_reversible(pg_provisioner):
     module = _module()
-    with private_database(pg_admin, "pending_clear_down") as sync_url:
+    with private_database(pg_provisioner, "pending_clear_down") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         alembic(sync_url, "downgrade", module.down_revision)
         with engine_on(sync_url) as engine:
