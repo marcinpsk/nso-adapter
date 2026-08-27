@@ -28,9 +28,9 @@ def test_the_settlement_cohort_migration_chains_off_the_previous_head():
     assert_single_head_containing(module.revision)
 
 
-def test_the_settlement_cohort_is_a_nullable_bigint_with_its_allocator(pg_admin):
+def test_the_settlement_cohort_is_a_nullable_bigint_with_its_allocator(pg_provisioner):
     module = _module()
-    with private_database(pg_admin, "settlecohort") as sync_url:
+    with private_database(pg_provisioner, "settlecohort") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         with engine_on(sync_url) as engine:
             inspector = sa.inspect(engine)
@@ -41,9 +41,9 @@ def test_the_settlement_cohort_is_a_nullable_bigint_with_its_allocator(pg_admin)
             assert inspector.has_sequence(_SEQUENCE)
 
 
-def test_the_settlement_cohort_migration_is_reversible(pg_admin):
+def test_the_settlement_cohort_migration_is_reversible(pg_provisioner):
     module = _module()
-    with private_database(pg_admin, "settlecohortrev") as sync_url:
+    with private_database(pg_provisioner, "settlecohortrev") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         alembic(sync_url, "downgrade", module.down_revision)
         with engine_on(sync_url) as engine:

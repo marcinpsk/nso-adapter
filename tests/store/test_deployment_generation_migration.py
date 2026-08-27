@@ -208,7 +208,7 @@ def test_historical_trigger_is_frozen_and_head_trigger_matches_live_ddl(pg_provi
         assert head_source == _function_source(generation_immutability_ddl()[0])
 
 
-def test_settlement_cohort_trigger_is_frozen_and_head_trigger_matches_live_ddl(pg_admin, tmp_path, monkeypatch):
+def test_settlement_cohort_trigger_is_frozen_and_head_trigger_matches_live_ddl(pg_provisioner, tmp_path, monkeypatch):
     from nso_adapter.store.ddl import generation_immutability_ddl
 
     module = load_migration(_SETTLEMENT_COHORT_MIGRATION)
@@ -222,7 +222,7 @@ def test_settlement_cohort_trigger_is_frozen_and_head_trigger_matches_live_ddl(p
         "ddl.generation_immutability_ddl.__defaults__ = (ddl.GENERATION_IMMUTABLE_COLUMNS,)\n"
     )
 
-    with private_database(pg_admin, "settlement_cohort_generation_ddl") as sync_url:
+    with private_database(pg_provisioner, "settlement_cohort_generation_ddl") as sync_url:
         old_pythonpath = os.environ.get("PYTHONPATH")
         pythonpath = str(tmp_path) if old_pythonpath is None else os.pathsep.join((str(tmp_path), old_pythonpath))
         monkeypatch.setenv("PYTHONPATH", pythonpath)
