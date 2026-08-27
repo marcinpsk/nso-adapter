@@ -85,7 +85,7 @@ def _installed_function_source(engine) -> str:
         return conn.execute(_FUNCTION_SOURCE_SQL, {"name": _FUNCTION}).scalar_one()
 
 
-def test_apply_evidence_trigger_is_frozen_for_upgrade_and_downgrade(pg_admin, tmp_path, monkeypatch):
+def test_apply_evidence_trigger_is_frozen_for_upgrade_and_downgrade(pg_provisioner, tmp_path, monkeypatch):
     module = _module()
     marker = tmp_path / "sitecustomize-loaded"
     sitecustomize = tmp_path / "sitecustomize.py"
@@ -98,7 +98,7 @@ def test_apply_evidence_trigger_is_frozen_for_upgrade_and_downgrade(pg_admin, tm
         "assert 'drifted_column' in ddl.generation_immutability_ddl()[0]\n"
     )
 
-    with private_database(pg_admin, "apply_evidence_ddl") as sync_url:
+    with private_database(pg_provisioner, "apply_evidence_ddl") as sync_url:
         old_pythonpath = os.environ.get("PYTHONPATH")
         pythonpath = str(tmp_path) if old_pythonpath is None else os.pathsep.join((str(tmp_path), old_pythonpath))
         monkeypatch.setenv("PYTHONPATH", pythonpath)
@@ -113,12 +113,12 @@ def test_apply_evidence_trigger_is_frozen_for_upgrade_and_downgrade(pg_admin, tm
             assert _installed_function_source(engine) == _FROZEN_PREVIOUS_FUNCTION_SOURCE
 
 
-def test_apply_evidence_schema_and_attempt_retention(pg_admin):
+def test_apply_evidence_schema_and_attempt_retention(pg_provisioner):
     module = _module()
     assert module.down_revision == "b9e3d7a1c5f2"
     assert_single_head_containing(module.revision)
 
-    with private_database(pg_admin, "applyevidence") as sync_url:
+    with private_database(pg_provisioner, "applyevidence") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         with engine_on(sync_url) as engine:
             inspector = sa.inspect(engine)
@@ -214,9 +214,9 @@ def test_apply_evidence_schema_and_attempt_retention(pg_admin):
                 )
 
 
-def test_generation_attempt_must_belong_to_the_same_device(pg_admin):
+def test_generation_attempt_must_belong_to_the_same_device(pg_provisioner):
     module = _module()
-    with private_database(pg_admin, "apply_evidence_device_fk") as sync_url:
+    with private_database(pg_provisioner, "apply_evidence_device_fk") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         with engine_on(sync_url) as engine:
             with pytest.raises(sa.exc.IntegrityError) as exc_info, engine.begin() as conn:
@@ -256,9 +256,9 @@ def test_generation_attempt_must_belong_to_the_same_device(pg_admin):
             assert "fk_generation_apply_attempt" in str(exc_info.value)
 
 
-def test_apply_evidence_migration_is_reversible(pg_admin):
+def test_apply_evidence_migration_is_reversible(pg_provisioner):
     module = _module()
-    with private_database(pg_admin, "applyevidencerev") as sync_url:
+    with private_database(pg_provisioner, "applyevidencerev") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         alembic(sync_url, "downgrade", module.down_revision)
         with engine_on(sync_url) as engine:
