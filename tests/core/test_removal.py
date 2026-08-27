@@ -40,6 +40,7 @@ from nso_adapter.store.models import (
 from tests.conftest import SNMP_COMMUNITY as _COMMUNITY
 from tests.conftest import SNMP_VAULT_REF as _REF
 from tests.conftest import note_projection_write, session
+from tests.core.removal_helpers import seed_removal_job
 
 _NOW = datetime.now(UTC)
 
@@ -1339,7 +1340,7 @@ async def test_static_route_removal_no_longer_blocks_on_collateral(adapter_clien
     instead. The full branch matrix lives in ``tests/core/test_static_route_removal.py``; this
     pin exists so the change cannot happen silently for the other twelve scopes' neighbours.
     """
-    from tests.core.test_static_route_removal import SrFake, run_removal_job, seed_removal_job, sr_client, wire
+    from tests.core.test_static_route_removal import SrFake, run_removal_job, sr_client, wire
 
     survivor = ("", "10.0.0.0/24", "192.0.2.1")
     dropped = ("", "10.9.0.0/24", "192.0.2.9")

@@ -151,6 +151,31 @@ async def test_generations_list_filters_strictly_after_since_seq(adapter_client)
     assert [(row["generation_id"], row["seq"]) for row in response.json()] == [(late_id, 9)]
 
 
+@pytest.mark.parametrize(
+    ("since_seq", "expected_status"),
+    [
+        (-(2**63) - 1, 422),
+        (-(2**63), 200),
+        (2**63 - 1, 200),
+        (2**63, 422),
+    ],
+)
+async def test_generations_list_bounds_since_seq_to_signed_bigint(adapter_client, since_seq, expected_status):
+    device_id = await seed_device(nso_device_name="generation-cursor-bounds", netbox_device_id=1561)
+
+    response = await adapter_client.get(
+        f"/api/v1/devices/{device_id}/generations",
+        params={"since_seq": since_seq},
+        headers=AUTH,
+    )
+
+    assert response.status_code == expected_status, response.text
+    if expected_status == 422:
+        error = response.json()["error"]
+        assert error["code"] == "validation_error"
+        assert any(item["loc"] == ["query", "since_seq"] for item in error["detail"]["errors"])
+
+
 async def test_generations_list_applies_a_fail_fast_page_limit(adapter_client):
     device_id = await seed_device(nso_device_name="generation-page", netbox_device_id=1560)
     early_id, _late_id, _job_id = await _seed_generation_chain(device_id)

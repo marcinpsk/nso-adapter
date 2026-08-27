@@ -353,7 +353,7 @@ async def get_device(device_id: int, db: AsyncSession = Depends(get_db)):
 )
 async def list_device_generations(
     device_id: int,
-    since_seq: int | None = None,
+    since_seq: Annotated[int | None, Query(ge=-(2**63), le=2**63 - 1)] = None,
     limit: Annotated[int, Query(ge=LIMIT_MIN, le=LIMIT_MAX)] = DEFAULT_PAGE,
     db: AsyncSession = Depends(get_read_db),
 ):

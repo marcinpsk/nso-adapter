@@ -53,6 +53,16 @@ def test_every_section_is_either_document_executed_or_names_its_blocker():
     assert ACTION_APPLY_EXECUTABLE_SECTIONS is DOCUMENT_EXECUTED_SECTIONS, (
         "selection and execution must share one section-set source of truth"
     )
+    incremented = (
+        _INCREMENT_ONE_SECTIONS
+        | _INCREMENT_TWO_SECTIONS
+        | _INCREMENT_THREE_SECTIONS
+        | _INCREMENT_FOUR_SECTIONS
+        | _INCREMENT_FIVE_SECTIONS
+    )
+    assert incremented | {"vlan"} == DOCUMENT_EXECUTED_SECTIONS, (
+        "vlan is intentionally document-executed without an incremental rollout step"
+    )
 
 
 def test_every_projection_column_has_a_supported_json_round_trip():

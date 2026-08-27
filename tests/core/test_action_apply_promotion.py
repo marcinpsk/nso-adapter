@@ -2289,6 +2289,7 @@ def test_every_apply_unexecutable_reason_is_documented_and_live():
     contract = (Path(__file__).resolve().parents[2] / "docs" / "api-contract.md").read_text()
 
     raised: set[str] = set()
+    accumulator_sites = 0
     for path in source_dir.rglob("*.py"):
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
@@ -2311,11 +2312,15 @@ def test_every_apply_unexecutable_reason_is_documented_and_live():
                     for target in node.targets
                 )
             ):
+                accumulator_sites += 1
                 raised.add(node.value.value)
 
     assert raised, "the reason scan found no raise site — the scan itself has drifted"
-    paragraph = contract.split("Reasons are stable machine codes:")[1].split("A push can also return")[0]
-    documented = set(re.findall(r"`([a-z_]+)`", paragraph))
+    assert accumulator_sites == 1, "an ApplyUnexecutable accumulator producer changed shape"
+    reason_list = contract.split("<!-- apply-unexecutable-reasons:start -->", 1)[1].split(
+        "<!-- apply-unexecutable-reasons:end -->", 1
+    )[0]
+    documented = set(re.findall(r"^\s*- `([a-z_]+)`\s*$", reason_list, re.MULTILINE))
     assert documented == raised, f"documented {sorted(documented)} != raised {sorted(raised)}"
 
 

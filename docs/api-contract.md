@@ -758,9 +758,15 @@ barrier.
 Apply refuses the whole request with `409 apply_unexecutable` when any selected stream cannot
 be routed faithfully through those runners. The refusal names each stream and reason. It does
 not promote or enqueue a subset. Reasons are stable machine codes:
-`interface_attribute_eligibility_unresolved`, `mixed_detach_replacement`,
-`no_executable_interface`, and `unresolved_interface_identity`. A push can also return
-`outstanding_deletion_provenance`
+
+<!-- apply-unexecutable-reasons:start -->
+- `interface_attribute_eligibility_unresolved`
+- `mixed_detach_replacement`
+- `no_executable_interface`
+- `unresolved_interface_identity`
+<!-- apply-unexecutable-reasons:end -->
+
+A push can also return `outstanding_deletion_provenance`
 when its receipt still carries deletion work.
 
 The manual-Apply boundary is exactly `DOCUMENT_EXECUTED_SECTIONS`. It contains every section,
