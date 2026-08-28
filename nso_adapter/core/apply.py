@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
@@ -1215,7 +1215,7 @@ def _stamp_key(row) -> tuple[type, object]:
     return type(row), getattr(row, "id", None)
 
 
-def _stamp_join(document_rows: list, live_rows: list) -> dict[tuple[type, object], object]:
+def _stamp_join(document_rows: Sequence, live_rows: Sequence) -> dict[tuple[type, object], Any]:
     """Map document rows to live rows that still hold the same intent."""
     live_by_id = {row.id: row for row in live_rows}
     return {
@@ -1284,6 +1284,8 @@ class _Projection:
         self._live: dict[tuple[type, bool], list] = {}
 
     def _document_rows(self, section: str) -> dict[type, list]:
+        if self._document is None:
+            raise RuntimeError("document rows requested without a deployment document")
         if section not in self._hydrated:
             self._hydrated[section] = hydrate_section(self._document, section)
         return self._hydrated[section]

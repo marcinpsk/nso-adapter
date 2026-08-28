@@ -339,7 +339,7 @@ def _row_dict(row) -> dict:
     return {attr.key: _document_value(row, attr.key) for attr in sa_inspect(type(row)).column_attrs}
 
 
-_SPEC_BY_MODEL: dict[type, _Spec] = {spec.model: spec for specs in _SECTION_TABLES.values() for spec in specs}
+_SPEC_BY_MODEL: dict[Any, _Spec] = {spec.model: spec for specs in _SECTION_TABLES.values() for spec in specs}
 _SPEC_BY_TABLE: dict[str, _Spec] = {spec.model.__tablename__: spec for spec in _SPEC_BY_MODEL.values()}
 
 
@@ -374,7 +374,7 @@ def _identity_fields(spec: _Spec) -> tuple[str, ...]:
     return tuple(field for field in candidates[0] if field != scope)
 
 
-def _row_identity(spec: _Spec, row: dict, identities_by_id: dict[type, dict[Any, tuple]]) -> tuple:
+def _row_identity(spec: _Spec, row: dict, identities_by_id: dict[Any, dict[Any, tuple]]) -> tuple:
     parent_identity: tuple = ()
     if spec.parent is not None:
         fk = _fk_column(spec.model, spec.parent)
@@ -384,17 +384,18 @@ def _row_identity(spec: _Spec, row: dict, identities_by_id: dict[type, dict[Any,
             # DbInterface is outside the projection and is not rebuilt by an intent PUT.
             parent_identity = (parent_id,)
         else:
-            parent_identity = identities_by_id.get(spec.parent, {}).get(parent_id)
-            if parent_identity is None:
+            found = identities_by_id.get(spec.parent, {}).get(parent_id)
+            if found is None:
                 raise RuntimeError(
                     f"{spec.model.__tablename__} row references missing {spec.parent.__tablename__} id {parent_id!r}"
                 )
+            parent_identity = found
     return (*parent_identity, *(row.get(field) for field in _identity_fields(spec)))
 
 
-def _identity_indexes(fragment: dict[str, list[dict]], specs: tuple[_Spec, ...]) -> dict[type, dict[tuple, dict]]:
+def _identity_indexes(fragment: dict[str, list[dict]], specs: tuple[_Spec, ...]) -> dict[Any, dict[tuple, dict]]:
     """Index each table once, with parents before children."""
-    identities_by_id: dict[type, dict[Any, tuple]] = {}
+    identities_by_id: dict[Any, dict[Any, tuple]] = {}
     rows_by_identity: dict[type, dict[tuple, dict]] = {}
     for spec in specs:
         indexed: dict[tuple, dict] = {}
@@ -651,7 +652,7 @@ def hydrate_interface_execution(document: dict) -> InterfaceExecution:
     return InterfaceExecution(interfaces, frozenset(eligible))
 
 
-_MODEL_BY_TABLE: dict[str, type] = {spec.model.__tablename__: spec.model for spec in _SPEC_BY_MODEL.values()}
+_MODEL_BY_TABLE: dict[str, Any] = {spec.model.__tablename__: spec.model for spec in _SPEC_BY_MODEL.values()}
 
 
 def _from_jsonable(value: Any, column) -> Any:
@@ -702,7 +703,7 @@ def intent_state(row) -> dict:
 
 
 @cache
-def _collection_relationship(parent: type, child: type) -> str:
+def _collection_relationship(parent: Any, child: Any) -> str:
     """Return the parent's one collection relationship to *child*."""
     relationships = [
         relation.key
@@ -717,7 +718,7 @@ def _collection_relationship(parent: type, child: type) -> str:
 
 
 def _attach_hydrated_relationships(
-    fragment: dict[str, list[dict]], section: str, records: dict[type, list[tuple[dict, object]]]
+    fragment: dict[str, list[dict]], section: str, records: dict[Any, list[tuple[dict, object]]]
 ) -> None:
     """Rebuild in-document parent collections from durable logical identities."""
     section_specs = _SECTION_TABLES[section]
@@ -733,7 +734,7 @@ def _attach_hydrated_relationships(
         child_pairs = records.get(spec.model, [])
         instance_by_record = {id(record): instance for record, instance in parent_pairs}
         parents = {identity: instance_by_record[id(record)] for identity, record in indexes[spec.parent].items()}
-        grouped = {identity: [] for identity in parents}
+        grouped: dict[tuple, list] = {identity: [] for identity in parents}
         child_instance_by_record = {id(record): instance for record, instance in child_pairs}
         local_identity_size = len(_identity_fields(spec))
         if local_identity_size == 0:
