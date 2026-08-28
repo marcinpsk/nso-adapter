@@ -196,7 +196,7 @@ async def test_clearing_an_owned_ospf_instance_scalar_retracts(adapter_client):
 
 async def test_ospf_enabled_false_to_none_is_an_update_not_a_clear(adapter_client):
     """The writer maps None to explicit enabled=true, so no replace is needed."""
-    from nso_adapter.store.models import StreamPendingClear
+    from nso_adapter.store.models import OspfInstanceIntent, StreamPendingClear
 
     device_id = await seed_device(nso_device_name="ospf-enabled-update", netbox_device_id=934)
     url = f"/api/v1/devices/{device_id}/ospf-intent"
@@ -222,7 +222,13 @@ async def test_ospf_enabled_false_to_none_is_an_update_not_a_clear(adapter_clien
             .scalars()
             .all()
         )
+        stored = (
+            await db.execute(select(OspfInstanceIntent.enabled).where(OspfInstanceIntent.device_id == device_id))
+        ).scalar_one()
     assert pending == []
+    # The second PUT really landed: the row updated False -> None (the writer stores the
+    # wire value verbatim; the renderer maps None to explicit enabled=true).
+    assert stored is None
 
 
 async def test_ospf_unown_riding_along_with_a_clear_defers_the_retract(adapter_client):

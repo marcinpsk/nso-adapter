@@ -42,8 +42,9 @@ depend on request order.
 row-oriented implementation emits that id twice, and the plugin's partition validator then
 rejects the stored response forever.
 
-Every output is sorted, so two orderings of one request produce byte-identical responses —
-and therefore byte-identical stored receipts.
+Every output is sorted, so two orderings of one request produce byte-identical response
+CONTENT. The stored receipt stays order-exact: the request digest hashes the body as
+parsed, so a reordered request is a distinct delivery with its own receipt.
 """
 
 from __future__ import annotations
