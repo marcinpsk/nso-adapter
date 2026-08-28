@@ -404,7 +404,7 @@ async def action_apply(
     job_id = generations[0]["job_id"] if generations else None
     if generations and job_id is None:
         raise api_error(500, "internal", "The promoted generation chain has no executable head job")
-    result = {
+    payload: dict[str, object] = {
         "device_id": device_id,
         "outcome": "promoted" if generations else "no_op",
         "selected": body.selected,
@@ -413,16 +413,16 @@ async def action_apply(
         "generations": generations,
     }
     if job_id is not None:
-        result["job_id"] = job_id
+        payload["job_id"] = job_id
     await complete_apply_attempt(
         db,
         body.apply_attempt_id,
         admission_state="admitted",
         http_status=status_code,
-        response=result,
+        response=payload,
     )
     await db.commit()
-    return _apply_http_response(status_code, result)
+    return _apply_http_response(status_code, payload)
 
 
 class BarrierActionIn(BaseModel):

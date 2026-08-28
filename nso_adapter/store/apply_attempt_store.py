@@ -11,6 +11,7 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.store.db import execute_dml
 from nso_adapter.store.models import DeploymentApplyAttempt
 
 
@@ -89,14 +90,15 @@ async def complete_apply_attempt(
     response: dict,
 ) -> None:
     """Store the final replay body before the caller commits the admission."""
-    result = await db.execute(
+    result = await execute_dml(
+        db,
         update(DeploymentApplyAttempt)
         .where(DeploymentApplyAttempt.id == attempt_id)
         .values(
             admission_state=admission_state,
             http_status=http_status,
             response=response,
-        )
+        ),
     )
     if result.rowcount != 1:
         raise RuntimeError(f"Apply attempt {attempt_id} disappeared before completion")

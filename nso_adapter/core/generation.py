@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from contextvars import ContextVar
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -1284,7 +1285,7 @@ async def settle_job_generations(
 
 async def _terminalize_generations(
     db: AsyncSession,
-    generations: list[DeploymentGeneration],
+    generations: Sequence[DeploymentGeneration],
     *,
     outcome: GenerationStatus,
     error: dict | None = None,
@@ -1651,7 +1652,7 @@ async def recover_generations() -> int:
             expected_statuses=(GenerationStatus.running,),
         )
         stranded.extend(generation.device_id for generation in rows if generation.id in terminalized)
-        devices = (
+        devices = list(
             (
                 await db.execute(
                     select(DeploymentGeneration.device_id)

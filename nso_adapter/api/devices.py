@@ -638,7 +638,7 @@ async def deployment_evidence(
 
     pending_generations = 0
     if head is not None:
-        pending_generations = await db.scalar(
+        count = await db.scalar(
             select(func.count())
             .select_from(DeploymentGeneration)
             .where(
@@ -647,6 +647,7 @@ async def deployment_evidence(
                 DeploymentGeneration.status.not_in(CROSSABLE_STATUSES),
             )
         )
+        pending_generations = int(count or 0)
 
     requested_ids = body.apply_attempt_ids
     attempts_by_id: dict[UUID, DeploymentApplyAttempt] = {}
@@ -682,6 +683,7 @@ async def deployment_evidence(
             .all()
         )
         for generation in generation_rows:
+            assert generation.apply_attempt_id is not None  # the query filters on the requested ids
             generations_by_attempt.setdefault(generation.apply_attempt_id, []).append(generation)
 
         for attempt in attempts_by_id.values():
@@ -699,16 +701,16 @@ async def deployment_evidence(
         "pending_generations": pending_generations,
         "attempts": [
             {
-                "apply_attempt_id": attempt.id,
-                "admission_state": attempt.admission_state,
-                "http_status": attempt.http_status,
-                "response": attempt.response,
+                "apply_attempt_id": found.id,
+                "admission_state": found.admission_state,
+                "http_status": found.http_status,
+                "response": found.response,
                 "generations": [
-                    _attempt_generation_out(generation) for generation in generations_by_attempt.get(attempt.id, [])
+                    _attempt_generation_out(generation) for generation in generations_by_attempt.get(found.id, [])
                 ],
             }
             for attempt_id in requested_ids
-            if (attempt := attempts_by_id.get(attempt_id)) is not None
+            if (found := attempts_by_id.get(attempt_id)) is not None
         ],
         "unknown_apply_attempt_ids": [attempt_id for attempt_id in requested_ids if attempt_id not in attempts_by_id],
     }
