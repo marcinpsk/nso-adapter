@@ -752,6 +752,12 @@ async def _replacement_rows(db: AsyncSession, device, scope: str, model, job_id:
     )
 
 
+async def _accepted_rows(db: AsyncSession, device_id: int, model, *extra) -> list:
+    """Return the live-store accepted rows of one model — the else half of a replacement read."""
+    stmt = select(model).where(model.device_id == device_id, model.accepted_at.is_not(None), *extra)
+    return list((await db.execute(stmt)).scalars().all())
+
+
 async def _replace_simple(
     db: AsyncSession, device, client, scope: str, context: dict | None = None, *, job_id: int | None = None
 ) -> None:
@@ -1428,17 +1434,7 @@ async def _replace_logging(
         level_rows = document_rows.get(LoggingLevelsIntent, [])
         levels = level_rows[0] if level_rows else None
     else:
-        rows = (
-            (
-                await db.execute(
-                    select(LoggingHostIntent).where(
-                        LoggingHostIntent.device_id == device.id, LoggingHostIntent.accepted_at.is_not(None)
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
+        rows = await _accepted_rows(db, device.id, LoggingHostIntent)
         levels = (
             await db.execute(
                 select(LoggingLevelsIntent).where(
@@ -1469,41 +1465,9 @@ async def _replace_ospf(
         ifaces = document_rows.get(OspfInterfaceIntent, [])
         redist = document_rows.get(RedistributionIntent, [])
     else:
-        insts = (
-            (
-                await db.execute(
-                    select(OspfInstanceIntent).where(
-                        OspfInstanceIntent.device_id == device.id, OspfInstanceIntent.accepted_at.is_not(None)
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        ifaces = (
-            (
-                await db.execute(
-                    select(OspfInterfaceIntent).where(
-                        OspfInterfaceIntent.device_id == device.id, OspfInterfaceIntent.accepted_at.is_not(None)
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        redist = (
-            (
-                await db.execute(
-                    select(RedistributionIntent).where(
-                        RedistributionIntent.device_id == device.id,
-                        RedistributionIntent.dest_protocol == "ospf",
-                        RedistributionIntent.accepted_at.is_not(None),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
+        insts = await _accepted_rows(db, device.id, OspfInstanceIntent)
+        ifaces = await _accepted_rows(db, device.id, OspfInterfaceIntent)
+        redist = await _accepted_rows(db, device.id, RedistributionIntent, RedistributionIntent.dest_protocol == "ospf")
 
     async def _apply(**kwargs):
         return await apply_ospf_config(client, device.nso_device_name, insts, ifaces, redist, **kwargs)
@@ -1525,31 +1489,9 @@ async def _replace_bgp(
     else:
         from nso_adapter.core.bgp_load import attach_bgp_relationships
 
-        routers = (
-            (
-                await db.execute(
-                    select(BgpRouterIntent).where(
-                        BgpRouterIntent.device_id == device.id, BgpRouterIntent.accepted_at.is_not(None)
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
+        routers = await _accepted_rows(db, device.id, BgpRouterIntent)
         await attach_bgp_relationships(db, routers)
-        redist = (
-            (
-                await db.execute(
-                    select(RedistributionIntent).where(
-                        RedistributionIntent.device_id == device.id,
-                        RedistributionIntent.dest_protocol == "bgp",
-                        RedistributionIntent.accepted_at.is_not(None),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
+        redist = await _accepted_rows(db, device.id, RedistributionIntent, RedistributionIntent.dest_protocol == "bgp")
 
     async def _apply(**kwargs):
         return await apply_bgp_config(client, device.nso_device_name, routers, redist, **kwargs)
@@ -1689,17 +1631,11 @@ async def _replace_isis(
         levels = document_rows.get(IsisLevelIntent, [])
         redist = document_rows.get(RedistributionIntent, [])
     else:
-        device_id = device.id
-
-        async def _accepted(model, *extra):
-            stmt = select(model).where(model.device_id == device_id, model.accepted_at.is_not(None), *extra)
-            return (await db.execute(stmt)).scalars().all()
-
-        ifaces = await _accepted(IsisInterfaceIntent)
-        procs = await _accepted(IsisProcessIntent)
-        flex = await _accepted(IsisFlexAlgoIntent)
-        levels = await _accepted(IsisLevelIntent)
-        redist = await _accepted(RedistributionIntent, RedistributionIntent.dest_protocol == "isis")
+        ifaces = await _accepted_rows(db, device.id, IsisInterfaceIntent)
+        procs = await _accepted_rows(db, device.id, IsisProcessIntent)
+        flex = await _accepted_rows(db, device.id, IsisFlexAlgoIntent)
+        levels = await _accepted_rows(db, device.id, IsisLevelIntent)
+        redist = await _accepted_rows(db, device.id, RedistributionIntent, RedistributionIntent.dest_protocol == "isis")
 
     async def _apply(**kwargs):
         return await apply_isis_interfaces(
@@ -1734,16 +1670,10 @@ async def _replace_snmp(
         sysinfo_rows = document_rows.get(SnmpSystemInfoIntent, [])
         sysinfo = sysinfo_rows[0] if sysinfo_rows else None
     else:
-        device_id = device.id
-
-        async def _accepted(model):
-            stmt = select(model).where(model.device_id == device_id, model.accepted_at.is_not(None))
-            return (await db.execute(stmt)).scalars().all()
-
-        comms = await _accepted(SnmpCommunityIntent)
-        users = await _accepted(SnmpV3UserIntent)
-        hosts = await _accepted(SnmpHostIntent)
-        sysinfo_rows = await _accepted(SnmpSystemInfoIntent)
+        comms = await _accepted_rows(db, device.id, SnmpCommunityIntent)
+        users = await _accepted_rows(db, device.id, SnmpV3UserIntent)
+        hosts = await _accepted_rows(db, device.id, SnmpHostIntent)
+        sysinfo_rows = await _accepted_rows(db, device.id, SnmpSystemInfoIntent)
         sysinfo = sysinfo_rows[0] if sysinfo_rows else None
 
     async def _apply(**kwargs):
