@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends
@@ -17,7 +18,7 @@ from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
-from nso_adapter.api.timestamps import UtcInstant, iso_z
+from nso_adapter.api.timestamps import UtcInstant, iso_z, latest_refreshed
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import DbInterface, Device, DeviceSettings, InterfaceIpAddress, InterfaceIpIntent
 
@@ -91,7 +92,7 @@ async def get_interface_ips(device_id: int, db: AsyncSession = Depends(get_read_
             "interfaces": [],
         }
 
-    latest = max(rows, key=lambda r: r.last_refreshed_at)
+    latest = latest_refreshed(rows)
 
     # Group addresses by interface name; track bound_port per interface.
     by_interface: dict[str, list] = defaultdict(list)
@@ -149,7 +150,12 @@ class IpIntentUpdate(BaseModel):
     addresses: list[IpAddressEntry]
 
 
-async def _delete_rows_absent_from_payload(db, existing_rows, new_keys, iface_name_by_id):
+async def _delete_rows_absent_from_payload(
+    db: AsyncSession,
+    existing_rows: dict[Any, InterfaceIpIntent],
+    new_keys: set[Any],
+    iface_name_by_id: dict[int, str],
+) -> tuple[set[str], list[list[str]]]:
     """Delete intent rows absent from the new payload; return what was removed.
 
     Returns the affected interface names (the removal job's per-instance scope) and

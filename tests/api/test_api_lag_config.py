@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device, seed_lag_config
+from nso_adapter.store.models import LagBundleConfig
+from tests.conftest import VALID_TOKEN, seed_device, seed_lag_config, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -76,6 +78,36 @@ async def test_lag_config_bundle_with_members(adapter_client):
     assert m1["port_priority"] == 200
     m2 = next(m for m in bundle["members"] if m["interface_name"] == "GigabitEthernet0/2")
     assert m2.get("port_priority") is None
+
+
+@pytest.mark.anyio
+async def test_lag_config_selects_latest_when_a_bundle_has_no_refresh_time(adapter_client):
+    device_id = await seed_device(nso_device_name="lag-config-mixed-time", netbox_device_id=1103)
+    async with session() as db:
+        db.add_all(
+            [
+                LagBundleConfig(
+                    device_id=device_id,
+                    name="Port-channel1",
+                    lag_id=1,
+                    last_refreshed_at=None,
+                    refresh_source="never",
+                ),
+                LagBundleConfig(
+                    device_id=device_id,
+                    name="Port-channel2",
+                    lag_id=2,
+                    last_refreshed_at=datetime(2026, 1, 2, tzinfo=UTC),
+                    refresh_source="poll",
+                ),
+            ]
+        )
+        await db.commit()
+
+    response = await adapter_client.get(f"/api/v1/devices/{device_id}/lag-config", headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json()["refresh_source"] == "poll"
 
 
 _APPLY_BODY = {

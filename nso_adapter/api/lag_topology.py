@@ -13,7 +13,7 @@ from sqlalchemy.orm import selectinload
 from nso_adapter.api.deps import get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
-from nso_adapter.api.timestamps import iso_z
+from nso_adapter.api.timestamps import iso_z, latest_refreshed
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, LagInterface
 
@@ -73,7 +73,7 @@ async def get_lag_topology(device_id: int, db: AsyncSession = Depends(get_read_d
             "lags": [],
         }
 
-    latest = max(lags, key=lambda lag: lag.last_refreshed_at)
+    latest = latest_refreshed(lags)
 
     return {
         "device_id": device_id,
