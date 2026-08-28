@@ -425,7 +425,7 @@ def projection_row_state(table: str, row: dict) -> dict:
     return {key: value for key, value in row.items() if key not in excluded}
 
 
-def _scope_ids(model: type, device_id: int):
+def _scope_ids(model: Any, device_id: int):
     """Build the subquery of *model*'s ids for *device_id*, walking up to the device-scoped root."""
     if hasattr(model, "device_id"):
         return select(model.id).where(model.device_id == device_id)

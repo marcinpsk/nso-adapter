@@ -2338,7 +2338,7 @@ async def _promotion_interface_context(
         if isinstance(row.get("interface_id"), int)
     ]
     interface_ids = sorted({row["interface_id"] for row in all_rows})
-    names_by_id = {}
+    names_by_id: dict[int, str] = {}
     if interface_ids:
         names_by_id = dict(
             (
@@ -2348,7 +2348,9 @@ async def _promotion_interface_context(
                         DbInterface.id.in_(interface_ids),
                     )
                 )
-            ).all()
+            )
+            .tuples()
+            .all()
         )
     unresolved = sorted(set(interface_ids) - names_by_id.keys())
     if unresolved:
@@ -2392,9 +2394,10 @@ async def promotion_removal_context(
             removed[label] = keys
     if scope == "route_policy":
         for row in removed_rows.get("route_policy_object_intent", []):
-            label = _ROUTE_POLICY_FAMILY_LISTS.get(row.get("family"))
-            if label:
-                removed.setdefault(label, []).append(row.get("name"))
+            family = row.get("family")
+            family_list = _ROUTE_POLICY_FAMILY_LISTS.get(family) if isinstance(family, str) else None
+            if family_list:
+                removed.setdefault(family_list, []).append(row.get("name"))
     if scope == "snmp":
         refs = {
             row["label"]: row["vault_ref"]

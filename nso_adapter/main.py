@@ -88,7 +88,7 @@ def _preserve_exact_openapi_integer_bounds(app: FastAPI) -> None:
         sequence["maximum"] = MAX_PUSH_SEQ
         return schema
 
-    app.openapi = openapi
+    app.openapi = openapi  # type: ignore[method-assign]
 
 
 def _init_secrets(app: FastAPI, cfg, env):

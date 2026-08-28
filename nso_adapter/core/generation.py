@@ -81,6 +81,7 @@ from nso_adapter.store.models import (
     DeviceProjectionStream,
     GenerationMode,
     GenerationStatus,
+    IntentPushReceipt,
     Job,
     JobStatus,
     JobType,
@@ -384,11 +385,11 @@ def _content_losing_rows(old: dict | None, desired: dict) -> dict[str, list[dict
 def _has_positive_content(before, after) -> bool:
     """Whether *after* adds content or changes a retained value to another set value."""
     if isinstance(after, dict):
-        previous = before if isinstance(before, dict) else {}
-        return any(_has_positive_content(previous.get(key), value) for key, value in after.items())
+        previous_map = before if isinstance(before, dict) else {}
+        return any(_has_positive_content(previous_map.get(key), value) for key, value in after.items())
     if isinstance(after, (list, tuple)):
-        previous = before if isinstance(before, (list, tuple)) else ()
-        old_entries = {json.dumps(value, sort_keys=True, default=str) for value in previous}
+        previous_seq = before if isinstance(before, (list, tuple)) else ()
+        old_entries = {json.dumps(value, sort_keys=True, default=str) for value in previous_seq}
         new_entries = {json.dumps(value, sort_keys=True, default=str) for value in after}
         return bool(new_entries - old_entries)
     return before != after and after is not None and after != ""
@@ -425,7 +426,7 @@ async def _promote_static_route_clears(db: AsyncSession, device_id: int) -> None
 
 class _Promotion(NamedTuple):
     row: DeviceProjectionStream
-    receipt: object
+    receipt: IntentPushReceipt
     desired: dict
     networked: dict[str, list[dict]]
     detached: dict[str, list[dict]]
@@ -444,7 +445,7 @@ async def _selected_promotions(
     db: AsyncSession,
     device_id: int,
     selected: dict[str, int],
-) -> tuple[dict[str, tuple[DeviceProjectionStream, object]], dict[str, str], dict[str, dict]]:
+) -> tuple[dict[str, tuple[DeviceProjectionStream, IntentPushReceipt]], dict[str, str], dict[str, dict]]:
     """Resolve exact selected receipts and report every stale selection."""
     from nso_adapter.core.receipt import latest_receipts
 
@@ -463,7 +464,7 @@ async def _selected_promotions(
             .all()
         )
     }
-    promotable: dict[str, tuple[DeviceProjectionStream, object]] = {}
+    promotable: dict[str, tuple[DeviceProjectionStream, IntentPushReceipt]] = {}
     skipped: dict[str, str] = {}
     skipped_detail: dict[str, dict] = {}
     receipts = await latest_receipts(db, device_id, selected)
