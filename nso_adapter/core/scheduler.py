@@ -545,25 +545,34 @@ def _utcnow_aware():
 
 
 async def _due_failover_device_ids(db, now) -> list[int]:
-    """Device IDs whose primary- or OOB-probe is due (linked + plugin-sourced primary IP).
+    """Device IDs with a due primary- or OOB-probe (linked + an address the tick can act on).
 
-    Pre-filtering in SQL keeps the tick from spinning up a session/task per not-due device.
+    Pre-filtering in SQL keeps the tick from spinning up a session/task per not-due device, so
+    this must mirror ``run_failover_tick``'s own gate: a device SITTING on OOB keeps its
+    liveness with no primary IP at all, and each leg is only due when its own address exists.
     """
     from sqlalchemy import and_, or_, select
 
-    from nso_adapter.store.models import Device, DeviceFailover
+    from nso_adapter.store.models import ActiveAddress, Device, DeviceFailover
 
+    has_primary = DeviceFailover.primary_ip.is_not(None)
+    has_oob = DeviceFailover.oob_ip.is_not(None)
     stmt = (
         select(Device.id)
         .join(DeviceFailover, DeviceFailover.device_id == Device.id)
         .where(
             Device.netbox_device_id.is_not(None),
-            DeviceFailover.primary_ip.is_not(None),
+            or_(has_primary, and_(DeviceFailover.active_address == ActiveAddress.oob.value, has_oob)),
             or_(
-                DeviceFailover.next_primary_probe_at.is_(None),
-                DeviceFailover.next_primary_probe_at <= now,
                 and_(
-                    DeviceFailover.oob_ip.is_not(None),
+                    has_primary,
+                    or_(
+                        DeviceFailover.next_primary_probe_at.is_(None),
+                        DeviceFailover.next_primary_probe_at <= now,
+                    ),
+                ),
+                and_(
+                    has_oob,
                     or_(
                         DeviceFailover.next_oob_probe_at.is_(None),
                         DeviceFailover.next_oob_probe_at <= now,

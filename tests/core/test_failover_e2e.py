@@ -448,6 +448,35 @@ async def test_proactive_oob_flip_reverts_to_primary_when_probe_blows_up(adapter
     assert (await _load(device_id)).active_address == ActiveAddress.primary.value
 
 
+async def test_device_on_oob_keeps_liveness_after_the_primary_ip_is_cleared(adapter_client, monkeypatch):
+    """The plugin clearing the primary IP must not take a device sitting on OOB off the tick.
+
+    OOB is the address the operator is connecting through, and its liveness needs no primary
+    address — but both the due-device query and the tick used to require one, so such a device
+    got zero health monitoring for as long as NetBox had no primary IP for it.
+    """
+    from nso_adapter.core.failover import upsert_failover_ips
+
+    sim = _NsoSim(address="192.0.2.5")
+    sim.reachable_addrs = {"192.0.2.5"}  # only OOB is up, which is why the device sits on it
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    device_id = await _seed(active="oob")
+    async with session() as db:
+        dev = (await db.execute(select(Device).where(Device.id == device_id))).scalar_one()
+        assert await upsert_failover_ips(db, dev, None, "192.0.2.5") is True  # NetBox lost the primary IP
+        await db.commit()
+    await _arm(device_id, primary_due=False, oob_due=True)
+
+    await sched._scheduled_failover_probe()
+
+    row = await _load(device_id)
+    assert row.oob_healthy is True  # still monitored
+    assert row.oob_health_checked_at is not None
+    assert sim.patches == []  # cheap liveness, no flip
+    assert row.active_address == ActiveAddress.oob.value
+
+
 async def test_manual_override_clears_once_address_restored(adapter_client, monkeypatch):
     """A stale manual_override flag clears as soon as NSO is back on a managed address."""
     sim = _NsoSim(address="10.0.0.1")  # operator restored the managed (primary) address

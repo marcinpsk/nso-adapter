@@ -493,7 +493,7 @@ async def _probe_oob(
     name: str,
     cfg: TickConfig,
     now: datetime,
-    primary_ip: str,
+    primary_ip: str | None,
     oob_ip: str,
     job_active: bool,
     flip_budget: FlipBudget | None,
@@ -518,6 +518,8 @@ async def _probe_oob(
         return True
 
     # On primary → proactive fallback-health flip-probe of OOB. Mutates address; defer/cap.
+    if primary_ip is None:
+        raise RuntimeError("proactive OOB flip-probe without a primary address")
     if job_active:
         return True
     if await _is_manual_override(client, fo, name):
@@ -569,22 +571,24 @@ async def run_failover_tick(
     """
     now = now or _utcnow()
     name = device.nso_device_name
-    primary_ip = fo.primary_ip
-    if not primary_ip:
-        return  # nothing to manage without a primary address
     # Normalize a freshly-created (not-yet-flushed) row whose column defaults haven't
     # materialized — the scheduler's loaded rows already carry these.
     fo.active_address = fo.active_address or _PRIMARY
     fo.consecutive_failures = fo.consecutive_failures or 0
     fo.consecutive_successes = fo.consecutive_successes or 0
+    primary_ip = fo.primary_ip or None
     oob_ip = fo.oob_ip if fo.oob_ip and fo.oob_ip != primary_ip else None
+    # Active-OOB liveness needs no primary address; everything else does (the plugin can
+    # clear either IP at any time while the row keeps its active_address).
+    if primary_ip is None and not (fo.active_address == _OOB and oob_ip is not None):
+        return
 
     # Drop a stale manual-override flag the moment NSO is back on a managed address (only a GET,
     # and only while flagged) so the UI doesn't show "manual override" after the operator restores.
     await _maybe_clear_manual_override(client, fo, name)
 
     addr_before = fo.active_address
-    if _due(fo.next_primary_probe_at, now):
+    if primary_ip is not None and _due(fo.next_primary_probe_at, now):
         ran = await _probe_primary(client, fo, name, cfg, now, primary_ip, oob_ip, job_active, flip_budget)
         if ran:
             fo.next_primary_probe_at = _next_due(now, cfg.failover_primary_probe_interval, jitter_fraction)

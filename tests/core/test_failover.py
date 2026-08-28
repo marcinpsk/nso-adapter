@@ -232,6 +232,42 @@ async def test_no_primary_ip_is_noop(monkeypatch):
     assert calls["n"] == 0  # never even probed
 
 
+def _on_oob_without_primary() -> DeviceFailover:
+    return DeviceFailover(device_id=1, primary_ip=None, oob_ip="192.0.2.5", active_address=ActiveAddress.oob.value)
+
+
+async def test_active_oob_liveness_runs_without_a_primary_ip(monkeypatch):
+    """A device sitting on OOB keeps its liveness after the plugin clears the primary IP.
+
+    That leg needs no primary address, and skipping it froze the health of the very address
+    the operator is connecting through ("not checked" for as long as the primary stays gone)."""
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=True)
+    dev, fo = _device(), _on_oob_without_primary()
+    client = FakeNso(address="192.0.2.5")
+
+    await _tick(dev, fo, client, cfg, now=_BASE, primary_due=False, oob_due=True)
+
+    assert fo.oob_healthy is True
+    assert fo.oob_health_checked_at == _BASE
+    assert fo.next_oob_probe_at == _BASE + timedelta(minutes=cfg.failover_primary_probe_interval)
+    assert client.calls == []  # cheap liveness, no address change
+
+
+async def test_no_failback_attempted_without_a_primary_ip(monkeypatch):
+    """The primary probe is due but there is no primary address to flip to — do nothing."""
+    cfg = SchedulerConfig()
+    calls = _stub_probe(monkeypatch, reachable=True)
+    dev, fo = _device(), _on_oob_without_primary()
+    client = FakeNso(address="192.0.2.5")
+
+    await _tick(dev, fo, client, cfg, now=_BASE, primary_due=True, oob_due=False)
+
+    assert calls["n"] == 0
+    assert client.calls == []
+    assert fo.active_address == ActiveAddress.oob.value
+
+
 @pytest.mark.parametrize("active", [ActiveAddress.primary.value, ActiveAddress.oob.value])
 async def test_probe_not_run_when_not_due(monkeypatch, active):
     cfg = SchedulerConfig()
