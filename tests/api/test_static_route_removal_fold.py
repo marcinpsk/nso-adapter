@@ -101,6 +101,20 @@ async def _settlement_cohorts(device_id: int) -> list[int | None]:
         return [generation.settlement_cohort for generation in generations]
 
 
+async def _cohorts_by_job(device_id: int) -> dict[int, int | None]:
+    from sqlalchemy import select
+
+    from nso_adapter.store.models import DeploymentGeneration
+
+    async with session() as db:
+        generations = (
+            (await db.execute(select(DeploymentGeneration).where(DeploymentGeneration.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        return {generation.job_id: generation.settlement_cohort for generation in generations}
+
+
 async def _generation_document_sections(device_id: int) -> list[set[str]]:
     from sqlalchemy import select
 
@@ -197,6 +211,8 @@ async def test_detach_and_companion_apply_stamp_the_revision_after_both_succeed(
     cohorts = await _settlement_cohorts(device_id)
     assert cohorts[0] is not None
     assert cohorts == [cohorts[0], cohorts[0]]
+    by_job = await _cohorts_by_job(device_id)
+    assert by_job[apply_id] == by_job[removal_id] == cohorts[0]
 
     fake = SrFake("sr-cohort-success", service=[wire(A), wire(B)])
     removal = await run_removal_job(device_id, removal_id, sr_client(fake))

@@ -685,9 +685,10 @@ class DeploymentGeneration(Base):
     #: stream -> the desired revision this document was built from. Settlement CASes
     #: exactly these, never whatever the store holds when the job finishes.
     stream_revisions: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    #: Marking-split generations from one request share a non-null value. Every other
-    #: generation leaves it NULL, so unrelated deployments of the same revision cannot
-    #: block each other's settlement.
+    #: Every generation one intent request promotes shares a non-null value: the
+    #: marking-split removals and the companion auto-apply. NULL when the request promotes
+    #: at most one generation, when it is store_only, and for reissue generations, so
+    #: unrelated deployments of the same revision cannot block each other's settlement.
     settlement_cohort: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     #: For a generation a removal produced: the job context that executes it (scope, the
     #: allowed removal keys, ``detach``, ``force``, vault refs). It lives HERE and not only
