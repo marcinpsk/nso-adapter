@@ -634,7 +634,7 @@ async def _enqueue_action_apply_job(
         raise ApplyAlreadyQueued(winner.id)
     if created is None:  # pragma: no cover - bounded admission retries exhausted
         raise RuntimeError(f"could not admit an apply job for device {device_id}")
-    await attach_to_job(db, generation, created)
+    await require_attach_to_job(db, generation, created)
     return generation
 
 
@@ -969,6 +969,12 @@ async def _blocking_predecessor(db: AsyncSession, device_id: int, seq: int) -> D
         .order_by(DeploymentGeneration.seq)
         .limit(1)
     )
+
+
+async def require_attach_to_job(db: AsyncSession, generation: DeploymentGeneration, job: Job) -> None:
+    """Attach to a job created empty for this generation; refusal is a carrier bug."""
+    if not await attach_to_job(db, generation, job):  # pragma: no cover - empty jobs always accept
+        raise RuntimeError(f"freshly created job {job.id} refused generation {generation.id}")
 
 
 async def attach_to_job(db: AsyncSession, generation: DeploymentGeneration, job: Job) -> bool:

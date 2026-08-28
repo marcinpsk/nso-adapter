@@ -74,7 +74,7 @@ class ActionApplyIn(BaseModel):
 class ActionApplyGenerationOut(BaseModel):
     generation_id: int
     seq: int
-    job_id: int | None
+    job_id: int
     mode: Literal["networked", "detach"]
     source_push_seq: dict[str, int | None]
     stream_revisions: dict[str, int]

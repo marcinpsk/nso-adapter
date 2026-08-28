@@ -1903,7 +1903,11 @@ async def enqueue_removal(
     that already built it. A reissue composes its own, so *force* refuses it here rather than
     dropping it silently. The same refusal applies to *marking* and *promotes*.
     """
-    from nso_adapter.core.generation import attach_to_job, create_generation, create_reissue_generation
+    from nso_adapter.core.generation import (
+        create_generation,
+        create_reissue_generation,
+        require_attach_to_job,
+    )
     from nso_adapter.core.request_flags import STORE_ONLY
     from nso_adapter.store.models import GenerationMode, Job, JobStatus, JobType
 
@@ -1995,7 +1999,7 @@ async def enqueue_removal(
     )
     db.add(job)
     await db.flush()
-    await attach_to_job(db, generation, job)
+    await require_attach_to_job(db, generation, job)
     await _settle_pending_clears_at_admission(db, device_id, scope, promotes, mode=mode, force=force)
     logger.info("removal.enqueued", device_id=device_id, scope=scope, job_id=job.id, marking=marking)
     return job

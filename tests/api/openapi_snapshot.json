@@ -12,15 +12,8 @@
             "type": "integer"
           },
           "job_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Job Id"
+            "title": "Job Id",
+            "type": "integer"
           },
           "mode": {
             "enum": [

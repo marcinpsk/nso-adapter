@@ -1079,6 +1079,7 @@ async def test_non_static_detach_mix_keeps_positive_delta_on_apply_link(adapter_
         (apply.job_id, JobType.apply),
         (detach.job_id, JobType.removal),
     ]
+    assert [link["job_id"] for link in response.json()["generations"]] == [apply.job_id, detach.job_id]
     assert detach.allowed_removal_keys == {"vlan": [10]}
     assert {row["vlan_id"] for row in apply.document["vlan"]["vlan_intent"]} == {10, 20}
     assert {row["vlan_id"] for row in detach.document["vlan"]["vlan_intent"]} == {20}
