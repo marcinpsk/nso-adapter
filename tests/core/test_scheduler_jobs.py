@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.bindings.netbox.scope import PluginScopeRecord
@@ -346,6 +347,20 @@ async def test_intent_reconcile_aborts_on_fetch_error(adapter_client, monkeypatc
     monkeypatch.setattr(
         "nso_adapter.bindings.netbox.intent.fetch_all_intent", AsyncMock(side_effect=RuntimeError("NetBox down"))
     )
+    await sched._scheduled_intent_reconcile()
+
+
+@pytest.mark.anyio
+async def test_intent_reconcile_handles_device_load_failure(adapter_client, monkeypatch):
+    await _seed_devices(("load-fails", 8000))
+
+    async def _load_fails(*_args, **_kwargs):
+        raise RuntimeError("database read failed")
+
+    monkeypatch.setattr("nso_adapter.core.importer.get_netbox_client", lambda: object())
+    monkeypatch.setattr("nso_adapter.bindings.netbox.intent.fetch_all_intent", AsyncMock(return_value=[]))
+    monkeypatch.setattr(AsyncSession, "get", _load_fails)
+
     await sched._scheduled_intent_reconcile()
 
 

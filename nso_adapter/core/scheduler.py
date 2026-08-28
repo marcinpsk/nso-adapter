@@ -141,7 +141,10 @@ async def _scheduled_scope_reconcile() -> None:
                 device = await db.get(Device, device_id)
                 if device is None:
                     continue
-                plugin_rec = plugin_by_nb_id.get(device.netbox_device_id)
+                netbox_device_id = device.netbox_device_id
+                if netbox_device_id is None:  # query predicate above guarantees this
+                    continue
+                plugin_rec = plugin_by_nb_id.get(netbox_device_id)
                 if plugin_rec is None:
                     if suppress_offboard:
                         continue  # keep the device — the plugin read looks under-complete
@@ -207,7 +210,10 @@ async def _scheduled_intent_reconcile() -> None:
                 device = await db.get(Device, device_id)
                 if device is None:
                     continue
-                records = by_nb_device.get(device.netbox_device_id, [])
+                netbox_device_id = device.netbox_device_id
+                if netbox_device_id is None:  # query predicate above guarantees this
+                    continue
+                records = by_nb_device.get(netbox_device_id, [])
 
                 # Load all interfaces for this device
                 ifaces_result = await db.execute(select(DbInterface).where(DbInterface.device_id == device.id))
@@ -253,7 +259,7 @@ async def _scheduled_intent_reconcile() -> None:
                     )
                 await db.commit()
             except Exception as exc:
-                logger.warning("scheduler.intent_reconcile.device_failed", device_id=device.id, error=repr(exc))
+                logger.warning("scheduler.intent_reconcile.device_failed", device_id=device_id, error=repr(exc))
                 await db.rollback()
 
 
