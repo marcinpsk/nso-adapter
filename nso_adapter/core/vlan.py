@@ -82,12 +82,13 @@ async def _upsert_vlans(
     now = _now()
     for item in vlans:
         raw_vlan_id = item.get("vlan-id", item.get("vlan_id"))
-        if raw_vlan_id is None:
-            continue
         try:
-            vid = int(raw_vlan_id)
+            vid = int(raw_vlan_id)  # type: ignore[arg-type]
         except (TypeError, ValueError):
-            continue
+            # A skipped item would vanish from `seen` and the prune below would delete its
+            # existing row — reject the whole refresh instead (the engine's savepoint keeps
+            # the last-known rows and records the failure).
+            raise ValueError(f"vlan-database item without a usable vlan id for device {device.id}: {item!r}") from None
         seen.add(vid)
         row = existing.get(vid) or DeviceVlan(device_id=device.id, vlan_id=vid)
         row.name = item.get("name") or ""

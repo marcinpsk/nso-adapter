@@ -403,7 +403,15 @@ async def apply_combined(
     url = f"{client._base}{_DATA_PATH}"
 
     if dry_run:
-        return await native_dry_run(client, url, payload, device_name, method="patch", strict=strict)
+        return await native_dry_run(
+            client,
+            url,
+            payload,
+            device_name,
+            method="patch",
+            strict=strict,
+            outformat="cli" if dry_run == "cli" else "native",
+        )
 
     async with client._client(timeout=client._action_timeout) as c:
         resp = await c.patch(_commit_url(url), content=payload, headers={"Content-Type": "application/yang-data+json"})
