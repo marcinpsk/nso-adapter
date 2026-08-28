@@ -186,7 +186,7 @@ async def test_projection_lock_takes_the_device_before_the_counter(adapter_clien
                 blocker_pid=holder_pid,
                 waiter_pid=writer_pid,
                 relation="devices",
-                fragments=("from devices", "for update"),
+                fragments=("from devices", "for no key update"),
             )
             assert not locking.done()
             held = await counter_probe.scalar(
@@ -332,7 +332,7 @@ async def test_real_offboard_commits_before_a_waiting_writer(adapter_client, riv
                 get_engine(),
                 blocker_pid=offboarding_pid,
                 relation="devices",
-                fragments=("from devices", "for update"),
+                fragments=("from devices", "for no key update"),
             )
             assert not writer.done()
             await gate.rollback()
