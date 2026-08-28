@@ -197,6 +197,8 @@ class DeviceGenerationOut(BaseModel):
 
 
 _DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT = 100
+# Bounds the RAW traversal work only; the distinct limit above stays the semantic contract.
+_DEPLOYMENT_EVIDENCE_RAW_LIMIT = 100 * _DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT
 
 
 class DeploymentEvidenceIn(BaseModel):
@@ -207,6 +209,8 @@ class DeploymentEvidenceIn(BaseModel):
     def deduplicate_attempt_ids(cls, value):
         if not isinstance(value, list):
             return value
+        if len(value) > _DEPLOYMENT_EVIDENCE_RAW_LIMIT:
+            return value  # unvisited: `max_length` answers the standard `too_long`
         unique = []
         identities = set()
         for item in value:

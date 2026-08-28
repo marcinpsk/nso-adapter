@@ -690,6 +690,23 @@ def test_evidence_enforces_attempt_id_bound_for_colliding_uuids():
     assert elapsed < 5.0
 
 
+def test_evidence_bounds_a_duplicate_only_list_that_collapses_below_the_distinct_limit():
+    """Dedup runs before the bound, so only a RAW ceiling can bound a duplicate-only list."""
+    from pydantic import ValidationError
+
+    from nso_adapter.api.devices import _DEPLOYMENT_EVIDENCE_RAW_LIMIT, DeploymentEvidenceIn
+
+    attempt_ids = [str(uuid.UUID(int=1))] * (_DEPLOYMENT_EVIDENCE_RAW_LIMIT + 1)
+
+    started = time.perf_counter()
+    with pytest.raises(ValidationError) as exc_info:
+        DeploymentEvidenceIn(apply_attempt_ids=attempt_ids)
+    elapsed = time.perf_counter() - started
+
+    assert [error["type"] for error in exc_info.value.errors()] == ["too_long"]
+    assert elapsed < 5.0
+
+
 async def test_evidence_deduplicates_attempt_ids_before_applying_the_request_bound(adapter_client):
     from nso_adapter.store.apply_attempt_store import begin_apply_attempt, complete_apply_attempt
 
@@ -730,6 +747,22 @@ async def test_evidence_rejects_more_than_100_attempt_ids(adapter_client):
     error = response.json()["error"]
     assert error["code"] == "validation_error"
     assert error["message"] == "Request validation failed"
+    assert any(item["loc"] == ["body", "apply_attempt_ids"] for item in error["detail"]["errors"])
+
+
+async def test_evidence_rejects_a_duplicate_only_list_past_the_raw_bound(adapter_client):
+    """End to end: a duplicate-only list of unbounded size is a 422, not a served request."""
+    from nso_adapter.api.devices import _DEPLOYMENT_EVIDENCE_RAW_LIMIT
+
+    response = await adapter_client.post(
+        "/api/v1/devices/999999/deployment-evidence",
+        headers=AUTH,
+        json={"apply_attempt_ids": [str(uuid.uuid4())] * (_DEPLOYMENT_EVIDENCE_RAW_LIMIT + 1)},
+    )
+
+    assert response.status_code == 422, response.text
+    error = response.json()["error"]
+    assert error["code"] == "validation_error"
     assert any(item["loc"] == ["body", "apply_attempt_ids"] for item in error["detail"]["errors"])
 
 

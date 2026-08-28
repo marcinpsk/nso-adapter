@@ -449,7 +449,8 @@ settlement cohort. `status` is one of `pending`, `running`, `settled`, `failed`,
 ### `POST /api/v1/devices/{id}/deployment-evidence`
 
 Return one unpaged snapshot of the device deployment barrier and the requested durable
-Apply attempts. The request accepts at most 100 attempt UUIDs:
+Apply attempts. The request accepts at most 100 **distinct** attempt UUIDs — repeats are
+collapsed before the bound is applied — and at most 10 000 list entries in total:
 
 ```json
 {
