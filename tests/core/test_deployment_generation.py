@@ -1024,6 +1024,46 @@ async def test_a_pending_head_bound_to_a_running_job_is_corruption(adapter_clien
     assert await _job_status(head.job_id) is JobStatus.running
 
 
+async def test_advancement_waits_for_a_carrier_a_worker_is_starting(adapter_client, rival_engine):
+    """The carrier's status is only truthful under its row lock.
+
+    The worker takes the job FOR UPDATE SKIP LOCKED and flips job→running and
+    generation→running in ONE transaction. An unlocked read here sees the pre-start
+    ``queued`` and hands that stale carrier back as the released successor, which is exactly
+    the identity the abandon contract promises to be truthful.
+    """
+    from nso_adapter.core.generation import GenerationCarrierCorruption, advance_device_generations
+    from nso_adapter.store.db import get_engine
+    from nso_adapter.store.models import Job, JobStatus
+
+    device_id = await _device("gen-advance-carrier-lock", 9744)
+    await _vlan(device_id, 99)
+    await _push(adapter_client, device_id)
+    (head,) = await _generations(device_id)
+    assert head.job_id is not None
+    assert await _job_status(head.job_id) is JobStatus.queued
+
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+    async with rival() as worker:
+        starting = await worker.scalar(sa.select(Job).where(Job.id == head.job_id).with_for_update(skip_locked=True))
+        assert starting is not None, "the worker could not claim the carrier it is starting"
+        starting.status = JobStatus.running
+        starting.run_attempt = 1
+        await worker.flush()
+
+        advancing = asyncio.create_task(advance_device_generations(device_id))
+        await _wait_for_relation_lock(get_engine(), "jobs")
+        assert not advancing.done(), "advancement trusted a carrier status it never locked"
+        await worker.commit()
+
+    with pytest.raises(GenerationCarrierCorruption, match="running carrier"):
+        await asyncio.wait_for(advancing, timeout=10)
+
+    (unchanged,) = await _generations(device_id)
+    assert unchanged.job_id == head.job_id
+    assert await _job_status(head.job_id) is JobStatus.running
+
+
 async def test_startup_recovery_isolates_a_corrupt_device(adapter_client):
     from nso_adapter.core.generation import recover_generations
     from nso_adapter.store.models import Job, JobStatus

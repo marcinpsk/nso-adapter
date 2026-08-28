@@ -1483,7 +1483,9 @@ async def advance_generations_locked(db: AsyncSession, device_id: int) -> Job | 
     if head is None or head.status is not GenerationStatus.pending:
         return None
     if head.job_id is not None:
-        carrier = await db.get(Job, head.job_id, populate_existing=True)
+        # Locked, device→job: an unlocked read sees a starting worker's pre-commit `queued`
+        # and hands that stale carrier back as the released successor.
+        carrier = await db.get(Job, head.job_id, populate_existing=True, with_for_update=True)
         if carrier is not None and carrier.status is JobStatus.queued:
             return carrier
         if carrier is not None and carrier.status is JobStatus.running:
