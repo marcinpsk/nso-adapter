@@ -9,7 +9,6 @@ GET /api/v1/devices/{id}/intent  — read current mirror
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Literal
 
 import structlog
 from fastapi import APIRouter, Depends
@@ -21,7 +20,7 @@ from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.timestamps import UtcInstant, iso_z
-from nso_adapter.core.request_flags import PENDING_CLEAR_PROVENANCES
+from nso_adapter.core.request_flags import PendingClearProvenance
 from nso_adapter.store.models import (
     DbInterface,
     Device,
@@ -86,7 +85,7 @@ class IntentScopeCount(BaseModel):
 class PendingClearSummary(BaseModel):
     """A stream with a clear that has no admitted networked carrier."""
 
-    provenance: Literal[*PENDING_CLEAR_PROVENANCES]
+    provenance: PendingClearProvenance
     since: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
 
 

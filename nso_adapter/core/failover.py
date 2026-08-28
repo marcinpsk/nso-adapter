@@ -454,7 +454,7 @@ async def _failback_flip_probe(
         return False
     fo.manual_override = False
     fo.failback_blocked_reason = None
-    await _set_address(client, name, fo.primary_ip)  # flip to primary for the probe
+    await _set_address(client, name, primary_ip)  # flip to primary for the probe
     committed = False
     try:
         outcome = _coerce_probe(await probe_reachable(client, name, cfg.failover_probe_timeout))

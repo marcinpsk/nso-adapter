@@ -19,6 +19,7 @@ to thread a flag.
 from __future__ import annotations
 
 from contextvars import ContextVar
+from typing import Final, Literal, get_args
 
 STORE_ONLY: ContextVar[bool] = ContextVar("store_only", default=False)
 
@@ -51,9 +52,14 @@ REMOVAL_MARKINGS: tuple[str, ...] = (DELETE_ORIGIN_MARKING, DETACH_MARKING)
 
 #: The provenance one pending-clear obligation carries. ``authorized`` was promoted by a
 #: normal claim. ``store_only`` is parked and never deploys.
-AUTHORIZED_PROVENANCE = "authorized"
-STORE_ONLY_PROVENANCE = "store_only"
-PENDING_CLEAR_PROVENANCES: tuple[str, ...] = (AUTHORIZED_PROVENANCE, STORE_ONLY_PROVENANCE)
+AUTHORIZED_PROVENANCE: Final = "authorized"
+STORE_ONLY_PROVENANCE: Final = "store_only"
+#: The API-visible domain; the tuple derives from it, and the guard below pins the
+#: named constants to the same values (Literal cannot reference them, PEP 586).
+PendingClearProvenance = Literal["authorized", "store_only"]
+PENDING_CLEAR_PROVENANCES: tuple[str, ...] = get_args(PendingClearProvenance)
+if PENDING_CLEAR_PROVENANCES != (AUTHORIZED_PROVENANCE, STORE_ONLY_PROVENANCE):
+    raise AssertionError("pending-clear provenance domains diverged")
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off"})
