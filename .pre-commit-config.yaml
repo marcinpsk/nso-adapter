@@ -61,7 +61,8 @@ repos:
     hooks:
       - id: mypy-gate
         name: mypy (new type errors only)
-        entry: uv run --native-tls -- scripts/mypy-gate.sh
+        # --locked: refuse a stale uv.lock instead of silently rewriting it (CI syncs --locked).
+        entry: uv run --locked --native-tls -- scripts/mypy-gate.sh
         language: system
         pass_filenames: false
         stages: [pre-push]
