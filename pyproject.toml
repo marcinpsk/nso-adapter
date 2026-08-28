@@ -39,7 +39,6 @@ dev = [
     "pytest-xdist>=3.8",
     "respx>=0.21",
     "ruff>=0.16.1",
-    "types-psycopg2>=2.9.0,<3.0.0",
     "types-PyYAML>=6.0.0,<7.0.0",
     "watchfiles>=1.0",
     # Keep in step with the pinned zizmor hook rev in .pre-commit-config.yaml.
@@ -91,7 +90,7 @@ addopts = "--cov=nso_adapter --cov-report=term-missing -n auto"
 
 [tool.mypy]
 python_version = "3.12"
-files = ["nso_adapter"]
+files = ["nso_adapter", "alembic"]
 # Alembic generates revision files from schema operations.
 exclude = "^alembic/versions/"
 
