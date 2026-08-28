@@ -745,11 +745,7 @@ async def _replacement_rows(db: AsyncSession, device, scope: str, model, job_id:
     replacement = await _replacement_section(db, scope, job_id)
     if replacement is not None:
         return replacement.rows.get(model, [])
-    return list(
-        (await db.execute(select(model).where(model.device_id == device.id, model.accepted_at.is_not(None))))
-        .scalars()
-        .all()
-    )
+    return await _accepted_rows(db, device.id, model)
 
 
 async def _accepted_rows(db: AsyncSession, device_id: int, model, *extra) -> list:
