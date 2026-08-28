@@ -101,7 +101,7 @@ async def _settlement_cohorts(device_id: int) -> list[int | None]:
         return [generation.settlement_cohort for generation in generations]
 
 
-async def _cohorts_by_job(device_id: int) -> dict[int, int | None]:
+async def _cohorts_by_job(device_id: int) -> dict[int | None, int | None]:
     from sqlalchemy import select
 
     from nso_adapter.store.models import DeploymentGeneration
