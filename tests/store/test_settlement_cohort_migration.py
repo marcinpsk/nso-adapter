@@ -24,7 +24,7 @@ def _module():
 
 def test_the_settlement_cohort_migration_chains_off_the_previous_head():
     module = _module()
-    assert module.down_revision == "a6d4f2c8e1b3"
+    assert module.down_revision == "b2c4e6a8d0f1"
     assert_single_head_containing(module.revision)
 
 
