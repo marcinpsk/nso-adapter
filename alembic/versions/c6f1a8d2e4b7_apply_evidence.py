@@ -118,6 +118,12 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("id", "device_id", name="uq_apply_attempt_id_device"),
     )
+    op.create_index(
+        "ix_apply_attempt_device",
+        "deployment_apply_attempt",
+        ["device_id"],
+        unique=False,
+    )
     op.add_column(
         "deployment_generation",
         sa.Column("apply_attempt_id", postgresql.UUID(as_uuid=True), nullable=True),

@@ -648,7 +648,10 @@ class DeploymentApplyAttempt(Base):
     """One durable manual Apply admission and its complete replay body."""
 
     __tablename__ = "deployment_apply_attempt"
-    __table_args__ = (UniqueConstraint("id", "device_id", name="uq_apply_attempt_id_device"),)
+    __table_args__ = (
+        UniqueConstraint("id", "device_id", name="uq_apply_attempt_id_device"),
+        Index("ix_apply_attempt_device", "device_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
     device_id: Mapped[int] = mapped_column(Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False)
