@@ -26,8 +26,8 @@ def upgrade() -> None:
         "stream_pending_clear",
         sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
         sa.Column("device_id", sa.Integer(), nullable=False),
-        sa.Column("stream", sa.Text(), nullable=False),
-        sa.Column("provenance", sa.Text(), nullable=False),
+        sa.Column("stream", sa.String(length=32), nullable=False),
+        sa.Column("provenance", sa.String(length=16), nullable=False),
         sa.Column("revision", sa.BigInteger(), nullable=False),
         sa.Column("recorded_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint(

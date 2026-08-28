@@ -568,8 +568,8 @@ class StreamPendingClear(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     device_id: Mapped[int] = mapped_column(Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False)
-    stream: Mapped[str] = mapped_column(Text, nullable=False)
-    provenance: Mapped[str] = mapped_column(Text, nullable=False)
+    stream: Mapped[str] = mapped_column(String(32), nullable=False)
+    provenance: Mapped[str] = mapped_column(String(16), nullable=False)
     revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
 
