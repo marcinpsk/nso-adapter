@@ -417,18 +417,28 @@ async def _failback_flip_probe(
     cfg: TickConfig,
     now: datetime,
     primary_ip: str,
-    oob_ip: str | None,
     job_active: bool,
     flip_budget: FlipBudget | None,
 ) -> bool:
     """On OOB → flip to primary and probe; fail back after the success threshold, else revert.
 
     A disruptive flip: deferred under a job, and skipped (return False, retry next tick) when
-    the per-tick flip budget is exhausted.
+    the per-tick flip budget is exhausted. A pre-flip read of NSO's current address refuses
+    the flip outright when that address is unreadable.
     """
     if job_active:
         return True
-    if await _is_manual_override(client, fo, name):
+    # One read serves the manual-override decision AND the revert target: a disruptive
+    # flip whose way back is unknown must not start, so an unreadable current address
+    # refuses the flip (the stored oob_ip may have been cleared meanwhile).
+    try:
+        address_before = await client.get_address(name)
+    except Exception as exc:
+        address_before = None
+        logger.warning("failover.failback_blocked", device=name, error=repr(exc))
+    if address_before is None:
+        return True  # ran → re-arm normally; retried on the next interval
+    if address_before not in (fo.primary_ip, fo.oob_ip):
         fo.manual_override = True
         return True
     if not _take_flip(flip_budget):
@@ -454,8 +464,9 @@ async def _failback_flip_probe(
     finally:
         if not committed:
             # Threshold not met, primary still down, OR the probe/decision raised → guaranteed
-            # revert to OOB so the device stays reachable (never stranded on a flipped address).
-            await _revert_address(client, name, oob_ip)
+            # revert to the address NSO actually had (the stored oob_ip may have been cleared
+            # meanwhile), so the device is never stranded on the flipped address.
+            await _revert_address(client, name, address_before)
     return True
 
 
@@ -473,7 +484,7 @@ async def _probe_primary(
     """Probe the primary IP and drive the failover/failback decision. Returns whether it ran."""
     if fo.active_address == _PRIMARY:
         return await _active_primary_probe(client, fo, name, cfg, now, oob_ip, job_active, flip_budget)
-    return await _failback_flip_probe(client, fo, name, cfg, now, primary_ip, oob_ip, job_active, flip_budget)
+    return await _failback_flip_probe(client, fo, name, cfg, now, primary_ip, job_active, flip_budget)
 
 
 async def _probe_oob(
