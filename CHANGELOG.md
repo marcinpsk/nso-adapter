@@ -2,6 +2,50 @@
 
 <!-- version list -->
 
+## v0.4.1 (2026-08-28)
+
+### Bug Fixes
+
+- Handle nullable refresh timestamps
+  ([`c3e5feb`](https://github.com/marcinpsk/nso-adapter/commit/c3e5feb5eb42348bed86805dd09db9b3f10a87f0))
+
+- Isolate scheduled intent reconciliation errors
+  ([`9456b3b`](https://github.com/marcinpsk/nso-adapter/commit/9456b3b486d4024a7e2368e47bbd19355a71f197))
+
+- Resolve mypy-branch review findings
+  ([`473c9dd`](https://github.com/marcinpsk/nso-adapter/commit/473c9dd12bc9c70bd96c3d87f0838bde4f542221))
+
+- **failover**: Keep active-OOB liveness running without a primary address
+  ([`c391e35`](https://github.com/marcinpsk/nso-adapter/commit/c391e3520ff2a02b39febea6aab5f2db3e199e75))
+
+- **failover**: Read the pre-flip address and refuse an unrevertable failback flip
+  ([`8390d99`](https://github.com/marcinpsk/nso-adapter/commit/8390d99f9db6b29d8e32f737cdefd823ff29c8a3))
+
+### Chores
+
+- Add mypy quality gate
+  ([`028f7a6`](https://github.com/marcinpsk/nso-adapter/commit/028f7a60ec612a0081f188474db06f547a2ad030))
+
+- Resolve mypy findings
+  ([`d6ecfc6`](https://github.com/marcinpsk/nso-adapter/commit/d6ecfc6f98cac29847d95858d70ac7d33fced4ea))
+
+- Widen mypy gate to alembic
+  ([`3056217`](https://github.com/marcinpsk/nso-adapter/commit/3056217275326ce36be734726a3503735b4086a7))
+
+- **hooks**: Refuse a stale uv.lock in the pre-push mypy gate
+  ([`3ad3fd1`](https://github.com/marcinpsk/nso-adapter/commit/3ad3fd1dbadba3d79341039ff325e554bf62ce9b))
+
+### Refactoring
+
+- Simplify mypy type boundaries
+  ([`9097111`](https://github.com/marcinpsk/nso-adapter/commit/90971114a7f8c0680e05a2acaa29d0b8a4cac01d))
+
+### Testing
+
+- Strengthen mypy adoption regressions
+  ([`b43afee`](https://github.com/marcinpsk/nso-adapter/commit/b43afee1613e84a131d5dad2d90452968d46787f))
+
+
 ## v0.4.0 (2026-08-25)
 
 ### Bug Fixes
