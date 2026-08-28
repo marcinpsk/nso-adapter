@@ -745,7 +745,7 @@ async def _stamp_settled_cohort(db: AsyncSession, settlement_cohort: int, now: d
         .scalars()
         .all()
     )
-    targets = {
+    targets: set[tuple[int, str, int, int | None]] = {
         (generation.device_id, stream, revision, settlement_cohort)
         for generation in settled
         for stream, revision in (generation.stream_revisions or {}).items()
