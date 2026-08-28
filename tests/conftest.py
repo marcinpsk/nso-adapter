@@ -63,7 +63,7 @@ def push_seq(seq: int | None = None) -> dict[str, str]:
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-ADMIN_URL = os.environ.get(
+PROVISIONER_URL = os.environ.get(
     "NSO_ADAPTER_TEST_DB_URL",
     "postgresql+psycopg2://postgres:postgres@127.0.0.1:55433/postgres",
 )
@@ -76,7 +76,7 @@ _clone_seq = itertools.count()
 
 def _url_for(dbname: str, *, driver: str) -> str:
     # NB: str(URL) masks the password as literal '***' — always render_as_string.
-    return make_url(ADMIN_URL).set(drivername=driver, database=dbname).render_as_string(hide_password=False)
+    return make_url(PROVISIONER_URL).set(drivername=driver, database=dbname).render_as_string(hide_password=False)
 
 
 #: How long a straggler may take to disappear before it counts as leaked.
@@ -93,7 +93,7 @@ def _client_backends(conn, name: str) -> list:
     ).fetchall()
 
 
-def _drop_database(admin, name: str, *, expect_clean: bool) -> None:
+def _drop_database(provisioner, name: str, *, expect_clean: bool) -> None:
     """Report stragglers BEFORE forcing. FORCE is last-resort cleanup, not the mechanism.
 
     A surviving connection means a fixture failed to close a session — a test bug we want
@@ -105,7 +105,7 @@ def _drop_database(admin, name: str, *, expect_clean: bool) -> None:
     state is excluded — an ``idle`` connection that never goes away IS the leak this guard
     exists to catch, and filtering on state would hide exactly that.
     """
-    with admin.connect() as conn:
+    with provisioner.connect() as conn:
         rows = _client_backends(conn, name)
         if rows and expect_clean:
             deadline = time.monotonic() + _TEARDOWN_GRACE_S
@@ -123,9 +123,9 @@ def _drop_database(admin, name: str, *, expect_clean: bool) -> None:
 
 @pytest.fixture(scope="session")
 def pg_provisioner():
-    """AUTOCOMMIT admin engine for CREATE/DROP DATABASE. Sync + session-scoped on purpose:
+    """AUTOCOMMIT provisioner engine for CREATE/DROP DATABASE. Sync + session-scoped on purpose:
     an asyncpg pool created on a session-scoped loop and used from per-test loops is UB."""
-    engine = sa.create_engine(ADMIN_URL, isolation_level="AUTOCOMMIT", poolclass=sa.pool.NullPool)
+    engine = sa.create_engine(PROVISIONER_URL, isolation_level="AUTOCOMMIT", poolclass=sa.pool.NullPool)
     try:
         with engine.connect() as conn:
             conn.exec_driver_sql("SELECT 1")  # FAIL LOUD: no silent skip lane any more

@@ -34,7 +34,7 @@ from pathlib import Path
 
 import sqlalchemy as sa
 
-from tests.conftest import ADMIN_URL, _drop_database, _url_for
+from tests.conftest import PROVISIONER_URL, _drop_database, _url_for
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -248,8 +248,8 @@ def test_migration_declares_all_25_columns_with_an_explicit_utc_using_clause():
     # ...and per column, on the SQL alembic actually renders. `--sql` is offline mode: the URL
     # is never connected to. The loop above proves one source-level clause; this proves all 25
     # rendered statements carry it.
-    up = _alembic(ADMIN_URL, "upgrade", f"{module.down_revision}:{module.revision}", "--sql")
-    down = _alembic(ADMIN_URL, "downgrade", f"{module.revision}:{module.down_revision}", "--sql")
+    up = _alembic(PROVISIONER_URL, "upgrade", f"{module.down_revision}:{module.revision}", "--sql")
+    down = _alembic(PROVISIONER_URL, "downgrade", f"{module.revision}:{module.down_revision}", "--sql")
     for table, col in _COLUMNS:
         assert (
             f"ALTER TABLE {table} ALTER COLUMN {col} TYPE TIMESTAMP WITH TIME ZONE USING {col} AT TIME ZONE 'UTC'" in up
