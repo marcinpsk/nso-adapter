@@ -1681,27 +1681,19 @@ async def _record_pending_clears(
         )
         if revision is None:
             raise RuntimeError(f"device {device_id} stream {stream!r} has no accepted write to record")
-        pending_rows = list(
-            (
-                await db.execute(
-                    select(StreamPendingClear).where(
-                        StreamPendingClear.device_id == device_id,
-                        StreamPendingClear.stream == stream,
-                    )
+        # uq_stream_pending_clear: at most ONE row per (device, stream); its provenance is
+        # the row's current standing, upgraded in place (store_only -> authorized).
+        existing = (
+            await db.execute(
+                select(StreamPendingClear).where(
+                    StreamPendingClear.device_id == device_id,
+                    StreamPendingClear.stream == stream,
                 )
             )
-            .scalars()
-            .all()
-        )
-        authorized = next((row for row in pending_rows if row.provenance == AUTHORIZED_PROVENANCE), None)
-        store_only = next((row for row in pending_rows if row.provenance == STORE_ONLY_PROVENANCE), None)
+        ).scalar_one_or_none()
 
         if provenance == STORE_ONLY_PROVENANCE:
-            if authorized is not None:
-                if store_only is not None:
-                    await db.delete(store_only)
-                continue
-            if store_only is None:
+            if existing is None:
                 db.add(
                     StreamPendingClear(
                         device_id=device_id,
@@ -1710,27 +1702,22 @@ async def _record_pending_clears(
                         revision=revision,
                     )
                 )
-            else:
-                store_only.revision = max(store_only.revision, revision)
+            elif existing.provenance == STORE_ONLY_PROVENANCE:
+                existing.revision = max(existing.revision, revision)
             continue
 
-        previous_revision = max((row.revision for row in pending_rows), default=revision)
-        previous_since = min((row.recorded_at for row in pending_rows), default=None)
-        if store_only is not None:
-            await db.delete(store_only)
-            await db.flush()
-        if authorized is None:
-            authorized = StreamPendingClear(
-                device_id=device_id,
-                stream=stream,
-                provenance=AUTHORIZED_PROVENANCE,
-                revision=max(revision, previous_revision),
+        if existing is None:
+            db.add(
+                StreamPendingClear(
+                    device_id=device_id,
+                    stream=stream,
+                    provenance=AUTHORIZED_PROVENANCE,
+                    revision=revision,
+                )
             )
-            if previous_since is not None:
-                authorized.recorded_at = previous_since
-            db.add(authorized)
         else:
-            authorized.revision = max(revision, previous_revision)
+            existing.provenance = AUTHORIZED_PROVENANCE
+            existing.revision = max(revision, existing.revision)
     await db.flush()
 
 
@@ -1743,19 +1730,16 @@ async def _promote_parked_clears(
     from nso_adapter.store.models import DeviceProjectionStream, StreamPendingClear
 
     for stream in sorted(set(streams)):
-        rows = list(
-            (
-                await db.execute(
-                    select(StreamPendingClear).where(
-                        StreamPendingClear.device_id == device_id,
-                        StreamPendingClear.stream == stream,
-                    )
+        # uq_stream_pending_clear: at most ONE row per (device, stream).
+        row = (
+            await db.execute(
+                select(StreamPendingClear).where(
+                    StreamPendingClear.device_id == device_id,
+                    StreamPendingClear.stream == stream,
                 )
             )
-            .scalars()
-            .all()
-        )
-        if not rows:
+        ).scalar_one_or_none()
+        if row is None:
             continue
         revision = await db.scalar(
             select(DeviceProjectionStream.desired_revision).where(
@@ -1763,18 +1747,8 @@ async def _promote_parked_clears(
                 DeviceProjectionStream.stream == stream,
             )
         )
-        top = max((row.revision for row in rows), default=0)
-        if revision is not None:
-            top = max(top, revision)
-        authorized = next((row for row in rows if row.provenance == AUTHORIZED_PROVENANCE), None)
-        store_only = next((row for row in rows if row.provenance == STORE_ONLY_PROVENANCE), None)
-        if authorized is None:
-            store_only.provenance = AUTHORIZED_PROVENANCE
-            store_only.revision = top
-        else:
-            authorized.revision = top
-            if store_only is not None:
-                await db.delete(store_only)
+        row.provenance = AUTHORIZED_PROVENANCE
+        row.revision = max(row.revision, revision or 0)
     await db.flush()
 
 
@@ -1831,6 +1805,15 @@ def _refuse_unmarked_deletion(scope: str, marking: str | None, *, deletes: bool,
     """Refuse a deleting removal that carries no marking (#106); the force reissue is exempt."""
     if marking is None and deletes and not force:
         raise ValueError(f"an unmarked deletion of {scope!r} would commit networked instead of detaching")
+
+
+def _refuse_deferred_delete_origin(scope: str, marking: str | None, *, retract: bool, defer_retract: bool) -> None:
+    """Refuse a deferred retract on a delete-origin job (static_route defers by design).
+
+    The job's networked generation would discharge the clear it just recorded as deferred.
+    """
+    if retract and defer_retract and scope != "static_route" and marking == DELETE_ORIGIN_MARKING:
+        raise ValueError(f"a deferred retract of {scope!r} cannot ride a delete-origin removal job")
 
 
 async def enqueue_removal(
@@ -1937,6 +1920,7 @@ async def enqueue_removal(
     # a body without the clear, so a NETWORKED job of a mixed request defers it too.
     deletes = shrank or bool(context.get("removed"))
     _refuse_unmarked_deletion(scope, marking, deletes=deletes, force=force)
+    _refuse_deferred_delete_origin(scope, marking, retract=retract, defer_retract=defer_retract)
     if retract and defer_retract:
         context["retract_deferred"] = True
         logger.warning("removal.retract_deferred", device_id=device_id, scope=scope)

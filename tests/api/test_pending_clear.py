@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import sqlalchemy as sa
 
+from nso_adapter.core.request_flags import AUTHORIZED_PROVENANCE, STORE_ONLY_PROVENANCE
 from tests.conftest import VALID_TOKEN, note_projection_write, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -39,23 +40,26 @@ async def test_record_pending_clears_replaces_store_only_with_authorized(adapter
             StreamPendingClear(
                 device_id=device_id,
                 stream="ospf",
-                provenance="store_only",
+                provenance=STORE_ONLY_PROVENANCE,
                 revision=1,
             )
         )
         await db.commit()
+    (parked,) = await _pending_clears(device_id)
+    parked_recorded_at = parked.recorded_at
 
     async with session() as db:
         await _record_pending_clears(
             db,
             device_id,
             ("ospf",),
-            provenance="authorized",
+            provenance=AUTHORIZED_PROVENANCE,
         )
         await db.commit()
 
     (pending,) = await _pending_clears(device_id)
-    assert (pending.stream, pending.provenance, pending.revision) == ("ospf", "authorized", 1)
+    assert (pending.stream, pending.provenance, pending.revision) == ("ospf", AUTHORIZED_PROVENANCE, 1)
+    assert pending.recorded_at == parked_recorded_at, "the upgrade must keep the original recording time"
 
 
 async def test_mixed_ospf_clear_records_one_authorized_stream_obligation(adapter_client):
@@ -103,7 +107,7 @@ async def test_mixed_ospf_clear_records_one_authorized_stream_obligation(adapter
     (pending,) = await _pending_clears(device_id)
     assert (pending.stream, pending.provenance, pending.revision) == (
         "ospf",
-        "authorized",
+        AUTHORIZED_PROVENANCE,
         stream.desired_revision,
     )
 
@@ -151,7 +155,7 @@ async def test_store_only_clear_parks_until_an_authorized_deferred_clear_superse
     ).status_code == 200
 
     (parked,) = await _pending_clears(device_id)
-    assert (parked.stream, parked.provenance, parked.revision) == ("ospf", "store_only", 2)
+    assert (parked.stream, parked.provenance, parked.revision) == ("ospf", STORE_ONLY_PROVENANCE, 2)
     async with session() as db:
         assert await db.scalar(sa.select(sa.func.count()).select_from(Job)) == 0
         assert await db.scalar(sa.select(sa.func.count()).select_from(DeploymentGeneration)) == 0
@@ -166,7 +170,7 @@ async def test_store_only_clear_parks_until_an_authorized_deferred_clear_superse
         )
     ).status_code == 200
     (authorized,) = await _pending_clears(device_id)
-    assert (authorized.stream, authorized.provenance, authorized.revision) == ("ospf", "authorized", 3)
+    assert (authorized.stream, authorized.provenance, authorized.revision) == ("ospf", AUTHORIZED_PROVENANCE, 3)
 
     # A later store-only clear is a real store revision, but it cannot weaken the frozen
     # authorization or claim that revision 4 was authorized.
@@ -178,7 +182,7 @@ async def test_store_only_clear_parks_until_an_authorized_deferred_clear_superse
         )
     ).status_code == 200
     (still_authorized,) = await _pending_clears(device_id)
-    assert (still_authorized.provenance, still_authorized.revision) == ("authorized", 3)
+    assert (still_authorized.provenance, still_authorized.revision) == (AUTHORIZED_PROVENANCE, 3)
     async with session() as db:
         stream_revision = await db.scalar(
             sa.select(DeviceProjectionStream.desired_revision).where(
@@ -212,7 +216,7 @@ async def test_authorized_push_with_the_same_omission_promotes_a_parked_clear(ad
         )
     ).status_code == 200
     (parked,) = await _pending_clears(device_id)
-    assert (parked.provenance, parked.revision) == ("store_only", 2)
+    assert (parked.provenance, parked.revision) == (STORE_ONLY_PROVENANCE, 2)
 
     assert (
         await adapter_client.put(
@@ -223,7 +227,7 @@ async def test_authorized_push_with_the_same_omission_promotes_a_parked_clear(ad
     ).status_code == 200
 
     (promoted,) = await _pending_clears(device_id)
-    assert (promoted.stream, promoted.provenance, promoted.revision) == ("ospf", "authorized", 3)
+    assert (promoted.stream, promoted.provenance, promoted.revision) == ("ospf", AUTHORIZED_PROVENANCE, 3)
 
 
 async def test_networked_marked_removal_with_the_same_omission_discharges_a_parked_clear(adapter_client):
@@ -272,13 +276,13 @@ async def test_force_removal_discharges_all_pending_streams_in_the_scope(adapter
                 StreamPendingClear(
                     device_id=device_id,
                     stream="isis",
-                    provenance="authorized",
+                    provenance=AUTHORIZED_PROVENANCE,
                     revision=3,
                 ),
                 StreamPendingClear(
                     device_id=device_id,
                     stream="isis_flex_algo",
-                    provenance="store_only",
+                    provenance=STORE_ONLY_PROVENANCE,
                     revision=2,
                 ),
             ]
@@ -317,7 +321,7 @@ async def test_networked_pure_clear_discharges_an_existing_stream_obligation(ada
             StreamPendingClear(
                 device_id=device_id,
                 stream="ospf",
-                provenance="store_only",
+                provenance=STORE_ONLY_PROVENANCE,
                 revision=1,
             )
         )
@@ -364,6 +368,6 @@ async def test_isis_recording_does_not_promote_the_flex_algo_sibling_stream(adap
 
     rows = await _pending_clears(device_id)
     assert [(row.stream, row.provenance, row.revision) for row in rows] == [
-        ("isis", "authorized", 2),
-        ("isis_flex_algo", "store_only", 2),
+        ("isis", AUTHORIZED_PROVENANCE, 2),
+        ("isis_flex_algo", STORE_ONLY_PROVENANCE, 2),
     ]

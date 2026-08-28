@@ -175,6 +175,27 @@ async def test_enqueue_removal_rejects_unknown_scope(adapter_client):
             await enqueue_removal(db, 1, "bogus", marking="detach", defer_retract=False, promotes=("vlan",))
 
 
+async def test_enqueue_removal_rejects_a_deferred_delete_origin_retract(adapter_client):
+    """A non-static deferred retract on a delete-origin job would discharge its own clear."""
+    device_id = await _seed_device(nso_device_name="sw-deferred-delete-origin")
+    async with session() as db:
+        await note_projection_write(db, device_id, "ospf")
+        with pytest.raises(
+            ValueError,
+            match="a deferred retract of 'ospf' cannot ride a delete-origin removal job",
+        ):
+            await enqueue_removal(
+                db,
+                device_id,
+                "ospf",
+                marking="delete_origin",
+                defer_retract=True,
+                promotes=("ospf",),
+                retract=True,
+                shrank=True,
+            )
+
+
 async def test_enqueue_removal_rejects_unmarked_deletion(adapter_client):
     device_id = await _seed_device(nso_device_name="sw-unmarked-delete")
     async with session() as db:
