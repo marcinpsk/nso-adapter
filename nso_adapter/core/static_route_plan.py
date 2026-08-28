@@ -139,6 +139,24 @@ def authorized_clear_fields(carrier: dict | None) -> set[str]:
     return {*(carrier.get(AUTHORIZED) or ())}
 
 
+def clears_suppressed(context: dict) -> bool:
+    """Detach and deferred-retract removals never deliver pending clears."""
+    return bool(context.get("detach") or context.get("retract_deferred"))
+
+
+def candidate_clear_fields(row) -> tuple[str, ...]:
+    """Return the still-wire-unset authorized clear fields of one row (``()`` for a non-candidate).
+
+    The ONE per-row rule both the creation-time classifier and the live reissue path apply.
+    A replacement-open row is skipped — it waits for the Apply PUT, whose store-rendered
+    body omits the leaf anyway. Only the ``authorized`` carrier half is visible.
+    """
+    fields = authorized_clear_fields(row.pending_clear)
+    if not fields or replacement_open(row):
+        return ()
+    return tuple(sorted(field for field in fields if not wire_set(field, getattr(row, field, None))))
+
+
 def leaf_is_neutral(field: str, entry: dict) -> bool:
     """Whether *entry* proves *field* is no longer set on the device (§4.11's table).
 
@@ -361,13 +379,9 @@ def classify_removal_plan(
     authorized -= claimed
 
     clears: list[SrClear] = []
-    if not context.get("detach") and not context.get("retract_deferred"):
+    if not clears_suppressed(context):
         for row in rows:
-            fields = authorized_clear_fields(row.pending_clear)
-            if not fields or replacement_open(row):
-                continue
-            still_unset = tuple(sorted(field for field in fields if not wire_set(field, getattr(row, field, None))))
-            if still_unset:
+            if still_unset := candidate_clear_fields(row):
                 clears.append(SrClear(row.id, triple_of(row), still_unset))
     return SrRemovalPlan(
         frozenset(authorized),
@@ -575,7 +589,9 @@ __all__: list[str] = [
     "authorized_clear_fields",
     "build_plan",
     "classify_apply_plan",
+    "candidate_clear_fields",
     "classify_removal_plan",
+    "clears_suppressed",
     "fence_open",
     "hydrate_static_route_apply_plan",
     "hydrate_static_route_removal_plan",

@@ -905,27 +905,6 @@ async def _sr_authorization(db: AsyncSession, device, context: dict, *, job_id: 
     return tombstones, authorized - claimed, claimed, rows, reclaimed
 
 
-def _sr_candidate_clears(rows) -> dict[int, tuple[str, ...]]:
-    """Which rows' cleared leaves this networked removal may deliver — §4.3's validity rules.
-
-    Evaluated at execution under the claim, never from a job-context snapshot: a clear queued
-    minutes ago can have been re-set, deleted, moved or had its key reclaimed since. A
-    replacement-open row is skipped — it waits for the Apply PUT, whose store-rendered body
-    omits the leaf anyway. Only the ``authorized`` carrier half is visible.
-    """
-    from nso_adapter.core.static_route_plan import authorized_clear_fields, replacement_open, wire_set
-
-    candidates: dict[int, tuple[str, ...]] = {}
-    for row in rows:
-        fields = authorized_clear_fields(row.pending_clear)
-        if not fields or replacement_open(row):
-            continue
-        still_unset = tuple(sorted(f for f in fields if not wire_set(f, getattr(row, f, None))))
-        if still_unset:
-            candidates[row.id] = still_unset
-    return candidates
-
-
 async def _sr_execution_plan(db: AsyncSession, device, context: dict, *, job_id: int | None):
     """Return a promoted removal plan, or classify a reissue (or an unqueued call) live.
 
@@ -934,7 +913,14 @@ async def _sr_execution_plan(db: AsyncSession, device, context: dict, *, job_id:
     store and retract whatever it holds now under a job authorized to assert something else.
     """
     from nso_adapter.core.generation import executing_generation
-    from nso_adapter.core.static_route_plan import SrClear, SrRemovalPlan, hydrate_static_route_removal_plan, triple_of
+    from nso_adapter.core.static_route_plan import (
+        SrClear,
+        SrRemovalPlan,
+        candidate_clear_fields,
+        clears_suppressed,
+        hydrate_static_route_removal_plan,
+        triple_of,
+    )
 
     if job_id is not None:
         generation = await executing_generation(db, job_id)
@@ -943,12 +929,18 @@ async def _sr_execution_plan(db: AsyncSession, device, context: dict, *, job_id:
         if generation.stream_revisions:
             return hydrate_static_route_removal_plan(generation.document)
     tombstones, authorized, claimed, rows, reclaimed = await _sr_authorization(db, device, context, job_id=job_id)
-    candidates = _sr_candidate_clears(rows) if not context.get("detach") and not context.get("retract_deferred") else {}
+    # Clears re-evaluated at execution under the claim, never from a job-context snapshot: a
+    # clear queued minutes ago can have been re-set, deleted, moved or had its key reclaimed.
+    clears = (
+        ()
+        if clears_suppressed(context)
+        else tuple(SrClear(row.id, triple_of(row), fields) for row in rows if (fields := candidate_clear_fields(row)))
+    )
     return SrRemovalPlan(
         frozenset(authorized),
         frozenset(claimed),
         tuple(tombstone.id for tombstone in tombstones),
-        tuple(SrClear(row.id, triple_of(row), candidates[row.id]) for row in rows if row.id in candidates),
+        clears,
         tuple(reclaimed),
     )
 
