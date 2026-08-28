@@ -157,8 +157,12 @@ async def lock_projection(db: AsyncSession, device_id: int) -> None:
     between two of the document's SELECTs would put state into a generation nobody
     authorized. The device row orders projection writers against offboard. The counter row
     then orders the sequence they allocate.
+
+    FOR NO KEY UPDATE, not FOR UPDATE: it must exclude teardown and a rival projection
+    writer, but not the FOR KEY SHARE that job admission (``jobs.py``) and PostgreSQL's own
+    FK validation take on the same row.
     """
-    held_device = await db.scalar(select(Device.id).where(Device.id == device_id).with_for_update())
+    held_device = await db.scalar(select(Device.id).where(Device.id == device_id).with_for_update(key_share=True))
     if held_device is None:
         raise DeviceProjectionGone(f"device {device_id} no longer exists")
     async with db.begin_nested():

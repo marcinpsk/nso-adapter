@@ -867,6 +867,43 @@ async def test_the_projection_lock_serializes_two_writers(adapter_client, rival_
         await waiter.rollback()
 
 
+async def test_the_projection_lock_does_not_block_job_admission(adapter_client, rival_engine):
+    """The lock excludes rival writers and teardown, NOT the FOR KEY SHARE admission takes.
+
+    ``admit_coalescible_job`` locks the device row FOR KEY SHARE, and PostgreSQL takes the
+    same mode again to validate the inserted job's FK. A plain FOR UPDATE here would give
+    every ordinary push teardown-strength blocking against job creation.
+    """
+    from nso_adapter.core.generation import lock_projection
+    from nso_adapter.core.jobs import admit_coalescible_job
+    from nso_adapter.store.db import get_engine
+    from nso_adapter.store.models import Device, JobType
+
+    device_id = await _device("gen-lock-admit", 9743)
+
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+    async with rival() as holder, rival() as admitter, rival() as teardown:
+        await lock_projection(holder, device_id)
+
+        # PostgreSQL itself decides whether admission conflicts: a lock_timeout turns the
+        # wait into a failure instead of a hang, so no task is left blocked on the row.
+        await admitter.execute(sa.text("SET LOCAL lock_timeout = '2s'"))
+        created, winner = await admit_coalescible_job(admitter, device_id, JobType.sync)
+        assert created is not None and winner is None
+        await admitter.commit()
+
+        # The guard: the mode teardown uses is still excluded, so the lock still orders
+        # projection writes against offboard.
+        torn_down = asyncio.create_task(
+            teardown.execute(sa.select(Device.id).where(Device.id == device_id).with_for_update())
+        )
+        await _wait_for_relation_lock(get_engine(), "devices")
+        assert not torn_down.done(), "teardown crossed a held projection lock"
+        await holder.commit()
+        await asyncio.wait_for(torn_down, timeout=5)
+        await teardown.rollback()
+
+
 # ── mode boundary ────────────────────────────────────────────────────────────
 
 
