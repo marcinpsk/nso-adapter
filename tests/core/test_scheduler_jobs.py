@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.bindings.netbox.scope import PluginScopeRecord
@@ -352,16 +353,48 @@ async def test_intent_reconcile_aborts_on_fetch_error(adapter_client, monkeypatc
 
 @pytest.mark.anyio
 async def test_intent_reconcile_handles_device_load_failure(adapter_client, monkeypatch):
-    await _seed_devices(("load-fails", 8000))
+    ids = await _seed_devices(("load-fails", 8000), ("still-reconciles", 8001))
+    async with session() as db:
+        db.add(DbInterface(device_id=ids["still-reconciles"], name="GigabitEthernet0/1"))
+        await db.commit()
 
-    async def _load_fails(*_args, **_kwargs):
-        raise RuntimeError("database read failed")
+    real_get = AsyncSession.get
+
+    async def _load_first_fails(self, entity, ident, *args, **kwargs):
+        if entity is Device and ident == ids["load-fails"]:
+            raise RuntimeError("database read failed")
+        return await real_get(self, entity, ident, *args, **kwargs)
+
+    records = [
+        SimpleNamespace(
+            netbox_device_id=8001,
+            interface_name="GigabitEthernet0/1",
+            attribute="description",
+            intent_value="uplink",
+            accepted_at=None,
+        )
+    ]
 
     monkeypatch.setattr("nso_adapter.core.importer.get_netbox_client", lambda: object())
-    monkeypatch.setattr("nso_adapter.bindings.netbox.intent.fetch_all_intent", AsyncMock(return_value=[]))
-    monkeypatch.setattr(AsyncSession, "get", _load_fails)
+    monkeypatch.setattr("nso_adapter.bindings.netbox.intent.fetch_all_intent", AsyncMock(return_value=records))
+    monkeypatch.setattr(AsyncSession, "get", _load_first_fails)
 
-    await sched._scheduled_intent_reconcile()
+    with capture_logs() as logs:
+        await sched._scheduled_intent_reconcile()
+
+    async with session() as db:
+        rows = (
+            (
+                await db.execute(
+                    select(InterfaceIntent).join(DbInterface).where(DbInterface.device_id == ids["still-reconciles"])
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert [(row.attribute, row.intent_value) for row in rows] == [("description", "uplink")]
+    failed = next(log for log in logs if log["event"] == "scheduler.intent_reconcile.device_failed")
+    assert failed["device_id"] == ids["load-fails"]
 
 
 @pytest.mark.anyio

@@ -20,7 +20,7 @@ async def _seed_routes(
     routes: list[dict],
     *,
     refresh_source: str = "poll",
-    last_refreshed_at: datetime = TS,
+    last_refreshed_at: datetime | None = TS,
 ) -> None:
     """Seed DeviceStaticRoute rows for a device."""
     from nso_adapter.store.models import DeviceStaticRoute
@@ -39,8 +39,8 @@ async def _seed_routes(
                     permanent=route.get("permanent"),
                     tag=route.get("tag"),
                     name=route.get("name"),
-                    last_refreshed_at=ts,
-                    refresh_source=refresh_source,
+                    last_refreshed_at=route.get("last_refreshed_at", ts),
+                    refresh_source=route.get("refresh_source", refresh_source),
                 )
             )
         await db.commit()
@@ -162,6 +162,43 @@ async def test_static_routes_last_refreshed_at_and_source(adapter_client):
     body = resp.json()
     assert body["refresh_source"] == "sse"
     assert "2026-05-29" in body["last_refreshed_at"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("unrefreshed_prefix", "refreshed_prefix"),
+    [
+        ("198.18.0.0/24", "198.18.1.0/24"),
+        ("198.18.1.0/24", "198.18.0.0/24"),
+    ],
+)
+async def test_static_routes_select_latest_with_mixed_refresh_times(
+    adapter_client, unrefreshed_prefix, refreshed_prefix
+):
+    device_id = await seed_device(nso_device_name="sr-mixed-refresh", netbox_device_id=976)
+    await _seed_routes(
+        device_id,
+        [
+            {
+                "prefix": unrefreshed_prefix,
+                "next_hop": "198.18.255.1",
+                "last_refreshed_at": None,
+                "refresh_source": "never",
+            },
+            {
+                "prefix": refreshed_prefix,
+                "next_hop": "198.18.255.2",
+                "last_refreshed_at": TS,
+                "refresh_source": "poll",
+            },
+        ],
+    )
+
+    response = await adapter_client.get(f"/api/v1/devices/{device_id}/static-routes", headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json()["last_refreshed_at"] == "2026-06-10T09:00:00Z"
+    assert response.json()["refresh_source"] == "poll"
 
 
 @pytest.mark.anyio
