@@ -177,6 +177,8 @@ async def test_enqueue_removal_rejects_unknown_scope(adapter_client):
 
 async def test_enqueue_removal_rejects_a_deferred_delete_origin_retract(adapter_client):
     """A non-static deferred retract on a delete-origin job would discharge its own clear."""
+    from nso_adapter.core.request_flags import DELETE_ORIGIN_MARKING
+
     device_id = await _seed_device(nso_device_name="sw-deferred-delete-origin")
     async with session() as db:
         await note_projection_write(db, device_id, "ospf")
@@ -188,7 +190,7 @@ async def test_enqueue_removal_rejects_a_deferred_delete_origin_retract(adapter_
                 db,
                 device_id,
                 "ospf",
-                marking="delete_origin",
+                marking=DELETE_ORIGIN_MARKING,
                 defer_retract=True,
                 promotes=("ospf",),
                 retract=True,
