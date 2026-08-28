@@ -1984,6 +1984,7 @@ def _removal_scope(context: dict) -> str:
         raise ValueError("Removal job context has no string scope")
     return scope
 
+
 class RemovalMarking(NamedTuple):
     """What one intent PUT's deletions are marked with, for a ``query_flag`` scope.
 
