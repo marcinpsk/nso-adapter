@@ -1024,44 +1024,79 @@ async def test_a_pending_head_bound_to_a_running_job_is_corruption(adapter_clien
     assert await _job_status(head.job_id) is JobStatus.running
 
 
-async def test_advancement_waits_for_a_carrier_a_worker_is_starting(adapter_client, rival_engine):
-    """The carrier's status is only truthful under its row lock.
+async def test_advancement_yields_to_a_worker_starting_the_carrier(adapter_client, rival_engine):
+    """The two lock orders are opposed, so the carrier read must be NOWAIT, not blocking.
 
-    The worker takes the job FOR UPDATE SKIP LOCKED and flips job→running and
-    generation→running in ONE transaction. An unlocked read here sees the pre-start
-    ``queued`` and hands that stale carrier back as the released successor, which is exactly
-    the identity the abandon contract promises to be truthful.
+    Advancement holds the head generation row and wants the job; the worker holds the job
+    (FOR UPDATE SKIP LOCKED) and wants the generation rows
+    (:func:`mark_job_generations_running`). This drives exactly that interleaving with the
+    REAL worker transition, so a blocking carrier read closes the cycle into a PostgreSQL
+    deadlock. An unavailable lock means a worker is starting this carrier right now: the
+    head is covered, so advancement yields instead of taking it over.
     """
-    from nso_adapter.core.generation import GenerationCarrierCorruption, advance_device_generations
+    from nso_adapter.core import generation as generation_mod
+    from nso_adapter.core.generation import advance_device_generations, mark_job_generations_running
     from nso_adapter.store.db import get_engine
-    from nso_adapter.store.models import Job, JobStatus
+    from nso_adapter.store.models import GenerationStatus, Job, JobStatus
 
-    device_id = await _device("gen-advance-carrier-lock", 9744)
+    device_id = await _device("gen-advance-carrier-nowait", 9744)
     await _vlan(device_id, 99)
     await _push(adapter_client, device_id)
     (head,) = await _generations(device_id)
     assert head.job_id is not None
     assert await _job_status(head.job_id) is JobStatus.queued
 
-    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
-    async with rival() as worker:
-        starting = await worker.scalar(sa.select(Job).where(Job.id == head.job_id).with_for_update(skip_locked=True))
-        assert starting is not None, "the worker could not claim the carrier it is starting"
-        starting.status = JobStatus.running
-        starting.run_attempt = 1
-        await worker.flush()
+    head_locked = asyncio.Event()
+    worker_blocked = asyncio.Event()
+    real_head = generation_mod._locked_executable_head
 
-        advancing = asyncio.create_task(advance_device_generations(device_id))
-        await _wait_for_relation_lock(get_engine(), "jobs")
-        assert not advancing.done(), "advancement trusted a carrier status it never locked"
+    async def gated(db, locked_device_id):
+        """Hold the head generation lock until the worker is blocked behind it."""
+        result = await real_head(db, locked_device_id)
+        head_locked.set()
+        await asyncio.wait_for(worker_blocked.wait(), timeout=20)
+        return result
+
+    async def start_the_job(worker) -> None:
+        """``worker.py`` — lock the job by exact id, then move ITS generations to running."""
+        locked = await worker.scalar(
+            sa.select(Job)
+            .where(Job.id == head.job_id, Job.status == JobStatus.queued)
+            .with_for_update(skip_locked=True)
+        )
+        assert locked is not None, "the worker could not claim the carrier it is starting"
+        await mark_job_generations_running(worker, locked.id)
+        locked.status = JobStatus.running
+        locked.run_attempt = locked.run_attempt + 1
         await worker.commit()
 
-    with pytest.raises(GenerationCarrierCorruption, match="running carrier"):
-        await asyncio.wait_for(advancing, timeout=10)
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+    async with rival() as worker:
+        with patch("nso_adapter.core.generation._locked_executable_head", new=gated):
+            advancing = asyncio.create_task(advance_device_generations(device_id))
+            starting = asyncio.create_task(start_the_job(worker))
+            try:
+                await asyncio.wait_for(head_locked.wait(), timeout=10)
+                await _wait_for_relation_lock(get_engine(), "deployment_generation")
+                assert not starting.done(), "the worker was never blocked on the head generation row"
+            finally:
+                worker_blocked.set()
 
-    (unchanged,) = await _generations(device_id)
-    assert unchanged.job_id == head.job_id
+            # (a) no deadlock, and no stale queued carrier handed back as a successor.
+            assert await asyncio.wait_for(advancing, timeout=20) is None, (
+                "advancement took over a carrier a worker is starting"
+            )
+        await asyncio.wait_for(starting, timeout=20)
+
+    # (b) the worker's transition landed whole, and a re-run reads that truthful state.
+    (running,) = await _generations(device_id)
+    assert running.status is GenerationStatus.running
+    assert running.job_id == head.job_id, "the yield moved the head off the carrier being started"
     assert await _job_status(head.job_id) is JobStatus.running
+
+    assert await advance_device_generations(device_id) is None
+    async with session() as db:
+        assert await db.scalar(sa.select(sa.func.count()).select_from(Job).where(Job.device_id == device_id)) == 1
 
 
 async def test_startup_recovery_isolates_a_corrupt_device(adapter_client):

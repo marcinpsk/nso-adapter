@@ -59,6 +59,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.projection import (
@@ -94,6 +95,8 @@ logger = structlog.get_logger(__name__)
 _CROSSABLE = (GenerationStatus.settled, GenerationStatus.abandoned)
 #: A job that is still going to run (or is running) covers its generations.
 _LIVE_JOB = (JobStatus.queued, JobStatus.running)
+#: PostgreSQL ``lock_not_available`` — what a refused ``FOR UPDATE NOWAIT`` reports.
+_LOCK_NOT_AVAILABLE = "55P03"
 
 
 class DeviceProjectionGone(RuntimeError):
@@ -1472,6 +1475,14 @@ async def advance_generations_locked(db: AsyncSession, device_id: int) -> Job | 
     pending head bound to a running carrier is corrupt because both states must change in one
     worker transaction.
 
+    The carrier read is NOWAIT because the two lock orders are opposed and cannot be
+    reconciled: this path holds the head generation row and wants the job, while the worker
+    holds the job and wants the generation rows (``mark_job_generations_running``). Waiting
+    here closes that cycle into a deadlock, and a victimised worker propagates out of
+    ``_claim_next_job`` with its device claim already committed. An unavailable lock has one
+    meaning — a worker is starting this carrier right now — so the head is covered and
+    advancement yields: no takeover, no successor reported.
+
     A REMOVAL head gets a job built from its OWN ``removal_context`` — never the shared
     queued apply. The test used to be the ``detach`` mode alone, which is the wrong question:
     a delete-origin removal is ``networked``, and handing it an apply job produced a device
@@ -1483,9 +1494,16 @@ async def advance_generations_locked(db: AsyncSession, device_id: int) -> Job | 
     if head is None or head.status is not GenerationStatus.pending:
         return None
     if head.job_id is not None:
-        # Locked, device→job: an unlocked read sees a starting worker's pre-commit `queued`
-        # and hands that stale carrier back as the released successor.
-        carrier = await db.get(Job, head.job_id, populate_existing=True, with_for_update=True)
+        try:
+            # SAVEPOINT: a refused lock aborts the statement, and reconcile_generation runs
+            # this inside the transaction that already abandoned the blocker.
+            async with db.begin_nested():
+                carrier = await db.get(Job, head.job_id, populate_existing=True, with_for_update={"nowait": True})
+        except DBAPIError as exc:
+            if getattr(exc.orig, "sqlstate", None) != _LOCK_NOT_AVAILABLE:
+                raise
+            logger.info("generation.carrier_locked_by_worker", device_id=device_id, job_id=head.job_id, seq=head.seq)
+            return None
         if carrier is not None and carrier.status is JobStatus.queued:
             return carrier
         if carrier is not None and carrier.status is JobStatus.running:
