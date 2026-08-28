@@ -45,7 +45,7 @@ logger = structlog.get_logger(__name__)
 async def ensure_topology_interfaces(
     db: AsyncSession,
     device: Device,
-    nb_client,  # type: ignore[annotation-unchecked]
+    nb_client,
 ) -> dict[str, int]:
     """Ensure NetBox holds the LAG/channel/loopback interfaces bound_port needs.
 

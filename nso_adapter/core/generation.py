@@ -52,11 +52,13 @@ import hashlib
 import json
 from contextvars import ContextVar
 from datetime import UTC, datetime
+from typing import Any, cast
 
 import structlog
 from sqlalchemy import select
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -184,7 +186,10 @@ async def note_write(db: AsyncSession, device_id: int, stream: str, *, push_seq:
         )
         .returning(DeviceProjectionStream.desired_revision)
     )
-    return await db.scalar(stmt)
+    revision = await db.scalar(stmt)
+    if revision is None:  # INSERT .. ON CONFLICT DO UPDATE .. RETURNING always returns one row
+        raise RuntimeError(f"projection revision update returned no row for device {device_id}, stream {stream!r}")
+    return revision
 
 
 async def _next_seq(db: AsyncSession, device_id: int) -> int:
@@ -747,11 +752,14 @@ async def _queue_job_for(db: AsyncSession, generation: DeploymentGeneration) -> 
         db.add(spec)
         await db.flush()
         return spec
-    released = await db.execute(
-        sa_update(DeploymentGeneration)
-        .where(DeploymentGeneration.job_id == existing.id, DeploymentGeneration.id != generation.id)
-        .values(job_id=None, updated_at=_now())
-        .execution_options(synchronize_session=False)
+    released = cast(
+        CursorResult[Any],
+        await db.execute(
+            sa_update(DeploymentGeneration)
+            .where(DeploymentGeneration.job_id == existing.id, DeploymentGeneration.id != generation.id)
+            .values(job_id=None, updated_at=_now())
+            .execution_options(synchronize_session=False)
+        ),
     )
     if spec.context is not None:
         # A removal's context IS its operation. An apply's is written by the run itself, so
@@ -904,13 +912,13 @@ async def advance_generations_locked(db: AsyncSession, device_id: int) -> int:
         head.job_id = None
         await db.flush()
     if head.removal_context or head.mode is GenerationMode.detach:
-        job = await _queue_job_for(db, head)
-        head.job_id = job.id
+        removal_job = await _queue_job_for(db, head)
+        head.job_id = removal_job.id
         await db.flush()
         logger.info(
             "generation.advanced_removal",
             device_id=device_id,
-            job_id=job.id,
+            job_id=removal_job.id,
             seq=head.seq,
             mode=head.mode.value,
         )
@@ -1000,7 +1008,7 @@ async def recover_generations() -> int:
             generation.status = GenerationStatus.outcome_unknown
             generation.updated_at = _now()
             stranded.append(generation.device_id)
-        devices = (
+        devices = list(
             (
                 await db.execute(
                     select(DeploymentGeneration.device_id)

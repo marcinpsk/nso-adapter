@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import NamedTuple
 
@@ -65,7 +66,7 @@ async def _group_in(db: AsyncSession, model, fk_col, ids: list[int], key_attr: s
     return grouped
 
 
-async def _load_bgp_graph(db: AsyncSession, bgp_routers: list[DeviceBgpRouter]) -> _BgpGraph:
+async def _load_bgp_graph(db: AsyncSession, bgp_routers: Sequence[DeviceBgpRouter]) -> _BgpGraph:
     """Batch-load the scope/af/peer/peer-af/peer-group graph beneath a device's routers."""
     router_ids = [r.id for r in bgp_routers]
     scopes_by_router = await _group_in(

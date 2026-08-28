@@ -11,6 +11,7 @@ only inserts a ``queued`` row; a worker claims and runs it.
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import structlog
 from sqlalchemy import exists, literal_column, select, text
@@ -125,7 +126,7 @@ async def _lock_queued_winner(db: AsyncSession, device_id: int, job_type: JobTyp
 
 async def admit_queued_job(
     db: AsyncSession,
-    device_id: int | None,
+    device_id: int,
     job_type: JobType,
     *,
     context: dict | None = None,
@@ -157,6 +158,8 @@ async def admit_queued_job(
 
         if job_id is not None:
             created = await db.get(Job, job_id)
+            if created is None:  # INSERT .. RETURNING proved this row exists
+                raise RuntimeError(f"newly admitted job {job_id} disappeared")
             return created, None
 
         # Lost to an existing queued row. Bound this transaction before parking on its lock.
@@ -268,7 +271,7 @@ async def _authorize_apply_job(db: AsyncSession, device_id: int, job: Job) -> bo
 # same two constants are the ON CONFLICT inference target and the lookup's filter, so the
 # lookup can never drift from what the database actually enforces. literal_column, not text:
 # ON CONFLICT infers from column EXPRESSIONS, and a TextClause is not one.
-_PROVISION_PAIR_ELEMENTS = (
+_PROVISION_PAIR_ELEMENTS: tuple[Any, Any] = (
     literal_column("(context ->> 'nso_instance')"),
     literal_column("(context ->> 'device_name')"),
 )
@@ -329,6 +332,8 @@ async def enqueue_provision_job(params: dict, db: AsyncSession) -> tuple[Job, bo
         if job_id is not None:
             await db.commit()
             job = await db.get(Job, job_id)
+            if job is None:  # INSERT .. RETURNING proved this row exists
+                raise RuntimeError(f"newly admitted provision job {job_id} disappeared")
             return job, True
 
         active = await get_active_provision_job(params["nso_instance"], params["device_name"], db)

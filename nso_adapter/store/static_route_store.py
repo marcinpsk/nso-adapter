@@ -15,9 +15,13 @@ leaves a closed replacement under a failed apply (§4.6 atomicity).
 
 from __future__ import annotations
 
+from typing import Any
+from typing import cast as type_cast
+
 import structlog
 from sqlalchemy import cast, select, update
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = structlog.get_logger(__name__)
@@ -67,14 +71,17 @@ async def cas_deployed_key(
     from nso_adapter.store.models import StaticRouteIntent
 
     sent = list(sent_triple)
-    result = await db.execute(
-        update(StaticRouteIntent)
-        .where(
-            StaticRouteIntent.device_id == device_id,
-            StaticRouteIntent.id == row_id,
-            StaticRouteIntent.deployed_key.is_not_distinct_from(_jsonb(expected_old)),
-        )
-        .values(deployed_key=sent)
+    result = type_cast(
+        CursorResult[Any],
+        await db.execute(
+            update(StaticRouteIntent)
+            .where(
+                StaticRouteIntent.device_id == device_id,
+                StaticRouteIntent.id == row_id,
+                StaticRouteIntent.deployed_key.is_not_distinct_from(_jsonb(expected_old)),
+            )
+            .values(deployed_key=sent)
+        ),
     )
     if result.rowcount:
         return CAS_ROW

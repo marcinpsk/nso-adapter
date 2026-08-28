@@ -81,8 +81,11 @@ async def _upsert_vlans(
     seen: set[int] = set()
     now = _now()
     for item in vlans:
+        raw_vlan_id = item.get("vlan-id", item.get("vlan_id"))
+        if raw_vlan_id is None:
+            continue
         try:
-            vid = int(item.get("vlan-id", item.get("vlan_id")))
+            vid = int(raw_vlan_id)
         except (TypeError, ValueError):
             continue
         seen.add(vid)

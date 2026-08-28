@@ -32,6 +32,7 @@ import os
 import sys
 import time
 from datetime import UTC, datetime, timedelta
+from typing import TypedDict
 
 import structlog
 from sqlalchemy import func, or_, select
@@ -77,6 +78,13 @@ _drains: dict[asyncio.Task, asyncio.Task] = {}
 # Distinct from 1 so a supervisor's logs separate "the adapter fail-stopped" from an
 # ordinary crash.
 _FAILSTOP_EXIT_CODE = 70
+
+
+class _DrainKwargs(TypedDict):
+    job_id: int
+    device_id: int | None
+    job_type: str
+
 
 # How many candidate devices one poll may consider. More than one is the cross-device
 # progress guarantee: a device whose head cannot be locked is skipped in favour of the next
@@ -375,7 +383,8 @@ async def _heartbeat(job_id: int, reg: ClaimRegistration | None = None) -> None:
                     await db.execute(sa_update(Job).where(Job.id == job_id).values(heartbeat_at=now))
                     await db.commit()
             if revoked:
-                logger.warning("worker.heartbeat_claim_revoked", job_id=job_id, device_id=reg.device_id)
+                assert live is not None
+                logger.warning("worker.heartbeat_claim_revoked", job_id=job_id, device_id=live.device_id)
                 return
         except asyncio.CancelledError:
             return
@@ -596,7 +605,7 @@ async def _run_one_job(
     seen = _CancelSeen()
     ownership = "drained"
     outcome = ClaimOutcome.ABORT_KNOWN
-    drain_kwargs = {"job_id": job_id, "device_id": device_id, "job_type": str(job_type)}
+    drain_kwargs: _DrainKwargs = {"job_id": job_id, "device_id": device_id, "job_type": str(job_type)}
 
     logger.info(
         "worker.job_start",

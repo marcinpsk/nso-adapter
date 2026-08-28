@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 from contextvars import ContextVar
+from typing import Any, cast
 
 import structlog
 
@@ -302,7 +303,7 @@ async def _send_service_config(
     *,
     scope: str,
     replace: bool = False,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
     stage: dict[str, list] | None = None,
     instance_key: str | None = None,
 ) -> str | None:
@@ -376,7 +377,7 @@ async def apply_combined(
     device_name: str,
     modules: dict[str, list[dict]],
     *,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
     strict: bool = False,
 ) -> str | None:
     """Stage several reconciler-service bodies into ONE ``/restconf/data`` PATCH.
@@ -686,7 +687,7 @@ def build_interface_config_entry(
 
 
 async def replace_interface_config(
-    client: NsoClient, device_name: str, interface_name: str, entry: dict, *, dry_run: bool = False
+    client: NsoClient, device_name: str, interface_name: str, entry: dict, *, dry_run: bool | str = False
 ) -> str | None:
     """PUT-replace the ``(device, interface-name)`` interface-reconciler instance with *entry*.
 
@@ -864,7 +865,7 @@ def _snmp_vault_triple(vault_ref: str, prefix: str, owner: str) -> dict[str, str
     return {
         f"{prefix}vault-mount": ref.mount,
         f"{prefix}vault-path": ref.path,
-        f"{prefix}vault-key": ref.key,
+        f"{prefix}vault-key": cast(str, ref.key),
     }
 
 
@@ -915,7 +916,7 @@ async def apply_snmp_config(
     system_info_intent,
     *,
     replace: bool = False,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
     stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write the full SNMP intent snapshot for a device to the snmp-reconciler service.
@@ -1026,7 +1027,7 @@ async def apply_static_routes(
     *,
     extra_entries: list[dict] | None = None,
     replace: bool = False,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
     stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write static route intent for a single device to NSO.
@@ -1091,7 +1092,7 @@ async def apply_logging_config(
     *,
     levels_intent_row=None,
     replace: bool = False,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
     stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write the full remote-syslog + local-levels intent snapshot for a device to NSO.
@@ -1161,7 +1162,7 @@ async def apply_svi_config(
     svi_intent_rows: list,
     *,
     replace: bool = False,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
     stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write the SVI/IRB intent snapshot for a device to NSO.
@@ -1216,7 +1217,7 @@ async def apply_subinterface_config(
     subif_intent_rows: list,
     *,
     replace: bool = False,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
     stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write the dot1q subinterface intent snapshot for a device to NSO.
@@ -1245,7 +1246,7 @@ async def apply_vlan_config(
     vlan_intent_rows: list,
     *,
     replace: bool = False,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
     stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write the VLAN-database intent snapshot for a device to NSO (write path).
@@ -1281,7 +1282,7 @@ async def apply_bfd_config(
     bfd_intent_rows: list,
     *,
     replace: bool = False,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
     stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write the per-interface BFD intent snapshot for a device to NSO.
@@ -1321,7 +1322,7 @@ async def apply_mtu_config(
     mtu_intent_rows: list,
     *,
     replace: bool = False,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
     stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write the per-interface MTU intent snapshot for a device to NSO (Phase 2b).
@@ -1362,7 +1363,7 @@ async def apply_l2_saps(
     sap_intent_rows: list,
     *,
     replace: bool = False,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
     stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write Nokia L2 SAP intent for a single device to NSO.
@@ -1406,7 +1407,7 @@ async def apply_lag_config(
     bundles: list[dict],
     *,
     replace: bool = False,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
     stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write LACP/LAG bundle intent for a single device to NSO.
@@ -1440,7 +1441,7 @@ async def apply_switchport_config(
     interfaces: list[dict],
     *,
     replace: bool = False,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
     stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write L2 switchport intent for a single device to NSO.
@@ -1556,10 +1557,10 @@ def build_isis_process_payload(
     for row in redistribution_rows or []:
         redist_by_proc.setdefault(row.dest_ref, []).append(_redistribute_entry(row))
 
-    processes: list[dict] = [
+    processes: list[dict[str, Any]] = [
         _isis_process_entry(row, redist_by_proc.get(row.process_tag or "", [])) for row in isis_process_rows or []
     ]
-    proc_by_tag = {p["process-tag"]: p for p in processes}
+    proc_by_tag: dict[str, dict[str, Any]] = {p["process-tag"]: p for p in processes}
 
     # Redistribute rows whose destination process has NO process row in this apply
     # (e.g. the process already applied cleanly and was filtered out by force=False
@@ -1567,9 +1568,9 @@ def build_isis_process_payload(
     # redistribute is never silently dropped (parity with the flex-algo orphan below).
     for tag, redist_list in redist_by_proc.items():
         if tag not in proc_by_tag:
-            proc = {"process-tag": tag, "redistribute": redist_list}
-            processes.append(proc)
-            proc_by_tag[tag] = proc
+            orphan_process: dict[str, Any] = {"process-tag": tag, "redistribute": redist_list}
+            processes.append(orphan_process)
+            proc_by_tag[tag] = orphan_process
 
     # Attach Flex-Algo definitions to their process-config entry, creating a
     # minimal entry for any process-tag that has flex-algo but no process row.
@@ -1578,12 +1579,12 @@ def build_isis_process_payload(
         flex_by_proc.setdefault(row.process_tag or "", []).append(_isis_flex_algo_entry(row))
 
     for tag, fa_list in flex_by_proc.items():
-        proc = proc_by_tag.get(tag)
-        if proc is None:
-            proc = {"process-tag": tag}
-            processes.append(proc)
-            proc_by_tag[tag] = proc
-        proc["flex-algo"] = fa_list
+        flex_process = proc_by_tag.get(tag)
+        if flex_process is None:
+            flex_process = {"process-tag": tag}
+            processes.append(flex_process)
+            proc_by_tag[tag] = flex_process
+        flex_process["flex-algo"] = fa_list
 
     # Per-level tuning attaches identically (orphan tags get a minimal entry so a
     # level row is never silently dropped).
@@ -1592,12 +1593,12 @@ def build_isis_process_payload(
         levels_by_proc.setdefault(row.process_tag or "", []).append(_isis_level_entry(row))
 
     for tag, lvl_list in levels_by_proc.items():
-        proc = proc_by_tag.get(tag)
-        if proc is None:
-            proc = {"process-tag": tag}
-            processes.append(proc)
-            proc_by_tag[tag] = proc
-        proc["level"] = lvl_list
+        level_process = proc_by_tag.get(tag)
+        if level_process is None:
+            level_process = {"process-tag": tag}
+            processes.append(level_process)
+            proc_by_tag[tag] = level_process
+        level_process["level"] = lvl_list
 
     return processes
 
@@ -1612,7 +1613,7 @@ async def apply_isis_interfaces(
     level_rows: list | None = None,
     *,
     replace: bool = False,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
     stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write IS-IS interface-enablement and process intent for a single device to NSO.
@@ -1826,7 +1827,7 @@ async def apply_bgp_config(
     redistribution_rows: list | None = None,
     *,
     replace: bool = False,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
     stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write BGP intent for a single device to NSO via the bgp-reconciler.
@@ -1958,7 +1959,7 @@ async def apply_route_policy_config(
     *,
     ned_id: str | None = None,
     replace: bool = False,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
     stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write route-policy intent for a single device to NSO via the route-policy-reconciler.
@@ -2083,7 +2084,7 @@ async def apply_ospf_config(
     redistribution_rows: list | None = None,
     *,
     replace: bool = False,
-    dry_run: bool = False,
+    dry_run: bool | str = False,
     stage: dict[str, list] | None = None,
 ) -> str | None:
     """Write OSPF process and interface intent for a single device to NSO.

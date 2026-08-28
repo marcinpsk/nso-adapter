@@ -64,7 +64,7 @@ def _loop_coordination() -> tuple[dict[tuple[int, str], asyncio.Lock], asyncio.S
     entry = getattr(loop, "_nso_adapter_refresh_coordination", None)
     if entry is None:
         entry = ({}, asyncio.Semaphore(_ACTION_CONCURRENCY))
-        loop._nso_adapter_refresh_coordination = entry
+        setattr(loop, "_nso_adapter_refresh_coordination", entry)
     return entry
 
 
@@ -154,7 +154,7 @@ async def _record_result(
 
 
 @dataclass(frozen=True)
-class FamilySpec:
+class FamilySpec[PayloadT]:
     """Declarative description of one read-mirror family (the policy-table row).
 
     * ``name`` — the surface name used in logs and degraded-surface lists (e.g. ``"static_route"``).
@@ -175,8 +175,8 @@ class FamilySpec:
     """
 
     name: str
-    extract: Callable[[dict], object]
-    materialize: Callable[[AsyncSession, Device, object, str], Awaitable[None]]
+    extract: Callable[[dict], PayloadT]
+    materialize: Callable[[AsyncSession, Device, PayloadT, str], Awaitable[None]]
     wire_name: str
 
 

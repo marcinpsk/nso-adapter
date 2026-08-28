@@ -9,9 +9,11 @@ decides when to call it. Nothing here decides whether a deletion is proven.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Any, cast
 
 import structlog
 from sqlalchemy import delete, select
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import ClaimRegistration, lock_claim
@@ -52,11 +54,14 @@ async def delete_tombstones(
         .order_by(StaticRouteTombstone.id)
         .with_for_update()
     )
-    result = await db.execute(
-        delete(StaticRouteTombstone).where(
-            StaticRouteTombstone.id.in_(ordered),
-            StaticRouteTombstone.device_id == device_id,
-        )
+    result = cast(
+        CursorResult[Any],
+        await db.execute(
+            delete(StaticRouteTombstone).where(
+                StaticRouteTombstone.id.in_(ordered),
+                StaticRouteTombstone.device_id == device_id,
+            )
+        ),
     )
     logger.info("tombstone.deleted", device_id=device_id, count=result.rowcount)
     return result.rowcount

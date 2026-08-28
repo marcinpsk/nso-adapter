@@ -12,18 +12,21 @@ Sync flow (docs/nso-adapter.md §7):
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
 
 import structlog
 from sqlalchemy import select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.config import get_config
 from nso_adapter.core.cancelsafe import await_uncancellable
 from nso_adapter.core.refresh_engine import (
+    FamilySpec,
     _action_semaphore,
     classify_envelope_family_read,
     run_family_refresh_from_outcome,
@@ -54,8 +57,27 @@ from nso_adapter.store.models import (
 
 logger = structlog.get_logger(__name__)
 
+if TYPE_CHECKING:
+    from nso_adapter.bindings.netbox.client import NetboxClient
+
+
+class SurfaceRefresh(Protocol):
+    """One refresh function in a projected surface fan-out."""
+
+    def __call__(
+        self,
+        db: AsyncSession,
+        device: Device,
+        nso_client: NsoClient,
+        *,
+        refresh_source: str,
+    ) -> Awaitable[bool]: ...
+
+
+Surface = tuple[str, SurfaceRefresh]
+
 _nso_clients: dict[str, NsoClient] = {}
-_netbox_client = None  # set at startup via set_netbox_client
+_netbox_client: NetboxClient | None = None  # set at startup via set_netbox_client
 
 
 def _utcnow() -> datetime:
@@ -129,12 +151,12 @@ def get_nso_client(instance_name: str) -> NsoClient:
     return _nso_clients[instance_name]
 
 
-def set_netbox_client(client) -> None:  # type: ignore[annotation-unchecked]
+def set_netbox_client(client: NetboxClient | None) -> None:
     global _netbox_client
     _netbox_client = client
 
 
-def get_netbox_client():
+def get_netbox_client() -> NetboxClient | None:
     return _netbox_client
 
 
@@ -142,7 +164,7 @@ async def _run_surfaces(
     db: AsyncSession,
     device: Device,
     nso_client: NsoClient,
-    surfaces: list[tuple[str, object]],
+    surfaces: list[Surface],
     refresh_source: str,
 ) -> list[str]:
     """Run a list of ``(name, refresh_fn)`` for one device, isolating per-surface failures.
@@ -170,7 +192,7 @@ async def _run_surfaces(
     return failed
 
 
-def _projectable_spec(name: str):
+def _projectable_spec(name: str) -> FamilySpec[Any] | None:
     """Resolve a surface name to its FamilySpec (None for non-spec composites like redistribution).
 
     Lazy imports mirror the surface-list builders below (import cost only when used).
@@ -275,7 +297,7 @@ def _section_or_error(section) -> dict:
 class _ProjectionLayout:
     """The exact wire and lock sets for one projected fan-out."""
 
-    spec_by_name: dict[str, object | None]
+    spec_by_name: dict[str, FamilySpec[Any] | None]
     wire_names: tuple[str, ...]
     lock_names: tuple[str, ...]
 
@@ -294,7 +316,7 @@ class _ProjectedRead:
 
 
 def _projection_layout(
-    surfaces: list[tuple[str, object]],
+    surfaces: list[Surface],
     *,
     extra_wires: tuple[str, ...] = (),
     extra_lock_names: tuple[str, ...] = (),
@@ -323,7 +345,7 @@ async def _projected_batch(
     db: AsyncSession,
     device: Device,
     nso_client: NsoClient,
-    surfaces: list[tuple[str, object]],
+    surfaces: list[Surface],
     *,
     atomic: bool = False,
     extra_wires: tuple[str, ...] = (),
@@ -353,7 +375,7 @@ async def _apply_projected(
     db: AsyncSession,
     device: Device,
     nso_client: NsoClient,
-    surfaces: list[tuple[str, object]],
+    surfaces: list[Surface],
     refresh_source: str,
     layout: _ProjectionLayout,
     projection: _ProjectedRead,
@@ -399,7 +421,7 @@ async def _run_surfaces_projected(
     db: AsyncSession,
     device: Device,
     nso_client: NsoClient,
-    surfaces: list[tuple[str, object]],
+    surfaces: list[Surface],
     refresh_source: str,
     *,
     atomic: bool = False,
@@ -418,7 +440,7 @@ async def _run_surfaces_projected(
         return failed, projection.supplier_outcome
 
 
-def _routing_surfaces(cfg) -> list[tuple[str, object]]:
+def _routing_surfaces(cfg) -> list[Surface]:
     """Build the routing/extra surface list refreshed by ``sync_device`` (Sync Now + 15-min poll).
 
     Includes ``interface_ip`` (A3): folding it into the sync fan-out is a cheap +1 read that
@@ -426,7 +448,7 @@ def _routing_surfaces(cfg) -> list[tuple[str, object]]:
     poll or an SSE event. The heavier L2/lag families stay off this hot path — they refresh
     on their own poll jobs and via the comprehensive on-demand ``refresh_all_surfaces``.
     """
-    surfaces: list[tuple[str, object]] = []
+    surfaces: list[Surface] = []
     if cfg.enable_static_routing_sync:
         from nso_adapter.core.static_route import refresh_static_routes_for_device
 
@@ -470,9 +492,9 @@ def _routing_surfaces(cfg) -> list[tuple[str, object]]:
     return surfaces
 
 
-def _config_surfaces(cfg) -> list[tuple[str, object]]:
+def _config_surfaces(cfg) -> list[Surface]:
     """Build the L2 / interface config surface list (VLAN / SVI / subinterface / MTU)."""
-    surfaces: list[tuple[str, object]] = []
+    surfaces: list[Surface] = []
     if cfg.enable_vlan_sync:
         from nso_adapter.core.vlan import refresh_vlan_database_for_device
 
@@ -492,13 +514,13 @@ def _config_surfaces(cfg) -> list[tuple[str, object]]:
     return surfaces
 
 
-def _extra_mirror_surfaces(cfg) -> list[tuple[str, object]]:
+def _extra_mirror_surfaces(cfg) -> list[Surface]:
     """Build the device-mirror surface list neither in the routing fan-out nor the config set.
 
     ``lag_topology`` / ``lag_config`` carry no dedicated enable flag (their poll job is
     gated on interval only), so they are always included in the comprehensive refresh.
     """
-    surfaces: list[tuple[str, object]] = []
+    surfaces: list[Surface] = []
     from nso_adapter.core.lag_topology import refresh_lag_topology_for_device
 
     surfaces.append(("lag_topology", refresh_lag_topology_for_device))
@@ -914,6 +936,8 @@ async def _consume_interface_attributes(
     refresh_source: str,
 ) -> _AttrsSyncResult:
     """Reconcile one already-classified projected attrs outcome and terminalize it."""
+    from nso_adapter.store import outcome_store
+
     device_id = device.id
     source_epoch = device.source_epoch
     available = isinstance(outcome, Present)
@@ -922,6 +946,7 @@ async def _consume_interface_attributes(
     interfaces_created = 0
     changes_detected = 0
     interfaces_written = 0
+    outcome_row: outcome_store.RefreshOutcome | None = None
     try:
         # Phase 1 and savepoint acquisition are guarded too: cancellation can land
         # after the outcome row flush but before begin_nested returns.
@@ -929,9 +954,9 @@ async def _consume_interface_attributes(
         if available and attempt_id is None:
             raise RuntimeError("interface_attributes: cannot publish without an outcome attempt")
         if attempt_id is not None:
-            from nso_adapter.store import outcome_store
-
             outcome_row = await db.get(outcome_store.RefreshOutcome, attempt_id)
+            if outcome_row is None:
+                raise RuntimeError(f"interface_attributes: outcome attempt {attempt_id} disappeared")
             await outcome_store.acquire_family_fence(db, device_id, "interface_attributes")
             if not await outcome_store.publication_is_current(db, outcome_row):
                 await outcome_store.stage_result(
@@ -945,7 +970,7 @@ async def _consume_interface_attributes(
                 await db.commit()
                 return _AttrsSyncResult(True, 0, 0, 0)
         savepoint = await db.begin_nested()
-        if available:
+        if isinstance(outcome, Present):
             interfaces = _attrs_to_interface_list(outcome.data)
             scope_result = await db.execute(select(ManagedScope).where(ManagedScope.device_id == device_id))
             scope_attrs = [scope.attribute for scope in scope_result.scalars().all()]
@@ -1010,6 +1035,8 @@ async def _consume_interface_attributes(
     async def _success_span() -> None:
         try:
             if available:
+                if outcome_row is None or savepoint is None:
+                    raise RuntimeError("interface_attributes: publication state is incomplete")
                 selected = await outcome_store.stage_result(
                     db,
                     outcome_row,
@@ -1165,14 +1192,17 @@ async def _publish_sync_metadata(
     degraded_surfaces: list[str] | None,
 ) -> bool:
     """Conditionally publish batch metadata in the source generation it describes."""
-    result = await db.execute(
-        update(Device)
-        .where(Device.id == device_id, Device.source_epoch == source_epoch)
-        .values(
-            last_sync_at=_utcnow(),
-            last_sync_status=status,
-            degraded_surfaces=degraded_surfaces,
-        )
+    result = cast(
+        CursorResult[Any],
+        await db.execute(
+            update(Device)
+            .where(Device.id == device_id, Device.source_epoch == source_epoch)
+            .values(
+                last_sync_at=_utcnow(),
+                last_sync_status=status,
+                degraded_surfaces=degraded_surfaces,
+            )
+        ),
     )
     await db.commit()
     if result.rowcount == 0:
@@ -1186,7 +1216,7 @@ async def _detect_drift_attributes(
     db: AsyncSession,
     device: Device,
     client: NsoClient,
-) -> tuple[int, object]:
+) -> tuple[int, NetboxClient | None]:
     """Read and commit interface drift while the caller owns the attrs family lock."""
     # Route the attrs read through the vocabulary (present-policy family): a 404/None or read
     # error is Unavailable, not "zero interfaces", so drift is computed only from an authoritative
@@ -1200,6 +1230,7 @@ async def _detect_drift_attributes(
     if isinstance(attrs_outcome, Present):
         interfaces = _attrs_to_interface_list(attrs_outcome.data)
     else:
+        assert isinstance(attrs_outcome, Unavailable)
         logger.warning(
             "drift.interface_attributes_unavailable",
             device_id=device_id,
@@ -1218,6 +1249,8 @@ async def _detect_drift_attributes(
         source_epoch=device.source_epoch,
     )
     outcome_row = await db.get(outcome_store.RefreshOutcome, attempt_id)
+    if outcome_row is None:
+        raise RuntimeError(f"interface_attributes: outcome attempt {attempt_id} disappeared")
     await outcome_store.acquire_family_fence(db, device_id, "interface_attributes")
     if not await outcome_store.publication_is_current(db, outcome_row):
         await outcome_store.stage_result(
@@ -1257,7 +1290,7 @@ async def _detect_drift_attributes(
         if db_iface is None:
             continue
 
-        nb_iface = netbox_attrs.get(iface.name)
+        live_nb_iface = netbox_attrs.get(iface.name)
         intent_by_attr = await _load_intent_by_attr(db, db_iface.id)
         for attr in ("description", "enabled"):
             if attr not in scope_attrs:
@@ -1276,8 +1309,8 @@ async def _detect_drift_attributes(
                 continue
 
             # Live NetBox value when we could read it; fall back to the cache otherwise.
-            if nb_iface is not None:
-                netbox_str = _attr_str(attr, nb_iface.get(attr))
+            if live_nb_iface is not None:
+                netbox_str = _attr_str(attr, live_nb_iface.get(attr))
             else:
                 netbox_str = attr_state.netbox_value
 
