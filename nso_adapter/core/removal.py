@@ -571,11 +571,11 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> t
     entry = section
     residue: dict[str, list] = {}
     for guard_list in spec.lists:
-        keymap = keymaps.get(guard_list.label)
-        if not keymap:
+        guard_keymap = keymaps.get(guard_list.label)
+        if not guard_keymap:
             continue
         present = _reader_keys(scope, entry, guard_list)
-        survivors = sorted(intent for intent, exported in keymap.items() if exported in present)
+        survivors = sorted(intent for intent, exported in guard_keymap.items() if exported in present)
         if survivors:
             residue[guard_list.label] = [list(k) for k in survivors]
     return residue, unverifiable
@@ -664,6 +664,8 @@ async def _guarded_apply(client, device, scope: str, context: dict | None, apply
         if spec is not None:
             current = await client.get_service_config(spec.service_path, device.nso_device_name)
     if current:
+        if spec is None:
+            raise ValueError(f"Unknown removal scope {scope!r}")
         stage: dict[str, list] = {}
         await apply_thunk(replace=True, stage=stage)
         staged_entries = next(iter(stage.values()), None) or [{}]
@@ -909,6 +911,7 @@ def _sr_body(current: dict, rows, authorized: set, clears: dict[int, tuple[str, 
         row = rows_by_key.get(key)
         fields = clears.get(row.id) if row is not None else None
         if fields:
+            assert row is not None
             for field in fields:
                 kept.pop(CLEAR_WIRE_LEAF[field], None)
             delivered[row.id] = fields
@@ -1763,6 +1766,13 @@ async def enqueue_removal(
     return job
 
 
+def _removal_scope(context: dict) -> str:
+    scope = context.get("scope")
+    if not isinstance(scope, str):
+        raise ValueError("Removal job context has no string scope")
+    return scope
+
+
 async def run_removal(job_id: int, device_id: int, reg=None) -> None:
     """Execute a queued ``removal`` job: PUT-replace the scope's reconciler service.
 
@@ -1784,8 +1794,9 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
         if row is None:
             return
         context = row.context or {}
-        scope = context.get("scope")
+        scope: str | None = None
         try:
+            scope = _removal_scope(context)
             device = await db.get(Device, device_id)
             if not device:
                 raise ValueError(f"Device {device_id} not found")

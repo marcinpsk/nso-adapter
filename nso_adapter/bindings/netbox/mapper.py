@@ -7,6 +7,8 @@ missing interfaces when decision I from docs/00-plan.md applies.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import structlog
 
 from nso_adapter.bindings.netbox.client import NetboxClient
@@ -90,7 +92,7 @@ def _base_type_for(kind: str | None, name: str) -> str:
     return _guess_netbox_type(name)
 
 
-def _normalize_interface_inputs(interfaces: list[str | dict]) -> list[dict]:
+def _normalize_interface_inputs(interfaces: Sequence[str | dict]) -> list[dict]:
     """Normalize mixed str/dict inputs to ``{name, parent_binding, kind}``, de-duped by name.
 
     Plain strings (back-compat) carry no parent_binding/kind; dicts carry the
@@ -221,7 +223,7 @@ def _type_value(obj: dict) -> str | None:
 async def bulk_ensure_interfaces(
     client: NetboxClient,
     netbox_device_id: int,
-    interfaces: list[str | dict],
+    interfaces: Sequence[str | dict],
 ) -> dict[str, int]:
     """Ensure every requested interface exists in NetBox, return a name→id map.
 

@@ -183,7 +183,8 @@ async def reclaim_one_device(device_id: int, *, db: AsyncSession | None = None) 
                     await reissue_removal_job(conn, device_id, row)
                     reissued += 1
             if consumable:
-                consumed = await delete_tombstones(conn, consumable, device_id=device_id, claim_token=reg.token)
+                _, claim_token = reg.identity()
+                consumed = await delete_tombstones(conn, consumable, device_id=device_id, claim_token=claim_token)
             await conn.commit()
     finally:
         await release_claim(reg, db=db)

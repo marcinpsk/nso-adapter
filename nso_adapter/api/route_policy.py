@@ -101,7 +101,9 @@ def _serialize_route_map(rm: DeviceRoutePolicyRouteMap, entries: list) -> dict:
 
 async def _load_named(db: AsyncSession, model, device_id: int) -> list:
     """Load a route-policy family for a device, ordered by name."""
-    return (await db.execute(select(model).where(model.device_id == device_id).order_by(model.name))).scalars().all()
+    return list(
+        (await db.execute(select(model).where(model.device_id == device_id).order_by(model.name))).scalars().all()
+    )
 
 
 # ── Read-mirror response models (GET /route-policy) ───────────────────────────

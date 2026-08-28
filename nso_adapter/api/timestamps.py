@@ -16,8 +16,9 @@ so the store only ever holds one clock domain.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Protocol
 
 from pydantic import AfterValidator
 
@@ -29,6 +30,21 @@ def to_utc(ts: datetime) -> datetime:
 
 #: Annotation for every INBOUND request-model datetime field.
 UtcInstant = Annotated[datetime, AfterValidator(to_utc)]
+
+
+class RefreshStamped(Protocol):
+    """A read-mirror row that records when its data was refreshed."""
+
+    @property
+    def last_refreshed_at(self) -> datetime | None: ...
+
+
+_EARLIEST_REFRESH = datetime.min.replace(tzinfo=UTC)
+
+
+def latest_refreshed[RowT: RefreshStamped](rows: Iterable[RowT]) -> RowT:
+    """Return the row with the latest refresh time. Treat an unset time as oldest."""
+    return max(rows, key=lambda row: row.last_refreshed_at or _EARLIEST_REFRESH)
 
 
 def iso_z(ts: datetime | None) -> str | None:

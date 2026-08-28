@@ -44,6 +44,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import structlog
 from sqlalchemy import delete, select, text
@@ -52,6 +53,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.store.db import execute_dml
 from nso_adapter.store.device_settle import MissingSettleCounter, allocate_settle_seq
 from nso_adapter.store.models import DeviceClaim, GenerationStatus, Job, JobStatus, JobType
 
@@ -197,6 +199,12 @@ class ClaimRegistration:
         if self.token is not None:
             raise RuntimeError("a run registers at most once")
         self.device_id, self.token = device_id, token
+
+    def identity(self) -> tuple[int, str]:
+        """Return the complete claim identity, or reject an unregistered value."""
+        if self.device_id is None or self.token is None:
+            raise RuntimeError("claim registration has no complete identity")
+        return self.device_id, self.token
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         state = "registered" if self.registered else "unregistered"
@@ -374,7 +382,7 @@ async def acquire_claim_resolving(
         if isinstance(exc, Exception):
             return resolved
         if adopt is not None and not adopt.registered:
-            adopt.register(resolved.device_id, resolved.token)
+            adopt.register(*resolved.identity())
         raise
 
 
@@ -662,7 +670,7 @@ class JobError(Exception):
 
     def __init__(self, code: str, message: str, detail: dict | None = None) -> None:
         super().__init__(message)
-        self.error = {"code": code, "message": message, "detail": detail or {}}
+        self.error: dict[str, Any] = {"code": code, "message": message, "detail": detail or {}}
 
 
 def error_envelope(exc: BaseException, *, code: str = "internal", detail: dict | None = None) -> dict:
@@ -763,11 +771,12 @@ async def terminalize_queued_bulk(db: AsyncSession, device_id: int, *, error: di
     the transaction that runs it goes on to detach every job of the device, terminal ones
     included. There is no execution to name, so the predicate is the queued status alone.
     """
-    result = await db.execute(
+    result = await execute_dml(
+        db,
         sa_update(Job)
         .where(Job.device_id == device_id, Job.status == JobStatus.queued)
         .values(status=JobStatus.failed, error=error)
-        .execution_options(synchronize_session=False)
+        .execution_options(synchronize_session=False),
     )
     return result.rowcount
 

@@ -20,6 +20,8 @@ from sqlalchemy import cast, select, update
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.store.db import execute_dml
+
 logger = structlog.get_logger(__name__)
 
 #: What :func:`cas_deployed_key` did. Never a boolean — "the row moved on" and "there was no
@@ -67,14 +69,15 @@ async def cas_deployed_key(
     from nso_adapter.store.models import StaticRouteIntent
 
     sent = list(sent_triple)
-    result = await db.execute(
+    result = await execute_dml(
+        db,
         update(StaticRouteIntent)
         .where(
             StaticRouteIntent.device_id == device_id,
             StaticRouteIntent.id == row_id,
             StaticRouteIntent.deployed_key.is_not_distinct_from(_jsonb(expected_old)),
         )
-        .values(deployed_key=sent)
+        .values(deployed_key=sent),
     )
     if result.rowcount:
         return CAS_ROW

@@ -1621,6 +1621,21 @@ async def test_apply_combined_single_patch_to_data_root():
 
 
 @pytest.mark.asyncio
+async def test_apply_combined_cli_dry_run_requests_the_cli_outformat():
+    """dry_run="cli" must reach the wire as the cli dry-run query, not the native default."""
+    client = _make_nso_client()
+    _mock_http_ctx(client, _httpx_response(200, json_data={"dry-run-result": {"cli": ""}}))
+
+    await apply_mod.apply_combined(
+        client, "sw01", {"interface-reconciler:interface-config": [{"device": "sw01"}]}, dry_run="cli"
+    )
+
+    mock_http = client._client.return_value.__aenter__.return_value
+    url = mock_http.patch.call_args_list[0][0][0]
+    assert url == apply_mod._commit_url(f"{client._base}{apply_mod._DATA_PATH}", dry_run="cli")
+
+
+@pytest.mark.asyncio
 async def test_apply_combined_drops_empty_modules():
     """A module whose body list is empty is omitted from the combined edit."""
     import json

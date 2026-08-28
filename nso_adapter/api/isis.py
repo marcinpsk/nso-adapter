@@ -17,7 +17,7 @@ from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
-from nso_adapter.api.timestamps import UtcInstant, iso_z
+from nso_adapter.api.timestamps import UtcInstant, iso_z, latest_refreshed
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
@@ -259,7 +259,7 @@ async def get_isis_interfaces(device_id: int, db: AsyncSession = Depends(get_rea
             "interfaces": [],
         }
 
-    latest = max(all_rows, key=lambda r: r.last_refreshed_at or "")
+    latest = latest_refreshed(all_rows)
     last_ts = latest.last_refreshed_at
     return {
         "device_id": device_id,
@@ -723,27 +723,27 @@ async def put_isis_flex_algo_intent(
     for item in body.flex_algos:
         key = (item.process_tag, item.algo_id)
         accepted = item.accepted_at if item.accepted_at else now
-        row = existing_rows.get(key)
+        flex_row = existing_rows.get(key)
         # Every flex-algo scalar is emitted only when set (`if row.priority is not None`),
         # so a merge-PATCH apply can never drop one that goes back to unset — a cleared
         # scalar needs the same PUT-replace retract as a dropped flex-algo.
-        before = {f: getattr(row, f) for f in _FLEX_STATE_FIELDS} if row is not None else None
-        if row is None:
-            row = IsisFlexAlgoIntent(
+        before = {f: getattr(flex_row, f) for f in _FLEX_STATE_FIELDS} if flex_row is not None else None
+        if flex_row is None:
+            flex_row = IsisFlexAlgoIntent(
                 device_id=device_id,
                 process_tag=item.process_tag,
                 algo_id=item.algo_id,
                 accepted_at=accepted,
             )
-            db.add(row)
-        row.metric_type = item.metric_type
-        row.priority = item.priority
-        row.admin_group_exclude = item.admin_group_exclude
-        row.admin_group_include_any = item.admin_group_include_any
-        row.admin_group_include_all = item.admin_group_include_all
-        if before is not None and any(is_cleared(before[f], getattr(row, f)) for f in _FLEX_STATE_FIELDS):
+            db.add(flex_row)
+        flex_row.metric_type = item.metric_type
+        flex_row.priority = item.priority
+        flex_row.admin_group_exclude = item.admin_group_exclude
+        flex_row.admin_group_include_any = item.admin_group_include_any
+        flex_row.admin_group_include_all = item.admin_group_include_all
+        if before is not None and any(is_cleared(before[f], getattr(flex_row, f)) for f in _FLEX_STATE_FIELDS):
             cleared = True
-        row.accepted_at = accepted
+        flex_row.accepted_at = accepted
         count += 1
 
     await db.flush()

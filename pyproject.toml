@@ -29,6 +29,8 @@ dependencies = [
 [dependency-groups]
 dev = [
     "httpx>=0.28.1",
+    "mypy>=1.14.0,<2.4.0",
+    "mypy-baseline>=0.7.0,<1.0.0",
     "pre-commit>=4.6.1",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
@@ -37,6 +39,7 @@ dev = [
     "pytest-xdist>=3.8",
     "respx>=0.21",
     "ruff>=0.16.1",
+    "types-PyYAML>=6.0.0,<7.0.0",
     "watchfiles>=1.0",
     # Keep in step with the pinned zizmor hook rev in .pre-commit-config.yaml.
     "zizmor==1.29.0",
@@ -84,6 +87,17 @@ parse_squash_commits = false
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "--cov=nso_adapter --cov-report=term-missing -n auto"
+
+[tool.mypy]
+python_version = "3.12"
+files = ["nso_adapter", "alembic"]
+# Alembic generates revision files from schema operations.
+exclude = "^alembic/versions/"
+
+[[tool.mypy.overrides]]
+# These libraries do not publish type information.
+module = ["apscheduler.*", "hvac.*"]
+ignore_missing_imports = true
 
 [tool.coverage.run]
 source = ["nso_adapter"]

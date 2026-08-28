@@ -29,6 +29,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.bindings.netbox.mapper import bulk_ensure_interfaces
 from nso_adapter.store.models import (
     DbInterface,
@@ -45,7 +46,7 @@ logger = structlog.get_logger(__name__)
 async def ensure_topology_interfaces(
     db: AsyncSession,
     device: Device,
-    nb_client,  # type: ignore[annotation-unchecked]
+    nb_client: NetboxClient | None,
 ) -> dict[str, int]:
     """Ensure NetBox holds the LAG/channel/loopback interfaces bound_port needs.
 

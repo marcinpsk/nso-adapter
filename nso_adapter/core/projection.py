@@ -87,8 +87,8 @@ class _Spec(NamedTuple):
     redistribution row belongs to the section named by its destination protocol.
     """
 
-    model: type
-    parent: type | None = None
+    model: Any
+    parent: Any | None = None
     discriminator: tuple[str, str] | None = None
 
 
@@ -301,10 +301,10 @@ def _row_dict(row) -> dict:
     return {attr.key: _jsonable(getattr(row, attr.key)) for attr in sa_inspect(type(row)).column_attrs}
 
 
-_SPEC_BY_MODEL: dict[type, _Spec] = {spec.model: spec for specs in _SECTION_TABLES.values() for spec in specs}
+_SPEC_BY_MODEL: dict[Any, _Spec] = {spec.model: spec for specs in _SECTION_TABLES.values() for spec in specs}
 
 
-def _fk_column(model: type, parent: type):
+def _fk_column(model: Any, parent: Any):
     """Return the column on *model* whose foreign key references *parent*'s table."""
     parent_table = parent.__table__.name
     for column in model.__table__.columns:
@@ -314,7 +314,7 @@ def _fk_column(model: type, parent: type):
     raise RuntimeError(f"{model.__name__} has no foreign key to {parent.__name__}")
 
 
-def _scope_ids(model: type, device_id: int):
+def _scope_ids(model: Any, device_id: int):
     """Build the subquery of *model*'s ids for *device_id*, walking up to the device-scoped root."""
     if hasattr(model, "device_id"):
         return select(model.id).where(model.device_id == device_id)
@@ -366,7 +366,7 @@ LIVE_READ_SECTIONS: dict[str, str] = {
     "interface_config": "eligibility is keyed off InterfaceAttrState, which is not intent",
 }
 
-_MODEL_BY_TABLE: dict[str, type] = {spec.model.__tablename__: spec.model for spec in _SPEC_BY_MODEL.values()}
+_MODEL_BY_TABLE: dict[str, Any] = {spec.model.__tablename__: spec.model for spec in _SPEC_BY_MODEL.values()}
 
 
 def _from_jsonable(value: Any, column) -> Any:

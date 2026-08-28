@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.api.deps import get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
-from nso_adapter.api.timestamps import iso_z
+from nso_adapter.api.timestamps import iso_z, latest_refreshed
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, DeviceRedistribution
 
@@ -85,7 +85,7 @@ async def get_redistribution(device_id: int, db: AsyncSession = Depends(get_read
             "entries": [],
         }
 
-    latest = max(rows, key=lambda r: r.last_refreshed_at or "")
+    latest = latest_refreshed(rows)
 
     entries = []
     for row in rows:

@@ -15,6 +15,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import ClaimRegistration, lock_claim
+from nso_adapter.store.db import execute_dml
 from nso_adapter.store.models import StaticRouteTombstone
 
 logger = structlog.get_logger(__name__)
@@ -52,11 +53,12 @@ async def delete_tombstones(
         .order_by(StaticRouteTombstone.id)
         .with_for_update()
     )
-    result = await db.execute(
+    result = await execute_dml(
+        db,
         delete(StaticRouteTombstone).where(
             StaticRouteTombstone.id.in_(ordered),
             StaticRouteTombstone.device_id == device_id,
-        )
+        ),
     )
     logger.info("tombstone.deleted", device_id=device_id, count=result.rowcount)
     return result.rowcount

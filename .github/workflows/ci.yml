@@ -37,6 +37,9 @@ jobs:
       - name: Ruff format check
         run: uv run --native-tls -- ruff format --check .
 
+      - name: Type check (mypy, new errors only)
+        run: uv run --native-tls -- scripts/mypy-gate.sh
+
       # GitHub Actions security audit, from the version pinned in [dependency-groups].dev
       # that `uv sync` above installed. The parity guard verifies that this target covers
       # every repository file matched by the pinned hook's upstream pattern.

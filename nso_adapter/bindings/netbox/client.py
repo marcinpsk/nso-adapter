@@ -107,7 +107,7 @@ class NetboxClient:
     async def get_interface(self, netbox_device_id: int, interface_name: str) -> dict | None:
         """Return a NetBox interface object or None."""
         url = f"{self._base}/api/dcim/interfaces/"
-        params = {"device_id": netbox_device_id, "name": interface_name}
+        params: dict[str, str | int] = {"device_id": netbox_device_id, "name": interface_name}
         resp = await self._client().get(url, params=params)
         resp.raise_for_status()
         results = resp.json().get("results", [])

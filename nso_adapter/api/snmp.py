@@ -18,7 +18,7 @@ from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
-from nso_adapter.api.timestamps import UtcInstant, iso_z
+from nso_adapter.api.timestamps import UtcInstant, iso_z, latest_refreshed
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
     Device,
@@ -108,7 +108,11 @@ async def get_snmp_config(device_id: int, db: AsyncSession = Depends(get_read_db
     system_info_result = await db.execute(select(SnmpSystemInfo).where(SnmpSystemInfo.device_id == device_id))
     system_info = system_info_result.scalar_one_or_none()
 
-    all_rows = list(communities) + list(v3_users) + list(hosts)
+    all_rows: list[SnmpCommunity | SnmpV3User | SnmpHost | SnmpSystemInfo] = [
+        *communities,
+        *v3_users,
+        *hosts,
+    ]
     if system_info:
         all_rows.append(system_info)
 
@@ -124,7 +128,7 @@ async def get_snmp_config(device_id: int, db: AsyncSession = Depends(get_read_db
             "system_info": None,
         }
 
-    latest = max(all_rows, key=lambda r: r.last_refreshed_at)
+    latest = latest_refreshed(all_rows)
 
     return {
         "device_id": device_id,
@@ -455,7 +459,7 @@ async def put_snmp_intent(
             "snmp",
             promotes=(delivery.stream,),
             removed={"community": removed_comms, "v3-user": removed_users, "host": removed_hosts},
-            vault_refs={label: ref for label, ref in removed_comm_refs.items() if ref},
+            vault_refs={label: ref for label, ref in removed_comm_refs.items() if isinstance(ref, str)},
         )
 
     settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))

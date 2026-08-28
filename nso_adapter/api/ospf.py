@@ -17,7 +17,7 @@ from nso_adapter.api.deps import get_db, get_read_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
-from nso_adapter.api.timestamps import iso_z
+from nso_adapter.api.timestamps import iso_z, latest_refreshed
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
@@ -111,37 +111,41 @@ async def get_ospf(device_id: int, db: AsyncSession = Depends(get_read_db)):
             "interfaces": [],
         }
 
-    latest = max(all_rows, key=lambda r: r.last_refreshed_at or "")
+    latest = latest_refreshed(all_rows)
 
     instances = []
-    for row in inst_rows:
-        entry: dict = {"process_id": row.process_id, "vrf": row.vrf or "", "areas": row.areas or []}
-        if row.router_id is not None:
-            entry["router_id"] = row.router_id
-        if row.enabled is not None:
-            entry["enabled"] = row.enabled
-        instances.append(entry)
+    for instance_row in inst_rows:
+        instance_entry: dict = {
+            "process_id": instance_row.process_id,
+            "vrf": instance_row.vrf or "",
+            "areas": instance_row.areas or [],
+        }
+        if instance_row.router_id is not None:
+            instance_entry["router_id"] = instance_row.router_id
+        if instance_row.enabled is not None:
+            instance_entry["enabled"] = instance_row.enabled
+        instances.append(instance_entry)
 
     interfaces = []
-    for row in iface_rows:
-        entry = {
-            "interface_name": row.interface_name,
-            "passive": row.passive,
-            "auth_present": row.auth_present,
+    for interface_row in iface_rows:
+        interface_entry = {
+            "interface_name": interface_row.interface_name,
+            "passive": interface_row.passive,
+            "auth_present": interface_row.auth_present,
         }
-        if row.process_id is not None:
-            entry["process_id"] = row.process_id
-        if row.area_id is not None:
-            entry["area_id"] = row.area_id
-        if row.priority is not None:
-            entry["priority"] = row.priority
-        if row.cost is not None:
-            entry["cost"] = row.cost
-        if row.network_type is not None:
-            entry["network_type"] = row.network_type
-        if row.auth_type is not None:
-            entry["auth_type"] = row.auth_type
-        interfaces.append(entry)
+        if interface_row.process_id is not None:
+            interface_entry["process_id"] = interface_row.process_id
+        if interface_row.area_id is not None:
+            interface_entry["area_id"] = interface_row.area_id
+        if interface_row.priority is not None:
+            interface_entry["priority"] = interface_row.priority
+        if interface_row.cost is not None:
+            interface_entry["cost"] = interface_row.cost
+        if interface_row.network_type is not None:
+            interface_entry["network_type"] = interface_row.network_type
+        if interface_row.auth_type is not None:
+            interface_entry["auth_type"] = interface_row.auth_type
+        interfaces.append(interface_entry)
 
     return {
         "device_id": device_id,

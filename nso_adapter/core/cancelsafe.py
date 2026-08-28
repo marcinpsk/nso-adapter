@@ -79,11 +79,12 @@ async def await_uncancellable(coro, *, absorb_deadline_s: float = 5.0, drain_tim
             if deadline is None:
                 deadline = loop.time() + absorb_deadline_s
 
-    if task.done() and not task.cancelled() and task.exception() is not None:
+    exception = task.exception() if task.done() and not task.cancelled() else None
+    if exception is not None:
         if cancelled:
-            logger.warning("cancelsafe.span_failed_under_cancel", error=repr(task.exception()))
+            logger.warning("cancelsafe.span_failed_under_cancel", error=repr(exception))
             raise asyncio.CancelledError()
-        raise task.exception()
+        raise exception
 
     if cancelled or expired:
         raise asyncio.CancelledError()
