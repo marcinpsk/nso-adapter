@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 from contextlib import asynccontextmanager
-from typing import Any, cast
 
 import structlog
 from fastapi import FastAPI
@@ -379,9 +378,9 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="NSO Adapter", version=__version__, lifespan=lifespan)
-    app.add_exception_handler(ApiError, cast(Any, api_error_handler))
-    app.add_exception_handler(StarletteHTTPException, cast(Any, framework_http_error_handler))
-    app.add_exception_handler(RequestValidationError, cast(Any, validation_error_handler))
+    app.add_exception_handler(ApiError, api_error_handler)
+    app.add_exception_handler(StarletteHTTPException, framework_http_error_handler)
+    app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(DeviceProjectionGone, projection_gone_handler)
 
     @app.middleware("http")

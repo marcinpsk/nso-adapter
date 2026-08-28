@@ -16,11 +16,10 @@ from collections.abc import Awaitable
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 import structlog
 from sqlalchemy import select, update
-from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.config import get_config
@@ -43,6 +42,7 @@ from nso_adapter.nso.read_outcome import (  # noqa: F401 — Present used below
     classify_envelope_section,
 )
 from nso_adapter.nso.shape import as_list
+from nso_adapter.store.db import execute_dml
 from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import (
     DbInterface,
@@ -1192,16 +1192,14 @@ async def _publish_sync_metadata(
     degraded_surfaces: list[str] | None,
 ) -> bool:
     """Conditionally publish batch metadata in the source generation it describes."""
-    result = cast(
-        CursorResult[Any],
-        await db.execute(
-            update(Device)
-            .where(Device.id == device_id, Device.source_epoch == source_epoch)
-            .values(
-                last_sync_at=_utcnow(),
-                last_sync_status=status,
-                degraded_surfaces=degraded_surfaces,
-            )
+    result = await execute_dml(
+        db,
+        update(Device)
+        .where(Device.id == device_id, Device.source_epoch == source_epoch)
+        .values(
+            last_sync_at=_utcnow(),
+            last_sync_status=status,
+            degraded_surfaces=degraded_surfaces,
         ),
     )
     await db.commit()

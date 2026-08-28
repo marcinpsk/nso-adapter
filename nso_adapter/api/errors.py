@@ -131,12 +131,14 @@ def push_conflict_error(code: str, message: str, detail: dict | None = None) -> 
     raise ValueError(f"unknown push-admission code {code!r}")
 
 
-async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
+async def api_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    assert isinstance(exc, ApiError)
     return JSONResponse(status_code=exc.status_code, content=exc.detail)
 
 
-async def framework_http_error_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+async def framework_http_error_handler(request: Request, exc: Exception) -> JSONResponse:
     """Normalize framework-generated failures that occur outside endpoint handlers."""
+    assert isinstance(exc, StarletteHTTPException)
     if exc.status_code == 400 and isinstance(exc.__cause__, ValueError):
         return JSONResponse(
             status_code=422,
@@ -220,13 +222,14 @@ def unhandled_exception_response(request: Request, exc: BaseException) -> JSONRe
     )
 
 
-async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+async def validation_error_handler(request: Request, exc: Exception) -> JSONResponse:
     """Convert FastAPI request-validation failures to the documented envelope.
 
     Pydantic can include the submitted value under ``input`` and a validator's
     exception under ``ctx`` and ``msg``. Any of them can contain secrets, so the
     public boundary keeps only the location and stable error type.
     """
+    assert isinstance(exc, RequestValidationError)
     errors = [{"loc": error["loc"], "type": error["type"], "msg": "Invalid value"} for error in exc.errors()]
     return JSONResponse(
         status_code=422,

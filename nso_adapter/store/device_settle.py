@@ -19,13 +19,10 @@ Three operations, deliberately separated by which transaction may run them:
 
 from __future__ import annotations
 
-from typing import Any, cast
-
 import structlog
 from sqlalchemy import select
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -64,7 +61,7 @@ async def ensure_settle_counters() -> int:
     (or a lifespan startup) whose remaining work would be skipped for the whole interval. One
     device vanishing under the sweep is normal, and it costs exactly that device's row.
     """
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import execute_dml, get_session
 
     async for db in get_session():
         missing = (
@@ -82,13 +79,11 @@ async def ensure_settle_counters() -> int:
         for device_id in missing:
             try:
                 async with db.begin_nested():
-                    result = cast(
-                        CursorResult[Any],
-                        await db.execute(
-                            pg_insert(DeviceSettleCounter)
-                            .values(device_id=device_id, last_seq=0)
-                            .on_conflict_do_nothing(index_elements=["device_id"])
-                        ),
+                    result = await execute_dml(
+                        db,
+                        pg_insert(DeviceSettleCounter)
+                        .values(device_id=device_id, last_seq=0)
+                        .on_conflict_do_nothing(index_elements=["device_id"]),
                     )
             except IntegrityError:
                 # The device was offboarded while this insert waited on its row lock.

@@ -44,16 +44,16 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import Any
 
 import structlog
 from sqlalchemy import delete, select, text
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from nso_adapter.store.db import execute_dml
 from nso_adapter.store.device_settle import MissingSettleCounter, allocate_settle_seq
 from nso_adapter.store.models import DeviceClaim, GenerationStatus, Job, JobStatus, JobType
 
@@ -771,14 +771,12 @@ async def terminalize_queued_bulk(db: AsyncSession, device_id: int, *, error: di
     the transaction that runs it goes on to detach every job of the device, terminal ones
     included. There is no execution to name, so the predicate is the queued status alone.
     """
-    result = cast(
-        CursorResult[Any],
-        await db.execute(
-            sa_update(Job)
-            .where(Job.device_id == device_id, Job.status == JobStatus.queued)
-            .values(status=JobStatus.failed, error=error)
-            .execution_options(synchronize_session=False)
-        ),
+    result = await execute_dml(
+        db,
+        sa_update(Job)
+        .where(Job.device_id == device_id, Job.status == JobStatus.queued)
+        .values(status=JobStatus.failed, error=error)
+        .execution_options(synchronize_session=False),
     )
     return result.rowcount
 

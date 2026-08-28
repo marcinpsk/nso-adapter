@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from typing import Any, cast
 
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.sql.dml import UpdateBase
 
 _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
@@ -24,6 +27,11 @@ _session_factory: async_sessionmaker[AsyncSession] | None = None
 # connection returns to the pool.
 ABSORBED_SPAN_LOCK_TIMEOUT_MS = 3_000
 ABSORBED_SPAN_STATEMENT_TIMEOUT_MS = 4_000
+
+
+async def execute_dml(db: AsyncSession, statement: UpdateBase) -> CursorResult[Any]:
+    """Execute one DML statement and return its row-count-bearing result."""
+    return cast(CursorResult[Any], await db.execute(statement))
 
 
 async def apply_absorbed_span_bounds(db: AsyncSession) -> None:

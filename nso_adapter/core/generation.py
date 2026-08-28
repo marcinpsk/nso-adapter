@@ -52,17 +52,16 @@ import hashlib
 import json
 from contextvars import ContextVar
 from datetime import UTC, datetime
-from typing import Any, cast
 
 import structlog
 from sqlalchemy import select
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.projection import projection_streams, snapshot_stream, stream_section
+from nso_adapter.store.db import execute_dml
 from nso_adapter.store.models import (
     DeploymentGeneration,
     DeviceGenerationCounter,
@@ -752,14 +751,12 @@ async def _queue_job_for(db: AsyncSession, generation: DeploymentGeneration) -> 
         db.add(spec)
         await db.flush()
         return spec
-    released = cast(
-        CursorResult[Any],
-        await db.execute(
-            sa_update(DeploymentGeneration)
-            .where(DeploymentGeneration.job_id == existing.id, DeploymentGeneration.id != generation.id)
-            .values(job_id=None, updated_at=_now())
-            .execution_options(synchronize_session=False)
-        ),
+    released = await execute_dml(
+        db,
+        sa_update(DeploymentGeneration)
+        .where(DeploymentGeneration.job_id == existing.id, DeploymentGeneration.id != generation.id)
+        .values(job_id=None, updated_at=_now())
+        .execution_options(synchronize_session=False),
     )
     if spec.context is not None:
         # A removal's context IS its operation. An apply's is written by the run itself, so
