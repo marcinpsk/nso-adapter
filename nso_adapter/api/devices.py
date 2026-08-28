@@ -9,6 +9,7 @@ from uuid import UUID
 import structlog
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field, field_validator
+from pydantic_core import PydanticCustomError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -196,13 +197,23 @@ class DeviceGenerationOut(BaseModel):
     updated_at: str
 
 
+#: The semantic contract: how many DISTINCT attempts one request may ask about.
 _DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT = 100
-# Bounds the RAW traversal work only; the distinct limit above stays the semantic contract.
+#: The ceiling on RAW list entries, which bounds the traversal duplicates would otherwise buy.
 _DEPLOYMENT_EVIDENCE_RAW_LIMIT = 100 * _DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT
 
 
 class DeploymentEvidenceIn(BaseModel):
-    apply_attempt_ids: list[UUID] = Field(max_length=_DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT)
+    # Two bounds, both in the schema: `maxItems` is the RAW one, and the description carries
+    # the distinct one the validator raises `too_long` for.
+    apply_attempt_ids: list[UUID] = Field(
+        max_length=_DEPLOYMENT_EVIDENCE_RAW_LIMIT,
+        description=(
+            f"At most {_DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT} DISTINCT attempt UUIDs. Duplicates are "
+            f"collapsed before that bound is applied; at most {_DEPLOYMENT_EVIDENCE_RAW_LIMIT} raw "
+            "list entries."
+        ),
+    )
 
     @field_validator("apply_attempt_ids", mode="before")
     @classmethod
@@ -218,16 +229,19 @@ class DeploymentEvidenceIn(BaseModel):
                 identity = UUID(item) if isinstance(item, str) else item
                 hash(identity)
             except (TypeError, ValueError):
+                unique.append(item)  # unhashable or unparsable: the field validator reports it
+            else:
+                if identity in identities:
+                    continue
                 unique.append(item)
-                if len(unique) > _DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT:
-                    return value
-                continue
-            if identity in identities:
-                continue
-            unique.append(item)
-            identities.add(identity)
+                identities.add(identity)
             if len(unique) > _DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT:
-                return value
+                # Raised here, not left to `max_length`, which now measures the RAW list.
+                raise PydanticCustomError(
+                    "too_long",
+                    "List should have at most {max_length} distinct items after duplicates are removed",
+                    {"max_length": _DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT},
+                )
         return unique
 
 

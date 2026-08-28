@@ -537,8 +537,9 @@ admits the request. The caller must not settle or roll back local intent from an
 alone. A generation-bearing replay body is corrupt when it omits the generation list, uses
 a non-list value, contains invalid or duplicate IDs, or does not name exactly the generations
 stamped to its attempt. Corrupt evidence is also non-actionable. The endpoint returns the
-`500 internal` error envelope for this invariant failure. More than 100 IDs returns
-`422 validation_error`. A missing device returns `404 not_found`.
+`500 internal` error envelope for this invariant failure. More than 100 **distinct** IDs
+returns `422 validation_error`, as does a raw list of more than 10 000 entries. A missing
+device returns `404 not_found`.
 
 ### `PATCH /api/v1/devices/{id}` — correct the mapping
 Request (any subset):

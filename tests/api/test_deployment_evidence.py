@@ -747,7 +747,32 @@ async def test_evidence_rejects_more_than_100_attempt_ids(adapter_client):
     error = response.json()["error"]
     assert error["code"] == "validation_error"
     assert error["message"] == "Request validation failed"
-    assert any(item["loc"] == ["body", "apply_attempt_ids"] for item in error["detail"]["errors"])
+    bound = [item for item in error["detail"]["errors"] if item["loc"] == ["body", "apply_attempt_ids"]]
+    # `maxItems` measures the RAW list now, so the distinct bound must be its own refusal.
+    # The envelope redacts `msg` by policy, so the wire carries the loc and the type only.
+    assert [item["type"] for item in bound] == ["too_long"]
+
+
+def test_evidence_rejects_the_distinct_bound_well_below_the_raw_ceiling():
+    """The distinct bound is enforced explicitly, not as a side effect of `maxItems`."""
+    from pydantic import ValidationError
+
+    from nso_adapter.api.devices import (
+        _DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT,
+        _DEPLOYMENT_EVIDENCE_RAW_LIMIT,
+        DeploymentEvidenceIn,
+    )
+
+    distinct = [str(uuid.UUID(int=value)) for value in range(_DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT + 1)]
+    padded = distinct + [distinct[0]] * (_DEPLOYMENT_EVIDENCE_RAW_LIMIT - len(distinct))
+    assert len(padded) == _DEPLOYMENT_EVIDENCE_RAW_LIMIT, "the raw ceiling must not be the thing that fires"
+
+    with pytest.raises(ValidationError) as exc_info:
+        DeploymentEvidenceIn(apply_attempt_ids=padded)
+
+    errors = exc_info.value.errors()
+    assert [error["type"] for error in errors] == ["too_long"]
+    assert "distinct" in errors[0]["msg"]
 
 
 async def test_evidence_rejects_a_duplicate_only_list_past_the_raw_bound(adapter_client):
@@ -810,7 +835,13 @@ def test_evidence_openapi_pins_the_bound_and_non_actionable_contract():
     request_ref = operation["requestBody"]["content"]["application/json"]["schema"]["$ref"]
     request_name = request_ref.rsplit("/", maxsplit=1)[1]
 
-    assert schema["components"]["schemas"][request_name]["properties"]["apply_attempt_ids"]["maxItems"] == 100
+    # Both bounds are schema-visible: `maxItems` is the RAW ceiling the runtime enforces,
+    # and the description carries the distinct bound the validator raises `too_long` for.
+    from nso_adapter.api.devices import _DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT, _DEPLOYMENT_EVIDENCE_RAW_LIMIT
+
+    attempt_ids = schema["components"]["schemas"][request_name]["properties"]["apply_attempt_ids"]
+    assert attempt_ids["maxItems"] == _DEPLOYMENT_EVIDENCE_RAW_LIMIT == 10_000
+    assert f"{_DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT} DISTINCT attempt UUIDs" in attempt_ids["description"]
     assert set(operation["responses"]) >= {"200", "401", "404", "422", "500"}
     assert operation["responses"]["500"] == {
         "description": "Internal adapter invariant failed",

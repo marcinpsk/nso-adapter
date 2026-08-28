@@ -1650,11 +1650,12 @@
       "DeploymentEvidenceIn": {
         "properties": {
           "apply_attempt_ids": {
+            "description": "At most 100 DISTINCT attempt UUIDs. Duplicates are collapsed before that bound is applied; at most 10000 raw list entries.",
             "items": {
               "format": "uuid",
               "type": "string"
             },
-            "maxItems": 100,
+            "maxItems": 10000,
             "title": "Apply Attempt Ids",
             "type": "array"
           }
