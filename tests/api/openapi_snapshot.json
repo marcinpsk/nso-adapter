@@ -1183,6 +1183,17 @@
             "title": "Active Address",
             "type": "string"
           },
+          "failback_blocked_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failback Blocked Reason"
+          },
           "last_probe_at": {
             "anyOf": [
               {
@@ -1322,7 +1333,8 @@
           "oob_health_detail",
           "oob_health_checked_at",
           "last_switch_at",
-          "manual_override"
+          "manual_override",
+          "failback_blocked_reason"
         ],
         "title": "DeviceFailoverOut",
         "type": "object"

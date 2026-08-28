@@ -149,6 +149,7 @@ async def test_get_device_maximal_golden(adapter_client):
             "oob_health_checked_at": TS_Z,
             "last_switch_at": TS_Z,
             "manual_override": False,
+            "failback_blocked_reason": None,
         },
     }
 

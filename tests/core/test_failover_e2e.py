@@ -493,3 +493,37 @@ async def test_manual_override_clears_once_address_restored(adapter_client, monk
     await sched._scheduled_failover_probe()
 
     assert (await _load(device_id)).manual_override is False  # cleared (current address is managed)
+
+
+async def test_upsert_refuses_to_clear_the_oob_ip_the_device_lives_on(adapter_client):
+    """#1630: NULLing oob_ip while active-on-OOB deletes the failback path's way home.
+
+    The stored OOB address is retained (the way back stays known), the stuck state is
+    surfaced on the row, and a later usable OOB address clears it again.
+    """
+    from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
+
+    async with session() as db:
+        dev = Device(nso_instance="nso-dev", nso_device_name="up-oob-clear", netbox_device_id=56)
+        db.add(dev)
+        await db.flush()
+        await set_initial_failover_state(db, dev.id, "10.0.0.1", "192.0.2.5", ActiveAddress.oob.value)
+        await db.commit()
+
+        changed = await upsert_failover_ips(db, dev, "10.0.0.1", None)
+        await db.commit()
+        assert changed is True  # the surfaced stuck state is a change
+        fo = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == dev.id))).scalar_one()
+        assert fo.oob_ip == "192.0.2.5", "the address the device lives on must be retained"
+        assert fo.failback_blocked_reason == "oob_address_cleared"
+
+        # The degenerate report (oob == primary) is the same class.
+        await upsert_failover_ips(db, dev, "10.0.0.1", "10.0.0.1")
+        await db.commit()
+        assert fo.oob_ip == "192.0.2.5"
+
+        # A usable OOB address restores normal behavior and clears the stuck marker.
+        changed = await upsert_failover_ips(db, dev, "10.0.0.1", "192.0.2.9")
+        await db.commit()
+        assert changed is True
+        assert (fo.oob_ip, fo.failback_blocked_reason) == ("192.0.2.9", None)

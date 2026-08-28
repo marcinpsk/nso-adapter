@@ -752,6 +752,9 @@ class DeviceFailover(Base):
     consecutive_successes: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     # Operator set the NSO address to something we don't manage → stop fighting them.
     manual_override: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    # Failback is stuck and needs the operator (#1630): the flip was refused because NSO's
+    # current address could not be read, or the OOB address the device lives on was cleared.
+    failback_blocked_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # Proactive fallback-health: is the OOB path known-good while we're on primary? (None=unknown)
     oob_healthy: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     oob_health_result: Mapped[str | None] = mapped_column(String(16), nullable=True)

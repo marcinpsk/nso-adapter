@@ -106,6 +106,7 @@ def _failover_out(fo: DeviceFailover | None) -> dict | None:
         "oob_health_checked_at": iso_z(fo.oob_health_checked_at),
         "last_switch_at": iso_z(fo.last_switch_at),
         "manual_override": fo.manual_override,
+        "failback_blocked_reason": fo.failback_blocked_reason,
     }
 
 
@@ -141,6 +142,7 @@ class DeviceFailoverOut(BaseModel):
     oob_health_checked_at: str | None
     last_switch_at: str | None
     manual_override: bool
+    failback_blocked_reason: str | None
 
 
 class DeviceOut(BaseModel):
