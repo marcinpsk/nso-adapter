@@ -745,3 +745,16 @@ async def test_failback_flip_reverts_to_the_address_nso_actually_had(monkeypatch
     sets = [c for c in client.calls if c[0] == "set_address"]
     assert sets[-1] == ("set_address", "10.0.0.1"), "revert must restore what NSO had, not invent a move"
     assert fo.failback_blocked_reason is None
+
+
+async def test_a_recovered_address_read_clears_the_stale_unreadable_reason(monkeypatch):
+    """A successful get_address invalidates address_unreadable on every branch,
+    including the manual-override exit that records no probe."""
+    client = FakeNso(address="203.0.113.7")  # readable, but foreign
+    fo = _failover_row(active="oob", failback_blocked_reason="address_unreadable")
+    _stub_probe(monkeypatch, False)
+
+    await _tick(_device(), fo, client, SchedulerConfig(), now=_BASE)
+
+    assert fo.manual_override is True
+    assert fo.failback_blocked_reason is None

@@ -445,6 +445,8 @@ async def _failback_flip_probe(
     if address_before is None:
         fo.failback_blocked_reason = _BLOCKED_ADDRESS_UNREADABLE
         return True  # ran → re-arm normally; retried on the next interval
+    if fo.failback_blocked_reason == _BLOCKED_ADDRESS_UNREADABLE:
+        fo.failback_blocked_reason = None  # the read recovered; the reason is stale on every branch
     if address_before not in (fo.primary_ip, fo.oob_ip):
         fo.manual_override = True
         return True
@@ -713,7 +715,15 @@ async def upsert_failover_ips(db: AsyncSession, device: Device, primary_ip: str 
             fo.oob_health_checked_at = None
             if oob_ip:
                 fo.next_oob_probe_at = now
-            if usable and fo.failback_blocked_reason == _BLOCKED_OOB_CLEARED:
-                fo.failback_blocked_reason = None
             changed = True
+    # The stuck marker clears whenever the report agrees on a USABLE stored address —
+    # including a re-report of the retained address itself, which skips the branch above.
+    if (
+        fo.failback_blocked_reason == _BLOCKED_OOB_CLEARED
+        and fo.oob_ip
+        and fo.oob_ip == oob_ip
+        and oob_ip != fo.primary_ip
+    ):
+        fo.failback_blocked_reason = None
+        changed = True
     return changed

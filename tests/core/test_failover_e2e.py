@@ -522,6 +522,18 @@ async def test_upsert_refuses_to_clear_the_oob_ip_the_device_lives_on(adapter_cl
         await db.commit()
         assert fo.oob_ip == "192.0.2.5"
 
+        # Re-reporting the RETAINED address itself (the operator restored it in NetBox)
+        # must clear the stuck marker even though the stored value never changed.
+        changed = await upsert_failover_ips(db, dev, "10.0.0.1", "192.0.2.5")
+        await db.commit()
+        assert changed is True
+        assert (fo.oob_ip, fo.failback_blocked_reason) == ("192.0.2.5", None)
+
+        # Re-refuse so the different-address tail below still exercises its own clear.
+        await upsert_failover_ips(db, dev, "10.0.0.1", None)
+        await db.commit()
+        assert fo.failback_blocked_reason == "oob_address_cleared"
+
         # A usable OOB address restores normal behavior and clears the stuck marker.
         changed = await upsert_failover_ips(db, dev, "10.0.0.1", "192.0.2.9")
         await db.commit()
