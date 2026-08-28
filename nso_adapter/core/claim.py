@@ -779,14 +779,15 @@ async def terminalize_queued_bulk(db: AsyncSession, device_id: int, *, error: di
 
 async def terminalize_offboard_orphans_bulk(db: AsyncSession, device_id: int, *, error: dict) -> int:
     """Terminalize every residual non-terminal job after offboard acquires the claim."""
-    result = await db.execute(
+    result = await execute_dml(
+        db,
         sa_update(Job)
         .where(
             Job.device_id == device_id,
             Job.status.not_in((JobStatus.succeeded, JobStatus.failed)),
         )
         .values(status=JobStatus.failed, error=error)
-        .execution_options(synchronize_session=False)
+        .execution_options(synchronize_session=False),
     )
     return result.rowcount
 

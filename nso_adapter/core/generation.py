@@ -73,7 +73,6 @@ from nso_adapter.core.projection import (
     stream_section,
 )
 from nso_adapter.core.receipt import promotion_deletion_identity
-from nso_adapter.store.db import execute_dml
 from nso_adapter.store.models import (
     SETTLEMENT_COHORT_SEQUENCE,
     DeploymentGeneration,
