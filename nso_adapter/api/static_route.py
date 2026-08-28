@@ -794,6 +794,8 @@ async def _apply_backfill_only(device_id: int, body: StaticRouteIntentUpdate, db
         if row is None:
             continue
         item = body.routes[index]
+        if item.route_id is None and item.generation is None:
+            continue  # nothing to adopt, so nothing to acknowledge
         if item.route_id is not None:
             row.route_id = item.route_id
         if item.generation is not None:

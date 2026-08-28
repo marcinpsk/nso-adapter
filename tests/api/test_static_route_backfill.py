@@ -191,6 +191,51 @@ async def test_o2b_10_the_pass_writes_no_content_onto_a_matched_row(adapter_clie
     assert (row["metric"], row["name"]) == (before[0]["metric"], before[0]["name"]), "content was written"
 
 
+async def test_o2b_10_an_entry_carrying_no_identity_acknowledges_nothing(adapter_client):
+    """The receipt counts the rows the pass wrote an id onto, so an identity-less entry counts 0.
+
+    Its stored row is already correlated, so the residual-NULL refusal cannot fire; without a
+    ``route_id`` or a ``generation`` the entry writes nothing and has nothing to settle.
+    """
+    device_id = await seed_device(nso_device_name="sr-bf-noid", netbox_device_id=9944)
+    await seed_intent(device_id, [{"triple": C, "route_id": 101, "deployed_key": list(C)}])
+    before = await read_intent_all_columns(device_id)
+
+    resp = await put(
+        adapter_client,
+        device_id,
+        [entry(C)],
+        deleted_routes=[],
+        query="?backfill_only=true",
+        seq=1,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["count"] == 0, "an entry that wrote nothing was acknowledged as adopted"
+    assert resp.json()["routes"] == [], "a row the pass never wrote to was echoed"
+    assert await read_intent_all_columns(device_id) == before
+
+
+async def test_o2b_10_a_generation_only_entry_is_acknowledged(adapter_client):
+    """Control — ``generation`` alone is identity, so it is adopted and acknowledged."""
+    device_id = await seed_device(nso_device_name="sr-bf-genonly", netbox_device_id=9946)
+    await seed_intent(device_id, [{"triple": C, "route_id": 101, "deployed_key": list(C)}])
+
+    resp = await put(
+        adapter_client,
+        device_id,
+        [entry(C, generation=7)],
+        deleted_routes=[],
+        query="?backfill_only=true",
+        seq=1,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["count"] == 1
+    assert [(r["route_id"], r["generation"]) for r in resp.json()["routes"]] == [(101, 7)]
+    assert _row(await read_intent_all_columns(device_id), C)["intent_generation"] == 7
+
+
 async def test_o2b_10_a_backfill_body_carrying_deletion_authority_is_refused(adapter_client):
     """O2b.10 negative — the mode carries no authority, so a non-empty list is a 422."""
     device_id = await _seed_fence_shut_key("auth", 9943)

@@ -1166,7 +1166,9 @@ the deleted route destroys the before-image the deletion depends on. This mode i
 Under it the request:
 
 - adopts `route_id` and `generation` from every payload entry onto its matched row, and writes
-  **no content** — a row whose adapter state has drifted stays drifted;
+  **no content** — a row whose adapter state has drifted stays drifted. `count` and `routes`
+  report the rows an id was written onto, so an entry carrying neither field acknowledges
+  nothing;
 - leaves every omitted row that carries a `route_id` exactly as it is;
 - prunes every omitted row whose `route_id` is NULL, reporting each in `removed_uncorrelated`;
 - refuses with **422** (`reason = "backfill_missing_route_id"`) if a matched row has a NULL
