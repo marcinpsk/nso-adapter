@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404, RESP_422_VALIDATION, api_error
+from nso_adapter.api.errors import RESP_401, RESP_404, RESP_422_VALIDATION, ResponseSpec, api_error
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.store.meta import get_store_incarnation
 from nso_adapter.store.models import Job, JobStatus
@@ -80,7 +80,7 @@ def stamp_store_incarnation(response: Response) -> None:
     response.headers[STORE_INCARNATION_HEADER] = get_store_incarnation()[0]
 
 
-_RESP_200_INCARNATION = {
+_RESP_200_INCARNATION: ResponseSpec = {
     200: {
         "headers": {
             STORE_INCARNATION_HEADER: {

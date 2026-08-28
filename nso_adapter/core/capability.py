@@ -18,6 +18,7 @@ operator finding out only when it silently didn't land. Three sources feed the m
 from __future__ import annotations
 
 import re
+from typing import Any
 
 import structlog
 from sqlalchemy import select
@@ -297,7 +298,7 @@ def _community_kind(member: str) -> str:
     return "regex" if any(c in _REGEX_META for c in member_str) else "standard"
 
 
-def _index_rows(rows):
+def _index_rows(rows: Any) -> tuple[dict[str, tuple[str, str]], dict[tuple[str, str], tuple[str, str]]]:
     """Build (community kind→(status,detail), construct (scope,name)→(status,detail)) maps.
 
     Community rows collapse to their KIND, keeping the worst (highest-ranked) status.

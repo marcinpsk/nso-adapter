@@ -232,6 +232,42 @@ async def test_no_primary_ip_is_noop(monkeypatch):
     assert calls["n"] == 0  # never even probed
 
 
+def _on_oob_without_primary() -> DeviceFailover:
+    return DeviceFailover(device_id=1, primary_ip=None, oob_ip="192.0.2.5", active_address=ActiveAddress.oob.value)
+
+
+async def test_active_oob_liveness_runs_without_a_primary_ip(monkeypatch):
+    """A device sitting on OOB keeps its liveness after the plugin clears the primary IP.
+
+    That leg needs no primary address, and skipping it froze the health of the very address
+    the operator is connecting through ("not checked" for as long as the primary stays gone)."""
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=True)
+    dev, fo = _device(), _on_oob_without_primary()
+    client = FakeNso(address="192.0.2.5")
+
+    await _tick(dev, fo, client, cfg, now=_BASE, primary_due=False, oob_due=True)
+
+    assert fo.oob_healthy is True
+    assert fo.oob_health_checked_at == _BASE
+    assert fo.next_oob_probe_at == _BASE + timedelta(minutes=cfg.failover_primary_probe_interval)
+    assert client.calls == []  # cheap liveness, no address change
+
+
+async def test_no_failback_attempted_without_a_primary_ip(monkeypatch):
+    """The primary probe is due but there is no primary address to flip to — do nothing."""
+    cfg = SchedulerConfig()
+    calls = _stub_probe(monkeypatch, reachable=True)
+    dev, fo = _device(), _on_oob_without_primary()
+    client = FakeNso(address="192.0.2.5")
+
+    await _tick(dev, fo, client, cfg, now=_BASE, primary_due=True, oob_due=False)
+
+    assert calls["n"] == 0
+    assert client.calls == []
+    assert fo.active_address == ActiveAddress.oob.value
+
+
 @pytest.mark.parametrize("active", [ActiveAddress.primary.value, ActiveAddress.oob.value])
 async def test_probe_not_run_when_not_due(monkeypatch, active):
     cfg = SchedulerConfig()
@@ -359,6 +395,83 @@ async def test_failback_flip_skipped_on_manual_override(monkeypatch):
     await _tick(dev, fo, client, cfg, now=_BASE)
     assert fo.manual_override is True
     assert all(c[0] != "set_address" for c in client.calls)
+
+
+def _set_address_calls(client) -> list[tuple]:
+    return [c for c in client.calls if c[0] == "set_address"]
+
+
+class _UnreadableAddressNso(FakeNso):
+    """NSO won't say which address it holds — the way back from a flip is unknown."""
+
+    async def get_address(self, name):
+        raise RuntimeError("get boom")
+
+
+async def test_failback_flip_reverts_to_the_pre_flip_address_when_oob_equals_primary(monkeypatch):
+    """``oob_ip == primary_ip`` normalizes to "no OOB" while the row still reads active=oob.
+
+    The revert must target the address NSO actually had: reverting to the normalized-away OOB
+    PATCHed a null address (error swallowed) and left NSO on the dead primary."""
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=False)  # primary still down → the flip must revert
+    dev = _device()
+    fo = _failover_row(active=ActiveAddress.oob.value, oob="10.0.0.1")
+    client = FakeNso(address="10.0.0.1")
+
+    await _tick(dev, fo, client, cfg, now=_BASE)
+
+    assert all(c[1] is not None for c in _set_address_calls(client))  # never PATCH a null address
+    assert _set_address_calls(client)[-1] == ("set_address", "10.0.0.1")  # back to the pre-flip address
+    assert fo.active_address == ActiveAddress.oob.value
+
+
+async def test_failback_flip_reverts_to_the_pre_flip_address_when_oob_ip_cleared(monkeypatch):
+    """The plugin can clear ``oob_ip`` while the row is still active on OOB (the upsert never
+    touches the active address), so the stored OOB is no revert target at all."""
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=False)
+    dev = _device()
+    fo = _failover_row(active=ActiveAddress.oob.value, oob=None)
+    client = FakeNso(address="10.0.0.1")  # NSO drifted onto the primary while the row says OOB
+
+    await _tick(dev, fo, client, cfg, now=_BASE)
+
+    assert all(c[1] is not None for c in _set_address_calls(client))
+    assert _set_address_calls(client)[-1] == ("set_address", "10.0.0.1")
+    assert client.address == "10.0.0.1"
+
+
+async def test_failback_flip_refused_when_the_current_address_is_unreadable(monkeypatch):
+    """A disruptive flip whose way back is unknown must not start. It still counts as run, so
+    the device re-arms on the normal interval instead of retrying the read every tick."""
+    cfg = SchedulerConfig()
+    calls = _stub_probe(monkeypatch, reachable=True)  # primary would be reachable
+    dev = _device()
+    fo = _failover_row(active=ActiveAddress.oob.value)
+    client = _UnreadableAddressNso(address="192.0.2.5")
+
+    await _tick(dev, fo, client, cfg, now=_BASE)
+
+    assert client.calls == []  # never flipped
+    assert calls["n"] == 0  # never probed
+    assert fo.active_address == ActiveAddress.oob.value
+    assert fo.next_primary_probe_at == _BASE + timedelta(minutes=cfg.failover_primary_probe_interval)
+
+
+async def test_failback_flip_flags_manual_override_when_oob_ip_cleared(monkeypatch):
+    """With ``oob_ip`` cleared, an address that is neither managed IP is still an operator's
+    (or a stale OOB): flag it and leave NSO alone rather than flipping to primary."""
+    cfg = SchedulerConfig()
+    _stub_probe(monkeypatch, reachable=True)
+    dev = _device()
+    fo = _failover_row(active=ActiveAddress.oob.value, oob=None)
+    client = FakeNso(address="172.16.9.9")  # the OOB the plugin no longer reports
+
+    await _tick(dev, fo, client, cfg, now=_BASE)
+
+    assert fo.manual_override is True
+    assert client.calls == []
 
 
 class _FlakyNso(FakeNso):

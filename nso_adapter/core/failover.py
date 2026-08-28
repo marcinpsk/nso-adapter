@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     # (defaults / tests) or the live EffectiveFailoverConfig (DB-sourced). Both expose the
     # ``failover_*`` knobs the tick reads — the honest type for those signatures. Quoted because
     # EffectiveFailoverConfig is defined below (forward ref; only read by type checkers).
-    TickConfig = "SchedulerConfig | EffectiveFailoverConfig"
+    type TickConfig = SchedulerConfig | EffectiveFailoverConfig
 
 # The enforced wall-clock lifetime of one device's tick, and the reason it exists: the tick
 # holds its own device_claim row FOR UPDATE from its guard to its commit, so an independent
@@ -319,8 +319,15 @@ def _legacy_health(outcome: ReachabilityProbe) -> bool | None:
 # ── State transitions (the switch + failback commit) ──────────────────────────
 
 
-async def _switch_to_oob(client: NsoClient, fo: DeviceFailover, name: str, cfg: TickConfig, now: datetime) -> None:
-    dropped = await _set_address(client, name, fo.oob_ip)
+async def _switch_to_oob(
+    client: NsoClient,
+    fo: DeviceFailover,
+    name: str,
+    oob_ip: str,
+    cfg: TickConfig,
+    now: datetime,
+) -> None:
+    dropped = await _set_address(client, name, oob_ip)
     fo.active_address = _OOB
     fo.consecutive_failures = 0
     fo.consecutive_successes = 0
@@ -334,10 +341,10 @@ async def _switch_to_oob(client: NsoClient, fo: DeviceFailover, name: str, cfg: 
         # address until it redials. The switch IS recorded (NSO's config is now on OOB) — but
         # surface the uncertainty instead of swallowing it (the deferred next-tick OOB liveness
         # verifies against a fresh session).
-        logger.warning("failover.switch.session_drop_failed", device=name, address=fo.oob_ip)
+        logger.warning("failover.switch.session_drop_failed", device=name, address=oob_ip)
     if cfg.failover_sync_from_after_switch:
         await _safe_sync_from(client, name)
-    logger.info("failover.switch", device=name, to=_OOB, address=fo.oob_ip)
+    logger.info("failover.switch", device=name, to=_OOB, address=oob_ip)
 
 
 async def _commit_failback(client: NsoClient, fo: DeviceFailover, name: str, cfg: TickConfig, now: datetime) -> None:
@@ -364,7 +371,7 @@ async def _active_primary_probe(
     name: str,
     cfg: TickConfig,
     now: datetime,
-    has_oob: bool,
+    oob_ip: str | None,
     job_active: bool,
     flip_budget: FlipBudget | None,
 ) -> bool:
@@ -383,7 +390,7 @@ async def _active_primary_probe(
         elapsed=outcome.elapsed,
     )
     _record_probe(fo, now, outcome, _PRIMARY)
-    step = step_failover(outcome.reachable, fo.consecutive_failures, has_oob, cfg.failover_failure_threshold)
+    step = step_failover(outcome.reachable, fo.consecutive_failures, oob_ip is not None, cfg.failover_failure_threshold)
     fo.consecutive_failures, fo.consecutive_successes = step.failures, step.successes
     if not step.act:
         return True
@@ -396,8 +403,10 @@ async def _active_primary_probe(
         # Over the per-tick flip cap — keep armed and retry the switch promptly (next tick).
         fo.consecutive_failures = cfg.failover_failure_threshold
         return False
+    if oob_ip is None:
+        raise RuntimeError("failover switch has no OOB address")
     fo.manual_override = False
-    await _switch_to_oob(client, fo, name, cfg, now)
+    await _switch_to_oob(client, fo, name, oob_ip, cfg, now)
     return True
 
 
@@ -407,23 +416,35 @@ async def _failback_flip_probe(
     name: str,
     cfg: TickConfig,
     now: datetime,
+    primary_ip: str,
     job_active: bool,
     flip_budget: FlipBudget | None,
 ) -> bool:
     """On OOB → flip to primary and probe; fail back after the success threshold, else revert.
 
     A disruptive flip: deferred under a job, and skipped (return False, retry next tick) when
-    the per-tick flip budget is exhausted.
+    the per-tick flip budget is exhausted. A pre-flip read of NSO's current address refuses
+    the flip outright when that address is unreadable.
     """
     if job_active:
         return True
-    if await _is_manual_override(client, fo, name):
+    # One read serves the manual-override decision AND the revert target: a disruptive
+    # flip whose way back is unknown must not start, so an unreadable current address
+    # refuses the flip (the stored oob_ip may have been cleared meanwhile).
+    try:
+        address_before = await client.get_address(name)
+    except Exception as exc:
+        address_before = None
+        logger.warning("failover.failback_blocked", device=name, error=repr(exc))
+    if address_before is None:
+        return True  # ran → re-arm normally; retried on the next interval
+    if address_before not in (fo.primary_ip, fo.oob_ip):
         fo.manual_override = True
         return True
     if not _take_flip(flip_budget):
         return False
     fo.manual_override = False
-    await _set_address(client, name, fo.primary_ip)  # flip to primary for the probe
+    await _set_address(client, name, primary_ip)  # flip to primary for the probe
     committed = False
     try:
         outcome = _coerce_probe(await probe_reachable(client, name, cfg.failover_probe_timeout))
@@ -443,8 +464,9 @@ async def _failback_flip_probe(
     finally:
         if not committed:
             # Threshold not met, primary still down, OR the probe/decision raised → guaranteed
-            # revert to OOB so the device stays reachable (never stranded on a flipped address).
-            await _revert_address(client, name, fo.oob_ip)
+            # revert to the address NSO actually had (the stored oob_ip may have been cleared
+            # meanwhile), so the device is never stranded on the flipped address.
+            await _revert_address(client, name, address_before)
     return True
 
 
@@ -454,14 +476,15 @@ async def _probe_primary(
     name: str,
     cfg: TickConfig,
     now: datetime,
-    has_oob: bool,
+    primary_ip: str,
+    oob_ip: str | None,
     job_active: bool,
     flip_budget: FlipBudget | None,
 ) -> bool:
     """Probe the primary IP and drive the failover/failback decision. Returns whether it ran."""
     if fo.active_address == _PRIMARY:
-        return await _active_primary_probe(client, fo, name, cfg, now, has_oob, job_active, flip_budget)
-    return await _failback_flip_probe(client, fo, name, cfg, now, job_active, flip_budget)
+        return await _active_primary_probe(client, fo, name, cfg, now, oob_ip, job_active, flip_budget)
+    return await _failback_flip_probe(client, fo, name, cfg, now, primary_ip, job_active, flip_budget)
 
 
 async def _probe_oob(
@@ -470,6 +493,8 @@ async def _probe_oob(
     name: str,
     cfg: TickConfig,
     now: datetime,
+    primary_ip: str | None,
+    oob_ip: str,
     job_active: bool,
     flip_budget: FlipBudget | None,
 ) -> bool:
@@ -493,6 +518,8 @@ async def _probe_oob(
         return True
 
     # On primary → proactive fallback-health flip-probe of OOB. Mutates address; defer/cap.
+    if primary_ip is None:
+        raise RuntimeError("proactive OOB flip-probe without a primary address")
     if job_active:
         return True
     if await _is_manual_override(client, fo, name):
@@ -501,7 +528,7 @@ async def _probe_oob(
     if not _take_flip(flip_budget):
         return False
     fo.manual_override = False
-    await _set_address(client, name, fo.oob_ip)  # flip to OOB for the health probe
+    await _set_address(client, name, oob_ip)  # flip to OOB for the health probe
     try:
         outcome = _coerce_probe(await probe_reachable(client, name, cfg.failover_probe_timeout))
         logger.debug(
@@ -517,7 +544,7 @@ async def _probe_oob(
         fo.oob_health_checked_at = now
     finally:
         # Always flip back to primary (even if the probe raised) — this was only a health check.
-        await _revert_address(client, name, fo.primary_ip)
+        await _revert_address(client, name, primary_ip)
     return True
 
 
@@ -544,22 +571,25 @@ async def run_failover_tick(
     """
     now = now or _utcnow()
     name = device.nso_device_name
-    if not fo.primary_ip:
-        return  # nothing to manage without a primary address
     # Normalize a freshly-created (not-yet-flushed) row whose column defaults haven't
     # materialized — the scheduler's loaded rows already carry these.
     fo.active_address = fo.active_address or _PRIMARY
     fo.consecutive_failures = fo.consecutive_failures or 0
     fo.consecutive_successes = fo.consecutive_successes or 0
-    has_oob = bool(fo.oob_ip) and fo.oob_ip != fo.primary_ip
+    primary_ip = fo.primary_ip or None
+    oob_ip = fo.oob_ip if fo.oob_ip and fo.oob_ip != primary_ip else None
+    # Active-OOB liveness needs no primary address; everything else does (the plugin can
+    # clear either IP at any time while the row keeps its active_address).
+    if primary_ip is None and not (fo.active_address == _OOB and oob_ip is not None):
+        return
 
     # Drop a stale manual-override flag the moment NSO is back on a managed address (only a GET,
     # and only while flagged) so the UI doesn't show "manual override" after the operator restores.
     await _maybe_clear_manual_override(client, fo, name)
 
     addr_before = fo.active_address
-    if _due(fo.next_primary_probe_at, now):
-        ran = await _probe_primary(client, fo, name, cfg, now, has_oob, job_active, flip_budget)
+    if primary_ip is not None and _due(fo.next_primary_probe_at, now):
+        ran = await _probe_primary(client, fo, name, cfg, now, primary_ip, oob_ip, job_active, flip_budget)
         if ran:
             fo.next_primary_probe_at = _next_due(now, cfg.failover_primary_probe_interval, jitter_fraction)
 
@@ -569,8 +599,8 @@ async def run_failover_tick(
     # left next_oob_probe_at due, so the deferred probe fires on the very next tick.
     address_changed = fo.active_address != addr_before
 
-    if has_oob and not address_changed and _due(fo.next_oob_probe_at, now):
-        ran = await _probe_oob(client, fo, name, cfg, now, job_active, flip_budget)
+    if oob_ip is not None and not address_changed and _due(fo.next_oob_probe_at, now):
+        ran = await _probe_oob(client, fo, name, cfg, now, primary_ip, oob_ip, job_active, flip_budget)
         if ran:
             # When OOB is the ACTIVE address the operator is connecting through it, so its
             # liveness must stay as fresh as a primary probe — use the active (primary)

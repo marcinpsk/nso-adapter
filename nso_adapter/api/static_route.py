@@ -24,7 +24,7 @@ from nso_adapter.api.errors import (
 )
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
-from nso_adapter.api.timestamps import UtcInstant, iso_z
+from nso_adapter.api.timestamps import UtcInstant, iso_z, latest_refreshed
 from nso_adapter.config import get_config
 from nso_adapter.core.claim import ClaimUnavailableError, held_claim, lock_claim
 from nso_adapter.core.request_flags import DELETE_ORIGIN, STORE_ONLY
@@ -111,7 +111,7 @@ async def get_static_routes(device_id: int, db: AsyncSession = Depends(get_read_
             "routes": [],
         }
 
-    latest = max(rows, key=lambda r: r.last_refreshed_at or "")
+    latest = latest_refreshed(rows)
 
     routes = []
     for row in rows:
@@ -496,8 +496,8 @@ async def _apply_static_route_intent(
 
     removed = [(r.vrf, r.prefix, r.next_hop) for r in removed_rows]
     tombstones = _write_tombstones(db, device_id, removed_rows, fence_open=fence_open)
-    for row in removed_rows:
-        await db.delete(row)
+    for removed_row in removed_rows:
+        await db.delete(removed_row)
 
     now = datetime.now(UTC)
     count = 0
@@ -508,50 +508,50 @@ async def _apply_static_route_intent(
     echoed: list[StaticRouteIntent] = []
     for index, item in enumerate(body.routes):
         accepted = item.accepted_at if item.accepted_at else now
-        row = matched.get(index)
-        if row is not None:
-            before = {f: getattr(row, f) for f in _STATE_FIELDS}
+        route_row = matched.get(index)
+        if route_row is not None:
+            before = {f: getattr(route_row, f) for f in _STATE_FIELDS}
             # The identity edit: same row, new triple. Legal transient collisions (a
             # same-payload swap, a delete-then-reclaim) are why the identity constraint
             # is DEFERRABLE INITIALLY DEFERRED.
-            row.vrf = item.vrf
-            row.prefix = item.prefix
-            row.next_hop = item.next_hop
+            route_row.vrf = item.vrf
+            route_row.prefix = item.prefix
+            route_row.next_hop = item.next_hop
             if item.route_id is not None:
-                row.route_id = item.route_id  # adopt/backfill; a pre-R3 push never clears it
+                route_row.route_id = item.route_id  # adopt/backfill; a pre-R3 push never clears it
             if item.generation is not None:
-                row.intent_generation = item.generation  # same rule, same reason
-            row.accepted_at = accepted
-            row.interface_next_hop = item.interface_next_hop
-            row.next_hop_vrf = item.next_hop_vrf
-            row.metric = item.metric
-            row.permanent = item.permanent
-            row.tag = item.tag
-            row.name = item.name
+                route_row.intent_generation = item.generation  # same rule, same reason
+            route_row.accepted_at = accepted
+            route_row.interface_next_hop = item.interface_next_hop
+            route_row.next_hop_vrf = item.next_hop_vrf
+            route_row.metric = item.metric
+            route_row.permanent = item.permanent
+            route_row.tag = item.tag
+            route_row.name = item.name
             # Clear detection is static-route-specific, not the shared `is_cleared`:
             # `permanent True -> False` IS a clear here because the renderer never emits
             # `permanent: false` (the other twelve scopes' writers do emit False, which is
             # why the shared predicate is right for them), and `name` is excluded outright
             # because it has no wire leaf.
-            cleared_fields = {f for f in SR_CLEAR_FIELDS if sr_is_cleared(f, before[f], getattr(row, f))}
+            cleared_fields = {f for f in SR_CLEAR_FIELDS if sr_is_cleared(f, before[f], getattr(route_row, f))}
             # The carrier is written for EVERY detected clear, before job classification and
             # unconditionally — a pure clear and a delete-origin+clear both enqueue a
             # networked job, and neither `retract` nor the cleared fields survive into its
             # context, so a carrier written only on the detach path leaves those jobs with
             # no clear to find.
             update_pending_clear(
-                row,
+                route_row,
                 cleared=cleared_fields,
-                reset={f for f in SR_CLEAR_FIELDS if wire_set(f, getattr(row, f))},
+                reset={f for f in SR_CLEAR_FIELDS if wire_set(f, getattr(route_row, f))},
                 store_only=STORE_ONLY.get(),
             )
             if cleared_fields:
                 cleared = True
-            echoed.append(row)
+            echoed.append(route_row)
         else:
             # deployed_key stays NULL: R1 never writes it at runtime — nothing is proven
             # committed until R2's CAS writer runs.
-            row = StaticRouteIntent(
+            route_row = StaticRouteIntent(
                 device_id=device_id,
                 route_id=item.route_id,
                 intent_generation=item.generation,
@@ -566,8 +566,8 @@ async def _apply_static_route_intent(
                 name=item.name,
                 accepted_at=accepted,
             )
-            db.add(row)
-            echoed.append(row)
+            db.add(route_row)
+            echoed.append(route_row)
         count += 1
 
     # Flushes the tombstone INSERTs and the row DELETEs, so this transaction holds those

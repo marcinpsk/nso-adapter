@@ -54,6 +54,22 @@ repos:
         pass_filenames: false
         files: ^(nso_adapter|tests|scripts|alembic)/.*\.py$
 
+  # Type-check nso_adapter and fail only on errors absent from mypy-baseline.txt.
+  # Runs on pre-push (not every commit). CI runs the same script in the lint job,
+  # so both gates share one definition.
+  - repo: local
+    hooks:
+      - id: mypy-gate
+        name: mypy (new type errors only)
+        # --locked: refuse a stale uv.lock instead of silently rewriting it (CI syncs --locked).
+        entry: uv run --locked --native-tls -- scripts/mypy-gate.sh
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+        # No types filter: the gate reads the whole package, so a push that changes only
+        # mypy-baseline.txt or the mypy config must still run it.
+        always_run: true
+
   # Conventional commit message validation
   - repo: https://github.com/compilerla/conventional-pre-commit
     rev: v4.4.0
@@ -63,6 +79,6 @@ repos:
         args: [feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert]
 
 # Configuration
-default_install_hook_types: [pre-commit, commit-msg]
+default_install_hook_types: [pre-commit, commit-msg, pre-push]
 default_stages: [pre-commit]
 fail_fast: false

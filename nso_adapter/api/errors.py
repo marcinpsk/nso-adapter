@@ -5,8 +5,8 @@ All non-2xx responses use:
   {"error": {"code": "snake_case", "message": "...", "detail": {}}}
 
 The code vocabulary is a CLOSED set (`ERROR_CODES`): api_error() rejects unknown
-codes at runtime (there is no static type-checker in CI, so the Literal alone
-enforces nothing), and tests pin call sites ⊆ ERROR_CODES ⊆ api-contract.md.
+codes at runtime (the Literal cannot validate dynamically constructed values),
+and tests pin call sites ⊆ ERROR_CODES ⊆ api-contract.md.
 Request-validation failures (FastAPI's RequestValidationError) are converted to
 the same envelope by `validation_error_handler` — the framework's default
 ``{"detail": [...]}`` shape never reaches the wire.
@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import traceback
 from http import HTTPStatus
-from typing import Literal, get_args
+from typing import Any, Literal, get_args
 
 import structlog
 from fastapi import HTTPException, Request
@@ -131,12 +131,14 @@ def push_conflict_error(code: str, message: str, detail: dict | None = None) -> 
     raise ValueError(f"unknown push-admission code {code!r}")
 
 
-async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
+async def api_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    assert isinstance(exc, ApiError)
     return JSONResponse(status_code=exc.status_code, content=exc.detail)
 
 
-async def framework_http_error_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+async def framework_http_error_handler(request: Request, exc: Exception) -> JSONResponse:
     """Normalize framework-generated failures that occur outside endpoint handlers."""
+    assert isinstance(exc, StarletteHTTPException)
     if exc.status_code == 400 and isinstance(exc.__cause__, ValueError):
         return JSONResponse(
             status_code=422,
@@ -220,13 +222,14 @@ def unhandled_exception_response(request: Request, exc: BaseException) -> JSONRe
     )
 
 
-async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+async def validation_error_handler(request: Request, exc: Exception) -> JSONResponse:
     """Convert FastAPI request-validation failures to the documented envelope.
 
     Pydantic can include the submitted value under ``input`` and a validator's
     exception under ``ctx`` and ``msg``. Any of them can contain secrets, so the
     public boundary keeps only the location and stable error type.
     """
+    assert isinstance(exc, RequestValidationError)
     errors = [{"loc": error["loc"], "type": error["type"], "msg": "Invalid value"} for error in exc.errors()]
     return JSONResponse(
         status_code=422,
@@ -243,15 +246,19 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 # Reusable per-endpoint `responses=` fragments. Compose only the ones an
 # operation can actually emit (its own api_error calls + its helpers' + its
 # dependencies' + framework paths) — never a blanket router-level set.
-_ENVELOPE_SCHEMA = {"model": ErrorEnvelope}
+ResponseSpec = dict[int | str, dict[str, Any]]
 
-RESP_400 = {400: {**_ENVELOPE_SCHEMA, "description": "Bad request"}}
-RESP_401 = {401: {**_ENVELOPE_SCHEMA, "description": "Missing or invalid bearer token"}}
-RESP_404_DEVICE = {404: {**_ENVELOPE_SCHEMA, "description": "Device not found"}}
-RESP_404 = {404: {**_ENVELOPE_SCHEMA, "description": "Not found"}}
-RESP_409_ACTIVE_JOB = {409: {**_ENVELOPE_SCHEMA, "description": "A job is already running for this device"}}
-RESP_409 = {409: {**_ENVELOPE_SCHEMA, "description": "Conflict"}}
-RESP_409_PUSH_SEQ = {
+_ENVELOPE_SCHEMA: dict[str, Any] = {"model": ErrorEnvelope}
+
+RESP_400: ResponseSpec = {400: {**_ENVELOPE_SCHEMA, "description": "Bad request"}}
+RESP_401: ResponseSpec = {401: {**_ENVELOPE_SCHEMA, "description": "Missing or invalid bearer token"}}
+RESP_404_DEVICE: ResponseSpec = {404: {**_ENVELOPE_SCHEMA, "description": "Device not found"}}
+RESP_404: ResponseSpec = {404: {**_ENVELOPE_SCHEMA, "description": "Not found"}}
+RESP_409_ACTIVE_JOB: ResponseSpec = {
+    409: {**_ENVELOPE_SCHEMA, "description": "A job is already running for this device"}
+}
+RESP_409: ResponseSpec = {409: {**_ENVELOPE_SCHEMA, "description": "Conflict"}}
+RESP_409_PUSH_SEQ: ResponseSpec = {
     409: {
         **_ENVELOPE_SCHEMA,
         "description": "X-Push-Seq reused with a different body or mode, or older than the admitted one",
@@ -261,7 +268,7 @@ RESP_409_PUSH_SEQ = {
 # the two fragments silently drops whichever comes first. The second cause is the DEVICE
 # CLAIM, not a running job: the static-route PUT refuses whenever any competing operation
 # holds the device — an apply, a removal, a teardown, another intent push.
-RESP_409_PUSH_SEQ_OR_DEVICE_BUSY = {
+RESP_409_PUSH_SEQ_OR_DEVICE_BUSY: ResponseSpec = {
     409: {
         **_ENVELOPE_SCHEMA,
         "description": (
@@ -270,7 +277,9 @@ RESP_409_PUSH_SEQ_OR_DEVICE_BUSY = {
         ),
     }
 }
-RESP_422_VALIDATION = {422: {**_ENVELOPE_SCHEMA, "description": "Request validation failed (envelope shape)"}}
-RESP_501 = {501: {**_ENVELOPE_SCHEMA, "description": "Not supported by the configured provider"}}
-RESP_502_NSO = {502: {**_ENVELOPE_SCHEMA, "description": "NSO unreachable"}}
-RESP_502 = {502: {**_ENVELOPE_SCHEMA, "description": "Upstream (NSO/Vault) operation failed"}}
+RESP_422_VALIDATION: ResponseSpec = {
+    422: {**_ENVELOPE_SCHEMA, "description": "Request validation failed (envelope shape)"}
+}
+RESP_501: ResponseSpec = {501: {**_ENVELOPE_SCHEMA, "description": "Not supported by the configured provider"}}
+RESP_502_NSO: ResponseSpec = {502: {**_ENVELOPE_SCHEMA, "description": "NSO unreachable"}}
+RESP_502: ResponseSpec = {502: {**_ENVELOPE_SCHEMA, "description": "Upstream (NSO/Vault) operation failed"}}

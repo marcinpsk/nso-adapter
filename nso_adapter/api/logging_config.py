@@ -23,7 +23,7 @@ from nso_adapter.api.errors import (
 )
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
-from nso_adapter.api.timestamps import UtcInstant, iso_z
+from nso_adapter.api.timestamps import UtcInstant, iso_z, latest_refreshed
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
@@ -111,7 +111,8 @@ async def get_logging_config(device_id: int, db: AsyncSession = Depends(get_read
             "hosts": [],
         }
 
-    latest = max([*rows, *([levels_row] if levels_row else [])], key=lambda r: r.last_refreshed_at or "")
+    refresh_rows: list[DeviceLoggingHost | DeviceLoggingLevels] = [*rows, *([levels_row] if levels_row else [])]
+    latest = latest_refreshed(refresh_rows)
     hosts = []
     for r in rows:
         entry: dict = {"address": r.address}
@@ -189,9 +190,11 @@ async def _sync_local_levels(
         await db.execute(select(LoggingLevelsIntent).where(LoggingLevelsIntent.device_id == device_id))
     ).scalar_one_or_none()
     before = {f: getattr(existing, f) for f in _LEVEL_FIELDS} if existing is not None else None
-    values = {f: (getattr(entry, f) if entry is not None else None) for f in _LEVEL_FIELDS}
+    values = {
+        field: (getattr(entry, field) if entry is not None else None) for field in (*_LEVEL_FIELDS, "accepted_at")
+    }
     cleared = before is not None and any(is_cleared(before[f], values[f]) for f in _LEVEL_FIELDS)
-    if not any(values.values()):
+    if not any(values[field] for field in _LEVEL_FIELDS):
         removed = int(existing is not None)
         if existing is not None:
             await db.delete(existing)
@@ -201,7 +204,7 @@ async def _sync_local_levels(
         db.add(existing)
     for f in _LEVEL_FIELDS:
         setattr(existing, f, values[f])
-    existing.accepted_at = entry.accepted_at if entry.accepted_at else now
+    existing.accepted_at = values["accepted_at"] or now
     return cleared, 1, 0
 
 

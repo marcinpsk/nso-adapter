@@ -11,12 +11,18 @@ flush: "'list' object has no attribute '_sa_adapter'").
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
+if TYPE_CHECKING:
+    from nso_adapter.store.models import BgpPeerIntent, BgpRouterIntent
 
-async def attach_bgp_relationships(db: AsyncSession, routers: list) -> list:
+
+async def attach_bgp_relationships(db: AsyncSession, routers: Sequence[BgpRouterIntent]) -> Sequence[BgpRouterIntent]:
     """Populate scopes→(address_families, peers→peer_address_families) on *routers*."""
     from nso_adapter.store.models import BgpAfIntent, BgpPeerAfIntent, BgpPeerIntent, BgpScopeIntent
 
@@ -34,7 +40,7 @@ async def attach_bgp_relationships(db: AsyncSession, routers: list) -> list:
     scope_ids = [s.id for s in all_scopes]
     afs_by_scope: dict[int, list] = {}
     peers_by_scope: dict[int, list] = {}
-    all_peers: list = []
+    all_peers: Sequence[BgpPeerIntent] = []
     if scope_ids:
         for af in (await db.execute(select(BgpAfIntent).where(BgpAfIntent.scope_id.in_(scope_ids)))).scalars().all():
             afs_by_scope.setdefault(af.scope_id, []).append(af)

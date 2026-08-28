@@ -19,7 +19,7 @@ import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import structlog
 from sqlalchemy import inspect as sa_inspect
@@ -506,7 +506,11 @@ async def _static_route_device_state(client, device) -> tuple[str, dict]:
         entries: dict[tuple[str, str, str], dict] = {}
         for entry in section.get("route") or []:
             if isinstance(entry, dict):
-                key = tuple(str(entry.get(leaf) or "") for leaf in ("vrf", "prefix", "next-hop"))
+                key = (
+                    str(entry.get("vrf") or ""),
+                    str(entry.get("prefix") or ""),
+                    str(entry.get("next-hop") or ""),
+                )
                 entries[key] = entry
         return "ok", entries
     except ClaimLostError:
@@ -833,7 +837,7 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
     client = get_nso_client(device.nso_instance)
     device_name = device.nso_device_name
     # dry_run is bool|str down the apply stack: True = native, "cli" = tree diff.
-    fmt = "cli" if outformat == "cli" else True
+    fmt: bool | str = "cli" if outformat == "cli" else True
     diffs: dict[str, str] = {}
 
     async def _accepted(model) -> list:
@@ -1184,6 +1188,8 @@ class _Projection:
 
     def _document_rows(self) -> dict[type, list]:
         if self._hydrated is None:
+            if self._document is None:
+                raise RuntimeError("document rows requested without a deployment document")
             rows: dict[type, list] = {}
             for section in DOCUMENT_EXECUTED_SECTIONS.intersection(self._document):
                 rows.update(hydrate_section(self._document, section))
@@ -1659,7 +1665,7 @@ async def _stage_atomic_modules(
     if iface_entries:
         modules[_IFACE_CONFIG_ROOT] = iface_entries
 
-    stagers: list[tuple[str, list, object]] = [
+    stagers: list[tuple[str, list, Callable[[], Awaitable[Any]]]] = [
         (
             "subinterface",
             elig["subif"],
@@ -1815,7 +1821,7 @@ async def _atomic_reader_compare(
     from nso_adapter.core.removal import _VERIFY_BATCH_TIMEOUT, _live_family_sections
 
     ned_id = getattr(device, "ned_id", None)
-    preps: dict[str, object] = {}  # scope → prep tuple | None (uncheckable) | "error" (translate raised)
+    preps: dict[str, Any] = {}  # scope → prep tuple | None (uncheckable) | "error" (translate raised)
     for key, rows in sent_rows.items():
         s_ok, s_failed = scope_outcomes.get(key, (0, 0))
         if not rows or s_failed:
@@ -1848,6 +1854,7 @@ async def _atomic_reader_compare(
             continue
         translated, unverifiable, spec, wire = prep
         evidence: dict[int, str] = {}
+        fails: list[Any]
         if not translated:  # every key Vault-unverifiable → nothing to look for
             n_ok, n_failed, fails, status = s_ok, 0, [], "unknown"
         elif action_error is not None:
@@ -2249,7 +2256,7 @@ def _unrenderable_community_list(row, ned_id: str | None) -> bool:
     return len(community_dialect_for(ned_id).unrepresentable_members(sorted(members))) == len(members)
 
 
-def _reader_compare_expected(scope: str, rows, ned_id: str | None = None) -> list[tuple[object, str, tuple]]:
+def _reader_compare_expected(scope: str, rows, ned_id: str | None = None) -> list[tuple[Any, str, tuple]]:
     """(intent row, YANG-list label, key tuple) for every checkable intended object (#108).
 
     Rows without a keyed reader presence are skipped: redistribution / flex-algo /
@@ -2269,7 +2276,7 @@ def _reader_compare_expected(scope: str, rows, ned_id: str | None = None) -> lis
             and not _unrenderable_community_list(r, ned_id)
         ]
     if scope == "bgp":
-        out: list[tuple[object, str, tuple]] = []
+        out: list[tuple[Any, str, tuple]] = []
         for r in rows:
             if not isinstance(r, m.BgpRouterIntent):
                 continue
@@ -2285,7 +2292,7 @@ def _reader_compare_expected(scope: str, rows, ned_id: str | None = None) -> lis
     return out
 
 
-async def _translate_expected(scope: str, expected: list[tuple[object, str, tuple]]) -> tuple[list, list[str]]:
+async def _translate_expected(scope: str, expected: list[tuple[Any, str, tuple]]) -> tuple[list, list[str]]:
     """Re-key the expected rows into the namespace the EXPORT uses (CR-A17).
 
     Identity for every grain but snmp/community, whose export key is ``sha256(secret)[:16]`` of a
@@ -2362,7 +2369,18 @@ async def _reader_compare_prepare(scope, rows, ned_id):
     return translated, unverifiable, spec, wire
 
 
-def _reader_compare_walk(scope, translated, unverifiable, section, spec, ok, *, job_id, device_name, stamp_of=None):
+def _reader_compare_walk(
+    scope: Any,
+    translated: Any,
+    unverifiable: Any,
+    section: Any,
+    spec: Any,
+    ok: Any,
+    *,
+    job_id: Any,
+    device_name: Any,
+    stamp_of: Any = None,
+) -> tuple[Any, Any, Any, Any, Any]:
     """Walk an ``ok`` device-state *section* for the presence of every translated key.
 
     Present-all → ``ok``, unless some grain was ``unverifiable`` (never checked) → ``partial``
@@ -2385,7 +2403,7 @@ def _reader_compare_walk(scope, translated, unverifiable, section, spec, ok, *, 
     from nso_adapter.core.removal import _norm_key, _reader_keys
 
     present = {gl.label: _reader_keys(scope, section, gl) for gl in spec.lists}
-    row_by_id: dict[int, object] = {}
+    row_by_id: dict[int, Any] = {}
     missing: dict[int, list[str]] = {}
     evidence: dict[int, str] = {}
     for row, label, key in translated:
@@ -2452,7 +2470,18 @@ def _classify_fetched_section(
     )
 
 
-async def _reader_compare_scope(client, device, scope, rows, *, ok, job_id, device_name, timeout, stamp_of=None):
+async def _reader_compare_scope(
+    client: Any,
+    device: Any,
+    scope: Any,
+    rows: Any,
+    *,
+    ok: Any,
+    job_id: Any,
+    device_name: Any,
+    timeout: Any,
+    stamp_of: Any = None,
+) -> tuple[Any, Any, Any, Any, Any, Any]:
     """Post-apply presence check (#108) → (ok, failed, fails, status, unverifiable, evidence).
 
     ``_verify_native_or_raise`` re-diffs the committed payload against the CDB SERVICE
@@ -2758,7 +2787,7 @@ async def _finalize_job(
     attr_ok, attr_failed, attr_failures = attr_outcome
     ip_ok, ip_failed, ip_failures = ip_outcome
 
-    result = {
+    result: dict[str, Any] = {
         "attribute_count_by_outcome": {"in_sync": attr_ok, "apply_failed": attr_failed},
         "ip_count_by_outcome": {"in_sync": ip_ok, "apply_failed": ip_failed},
     }

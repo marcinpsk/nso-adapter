@@ -11,6 +11,7 @@ import asyncio
 import time
 import uuid
 from contextlib import suppress
+from typing import Any
 
 import structlog
 from sqlalchemy import select
@@ -208,8 +209,8 @@ async def onboard_device(
         return existing
 
     # New NSO node → the target netbox_device_id must not already be onboarded elsewhere.
-    dup_nb = await db.execute(select(Device).where(Device.netbox_device_id == netbox_device_id))
-    if dup_nb.scalar_one_or_none():
+    dup_nb_result = await db.execute(select(Device).where(Device.netbox_device_id == netbox_device_id))
+    if dup_nb_result.scalar_one_or_none():
         raise LookupError(f"NetBox device {netbox_device_id} is already onboarded")
 
     device = Device(
@@ -401,7 +402,7 @@ async def _insert_device_with_claim(
         resolved = await resolve_claim_by_token(token)
         if resolved is None:
             raise
-        reg.register(resolved.device_id, token)
+        reg.register(*resolved.identity())
         if not isinstance(exc, Exception):
             # A cancellation still has to propagate — the ownership was just handed to the
             # registration, so the worker's claimed terminal path releases it.
@@ -447,7 +448,7 @@ async def _link_existing_under_claim(
 
     # Already linked to THIS NetBox device → idempotent no-op; nothing to write.
     if linked_to == netbox_device_id:
-        reg.register(acquired.device_id, acquired.token)
+        reg.register(*acquired.identity())
         await db.rollback()
         return await db.get(Device, device_id)
     # Linked to a DIFFERENT NetBox device → genuine conflict; never silently repoint it.
@@ -466,7 +467,7 @@ async def _link_existing_under_claim(
     existing.netbox_device_id = netbox_device_id
     existing.mapping_status = MappingStatus.mapped
     await db.commit()
-    reg.register(acquired.device_id, acquired.token)
+    reg.register(*acquired.identity())
     await db.refresh(existing)
     logger.info(
         "device.adopted",
@@ -845,7 +846,7 @@ async def rekey_device(
     return device
 
 
-def intent_root_models() -> list[type]:
+def intent_root_models() -> list[Any]:
     """Return the direct intent roots on ``Device``, derived from the mapper.
 
     Never hard-coded: a family added later joins this list automatically instead of
