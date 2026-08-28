@@ -515,7 +515,7 @@ The response contains:
 ```
 
 `head` is the device-wide executable head, not a cohort-scoped generation. `blocked` is
-true when that head is `failed` or `outcome_unknown`. `write_work_pending` counts only a
+true when that head is `failed` or `outcome_unknown`. `write_work_pending` is true only for a
 queued or running device-writing job that the generation barrier admits. A queued
 device-writing job that the barrier refuses appears in `held_jobs` and does not make
 `write_work_pending` true. `pending_generations` counts non-crossable generations after
@@ -836,8 +836,10 @@ envelope.
 The adapter stores one `DeploymentApplyAttempt` for every admitted request. This includes
 a complete no-op and a deterministic rejection such as `409 apply_unexecutable`. The row
 contains the complete canonical selection, admission state, HTTP status, and exact response
-body. Generations created by the request carry its `apply_attempt_id`. Removal, retry, and
-advancement reissue generations leave it `null`.
+body. Generations created by the request carry its `apply_attempt_id`, including the
+Apply-composed removal generations it enqueues. Only generations reissued outside an
+admitted request leave it `null`: force-removal, retry-generation, and chain-advancement
+reissues.
 
 A repeat with the same UUID, same device and complete canonical `selected` returns the
 stored HTTP status and response body byte for byte. It performs no admission check and
