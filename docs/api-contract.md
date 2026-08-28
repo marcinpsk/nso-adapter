@@ -995,8 +995,9 @@ Field notes:
 
 ### `GET /api/v1/devices/{id}/static-route-intent` → `200 | 404`
 
-Re-serves the settlement coordinates of every stored intent row for this device — the same
-`{route_id, generation, fingerprint}` triples the last `PUT` echoed.
+Re-serves the settlement coordinates of every stored intent row for this device, as
+`{route_id, generation, fingerprint}` triples rendered by the same renderer the `PUT` echo
+uses.
 
 ```json
 {
@@ -1011,8 +1012,17 @@ This is the recovery path for a **lost PUT response**. The PUT commits its store
 before it answers, so a response lost in flight leaves the pusher holding intent the adapter
 has already stored but for which the pusher recorded no expectation — and an apply result
 for that intent would then correlate with nothing. The triples are rendered from the stored
-rows themselves, by the same renderer the PUT uses, so the read-back cannot drift from what
-the PUT reported.
+rows themselves, by the same renderer the PUT uses, so a coordinate read back here cannot
+drift from the coordinate a PUT reports for that row.
+
+It is **not** a report of what any one pass wrote. The read reflects the store's CURRENT
+correlation state: it echoes every stored row whatever assigned its `route_id`, and it
+cannot attribute a row to a push. The **receipt** is the sole authority for that — replay
+the lost push at its own `X-Push-Seq` to get that pass's exact response back. The two
+answers differ on purpose under `?backfill_only=true`, whose `count` and `routes` name only
+the rows the pass wrote an id onto: an entry carrying neither `route_id` nor `generation`
+wrote nothing, so it is absent from the receipt while its already-correlated row is still
+listed here. A recovering pusher must therefore not read this list as an acknowledgement.
 
 `route_id` and `generation` are `null` for a row whose pusher never supplied them; a `null`
 on either never correlates with anything (see below).
@@ -1168,7 +1178,8 @@ Under it the request:
 - adopts `route_id` and `generation` from every payload entry onto its matched row, and writes
   **no content** — a row whose adapter state has drifted stays drifted. `count` and `routes`
   report the rows an id was written onto, so an entry carrying neither field acknowledges
-  nothing;
+  nothing. Recover a lost response by replaying the push, never from the `GET`, which lists
+  every stored row regardless of which pass correlated it;
 - leaves every omitted row that carries a `route_id` exactly as it is;
 - prunes every omitted row whose `route_id` is NULL, reporting each in `removed_uncorrelated`;
 - refuses with **422** (`reason = "backfill_missing_route_id"`) if a matched row has a NULL
