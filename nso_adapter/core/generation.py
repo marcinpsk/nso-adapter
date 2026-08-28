@@ -973,8 +973,10 @@ async def _blocking_predecessor(db: AsyncSession, device_id: int, seq: int) -> D
 
 async def require_attach_to_job(db: AsyncSession, generation: DeploymentGeneration, job: Job) -> None:
     """Attach to a job created empty for this generation; refusal is a carrier bug."""
-    if not await attach_to_job(db, generation, job):  # pragma: no cover - empty jobs always accept
-        raise RuntimeError(f"freshly created job {job.id} refused generation {generation.id}")
+    if not await attach_to_job(db, generation, job):
+        raise RuntimeError(  # pragma: no cover - empty jobs always accept
+            f"freshly created job {job.id} refused generation {generation.id}"
+        )
 
 
 async def attach_to_job(db: AsyncSession, generation: DeploymentGeneration, job: Job) -> bool:
@@ -1565,6 +1567,7 @@ __all__ = [
     "advance_generations_locked",
     "allocate_settlement_cohort",
     "attach_to_job",
+    "require_attach_to_job",
     "consume_last_enqueued_generation_id",
     "create_generation",
     "create_action_apply",
