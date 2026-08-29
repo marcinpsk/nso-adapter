@@ -16,8 +16,15 @@ test that injected the value it was supposed to read.
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import select
 
-from tests.api.test_static_route_identity import enable_auto_apply, entry, seed_intent
+from tests.api.test_static_route_identity import (
+    enable_auto_apply,
+    entry,
+    read_intent,
+    read_tombstones,
+    seed_intent,
+)
 from tests.conftest import VALID_TOKEN, seed_device, session
 
 pytestmark = pytest.mark.anyio
@@ -205,6 +212,60 @@ async def test_o2b_9_the_receipt_names_the_generation_its_push_authorized(adapte
     rows = by_key((await adapter_client.get(URL, headers=AUTH)).json())
     assert rows[(device_id, "vlan")]["generation_id"] == generation.id
     assert rows[(device_id, "static_route")]["generation_id"] is None
+
+
+async def test_receipt_held_route_id_still_counts_toward_the_maximum(adapter_client):
+    """A store-only deletion leaves its route id in the receipt as the sole carrier."""
+    device_id = await seed_device(nso_device_name="rcpt-pending-deletion", netbox_device_id=9964)
+    await seed_intent(device_id, [{"triple": A, "route_id": 9999, "deployed_key": list(A)}])
+    deletion = {
+        "route_id": 9999,
+        "triples": [{"vrf": A[0], "prefix": A[1], "next_hop": A[2]}],
+        "unverified": False,
+    }
+
+    deleted = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/static-route-intent?store_only=true",
+        json={"routes": [], "deleted_routes": [deletion]},
+        headers={**AUTH, "X-Push-Seq": "1"},
+    )
+    assert deleted.status_code == 200, deleted.text
+    assert await read_intent(device_id) == []
+    assert await read_tombstones(device_id) == []
+
+    payload = (await adapter_client.get(URL, headers=AUTH)).json()
+
+    assert payload["global_max_route_id"] == 9999
+
+
+async def test_malformed_receipt_provenance_does_not_break_the_maximum(adapter_client):
+    """The database aggregate ignores non-array and non-integer provenance values."""
+    from nso_adapter.store.models import IntentPushReceipt
+
+    device_id = await seed_device(nso_device_name="rcpt-malformed-provenance", netbox_device_id=None)
+    assert (await push_vlan(adapter_client, device_id, 1, [10])).status_code == 200
+    async with session() as db:
+        receipt = await db.scalar(
+            select(IntentPushReceipt).where(
+                IntentPushReceipt.device_id == device_id,
+                IntentPushReceipt.section == "vlan",
+            )
+        )
+        receipt.response = {
+            "_promotion_deletions": [
+                None,
+                {},
+                {"route_id": "200"},
+                {"route_id": 1.5},
+                {"route_id": True},
+                {"route_id": 123},
+            ]
+        }
+        await db.commit()
+
+    payload = (await adapter_client.get(URL, headers=AUTH)).json()
+
+    assert payload["global_max_route_id"] == 123
 
 
 async def test_o2b_9_an_unknown_section_is_refused_rather_than_served_empty(adapter_client):

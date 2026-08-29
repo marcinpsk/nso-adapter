@@ -29,7 +29,7 @@ from nso_adapter.core.importer import get_nso_client
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.core.switchport_intent import apply_switchport_config as apply_switchport_core
 from nso_adapter.store import outcome_store
-from nso_adapter.store.models import Device, DeviceSettings, DeviceSwitchport, DeviceVlan, VlanIntent
+from nso_adapter.store.models import Device, DeviceSwitchport, DeviceVlan, VlanIntent
 
 router = APIRouter(prefix="/api/v1/devices", tags=["vlan"])
 
@@ -276,6 +276,14 @@ async def put_vlan_intent(
         count += 1
 
     await db.flush()
+    from nso_adapter.core.generation import prepare_request_settlement
+
+    apply_requested, settlement_cohort = await prepare_request_settlement(
+        db,
+        device_id,
+        mutation_count=count,
+        removal_generation_count=int(bool(removed_vids or cleared)),
+    )
 
     # Removal propagation: a dropped vid won't be removed by the next merge-PATCH apply, so
     # PUT-replace the vlan-reconciler instance with the remaining list. Enqueued BEFORE the
@@ -286,15 +294,20 @@ async def put_vlan_intent(
         from nso_adapter.core.removal import replace_on_removal
         from nso_adapter.nso.apply import apply_vlan_config
 
-        replaced = await replace_on_removal(db, device, removed_vids, VlanIntent, apply_vlan_config, retract=cleared)
+        replaced = await replace_on_removal(
+            db,
+            device,
+            removed_vids,
+            VlanIntent,
+            apply_vlan_config,
+            retract=cleared,
+            settlement_cohort=settlement_cohort,
+        )
 
-    settings = (
-        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    ).scalar_one_or_none()
-    if settings and settings.auto_apply and count > 0:
+    if apply_requested:
         from nso_adapter.core.apply import enqueue_apply
 
-        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
 
     result = {"device_id": device_id, "count": count, "removed": len(removed_vids), "replaced": replaced}
     await record_response(db, device_id, delivery, result)

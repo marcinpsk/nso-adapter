@@ -77,6 +77,20 @@ CASES = (
         },
         {"communities": [{"label": "one", "vault_ref": "network/snmp#one", "access": "RO"}]},
     ),
+    (
+        "route-policy",
+        {
+            "objects": [
+                {"family": "prefix_list", "name": "PL-ONE", "entries": [], "accepted": True},
+                {"family": "as_path", "name": "AP-ONE", "entries": [], "accepted": True},
+            ]
+        },
+        {
+            "objects": [
+                {"family": "prefix_list", "name": "PL-ONE", "entries": [], "accepted": True},
+            ]
+        },
+    ),
 )
 
 

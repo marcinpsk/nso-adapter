@@ -267,7 +267,8 @@ async def test_intent_put_carries_next_hop_vrf_and_interface_next_hop(adapter_cl
                 "next_hop_vrf": "default",
                 "interface_next_hop": "MgmtEth0/RSP0/CPU0/0",
             }
-        ]
+        ],
+        "deleted_routes": [],
     }
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/static-route-intent", json=body, headers=AUTH | push_seq()

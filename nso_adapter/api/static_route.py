@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import structlog
@@ -33,7 +34,6 @@ from nso_adapter.core.request_flags import (
     DELETE_ORIGIN_MARKING,
     DETACH_MARKING,
     STORE_ONLY,
-    request_marking,
 )
 from nso_adapter.core.static_route_plan import (
     SR_CLEAR_FIELDS,
@@ -46,7 +46,6 @@ from nso_adapter.core.static_route_plan import fence_open as sr_fence_open
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import (
     Device,
-    DeviceSettings,
     DeviceStaticRoute,
     StaticRouteIntent,
     StaticRouteTombstone,
@@ -218,11 +217,9 @@ class DeletedRoute(BaseModel):
 
 class StaticRouteIntentUpdate(BaseModel):
     routes: list[StaticRouteEntry]
-    #: The deletion authority this push carries (§4.4). ``null`` is the PRE-ACTIVATION shape:
-    #: the scope is still marked by ``?delete_origin=`` for the whole request. A list — empty
-    #: included — means the push marks PER OBJECT and the query flag no longer applies to
-    #: this scope. O3 makes the field required and retires the null arm with it.
-    deleted_routes: list[DeletedRoute] | None = None
+    #: The required deletion authority this push carries (§4.4). An empty list means no
+    #: deletions are carried. Every push marks removals per object.
+    deleted_routes: list[DeletedRoute]
 
 
 class StaticRouteIntentEcho(BaseModel):
@@ -319,7 +316,7 @@ def _reject_payload_duplicates(routes: list[StaticRouteEntry]) -> None:
         seen_route_ids.add(item.route_id)
 
 
-def _reject_deletion_payload(records: list[DeletedRoute] | None) -> None:
+def _reject_deletion_payload(records: list[DeletedRoute]) -> None:
     """Payload-internal refusals for the deletion authority. No store read, so they run first.
 
     A backfill-only pass carries no authority AT ALL: its whole purpose is to open a device's
@@ -334,7 +331,7 @@ def _reject_deletion_payload(records: list[DeletedRoute] | None) -> None:
             {"reason": "backfill_carries_deletions", "route_ids": [r.route_id for r in records]},
         )
     seen: set[int] = set()
-    for record in records or ():
+    for record in records:
         if record.route_id in seen:
             # Emission is id-oriented, exactly one outcome per id: two records for one pk
             # cannot both be answered, and a partition that names it twice is rejected.
@@ -347,10 +344,10 @@ def _reject_deletion_payload(records: list[DeletedRoute] | None) -> None:
         seen.add(record.route_id)
 
 
-def _deletion_records(records: list[DeletedRoute] | None) -> list[DeletionRecord]:
+def _deletion_records(records: list[DeletedRoute]) -> list[DeletionRecord]:
     """Wire records → the classifier's own shape, with each lineage deduplicated in order."""
     out: list[DeletionRecord] = []
-    for record in records or ():
+    for record in records:
         triples: list[tuple[str, str, str]] = []
         for triple in record.triples:
             key = (triple.vrf, triple.prefix, triple.next_hop)
@@ -479,6 +476,7 @@ async def put_static_route_intent(
     second then applies a plan whose premise is gone, and the deferred identity constraint
     surfaces it as a 500 instead of the sequentially correct answer.
     """
+    delivery = replace(delivery, identity=replace(delivery.identity, delete_origin=False))
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
@@ -589,7 +587,9 @@ async def _apply_static_route_intent(
     if BACKFILL_ONLY.get():
         return await _apply_backfill_only(device_id, body, db, delivery)
 
-    existing_result = await db.execute(select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id))
+    existing_result = await db.execute(
+        select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id).order_by(StaticRouteIntent.id)
+    )
     existing = list(existing_result.scalars().all())
 
     # The fence is evaluated on the PRE-mutation row set. Post-payload evaluation would
@@ -608,7 +608,16 @@ async def _apply_static_route_intent(
     partition = classify_deletions(_deletion_records(body.deleted_routes), removed_rows)
     _refuse_unmarkable_deletions(partition, fence_open=fence_open)
 
-    markings = _removal_markings(removed_rows, partition, per_object=body.deleted_routes is not None)
+    markings = _removal_markings(removed_rows, partition)
+    promotion_deletions = [
+        {
+            "table": "static_route_intent",
+            "route_id": row.route_id,
+            "key": [row.vrf, row.prefix, row.next_hop],
+            "marking": markings[row.id],
+        }
+        for row in removed_rows
+    ]
     removed_by_marking: dict[str, list] = {}
     for row in removed_rows:
         removed_by_marking.setdefault(markings[row.id], []).append((row.vrf, row.prefix, row.next_hop))
@@ -691,16 +700,15 @@ async def _apply_static_route_intent(
     # rows before it touches `jobs` — the §3.9 order, `intent + tombstone -> jobs`.
     await db.flush()
 
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
-    auto_apply = bool(settings and settings.auto_apply and count > 0)
     removal_generation_count = len(removed_by_marking) if removed_rows else int(cleared)
-    promoted_generation_count = 0 if STORE_ONLY.get() else removal_generation_count + int(auto_apply)
-    settlement_cohort = None
-    if promoted_generation_count > 1:
-        from nso_adapter.core.generation import allocate_settlement_cohort
+    from nso_adapter.core.generation import prepare_request_settlement
 
-        settlement_cohort = await allocate_settlement_cohort(db)
+    auto_apply, settlement_cohort = await prepare_request_settlement(
+        db,
+        device_id,
+        mutation_count=count,
+        removal_generation_count=removal_generation_count,
+    )
 
     # Removal BEFORE apply, and both inside this transaction. The order is the contract:
     # the removal must carry the lower (created_at, id) so the worker's per-device head
@@ -747,6 +755,8 @@ async def _apply_static_route_intent(
         "removed": len(removed_rows),
         "replaced": replaced,
         "routes": routes,
+        # The public response model filters this receipt-only carrier from the wire.
+        "_promotion_deletions": promotion_deletions,
         **_acknowledgement(partition),
     }
     await record_response(db, device_id, delivery, result)
@@ -873,10 +883,9 @@ def _acknowledgement(partition) -> dict:
 def _refuse_unmarkable_deletions(partition, *, fence_open: bool) -> None:
     """Refuse, before ANY effect, a request whose genuine deletions cannot be marked (§4.4).
 
-    A genuine id needs a tombstone: it is the only carrier of the deletion once the intent row
-    is gone. ``_write_tombstones`` writes none while the fence is shut or the request is
-    store-only, so processing the request would delete the before-image the operator's
-    deletion still depends on (`:476-477`, the O-A4 hazard) and record nothing at all.
+    A genuine id needs a tombstone on an immediately promoted request. A store-only request
+    preserves the removed row and its marking in the durable receipt for a later selected
+    Apply. The fence remains mandatory for an immediate removal job.
 
     Nothing is written yet — the caller's ``held_claim`` rolls this transaction back — so the
     sequence is NOT burned and the pusher can abandon the claim and re-send at a new one once
@@ -884,9 +893,8 @@ def _refuse_unmarkable_deletions(partition, *, fence_open: bool) -> None:
     """
     if not partition.executed:
         return
-    store_only = STORE_ONLY.get()
-    if store_only or not fence_open:
-        reason = "store_only_deletion" if store_only else "fence_shut"
+    if not STORE_ONLY.get() and not fence_open:
+        reason = "fence_shut"
         logger.warning("static_route.deletion_refused", reason=reason, route_ids=list(partition.executed))
         raise api_error(
             409,
@@ -896,16 +904,12 @@ def _refuse_unmarkable_deletions(partition, *, fence_open: bool) -> None:
         )
 
 
-def _removal_markings(removed_rows, partition, *, per_object: bool) -> dict[int, str]:
+def _removal_markings(removed_rows, partition) -> dict[int, str]:
     """Each removed row's deletion provenance, by intent-row id.
 
-    *per_object* is the payload's own answer (§4.5): a push that carries ``deleted_routes``
-    marks each row by whether a NetBox deletion actually authorized it, and ``?delete_origin``
-    stops applying to this scope. Without the list the scope is still request-marked, which is
-    every production push until O3 activates the field.
+    Every push carries ``deleted_routes`` (§4.5), so each row is marked by whether a NetBox
+    deletion authorized it. The request-wide ``?delete_origin`` flag does not apply here.
     """
-    if not per_object:
-        return {row.id: request_marking() for row in removed_rows}
     return {
         row.id: (DELETE_ORIGIN_MARKING if row.id in partition.genuine_row_ids else DETACH_MARKING)
         for row in removed_rows

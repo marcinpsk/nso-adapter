@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
-"""GET /api/v1/intent-receipts — what the pusher's restore path reads (#1503 §4.4/§4.6).
+"""GET /api/v1/intent-receipts: what the pusher's restore path reads.
 
 The receipt is the only durable record of which logical operation the adapter last admitted
 for a ``(device, stream)``. A pusher restored from a snapshot has lost that knowledge on its
 own side, so before it resolves a single outstanding claim it reads this surface and learns:
 
 * every per-key receipt — its sequence, the body digest, the request mode and the STORED
-  RESPONSE, which is what §4.6's same-sequence arm re-validates the claim's exact set
+  RESPONSE, which lets a replay re-validate the claim's exact set
   against;
 * ``global_max_push_seq``, the fleet-wide highest admitted sequence, so the restored pusher
   allocates ABOVE it and never re-uses one;
@@ -16,8 +16,9 @@ own side, so before it resolves a single outstanding claim it reads this surface
   pk R existed can re-allocate R while the adapter still holds an acknowledged, unrelated row
   carrying ``route_id = R``. The deletion partition's first pass would then bind that row as
   GENUINE and authorize removing it: a device write with no authority behind it. Advancing the
-  pk sequence past this value is what closes it (R9-B4), and the value therefore counts the
-  TOMBSTONES too — a carrier holds the pk of a route whose deletion is still in flight.
+  pk sequence past this value closes that risk. The value therefore counts both
+  TOMBSTONES and receipt-held promotion deletions. Either carrier can hold the pk of a route
+  whose deletion is still in flight.
 
 Both maxima stay fleet-wide under a filter: the pusher advances ONE sequence for the whole
 fleet, and a per-key answer would let it advance past its own key while another key's receipt
@@ -28,7 +29,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import Numeric, and_, case, cast, column, func, literal_column, select, true
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_read_db, verify_token
@@ -38,6 +40,30 @@ from nso_adapter.core.intent_protocol import INTENT_STREAMS
 from nso_adapter.store.models import IntentPushReceipt, StaticRouteIntent, StaticRouteTombstone
 
 router = APIRouter(prefix="/api/v1/intent-receipts", tags=["intent-receipts"])
+
+
+async def _max_receipt_route_id(db: AsyncSession) -> int | None:
+    """Return the largest integer route id held in receipt promotion provenance."""
+    response = cast(IntentPushReceipt.response, JSONB)
+    raw_deletions = response["_promotion_deletions"]
+    deletions = case(
+        (func.jsonb_typeof(raw_deletions) == "array", raw_deletions),
+        else_=literal_column("'[]'::jsonb", type_=JSONB),
+    )
+    records = func.jsonb_array_elements(deletions).table_valued(column("value", JSONB)).lateral()
+    route_id = records.c.value["route_id"]
+    route_text = route_id.astext
+    integer_value = case(
+        (
+            and_(
+                func.jsonb_typeof(route_id) == "number",
+                route_text.op("~")(r"^-?[0-9]+$"),
+            ),
+            cast(route_text, Numeric),
+        )
+    )
+    maximum = await db.scalar(select(func.max(integer_value)).select_from(IntentPushReceipt).join(records, true()))
+    return int(maximum) if maximum is not None else None
 
 
 class IntentReceiptOut(BaseModel):
@@ -70,6 +96,9 @@ class IntentReceiptsOut(BaseModel):
 
 
 def _receipt_out(row: IntentPushReceipt) -> dict:
+    response = row.response
+    if isinstance(response, dict):
+        response = {key: value for key, value in response.items() if not key.startswith("_")}
     return {
         "device_id": row.device_id,
         "section": row.section,
@@ -79,7 +108,7 @@ def _receipt_out(row: IntentPushReceipt) -> dict:
         "delete_origin": row.delete_origin,
         "backfill_only": row.backfill_only,
         "status_code": row.status_code,
-        "response": row.response,
+        "response": response,
         "generation_id": row.generation_id,
         "created_at": iso_z(row.created_at),
         "updated_at": iso_z(row.updated_at),
@@ -119,7 +148,10 @@ async def list_intent_receipts(
     max_push_seq = await db.scalar(select(func.max(IntentPushReceipt.push_seq)))
     max_live_route_id = await db.scalar(select(func.max(StaticRouteIntent.route_id)))
     max_tombstoned_route_id = await db.scalar(select(func.max(StaticRouteTombstone.route_id)))
-    held_route_ids = [value for value in (max_live_route_id, max_tombstoned_route_id) if value is not None]
+    max_receipt_route_id = await _max_receipt_route_id(db)
+    held_route_ids = [
+        value for value in (max_live_route_id, max_tombstoned_route_id, max_receipt_route_id) if value is not None
+    ]
 
     return {
         "receipts": [_receipt_out(row) for row in rows],

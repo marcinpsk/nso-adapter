@@ -40,6 +40,7 @@ from nso_adapter.store.models import (
 from tests.conftest import SNMP_COMMUNITY as _COMMUNITY
 from tests.conftest import SNMP_VAULT_REF as _REF
 from tests.conftest import note_projection_write, session
+from tests.core.removal_helpers import seed_removal_job
 
 _NOW = datetime.now(UTC)
 
@@ -164,9 +165,13 @@ async def test_replace_on_removal_unknown_model_returns_false(adapter_client):
 
 
 def test_enqueue_removal_requires_a_promotion_disposition():
-    parameter = inspect.signature(enqueue_removal).parameters["promotes"]
+    parameters = inspect.signature(enqueue_removal).parameters
 
-    assert parameter.default is inspect.Parameter.empty
+    for name in ("promotes", "marking", "defer_retract"):
+        assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameters[name].default is inspect.Parameter.empty, (
+            f"{name} gained a default; a silent default misdispatches the removal"
+        )
 
 
 async def test_enqueue_removal_rejects_unknown_scope(adapter_client):
@@ -340,6 +345,70 @@ async def test_dispatch_scope_logging_excludes_unaccepted_levels(adapter_client)
     assert apply_fn.await_args.kwargs["levels_intent_row"] is None
 
 
+async def test_dispatch_scope_snmp_excludes_unaccepted_live_rows(adapter_client):
+    from nso_adapter.store.models import (
+        SnmpCommunityIntent,
+        SnmpHostIntent,
+        SnmpSystemInfoIntent,
+        SnmpV3UserIntent,
+    )
+
+    device_id = await _seed_device(nso_device_name="snmp-accepted-filter", netbox_device_id=47)
+    async with session() as db:
+        db.add_all(
+            [
+                SnmpCommunityIntent(
+                    device_id=device_id,
+                    label="accepted",
+                    vault_ref="network/snmp/accepted#community",
+                    access="RO",
+                    accepted_at=_NOW,
+                ),
+                SnmpCommunityIntent(
+                    device_id=device_id,
+                    label="pending",
+                    vault_ref="network/snmp/pending#community",
+                    access="RO",
+                    accepted_at=None,
+                ),
+                SnmpV3UserIntent(device_id=device_id, username="accepted", accepted_at=_NOW),
+                SnmpV3UserIntent(device_id=device_id, username="pending", accepted_at=None),
+                SnmpHostIntent(
+                    device_id=device_id,
+                    address="198.18.0.10",
+                    version="3",
+                    notify_type="trap",
+                    community_or_user="accepted",
+                    accepted_at=_NOW,
+                ),
+                SnmpHostIntent(
+                    device_id=device_id,
+                    address="198.18.0.11",
+                    version="3",
+                    notify_type="trap",
+                    community_or_user="pending",
+                    accepted_at=None,
+                ),
+                SnmpSystemInfoIntent(device_id=device_id, location="accepted", accepted_at=_NOW),
+            ]
+        )
+        await db.commit()
+
+    apply_fn = AsyncMock()
+    client = _guard_client(None)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with patch("nso_adapter.nso.apply.apply_snmp_config", apply_fn):
+            await removal_mod._dispatch_scope(db, device, client, "snmp")
+
+    apply_fn.assert_awaited_once()
+    args = apply_fn.await_args.args
+    assert [row.label for row in args[2]] == ["accepted"]
+    assert [row.username for row in args[3]] == ["accepted"]
+    assert [row.address for row in args[4]] == ["198.18.0.10"]
+    assert args[5].location == "accepted"
+
+
 async def test_dispatch_scope_ospf_uses_multi_row_apply(adapter_client):
     """OSPF dispatch fetches ONLY accepted instances+interfaces+redist(ospf only), replace=True.
 
@@ -466,6 +535,267 @@ async def test_dispatch_scope_route_policy_passes_ned_id(adapter_client):
     assert kwargs.get("replace") is True
 
 
+@pytest.mark.parametrize(
+    ("scope", "model_name", "values", "changed_field", "successor_value", "apply_target"),
+    [
+        pytest.param(
+            "svi",
+            "SviIntent",
+            {"interface_name": "Vlan100", "vlan_id": 100, "svi_type": "svi"},
+            "vlan_id",
+            200,
+            "apply_svi_config",
+            id="svi",
+        ),
+        pytest.param(
+            "subinterface",
+            "SubinterfaceIntent",
+            {
+                "interface_name": "GigabitEthernet0/1.100",
+                "parent_interface": "GigabitEthernet0/1",
+                "dot1q_vlan": 100,
+                "sub_type": "subinterface",
+            },
+            "dot1q_vlan",
+            200,
+            "apply_subinterface_config",
+            id="subinterface",
+        ),
+        pytest.param(
+            "bfd",
+            "BfdIntent",
+            {"interface_name": "Port-channel1", "min_tx": 300, "min_rx": 300, "multiplier": 3},
+            "min_tx",
+            900,
+            "apply_bfd_config",
+            id="bfd",
+        ),
+        pytest.param(
+            "interface_mtu",
+            "InterfaceMtuIntent",
+            {"interface_name": "Port-channel1", "mtu": 9216},
+            "mtu",
+            9000,
+            "apply_mtu_config",
+            id="interface_mtu",
+        ),
+        pytest.param(
+            "l2_sap",
+            "L2SapIntent",
+            {
+                "service_name": "EXAMPLE",
+                "service_type": "epipe",
+                "sap_id": "lag-60:3999",
+                "port": "lag-60",
+            },
+            "port",
+            "lag-61",
+            "apply_l2_saps",
+            id="l2_sap",
+        ),
+        pytest.param(
+            "isis",
+            "IsisInterfaceIntent",
+            {"interface_name": "system", "af": "ipv4", "process_tag": "0", "metric": 10},
+            "metric",
+            20,
+            "apply_isis_interfaces",
+            id="isis",
+        ),
+        pytest.param(
+            "route_policy",
+            "RoutePolicyObjectIntent",
+            {"family": "prefix_list", "name": "EXAMPLE-PFX", "entries": [{"sequence": 10}]},
+            "entries",
+            [{"sequence": 20}],
+            "apply_route_policy_config",
+            id="route_policy",
+        ),
+        pytest.param(
+            "ospf",
+            "OspfInstanceIntent",
+            {"process_id": "1", "router_id": "192.0.2.1", "vrf": ""},
+            "router_id",
+            "192.0.2.2",
+            "apply_ospf_config",
+            id="ospf",
+        ),
+    ],
+)
+async def test_increment_one_removal_rows_come_from_the_generation_document(
+    adapter_client,
+    scope,
+    model_name,
+    values,
+    changed_field,
+    successor_value,
+    apply_target,
+):
+    """A removal PUT-replace asserts its own document after the live store changes."""
+    from nso_adapter.store import models
+
+    device_id = await _seed_device(nso_device_name=f"removal-document-{scope}")
+    model = getattr(models, model_name)
+    async with session() as db:
+        row = model(device_id=device_id, accepted_at=_NOW, **values)
+        db.add(row)
+        await db.commit()
+
+    job_id = await _seed_removal_job(device_id, scope)
+    async with session() as db:
+        row = await db.scalar(select(model).where(model.device_id == device_id))
+        original_value = getattr(row, changed_field)
+        setattr(row, changed_field, successor_value)
+        await db.commit()
+
+    apply_fn = AsyncMock()
+    client = _guard_client(None)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with patch(f"nso_adapter.nso.apply.{apply_target}", apply_fn):
+            await removal_mod._dispatch_scope(db, device, client, scope, job_id=job_id)
+
+    apply_fn.assert_awaited_once()
+    # Every scope runner takes (client, device_name, rows, ...): the rows are argument 2.
+    rows = apply_fn.await_args.args[2]
+    assert [getattr(row, changed_field) for row in rows] == [original_value]
+
+
+async def test_snmp_removal_rows_and_vault_refs_come_from_the_generation_document(adapter_client):
+    """The SNMP replacement reads every collection and reference from its stored document."""
+    from nso_adapter.store.models import SnmpCommunityIntent
+
+    device_id = await _seed_device(nso_device_name="removal-document-snmp", netbox_device_id=45)
+    async with session() as db:
+        db.add(
+            SnmpCommunityIntent(
+                device_id=device_id,
+                label="readonly",
+                vault_ref="network/snmp/communities/selected#community",
+                access="RO",
+                accepted_at=_NOW,
+            )
+        )
+        await db.commit()
+
+    job_id = await _seed_removal_job(device_id, "snmp")
+    async with session() as db:
+        row = await db.scalar(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id))
+        row.vault_ref = "network/snmp/communities/successor#community"
+        await db.commit()
+
+    apply_fn = AsyncMock()
+    client = _guard_client(None)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with patch("nso_adapter.nso.apply.apply_snmp_config", apply_fn):
+            await removal_mod._dispatch_scope(db, device, client, "snmp", job_id=job_id)
+
+    apply_fn.assert_awaited_once()
+    communities = apply_fn.await_args.args[2]
+    assert [(row.label, row.vault_ref) for row in communities] == [
+        ("readonly", "network/snmp/communities/selected#community")
+    ]
+
+
+async def test_logging_removal_rows_come_from_the_generation_document(adapter_client):
+    """The logging replacement reads its hosts and levels singleton from one stored document."""
+    from nso_adapter.store.models import LoggingHostIntent, LoggingLevelsIntent
+
+    device_id = await _seed_device(nso_device_name="removal-document-logging", netbox_device_id=46)
+    async with session() as db:
+        db.add(
+            LoggingHostIntent(
+                device_id=device_id,
+                address="198.18.0.10",
+                severity="ERROR",
+                accepted_at=_NOW,
+            )
+        )
+        db.add(LoggingLevelsIntent(device_id=device_id, console_severity="CRITICAL", accepted_at=_NOW))
+        await db.commit()
+
+    job_id = await _seed_removal_job(device_id, "logging")
+    async with session() as db:
+        host = await db.scalar(select(LoggingHostIntent).where(LoggingHostIntent.device_id == device_id))
+        levels = await db.scalar(select(LoggingLevelsIntent).where(LoggingLevelsIntent.device_id == device_id))
+        host.severity = "WARNING"
+        levels.console_severity = "ERROR"
+        await db.commit()
+
+    apply_fn = AsyncMock()
+    client = _guard_client(None)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with patch("nso_adapter.nso.apply.apply_logging_config", apply_fn):
+            await removal_mod._dispatch_scope(db, device, client, "logging", job_id=job_id)
+
+    apply_fn.assert_awaited_once()
+    hosts = apply_fn.await_args.args[2]
+    levels = apply_fn.await_args.kwargs["levels_intent_row"]
+    assert [(row.address, row.severity) for row in hosts] == [("198.18.0.10", "ERROR")]
+    assert levels.console_severity == "CRITICAL"
+
+
+async def test_bgp_removal_graph_comes_from_the_generation_document(adapter_client):
+    """The BGP replacement keeps its selected graph after a successor rebuilds the store."""
+    from sqlalchemy import delete
+
+    from nso_adapter.store.models import (
+        BgpAfIntent,
+        BgpPeerAfIntent,
+        BgpPeerIntent,
+        BgpRouterIntent,
+        BgpScopeIntent,
+    )
+
+    def router(remote_as: str) -> BgpRouterIntent:
+        return BgpRouterIntent(
+            device_id=device_id,
+            asn="64512",
+            accepted_at=_NOW,
+            scopes=[
+                BgpScopeIntent(
+                    vrf="",
+                    address_families=[BgpAfIntent(af="ipv4-unicast")],
+                    peers=[
+                        BgpPeerIntent(
+                            peer_address="192.0.2.1",
+                            remote_as=remote_as,
+                            peer_address_families=[BgpPeerAfIntent(af="ipv4-unicast", enabled=True)],
+                        )
+                    ],
+                )
+            ],
+        )
+
+    device_id = await _seed_device(nso_device_name="removal-document-bgp", netbox_device_id=47)
+    async with session() as db:
+        db.add(router("64513"))
+        await db.commit()
+
+    job_id = await _seed_removal_job(device_id, "bgp")
+    async with session() as db:
+        await db.execute(delete(BgpRouterIntent).where(BgpRouterIntent.device_id == device_id))
+        db.add(router("64514"))
+        await db.commit()
+
+    apply_fn = AsyncMock()
+    client = _guard_client(None)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with patch("nso_adapter.nso.apply.apply_bgp_config", apply_fn):
+            await removal_mod._dispatch_scope(db, device, client, "bgp", job_id=job_id)
+
+    apply_fn.assert_awaited_once()
+    selected = apply_fn.await_args.args[2][0]
+    assert selected.asn == "64512"
+    assert [scope.vrf for scope in selected.scopes] == [""]
+    assert [af.af for af in selected.scopes[0].address_families] == ["ipv4-unicast"]
+    assert [peer.remote_as for peer in selected.scopes[0].peers] == ["64513"]
+    assert [af.af for af in selected.scopes[0].peers[0].peer_address_families] == ["ipv4-unicast"]
+
+
 async def test_dispatch_interface_config_puts_remaining_and_deletes_empty(adapter_client):
     """interface_config removal PUT-replaces an interface that still has accepted intent, and
     DELETEs one with none — so a removed IP is reverted on the device (#5)."""
@@ -497,6 +827,54 @@ async def test_dispatch_interface_config_puts_remaining_and_deletes_empty(adapte
     assert replace_fn.await_args.args[1] == "sw3" and replace_fn.await_args.args[2] == "Gi0/0"
     delete_fn.assert_awaited_once()
     assert delete_fn.await_args.args[1] == "sw3" and delete_fn.await_args.args[2] == "Gi0/1"
+
+
+async def test_interface_config_removal_rows_come_from_the_generation_document(adapter_client):
+    """A successor attribute cannot replace the selected removal document's retained row."""
+    from nso_adapter.store.models import DbInterface, InterfaceAttrState, InterfaceIntent, SyncState
+
+    device_id = await _seed_device(nso_device_name="removal-document-interface-config")
+    async with session() as db:
+        iface = DbInterface(device_id=device_id, name="Gi0/0")
+        db.add(iface)
+        await db.flush()
+        db.add(InterfaceAttrState(interface_id=iface.id, attribute="description", sync_state=SyncState.accepted))
+        db.add(
+            InterfaceIntent(
+                interface_id=iface.id,
+                attribute="description",
+                intent_value="selected description",
+                accepted_at=_NOW,
+            )
+        )
+        iface_id = iface.id
+        await db.commit()
+
+    job_id = await _seed_removal_job(
+        device_id,
+        "interface_config",
+        {"interfaces": ["Gi0/0"]},
+    )
+    async with session() as db:
+        row = await db.scalar(select(InterfaceIntent).where(InterfaceIntent.interface_id == iface_id))
+        row.intent_value = "successor description"
+        await db.commit()
+
+    replace_fn = AsyncMock()
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with patch("nso_adapter.nso.apply.replace_interface_config", replace_fn):
+            await removal_mod._dispatch_scope(
+                db,
+                device,
+                _CLIENT,
+                "interface_config",
+                {"interfaces": ["Gi0/0"]},
+                job_id=job_id,
+            )
+
+    replace_fn.assert_awaited_once()
+    assert replace_fn.await_args.args[3]["description"] == "selected description"
 
 
 async def test_dispatch_scope_unknown_raises(adapter_client):
@@ -556,6 +934,81 @@ async def test_run_removal_records_failure(adapter_client):
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
         assert job.error["code"] == "removal_failed"
+
+
+@pytest.mark.parametrize("scope", ["vlan", "static_route"])
+async def test_run_removal_refuses_a_job_that_carries_no_generation(adapter_client, scope):
+    """Every producer attaches one, so its absence is a broken chain, not a live-store fallback.
+
+    Deploying the live store here would PUT-replace whatever the store holds NOW under a job
+    that was authorized to assert something else. Both scopes, because ``static_route`` reaches
+    its plan through its own classifier and not through ``_replacement_section``.
+    """
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.removal import run_removal
+
+    device_id = await _seed_device(nso_device_name=f"sw-no-generation-{scope}")
+    async with session() as db:
+        job = Job(
+            job_type=JobType.removal,
+            device_id=device_id,
+            status=JobStatus.running,
+            run_attempt=1,
+            context={"scope": scope},
+        )
+        db.add(job)
+        await db.commit()
+        job_id = job.id
+
+    with capture_logs() as logs, patch("nso_adapter.core.importer.get_nso_client", return_value=_CLIENT):
+        await run_removal(job_id=job_id, device_id=device_id)
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.error["code"] == "removal_failed"
+        assert job.error["detail"]["scope"] == scope
+    # The wire message is redacted; the cause is named in the structured log.
+    failures = [entry for entry in logs if entry["event"] == "removal.failed"]
+    assert failures and "carries no generation to deploy" in failures[0]["error"], failures
+
+
+async def test_run_removal_refuses_a_static_route_force_job_that_carries_no_generation(adapter_client):
+    """A static-route force job cannot fall back to deploying the live store."""
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.removal import run_removal
+
+    device_id = await _seed_device(nso_device_name="sw-no-generation-static-route-force")
+    async with session() as db:
+        job = Job(
+            job_type=JobType.removal,
+            device_id=device_id,
+            status=JobStatus.running,
+            run_attempt=1,
+            context={"scope": "static_route", "force": True},
+        )
+        db.add(job)
+        await db.commit()
+        job_id = job.id
+
+    apply_fn = AsyncMock()
+    with (
+        capture_logs() as logs,
+        patch("nso_adapter.core.importer.get_nso_client", return_value=_CLIENT),
+        patch("nso_adapter.nso.apply.apply_static_routes", apply_fn),
+    ):
+        await run_removal(job_id=job_id, device_id=device_id)
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        assert job.status == JobStatus.failed
+        assert job.error["code"] == "removal_failed"
+        assert job.error["detail"]["scope"] == "static_route"
+    failures = [entry for entry in logs if entry["event"] == "removal.failed"]
+    assert failures and "carries no generation to deploy" in failures[0]["error"], failures
+    apply_fn.assert_not_awaited()
 
 
 async def test_run_removal_marks_failed_even_when_session_poisoned(adapter_client):
@@ -887,7 +1340,7 @@ async def test_static_route_removal_no_longer_blocks_on_collateral(adapter_clien
     instead. The full branch matrix lives in ``tests/core/test_static_route_removal.py``; this
     pin exists so the change cannot happen silently for the other twelve scopes' neighbours.
     """
-    from tests.core.test_static_route_removal import SrFake, run_removal_job, seed_removal_job, sr_client, wire
+    from tests.core.test_static_route_removal import SrFake, run_removal_job, sr_client, wire
 
     survivor = ("", "10.0.0.0/24", "192.0.2.1")
     dropped = ("", "10.9.0.0/24", "192.0.2.9")
@@ -1748,7 +2201,62 @@ async def test_enqueue_removal_force_refuses_to_promote(adapter_client):
         await note_projection_write(db, device_id, "svi")
         with pytest.raises(ValueError, match="promotes nothing"):
             await enqueue_removal(
-                db, device_id, "svi", marking=None, defer_retract=False, promotes=("svi",), force=True
+                db,
+                device_id,
+                "svi",
+                marking=None,
+                defer_retract=True,
+                promotes=("svi",),
+                retract=True,
+                force=True,
+            )
+        # The refusal must precede ALL store work: a late check let _record_pending_clears
+        # write rows for exactly the promoted streams before raising.
+        from nso_adapter.store.models import StreamPendingClear
+
+        leftover = (await db.execute(select(StreamPendingClear))).scalars().all()
+        assert leftover == [], "force refusal ran after pending-clear store work"
+
+
+async def test_enqueue_removal_force_refuses_a_composed_document(adapter_client):
+    """A reissue composes its own document; accepting one and dropping it deploys the wrong bytes."""
+    device_id = await _seed_device(nso_device_name="sw-force-document")
+    async with session() as db:
+        with pytest.raises(ValueError, match="composes its own reissue document"):
+            await enqueue_removal(
+                db,
+                device_id,
+                "svi",
+                marking=None,
+                defer_retract=False,
+                promotes=(),
+                force=True,
+                document={"svi": {"svi_intent": []}},
+            )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"allowed_removal_keys": {}}, "skips the collateral guard; got allowed removal keys"),
+        ({"static_route_tombstone_ids": (7,)}, r"records no execution plan; got tombstone ids \[7\]"),
+        ({"settlement_cohort": 42}, "settles no promoted revisions; got settlement cohort 42"),
+    ],
+    ids=["allowed-removal-keys", "static-route-tombstone-ids", "settlement-cohort"],
+)
+async def test_enqueue_removal_force_refuses_generation_only_arguments(adapter_client, kwargs, message):
+    device_id = await _seed_device(nso_device_name="sw-force-generation-metadata")
+    async with session() as db:
+        with pytest.raises(ValueError, match=message):
+            await enqueue_removal(
+                db,
+                device_id,
+                "static_route",
+                marking=None,
+                defer_retract=False,
+                promotes=(),
+                force=True,
+                **kwargs,
             )
 
 

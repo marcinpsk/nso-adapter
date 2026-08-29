@@ -30,7 +30,6 @@ from nso_adapter.store.models import (
     Device,
     DeviceLoggingHost,
     DeviceLoggingLevels,
-    DeviceSettings,
     LoggingHostIntent,
     LoggingLevelsIntent,
 )
@@ -276,22 +275,35 @@ async def put_logging_intent(
         levels_cleared, levels_count, levels_removed = await _sync_local_levels(db, device_id, body.local_levels, now)
 
     await db.flush()
+    removal_requested = bool(removed or cleared or levels_cleared)
+    from nso_adapter.core.generation import prepare_request_settlement
+
+    apply_requested, settlement_cohort = await prepare_request_settlement(
+        db,
+        device_id,
+        mutation_count=count + levels_count,
+        removal_generation_count=int(removal_requested),
+    )
 
     replaced = False
-    if removed or cleared or levels_cleared:
+    if removal_requested:
         from nso_adapter.core.removal import replace_on_removal
         from nso_adapter.nso.apply import apply_logging_config
 
         replaced = await replace_on_removal(
-            db, device, removed, LoggingHostIntent, apply_logging_config, retract=cleared or levels_cleared
+            db,
+            device,
+            removed,
+            LoggingHostIntent,
+            apply_logging_config,
+            retract=cleared or levels_cleared,
+            settlement_cohort=settlement_cohort,
         )
 
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
-    if settings and settings.auto_apply and (count > 0 or levels_count > 0):
+    if apply_requested:
         from nso_adapter.core.apply import enqueue_apply
 
-        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
 
     result = {
         "device_id": device_id,

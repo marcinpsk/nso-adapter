@@ -84,6 +84,13 @@ def test_generation_actions_document_both_conflict_details(openapi_schema):
         assert "empty detail" in description
 
 
+def test_action_apply_requires_skipped_detail(openapi_schema):
+    schema = openapi_schema["components"]["schemas"]["ActionApplyOut"]
+
+    assert "skipped_detail" in schema["required"]
+    assert {"type": "null"} in schema["properties"]["skipped_detail"]["anyOf"]
+
+
 def test_api_contract_documents_both_generation_action_conflicts():
     contract = (SNAPSHOT_PATH.parents[2] / "docs" / "api-contract.md").read_text()
     section = contract.split(
@@ -94,6 +101,17 @@ def test_api_contract_documents_both_generation_action_conflicts():
 
     assert "error.detail.head_status" in section
     assert "empty `error.detail`" in section
+
+
+def test_api_contract_documents_the_skipped_detail_null_shape():
+    contract = (SNAPSHOT_PATH.parents[2] / "docs" / "api-contract.md").read_text()
+    section = contract.split("### `POST /api/v1/devices/{id}/actions/apply`", maxsplit=1)[1].split(
+        "\n### ", maxsplit=1
+    )[0]
+
+    assert "only its CONTENT is conditional" in section
+    assert "The value is\n`null` when no member qualifies" in section
+    assert '"skipped_detail": null' in section
 
 
 def test_no_disambiguation_qualified_component_names(openapi_schema):
@@ -110,6 +128,41 @@ def test_no_disambiguation_qualified_component_names(openapi_schema):
         f"distinct models share a class name: {qualified}. Give each response/"
         "request model a globally-unique class name (plan F8)."
     )
+
+
+def test_action_apply_sequence_schema_preserves_the_exact_receipt_bound(openapi_schema):
+    from nso_adapter.core.request_flags import MAX_PUSH_SEQ, MIN_PUSH_SEQ
+
+    selected = openapi_schema["components"]["schemas"]["ActionApplyIn"]["properties"]["selected"]
+    sequence = selected["additionalProperties"]
+
+    assert sequence["minimum"] == MIN_PUSH_SEQ
+    assert sequence["maximum"] == MAX_PUSH_SEQ
+    assert isinstance(sequence["minimum"], int)
+    assert isinstance(sequence["maximum"], int)
+
+
+def test_action_apply_documents_its_internal_error_envelope(openapi_schema):
+    responses = openapi_schema["paths"]["/api/v1/devices/{device_id}/actions/apply"]["post"]["responses"]
+
+    assert responses["500"] == {
+        "description": "Internal adapter invariant failed",
+        "content": {
+            "application/json": {
+                "schema": {"$ref": "#/components/schemas/ErrorEnvelope"},
+            }
+        },
+    }
+
+
+def test_device_generation_limit_schema_matches_the_runtime_bounds(openapi_schema):
+    from nso_adapter.api.pagination import LIMIT_MAX, LIMIT_MIN
+
+    parameters = openapi_schema["paths"]["/api/v1/devices/{device_id}/generations"]["get"]["parameters"]
+    limit = next(parameter for parameter in parameters if parameter["name"] == "limit")
+
+    assert limit["schema"]["minimum"] == LIMIT_MIN
+    assert limit["schema"]["maximum"] == LIMIT_MAX
 
 
 def _resolve_pointer(doc, ref: str) -> bool:

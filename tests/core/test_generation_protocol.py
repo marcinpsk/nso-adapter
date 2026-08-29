@@ -769,9 +769,14 @@ async def test_f6_a_manual_apply_creates_a_generation_from_authorized_state(adap
     assert (await put_vlans(adapter_client, device_id, [10])).status_code == 200
     assert await generations(device_id) == []
 
-    resp = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/apply", headers=AUTH)
+    selected_seq = (await stream_row(device_id, "vlan")).source_push_seq
+    resp = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/apply",
+        json={"selected": {"vlan": selected_seq}},
+        headers=AUTH,
+    )
     assert resp.status_code == 202
-    job_id = resp.json()["job_id"]
+    job_id = resp.json()["generations"][0]["job_id"]
 
     chain = await generations(device_id)
     assert len(chain) == 1, "the manual apply trigger enqueued a job with no generation"
@@ -781,108 +786,6 @@ async def test_f6_a_manual_apply_creates_a_generation_from_authorized_state(adap
             sa.select(DeploymentGeneration.job_id).where(DeploymentGeneration.id == chain[0].id)
         ) == (job_id)
     assert [row["vlan_id"] for row in chain[0].document["vlan"]["vlan_intent"]] == [10]
-
-
-async def test_manual_apply_authorizes_a_store_only_repair_on_its_queued_winner(adapter_client):
-    """A deduplicated Apply must update the queued job's immutable deployment document."""
-    device_id = await seed_device(nso_device_name="gen-queued-repair", netbox_device_id=9860)
-    await seed_settings(device_id)
-    stamp = "2026-08-01T00:00:00Z"
-    first = await put_vlans(
-        adapter_client,
-        device_id,
-        [10],
-        seq=98601,
-        names={10: "before"},
-        accepted={10: stamp},
-    )
-    assert first.status_code == 200
-    (first_generation,) = await generations(device_id)
-    first_job_id = first_generation.job_id
-    assert first_job_id is not None
-
-    repaired = await put_vlans(
-        adapter_client,
-        device_id,
-        [10],
-        seq=98602,
-        query="?store_only=true",
-        names={10: "after"},
-        accepted={10: stamp},
-    )
-    assert repaired.status_code == 200
-
-    response = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/apply", headers=AUTH)
-    assert response.status_code == 409
-    assert response.json()["error"]["detail"]["job_id"] == first_job_id
-
-    chain = await generations(device_id)
-    assert len(chain) == 2, "the deduplicated Apply did not authorize the repaired projection"
-    assert [generation.job_id for generation in chain] == [first_job_id, first_job_id]
-    assert chain[-1].document["vlan"]["vlan_intent"][0]["name"] == "after"
-
-    client, rec = recorded_client("gen-queued-repair")
-    assert await run_head(device_id, client) == first_job_id
-    [body] = rec.bodies(_VLAN_ROOT)
-    assert body[_VLAN_ROOT][0]["vlan"] == [{"vlan-id": 10, "name": "after"}]
-
-
-async def test_manual_apply_conflict_does_not_authorize_past_an_intervening_generation(adapter_client):
-    """A 409 must not claim that its queued winner carries a noncontiguous repair."""
-    from nso_adapter.core.generation import attach_to_job, create_generation
-    from nso_adapter.store.models import GenerationMode, Job, JobStatus, JobType
-
-    device_id = await seed_device(nso_device_name="gen-queued-barrier", netbox_device_id=9861)
-    await seed_settings(device_id)
-    stamp = "2026-08-01T00:00:00Z"
-    first = await put_vlans(
-        adapter_client,
-        device_id,
-        [10],
-        seq=98611,
-        names={10: "before"},
-        accepted={10: stamp},
-    )
-    assert first.status_code == 200
-    (first_generation,) = await generations(device_id)
-    first_job_id = first_generation.job_id
-    assert first_job_id is not None
-
-    async with session() as db:
-        removal_job = Job(
-            device_id=device_id,
-            job_type=JobType.removal,
-            status=JobStatus.queued,
-            context={"scope": "vlan", "detach": True},
-        )
-        db.add(removal_job)
-        await db.flush()
-        barrier = await create_generation(db, device_id, streams=("vlan",), mode=GenerationMode.detach)
-        assert await attach_to_job(db, barrier, removal_job) is True
-        await db.commit()
-
-    repaired = await put_vlans(
-        adapter_client,
-        device_id,
-        [10],
-        seq=98612,
-        query="?store_only=true",
-        names={10: "after"},
-        accepted={10: stamp},
-    )
-    assert repaired.status_code == 200
-    before = await stream_row(device_id, "vlan")
-    assert before.desired_revision > before.authorized_revision
-
-    response = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/apply", headers=AUTH)
-    assert response.status_code == 409
-    assert response.json()["error"]["detail"]["job_id"] == first_job_id
-
-    chain = await generations(device_id)
-    assert len(chain) == 2, "the conflict authorized work that its reported winner cannot carry"
-    assert [generation.job_id for generation in chain] == [first_job_id, removal_job.id]
-    after = await stream_row(device_id, "vlan")
-    assert after.authorized_revision == before.authorized_revision
 
 
 async def test_f6_b_the_tombstone_sweeper_gives_its_job_a_generation(adapter_client):

@@ -25,7 +25,7 @@ from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant
 from nso_adapter.store import outcome_store
-from nso_adapter.store.models import Device, DeviceL2Sap, DeviceSettings, L2SapIntent
+from nso_adapter.store.models import Device, DeviceL2Sap, L2SapIntent
 
 logger = structlog.get_logger(__name__)
 
@@ -190,20 +190,33 @@ async def put_l2_sap_intent(
         count += 1
 
     await db.flush()
+    from nso_adapter.core.generation import prepare_request_settlement
+
+    apply_requested, settlement_cohort = await prepare_request_settlement(
+        db,
+        device_id,
+        mutation_count=count,
+        removal_generation_count=int(bool(removed)),
+    )
 
     replaced = False
     if removed:
         from nso_adapter.core.removal import replace_on_removal
         from nso_adapter.nso.apply import apply_l2_saps
 
-        replaced = await replace_on_removal(db, device, removed, L2SapIntent, apply_l2_saps)
+        replaced = await replace_on_removal(
+            db,
+            device,
+            removed,
+            L2SapIntent,
+            apply_l2_saps,
+            settlement_cohort=settlement_cohort,
+        )
 
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
-    if settings and settings.auto_apply and count > 0:
+    if apply_requested:
         from nso_adapter.core.apply import enqueue_apply
 
-        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
 
     result = {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}
     await record_response(db, device_id, delivery, result)

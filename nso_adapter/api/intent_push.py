@@ -120,6 +120,8 @@ async def admit_or_replay(db: AsyncSession, device_id: int, delivery: IntentDeli
     if stored is None:
         return None
     await db.rollback()
+    if isinstance(stored, dict):
+        stored = {key: value for key, value in stored.items() if not key.startswith("_")}
     return JSONResponse(status_code=status_code, content=stored)
 
 

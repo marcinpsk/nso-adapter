@@ -632,7 +632,7 @@ async def test_a1_discriminator_a_later_authorized_push_releases_the_parked_clea
     async def put_intent(routes, query=""):
         resp = await adapter_client.put(
             f"/api/v1/devices/{device_id}/static-route-intent{query}",
-            json={"routes": routes},
+            json={"routes": routes, "deleted_routes": []},
             headers=AUTH | push_seq(),
         )
         assert resp.status_code == 200, resp.text

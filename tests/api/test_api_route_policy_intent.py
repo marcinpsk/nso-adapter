@@ -248,9 +248,10 @@ async def test_put_route_policy_intent_auto_apply_creates_generation(adapter_cli
         db.add(DeviceSettings(device_id=device_id, auto_apply=True))
         await db.commit()
 
+    headers = AUTH | push_seq()
     response = await adapter_client.put(
         f"/api/v1/devices/{device_id}/route-policy-intent",
-        headers={**AUTH, "X-Push-Seq": "7965"},
+        headers=headers,
         json={"objects": [_obj("prefix_list", "PL-AUTO", accepted=True)]},
     )
 
@@ -272,10 +273,10 @@ async def test_put_route_policy_intent_auto_apply_creates_generation(adapter_cli
     assert len(generations) == 1
     generation, job = generations[0]
     assert generation.stream_revisions == {"route_policy": 1}
-    assert generation.source_push_seq == {"route_policy": 7965}
+    assert generation.source_push_seq == {"route_policy": int(headers["X-Push-Seq"])}
     assert job.job_type is JobType.apply
     assert receipt is not None
-    assert receipt.push_seq == 7965
+    assert receipt.push_seq == int(headers["X-Push-Seq"])
     assert receipt.generation_id == generation.id
 
     async with session() as db:
