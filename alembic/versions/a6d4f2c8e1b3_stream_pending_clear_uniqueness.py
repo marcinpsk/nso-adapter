@@ -54,9 +54,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_constraint("uq_stream_pending_clear", "stream_pending_clear", type_="unique")
-    op.create_unique_constraint(
-        "uq_stream_pending_clear",
-        "stream_pending_clear",
-        ["device_id", "stream", "provenance"],
+    # The upgrade merged each store_only row into its authorized partner and DELETED it;
+    # those rows, their revisions, and timestamps cannot be reconstructed.
+    raise RuntimeError(
+        "a6d4f2c8e1b3 is irreversible: the upgrade merged and deleted store_only "
+        "pending-clear rows; restore from a backup taken before the upgrade instead"
     )

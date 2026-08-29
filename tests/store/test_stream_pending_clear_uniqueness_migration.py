@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 import sqlalchemy as sa
 
 from tests.store.migration_harness import (
@@ -102,14 +103,13 @@ def test_stream_pending_clear_uniqueness_repairs_pairs_before_upgrade(pg_provisi
             assert _unique_constraints(engine)["uq_stream_pending_clear"] == ("device_id", "stream")
 
 
-def test_stream_pending_clear_uniqueness_downgrade_restores_provenance_identity(pg_provisioner):
+def test_stream_pending_clear_uniqueness_downgrade_refuses(pg_provisioner):
+    """The upgrade merges and DELETES store_only rows; no downgrade can restore them."""
     module = _module()
     with private_database(pg_provisioner, "pending_clear_unique_down") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
-        alembic(sync_url, "downgrade", module.down_revision)
+        with pytest.raises(Exception, match="irreversible"):
+            alembic(sync_url, "downgrade", module.down_revision)
         with engine_on(sync_url) as engine:
-            assert _unique_constraints(engine)["uq_stream_pending_clear"] == (
-                "device_id",
-                "stream",
-                "provenance",
-            )
+            # The refusal left the upgraded schema in place.
+            assert _unique_constraints(engine)["uq_stream_pending_clear"] == ("device_id", "stream")
