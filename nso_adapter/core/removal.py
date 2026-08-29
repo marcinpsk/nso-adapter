@@ -2104,10 +2104,10 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
     """
     from nso_adapter.core.claim import terminalize
     from nso_adapter.core.importer import get_nso_client
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import session
     from nso_adapter.store.models import Device, Job, JobStatus
 
-    async for db in get_session():
+    async with session() as db:
         row = (await db.execute(select(Job.id, Job.context).where(Job.id == job_id))).one_or_none()
         if row is None:
             return

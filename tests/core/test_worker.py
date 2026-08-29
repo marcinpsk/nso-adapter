@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from unittest.mock import patch
 
 from nso_adapter.core import worker
@@ -312,16 +313,18 @@ async def test_heartbeat_survives_transient_db_error(adapter_client, monkeypatch
     job_id = await _seed_job(device_id, JobType.sync, JobStatus.running)
 
     monkeypatch.setattr(worker, "_HEARTBEAT_INTERVAL", 0.001)
-    real_get_session = worker.get_session
+    real_session = worker.session
     calls = {"n": 0}
 
-    def flaky_get_session():
+    @asynccontextmanager
+    async def flaky_session():
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("transient db blip")  # first tick fails
-        return real_get_session()
+        async with real_session() as db:
+            yield db
 
-    monkeypatch.setattr(worker, "get_session", flaky_get_session)
+    monkeypatch.setattr(worker, "session", flaky_session)
 
     task = asyncio.create_task(worker._heartbeat(job_id))
     await asyncio.sleep(0.05)  # several ticks at the 1ms interval

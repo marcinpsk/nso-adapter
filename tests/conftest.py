@@ -12,7 +12,6 @@ import threading
 import time
 import uuid
 import warnings
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +27,7 @@ from sqlalchemy.orm import Session as SyncSession
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.main import create_app
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.store.db import session
 
 # Hermetic tests: ignore any ambient DATABASE_URL. The dev container sets one to
 # point at the dev Postgres; without this, get_config()'s env override would make
@@ -221,21 +221,6 @@ def pg_sync_session(pg_database):
             yield s
     finally:
         engine.dispose()
-
-
-@asynccontextmanager
-async def session():
-    """One store session with deterministic close — replaces the historical
-    ``get_session`` async-for-with-break loops, whose ``break`` left the
-    generator (and its connection) suspended until GC."""
-    from nso_adapter.store.db import get_session
-
-    gen = get_session()
-    db = await anext(gen)
-    try:
-        yield db
-    finally:
-        await gen.aclose()
 
 
 # Enforceable zero-skip gate (pytest's -rs only REPORTS skips; it never fails the run).

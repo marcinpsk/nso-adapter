@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -684,18 +685,19 @@ async def test_run_connect_timeout(adapter_client):
 
 async def test_run_connect_marks_failed_even_when_session_poisoned(adapter_client):
     """Same poisoned-session guard for _run_connect (s3-5). The connect boundary doesn't take
-    the runner's db, so a capturing get_session wrapper hands the poison stub the real session
+    the runner's db, so a capturing session wrapper hands the poison stub the real session
     to fail a flush on — proving the runner rolls back before committing the failed status."""
     device_id = await _seed_device("rtr-poison-c", 72)
     job_id = await _seed_job(device_id, JobStatus.running)
 
     from nso_adapter.store import db as db_mod
 
-    real_get_session = db_mod.get_session
+    real_session = db_mod.session
     captured: dict = {}
 
-    async def capturing_get_session():
-        async for db in real_get_session():
+    @asynccontextmanager
+    async def capturing_session():
+        async with real_session() as db:
             captured["db"] = db
             yield db
 
@@ -705,7 +707,7 @@ async def test_run_connect_marks_failed_even_when_session_poisoned(adapter_clien
         await db.flush()  # duplicate PK → session poisoned
 
     with (
-        patch("nso_adapter.store.db.get_session", capturing_get_session),
+        patch("nso_adapter.store.db.session", capturing_session),
         patch("nso_adapter.core.importer.get_nso_client", return_value=object()),
         patch("nso_adapter.nso.actions.connect", poison_connect),
     ):

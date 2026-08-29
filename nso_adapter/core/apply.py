@@ -3338,9 +3338,9 @@ async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -
     nothing the apply wrote could be claim-scoped; R2's CAS and carrier transactions guard
     themselves with it.
     """
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import session
 
-    async for db in get_session():
+    async with session() as db:
         job = await db.get(Job, job_id)
         if not job:
             logger.error("apply.job_not_found", job_id=job_id)

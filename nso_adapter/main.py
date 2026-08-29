@@ -62,7 +62,7 @@ from nso_adapter.notifications.persistent_subscriber import persistent_subscribe
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.secrets import make_provider
-from nso_adapter.store.db import get_engine, get_session, init_db
+from nso_adapter.store.db import get_engine, init_db, session
 
 logger = structlog.get_logger(__name__)
 
@@ -183,12 +183,11 @@ class _DeviceRefreshCoalescer:
         client = self._clients.get(nso_instance)
         if client is None:
             return
-        async for db in get_session():
+        async with session() as db:
             device = await db.get(Device, device_id)  # RE-FETCH by id — never a foreign session's row
             if device is None:
                 return
             await refresh_all_surfaces_for_device(db, device, client, refresh_source="notification", atomic=False)
-            break
         # Notify AFTER the refresh and BEFORE the dirty check (codex R1-F5 ordering): the
         # plugin reconciles the refreshed mirror; failures are swallowed (best-effort).
         nb_client = get_netbox_client()
@@ -258,7 +257,7 @@ def _make_sse_event_handler(
             return
 
         async def _run() -> None:
-            async for db in get_session():
+            async with session() as db:
                 await _dispatch_netconf_change(cfg, parsed, db, clients, coalescer)
 
         task = asyncio.create_task(_run())

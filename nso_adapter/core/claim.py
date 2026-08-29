@@ -242,14 +242,10 @@ async def claim_session(db: AsyncSession | None) -> AsyncIterator[AsyncSession]:
     if db is not None:
         yield db
         return
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import session
 
-    gen = get_session()
-    own = await anext(gen)
-    try:
+    async with session() as own:
         yield own
-    finally:
-        await gen.aclose()
 
 
 async def _commit_outcome(db: AsyncSession) -> ClaimOutcome:

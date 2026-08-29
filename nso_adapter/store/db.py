@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any, cast
 
 from sqlalchemy.engine import CursorResult
@@ -88,10 +89,22 @@ def init_db(database_url: str, *, application_name: str = "nso-adapter.store") -
     _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
 
 
-async def get_session() -> AsyncGenerator[AsyncSession, None]:
+@asynccontextmanager
+async def session() -> AsyncIterator[AsyncSession]:
+    """Open one store session and close it before the caller continues.
+
+    Internal code uses this context manager. An early return or exception then awaits
+    ``AsyncSession.close()`` instead of leaving the generator suspended until finalization.
+    """
     assert _session_factory is not None, "DB not initialised — call init_db() first"
     async with _session_factory() as session:
         yield session
+
+
+async def get_session() -> AsyncGenerator[AsyncSession, None]:
+    """Yield one request-scoped session for FastAPI dependency injection."""
+    async with session() as db:
+        yield db
 
 
 def get_engine():

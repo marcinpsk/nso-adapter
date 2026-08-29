@@ -5,7 +5,7 @@
 Exercises the inner ``_scheduled_*`` jobs DIRECTLY (per testing-strategy.md §3.6), not the
 APScheduler lifecycle wrapper (covered separately in test_lag_topology_scheduler.py). The
 NSO/NetBox clients and per-family refresh functions are the true integration edges and are
-monkeypatched; the DB is real (the ``adapter_client`` fixture wires ``get_session``).
+monkeypatched; the DB is real (the ``adapter_client`` fixture wires the store session).
 """
 
 from __future__ import annotations
@@ -186,7 +186,7 @@ async def test_scope_reconcile_offboards_absent_and_sets_present(adapter_client,
 @pytest.mark.anyio
 async def test_scope_reconcile_persists_failover_ips(adapter_client, monkeypatch):
     """The reconcile must COMMIT its session — otherwise the plugin-sourced primary/OOB IPs
-    (and scope) are silently discarded when get_session closes uncommitted (s3-3).
+    (and scope) are silently discarded when the session closes uncommitted (s3-3).
 
     Runs the real set_scope + upsert_failover_ips, then reads back in a FRESH session so the
     assertion only passes if the change was actually committed, not just left pending.

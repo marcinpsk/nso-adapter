@@ -31,10 +31,10 @@ async def _scheduled_sync_all() -> None:
     from sqlalchemy import select
 
     from nso_adapter.core.jobs import enqueue_job
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import session
     from nso_adapter.store.models import Device, JobType, ManagedScope
 
-    async for db in get_session():
+    async with session() as db:
         result = await db.execute(select(Device).where(Device.id.in_(select(ManagedScope.device_id).distinct())))
         devices = result.scalars().all()
         for device in devices:
@@ -89,7 +89,7 @@ async def _scheduled_scope_reconcile() -> None:
     from nso_adapter.core.failover import upsert_failover_ips
     from nso_adapter.core.importer import get_netbox_client
     from nso_adapter.core.onboarding import offboard_device, set_scope
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import session
     from nso_adapter.store.models import Device
 
     nb_client = get_netbox_client()
@@ -105,7 +105,7 @@ async def _scheduled_scope_reconcile() -> None:
 
     plugin_by_nb_id = {r.netbox_device_id: r for r in plugin_records}
 
-    async for db in get_session():
+    async with session() as db:
         # (id, netbox_device_id) pairs — not ORM rows: the per-device commit/rollback below
         # would expire pre-loaded Device instances, and touching an expired attr later triggers
         # a lazy load that fails in the async greenlet context. Re-fetch a fresh row per iter.
@@ -133,7 +133,7 @@ async def _scheduled_scope_reconcile() -> None:
 
         for device_id, _nb_id in rows:
             # Isolate + commit per device: set_scope/upsert_failover_ips document "caller
-            # commits" (and get_session never commits on exit), so each device's scope +
+            # commits" (and session never commits on exit), so each device's scope +
             # primary/OOB IPs must be committed here or they're silently discarded. Per-device
             # so one device raising (FK/constraint) can't abort the tick and skip every later
             # device — roll its partial/poisoned work back and carry on with the rest.
@@ -179,7 +179,7 @@ async def _scheduled_intent_reconcile() -> None:
 
     from nso_adapter.bindings.netbox.intent import fetch_all_intent
     from nso_adapter.core.importer import get_netbox_client
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import session
     from nso_adapter.store.models import DbInterface, Device, InterfaceIntent
 
     nb_client = get_netbox_client()
@@ -198,7 +198,7 @@ async def _scheduled_intent_reconcile() -> None:
     for rec in intent_records:
         by_nb_device.setdefault(rec.netbox_device_id, []).append(rec)
 
-    async for db in get_session():
+    async with session() as db:
         # ids only + re-fetch per iteration: the per-device commit/rollback expires pre-loaded
         # ORM rows, and a later expired-attr access does a lazy load that fails under asyncio.
         device_ids = (await db.execute(select(Device.id).where(Device.netbox_device_id.is_not(None)))).scalars().all()
@@ -422,10 +422,10 @@ async def _scheduled_capability_refresh() -> None:
 
     from nso_adapter.core.capability import refresh_device_capability
     from nso_adapter.core.importer import get_nso_client
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import session
     from nso_adapter.store.models import Device
 
-    async for db in get_session():
+    async with session() as db:
         devices = (await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))).scalars().all()
         for device in devices:
             try:
@@ -448,10 +448,10 @@ async def _refresh_all_devices(refresh_fn, label: str) -> None:
     from sqlalchemy import select
 
     from nso_adapter.core.importer import get_nso_client
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import session
     from nso_adapter.store.models import Device
 
-    async for db in get_session():
+    async with session() as db:
         result = await db.execute(select(Device).where(Device.nso_device_name.is_not(None)))
         for device in result.scalars().all():
             try:
@@ -515,7 +515,7 @@ async def _scheduled_topology_interfaces_refresh() -> None:
 
     from nso_adapter.core.importer import get_netbox_client
     from nso_adapter.core.topology_interfaces import ensure_topology_interfaces
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import session
     from nso_adapter.store.models import Device
 
     nb_client = get_netbox_client()
@@ -523,7 +523,7 @@ async def _scheduled_topology_interfaces_refresh() -> None:
         logger.debug("scheduler.topology_interfaces.skipped", reason="no_netbox_client")
         return
 
-    async for db in get_session():
+    async with session() as db:
         result = await db.execute(select(Device).where(Device.netbox_device_id.is_not(None)))
         devices = result.scalars().all()
         for device in devices:
@@ -630,10 +630,10 @@ async def _failover_tick_under_claim(device_id: int, reg, eff, now, flip_budget)
     from nso_adapter.core.failover import run_failover_tick
     from nso_adapter.core.importer import get_nso_client
     from nso_adapter.core.jobs import has_any_active_job
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import session
     from nso_adapter.store.models import Device, DeviceFailover
 
-    async for db in get_session():
+    async with session() as db:
         # The guard, held to commit. Any preliminary state a caller loaded before
         # acquisition is discarded: the select below runs AFTER the claim, so a transition
         # another scheduler committed in between is observed rather than overwritten.
@@ -687,17 +687,16 @@ async def _scheduled_failover_probe() -> None:
     import asyncio
 
     from nso_adapter.core.failover import FlipBudget, get_effective_failover_config
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import session
 
     cfg = get_config().scheduler
     now = _utcnow_aware()
     eff = None
     due_ids: list[int] = []
-    async for db in get_session():
+    async with session() as db:
         eff = await get_effective_failover_config(db, cfg)
         if eff.enabled:
             due_ids = await _due_failover_device_ids(db, now)
-        break
     if eff is None or not eff.enabled or not due_ids:
         return
 

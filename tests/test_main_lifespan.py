@@ -14,6 +14,7 @@ nine-handler fan-out is gone).
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -293,10 +294,11 @@ async def test_sse_handler_dispatches_parsed_frame(monkeypatch):
 
     monkeypatch.setattr("nso_adapter.main._dispatch_netconf_change", rec_dispatch)
 
+    @asynccontextmanager
     async def fake_session():
         yield "DB-SESSION"
 
-    monkeypatch.setattr("nso_adapter.main.get_session", fake_session)
+    monkeypatch.setattr("nso_adapter.main.session", fake_session)
     dispatch_tasks: set[asyncio.Task] = set()
     handler = _make_sse_event_handler(SimpleNamespace(scheduler=_scheduler()), {"i": object()}, dispatch_tasks)
 
@@ -319,10 +321,11 @@ async def test_sse_handler_logs_and_does_not_leak_failed_dispatch(monkeypatch):
 
     monkeypatch.setattr("nso_adapter.main._dispatch_netconf_change", boom_dispatch)
 
+    @asynccontextmanager
     async def fake_session():
         yield "DB-SESSION"
 
-    monkeypatch.setattr("nso_adapter.main.get_session", fake_session)
+    monkeypatch.setattr("nso_adapter.main.session", fake_session)
     dispatch_tasks: set[asyncio.Task] = set()
     handler = _make_sse_event_handler(SimpleNamespace(scheduler=_scheduler()), {"i": object()}, dispatch_tasks)
 

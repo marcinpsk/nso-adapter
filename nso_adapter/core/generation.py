@@ -1032,9 +1032,9 @@ async def advance_device_generations(device_id: int) -> int:
     Called after every job finishes, at startup, and after a push whose own admission left
     a generation unattached.
     """
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import session
 
-    async for db in get_session():
+    async with session() as db:
         await lock_projection(db, device_id)
         attached = await advance_generations_locked(db, device_id)
         await db.commit()
@@ -1051,11 +1051,11 @@ async def recover_generations() -> int:
     Everything ``pending`` and uncovered is then handed a job, so a restart resumes the
     chain instead of stranding it.
     """
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import session
 
     stranded: list[int] = []
     devices: list[int] = []
-    async for db in get_session():
+    async with session() as db:
         rows = (
             (
                 await db.execute(
@@ -1086,7 +1086,6 @@ async def recover_generations() -> int:
             .all()
         )
         await db.commit()
-        break
     if stranded:
         logger.error("generation.outcome_unknown_on_restart", count=len(stranded), devices=sorted(set(stranded)))
     for device_id in devices:

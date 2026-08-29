@@ -409,14 +409,14 @@ async def _run_with_db(
     way to say which run it reports, and an abandoned runner could suppress the rerun
     recovery mandated or clobber the successor that replaced it.
     """
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import session
 
     # Total job timeout, default 10 minutes: guards against NSO hung connections that
     # outlast the per-request httpx timeout (e.g. TCP keepalive issues or mid-response
     # stalls). The comprehensive runners (sync_now, sync_from_nso) pass 900s — their
     # legal child waits alone sum to ~720s (NED resolve 30 + sync-from 120 + attrs
     # 30+180 escalation + atomic action 360; codex S5a R1-F3).
-    async for db in get_session():
+    async with session() as db:
         if await db.scalar(select(Job.id).where(Job.id == job_id)) is None:
             return
         logger.info("job.budget", job_id=job_id, device_id=device_id, timeout=timeout)
@@ -526,14 +526,14 @@ async def _run_detect_drift(job_id: int, device_id: int, reg: ClaimRegistration 
 async def _run_connect(job_id: int, device_id: int, reg: ClaimRegistration | None = None) -> None:
     from nso_adapter.core.importer import get_nso_client
     from nso_adapter.nso.actions import connect
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import session
     from nso_adapter.store.models import Device
 
     _JOB_TIMEOUT = 600.0
 
     logger.info("job.connect.start", job_id=job_id, device_id=device_id)
 
-    async for db in get_session():
+    async with session() as db:
         if await db.scalar(select(Job.id).where(Job.id == job_id)) is None:
             return
         try:
@@ -632,12 +632,12 @@ async def _run_provision(job_id: int, device_id: int | None, reg: ClaimRegistrat
     Contention on the device is one such honest failure — see ``device_busy`` below.
     """
     from nso_adapter.core.onboarding import provision_nso_device
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import session
 
     _JOB_TIMEOUT = 600.0
     logger.info("job.provision.start", job_id=job_id)
 
-    async for db in get_session():
+    async with session() as db:
         context = await db.scalar(select(Job.context).where(Job.id == job_id))
         if context is None and await db.scalar(select(Job.id).where(Job.id == job_id)) is None:
             return
