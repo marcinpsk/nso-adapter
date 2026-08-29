@@ -17,6 +17,7 @@ the stored document, blocked-head retry) lives in ``test_generation_protocol.py`
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 from unittest.mock import patch
 
@@ -1076,17 +1077,26 @@ async def test_advancement_yields_to_a_worker_starting_the_carrier(adapter_clien
             advancing = asyncio.create_task(advance_device_generations(device_id))
             starting = asyncio.create_task(start_the_job(worker))
             try:
-                await asyncio.wait_for(head_locked.wait(), timeout=10)
-                await _wait_for_relation_lock(get_engine(), "deployment_generation")
-                assert not starting.done(), "the worker was never blocked on the head generation row"
-            finally:
-                worker_blocked.set()
+                try:
+                    await asyncio.wait_for(head_locked.wait(), timeout=10)
+                    await _wait_for_relation_lock(get_engine(), "deployment_generation")
+                    assert not starting.done(), "the worker was never blocked on the head generation row"
+                finally:
+                    worker_blocked.set()
 
-            # (a) no deadlock, and no stale queued carrier handed back as a successor.
-            assert await asyncio.wait_for(advancing, timeout=20) is None, (
-                "advancement took over a carrier a worker is starting"
-            )
-        await asyncio.wait_for(starting, timeout=20)
+                # (a) no deadlock, and no stale queued carrier handed back as a successor.
+                assert await asyncio.wait_for(advancing, timeout=20) is None, (
+                    "advancement took over a carrier a worker is starting"
+                )
+                await asyncio.wait_for(starting, timeout=20)
+            finally:
+                # A failed assertion above must not leave either task holding an open
+                # transaction and its locks on the shared test database.
+                for task in (starting, advancing):
+                    if not task.done():
+                        task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await task
 
     # (b) the worker's transition landed whole, and a re-run reads that truthful state.
     (running,) = await _generations(device_id)
