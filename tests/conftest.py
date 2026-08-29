@@ -13,6 +13,8 @@ import time
 import uuid
 import warnings
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -83,14 +85,27 @@ def _url_for(dbname: str, *, driver: str) -> str:
 _TEARDOWN_GRACE_S = 15.0
 
 
-def _client_backends(conn, name: str) -> list:
+@dataclass(frozen=True, slots=True)
+class ClientBackend:
+    """Diagnostic identity and state for one leaked PostgreSQL client backend."""
+
+    pid: int
+    application_name: str
+    backend_start: datetime
+    state: str | None
+    xact_start: datetime | None
+    query: str | None
+
+
+def _client_backends(conn, name: str) -> list[ClientBackend]:
     # backend_type filter: PG's own autovacuum worker can be inside the clone at DROP
     # time and is not a leaked test session — only client backends count as stragglers.
-    return conn.exec_driver_sql(
-        "SELECT pid, state FROM pg_stat_activity "
+    rows = conn.exec_driver_sql(
+        "SELECT pid, application_name, backend_start, state, xact_start, query FROM pg_stat_activity "
         f"WHERE datname = '{name}' AND pid <> pg_backend_pid() "
         "AND backend_type = 'client backend'"
     ).fetchall()
+    return [ClientBackend(*row) for row in rows]
 
 
 def _drop_database(provisioner, name: str, *, expect_clean: bool) -> None:
@@ -125,7 +140,12 @@ def _drop_database(provisioner, name: str, *, expect_clean: bool) -> None:
 def pg_provisioner():
     """AUTOCOMMIT provisioner engine for CREATE/DROP DATABASE. Sync + session-scoped on purpose:
     an asyncpg pool created on a session-scoped loop and used from per-test loops is UB."""
-    engine = sa.create_engine(PROVISIONER_URL, isolation_level="AUTOCOMMIT", poolclass=sa.pool.NullPool)
+    engine = sa.create_engine(
+        PROVISIONER_URL,
+        isolation_level="AUTOCOMMIT",
+        poolclass=sa.pool.NullPool,
+        connect_args={"application_name": "tests.pg_provisioner"},
+    )
     try:
         with engine.connect() as conn:
             conn.exec_driver_sql("SELECT 1")  # FAIL LOUD: no silent skip lane any more
@@ -191,7 +211,11 @@ def pg_url(pg_database) -> str:
 def pg_sync_session(pg_database):
     """Sync Session for the ORM-model tests. Schema comes from the template; FK
     enforcement is native — no PRAGMA."""
-    engine = sa.create_engine(_url_for(pg_database, driver="postgresql+psycopg2"), poolclass=sa.pool.NullPool)
+    engine = sa.create_engine(
+        _url_for(pg_database, driver="postgresql+psycopg2"),
+        poolclass=sa.pool.NullPool,
+        connect_args={"application_name": "tests.pg_sync_session"},
+    )
     try:
         with SyncSession(engine) as s:
             yield s
@@ -294,7 +318,7 @@ async def store_engine(pg_url):
     """
     from nso_adapter.store import db as store_db
 
-    store_db.init_db(pg_url)
+    store_db.init_db(pg_url, application_name="tests.store_engine")
     engine = store_db.get_engine()
     try:
         yield engine
@@ -318,7 +342,11 @@ async def rival_engine(store_engine, pg_url):
     gone before the clone is dropped (``_drop_database(..., expect_clean=True)`` fails the
     test otherwise, which is the point).
     """
-    engine = create_async_engine(pg_url, poolclass=sa.pool.NullPool)
+    engine = create_async_engine(
+        pg_url,
+        poolclass=sa.pool.NullPool,
+        connect_args={"server_settings": {"application_name": "tests.rival_engine"}},
+    )
     try:
         yield engine
     finally:

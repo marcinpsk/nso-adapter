@@ -30,7 +30,10 @@ def two_databases(pg_provisioner):
             conn.exec_driver_sql(f'CREATE DATABASE "{name}"')
 
     def snapshot_of(dbname: str, ddl: list[str]) -> dict:
-        engine = sa.create_engine(_url_for(dbname, driver="postgresql+psycopg2"))
+        engine = sa.create_engine(
+            _url_for(dbname, driver="postgresql+psycopg2"),
+            connect_args={"application_name": "tests.schema_parity.snapshot"},
+        )
         try:
             with engine.begin() as conn:
                 for stmt in ddl:

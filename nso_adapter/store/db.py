@@ -65,7 +65,7 @@ def require_postgresql_url(database_url: str, *, label: str = "database_url") ->
     return database_url
 
 
-def init_db(database_url: str) -> None:
+def init_db(database_url: str, *, application_name: str = "nso-adapter.store") -> None:
     """Bind the process-global engine and session factory to *database_url*.
 
     Refuses any non-PostgreSQL scheme up front, so a misconfiguration fails at startup
@@ -77,7 +77,14 @@ def init_db(database_url: str) -> None:
     # unreachable-probe timeout (~10s), and normal API/sync traffic shares this pool. Keep
     # it comfortably above failover_probe_concurrency (capped at 16 in api/config.py) so a
     # worst-case tick can't starve the pool: 20 + 10 overflow = 30, leaving 14 for everyone else.
-    _engine = create_async_engine(database_url, pool_size=20, max_overflow=10, pool_pre_ping=True, echo=False)
+    _engine = create_async_engine(
+        database_url,
+        pool_size=20,
+        max_overflow=10,
+        pool_pre_ping=True,
+        echo=False,
+        connect_args={"server_settings": {"application_name": application_name}},
+    )
     _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
 
 

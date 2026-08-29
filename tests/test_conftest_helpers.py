@@ -13,11 +13,14 @@ import ast
 from pathlib import Path
 from typing import get_args, get_type_hints
 
+import pytest
+import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from nso_adapter.store import db as store_db
 from nso_adapter.store.models import Job, JobStatus, JobType
-from tests.conftest import _client_backends, seed_device, session, start_job
+from tests import conftest as root_conftest
+from tests.conftest import _drop_database, _url_for, seed_device, session, start_job
 
 _TESTS_ROOT = Path(__file__).resolve().parent
 
@@ -43,16 +46,33 @@ async def test_start_job_returns_the_attempt_under_an_expiring_session(store_eng
         assert started.status is JobStatus.running and started.run_attempt == 1
 
 
-async def test_client_backend_diagnostics_exclude_query_text(store_engine, pg_provisioner):
-    """A leaked session's last statement can contain a secret literal."""
-    async with store_engine.connect() as leaked:
-        await leaked.exec_driver_sql("SELECT 'review-secret-literal'")
-        with pg_provisioner.connect() as provisioner:
-            rows = _client_backends(provisioner, store_engine.url.database)
+def test_drop_database_reports_surviving_backend_diagnostics(pg_database, pg_provisioner, monkeypatch):
+    """Strict teardown must identify the fixture that owns a surviving backend."""
+    engine = sa.create_engine(
+        _url_for(pg_database, driver="postgresql+psycopg2"),
+        isolation_level="AUTOCOMMIT",
+        poolclass=sa.pool.NullPool,
+        connect_args={"application_name": "test.guard-injected-leak"},
+    )
+    leaked = engine.connect()
+    leaked.exec_driver_sql("SELECT 1 AS instrumentation_probe")
+    monkeypatch.setattr(root_conftest, "STRICT_TEARDOWN", True)
+    monkeypatch.setattr(root_conftest, "_TEARDOWN_GRACE_S", 0.0)
 
-    assert rows
-    assert all(len(row) == 2 for row in rows)
-    assert "review-secret-literal" not in repr(rows)
+    try:
+        with pytest.raises(AssertionError) as caught:
+            _drop_database(pg_provisioner, pg_database, expect_clean=True)
+    finally:
+        leaked.invalidate()
+        leaked.close()
+        engine.dispose()
+
+    message = str(caught.value)
+    assert "application_name='test.guard-injected-leak'" in message
+    assert "backend_start=" in message
+    assert "state='idle'" in message
+    assert "xact_start=" in message
+    assert "query='SELECT 1 AS instrumentation_probe'" in message
 
 
 def test_seed_device_type_contract_allows_no_netbox_identity():

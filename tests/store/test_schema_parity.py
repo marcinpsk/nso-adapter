@@ -131,11 +131,11 @@ def test_alembic_baseline_matches_create_all(pg_provisioner):
 
         from nso_adapter.store.models import Base
 
-        ca_engine = sa.create_engine(ca_url)
+        ca_engine = sa.create_engine(ca_url, connect_args={"application_name": "tests.schema_parity.create_all"})
         Base.metadata.create_all(ca_engine)
 
         _alembic_upgrade_head(al_url)
-        al_engine = sa.create_engine(al_url)
+        al_engine = sa.create_engine(al_url, connect_args={"application_name": "tests.schema_parity.alembic"})
 
         ca_snap = _snapshot(ca_engine)
         al_snap = _snapshot(al_engine)

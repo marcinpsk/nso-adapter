@@ -485,7 +485,10 @@ async def test_dispose_engine_noop_when_unset(monkeypatch):
 async def test_dispose_engine_disposes_real_engine(monkeypatch, pg_url):
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    engine = create_async_engine(pg_url)
+    engine = create_async_engine(
+        pg_url,
+        connect_args={"server_settings": {"application_name": "tests.lifespan.dispose_engine"}},
+    )
     monkeypatch.setattr("nso_adapter.main.get_engine", lambda: engine)
 
     await _dispose_engine()  # real engine, real dispose
@@ -613,7 +616,10 @@ async def test_init_database_never_materializes_schema(monkeypatch, unmigrated_p
     def _tables(conn):
         return set(sa.inspect(conn).get_table_names())
 
-    engine = create_async_engine(unmigrated_pg_url)
+    engine = create_async_engine(
+        unmigrated_pg_url,
+        connect_args={"server_settings": {"application_name": "tests.lifespan.schema_probe"}},
+    )
     try:
         async with engine.connect() as conn:
             before = await conn.run_sync(_tables)

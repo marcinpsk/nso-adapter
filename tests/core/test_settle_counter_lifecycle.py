@@ -228,7 +228,7 @@ def test_every_device_insert_path_creates_a_counter_migration(pg_provisioner):
         url = _url_for(dbname, driver="postgresql+psycopg2")
         _alembic(url, "upgrade", _PRE_COUNTER_REVISION)
 
-        engine = sa.create_engine(url)
+        engine = sa.create_engine(url, connect_args={"application_name": "tests.settle_counter.pre_upgrade"})
         with engine.begin() as conn:
             device_id = conn.exec_driver_sql(
                 "INSERT INTO devices "
@@ -239,7 +239,7 @@ def test_every_device_insert_path_creates_a_counter_migration(pg_provisioner):
 
         _alembic(url, "upgrade", "head")
 
-        engine = sa.create_engine(url)
+        engine = sa.create_engine(url, connect_args={"application_name": "tests.settle_counter.post_upgrade"})
         with engine.connect() as conn:
             backfilled = conn.exec_driver_sql(
                 f"SELECT last_seq FROM device_settle_counter WHERE device_id = {device_id}"

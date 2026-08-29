@@ -71,7 +71,11 @@ def _private_database(pg_provisioner, tag: str):
 
 @contextmanager
 def _engine_on(sync_url: str):
-    engine = sa.create_engine(sync_url, poolclass=sa.pool.NullPool)
+    engine = sa.create_engine(
+        sync_url,
+        poolclass=sa.pool.NullPool,
+        connect_args={"application_name": "tests.static_route_identity_migration"},
+    )
     try:
         yield engine
     finally:
