@@ -602,7 +602,9 @@ Phase 2: the rest activate as M5–M6 land.
 ## Actions (async)
 
 Unless its section documents otherwise, an action returns `202` with
-`{ "job_id": <int> }`. Only
+`{ "job_id": <int> }`. The one exception at this level: the generation barrier
+actions (`retry-generation`, `abandon-generation`) return a nullable `job_id`,
+documented in their section below. Only
 one job per device runs at a time: if an action is requested while a
 `queued`/`running` job exists for that device, the adapter returns `409
 conflict` with the existing job's id in `error.detail.job_id`.
