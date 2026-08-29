@@ -1125,6 +1125,35 @@
         "title": "CapabilityOut",
         "type": "object"
       },
+      "DeletedRoute": {
+        "description": "One NetBox route pk the operator deleted, and where the adapter may be holding it.\n\n``triples`` is the route's LINEAGE, most-authoritative-first (last acknowledged, then\ncurrent): a content edit whose push never landed leaves the adapter on the older triple,\nso an id carrying only the current one would match nothing and be called moot (\u00a74.1).\nAn empty list restores the undecidable degraded-versus-moot partition and is a 422.\n\nTwo is the ceiling, not a convention (R9-M2): the adapter can only hold a triple that was\nsent, and at most one claim is ever unresolved. A third distinct triple would be\nclassification evidence the contract never grants \u2014 a ``route_id IS NULL`` row matching\nonly it flips the acknowledgement from moot to degraded \u2014 so it is a 422 too.\n\n``unverified`` is declared, never inferred from the lineage's shape: a verified ``[C, C]``\ndeduplicates to exactly what a genuinely unverified ``[C]`` produces (R10-B1).",
+        "properties": {
+          "route_id": {
+            "title": "Route Id",
+            "type": "integer"
+          },
+          "triples": {
+            "items": {
+              "$ref": "#/components/schemas/RouteTriple"
+            },
+            "maxItems": 2,
+            "minItems": 1,
+            "title": "Triples",
+            "type": "array"
+          },
+          "unverified": {
+            "title": "Unverified",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "route_id",
+          "triples",
+          "unverified"
+        ],
+        "title": "DeletedRoute",
+        "type": "object"
+      },
       "DeviceCreate": {
         "properties": {
           "netbox_device_id": {
@@ -1153,6 +1182,17 @@
           "active_address": {
             "title": "Active Address",
             "type": "string"
+          },
+          "failback_blocked_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failback Blocked Reason"
           },
           "last_probe_at": {
             "anyOf": [
@@ -1293,7 +1333,8 @@
           "oob_health_detail",
           "oob_health_checked_at",
           "last_switch_at",
-          "manual_override"
+          "manual_override",
+          "failback_blocked_reason"
         ],
         "title": "DeviceFailoverOut",
         "type": "object"
@@ -2342,6 +2383,137 @@
         "title": "IntentReadOut",
         "type": "object"
       },
+      "IntentReceiptOut": {
+        "description": "One ``(device, section)`` receipt \u2014 EMIT-NULL, every key always present.\n\n``section`` is the adapter's own stream vocabulary (:mod:`core.intent_protocol`). The\npusher's delivery key for the interface family is ``interface`` and maps onto\n``interface_config`` here; the other fifteen names are identical on both sides.",
+        "properties": {
+          "backfill_only": {
+            "title": "Backfill Only",
+            "type": "boolean"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "delete_origin": {
+            "title": "Delete Origin",
+            "type": "boolean"
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": "integer"
+          },
+          "generation_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation Id"
+          },
+          "push_seq": {
+            "title": "Push Seq",
+            "type": "integer"
+          },
+          "request_digest": {
+            "title": "Request Digest",
+            "type": "string"
+          },
+          "response": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response"
+          },
+          "section": {
+            "title": "Section",
+            "type": "string"
+          },
+          "status_code": {
+            "title": "Status Code",
+            "type": "integer"
+          },
+          "store_only": {
+            "title": "Store Only",
+            "type": "boolean"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "device_id",
+          "section",
+          "push_seq",
+          "request_digest",
+          "store_only",
+          "delete_origin",
+          "backfill_only",
+          "status_code",
+          "response",
+          "generation_id",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "IntentReceiptOut",
+        "type": "object"
+      },
+      "IntentReceiptsOut": {
+        "properties": {
+          "global_max_push_seq": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Global Max Push Seq"
+          },
+          "global_max_route_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Global Max Route Id"
+          },
+          "receipts": {
+            "items": {
+              "$ref": "#/components/schemas/IntentReceiptOut"
+            },
+            "title": "Receipts",
+            "type": "array"
+          }
+        },
+        "required": [
+          "receipts",
+          "global_max_push_seq",
+          "global_max_route_id"
+        ],
+        "title": "IntentReceiptsOut",
+        "type": "object"
+      },
       "IntentRowOut": {
         "description": "One mirror row \u2014 EMIT-NULL (all six keys always present).",
         "properties": {
@@ -2435,11 +2607,18 @@
         "type": "object"
       },
       "IntentSummaryOut": {
-        "description": "GET /intent-summary \u2014 a {scope_name: {count, applied, failed}} map, non-empty scopes only.",
+        "description": "GET /intent-summary with owned-intent counts and unresolved stream clears.",
         "properties": {
           "device_id": {
             "title": "Device Id",
             "type": "integer"
+          },
+          "pending_clear": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/PendingClearSummary"
+            },
+            "title": "Pending Clear",
+            "type": "object"
           },
           "scopes": {
             "additionalProperties": {
@@ -2451,7 +2630,8 @@
         },
         "required": [
           "device_id",
-          "scopes"
+          "scopes",
+          "pending_clear"
         ],
         "title": "IntentSummaryOut",
         "type": "object"
@@ -5808,6 +5988,30 @@
         "title": "OspfInterfaceOut",
         "type": "object"
       },
+      "PendingClearSummary": {
+        "description": "A stream with a clear that has no admitted networked carrier.",
+        "properties": {
+          "provenance": {
+            "enum": [
+              "authorized",
+              "store_only"
+            ],
+            "title": "Provenance",
+            "type": "string"
+          },
+          "since": {
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$",
+            "title": "Since",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provenance",
+          "since"
+        ],
+        "title": "PendingClearSummary",
+        "type": "object"
+      },
       "PreflightRequest": {
         "properties": {
           "aspath_names": {
@@ -6546,6 +6750,30 @@
           "entries"
         ],
         "title": "RoutePolicyRouteMapOut",
+        "type": "object"
+      },
+      "RouteTriple": {
+        "description": "One ``(vrf, prefix, next_hop)`` identity.\n\nThe only thing the adapter can match a deleted NetBox route by once its intent row is gone.",
+        "properties": {
+          "next_hop": {
+            "title": "Next Hop",
+            "type": "string"
+          },
+          "prefix": {
+            "title": "Prefix",
+            "type": "string"
+          },
+          "vrf": {
+            "default": "",
+            "title": "Vrf",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prefix",
+          "next_hop"
+        ],
+        "title": "RouteTriple",
         "type": "object"
       },
       "ScopeOut": {
@@ -7472,11 +7700,32 @@
         "type": "object"
       },
       "StaticRouteIntentResult": {
-        "description": "The static-route PUT's 2xx body: the shared summary plus the per-route echo.",
+        "description": "The static-route PUT's 2xx body: the shared summary, the per-route echo, the ack.\n\nThe three id lists PARTITION the ``deleted_routes`` the request carried \u2014 unique within\neach list, pairwise disjoint, no id the request did not send, and exact coverage. The\npusher validates all four properties and treats anything else as a protocol violation, so\na union of the three is not enough: executed ``[1]`` with degraded ``[1]`` would otherwise\ndrive both a degradation record and a restore decision for one id.\n\n``removed_uncorrelated`` is emitted on EVERY mode, normal, store-only and backfill-only\nalike (R11-B2): a normal push detaches a ``route_id IS NULL`` row nobody claimed exactly\nas a backfill pass prunes one, and the pusher's conservative attribution rule reads it.",
         "properties": {
           "count": {
             "title": "Count",
             "type": "integer"
+          },
+          "deleted_degraded_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Deleted Degraded Ids",
+            "type": "array"
+          },
+          "deleted_executed_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Deleted Executed Ids",
+            "type": "array"
+          },
+          "deleted_moot_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Deleted Moot Ids",
+            "type": "array"
           },
           "device_id": {
             "title": "Device Id",
@@ -7485,6 +7734,13 @@
           "removed": {
             "title": "Removed",
             "type": "integer"
+          },
+          "removed_uncorrelated": {
+            "items": {
+              "$ref": "#/components/schemas/RouteTriple"
+            },
+            "title": "Removed Uncorrelated",
+            "type": "array"
           },
           "replaced": {
             "title": "Replaced",
@@ -7503,13 +7759,31 @@
           "count",
           "removed",
           "replaced",
-          "routes"
+          "routes",
+          "deleted_executed_ids",
+          "deleted_degraded_ids",
+          "deleted_moot_ids",
+          "removed_uncorrelated"
         ],
         "title": "StaticRouteIntentResult",
         "type": "object"
       },
       "StaticRouteIntentUpdate": {
         "properties": {
+          "deleted_routes": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/DeletedRoute"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deleted Routes"
+          },
           "routes": {
             "items": {
               "$ref": "#/components/schemas/StaticRouteEntry"
@@ -9770,6 +10044,19 @@
               "title": "Device Id",
               "type": "integer"
             }
+          },
+          {
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": true,
+            "schema": {
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
@@ -9924,6 +10211,19 @@
             "required": true,
             "schema": {
               "title": "Device Id",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": true,
+            "schema": {
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
               "type": "integer"
             }
           }
@@ -10245,6 +10545,19 @@
               "title": "Device Id",
               "type": "integer"
             }
+          },
+          {
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": true,
+            "schema": {
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
@@ -10536,6 +10849,19 @@
               "title": "Device Id",
               "type": "integer"
             }
+          },
+          {
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": true,
+            "schema": {
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
@@ -10762,6 +11088,19 @@
               "title": "Device Id",
               "type": "integer"
             }
+          },
+          {
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": true,
+            "schema": {
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
@@ -10850,6 +11189,19 @@
               "title": "Device Id",
               "type": "integer"
             }
+          },
+          {
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": true,
+            "schema": {
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
@@ -10936,6 +11288,19 @@
             "required": true,
             "schema": {
               "title": "Device Id",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": true,
+            "schema": {
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
               "type": "integer"
             }
           }
@@ -11091,6 +11456,19 @@
             "required": true,
             "schema": {
               "title": "Device Id",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": true,
+            "schema": {
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
               "type": "integer"
             }
           }
@@ -11535,6 +11913,19 @@
               "title": "Device Id",
               "type": "integer"
             }
+          },
+          {
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": true,
+            "schema": {
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
@@ -11688,6 +12079,19 @@
             "required": true,
             "schema": {
               "title": "Device Id",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": true,
+            "schema": {
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
               "type": "integer"
             }
           }
@@ -11980,6 +12384,19 @@
             "required": true,
             "schema": {
               "title": "Device Id",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": true,
+            "schema": {
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
               "type": "integer"
             }
           }
@@ -12549,6 +12966,19 @@
               "title": "Device Id",
               "type": "integer"
             }
+          },
+          {
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": true,
+            "schema": {
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
@@ -12768,6 +13198,19 @@
             "required": true,
             "schema": {
               "title": "Device Id",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": true,
+            "schema": {
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
               "type": "integer"
             }
           }
@@ -12993,6 +13436,19 @@
               "title": "Device Id",
               "type": "integer"
             }
+          },
+          {
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": true,
+            "schema": {
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
@@ -13147,6 +13603,19 @@
             "required": true,
             "schema": {
               "title": "Device Id",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": true,
+            "schema": {
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
               "type": "integer"
             }
           }
@@ -13534,6 +14003,19 @@
               "title": "Device Id",
               "type": "integer"
             }
+          },
+          {
+            "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+            "in": "header",
+            "name": "X-Push-Seq",
+            "required": true,
+            "schema": {
+              "description": "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an absent header is a 422, exactly as a value outside 1 \u2026 2^63-1 is, and never a silent downgrade to an unkeyed write.",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "X-Push-Seq",
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
@@ -13606,6 +14088,87 @@
         "summary": "Put Vlan Intent",
         "tags": [
           "vlan"
+        ]
+      }
+    },
+    "/api/v1/intent-receipts": {
+      "get": {
+        "description": "Serve the per-key receipts, filterable, plus the two fleet-wide maxima.",
+        "operationId": "list_intent_receipts_api_v1_intent_receipts_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "device_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Device Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "section",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Section"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IntentReceiptsOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request validation failed (envelope shape)"
+          }
+        },
+        "security": [
+          {
+            "_OptionalBearer": []
+          }
+        ],
+        "summary": "List Intent Receipts",
+        "tags": [
+          "intent-receipts"
         ]
       }
     },

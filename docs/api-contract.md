@@ -125,12 +125,14 @@ authorized, with the collateral guard off — so it promotes no stream and marks
 
 - the digest is `sha256` over the canonical JSON of the raw request body
   (`json.dumps(body, sort_keys=True, default=str)`);
-- the mode is the pair (`?store_only=`, `?delete_origin=`) as parsed — `1`, `true`,
-  `yes`, `on` are true, everything else (absent included) is false. The body does
-  not say what the request does with it: store-only authorizes no device write,
-  delete-origin turns a shrink into a networked retraction, and the unmarked form
-  detaches instead. One sequence carrying one body under two of those is two
-  different deployments.
+- the mode is the triple (`?store_only=`, `?delete_origin=`, `?backfill_only=`) as
+  parsed: `1`, `true`, `yes`, `on` are true; `0`, `false`, `no`, `off` and an absent
+  flag are false; any other spelling is refused with `422 validation_error`. The
+  body does not say what the request does with it: store-only authorizes no
+  device write, delete-origin turns a shrink into a networked retraction, the unmarked
+  form detaches instead, and backfill-only adopts ids and prunes uncorrelated rows while
+  writing no content at all. One sequence carrying one body under two of those is two
+  different operations.
 
 **Admission.**
 
@@ -147,10 +149,17 @@ INSIDE that lock answers **404 `not_found`**, the same as a push for a device th
 already gone — the outbox retrying a push while an operator removes the device is a
 race, not a server error.
 
-The sequence domain is `1 … 2^63-1`; a present header that is malformed or outside it
-is **422**, never a silent downgrade to an unkeyed write. An ABSENT header is accepted
-and simply gets no receipt — the direct-apply families (lacp, switchport) are
-deliberately claim-less, and they are POSTs, not intent PUTs. The two remaining PUTs
+The header is **required** on every one of the sixteen endpoints above, and the sequence
+domain is `1 … 2^63-1`. An absent header is a **422**, exactly as a malformed or
+out-of-domain one is, and never a silent downgrade to an unkeyed write: the refusal happens
+at request validation, so the mutation does not run and no receipt is written. Without it
+the delivery is unresolvable — the write commits with nothing to recognise a redelivery by,
+so a lost response turns the retry into a second operation.
+
+The header is a DECLARED, required parameter of each of the sixteen endpoints, with those
+bounds, and appears in `/openapi.json`; the two out-of-protocol PUTs declare no such
+parameter. The direct-apply families (lacp, switchport) are deliberately claim-less and are
+POSTs, not intent PUTs, so they never reach admission. The two remaining PUTs
 (`/api/v1/config/failover` and `PUT /api/v1/devices/{id}/scope`) are adapter
 configuration rather than intent deliveries and carry no claim either.
 
@@ -496,12 +505,21 @@ their parent and skipped.
   "scopes": {
     "static_route_intent":  { "count": 4, "applied": 4, "failed": 0 },
     "vlan_intent":          { "count": 12, "applied": 0, "failed": 0 }
+  },
+  "pending_clear": {
+    "ospf": { "provenance": "authorized", "since": "2026-08-25T10:30:00Z" }
   } }
 ```
 
 - `count` — intent rows the adapter holds for this device.
-- `applied` — rows with a non-null `last_apply_at`.
+- `applied`: rows with a non-null `last_apply_at`. This counts timestamps. It is not proof
+  that the current intent is on the device.
 - `failed` — rows with a non-null `last_apply_error`.
+- `pending_clear`: streams with a recorded clear that has no admitted networked carrier.
+  The map itself is always present (`{}` when no row exists); only a stream's entry inside
+  it is absent. Each value reports only its provenance and the
+  time the obligation was first recorded. It never reports leaf names or paths. A listed
+  stream can still hold a device leaf that the intent store says is unset.
 
 Cheap by design (one count query per table): the plugin calls it on every
 device-tab render to detect intent split-brain (next section).
@@ -584,7 +602,9 @@ Phase 2: the rest activate as M5–M6 land.
 ## Actions (async)
 
 Unless its section documents otherwise, an action returns `202` with
-`{ "job_id": <int> }`. Only
+`{ "job_id": <int> }`. The one exception at this level: the generation barrier
+actions (`retry-generation`, `abandon-generation`) return a nullable `job_id`,
+documented in their section below. Only
 one job per device runs at a time: if an action is requested while a
 `queued`/`running` job exists for that device, the adapter returns `409
 conflict` with the existing job's id in `error.detail.job_id`.
@@ -815,6 +835,58 @@ persisted per device so a process restart does not reset it.
 
 ---
 
+## Intent push receipts
+
+### `GET /api/v1/intent-receipts` → `200 | 401 | 422`
+
+Every per-key push receipt, plus the two fleet-wide maxima a restored pusher needs before
+it resolves a single outstanding claim. Filterable by `device_id` and by `section`; an
+unrecognised `section` is a **422** (`reason = "unknown_section"`, with the valid set in
+`detail.sections`) rather than an empty page, because an empty page reads as "this key has
+no receipt" and sends the restore down the wrong branch.
+
+```json
+{
+  "receipts": [
+    {
+      "device_id": 1,
+      "section": "static_route",
+      "push_seq": 4,
+      "request_digest": "3b1f…",
+      "store_only": false,
+      "delete_origin": false,
+      "backfill_only": false,
+      "status_code": 200,
+      "response": { "device_id": 1, "count": 1, "removed": 0, "replaced": false,
+                    "routes": [{ "route_id": 41, "generation": 12, "fingerprint": "9f2c…" }],
+                    "deleted_executed_ids": [], "deleted_degraded_ids": [],
+                    "deleted_moot_ids": [], "removed_uncorrelated": [] },
+      "generation_id": 12,
+      "created_at": "2026-08-11T10:00:00Z",
+      "updated_at": "2026-08-11T10:00:00Z"
+    }
+  ],
+  "global_max_push_seq": 11,
+  "global_max_route_id": 4242
+}
+```
+
+`section` is the adapter's own stream vocabulary — the sixteen names in the `X-Push-Seq`
+table above. The plugin's delivery key for the interface family is `interface` and maps onto
+`interface_config` here; the other fifteen are identical on both sides.
+
+`response` is the stored response that push returned. A restored pusher re-validates its
+claim's exact deletion set against it rather than re-sending.
+
+**Both maxima are fleet-wide, filter or no filter.** `global_max_push_seq` is the highest
+admitted sequence anywhere, so a restored pusher allocates above it and never re-uses one.
+`global_max_route_id` is the highest NetBox route pk the adapter holds anywhere, counting the
+tombstones as well as the live intent rows: a plugin-only restore rewinds `StaticRoute`'s pk
+sequence, so a snapshot taken before pk R existed can re-allocate R while the adapter still
+holds an unrelated row carrying `route_id = R` — and the deletion partition's first pass
+would bind that row as genuine and authorize removing it. Advancing the pk sequence past this
+value is what closes that. `null` on both means the adapter holds nothing, which is not `0`.
+
 ## SNMP Configuration (M11)
 
 ### `GET /api/v1/devices/{id}/snmp-config` → `200 | 404`
@@ -925,8 +997,9 @@ Field notes:
 
 ### `GET /api/v1/devices/{id}/static-route-intent` → `200 | 404`
 
-Re-serves the settlement coordinates of every stored intent row for this device — the same
-`{route_id, generation, fingerprint}` triples the last `PUT` echoed.
+Re-serves the settlement coordinates of every stored intent row for this device, as
+`{route_id, generation, fingerprint}` triples rendered by the same renderer the `PUT` echo
+uses.
 
 ```json
 {
@@ -941,8 +1014,17 @@ This is the recovery path for a **lost PUT response**. The PUT commits its store
 before it answers, so a response lost in flight leaves the pusher holding intent the adapter
 has already stored but for which the pusher recorded no expectation — and an apply result
 for that intent would then correlate with nothing. The triples are rendered from the stored
-rows themselves, by the same renderer the PUT uses, so the read-back cannot drift from what
-the PUT reported.
+rows themselves, by the same renderer the PUT uses, so a coordinate read back here cannot
+drift from the coordinate a PUT reports for that row.
+
+It is **not** a report of what any one pass wrote. The read reflects the store's CURRENT
+correlation state: it echoes every stored row whatever assigned its `route_id`, and it
+cannot attribute a row to a push. The **receipt** is the sole authority for that — replay
+the lost push at its own `X-Push-Seq` to get that pass's exact response back. The two
+answers differ on purpose under `?backfill_only=true`, whose `count` and `routes` name only
+the rows the pass wrote an id onto: an entry carrying neither `route_id` nor `generation`
+wrote nothing, so it is absent from the receipt while its already-correlated row is still
+listed here. A recovering pusher must therefore not read this list as an acknowledgement.
 
 `route_id` and `generation` are `null` for a row whose pusher never supplied them; a `null`
 on either never correlates with anything (see below).
@@ -966,6 +1048,13 @@ routes must be omitted by the caller.
       "permanent": false,
       "tag": null
     }
+  ],
+  "deleted_routes": [
+    {
+      "route_id": 40,
+      "triples": [{ "vrf": "", "prefix": "10.0.0.0/24", "next_hop": "10.0.0.2" }],
+      "unverified": false
+    }
   ]
 }
 ```
@@ -975,11 +1064,15 @@ Response:
 {
   "device_id": 1,
   "count": 1,
-  "removed": 0,
-  "replaced": false,
+  "removed": 1,
+  "replaced": true,
   "routes": [
     { "route_id": 41, "generation": 12, "fingerprint": "9f2c…" }
-  ]
+  ],
+  "deleted_executed_ids": [40],
+  "deleted_degraded_ids": [],
+  "deleted_moot_ids": [],
+  "removed_uncorrelated": []
 }
 ```
 
@@ -1029,6 +1122,80 @@ actually holds; a pusher cannot recompute it locally, which is why it is echoed 
 assumed. `GET /api/v1/devices/{id}/static-route-intent` re-serves the same triples if the
 response is lost.
 
+#### `deleted_routes` — the deletion authority, and its acknowledgement
+
+A full-replace body cannot say WHY a route left it: an operator deleting a NetBox route and
+an operator un-owning it produce the same shrink, and the two have opposite device outcomes.
+`deleted_routes` is that answer, one record per deleted NetBox route pk:
+
+| field | meaning |
+|---|---|
+| `route_id` | the deleted `routing.StaticRoute` pk |
+| `triples` | its LINEAGE, most-authoritative-first: the last acknowledged triple, then the current one. Deduplicated. Empty is a **422**, and so is a third triple — the ceiling is enforced at request validation, not assumed |
+| `unverified` | declared by the pusher when the overlay held no acknowledged triple. Never inferred from the lineage's shape — a verified `[C, C]` deduplicates to exactly what an unverified `[C]` produces |
+
+The field is optional today. Omission or an explicit `null` is the PRE-ACTIVATION shape:
+the scope is still marked for the whole request by `?delete_origin=`. A list (empty
+included) means the push marks **per object**, and `?delete_origin=` no longer applies to
+this scope.
+
+**Classification.** Two ordered passes over the rows this push removes:
+
+1. **by `route_id`, exclusively.** A requested id equal to a removed row's `route_id` is
+   GENUINE: its removal retracts from the device, and both the id and the row leave the pool.
+2. **by triple, over the remainder.** A removed `route_id IS NULL` row classifies EVERY
+   remaining id whose lineage carries its triple, identically — NetBox has no uniqueness
+   constraint on the triple, so two deleted pks can legitimately share one against one
+   adapter row. Those ids are DEGRADED: the row is detached, and the record exists so the
+   detach is not silent.
+
+A remaining id that matched nothing is MOOT, unless its lineage is `unverified` **and** this
+push removed at least one uncorrelated row — then it is degraded, attributed to that row.
+
+The response carries the three id lists plus `removed_uncorrelated`, the triples of the
+removed `route_id IS NULL` rows no requested id claimed. The three lists PARTITION the
+requested set: unique within each, pairwise disjoint, no unknown id, exact coverage. All four
+fields are emitted on **every** mode — normal, store-only, backfill-only and delete_origin.
+
+Response lists are sorted and do not preserve request order. The receipt's
+`request_digest` covers the body as sent — array order included — so two orderings of one
+request are different delivery identities, not one replayed receipt.
+
+#### `409` before any effect: `fence_shut` and `store_only_deletion`
+
+A genuine deletion needs a tombstone — the only carrier of the deletion once the intent row
+is gone. No tombstone is written while the device's replacement fence is shut (some row still
+carries no `route_id`) or the request is `?store_only=true`. A request carrying a genuine
+deletion under either condition is refused with `409 conflict` and
+`error.detail.reason = "fence_shut"` or `"store_only_deletion"`, **before any effect**: no row
+deleted, no tombstone, no job, and no receipt — so the sequence is not burned and the pusher
+can abandon the claim and re-send at a new one. `error.detail.route_ids` names the ids.
+
+#### `?backfill_only=true` — opening the fence
+
+A key holding a pending genuine deletion cannot open its own fence: any ordinary push omitting
+the deleted route destroys the before-image the deletion depends on. This mode is the way out.
+Under it the request:
+
+- adopts `route_id` and `generation` from every payload entry onto its matched row, and writes
+  **no content** — a row whose adapter state has drifted stays drifted. `count` and `routes`
+  report the rows an id was written onto, so an entry carrying neither field acknowledges
+  nothing. Recover a lost response by replaying the push, never from the `GET`, which lists
+  every stored row regardless of which pass correlated it;
+- leaves every omitted row that carries a `route_id` exactly as it is;
+- prunes every omitted row whose `route_id` is NULL, reporting each in `removed_uncorrelated`;
+- refuses with **422** (`reason = "backfill_missing_route_id"`) if a matched row has a NULL
+  `route_id` and its payload entry does not supply one; `detail.routes` names the affected triples;
+- spawns nothing: no removal job, no tombstone, no auto-apply;
+- carries no authority: a non-empty `deleted_routes` is a **422**
+  (`reason = "backfill_carries_deletions"`);
+- takes an `X-Push-Seq` and writes a receipt, so it is replayable and cannot be re-applied at
+  a stale sequence. The mode is part of the receipt identity, so the same sequence delivered
+  once as a backfill and once as an ordinary push is `409 sequence_reuse`, never a replay.
+
+`static_route` is the only stream that implements it. Any other in-protocol intent PUT
+carrying the flag is a **422** (`reason = "backfill_only_unsupported"`).
+
 #### `422` refusals
 
 All use the standard envelope with `error.code = "validation_error"`; the specific rule
@@ -1038,6 +1205,9 @@ is in `error.detail.reason`:
 |---|---|
 | `duplicate_triple` | two entries carry the same `(vrf, prefix, next_hop)`; `detail.triple` names it |
 | `duplicate_route_id` | two entries claim the same non-null `route_id`; `detail.route_id` names it |
+| `duplicate_deleted_route_id` | two `deleted_routes` records claim the same `route_id`; emission is id-oriented, exactly one outcome per id |
+| `backfill_carries_deletions` | a `?backfill_only=true` body carried a non-empty `deleted_routes` |
+| `backfill_missing_route_id` | a `?backfill_only=true` entry matched an uncorrelated row but did not assign a non-null `route_id`; `detail.routes` names the affected triples |
 
 Entries with no `route_id` never collide with each other — a body of routes that all omit
 it is the normal shape and is accepted.
@@ -1888,6 +2058,30 @@ from the intent store would otherwise leave the config orphaned on the device. T
 revert it, the owning `*-reconciler` service instance is **PUT-replaced** with the
 full remaining accepted state, which lets NSO FASTMAP delete the dropped entries.
 
+The same rule applies to a device-effective scalar that changes from emitted state to
+omitted state. A clear with no un-own gets a networked removal job, so that admission
+discharges any pending-clear row for the promoted stream. If an un-own rides with the
+clear, the existing detach job still admits and the clear is deferred. The adapter then
+records one `stream_pending_clear` row for each promoted stream at its current desired
+revision. Static routes use their own per-route pending-clear mechanism and never use this
+table. L2 SAP `port`, `outer_tag`, and `inner_tag` are informational and key-derived, so
+omitting them is not a device-effective clear.
+
+The recording provenance comes from the request mode. An ordinary deferred clear records
+`authorized`. A clear detected under `?store_only=true` records `store_only`, creates no
+job, and creates no deployment generation. A later authorized recording for the same
+stream replaces its store-only row and keeps the highest revision. A later store-only push
+never demotes or advances an authorized row. A parked row can leave store-only provenance
+only when a later authorized push of the same stream reaches the removal choke. The
+Apply-action promotion-release hook is follow-on work above this branch, so this core does
+not release a parked row from an unrelated Apply.
+Recording is per stream, not per document section. An `isis` push cannot create or promote
+an `isis_flex_algo` row.
+
+`POST /api/v1/devices/{id}/actions/force-removal` is the operator discharge. When its
+promotion-free removal job admits, it deletes the device's pending-clear rows for every
+stream in the affected section in the same transaction. It records no new row.
+
 That PUT-replace is a synchronous device commit that can exceed the plugin's HTTP
 client timeout (~30s). So it does **not** run inline in the intent PUT: when an
 intent PUT drops one or more rows it enqueues a **`removal`** job (a new
@@ -1896,8 +2090,9 @@ A worker runs the job in the background, re-reading the **current** accepted row
 and PUT-replacing the service — so the job is idempotent and is requeued (not
 failed) after a worker restart. Scope is carried in `Job.context.scope` (one of
 `route_policy · bfd · svi · subinterface · static_route · interface_mtu · vlan ·
-logging · l2_sap · ospf · bgp`). Job status is observable via `GET …/jobs` like
-any other job; a failed removal records `error.code = "removal_failed"`.
+logging · l2_sap · ospf · bgp · isis · interface_config · snmp`). Job status is
+observable via `GET …/jobs` like any other job; a failed removal records
+`error.code = "removal_failed"`.
 
 `static_route` is the one scope that does **not** rebuild its body from the remaining accepted
 rows — it drops exactly what it is authorized to drop and keeps the rest of the live service

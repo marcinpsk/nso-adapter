@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Clearing an owned scalar must reach the device — on EVERY scope, not just IS-IS/OSPF.
+"""Clearing a device-effective owned scalar must reach the device across intent scopes.
 
 A normal apply is a merge-PATCH (``_send_service_config`` picks ``method="patch"`` when
 ``replace=False``), and every writer emits its optional leaves only when they are set
@@ -16,6 +16,10 @@ reconcile then flipped the overlay to ``changed``, and re-clearing did nothing.
 These drive the real FastAPI routes through the real PostgreSQL session. No NSO is needed: the
 whole assertion is about which JOB the PUT queues, and with what semantics.
 
+L2 SAP port/tag metadata is excluded. It is informational, key-derived, and ignored by the
+planner, so its omission has no device effect. Its regression lives in
+``test_api_l2_service.py::test_omitting_key_derived_sap_metadata_does_not_retract``.
+
     detach absent  → the replace really networks (a clear is not an un-own: the row stays
                      owned and accepted, only the leaf was blanked)
     removed absent → nothing was un-owned, so the collateral guard has no allowance
@@ -26,7 +30,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -74,12 +78,6 @@ _CASES = [
         {"hosts": [{"address": "10.9.1.1"}]},  # severity -> "" (NOT NULL default), port -> None
     ),
     (
-        "l2_sap",
-        "l2-sap-intent",
-        {"saps": [{"service_name": "EPIPE-1", "service_type": "epipe", "sap_id": "1/1/1", "outer_tag": 100}]},
-        {"saps": [{"service_name": "EPIPE-1", "service_type": "epipe", "sap_id": "1/1/1"}]},
-    ),
-    (
         "vlan",
         "vlan-intent",
         {"vlans": [{"vlan_id": 10, "name": "USERS"}]},
@@ -105,11 +103,11 @@ _CASES = [
 async def test_clearing_an_owned_scalar_retracts_for_real(adapter_client, scope, url, body_set, body_cleared):
     device_id = await seed_device(nso_device_name=f"clr-{scope}", netbox_device_id=abs(hash(scope)) % 10000)
 
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/{url}", json=body_set, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/{url}", json=body_set, headers=AUTH | push_seq())
     assert resp.status_code == 200
     assert await _removal_jobs(device_id, scope) == []  # setting a value is not a retraction
 
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/{url}", json=body_cleared, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/{url}", json=body_cleared, headers=AUTH | push_seq())
     assert resp.status_code == 200
 
     jobs = await _removal_jobs(device_id, scope)
@@ -126,9 +124,9 @@ async def test_clearing_an_owned_scalar_under_store_only_touches_nothing(
     """The store-only re-sync re-pushes every scope and promises not to touch the device."""
     device_id = await seed_device(nso_device_name=f"clrso-{scope}", netbox_device_id=abs(hash(scope)) % 10000 + 1)
 
-    await adapter_client.put(f"/api/v1/devices/{device_id}/{url}", json=body_set, headers=AUTH)
+    await adapter_client.put(f"/api/v1/devices/{device_id}/{url}", json=body_set, headers=AUTH | push_seq())
     resp = await adapter_client.put(
-        f"/api/v1/devices/{device_id}/{url}?store_only=true", json=body_cleared, headers=AUTH
+        f"/api/v1/devices/{device_id}/{url}?store_only=true", json=body_cleared, headers=AUTH | push_seq()
     )
     assert resp.status_code == 200
     assert await _removal_jobs(device_id, scope) == []
@@ -142,12 +140,12 @@ async def test_setting_a_value_from_blank_is_not_a_retraction(adapter_client):
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/interface-mtu-intent",
         json={"interfaces": [{"interface_name": "Gi0/0"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/interface-mtu-intent",
         json={"interfaces": [{"interface_name": "Gi0/0", "mtu": 9000}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert await _removal_jobs(device_id, "interface_mtu") == []
 
@@ -173,14 +171,14 @@ async def test_toggling_a_boolean_off_IS_a_retraction_for_static_routes(adapter_
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/static-route-intent",
         json={"routes": [{**route, "permanent": True}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert await _removal_jobs(device_id, "static_route") == []
 
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/static-route-intent",
         json={"routes": [{**route, "permanent": False}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     jobs = await _removal_jobs(device_id, "static_route")
     assert len(jobs) == 1

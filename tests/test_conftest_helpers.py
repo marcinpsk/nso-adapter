@@ -43,12 +43,12 @@ async def test_start_job_returns_the_attempt_under_an_expiring_session(store_eng
         assert started.status is JobStatus.running and started.run_attempt == 1
 
 
-async def test_client_backend_diagnostics_exclude_query_text(store_engine, pg_admin):
+async def test_client_backend_diagnostics_exclude_query_text(store_engine, pg_provisioner):
     """A leaked session's last statement can contain a secret literal."""
     async with store_engine.connect() as leaked:
         await leaked.exec_driver_sql("SELECT 'review-secret-literal'")
-        with pg_admin.connect() as admin:
-            rows = _client_backends(admin, store_engine.url.database)
+        with pg_provisioner.connect() as provisioner:
+            rows = _client_backends(provisioner, store_engine.url.database)
 
     assert rows
     assert all(len(row) == 2 for row in rows)

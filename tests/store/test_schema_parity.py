@@ -117,12 +117,12 @@ def _alembic_upgrade_head(db_url: str) -> None:
         raise AssertionError(f"alembic upgrade head failed:\n{proc.stdout.decode()}\n{proc.stderr.decode()}")
 
 
-def test_alembic_baseline_matches_create_all(pg_admin):
+def test_alembic_baseline_matches_create_all(pg_provisioner):
     suffix = uuid.uuid4().hex[:10]
     ca_db = f"parity_ca_{suffix}"
     al_db = f"parity_al_{suffix}"
 
-    with pg_admin.connect() as conn:
+    with pg_provisioner.connect() as conn:
         conn.exec_driver_sql(f'CREATE DATABASE "{ca_db}"')
         conn.exec_driver_sql(f'CREATE DATABASE "{al_db}"')
     try:
@@ -152,4 +152,4 @@ def test_alembic_baseline_matches_create_all(pg_admin):
             )
     finally:
         for dbname in (ca_db, al_db):
-            _drop_database(pg_admin, dbname, expect_clean=False)
+            _drop_database(pg_provisioner, dbname, expect_clean=False)

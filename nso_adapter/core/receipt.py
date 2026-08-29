@@ -21,19 +21,21 @@ One receipt per ``(device, stream)``, replaced as the sequence advances, decides
 **Why the mode is part of the identity.** The digest covers the wire BODY, and the body
 alone does not say what the request does with it: ``?store_only=true`` mutates the store and
 authorizes no device write, ``?delete_origin=true`` turns a shrink into a networked
-retraction, and the unmarked form detaches instead (#106). The same sequence carrying the
-same bytes under two of those is three different deployments, so the two flags are stored
-as receipt COLUMNS and compared at admission. The digest ALGORITHM is untouched — it is
+retraction, the unmarked form detaches instead (#106), and ``?backfill_only=true`` adopts ids
+and prunes uncorrelated rows while writing no content at all (#1503 §4.4). The same sequence
+carrying the same bytes under two of those is two different operations, so the flags are
+stored as receipt COLUMNS and compared at admission. The digest ALGORITHM is untouched — it is
 pinned by the plugin, which computes it over the raw body it sent.
 
 The receipt is written in the SAME transaction as the mutation it admits. A receipt that
 outlived a rolled-back operation would turn the plugin's retry into a silent no-op, which is
 the one outcome worse than a double apply.
 
-Absence of the header is NOT an error here: the ratified #1503 contract keeps lacp and
-switchport out of the protocol as claim-less direct-apply deliveries, so an unkeyed write is
-admitted and simply gets no receipt. A malformed or out-of-domain header IS an error, and
-the API boundary rejects it before any of this runs (:mod:`core.request_flags`).
+Every in-protocol delivery is keyed: the header is REQUIRED on all sixteen PUTs, so a missing,
+malformed or out-of-domain value is a 422 at the API boundary and nothing here ever sees an
+unkeyed one (:mod:`api.intent_push`). The ratified #1503 contract keeps lacp and switchport
+out of the protocol as claim-less direct-apply deliveries — they are POSTs, they never reach
+admission, and they need no representation in these types.
 """
 
 from __future__ import annotations
@@ -72,8 +74,8 @@ class PushSequenceConflict(Exception):
 class PushIdentity:
     """One delivery's identity: the claim sequence, the body digest, and the request MODE.
 
-    The two mode flags are the canonical form of what the middleware parsed off the query
-    string (``core.request_flags.parse_store_only``), so "absent", ``0`` and ``no`` are one
+    The three mode flags are the canonical form of what the middleware parsed off the query
+    string (``core.request_flags.parse_request_flag``), so "absent", ``0`` and ``no`` are one
     identity and cannot be replayed as ``true``.
     """
 
@@ -81,6 +83,7 @@ class PushIdentity:
     digest: str
     store_only: bool
     delete_origin: bool
+    backfill_only: bool
 
 
 @dataclass(frozen=True)
@@ -88,7 +91,8 @@ class IntentDelivery:
     """One intent PUT as the protocol sees it (see :mod:`core.intent_protocol`).
 
     *stream* is the receipt key AND the promotion unit — the endpoint's lane and the intent
-    tables it owns. *identity* is ``None`` for a claim-less, out-of-protocol delivery.
+    tables it owns. *identity* is not optional: an in-protocol delivery without a claim is
+    refused at the boundary, so there is no unkeyed shape to represent.
 
     The document family the lane composes into is not carried: nothing a request does needs
     it. It is declared on :class:`core.intent_protocol.IntentEndpoint`, where
@@ -96,7 +100,12 @@ class IntentDelivery:
     """
 
     stream: str
-    identity: PushIdentity | None
+    identity: PushIdentity
+
+    @property
+    def push_seq(self) -> int:
+        """The claim sequence this delivery carries."""
+        return self.identity.seq
 
 
 def digest_body(body: object) -> str:
@@ -127,17 +136,17 @@ async def latest_receipt(db: AsyncSession, device_id: int, stream: str) -> Inten
     )
 
 
-def _mode(carrier) -> tuple[bool, bool]:
-    """Return the request mode as one comparable pair: ``(store_only, delete_origin)``."""
-    return bool(carrier.store_only), bool(carrier.delete_origin)
+def _mode(carrier) -> tuple[bool, bool, bool]:
+    """Return the request mode as one comparable triple, receipt row and identity alike."""
+    return bool(carrier.store_only), bool(carrier.delete_origin), bool(carrier.backfill_only)
 
 
 async def admit_push(db: AsyncSession, device_id: int, delivery: IntentDelivery) -> tuple[dict | None, int] | None:
     """Admit one keyed push. Returns the stored ``(response, status)`` on a replay.
 
-    ``None`` means "do the work": either the push is unkeyed, or this sequence is new. The
-    caller must already hold the device's projection lock, so two concurrent deliveries of
-    the same sequence cannot both read "no receipt" and both proceed.
+    ``None`` means "do the work": this sequence is new. The caller must already hold the
+    device's projection lock, so two concurrent deliveries of the same sequence cannot both
+    read "no receipt" and both proceed.
 
     Raises :class:`PushSequenceConflict` for a reused sequence or a stale one.
     """
@@ -145,8 +154,6 @@ async def admit_push(db: AsyncSession, device_id: int, delivery: IntentDelivery)
     if stream not in INTENT_STREAMS:
         raise RuntimeError(f"{stream!r} is not an in-protocol intent stream")
     identity = delivery.identity
-    if identity is None:
-        return None
     receipt = await latest_receipt(db, device_id, stream)
     if receipt is None:
         db.add(
@@ -157,6 +164,7 @@ async def admit_push(db: AsyncSession, device_id: int, delivery: IntentDelivery)
                 request_digest=identity.digest,
                 store_only=identity.store_only,
                 delete_origin=identity.delete_origin,
+                backfill_only=identity.backfill_only,
             )
         )
         await db.flush()
@@ -175,6 +183,7 @@ async def admit_push(db: AsyncSession, device_id: int, delivery: IntentDelivery)
                 "admitted_digest": receipt.request_digest,
                 "admitted_store_only": receipt.store_only,
                 "admitted_delete_origin": receipt.delete_origin,
+                "admitted_backfill_only": receipt.backfill_only,
             },
         )
     if identity.seq < receipt.push_seq:
@@ -187,6 +196,7 @@ async def admit_push(db: AsyncSession, device_id: int, delivery: IntentDelivery)
     receipt.request_digest = identity.digest
     receipt.store_only = identity.store_only
     receipt.delete_origin = identity.delete_origin
+    receipt.backfill_only = identity.backfill_only
     receipt.response = None
     receipt.status_code = 200
     receipt.generation_id = None
@@ -214,10 +224,7 @@ async def record_response(
     from nso_adapter.core.generation import consume_last_enqueued_generation_id
 
     identity = delivery.identity
-    # Consumed even on an unkeyed delivery, so it cannot outlive the request that enqueued it.
     enqueued_generation_id = consume_last_enqueued_generation_id()
-    if identity is None:
-        return
     receipt = await latest_receipt(db, device_id, delivery.stream)
     if receipt is None or receipt.push_seq != identity.seq:  # pragma: no cover — admit_push just wrote it
         raise RuntimeError(f"no admitted receipt for device {device_id} stream {delivery.stream!r} seq {identity.seq}")

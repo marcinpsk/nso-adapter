@@ -32,6 +32,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from nso_adapter.core.request_flags import PENDING_CLEAR_PROVENANCES, REMOVAL_MARKINGS
 from nso_adapter.store.ddl import generation_immutability_ddl
 
 
@@ -553,6 +554,26 @@ class DeviceProjectionStream(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
 
+class StreamPendingClear(Base):
+    """A stream whose unset intent is not yet known to have reached the device."""
+
+    __tablename__ = "stream_pending_clear"
+    __table_args__ = (
+        UniqueConstraint("device_id", "stream", name="uq_stream_pending_clear"),
+        CheckConstraint(
+            f"provenance IN ({', '.join(repr(provenance) for provenance in PENDING_CLEAR_PROVENANCES)})",
+            name="ck_stream_pending_clear_provenance",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[int] = mapped_column(Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False)
+    stream: Mapped[str] = mapped_column(String(32), nullable=False)
+    provenance: Mapped[str] = mapped_column(String(16), nullable=False)
+    revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
+
+
 class IntentPushReceipt(Base):
     """The last admitted keyed push per (device, section) — the replay boundary (#1522 §G2).
 
@@ -569,9 +590,9 @@ class IntentPushReceipt(Base):
 
     ``request_digest`` is sha256 over the canonical JSON of the RAW wire body, so two
     deliveries of the same push digest alike whatever the store does with them. The digest
-    does NOT cover the request MODE — the body says nothing about ``?store_only`` or
-    ``?delete_origin``, and one sequence carrying one body under two of those is two
-    different deployments — so the two flags are stored as columns and compared alongside it.
+    does NOT cover the request MODE — the body says nothing about ``?store_only``,
+    ``?delete_origin``, or ``?backfill_only``. The three flags are stored as columns and
+    compared alongside it, because one body under two modes is two different operations.
     ``section`` holds the intent-ENDPOINT vocabulary (:mod:`core.intent_protocol`), one
     receipt per outbox STREAM, which is why ``ip`` and ``interface_config`` are separate rows
     even though they compose into one projection family. The code calls that vocabulary
@@ -591,10 +612,14 @@ class IntentPushReceipt(Base):
     section: Mapped[str] = mapped_column(String(32), nullable=False)
     push_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
     request_digest: Mapped[str] = mapped_column(String(64), nullable=False)
-    #: The admitted delivery's ``?store_only=true`` / ``?delete_origin=true``, canonicalised
-    #: to booleans by the same parser the middleware uses. Part of the admission identity.
+    #: The admitted delivery's ``?store_only=true`` / ``?delete_origin=true`` /
+    #: ``?backfill_only=true``, canonicalised to booleans by the same parser the middleware
+    #: uses. Part of the admission identity: one body under two of these modes is two
+    #: different operations, and a backfill-only pass in particular writes a completely
+    #: different set of rows than the ordinary push it would otherwise replay as (#1503 §4.4).
     store_only: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"), default=False)
     delete_origin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"), default=False)
+    backfill_only: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"), default=False)
     #: The response body this push returned, replayed byte for byte on a repeat delivery.
     response: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     status_code: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("200"), default=200)
@@ -727,6 +752,9 @@ class DeviceFailover(Base):
     consecutive_successes: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     # Operator set the NSO address to something we don't manage → stop fighting them.
     manual_override: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    # Failback is stuck and needs the operator (#1630): the flip was refused because NSO's
+    # current address could not be read, or the OOB address the device lives on was cleared.
+    failback_blocked_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # Proactive fallback-health: is the OOB path known-good while we're on primary? (None=unknown)
     oob_healthy: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     oob_health_result: Mapped[str | None] = mapped_column(String(16), nullable=True)
@@ -1425,7 +1453,9 @@ class StaticRouteTombstone(Base):
 
     __tablename__ = "static_route_tombstone"
     __table_args__ = (
-        CheckConstraint("marking IN ('delete_origin', 'detach')", name="ck_srt_marking"),
+        # Derived from the one place the vocabulary is defined, so the column, the removal
+        # jobs and the sweeper cannot drift apart.
+        CheckConstraint(f"marking IN ({', '.join(repr(m) for m in REMOVAL_MARKINGS)})", name="ck_srt_marking"),
         # The sweeper's exact predicate, scanned per device and consumed in id order.
         # Non-unique: one push deleting three routes can orphan three at once.
         Index("ix_srt_unclaimed", "device_id", "id", postgresql_where=text("job_id IS NULL")),
@@ -1443,8 +1473,9 @@ class StaticRouteTombstone(Base):
     prefix: Mapped[str] = mapped_column(String(64), nullable=False)
     next_hop: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     deployed_key: Mapped[list | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
-    # String + CHECK rather than a PG enum: the value set is closed and two-valued, and a
-    # new enum type widens the parity snapshot and needs ALTER TYPE care forever.
+    # String + CHECK rather than a PG enum: the closed value set comes from
+    # REMOVAL_MARKINGS. A new enum type widens the parity snapshot and needs ALTER TYPE
+    # care forever.
     marking: Mapped[str] = mapped_column(String(16), nullable=False)
     # The owning removal job. SET NULL, not CASCADE: a deleted job returns the tombstone
     # to the sweeper rather than destroying the deletion carrier.

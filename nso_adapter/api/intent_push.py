@@ -18,22 +18,59 @@ nothing behind because the same transaction is rolled back.
 
 from __future__ import annotations
 
-from fastapi import Request
+from typing import Annotated
+
+from fastapi import Header, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.errors import api_error, push_conflict_error
 from nso_adapter.core.intent_protocol import intent_endpoint
 from nso_adapter.core.receipt import IntentDelivery, PushIdentity, PushSequenceConflict, admit_push, digest_body
-from nso_adapter.core.request_flags import DELETE_ORIGIN, PUSH_SEQ, STORE_ONLY
+from nso_adapter.core.request_flags import (
+    BACKFILL_ONLY,
+    DELETE_ORIGIN,
+    MAX_PUSH_SEQ,
+    MIN_PUSH_SEQ,
+    STORE_ONLY,
+)
+
+_PUSH_SEQ_HEADER = Header(
+    alias="X-Push-Seq",
+    ge=MIN_PUSH_SEQ,
+    le=MAX_PUSH_SEQ,
+    description=(
+        "The delivering claim's identity. REQUIRED on every in-protocol intent PUT: an "
+        "absent header is a 422, exactly as a value outside 1 … 2^63-1 is, and never a "
+        "silent downgrade to an unkeyed write."
+    ),
+)
+
+#: The one stream that implements ``?backfill_only=true`` (#1503 §4.4). Any other in-protocol
+#: delivery carrying the flag is refused: silently running it as an ordinary full-replace is
+#: precisely the before-image destruction the mode exists to prevent.
+BACKFILL_ONLY_STREAM = "static_route"
 
 
-async def get_intent_delivery(request: Request) -> IntentDelivery:
+async def get_intent_delivery(
+    request: Request,
+    x_push_seq: Annotated[int, _PUSH_SEQ_HEADER],
+) -> IntentDelivery:
     """Return this request's delivery: the stream it lands in and what identifies it.
 
-    Declared as a plain ``Request`` dependency rather than ``Header`` parameters so it adds
-    nothing to the OpenAPI schema: the header is a transport-level delivery identity that
-    every in-protocol intent PUT shares, documented once in ``docs/api-contract.md``.
+    ``X-Push-Seq`` is a DECLARED, REQUIRED parameter here, so the sixteen in-protocol intent
+    PUTs carry it in the regenerated OpenAPI snapshot and the two out-of-protocol PUTs —
+    which do not inject this dependency — carry no such parameter. OpenAPI truthfulness
+    applies to headers too, and this is also the only place the header is parsed: presence
+    and domain bounds are declared on the parameter, so an absent or out-of-domain value is
+    refused by the same validator that renders the schema rather than by a second copy of the
+    rule in a middleware.
+
+    Requiredness is what makes the mutation resolvable (#1503 §5 O3.2). A header-less
+    delivery used to commit without a receipt, so a lost response turned the plugin's retry
+    into a SECOND operation rather than a replay; on the backfill stream it also lost the
+    first response's ``removed_uncorrelated`` attribution. The refusal happens during
+    dependency solving, before the endpoint runs: no mutation, no receipt.
 
     The stream comes from the MATCHED ROUTE, never from a literal at the call site, so an
     endpoint, its receipt and the tables it authorizes cannot drift apart. The digest is
@@ -42,20 +79,27 @@ async def get_intent_delivery(request: Request) -> IntentDelivery:
     caches the body, so re-reading it here costs nothing.
     """
     endpoint = intent_endpoint(request.scope["route"].path)
-    seq = PUSH_SEQ.get()
-    identity = None
-    if seq is not None:
-        try:
-            body = await request.json()
-        except ValueError:
-            raise api_error(422, "validation_error", "Request body must contain valid JSON") from None
-        identity = PushIdentity(
-            seq=seq,
+    if BACKFILL_ONLY.get() and endpoint.stream != BACKFILL_ONLY_STREAM:
+        raise api_error(
+            422,
+            "validation_error",
+            f"?backfill_only is implemented for the {BACKFILL_ONLY_STREAM!r} stream only",
+            {"reason": "backfill_only_unsupported", "section": endpoint.stream},
+        )
+    try:
+        body = await request.json()
+    except ValueError:
+        raise api_error(422, "validation_error", "Request body must contain valid JSON") from None
+    return IntentDelivery(
+        stream=endpoint.stream,
+        identity=PushIdentity(
+            seq=x_push_seq,
             digest=digest_body(body),
             store_only=STORE_ONLY.get(),
             delete_origin=DELETE_ORIGIN.get(),
-        )
-    return IntentDelivery(stream=endpoint.stream, identity=identity)
+            backfill_only=BACKFILL_ONLY.get(),
+        ),
+    )
 
 
 async def admit_or_replay(db: AsyncSession, device_id: int, delivery: IntentDelivery) -> JSONResponse | None:
@@ -82,9 +126,8 @@ async def admit_or_replay(db: AsyncSession, device_id: int, delivery: IntentDeli
 async def begin_delivery(db: AsyncSession, device_id: int, delivery: IntentDelivery) -> JSONResponse | None:
     """Record and admit one intent delivery under the device projection lock."""
     from nso_adapter.core.generation import note_write
-    from nso_adapter.core.request_flags import PUSH_SEQ
 
-    await note_write(db, device_id, delivery.stream, push_seq=PUSH_SEQ.get())
+    await note_write(db, device_id, delivery.stream, push_seq=delivery.push_seq)
     return await admit_or_replay(db, device_id, delivery)
 
 

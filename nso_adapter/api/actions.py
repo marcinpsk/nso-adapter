@@ -111,7 +111,16 @@ async def action_force_removal(
             "force-removal of interface_config requires 'interfaces': the interface-reconciler "
             "is keyed per interface, so with none named the job would flush nothing.",
         )
-    job = await enqueue_removal(db, device_id, body.scope, promotes=(), interfaces=body.interfaces, force=True)
+    job = await enqueue_removal(
+        db,
+        device_id,
+        body.scope,
+        marking=None,
+        defer_retract=False,
+        promotes=(),
+        interfaces=body.interfaces,
+        force=True,
+    )
     await db.commit()
     return {"job_id": job.id}
 

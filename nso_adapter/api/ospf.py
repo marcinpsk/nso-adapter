@@ -415,15 +415,18 @@ async def put_ospf_intent(
     deleted = bool(removed_inst or removed_iface or removed_redist)
     cleared = inst_cleared or iface_cleared or redist_cleared
     if deleted or cleared:
-        from nso_adapter.core.removal import enqueue_removal
+        from nso_adapter.core.removal import enqueue_removal, query_flag_marking
 
         # Thread the just-removed keys so the collateral guard can tell this intended
         # retraction from an orphaned service row (redistribute rows are nested,
         # non-guarded content — only the keyed lists matter here, hence `shrank`).
+        marks = query_flag_marking(deletes=deleted)
         await enqueue_removal(
             db,
             device_id,
             "ospf",
+            marking=marks.marking,
+            defer_retract=marks.defer_retract,
             promotes=(delivery.stream,),
             removed={"interface-config": removed_iface, "process-config": removed_inst},
             retract=cleared,

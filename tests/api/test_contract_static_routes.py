@@ -11,7 +11,9 @@ Mirror (consumer side): ``netbox-nso-plugin/.../tests/test_contract_static_route
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -22,6 +24,25 @@ AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "read_state", "routes"}
 ROUTE_REQUIRED_KEYS = {"vrf", "prefix", "next_hop"}
 ROUTE_OPTIONAL_KEYS = {"interface_next_hop", "metric", "permanent", "tag", "name"}
+
+
+def test_receipt_contract_example_echoes_every_counted_route():
+    from nso_adapter.api.static_route import StaticRouteIntentResult
+
+    document = Path("docs/api-contract.md").read_text(encoding="utf-8")
+    receipt_section = document.split("## Intent push receipts", 1)[1]
+    example = json.loads(receipt_section.split("```json", 1)[1].split("```", 1)[0])
+    response = example["receipts"][0]["response"]
+
+    StaticRouteIntentResult.model_validate(response)
+    assert response["count"] == len(response["routes"])
+
+
+def test_deleted_routes_contract_defines_the_nullable_pre_activation_shape():
+    document = Path("docs/api-contract.md").read_text(encoding="utf-8")
+    section = document.split("#### `deleted_routes`", 1)[1].split("#### ", 1)[0]
+
+    assert "Omission or an explicit `null` is the PRE-ACTIVATION shape" in section
 
 
 @pytest.mark.anyio

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -25,7 +25,7 @@ async def test_put_ospf_intent_string_process_id(adapter_client):
         "instances": [{"process_id": "1", "router_id": "198.18.250.117", "vrf": "", "areas": []}],
         "interfaces": [{"interface_name": "LAG99:99", "process_id": "1", "area_id": "0", "passive": False}],
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH, json=payload)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH | push_seq(), json=payload)
     assert resp.status_code == 200
 
     async with session() as db:
@@ -56,7 +56,7 @@ async def test_put_ospf_intent_admin_state(adapter_client):
         "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "enabled": True, "areas": []}],
         "interfaces": [],
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH, json=payload)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH | push_seq(), json=payload)
     assert resp.status_code == 200
 
     async with session() as db:
@@ -90,7 +90,7 @@ async def test_put_ospf_intent_removal_enqueues_job_not_inline(adapter_client):
     # Seed two processes, then PUT a payload that drops one.
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/ospf-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "instances": [
                 {"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []},
@@ -101,7 +101,7 @@ async def test_put_ospf_intent_removal_enqueues_job_not_inline(adapter_client):
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/ospf-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
             "interfaces": [],
@@ -147,7 +147,7 @@ async def test_clearing_an_owned_ospf_interface_scalar_retracts(adapter_client):
     device_id = await seed_device(nso_device_name="ospf-clear-iface", netbox_device_id=930)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/ospf-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
             "interfaces": [{"interface_name": "Gi0/0", "process_id": "1", "area_id": "0", "cost": 100}],
@@ -157,7 +157,7 @@ async def test_clearing_an_owned_ospf_interface_scalar_retracts(adapter_client):
 
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/ospf-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
             "interfaces": [{"interface_name": "Gi0/0", "process_id": "1", "area_id": "0"}],  # cost cleared
@@ -176,7 +176,7 @@ async def test_clearing_an_owned_ospf_instance_scalar_retracts(adapter_client):
     device_id = await seed_device(nso_device_name="ospf-clear-inst", netbox_device_id=931)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/ospf-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
             "interfaces": [],
@@ -184,7 +184,7 @@ async def test_clearing_an_owned_ospf_instance_scalar_retracts(adapter_client):
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/ospf-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"instances": [{"process_id": "1", "vrf": "", "areas": []}], "interfaces": []},  # router_id cleared
     )
     assert resp.status_code == 200
@@ -194,13 +194,50 @@ async def test_clearing_an_owned_ospf_instance_scalar_retracts(adapter_client):
     assert jobs[0].context.get("detach") is None
 
 
+async def test_ospf_enabled_false_to_none_is_an_update_not_a_clear(adapter_client):
+    """The writer maps None to explicit enabled=true, so no replace is needed."""
+    from nso_adapter.store.models import OspfInstanceIntent, StreamPendingClear
+
+    device_id = await seed_device(nso_device_name="ospf-enabled-update", netbox_device_id=934)
+    url = f"/api/v1/devices/{device_id}/ospf-intent"
+    assert (
+        await adapter_client.put(
+            url,
+            headers=AUTH | push_seq(),
+            json={"instances": [{"process_id": "1", "enabled": False, "areas": []}], "interfaces": []},
+        )
+    ).status_code == 200
+    assert (
+        await adapter_client.put(
+            url,
+            headers=AUTH | push_seq(),
+            json={"instances": [{"process_id": "1", "areas": []}], "interfaces": []},
+        )
+    ).status_code == 200
+
+    assert await _ospf_removal_jobs(device_id) == []
+    async with session() as db:
+        pending = (
+            (await db.execute(select(StreamPendingClear).where(StreamPendingClear.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        stored = (
+            await db.execute(select(OspfInstanceIntent.enabled).where(OspfInstanceIntent.device_id == device_id))
+        ).scalar_one()
+    assert pending == []
+    # The second PUT really landed: the row updated False -> None (the writer stores the
+    # wire value verbatim; the renderer maps None to explicit enabled=true).
+    assert stored is None
+
+
 async def test_ospf_unown_riding_along_with_a_clear_defers_the_retract(adapter_client):
     """An un-own in the same push cannot be networked (it would strip the dropped process off
     the device) — safety wins, and the deferred retract is recorded, not silently dropped."""
     device_id = await seed_device(nso_device_name="ospf-mixed", netbox_device_id=932)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/ospf-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "instances": [
                 {"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []},
@@ -211,7 +248,7 @@ async def test_ospf_unown_riding_along_with_a_clear_defers_the_retract(adapter_c
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/ospf-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             # process 2 un-owned AND Gi0/0's cost cleared, in the same push
             "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
@@ -230,7 +267,7 @@ async def test_clearing_an_ospf_scalar_under_store_only_touches_nothing(adapter_
     device_id = await seed_device(nso_device_name="ospf-clear-so", netbox_device_id=933)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/ospf-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
             "interfaces": [{"interface_name": "Gi0/0", "process_id": "1", "area_id": "0", "cost": 100}],
@@ -238,7 +275,7 @@ async def test_clearing_an_ospf_scalar_under_store_only_touches_nothing(adapter_
     )
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/ospf-intent?store_only=true",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
             "interfaces": [{"interface_name": "Gi0/0", "process_id": "1", "area_id": "0"}],
@@ -252,7 +289,7 @@ async def test_put_ospf_intent_device_not_found(adapter_client):
     """Non-existent device → 404."""
     resp = await adapter_client.put(
         "/api/v1/devices/99999/ospf-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"instances": [], "interfaces": []},
     )
     assert resp.status_code == 404
@@ -285,7 +322,7 @@ async def test_put_ospf_intent_creates_redistribution(adapter_client):
         ],
         "interfaces": [],
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH, json=payload)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH | push_seq(), json=payload)
     assert resp.status_code == 200
 
     async with session() as db:
@@ -322,7 +359,7 @@ async def test_put_ospf_intent_redistribution_full_replace_and_update(adapter_cl
 
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/ospf-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json=_body(
             [
                 {"source_protocol": "bgp", "source_ref": "65001", "route_map": "RM-A", "metric": 10},
@@ -333,7 +370,7 @@ async def test_put_ospf_intent_redistribution_full_replace_and_update(adapter_cl
     # Keep bgp (changed route_map/metric/type), drop static.
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/ospf-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json=_body(
             [{"source_protocol": "bgp", "source_ref": "65001", "route_map": "RM-B", "metric": 99, "metric_type": "1"}]
         ),
@@ -362,7 +399,7 @@ async def test_put_ospf_intent_interface_full_replace_and_update(adapter_client)
     device_id = await seed_device(nso_device_name="ospf-iface-replace", netbox_device_id=932)
     await adapter_client.put(
         f"/api/v1/devices/{device_id}/ospf-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "instances": [],
             "interfaces": [
@@ -374,7 +411,7 @@ async def test_put_ospf_intent_interface_full_replace_and_update(adapter_client)
     # Keep GE0/0 (changed cost/passive), drop GE0/1.
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/ospf-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={
             "instances": [],
             "interfaces": [{"interface_name": "GE0/0", "area_id": "0", "passive": True, "cost": 50}],
@@ -411,7 +448,7 @@ async def test_put_ospf_intent_auto_apply_enqueues_apply_job(adapter_client):
         "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
         "interfaces": [{"interface_name": "GE0/0", "process_id": "1", "area_id": "0", "passive": False}],
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH, json=payload)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH | push_seq(), json=payload)
     assert resp.status_code == 200
 
     async with session() as db:
@@ -434,7 +471,7 @@ async def test_put_ospf_intent_no_apply_job_when_auto_apply_disabled(adapter_cli
         "instances": [{"process_id": "1", "router_id": "1.1.1.1", "vrf": "", "areas": []}],
         "interfaces": [],
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH, json=payload)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ospf-intent", headers=AUTH | push_seq(), json=payload)
     assert resp.status_code == 200
 
     async with session() as db:
@@ -455,7 +492,7 @@ async def test_put_ospf_intent_empty_payload_no_apply_job(adapter_client):
 
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/ospf-intent",
-        headers=AUTH,
+        headers=AUTH | push_seq(),
         json={"instances": [], "interfaces": []},
     )
     assert resp.status_code == 200

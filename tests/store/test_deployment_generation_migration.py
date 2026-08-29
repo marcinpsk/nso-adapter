@@ -82,10 +82,10 @@ def _wait_until_migration_reaches_jobs(engine, upgrade: Future[str]) -> None:
     raise AssertionError("the migration neither completed nor waited for the jobs table")
 
 
-def test_upgrade_refuses_active_generationless_removals(pg_admin):
+def test_upgrade_refuses_active_generationless_removals(pg_provisioner):
     """The operator must drain old removal work before generation execution starts."""
     module = load_migration(_MIGRATION)
-    with private_database(pg_admin, "generation_removal_gate") as sync_url:
+    with private_database(pg_provisioner, "generation_removal_gate") as sync_url:
         alembic(sync_url, "upgrade", module.down_revision)
         with engine_on(sync_url) as engine, engine.begin() as conn:
             conn.execute(
@@ -99,10 +99,10 @@ def test_upgrade_refuses_active_generationless_removals(pg_admin):
             alembic(sync_url, "upgrade", module.revision)
 
 
-def test_upgrade_serializes_removal_gate_against_a_concurrent_enqueue(pg_admin):
+def test_upgrade_serializes_removal_gate_against_a_concurrent_enqueue(pg_provisioner):
     """A removal committed during cutover must be visible to the quiescence gate."""
     module = load_migration(_MIGRATION)
-    with private_database(pg_admin, "generation_removal_race") as sync_url:
+    with private_database(pg_provisioner, "generation_removal_race") as sync_url:
         alembic(sync_url, "upgrade", module.down_revision)
         with engine_on(sync_url) as engine, engine.connect() as enqueue_conn:
             enqueue_tx = enqueue_conn.begin()
@@ -144,7 +144,7 @@ def test_upgrade_serializes_removal_gate_against_a_concurrent_enqueue(pg_admin):
                     )
 
 
-def test_historical_trigger_is_frozen_and_head_trigger_matches_live_ddl(pg_admin, tmp_path, monkeypatch):
+def test_historical_trigger_is_frozen_and_head_trigger_matches_live_ddl(pg_provisioner, tmp_path, monkeypatch):
     """The historical revision must render frozen SQL, not the live helper.
 
     The injected drifted_column discriminates where the helper reads the module
@@ -164,7 +164,7 @@ def test_historical_trigger_is_frozen_and_head_trigger_matches_live_ddl(pg_admin
         "ddl.GENERATION_IMMUTABLE_COLUMNS += ('drifted_column',)\n"
     )
 
-    with private_database(pg_admin, "generation_ddl") as sync_url:
+    with private_database(pg_provisioner, "generation_ddl") as sync_url:
         old_pythonpath = os.environ.get("PYTHONPATH")
         pythonpath = str(tmp_path) if old_pythonpath is None else os.pathsep.join((str(tmp_path), old_pythonpath))
         monkeypatch.setenv("PYTHONPATH", pythonpath)

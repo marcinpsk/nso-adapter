@@ -259,6 +259,11 @@ async def _revert_address(client: NsoClient, name: str, address: str) -> None:
         logger.error("failover.revert_failed", device=name, address=address, error=repr(exc))
 
 
+# Why failback cannot proceed (surfaced on the row for the operator; #1630).
+_BLOCKED_ADDRESS_UNREADABLE = "address_unreadable"
+_BLOCKED_OOB_CLEARED = "oob_address_cleared"
+
+
 async def _is_manual_override(client: NsoClient, fo: DeviceFailover, name: str) -> bool:
     """Return True when NSO's current address is neither the primary nor the OOB IP.
 
@@ -428,22 +433,27 @@ async def _failback_flip_probe(
     """
     if job_active:
         return True
-    # One read serves the manual-override decision AND the revert target: a disruptive
-    # flip whose way back is unknown must not start, so an unreadable current address
-    # refuses the flip (the stored oob_ip may have been cleared meanwhile).
+    # One read serves the manual-override decision AND the revert target (#1630): a
+    # disruptive flip whose way back is unknown must not start, so an unreadable current
+    # address refuses the flip — unlike the non-disruptive checks, where "can't tell"
+    # correctly does not block the loop.
     try:
         address_before = await client.get_address(name)
     except Exception as exc:
         address_before = None
-        logger.warning("failover.failback_blocked", device=name, error=repr(exc))
+        logger.warning("failover.failback_blocked", device=name, reason=_BLOCKED_ADDRESS_UNREADABLE, error=repr(exc))
     if address_before is None:
+        fo.failback_blocked_reason = _BLOCKED_ADDRESS_UNREADABLE
         return True  # ran → re-arm normally; retried on the next interval
+    if fo.failback_blocked_reason == _BLOCKED_ADDRESS_UNREADABLE:
+        fo.failback_blocked_reason = None  # the read recovered; the reason is stale on every branch
     if address_before not in (fo.primary_ip, fo.oob_ip):
         fo.manual_override = True
         return True
     if not _take_flip(flip_budget):
         return False
     fo.manual_override = False
+    fo.failback_blocked_reason = None
     await _set_address(client, name, primary_ip)  # flip to primary for the probe
     committed = False
     try:
@@ -464,8 +474,8 @@ async def _failback_flip_probe(
     finally:
         if not committed:
             # Threshold not met, primary still down, OR the probe/decision raised → guaranteed
-            # revert to the address NSO actually had (the stored oob_ip may have been cleared
-            # meanwhile), so the device is never stranded on the flipped address.
+            # revert to the address NSO actually had (never the stored oob_ip, which the
+            # operator may have cleared meanwhile) so the device stays reachable.
             await _revert_address(client, name, address_before)
     return True
 
@@ -684,12 +694,36 @@ async def upsert_failover_ips(db: AsyncSession, device: Device, primary_ip: str 
             fo.next_primary_probe_at = now
         changed = True
     if fo.oob_ip != oob_ip:
-        fo.oob_ip = oob_ip
-        fo.oob_healthy = None
-        fo.oob_health_result = None
-        fo.oob_health_detail = None
-        fo.oob_health_checked_at = None
-        if oob_ip:
-            fo.next_oob_probe_at = now
+        usable = bool(oob_ip) and oob_ip != fo.primary_ip
+        if fo.active_address == _OOB and fo.oob_ip and not usable:
+            # NSO is living on the stored OOB address; the report would delete the failback
+            # path's way home (#1630). Retain it, surface the stuck state for the operator.
+            logger.warning(
+                "failover.oob_clear_refused",
+                device=device.nso_device_name,
+                stored=fo.oob_ip,
+                reported=oob_ip,
+            )
+            if fo.failback_blocked_reason != _BLOCKED_OOB_CLEARED:
+                fo.failback_blocked_reason = _BLOCKED_OOB_CLEARED
+                changed = True
+        else:
+            fo.oob_ip = oob_ip
+            fo.oob_healthy = None
+            fo.oob_health_result = None
+            fo.oob_health_detail = None
+            fo.oob_health_checked_at = None
+            if oob_ip:
+                fo.next_oob_probe_at = now
+            changed = True
+    # The stuck marker clears whenever the report agrees on a USABLE stored address —
+    # including a re-report of the retained address itself, which skips the branch above.
+    if (
+        fo.failback_blocked_reason == _BLOCKED_OOB_CLEARED
+        and fo.oob_ip
+        and fo.oob_ip == oob_ip
+        and oob_ip != fo.primary_ip
+    ):
+        fo.failback_blocked_reason = None
         changed = True
     return changed

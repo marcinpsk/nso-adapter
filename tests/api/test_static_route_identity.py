@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import select, text
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -178,7 +178,7 @@ async def put_intent(client, device_id: int, routes: list[dict], *, query: str =
     return await client.put(
         f"/api/v1/devices/{device_id}/static-route-intent{query}",
         json={"routes": routes},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
 
 

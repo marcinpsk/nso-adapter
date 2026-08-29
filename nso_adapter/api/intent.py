@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 
 import structlog
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,6 +20,7 @@ from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_409_PUSH_SEQ, RESP_422_VALIDATION, api_error
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.timestamps import UtcInstant, iso_z
+from nso_adapter.core.request_flags import PendingClearProvenance
 from nso_adapter.store.models import (
     DbInterface,
     Device,
@@ -81,11 +82,19 @@ class IntentScopeCount(BaseModel):
     failed: int
 
 
+class PendingClearSummary(BaseModel):
+    """A stream with a clear that has no admitted networked carrier."""
+
+    provenance: PendingClearProvenance
+    since: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+
+
 class IntentSummaryOut(BaseModel):
-    """GET /intent-summary — a {scope_name: {count, applied, failed}} map, non-empty scopes only."""
+    """GET /intent-summary with owned-intent counts and unresolved stream clears."""
 
     device_id: int
     scopes: dict[str, IntentScopeCount]
+    pending_clear: dict[str, PendingClearSummary]
 
 
 def _intent_row_out(row: InterfaceIntent, if_name: str) -> dict:
@@ -287,6 +296,29 @@ async def _device_intent_counts(db: AsyncSession, device_id: int) -> dict[str, d
     return out
 
 
+async def _device_pending_clears(db: AsyncSession, device_id: int) -> dict[str, dict]:
+    """Return one path-free truthfulness summary per pending stream."""
+    from nso_adapter.store.models import StreamPendingClear
+
+    rows = (
+        (
+            await db.execute(
+                select(StreamPendingClear)
+                .where(StreamPendingClear.device_id == device_id)
+                .order_by(StreamPendingClear.stream)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    out: dict[str, dict] = {}
+    for row in rows:
+        if row.stream in out:
+            raise RuntimeError(f"device {device_id} has multiple pending-clear provenances for {row.stream!r}")
+        out[row.stream] = {"provenance": row.provenance, "since": iso_z(row.recorded_at)}
+    return out
+
+
 @router.get(
     "/{device_id}/intent-summary",
     dependencies=[Depends(verify_token)],
@@ -304,4 +336,8 @@ async def get_intent_summary(device_id: int, db: AsyncSession = Depends(get_db))
     if not device:
         raise api_error(404, "not_found", "Device not found")
     scopes = await _device_intent_counts(db, device_id)
-    return {"device_id": device_id, "scopes": scopes}
+    return {
+        "device_id": device_id,
+        "scopes": scopes,
+        "pending_clear": await _device_pending_clears(db, device_id),
+    }

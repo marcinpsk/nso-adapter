@@ -576,7 +576,7 @@ def test_build_netbox_client_defaults_verify_true(clean_netbox_registry):
 
 
 @pytest.fixture
-def unmigrated_pg_url(pg_admin):
+def unmigrated_pg_url(pg_provisioner):
     """A database with NO schema whatsoever — plain CREATE DATABASE, never TEMPLATE.
 
     The normal ``pg_url`` clone is already at head, so a reintroduced ``create_all`` there
@@ -588,12 +588,12 @@ def unmigrated_pg_url(pg_admin):
     from tests.conftest import _drop_database, _url_for
 
     name = f"nsoadp_empty_{uuid_mod.uuid4().hex[:8]}"
-    with pg_admin.connect() as conn:
+    with pg_provisioner.connect() as conn:
         conn.exec_driver_sql(f'CREATE DATABASE "{name}"')
     try:
         yield _url_for(name, driver="postgresql+asyncpg")
     finally:
-        _drop_database(pg_admin, name, expect_clean=True)
+        _drop_database(pg_provisioner, name, expect_clean=True)
 
 
 async def test_init_database_never_materializes_schema(monkeypatch, unmigrated_pg_url):

@@ -707,3 +707,54 @@ async def test_switch_surfaces_failed_session_drop(monkeypatch):
     assert fo.active_address == ActiveAddress.oob.value  # switch still recorded (config changed)
     events = [e.get("event") for e in logs]
     assert "failover.switch.session_drop_failed" in events
+
+
+class FlakyNso(FakeNso):
+    """A FakeNso whose get_address raises — the on-OOB device with a flaky session."""
+
+    async def get_address(self, name: str) -> str:
+        raise TimeoutError("session read timed out")
+
+
+async def test_failback_flip_refused_when_current_address_is_unreadable(monkeypatch):
+    """#1630: a flip whose way back is unknown must not start.
+
+    The old code treated a failed manual-override read as "can't tell -> proceed",
+    flipped, and then reverted to the stored oob_ip - None when the operator had
+    cleared it - stranding the device on the down primary.
+    """
+    client = FlakyNso()
+    fo = _failover_row(active="oob", oob=None)
+    _stub_probe(monkeypatch, False)
+
+    await _tick(_device(), fo, client, SchedulerConfig(), now=_BASE)
+
+    assert [c for c in client.calls if c[0] == "set_address"] == []
+    assert fo.failback_blocked_reason == "address_unreadable"
+    assert fo.next_primary_probe_at is not None  # ran -> re-armed, retried next interval
+
+
+async def test_failback_flip_reverts_to_the_address_nso_actually_had(monkeypatch):
+    """#1630: the revert target is the pre-flip read, never the stored oob_ip."""
+    client = FakeNso(address="10.0.0.1")  # NSO found on the primary (a managed slot)
+    fo = _failover_row(active="oob", oob="192.0.2.5")
+    _stub_probe(monkeypatch, False)
+
+    await _tick(_device(), fo, client, SchedulerConfig(), now=_BASE)
+
+    sets = [c for c in client.calls if c[0] == "set_address"]
+    assert sets[-1] == ("set_address", "10.0.0.1"), "revert must restore what NSO had, not invent a move"
+    assert fo.failback_blocked_reason is None
+
+
+async def test_a_recovered_address_read_clears_the_stale_unreadable_reason(monkeypatch):
+    """A successful get_address invalidates address_unreadable on every branch,
+    including the manual-override exit that records no probe."""
+    client = FakeNso(address="203.0.113.7")  # readable, but foreign
+    fo = _failover_row(active="oob", failback_blocked_reason="address_unreadable")
+    _stub_probe(monkeypatch, False)
+
+    await _tick(_device(), fo, client, SchedulerConfig(), now=_BASE)
+
+    assert fo.manual_override is True
+    assert fo.failback_blocked_reason is None
