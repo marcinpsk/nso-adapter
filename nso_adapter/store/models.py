@@ -22,6 +22,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Sequence,
     String,
     Text,
     UniqueConstraint,
@@ -38,6 +39,9 @@ from nso_adapter.store.ddl import generation_immutability_ddl
 
 class Base(DeclarativeBase):
     pass
+
+
+SETTLEMENT_COHORT_SEQUENCE = Sequence("deployment_generation_settlement_cohort_seq", metadata=Base.metadata)
 
 
 class MappingStatus(str, enum.Enum):
@@ -681,6 +685,11 @@ class DeploymentGeneration(Base):
     #: stream -> the desired revision this document was built from. Settlement CASes
     #: exactly these, never whatever the store holds when the job finishes.
     stream_revisions: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    #: Every generation one intent request promotes shares a non-null value: the
+    #: marking-split removals and the companion auto-apply. NULL when the request promotes
+    #: at most one generation, when it is store_only, and for reissue generations, so
+    #: unrelated deployments of the same revision cannot block each other's settlement.
+    settlement_cohort: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     #: For a generation a removal produced: the job context that executes it (scope, the
     #: allowed removal keys, ``detach``, ``force``, vault refs). It lives HERE and not only
     #: on the job because a retry of a blocked detach has to rebuild a job that commits the

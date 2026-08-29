@@ -120,7 +120,14 @@ def _nokia_attr_kind(iface) -> str | None:
     return _nokia_routed_kind(iface)
 
 
-async def enqueue_apply(db: AsyncSession, device_id: int, force: bool = True, *, stream: str) -> Job | None:
+async def enqueue_apply(
+    db: AsyncSession,
+    device_id: int,
+    force: bool = True,
+    *,
+    stream: str,
+    settlement_cohort: int | None = None,
+) -> Job | None:
     """Create an apply job if no active job exists.  Returns Job or None if blocked.
 
     *stream* names the endpoint lane this write touched — the promotion protocol's unit
@@ -129,6 +136,9 @@ async def enqueue_apply(db: AsyncSession, device_id: int, force: bool = True, *,
     attribute every such write to one family. It is the ENDPOINT's stream, never the
     document section: promoting ``interface_config`` for an address push would authorize the
     interface attributes a store-only repair left behind (#103).
+
+    *settlement_cohort* groups this generation with other generations created by the same
+    request. It stays NULL when this is the request's only promoted generation.
 
     Also returns ``None`` on a store-only request (the plugin's intent re-sync,
     tracker #103): reconciling the intent store must never trigger a device commit,
@@ -153,7 +163,13 @@ async def enqueue_apply(db: AsyncSession, device_id: int, force: bool = True, *,
     # The promotion and its immutable document, in THIS transaction and under the projection
     # lock note_write already took: the document is the state that authorized the job, not
     # whatever the store holds when a worker eventually picks it up.
-    generation = await create_generation(db, device_id, streams=(stream,), mode=GenerationMode.networked)
+    generation = await create_generation(
+        db,
+        device_id,
+        streams=(stream,),
+        mode=GenerationMode.networked,
+        settlement_cohort=settlement_cohort,
+    )
 
     # Atomic same-type QUEUED dedupe, inside a savepoint. Two properties matter to the
     # fifteen callers, all of which reach here with intent rows already mutated and

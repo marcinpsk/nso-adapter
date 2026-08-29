@@ -11,6 +11,8 @@ which is the sweeper's whole trigger.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
 from tests.api.test_static_route_identity import (
     A,
     B,
@@ -41,6 +43,94 @@ async def _jobs_ordered(device_id: int) -> list[tuple[int, str]]:
         return [(r.id, r.job_type.value) for r in rows]
 
 
+async def _run_apply_job(device_id: int, job_id: int, client):
+    """Run the apply job the endpoint enqueued, as the worker would."""
+    from nso_adapter.core.apply import run_apply
+    from nso_adapter.core.claim import acquire_claim, release_claim
+    from nso_adapter.store.models import Job
+    from tests.conftest import start_job
+
+    attempt = await start_job(job_id)
+    reg = await acquire_claim(device_id, "job", job_id=job_id)
+    if reg.run_attempt is None:
+        reg.run_attempt = attempt
+    try:
+        with (
+            patch("nso_adapter.core.importer.get_nso_client", return_value=client),
+            patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
+        ):
+            await run_apply(job_id=job_id, device_id=device_id, force=True, reg=reg)
+    finally:
+        await release_claim(reg)
+    async with session() as db:
+        return await db.get(Job, job_id)
+
+
+async def _projection_revisions(device_id: int) -> tuple[int, int, int]:
+    from sqlalchemy import select
+
+    from nso_adapter.store.models import DeviceProjectionStream
+
+    async with session() as db:
+        stream = await db.scalar(
+            select(DeviceProjectionStream).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == "static_route",
+            )
+        )
+        return stream.desired_revision, stream.authorized_revision, stream.applied_revision
+
+
+async def _settlement_cohorts(device_id: int) -> list[int | None]:
+    from sqlalchemy import select
+
+    from nso_adapter.store.models import DeploymentGeneration
+
+    async with session() as db:
+        generations = (
+            (
+                await db.execute(
+                    select(DeploymentGeneration)
+                    .where(DeploymentGeneration.device_id == device_id)
+                    .order_by(DeploymentGeneration.seq)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return [generation.settlement_cohort for generation in generations]
+
+
+async def _cohorts_by_job(device_id: int) -> dict[int | None, int | None]:
+    from sqlalchemy import select
+
+    from nso_adapter.store.models import DeploymentGeneration
+
+    async with session() as db:
+        generations = (
+            (await db.execute(select(DeploymentGeneration).where(DeploymentGeneration.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        return {generation.job_id: generation.settlement_cohort for generation in generations}
+
+
+async def _generation_document_sections(device_id: int) -> list[set[str]]:
+    from sqlalchemy import select
+
+    from nso_adapter.store.models import DeploymentGeneration
+
+    async with session() as db:
+        documents = (
+            await db.scalars(
+                select(DeploymentGeneration.document)
+                .where(DeploymentGeneration.device_id == device_id)
+                .order_by(DeploymentGeneration.seq)
+            )
+        ).all()
+        return [set(document) for document in documents]
+
+
 async def test_removal_precedes_apply_at_the_endpoint(adapter_client):
     """M7.1 — asserted before any worker runs; the endpoint's own ordering is the contract."""
     device_id = await seed_device(nso_device_name="sr-m7-1", netbox_device_id=9780)
@@ -60,6 +150,101 @@ async def test_removal_precedes_apply_at_the_endpoint(adapter_client):
     assert [kind for _id, kind in ordered] == ["removal", "apply"]
     removal_id, apply_id = ordered[0][0], ordered[1][0]
     assert removal_id < apply_id
+
+
+async def test_detach_cannot_certify_the_revision_when_its_companion_apply_fails(adapter_client):
+    """One PUT's removal and apply must settle the promoted revision together."""
+    from nso_adapter.store.models import JobStatus
+    from tests.core.test_static_route_put import wire
+    from tests.core.test_static_route_removal import SrFake, run_removal_job, sr_client
+
+    device_id = await seed_device(nso_device_name="sr-cohort-fail", netbox_device_id=9786)
+    await enable_auto_apply(device_id)
+    await seed_intent(
+        device_id,
+        [
+            {"triple": A, "route_id": 7, "deployed_key": list(A)},
+            {"triple": B, "route_id": 8, "deployed_key": list(B)},
+        ],
+    )
+
+    response = await put_intent(adapter_client, device_id, [entry(B, route_id=8, metric=20)])
+    assert response.status_code == 200
+    ordered = await _jobs_ordered(device_id)
+    assert [kind for _id, kind in ordered] == ["removal", "apply"]
+    removal_id, apply_id = (job_id for job_id, _kind in ordered)
+
+    fake = SrFake("sr-cohort-fail", service=[wire(A), wire(B)])
+    removal = await run_removal_job(device_id, removal_id, sr_client(fake))
+    assert removal.status is JobStatus.succeeded
+
+    fake.dry_run_status = 400
+    apply = await _run_apply_job(device_id, apply_id, sr_client(fake))
+    assert apply.status is JobStatus.failed
+
+    assert (await _projection_revisions(device_id))[2] == 0, (
+        "the detach certified a revision its companion apply did not land"
+    )
+
+
+async def test_detach_and_companion_apply_stamp_the_revision_after_both_succeed(adapter_client):
+    """The second success stamps the shared revision exactly once."""
+    from nso_adapter.store.models import JobStatus
+    from tests.core.test_static_route_put import wire
+    from tests.core.test_static_route_removal import SrFake, run_removal_job, sr_client
+
+    device_id = await seed_device(nso_device_name="sr-cohort-success", netbox_device_id=9787)
+    await enable_auto_apply(device_id)
+    await seed_intent(
+        device_id,
+        [
+            {"triple": A, "route_id": 7, "deployed_key": list(A)},
+            {"triple": B, "route_id": 8, "deployed_key": list(B)},
+        ],
+    )
+
+    response = await put_intent(adapter_client, device_id, [entry(B, route_id=8, metric=20)])
+    assert response.status_code == 200
+    ordered = await _jobs_ordered(device_id)
+    assert [kind for _id, kind in ordered] == ["removal", "apply"]
+    removal_id, apply_id = (job_id for job_id, _kind in ordered)
+    cohorts = await _settlement_cohorts(device_id)
+    assert cohorts[0] is not None
+    assert cohorts == [cohorts[0], cohorts[0]]
+    by_job = await _cohorts_by_job(device_id)
+    assert by_job[apply_id] == by_job[removal_id] == cohorts[0]
+
+    fake = SrFake("sr-cohort-success", service=[wire(A), wire(B)])
+    removal = await run_removal_job(device_id, removal_id, sr_client(fake))
+    assert removal.status is JobStatus.succeeded
+    assert (await _projection_revisions(device_id))[2] == 0
+
+    apply = await _run_apply_job(device_id, apply_id, sr_client(fake))
+    assert apply.status is JobStatus.succeeded
+    assert await _projection_revisions(device_id) == (1, 1, 1)
+
+
+async def test_an_apply_only_put_keeps_independent_settlement(adapter_client):
+    """A single-stream generation executes without inventing absent document sections."""
+    from nso_adapter.store.models import JobStatus
+    from tests.core.test_static_route_put import wire
+    from tests.core.test_static_route_removal import SrFake, sr_client
+
+    device_id = await seed_device(nso_device_name="sr-single-apply", netbox_device_id=9788)
+    await enable_auto_apply(device_id)
+    await seed_intent(device_id, [{"triple": B, "route_id": 8, "deployed_key": list(B)}])
+
+    response = await put_intent(adapter_client, device_id, [entry(B, route_id=8, metric=20)])
+    assert response.status_code == 200
+    ordered = await _jobs_ordered(device_id)
+    assert [kind for _id, kind in ordered] == ["apply"]
+    assert await _settlement_cohorts(device_id) == [None]
+    assert await _generation_document_sections(device_id) == [{"static_route"}]
+
+    fake = SrFake("sr-single-apply", service=[wire(B)])
+    apply = await _run_apply_job(device_id, ordered[0][0], sr_client(fake))
+    assert apply.status is JobStatus.succeeded
+    assert await _projection_revisions(device_id) == (1, 1, 1)
 
 
 async def test_the_tombstone_carries_its_removal_job_id(adapter_client):

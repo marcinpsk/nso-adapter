@@ -63,6 +63,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.core.projection import projection_streams, snapshot_stream, stream_section
 from nso_adapter.store.db import execute_dml
 from nso_adapter.store.models import (
+    SETTLEMENT_COHORT_SEQUENCE,
     DeploymentGeneration,
     DeviceGenerationCounter,
     DeviceProjectionStream,
@@ -205,6 +206,14 @@ async def _next_seq(db: AsyncSession, device_id: int) -> int:
     return seq
 
 
+async def allocate_settlement_cohort(db: AsyncSession) -> int:
+    """Reserve one globally unique identifier for a request settlement group."""
+    cohort = await db.scalar(select(SETTLEMENT_COHORT_SEQUENCE.next_value()))
+    if cohort is None:  # pragma: no cover - PostgreSQL nextval always returns one value
+        raise RuntimeError("the settlement cohort sequence returned no value")
+    return cohort
+
+
 def _compose_document(fragments: dict[str, dict]) -> dict:
     """Compose ``{stream: fragment}`` into the ``{section: {table: rows}}`` outbound document.
 
@@ -277,6 +286,7 @@ async def create_generation(
     allowed_removal_keys: dict | None = None,
     document: dict | None = None,
     removal_context: dict | None = None,
+    settlement_cohort: int | None = None,
 ) -> DeploymentGeneration:
     """Promote *streams* and store the immutable generation they authorize. Caller commits.
 
@@ -336,6 +346,7 @@ async def create_generation(
         source_push_seq=source_push_seq,
         stream_revisions=stream_revisions,
         removal_context=removal_context,
+        settlement_cohort=settlement_cohort,
     )
 
 
@@ -349,6 +360,7 @@ async def _store_generation(
     source_push_seq: dict,
     stream_revisions: dict,
     removal_context: dict | None,
+    settlement_cohort: int | None,
 ) -> DeploymentGeneration:
     """Allocate the sequence and write the immutable row. The projection lock is held."""
     generation = DeploymentGeneration(
@@ -362,6 +374,7 @@ async def _store_generation(
         source_push_seq=source_push_seq,
         stream_revisions=stream_revisions,
         removal_context=removal_context,
+        settlement_cohort=settlement_cohort,
     )
     db.add(generation)
     await db.flush()
@@ -447,6 +460,7 @@ async def create_reissue_generation(
         source_push_seq={row.stream: row.source_push_seq for row in rows if row.authorized_document},
         stream_revisions={},
         removal_context=removal_context,
+        settlement_cohort=None,
     )
 
 
@@ -646,7 +660,10 @@ async def settle_job_generations(
     Runs INSIDE the terminal transaction, so a generation can never be settled by a status
     write that was rolled back. On success each carried stream is stamped applied at THE
     REVISION THE GENERATION CARRIED — never at the store's current revision, which may
-    already hold writes this deployment never contained (§G2).
+    already hold writes this deployment never contained (§G2). A marking-split removal can
+    put the same stream revision in two generations. That revision is stamped only after
+    every cohort member has either settled or been explicitly abandoned, and only when at
+    least one member settled successfully.
     """
     carried = await _job_generations(db, job_id)
     if not carried:
@@ -672,18 +689,68 @@ async def settle_job_generations(
             seqs=[g.seq for g in carried],
         )
         return
-    for generation in carried:
-        for stream, revision in (generation.stream_revisions or {}).items():
-            await db.execute(
-                sa_update(DeviceProjectionStream)
+    targets = {
+        (generation.device_id, stream, revision, generation.settlement_cohort)
+        for generation in carried
+        for stream, revision in (generation.stream_revisions or {}).items()
+    }
+    await _stamp_applied_revisions(db, targets, now)
+
+
+async def _stamp_applied_revisions(
+    db: AsyncSession,
+    targets: set[tuple[int, str, int, int | None]],
+    now: datetime,
+) -> None:
+    """Stamp settled revision targets whose request cohort has no live or failed member."""
+    for device_id, stream, revision, settlement_cohort in sorted(
+        targets,
+        key=lambda target: (target[0], target[1], target[2], target[3] is not None, target[3] or 0),
+    ):
+        conditions = [
+            DeviceProjectionStream.device_id == device_id,
+            DeviceProjectionStream.stream == stream,
+            DeviceProjectionStream.applied_revision < revision,
+        ]
+        if settlement_cohort is not None:
+            blocking_sibling = (
+                select(DeploymentGeneration.id)
                 .where(
-                    DeviceProjectionStream.device_id == generation.device_id,
-                    DeviceProjectionStream.stream == stream,
-                    DeviceProjectionStream.applied_revision < revision,
+                    DeploymentGeneration.device_id == device_id,
+                    DeploymentGeneration.status.not_in(_CROSSABLE),
+                    DeploymentGeneration.settlement_cohort == settlement_cohort,
                 )
-                .values(applied_revision=revision, updated_at=now)
-                .execution_options(synchronize_session=False)
+                .exists()
             )
+            conditions.append(~blocking_sibling)
+        await db.execute(
+            sa_update(DeviceProjectionStream)
+            .where(*conditions)
+            .values(applied_revision=revision, updated_at=now)
+            .execution_options(synchronize_session=False)
+        )
+
+
+async def _stamp_settled_cohort(db: AsyncSession, settlement_cohort: int, now: datetime) -> None:
+    """Re-evaluate one cohort after a blocker becomes explicitly crossable."""
+    settled = (
+        (
+            await db.execute(
+                select(DeploymentGeneration).where(
+                    DeploymentGeneration.settlement_cohort == settlement_cohort,
+                    DeploymentGeneration.status == GenerationStatus.settled,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    targets: set[tuple[int, str, int, int | None]] = {
+        (generation.device_id, stream, revision, settlement_cohort)
+        for generation in settled
+        for stream, revision in (generation.stream_revisions or {}).items()
+    }
+    await _stamp_applied_revisions(db, targets, now)
 
 
 async def requeue_job_generations(db: AsyncSession, job_id: int) -> None:
@@ -862,6 +929,8 @@ async def reconcile_generation(db: AsyncSession, generation_id: int) -> Job | No
     generation.status = GenerationStatus.abandoned
     generation.updated_at = _now()
     await db.flush()
+    if generation.settlement_cohort is not None:
+        await _stamp_settled_cohort(db, generation.settlement_cohort, generation.updated_at)
     logger.warning(
         "generation.abandoned",
         generation_id=generation_id,
@@ -1033,6 +1102,7 @@ __all__ = [
     "GenerationTampered",
     "advance_device_generations",
     "advance_generations_locked",
+    "allocate_settlement_cohort",
     "attach_to_job",
     "authorized_streams",
     "consume_last_enqueued_generation_id",

@@ -31,6 +31,7 @@ _REWRITES = {
     "source_push_seq": "CAST('{\"vlan\": 42}' AS json)",
     "stream_revisions": "CAST('{\"vlan\": 7}' AS json)",
     "removal_context": 'CAST(\'{"scope": "vlan"}\' AS json)',
+    "settlement_cohort": "42",
     "created_at": "now() - interval '1 day'",
 }
 
