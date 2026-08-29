@@ -94,14 +94,13 @@ class ClientBackend:
     backend_start: datetime
     state: str | None
     xact_start: datetime | None
-    query: str | None
 
 
 def _client_backends(conn, name: str) -> list[ClientBackend]:
     # backend_type filter: PG's own autovacuum worker can be inside the clone at DROP
     # time and is not a leaked test session — only client backends count as stragglers.
     rows = conn.exec_driver_sql(
-        "SELECT pid, application_name, backend_start, state, xact_start, query FROM pg_stat_activity "
+        "SELECT pid, application_name, backend_start, state, xact_start FROM pg_stat_activity "
         f"WHERE datname = '{name}' AND pid <> pg_backend_pid() "
         "AND backend_type = 'client backend'"
     ).fetchall()

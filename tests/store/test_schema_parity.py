@@ -20,6 +20,7 @@ import sys
 import uuid
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 from sqlalchemy import inspect
 
@@ -125,6 +126,8 @@ def test_alembic_baseline_matches_create_all(pg_provisioner):
     with pg_provisioner.connect() as conn:
         conn.exec_driver_sql(f'CREATE DATABASE "{ca_db}"')
         conn.exec_driver_sql(f'CREATE DATABASE "{al_db}"')
+    ca_engine = None
+    al_engine = None
     try:
         ca_url = _url_for(ca_db, driver="postgresql+psycopg2")
         al_url = _url_for(al_db, driver="postgresql+psycopg2")
@@ -139,8 +142,6 @@ def test_alembic_baseline_matches_create_all(pg_provisioner):
 
         ca_snap = _snapshot(ca_engine)
         al_snap = _snapshot(al_engine)
-        ca_engine.dispose()
-        al_engine.dispose()
 
         assert set(ca_snap) == set(al_snap), (
             f"table set differs: only_create_all={set(ca_snap) - set(al_snap)} "
@@ -151,5 +152,41 @@ def test_alembic_baseline_matches_create_all(pg_provisioner):
                 f"schema mismatch in {table!r}:\n  create_all={ca_snap[table]}\n  alembic   ={al_snap[table]}"
             )
     finally:
+        if ca_engine is not None:
+            ca_engine.dispose()
+        if al_engine is not None:
+            al_engine.dispose()
         for dbname in (ca_db, al_db):
             _drop_database(pg_provisioner, dbname, expect_clean=False)
+
+
+def test_schema_parity_disposes_both_engines_when_snapshot_fails(pg_provisioner, monkeypatch):
+    """A comparison failure must release both databases before cleanup starts."""
+    from tests import conftest as root_conftest
+
+    module = sys.modules[__name__]
+    real_snapshot = _snapshot
+    real_drop_database = _drop_database
+    snapshot_calls = 0
+    dropped_databases: list[str] = []
+
+    def fail_after_snapshot(engine):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        snapshot = real_snapshot(engine)
+        if snapshot_calls == 2:
+            raise RuntimeError("schema comparison probe")
+        return snapshot
+
+    def require_clean_then_drop(provisioner, name: str, *, expect_clean: bool) -> None:
+        dropped_databases.append(name)
+        real_drop_database(provisioner, name, expect_clean=True)
+
+    monkeypatch.setattr(module, "_snapshot", fail_after_snapshot)
+    monkeypatch.setattr(module, "_drop_database", require_clean_then_drop)
+    monkeypatch.setattr(root_conftest, "STRICT_TEARDOWN", True)
+
+    with pytest.raises(RuntimeError, match="schema comparison probe"):
+        test_alembic_baseline_matches_create_all(pg_provisioner)
+
+    assert len(dropped_databases) == 2

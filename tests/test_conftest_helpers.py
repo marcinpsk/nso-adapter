@@ -72,7 +72,8 @@ def test_drop_database_reports_surviving_backend_diagnostics(pg_database, pg_pro
     assert "backend_start=" in message
     assert "state='idle'" in message
     assert "xact_start=" in message
-    assert "query='SELECT 1 AS instrumentation_probe'" in message
+    assert "instrumentation_probe" not in message
+    assert "query=" not in message
 
 
 def test_seed_device_type_contract_allows_no_netbox_identity():

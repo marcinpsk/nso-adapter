@@ -695,6 +695,10 @@ async def settle_job_generations(
         for stream, revision in (generation.stream_revisions or {}).items()
     }
     await _stamp_applied_revisions(db, targets, now)
+    for settlement_cohort in sorted(
+        {generation.settlement_cohort for generation in carried if generation.settlement_cohort is not None}
+    ):
+        await _stamp_settled_cohort(db, settlement_cohort, now)
 
 
 async def _stamp_applied_revisions(
@@ -1039,7 +1043,6 @@ async def advance_device_generations(device_id: int) -> int:
         attached = await advance_generations_locked(db, device_id)
         await db.commit()
         return attached
-    return 0
 
 
 async def recover_generations() -> int:

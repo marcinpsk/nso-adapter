@@ -407,6 +407,74 @@ async def test_settlement_never_regresses_applied_revision(adapter_client):
     assert (await _stream(device_id, "vlan")).applied_revision == 7
 
 
+async def test_the_final_settled_cohort_member_rechecks_every_carried_stream(adapter_client):
+    """The final sibling certifies a stream carried only by an earlier sibling."""
+    from nso_adapter.core.generation import digest_document, note_write, settle_job_generations
+    from nso_adapter.store.models import (
+        DeploymentGeneration,
+        DeviceProjectionStream,
+        GenerationMode,
+        GenerationStatus,
+        Job,
+        JobStatus,
+        JobType,
+    )
+
+    device_id = await _device("gen-settle-cohort-recheck", 9783)
+    async with session() as db:
+        await note_write(db, device_id, "vlan")
+        await note_write(db, device_id, "static_route")
+        first_job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.running, context={})
+        final_job = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.running, context={})
+        db.add_all([first_job, final_job])
+        await db.flush()
+
+        cohort = 9783
+        first = DeploymentGeneration(
+            device_id=device_id,
+            seq=1,
+            mode=GenerationMode.networked,
+            status=GenerationStatus.running,
+            document={},
+            digest=digest_document(GenerationMode.networked, {}, {}),
+            allowed_removal_keys={},
+            source_push_seq={"vlan": None},
+            stream_revisions={"vlan": 1},
+            settlement_cohort=cohort,
+            job_id=first_job.id,
+        )
+        final = DeploymentGeneration(
+            device_id=device_id,
+            seq=2,
+            mode=GenerationMode.networked,
+            status=GenerationStatus.running,
+            document={},
+            digest=digest_document(GenerationMode.networked, {}, {}),
+            allowed_removal_keys={},
+            source_push_seq={"static_route": None},
+            stream_revisions={"static_route": 1},
+            settlement_cohort=cohort,
+            job_id=final_job.id,
+        )
+        db.add_all([first, final])
+        await db.flush()
+
+        await settle_job_generations(db, first_job.id, outcome=GenerationStatus.settled)
+        await settle_job_generations(db, final_job.id, outcome=GenerationStatus.settled)
+        streams = dict(
+            (
+                await db.execute(
+                    sa.select(DeviceProjectionStream.stream, DeviceProjectionStream.applied_revision).where(
+                        DeviceProjectionStream.device_id == device_id,
+                        DeviceProjectionStream.stream.in_(("vlan", "static_route")),
+                    )
+                )
+            ).all()
+        )
+
+    assert streams == {"static_route": 1, "vlan": 1}
+
+
 async def test_an_unchanged_apply_settles_after_the_same_revision_was_abandoned(adapter_client):
     """An abandoned deployment at revision 1 does not block a later Apply of revision 1."""
     from nso_adapter.store.models import GenerationStatus, JobStatus
@@ -817,6 +885,18 @@ async def test_a_pending_apply_head_replaces_its_terminal_job(adapter_client):
     (advanced,) = await _generations(device_id)
     assert advanced.job_id != stale_job_id
     assert await _job_status(advanced.job_id) is JobStatus.queued
+
+
+def test_standalone_advancement_has_no_unreachable_fallback():
+    """The transaction owns every return path; no dead fallback follows it."""
+    import ast
+    import inspect
+    from textwrap import dedent
+
+    from nso_adapter.core.generation import advance_device_generations
+
+    function = ast.parse(dedent(inspect.getsource(advance_device_generations))).body[0]
+    assert isinstance(function.body[-1], ast.AsyncWith)
 
 
 async def test_standalone_advancement_takes_the_projection_lock(adapter_client, rival_engine):
