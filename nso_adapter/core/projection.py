@@ -458,10 +458,11 @@ async def _rows_for(db: AsyncSession, device_id: int, spec: _Spec) -> list[dict]
 #: the protocol unnoticed, and closing a reason without wiring the section fails.
 DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset({"vlan"})
 
-#: A STRICT SUBSET of :data:`DOCUMENT_EXECUTED_SECTIONS`. Static-route companion apply and
-#: claim subtraction read live intent, so a later store-only push could execute under the
-#: selected generation. This is why ``static_route`` is document-executed but not
-#: selectable here.
+#: The document-executed sections a manual Apply may select. This set equals
+#: :data:`DOCUMENT_EXECUTED_SECTIONS` today. The names remain separate because one states
+#: how a section executes and the other states whether an operator may select it. A section
+#: can join this set only after its companion apply and claim subtraction stop reading live
+#: intent.
 ACTION_APPLY_EXECUTABLE_SECTIONS: frozenset[str] = frozenset({"vlan"})
 
 #: Why each remaining section still reads live rows at apply time. Most await #1522's

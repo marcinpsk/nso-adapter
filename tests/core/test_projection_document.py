@@ -24,7 +24,7 @@ pytestmark = pytest.mark.anyio
 
 
 def test_every_section_is_either_document_executed_or_names_its_blocker():
-    """No third state. Adding a section forces a decision about how it deploys."""
+    """No third state. Manual selection and execution stay equal but distinct concepts."""
     from nso_adapter.core.projection import (
         ACTION_APPLY_EXECUTABLE_SECTIONS,
         DOCUMENT_EXECUTED_SECTIONS,
@@ -39,8 +39,12 @@ def test_every_section_is_either_document_executed_or_names_its_blocker():
     )
     assert not (DOCUMENT_EXECUTED_SECTIONS & set(LIVE_READ_SECTIONS)), "a section cannot be both"
     assert all(reason for reason in LIVE_READ_SECTIONS.values()), "every live-read section must state why"
-    assert ACTION_APPLY_EXECUTABLE_SECTIONS == DOCUMENT_EXECUTED_SECTIONS
-    assert ACTION_APPLY_EXECUTABLE_SECTIONS is not DOCUMENT_EXECUTED_SECTIONS
+    assert ACTION_APPLY_EXECUTABLE_SECTIONS == DOCUMENT_EXECUTED_SECTIONS, (
+        "manual Apply may select exactly the sections that execute from their documents"
+    )
+    assert ACTION_APPLY_EXECUTABLE_SECTIONS is not DOCUMENT_EXECUTED_SECTIONS, (
+        "selection and execution answer different questions even while their members match"
+    )
 
 
 def test_every_projection_column_has_a_supported_json_round_trip():
