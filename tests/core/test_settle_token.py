@@ -455,7 +455,7 @@ async def test_a_successor_inserted_mid_decision_lands_superseded(adapter_client
 
 
 async def test_offboard_queued_writer_needs_no_token(adapter_client, monkeypatch):
-    """S1.5 — offboarding has no execution to name.
+    """S1.5: offboarding has no execution to name.
 
     Requiring a token would leave offboard unable to terminalize a queued job. Offboard
     uses the bulk helper because a per-job helper cannot express its unbounded row set.

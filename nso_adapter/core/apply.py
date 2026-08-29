@@ -1138,7 +1138,7 @@ class _Scope(NamedTuple):
     push: list | None = None
     #: Where a finding about a PUSHED row is recorded: ``{row id -> the live row}``. ``None``
     #: means the pushed rows are already the live rows. A pushed row absent from the map has
-    #: no live counterpart left — it still fails the scope, but has no bookkeeping target.
+    #: no live counterpart left. It still fails the scope, but has no bookkeeping target.
     stamp_of: dict | None = None
 
     @property

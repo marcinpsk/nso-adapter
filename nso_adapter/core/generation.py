@@ -95,7 +95,7 @@ logger = structlog.get_logger(__name__)
 _CROSSABLE = (GenerationStatus.settled, GenerationStatus.abandoned)
 #: A job that is still going to run (or is running) covers its generations.
 _LIVE_JOB = (JobStatus.queued, JobStatus.running)
-#: PostgreSQL ``lock_not_available`` — what a refused ``FOR UPDATE NOWAIT`` reports.
+#: PostgreSQL ``lock_not_available``: what a refused ``FOR UPDATE NOWAIT`` reports.
 _LOCK_NOT_AVAILABLE = "55P03"
 
 
@@ -1480,7 +1480,7 @@ async def advance_generations_locked(db: AsyncSession, device_id: int) -> Job | 
     holds the job and wants the generation rows (``mark_job_generations_running``). Waiting
     here closes that cycle into a deadlock, and a victimised worker propagates out of
     ``_claim_next_job`` with its device claim already committed. An unavailable lock has one
-    meaning — a worker is starting this carrier right now — so the head is covered and
+    meaning: a worker is starting this carrier right now. Thus, the head is covered and
     advancement yields: no takeover, no successor reported.
 
     A REMOVAL head gets a job built from its OWN ``removal_context`` — never the shared

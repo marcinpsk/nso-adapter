@@ -869,7 +869,7 @@ async def offboard_device(db: AsyncSession, device: Device) -> None:
     ``device_claim -> devices -> device_generation_counter -> intent/children -> jobs``.
     Deleting the intent roots explicitly, BEFORE ``jobs``, is what removes the deadlock
     against an intent endpoint that holds an intent row and reaches for the queued apply
-    winner — leaving them to ``db.delete(device)``'s cascade puts them after the job null-out.
+    winner. Leaving them to ``db.delete(device)``'s cascade puts them after the job null-out.
 
     Raises :class:`ClaimUnavailableError` when the device stays claimed for the whole
     wait budget.

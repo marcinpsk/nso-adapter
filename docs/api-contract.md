@@ -710,7 +710,7 @@ Both return:
 
 For retry, `job_id` identifies the fresh job that will execute the blocked head.
 For abandon, `job_id` identifies the carrier of the successor made executable.
-It is `null` when abandoning the head makes no successor executable — including
+It is `null` when abandoning the head makes no successor executable. This includes
 when a successor exists but is itself failed (for example the adjacent generation
 of the same failed carrier). Both actions return `409 conflict` when
 the device has no blocked generation; `error.detail.head_status` reports the

@@ -364,7 +364,7 @@ _INVENTORY = {
 
 @pytest.mark.parametrize("site_id", list(_INVENTORY))
 async def test_every_terminal_writer_allocates(adapter_client, site_id):
-    """S2.3 (P0.8) — all 14 device-bound sites allocate; the device-less site does not.
+    """S2.3 (P0.8): all 14 device-bound sites allocate; the device-less site does not.
 
     Forbidden: any site producing a terminal, device-bound job with ``settle_seq IS NULL``.
     Such a job is permanently invisible to a settlement consumer, and nothing about the row
@@ -507,7 +507,7 @@ async def test_a_rejected_recovery_write_allocates_nothing(adapter_client, monke
 
 
 async def test_device_null_provision_failure_is_exempt(adapter_client):
-    """S2.5 — a provision that fails before acquiring a device remains unsequenced.
+    """S2.5: a provision that fails before acquiring a device remains unsequenced.
 
     It is terminal and device-less. A device-scoped cursor cannot reach it, and there is no
     counter to allocate from.

@@ -510,7 +510,7 @@ async def test_a_keyed_syntactically_invalid_json_body_is_a_validation_error(ada
 
     Unlike the invalid-UTF8 sibling (Starlette 400 -> flat envelope), FastAPI parses a
     decodable body itself, so this path answers through the validation handler with the
-    pydantic error list in ``detail`` — still the one documented envelope.
+    pydantic error list in ``detail``. This is still the one documented envelope.
     """
     device_id = await seed_device(nso_device_name="rcp-not-json", netbox_device_id=None)
 

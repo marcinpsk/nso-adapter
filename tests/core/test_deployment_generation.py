@@ -1076,7 +1076,7 @@ async def test_advancement_yields_to_a_worker_starting_the_carrier(adapter_clien
         return result
 
     async def start_the_job(worker) -> None:
-        """``worker.py`` — lock the job by exact id, then move ITS generations to running."""
+        """``worker.py``: lock the job by exact id, then move ITS generations to running."""
         locked = await worker.scalar(
             sa.select(Job)
             .where(Job.id == head.job_id, Job.status == JobStatus.queued)
@@ -1217,13 +1217,15 @@ async def test_startup_recovery_isolates_a_database_failure(adapter_client):
     from nso_adapter.core.generation import create_generation, note_write, recover_generations
     from nso_adapter.store.models import GenerationMode, JobStatus
 
-    failing_device = await _device("gen-recover-db-failure", 9798)
-    healthy_device = await _device("gen-recover-after-db-failure", 9799)
-    for device_id, vlan_id in ((failing_device, 99), (healthy_device, 100)):
+    devices = (
+        await _device("gen-recover-db-failure", 9798),
+        await _device("gen-recover-after-db-failure", 9799),
+    )
+    for device_id, vlan_id in zip(devices, (99, 100), strict=True):
         await _vlan(device_id, vlan_id)
 
     async with session() as db:
-        for device_id in (failing_device, healthy_device):
+        for device_id in devices:
             await note_write(db, device_id, "vlan")
             generation = await create_generation(
                 db,
@@ -1235,17 +1237,21 @@ async def test_startup_recovery_isolates_a_database_failure(adapter_client):
         await db.commit()
 
     advance_device_generations = generation_module.advance_device_generations
+    recovery_order = []
 
     async def fail_one_device(device_id):
-        if device_id == failing_device:
+        recovery_order.append(device_id)
+        if len(recovery_order) == 1:
             raise DBAPIError("SELECT carrier", {}, RuntimeError("transient database failure"), True)
         return await advance_device_generations(device_id)
 
     with patch("nso_adapter.core.generation.advance_device_generations", new=fail_one_device):
         await recover_generations()
 
-    (unchanged_failure,) = await _generations(failing_device)
-    (recovered_healthy,) = await _generations(healthy_device)
+    assert len(recovery_order) == 2
+    failed_device, recovered_device = recovery_order
+    (unchanged_failure,) = await _generations(failed_device)
+    (recovered_healthy,) = await _generations(recovered_device)
     assert unchanged_failure.job_id is None
     assert recovered_healthy.job_id is not None
     assert await _job_status(recovered_healthy.job_id) is JobStatus.queued
