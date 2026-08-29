@@ -2,6 +2,252 @@
 
 <!-- version list -->
 
+## v1.1.0 (2026-08-29)
+
+### Bug Fixes
+
+- **api**: Declare ActionApplyGenerationOut.job_id non-null
+  ([`8a63c66`](https://github.com/marcinpsk/nso-adapter/commit/8a63c663dd02c1b38509f660e7c8dc600beb2134))
+
+- **api**: Route promotion refusal through error factory
+  ([`5acf1ee`](https://github.com/marcinpsk/nso-adapter/commit/5acf1ee8e76c8c696a3b56318515398a5a193144))
+
+- **api**: Skipped_detail is required and serialized on the Apply response
+  ([`8c857c3`](https://github.com/marcinpsk/nso-adapter/commit/8c857c39a18bfdc3563937fe3f8f1cf1697eb08c))
+
+- **apply**: Order the backfill skip after sequence match
+  ([`84c45de`](https://github.com/marcinpsk/nso-adapter/commit/84c45de672ab2b357776a5653b34749e7926c461))
+
+- **apply**: Preserve error response contract
+  ([`0883596`](https://github.com/marcinpsk/nso-adapter/commit/0883596cb282497ac0f51689c9f4abb5db85773b))
+
+- **compose**: Mount postgres volumes at the 18+ parent directory
+  ([`4fba8c8`](https://github.com/marcinpsk/nso-adapter/commit/4fba8c891f557a455c290f072d5c247467c041c4))
+
+- **contract**: Include provenance refusal reason
+  ([`e76c97d`](https://github.com/marcinpsk/nso-adapter/commit/e76c97dae091f241825175399782e667d4128f44))
+
+- **generation**: Carry interface execution into successors
+  ([`c0167cf`](https://github.com/marcinpsk/nso-adapter/commit/c0167cffd7ffdb0303c3f6d7942922e12ba3f50d))
+
+- **generation**: Close document execution gaps
+  ([`08ef84a`](https://github.com/marcinpsk/nso-adapter/commit/08ef84adf9c276745753dddadd58e58d0256a705))
+
+- **generation**: Complete writer settlement admission
+  ([`e85b5c6`](https://github.com/marcinpsk/nso-adapter/commit/e85b5c635261756ff84adf4a02671c2e5fde540d))
+
+- **generation**: Drop the stale authorized_streams export
+  ([`ecfdca3`](https://github.com/marcinpsk/nso-adapter/commit/ecfdca3979d279b517e35066c15249bb95ca7de6))
+
+- **generation**: Harden document boundaries
+  ([`7cfd932`](https://github.com/marcinpsk/nso-adapter/commit/7cfd93212823a104a3882f886d4c9b971ed5529c))
+
+- **generation**: Preserve empty document sections
+  ([`2bf61fb`](https://github.com/marcinpsk/nso-adapter/commit/2bf61fb05c66fa705ca5b6f378eb92ec8eed7f67))
+
+- **generation**: Scope interface eligibility to its promotion
+  ([`81bb121`](https://github.com/marcinpsk/nso-adapter/commit/81bb12191bac7b7b46ce73f1756efa55f018e32b))
+
+- **l2**: Count removal generations without the retired metadata-clear signal
+  ([`264dd9b`](https://github.com/marcinpsk/nso-adapter/commit/264dd9bd1c78250bb913a92c0d7627626f4bd9d0))
+
+- **openapi**: Preserve push sequence bound
+  ([`c99ec77`](https://github.com/marcinpsk/nso-adapter/commit/c99ec778c84b92ba1e3e2dd9487fc60f045aca84))
+
+- **projection**: Keep correlation-only edits out of the apply delta
+  ([`b6d9b67`](https://github.com/marcinpsk/nso-adapter/commit/b6d9b6704c1e8f9c70308c9789d384fa7b4aba68))
+
+- **promotion**: Harden manual apply boundaries
+  ([`b92e608`](https://github.com/marcinpsk/nso-adapter/commit/b92e608bbdb8e63cc29989225f651f3b64199c88))
+
+- **removal**: Fail closed on a generationless static-route force job
+  ([`ee758c6`](https://github.com/marcinpsk/nso-adapter/commit/ee758c606b08597e796adc8dc9a109a10347b348))
+
+- **removal**: Refuse force promotes before any store work
+  ([`dbef8f4`](https://github.com/marcinpsk/nso-adapter/commit/dbef8f43cb2204bdb90df44c2a51343d94545420))
+
+- **removal**: Refuse generation-only arguments on a force removal
+  ([`5c28853`](https://github.com/marcinpsk/nso-adapter/commit/5c28853aba58115b2bc1cfc23a256d89fcf63f9b))
+
+- **removal**: Reject cohort on force reissue
+  ([`b93810b`](https://github.com/marcinpsk/nso-adapter/commit/b93810bd7ca6b0eb81276d26fb15529560f1faa5))
+
+- **removal**: Tighten promotion-context invariants and the lock probe
+  ([`a86cd2b`](https://github.com/marcinpsk/nso-adapter/commit/a86cd2b96a59a7a7a7dc48cd38f0b0634f6f2bb4))
+
+- **review**: Resolve branch 24 findings
+  ([`9f01870`](https://github.com/marcinpsk/nso-adapter/commit/9f01870dd41ffc403a342febfc80b1473ce196e7))
+
+- **review**: Resolve branch 26 findings
+  ([`dbc6e15`](https://github.com/marcinpsk/nso-adapter/commit/dbc6e15af123b2f4e70274e8b9ec7b4c51734c94))
+
+- **stack**: Preserve final helper seams
+  ([`c64679d`](https://github.com/marcinpsk/nso-adapter/commit/c64679dfba3aae7a2224bb2c91d1880c3af97c5e))
+
+- **static-route**: Normalize replay identity
+  ([`e7225b8`](https://github.com/marcinpsk/nso-adapter/commit/e7225b827fe744adf26e8d709decdcc119c9ff4d))
+
+- **static-route**: Refuse a generationless removal job on every scope
+  ([`182a1cd`](https://github.com/marcinpsk/nso-adapter/commit/182a1cd0d83d6d7bbe838bca5d01c3f9805bdffd))
+
+- **types**: Satisfy the mypy gate after rebasing onto develop
+  ([`54e6071`](https://github.com/marcinpsk/nso-adapter/commit/54e6071dc85467790eca2a2121334be27f27939f))
+
+- **types**: Satisfy the mypy gate after rebasing onto develop
+  ([`0fde500`](https://github.com/marcinpsk/nso-adapter/commit/0fde500564ca0b7d73ccf3b3dfc06919f6922155))
+
+### Code Style
+
+- **api**: Format promotion error regression
+  ([`e407c86`](https://github.com/marcinpsk/nso-adapter/commit/e407c865a9301761ade628bb63c2157eb8e06306))
+
+### Documentation
+
+- **api**: Clarify explicit apply boundary
+  ([`1e243bd`](https://github.com/marcinpsk/nso-adapter/commit/1e243bda29990d6d3ed9b8eb4511df60bd88363e))
+
+- **api**: Distinguish document-executed removals from live-store reissues; unambiguous
+  skipped_detail presence
+  ([`ecf7070`](https://github.com/marcinpsk/nso-adapter/commit/ecf7070a82dd166c6921e55a01fe09c368167610))
+
+- **api**: Name the backfill removal exception
+  ([`32bf196`](https://github.com/marcinpsk/nso-adapter/commit/32bf196237b070a46ad54fb44eb86fa23177bc48))
+
+- **api**: Name the static-route store-only removal exception
+  ([`753cd60`](https://github.com/marcinpsk/nso-adapter/commit/753cd60daefbbd77d1956409dca28b8708df1481))
+
+- **api**: Update explicit apply sections
+  ([`1338699`](https://github.com/marcinpsk/nso-adapter/commit/1338699a71be8e03c149a0067740b9eab682a6c1))
+
+- **contract**: Document the skipped_detail response member
+  ([`02819ef`](https://github.com/marcinpsk/nso-adapter/commit/02819efba93e23276606e663f5af6d8e92c2aeb1))
+
+- **contract**: Name all three removal-execution outcomes
+  ([`46bac11`](https://github.com/marcinpsk/nso-adapter/commit/46bac11599334a7cc237a2979f16576452309533))
+
+- **contract**: Scope the empty-list detach rule to non-backfill pushes
+  ([`cdc7f58`](https://github.com/marcinpsk/nso-adapter/commit/cdc7f5832c297cc5c517e73281ac2d45467df71c))
+
+- **contract**: State the real action-apply chain order
+  ([`18dba93`](https://github.com/marcinpsk/nso-adapter/commit/18dba93cf6d4b985e9c44c520a51a8b4aef5cfe8))
+
+- **projection**: Correct manual apply set relation
+  ([`0d4075f`](https://github.com/marcinpsk/nso-adapter/commit/0d4075f28d541f0d74a48186666e66c80a5b4e50))
+
+### Features
+
+- **1558**: Atomic action-apply promotion with generation chains (slice 2a)
+  ([`47590bc`](https://github.com/marcinpsk/nso-adapter/commit/47590bc281a5fb1becd11cd999091c6b86f775cc))
+
+- **1558**: Device generations listing for chain-aware consumers
+  ([`73ee4e1`](https://github.com/marcinpsk/nso-adapter/commit/73ee4e1f1010e9911ff5bc0eeac8e45788d732ab))
+
+- **1558**: Document execution for bgp
+  ([`b279abc`](https://github.com/marcinpsk/nso-adapter/commit/b279abc86fffce3937c368ff6e487ad36699b9a8))
+
+- **1558**: Document execution for eight sections + request-atomic cohorts
+  ([`c63a45c`](https://github.com/marcinpsk/nso-adapter/commit/c63a45cc59cfc678112cbf4174547f89104a2684))
+
+- **1558**: Document execution for interface_config and the ip lane
+  ([`62d32f9`](https://github.com/marcinpsk/nso-adapter/commit/62d32f967734457357eee105a8e5af069cbf75ab))
+
+- **1558**: Document execution for snmp and logging
+  ([`cedb524`](https://github.com/marcinpsk/nso-adapter/commit/cedb5243be27b55e0284f3ca502acb93d18ae40e))
+
+- **1558**: Document execution for static_route completes the partition
+  ([`786f5d4`](https://github.com/marcinpsk/nso-adapter/commit/786f5d4fade8240bb965b9158e967b4571838dbb))
+
+- **apply**: Report a backfill-only receipt with its own skip code
+  ([`3c12001`](https://github.com/marcinpsk/nso-adapter/commit/3c120013aebfbc072cf32c2983d3b6cac8394835))
+
+- **static-route**: Require deleted_routes on the intent PUT
+  ([`dc3405c`](https://github.com/marcinpsk/nso-adapter/commit/dc3405c718b72fd1c994a18e7feeb342f50c6a24))
+
+### Performance Improvements
+
+- **receipt**: Index deletion-restore lookups once per table
+  ([`63fc23a`](https://github.com/marcinpsk/nso-adapter/commit/63fc23ad46482a11e0f28845d097bc91c14aac8a))
+
+### Refactoring
+
+- **intent**: Export require_attach_to_job and narrow its pragma
+  ([`b7e4fff`](https://github.com/marcinpsk/nso-adapter/commit/b7e4fffb3c9b67e9b86dadbc4b347c22e02389ce))
+
+- **removal**: Collapse the live-store accepted reads
+  ([`f19fed7`](https://github.com/marcinpsk/nso-adapter/commit/f19fed7b45c9fa818412b7d04307522faf59a01d))
+
+- **removal**: Route _replacement_rows through _accepted_rows
+  ([`26b6e70`](https://github.com/marcinpsk/nso-adapter/commit/26b6e70086aa1bd24a2a907a60f35b13d2ddbcdd))
+
+- **static-route**: Share one clear-candidate rule
+  ([`bad2b95`](https://github.com/marcinpsk/nso-adapter/commit/bad2b9579a33fd8e816a5f32d9694fdfd26bb557))
+
+### Testing
+
+- Drop the time import left unused by the lock-wait resolution
+  ([`cdeffbd`](https://github.com/marcinpsk/nso-adapter/commit/cdeffbd4f7458370889cf23ace662ae5220485e0))
+
+- Replace the remaining iteration-count waits with deadlines
+  ([`cd8f969`](https://github.com/marcinpsk/nso-adapter/commit/cd8f9695f7e7f1e7c5ac29861e0082b95cc51844))
+
+- **api**: Exercise promotion refusal dispatch
+  ([`3f0192a`](https://github.com/marcinpsk/nso-adapter/commit/3f0192af3b2fd4a10e263444aa8f407bf0d11ea7))
+
+- **apply**: Pin both interface apply_unexecutable reasons
+  ([`75c276f`](https://github.com/marcinpsk/nso-adapter/commit/75c276f8f941c930dc30b4c48ef3ee3427838a17))
+
+- **apply**: Wait on a deadline, not an iteration count
+  ([`03c86bd`](https://github.com/marcinpsk/nso-adapter/commit/03c86bdee61b4605ccda8de27eb5d2cdf1405e00))
+
+- **apply**: Widen the live-read gate at its source module
+  ([`6060947`](https://github.com/marcinpsk/nso-adapter/commit/6060947954aad5ad9922f635168c2edbfc905098))
+
+- **generation**: Drop superseded apply cases
+  ([`0e866bd`](https://github.com/marcinpsk/nso-adapter/commit/0e866bd1adf44031a4c0a05614a089ae81c408eb))
+
+- **generation**: Refresh lock probe snapshot
+  ([`c59687f`](https://github.com/marcinpsk/nso-adapter/commit/c59687ff67fda1864ec3930bc690bfe4e7a7ea4e))
+
+- **projection**: Refuse a well-formed keyless vault reference
+  ([`eb1b61a`](https://github.com/marcinpsk/nso-adapter/commit/eb1b61a54a91d65eb330f2eb11188c4359097fc6))
+
+- **protocol**: Stop shadowing the push_seq helper
+  ([`b621af9`](https://github.com/marcinpsk/nso-adapter/commit/b621af98f94f7be5933fe696d0e91a9f06e28ae8))
+
+- **receipts**: Assert the transmitted push sequence
+  ([`97fa96a`](https://github.com/marcinpsk/nso-adapter/commit/97fa96abf69f24ff0c76c58a56fa8626b8f95d93))
+
+- **removal**: Adapt predicate case to documents
+  ([`788bc5f`](https://github.com/marcinpsk/nso-adapter/commit/788bc5f6084c124c09c8c341cbc80c312a40544c))
+
+- **removal**: Pin generation ownership predicate
+  ([`c1987c6`](https://github.com/marcinpsk/nso-adapter/commit/c1987c6369a86fbda5741311133dfe5113a0fa60))
+
+- **removal**: State force promotion disposition
+  ([`c981885`](https://github.com/marcinpsk/nso-adapter/commit/c981885564e4f9a775abab4676464ffa73286274))
+
+- **removal**: State reissue promotion disposition
+  ([`5b0b9bb`](https://github.com/marcinpsk/nso-adapter/commit/5b0b9bbfe60b80b5b83535e156ed0331241103a9))
+
+- **review**: Separate the document slot from the stamp slot
+  ([`3af124d`](https://github.com/marcinpsk/nso-adapter/commit/3af124dc18d24aecb6656ea59a58d5a0b4811b55))
+
+- **static-route**: Cover null deleted routes
+  ([`72ba063`](https://github.com/marcinpsk/nso-adapter/commit/72ba063cdee0d16bc75c2c044f657fdd11f9bdb6))
+
+- **static-route**: Cover per-object deletion rollback
+  ([`b8d10c1`](https://github.com/marcinpsk/nso-adapter/commit/b8d10c17e4b7f52ee77117e580c3ddf74f20455c))
+
+- **static-route**: Record removal execution fixture
+  ([`de633e9`](https://github.com/marcinpsk/nso-adapter/commit/de633e9a05f2370a3988d0bccb72ac1b8e6b90cb))
+
+- **store**: Assert the cohort index returns on re-upgrade
+  ([`368e261`](https://github.com/marcinpsk/nso-adapter/commit/368e2618ff705e4094c3f5e3ad8d5ed6b7beac41))
+
+- **store**: Finish the pg_provisioner fixture rename at this level
+  ([`65f20eb`](https://github.com/marcinpsk/nso-adapter/commit/65f20eb920a528e42bcb6cffff5d8aa872c8081e))
+
+
 ## v1.0.0 (2026-08-29)
 
 ### Bug Fixes
