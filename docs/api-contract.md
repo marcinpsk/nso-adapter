@@ -2086,6 +2086,9 @@ That PUT-replace is a synchronous device commit that can exceed the plugin's HTT
 client timeout (~30s). So it does **not** run inline in the intent PUT: when an
 intent PUT drops one or more rows it enqueues a **`removal`** job (a new
 `jobtype` enum value), atomically with the row deletes, and returns immediately.
+`?store_only=true` is the exception: it updates the mirror without authorizing the
+drop on the device, so it enqueues no removal job (and no apply job, whatever the
+device's `auto_apply` setting) — clients must not wait for jobs it never creates.
 A worker runs the job in the background, re-reading the **current** accepted rows
 and PUT-replacing the service — so the job is idempotent and is requeued (not
 failed) after a worker restart. Scope is carried in `Job.context.scope` (one of
