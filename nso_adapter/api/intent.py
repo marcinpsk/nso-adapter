@@ -24,7 +24,6 @@ from nso_adapter.core.request_flags import PendingClearProvenance
 from nso_adapter.store.models import (
     DbInterface,
     Device,
-    DeviceSettings,
     InterfaceAttrState,
     InterfaceIntent,
     ManagedScope,
@@ -207,9 +206,9 @@ async def put_intent(
     await db.flush()
 
     # If auto_apply is enabled, enqueue an apply job
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
-    if settings and settings.auto_apply and count > 0:
+    from nso_adapter.core.generation import auto_apply_requested
+
+    if await auto_apply_requested(db, device_id, count):
         from nso_adapter.core.apply import enqueue_apply
 
         await enqueue_apply(db, device_id, force=True, stream=delivery.stream)

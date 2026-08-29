@@ -42,6 +42,7 @@ from typing import Any, NamedTuple
 from sqlalchemy import UniqueConstraint, select
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from nso_adapter.store.models import (
     BfdIntent,
@@ -51,6 +52,7 @@ from nso_adapter.store.models import (
     BgpRouterIntent,
     BgpScopeIntent,
     DbInterface,
+    InterfaceAttrState,
     InterfaceIntent,
     InterfaceIpIntent,
     InterfaceMtuIntent,
@@ -73,6 +75,7 @@ from nso_adapter.store.models import (
     StaticRouteTombstone,
     SubinterfaceIntent,
     SviIntent,
+    SyncState,
     VlanIntent,
 )
 
@@ -310,11 +313,33 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+_VAULT_REFERENCE_COLUMNS: dict[type, frozenset[str]] = {
+    SnmpCommunityIntent: frozenset({"vault_ref"}),
+    SnmpV3UserIntent: frozenset({"auth_vault_ref", "priv_vault_ref"}),
+}
+
+
+def _document_value(row, key: str) -> Any:
+    """Return one durable-document value after enforcing the secret boundary."""
+    value = getattr(row, key)
+    # '' is the API's absent optional leg (apply_snmp_config skips it) — nothing to parse
+    if value is not None and value != "" and key in _VAULT_REFERENCE_COLUMNS.get(type(row), ()):
+        from nso_adapter.secrets.refs import VaultRefError, parse_vault_ref
+
+        try:
+            parse_vault_ref(value, require_key=True)
+        except VaultRefError:
+            raise ValueError(
+                f"{type(row).__tablename__}.{key}: refusing to serialize non-reference secret material"
+            ) from None
+    return _jsonable(value)
+
+
 def _row_dict(row) -> dict:
-    return {attr.key: _jsonable(getattr(row, attr.key)) for attr in sa_inspect(type(row)).column_attrs}
+    return {attr.key: _document_value(row, attr.key) for attr in sa_inspect(type(row)).column_attrs}
 
 
-_SPEC_BY_MODEL: dict[type, _Spec] = {spec.model: spec for specs in _SECTION_TABLES.values() for spec in specs}
+_SPEC_BY_MODEL: dict[Any, _Spec] = {spec.model: spec for specs in _SECTION_TABLES.values() for spec in specs}
 _SPEC_BY_TABLE: dict[str, _Spec] = {spec.model.__tablename__: spec for spec in _SPEC_BY_MODEL.values()}
 
 
@@ -349,16 +374,7 @@ def _identity_fields(spec: _Spec) -> tuple[str, ...]:
     return tuple(field for field in candidates[0] if field != scope)
 
 
-def _rows_by_id(fragment: dict[str, list[dict]], table: str, by_id: dict[str, dict]) -> dict:
-    """Return *table*'s ``{id: row}`` map, built once per index pass and reused per row."""
-    index = by_id.get(table)
-    if index is None:
-        index = {row.get("id"): row for row in fragment.get(table, [])}
-        by_id[table] = index
-    return index
-
-
-def _row_identity(fragment: dict[str, list[dict]], spec: _Spec, row: dict, by_id: dict[str, dict]) -> tuple:
+def _row_identity(spec: _Spec, row: dict, identities_by_id: dict[Any, dict[Any, tuple]]) -> tuple:
     parent_identity: tuple = ()
     if spec.parent is not None:
         fk = _fk_column(spec.model, spec.parent)
@@ -368,12 +384,43 @@ def _row_identity(fragment: dict[str, list[dict]], spec: _Spec, row: dict, by_id
             # DbInterface is outside the projection and is not rebuilt by an intent PUT.
             parent_identity = (parent_id,)
         else:
-            parent_table = spec.parent.__tablename__
-            parent_row = _rows_by_id(fragment, parent_table, by_id).get(parent_id)
-            if parent_row is None:
-                raise RuntimeError(f"{spec.model.__tablename__} row references missing {parent_table} id {parent_id!r}")
-            parent_identity = _row_identity(fragment, parent_spec, parent_row, by_id)
+            found = identities_by_id.get(spec.parent, {}).get(parent_id)
+            if found is None:
+                raise RuntimeError(
+                    f"{spec.model.__tablename__} row references missing {spec.parent.__tablename__} id {parent_id!r}"
+                )
+            parent_identity = found
     return (*parent_identity, *(row.get(field) for field in _identity_fields(spec)))
+
+
+def _identity_indexes(fragment: dict[str, list[dict]], specs: tuple[_Spec, ...]) -> dict[Any, dict[tuple, dict]]:
+    """Index each table once, with parents before children."""
+    identities_by_id: dict[Any, dict[Any, tuple]] = {}
+    rows_by_identity: dict[type, dict[tuple, dict]] = {}
+    for spec in specs:
+        indexed: dict[tuple, dict] = {}
+        by_id: dict[Any, tuple] = {}
+        for row in fragment.get(spec.model.__tablename__, []):
+            identity = _row_identity(spec, row, identities_by_id)
+            if identity in indexed:
+                raise RuntimeError(
+                    f"{spec.model.__tablename__} projection contains duplicate durable identity {identity!r}"
+                )
+            indexed[identity] = row
+            by_id[row.get("id")] = identity
+        rows_by_identity[spec.model] = indexed
+        identities_by_id[spec.model] = by_id
+    return rows_by_identity
+
+
+def _identity_lineage(spec: _Spec) -> tuple[_Spec, ...]:
+    """Return the projected ancestors of *spec*, followed by *spec*."""
+    lineage = [spec]
+    parent = _SPEC_BY_MODEL.get(spec.parent)
+    while parent is not None:
+        lineage.append(parent)
+        parent = _SPEC_BY_MODEL.get(parent.parent)
+    return tuple(reversed(lineage))
 
 
 def rows_by_intent_identity(fragment: dict[str, list[dict]], table: str) -> dict[tuple, dict]:
@@ -383,20 +430,13 @@ def rows_by_intent_identity(fragment: dict[str, list[dict]], table: str) -> dict
     logical parent identity, so full-replace writers can mint new database ids without making
     unchanged BGP scopes, peers, or address families look deleted.
 
-    Each parent table is indexed by id ONCE per call: BGP repeats the lineage walk at four
-    levels, so scanning the parent list per row is quadratic in the fragment size.
+    Each table in the lineage is indexed ONCE per call, parents before children: BGP repeats
+    the walk at four levels, so re-deriving a parent per child row is quadratic.
     """
     spec = _SPEC_BY_TABLE.get(table)
     if spec is None:
         raise ValueError(f"unknown projection table {table!r}")
-    by_id: dict[str, dict] = {}
-    indexed: dict[tuple, dict] = {}
-    for row in fragment.get(table, []):
-        identity = _row_identity(fragment, spec, row, by_id)
-        if identity in indexed:
-            raise RuntimeError(f"{table} projection contains duplicate durable identity {identity!r}")
-        indexed[identity] = row
-    return indexed
+    return _identity_indexes(fragment, _identity_lineage(spec))[spec.model]
 
 
 def is_intent_deletion(table: str, identity: tuple, desired_rows: dict[tuple, dict]) -> bool:
@@ -451,38 +491,166 @@ async def _rows_for(db: AsyncSession, device_id: int, spec: _Spec) -> list[dict]
 #: Sections whose apply pass is served from the executing generation's stored document
 #: rather than from live intent rows (#1522 §G1).
 #:
-#: Membership is a property of the SECTION, not a switch: a section joins when its whole
-#: outbound payload can be rebuilt from :func:`snapshot_sections` alone. Every other section
-#: is named in :data:`LIVE_READ_SECTIONS` with the reason it cannot yet, and
-#: ``test_projection_document.py`` pins the partition — so a new section cannot drift out of
-#: the protocol unnoticed, and closing a reason without wiring the section fails.
-DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset({"vlan"})
+#: Membership is a property of the SECTION, not a switch. Every outbound payload can now be
+#: rebuilt from the stored document. ``test_projection_document.py`` pins the complete set.
+DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset(
+    {
+        "bgp",
+        "vlan",
+        "snmp",
+        "logging",
+        "svi",
+        "subinterface",
+        "bfd",
+        "interface_config",
+        "interface_mtu",
+        "l2_sap",
+        "isis",
+        "route_policy",
+        "ospf",
+        "static_route",
+    }
+)
 
-#: The document-executed sections a manual Apply may select. This set equals
-#: :data:`DOCUMENT_EXECUTED_SECTIONS` today. The names remain separate because one states
-#: how a section executes and the other states whether an operator may select it. A section
-#: can join this set only after its companion apply and claim subtraction stop reading live
-#: intent.
-ACTION_APPLY_EXECUTABLE_SECTIONS: frozenset[str] = frozenset({"vlan"})
+#: The manual Apply selection boundary equals the document-executed boundary. Every
+#: projection stream now maps to a section that executes from its stored document.
+ACTION_APPLY_EXECUTABLE_SECTIONS: frozenset[str] = DOCUMENT_EXECUTED_SECTIONS
 
-#: Why each remaining section still reads live rows at apply time. Most await #1522's
-#: aggregate device-intent builder, which is the general producer of a complete document;
-#: three need something more specific, named here.
-LIVE_READ_SECTIONS: dict[str, str] = {
-    "snmp": "the payload resolves Vault refs per row at send time",
-    "static_route": "build_plan classifies against tombstones, carriers and deployed keys",
-    "logging": "shares the snmp module's per-row secret resolution",
-    "svi": "awaits the aggregate builder",
-    "subinterface": "awaits the aggregate builder",
-    "bfd": "awaits the aggregate builder",
-    "interface_mtu": "awaits the aggregate builder",
-    "l2_sap": "awaits the aggregate builder",
-    "isis": "awaits the aggregate builder",
-    "bgp": "the payload walks the router -> scope -> af -> peer relationship graph",
-    "route_policy": "awaits the aggregate builder",
-    "ospf": "awaits the aggregate builder",
-    "interface_config": "eligibility is keyed off InterfaceAttrState, which is not intent",
-}
+#: No section reads live intent to decide what a generation executes.
+LIVE_READ_SECTIONS: dict[str, str] = {}
+
+#: Reserved section key for immutable interface and static-route execution metadata.
+EXECUTION_KEY = "_execution"
+#: The sections that record execution metadata under :data:`EXECUTION_KEY`.
+EXECUTION_METADATA_SECTIONS: frozenset[str] = frozenset({"interface_config", "static_route"})
+INTERFACE_ATTRIBUTE_ELIGIBLE_STATES: frozenset[SyncState] = frozenset(
+    {
+        SyncState.accepted,
+        SyncState.apply_failed,
+        SyncState.drifted,
+        SyncState.in_sync,
+    }
+)
+
+
+class InterfaceEligibilityUnresolved(RuntimeError):
+    """Interface intent whose non-intent eligibility state is missing at creation."""
+
+
+class InterfaceExecution(NamedTuple):
+    """Creation-time interface context and the explicit eligible attribute set."""
+
+    interfaces: dict[int, DbInterface]
+    eligible_attributes: frozenset[tuple[int, str]]
+
+
+async def record_interface_execution(db: AsyncSession, device_id: int, document: dict) -> None:
+    """Resolve and record all non-intent facts needed to execute interface_config."""
+    section = document.get("interface_config")
+    if section is None:
+        return
+    attr_rows = section.get(InterfaceIntent.__tablename__, [])
+    ip_rows = section.get(InterfaceIpIntent.__tablename__, [])
+    interface_ids = sorted({row["interface_id"] for row in [*attr_rows, *ip_rows]})
+    interfaces = (
+        (
+            await db.execute(
+                select(DbInterface)
+                .where(DbInterface.device_id == device_id, DbInterface.id.in_(interface_ids))
+                .order_by(DbInterface.id)
+            )
+        )
+        .scalars()
+        .all()
+        if interface_ids
+        else []
+    )
+    by_id = {iface.id: iface for iface in interfaces}
+    missing_interfaces = sorted(set(interface_ids) - set(by_id))
+    if missing_interfaces:
+        raise InterfaceEligibilityUnresolved(f"interface_config references missing interface ids {missing_interfaces}")
+
+    states = (
+        (await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id.in_(interface_ids))))
+        .scalars()
+        .all()
+        if interface_ids
+        else []
+    )
+    state_by_key = {(state.interface_id, state.attribute): state for state in states}
+    attr_keys = [(row["interface_id"], row["attribute"]) for row in attr_rows]
+    unresolved = sorted(key for key in attr_keys if key not in state_by_key)
+    if unresolved:
+        raise InterfaceEligibilityUnresolved(
+            "interface_config attribute eligibility is missing for "
+            + ", ".join(f"interface {interface_id} attribute {attribute!r}" for interface_id, attribute in unresolved)
+        )
+    eligible = [
+        {"interface_id": interface_id, "attribute": attribute}
+        for interface_id, attribute in sorted(attr_keys)
+        if state_by_key[(interface_id, attribute)].sync_state in INTERFACE_ATTRIBUTE_ELIGIBLE_STATES
+    ]
+    section[EXECUTION_KEY] = {
+        "interfaces": [
+            {
+                "id": iface.id,
+                "name": iface.name,
+                "kind": iface.kind,
+                "parent_binding": iface.parent_binding,
+                "encap_tag": iface.encap_tag,
+                "vrf": iface.vrf,
+                "service": iface.service,
+            }
+            for iface in interfaces
+        ],
+        "eligible_interface_attributes": eligible,
+    }
+
+
+def hydrate_interface_execution(document: dict) -> InterfaceExecution:
+    """Rebuild interface writer context and eligibility from the stored document."""
+    section = document.get("interface_config") or {}
+    execution = section.get(EXECUTION_KEY)
+    if execution is None:
+        raise ValueError("document section 'interface_config' has no recorded execution context")
+    if not isinstance(execution, dict) or set(execution) != {
+        "interfaces",
+        "eligible_interface_attributes",
+    }:
+        raise ValueError("document section 'interface_config' has invalid execution context")
+    serialized_interfaces = execution.get("interfaces")
+    serialized_eligible = execution.get("eligible_interface_attributes")
+    if not isinstance(serialized_interfaces, list) or not isinstance(serialized_eligible, list):
+        raise ValueError("document section 'interface_config' has invalid execution context")
+    interfaces: dict[int, DbInterface] = {}
+    allowed = {"id", "name", "kind", "parent_binding", "encap_tag", "vrf", "service"}
+    for record in serialized_interfaces:
+        if not isinstance(record, dict) or set(record) != allowed:
+            raise ValueError("document section 'interface_config' has invalid interface context")
+        iface = DbInterface(**record)
+        if iface.id in interfaces:
+            raise ValueError(f"document section 'interface_config' repeats interface id {iface.id}")
+        interfaces[iface.id] = iface
+    eligible: set[tuple[int, str]] = set()
+    for record in serialized_eligible:
+        if not isinstance(record, dict) or set(record) != {"interface_id", "attribute"}:
+            raise ValueError("document section 'interface_config' has invalid eligible attribute")
+        key = (record["interface_id"], record["attribute"])
+        if key in eligible:
+            raise ValueError(f"document section 'interface_config' repeats eligible attribute {key!r}")
+        eligible.add(key)
+    referenced_interfaces = {
+        row["interface_id"]
+        for table in (InterfaceIntent.__tablename__, InterfaceIpIntent.__tablename__)
+        for row in section.get(table, [])
+    }
+    if set(interfaces) != referenced_interfaces:
+        raise ValueError("document section 'interface_config' execution context does not match its rows")
+    attribute_keys = {(row["interface_id"], row["attribute"]) for row in section.get(InterfaceIntent.__tablename__, [])}
+    if not eligible <= attribute_keys:
+        raise ValueError("document section 'interface_config' eligibility does not match its attribute rows")
+    return InterfaceExecution(interfaces, frozenset(eligible))
+
 
 _MODEL_BY_TABLE: dict[str, Any] = {spec.model.__tablename__: spec.model for spec in _SPEC_BY_MODEL.values()}
 
@@ -534,6 +702,60 @@ def intent_state(row) -> dict:
     return {key: value for key, value in _row_dict(row).items() if key not in APPLY_BOOKKEEPING_COLUMNS}
 
 
+@cache
+def _collection_relationship(parent: Any, child: Any) -> str:
+    """Return the parent's one collection relationship to *child*."""
+    relationships = [
+        relation.key
+        for relation in sa_inspect(parent).relationships
+        if relation.uselist and relation.mapper.class_ is child
+    ]
+    if len(relationships) != 1:
+        raise RuntimeError(
+            f"{parent.__name__} needs one collection relationship to {child.__name__}, got {relationships}"
+        )
+    return relationships[0]
+
+
+def _attach_hydrated_relationships(
+    fragment: dict[str, list[dict]], section: str, records: dict[Any, list[tuple[dict, object]]]
+) -> None:
+    """Rebuild in-document parent collections from durable logical identities."""
+    section_specs = _SECTION_TABLES[section]
+    relationship_models = {
+        model for spec in section_specs if spec.parent in _SPEC_BY_MODEL for model in (spec.parent, spec.model)
+    }
+    indexes = _identity_indexes(fragment, tuple(spec for spec in section_specs if spec.model in relationship_models))
+    for spec in section_specs:
+        parent_spec = _SPEC_BY_MODEL.get(spec.parent)
+        if parent_spec is None:
+            continue
+        parent_pairs = records.get(spec.parent, [])
+        child_pairs = records.get(spec.model, [])
+        instance_by_record = {id(record): instance for record, instance in parent_pairs}
+        parents = {identity: instance_by_record[id(record)] for identity, record in indexes[spec.parent].items()}
+        grouped: dict[tuple, list] = {identity: [] for identity in parents}
+        child_instance_by_record = {id(record): instance for record, instance in child_pairs}
+        local_identity_size = len(_identity_fields(spec))
+        if local_identity_size == 0:
+            # identity[:-0] is the EMPTY tuple, so every child row would report a missing
+            # parent. No table has this shape today; name the real cause if one gains it.
+            raise RuntimeError(
+                f"{spec.model.__tablename__} has no local durable identity, so its parent identity "
+                "cannot be derived by prefix"
+            )
+        for identity, record in indexes[spec.model].items():
+            parent_identity = identity[:-local_identity_size]
+            if parent_identity not in grouped:
+                raise RuntimeError(
+                    f"{spec.model.__tablename__} row references missing durable parent identity {parent_identity!r}"
+                )
+            grouped[parent_identity].append(child_instance_by_record[id(record)])
+        relationship = _collection_relationship(spec.parent, spec.model)
+        for identity, parent in parents.items():
+            set_committed_value(parent, relationship, grouped[identity])
+
+
 def hydrate_section(document: dict, section: str) -> dict[type, list]:
     """Rebuild *section*'s rows from a stored document as TRANSIENT ORM instances.
 
@@ -547,15 +769,22 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
     if section not in document:
         raise ValueError(f"document does not carry section {section!r}")
     tables = document[section] or {}
+    allowed_models = {spec.model for spec in _SECTION_TABLES[section]}
     rows: dict[type, list] = {}
-    for table_name, records in tables.items():
+    row_records: dict[type, list[tuple[dict, object]]] = {}
+    for table_name, serialized_rows in tables.items():
+        if table_name == EXECUTION_KEY and section in EXECUTION_METADATA_SECTIONS:
+            continue
         model = _MODEL_BY_TABLE.get(table_name)
         if model is None:
             raise ValueError(f"document section {section!r} names unknown table {table_name!r}")
+        if model not in allowed_models:
+            raise ValueError(f"document table {table_name!r} does not belong to section {section!r}")
         columns = {column.key: column for column in model.__table__.columns}
         keys = [column.key for column in model.__table__.primary_key.columns]
         built = []
-        for record in records:
+        model_records = []
+        for record in serialized_rows:
             instance = model()
             for key, value in record.items():
                 column = columns.get(key)
@@ -565,7 +794,10 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
             if any(record.get(key) is None for key in keys):
                 raise ValueError(f"document row for {table_name!r} omits the primary key {keys!r}")
             built.append(instance)
+            model_records.append((record, instance))
         rows[model] = built
+        row_records[model] = model_records
+    _attach_hydrated_relationships(tables, section, row_records)
     return rows
 
 
@@ -588,8 +820,12 @@ __all__ = [
     "ACTION_APPLY_EXECUTABLE_SECTIONS",
     "APPLY_BOOKKEEPING_COLUMNS",
     "DOCUMENT_EXECUTED_SECTIONS",
+    "INTERFACE_ATTRIBUTE_ELIGIBLE_STATES",
+    "EXECUTION_KEY",
+    "InterfaceEligibilityUnresolved",
     "LIVE_READ_SECTIONS",
     "hydrate_section",
+    "hydrate_interface_execution",
     "intent_state",
     "is_intent_deletion",
     "projection_sections",
@@ -598,6 +834,7 @@ __all__ = [
     "rows_by_intent_identity",
     "section_models",
     "section_streams",
+    "record_interface_execution",
     "snapshot_stream",
     "stream_for_model",
     "stream_section",

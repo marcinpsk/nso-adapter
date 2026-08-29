@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from types import SimpleNamespace
 
+import httpx
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
@@ -52,12 +54,51 @@ async def _put_snmp(client, device_id: int, labels: list[str], *, seq: int, quer
     )
 
 
+async def _put_bgp(client, device_id: int, remote_as: str, *, seq: int, query: str = ""):
+    return await client.put(
+        f"/api/v1/devices/{device_id}/bgp-intent{query}",
+        json={"routers": [_bgp_router(remote_as)]},
+        headers=AUTH | {"X-Push-Seq": str(seq)},
+    )
+
+
+async def _put_interface_attrs(client, device_id: int, value: str, *, seq: int, query: str = ""):
+    return await client.put(
+        f"/api/v1/devices/{device_id}/intent{query}",
+        json={"attributes": [{"interface": "GigabitEthernet0/1", "attribute": "description", "intent_value": value}]},
+        headers=AUTH | {"X-Push-Seq": str(seq)},
+    )
+
+
+async def _put_svis(client, device_id: int, vlan_ids: list[int], *, seq: int, query: str = ""):
+    return await client.put(
+        f"/api/v1/devices/{device_id}/svi-intent{query}",
+        json={
+            "interfaces": [
+                {"interface_name": f"Vlan{vlan_id}", "vlan_id": vlan_id, "type": "svi"} for vlan_id in vlan_ids
+            ]
+        },
+        headers=AUTH | {"X-Push-Seq": str(seq)},
+    )
+
+
 async def _apply(client, device_id: int, selected: dict[str, int]):
     return await client.post(
         f"/api/v1/devices/{device_id}/actions/apply",
         json={"selected": selected},
         headers=AUTH,
     )
+
+
+def _reject_restconf_patches(client, message: str) -> None:
+    async def reject(url, content=None, headers=None, **kwargs):
+        return httpx.Response(
+            400,
+            request=httpx.Request("PATCH", url),
+            json={"errors": {"error": [{"error-message": message}]}},
+        )
+
+    client._client.return_value.__aenter__.return_value.patch.side_effect = reject
 
 
 def _bgp_router(remote_as: str) -> dict:
@@ -216,6 +257,832 @@ async def test_mixed_promotion_stamps_applied_only_after_the_whole_chain_settles
     await _settle(apply.job_id, GenerationStatus.settled)
     stream = await _stream(device_id, "static_route")
     assert (stream.desired_revision, stream.authorized_revision, stream.applied_revision) == (2, 2, 2)
+
+
+async def test_request_settlement_preparation_uses_one_auto_apply_predicate(adapter_client):
+    from nso_adapter.core.generation import prepare_request_settlement
+
+    device_id = await seed_device(nso_device_name="request-settlement-helper", netbox_device_id=9989)
+    await seed_settings(device_id, auto_apply=True)
+    async with session() as db:
+        assert await prepare_request_settlement(
+            db,
+            device_id,
+            mutation_count=0,
+            removal_generation_count=1,
+        ) == (False, None)
+        apply_requested, cohort = await prepare_request_settlement(
+            db,
+            device_id,
+            mutation_count=1,
+            removal_generation_count=1,
+        )
+
+    assert apply_requested is True
+    assert isinstance(cohort, int)
+
+
+async def test_request_atomic_cohort_stamps_no_stream_until_every_member_succeeds(adapter_client):
+    """One failed cohort member withholds every stream until that member is retried."""
+    from nso_adapter.core.claim import terminalize
+    from nso_adapter.core.generation import (
+        allocate_settlement_cohort,
+        attach_to_job,
+        create_generation,
+        mark_job_generations_running,
+        note_write,
+        retry_generation,
+    )
+    from nso_adapter.store.models import (
+        GenerationMode,
+        Job,
+        JobStatus,
+        JobType,
+        SviIntent,
+        VlanIntent,
+    )
+
+    device_id = await seed_device(nso_device_name="request-atomic-cohort", netbox_device_id=9990)
+    async with session() as db:
+        db.add(VlanIntent(device_id=device_id, vlan_id=10, accepted_at=sa.func.now()))
+        db.add(SviIntent(device_id=device_id, interface_name="Vlan10", vlan_id=10, accepted_at=sa.func.now()))
+        await db.flush()
+        cohort = await allocate_settlement_cohort(db)
+
+        await note_write(db, device_id, "vlan")
+        vlan_generation = await create_generation(
+            db,
+            device_id,
+            streams=("vlan",),
+            mode=GenerationMode.networked,
+            settlement_cohort=cohort,
+        )
+        vlan_job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.running)
+        db.add(vlan_job)
+        await db.flush()
+        await attach_to_job(db, vlan_generation, vlan_job)
+
+        await note_write(db, device_id, "svi")
+        svi_generation = await create_generation(
+            db,
+            device_id,
+            streams=("svi",),
+            mode=GenerationMode.networked,
+            settlement_cohort=cohort,
+        )
+        svi_job = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued)
+        db.add(svi_job)
+        await db.flush()
+        await attach_to_job(db, svi_generation, svi_job)
+        await db.commit()
+
+    async with session() as db:
+        assert await terminalize(db, vlan_job.id, status=JobStatus.succeeded, expect=JobStatus.running) is not None
+        await db.commit()
+    assert (await _stream(device_id, "vlan")).applied_revision == 0
+    assert (await _stream(device_id, "svi")).applied_revision == 0
+
+    async with session() as db:
+        queued = await db.get(Job, svi_job.id)
+        queued.status = JobStatus.running
+        await mark_job_generations_running(db, svi_job.id)
+        await db.flush()
+        assert await terminalize(db, svi_job.id, status=JobStatus.failed, expect=JobStatus.running) is not None
+        await db.commit()
+    assert (await _stream(device_id, "vlan")).applied_revision == 0
+    assert (await _stream(device_id, "svi")).applied_revision == 0
+
+    async with session() as db:
+        retry = await retry_generation(db, svi_generation.id)
+        assert retry is not None
+        await db.commit()
+        retry.status = JobStatus.running
+        await mark_job_generations_running(db, retry.id)
+        await db.flush()
+        assert await terminalize(db, retry.id, status=JobStatus.succeeded, expect=JobStatus.running) is not None
+        await db.commit()
+
+    assert (await _stream(device_id, "vlan")).applied_revision == 1
+    assert (await _stream(device_id, "svi")).applied_revision == 1
+
+
+async def test_svi_request_with_removal_and_apply_uses_one_cohort(adapter_client):
+    """Every generation promoted by one non-static request shares one request cohort."""
+    from nso_adapter.store.models import GenerationStatus
+
+    device_id = await seed_device(nso_device_name="svi-request-cohort", netbox_device_id=9991)
+    await seed_settings(device_id, auto_apply=True)
+    assert (await _put_svis(adapter_client, device_id, [100, 200], seq=6401)).status_code == 200
+    (baseline,) = await _generations(device_id)
+    await _settle(baseline.job_id, GenerationStatus.settled)
+
+    assert (await _put_svis(adapter_client, device_id, [100], seq=6402)).status_code == 200
+    removal, apply = (await _generations(device_id))[1:]
+    assert removal.settlement_cohort is not None
+    assert apply.settlement_cohort == removal.settlement_cohort
+
+
+async def test_svi_action_apply_executes_the_selected_document(adapter_client):
+    """A store-only successor landing after Apply cannot leak into the selected run."""
+    from tests.core.test_generation_protocol import recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="svi-exact-selection", netbox_device_id=9992)
+    await seed_settings(device_id, auto_apply=False)
+    assert (await _put_svis(adapter_client, device_id, [100], seq=6501, query="?store_only=true")).status_code == 200
+    response = await _apply(adapter_client, device_id, {"svi": 6501})
+    assert response.status_code == 202, response.text
+
+    async def successor():
+        result = await _put_svis(adapter_client, device_id, [200], seq=6502, query="?store_only=true")
+        assert result.status_code == 200
+
+    client, recorder = recorded_client("svi-exact-selection", on_sync_from=successor)
+    assert await run_head(device_id, client) is not None
+    bodies = recorder.bodies("svi-reconciler:svi-config")
+    assert [[entry["vlan-id"] for entry in body["svi-reconciler:svi-config"][0]["interface"]] for body in bodies] == [
+        [100]
+    ]
+
+
+async def test_snmp_action_apply_executes_the_selected_document(adapter_client):
+    """A later SNMP push cannot replace the selected rows or Vault references at send time."""
+    from tests.core.test_generation_protocol import recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="snmp-exact-selection", netbox_device_id=9995)
+    await seed_settings(device_id, auto_apply=False)
+    assert (
+        await _put_snmp(adapter_client, device_id, ["selected"], seq=6551, query="?store_only=true")
+    ).status_code == 200
+    response = await _apply(adapter_client, device_id, {"snmp": 6551})
+    assert response.status_code == 202, response.text
+
+    async def successor():
+        result = await _put_snmp(
+            adapter_client,
+            device_id,
+            ["successor"],
+            seq=6552,
+            query="?store_only=true",
+        )
+        assert result.status_code == 200
+
+    client, recorder = recorded_client("snmp-exact-selection", on_sync_from=successor)
+    assert await run_head(device_id, client) is not None
+    bodies = recorder.bodies("snmp-reconciler:snmp-config")
+    assert [entry["name"] for entry in bodies[0]["snmp-reconciler:snmp-config"][0]["community"]] == ["selected"]
+    assert bodies[0]["snmp-reconciler:snmp-config"][0]["community"][0] == {
+        "name": "selected",
+        "access": "ro",
+        "vault-mount": "kv",
+        "vault-path": "snmp",
+        "vault-key": "selected",
+    }
+
+
+async def test_bgp_action_apply_executes_the_selected_graph(adapter_client):
+    """A later BGP tree cannot replace the selected graph at worker claim time."""
+    from nso_adapter.store.models import JobStatus
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="bgp-exact-selection", netbox_device_id=9996)
+    await seed_settings(device_id, auto_apply=False)
+    assert (await _put_bgp(adapter_client, device_id, "64513", seq=6561, query="?store_only=true")).status_code == 200
+    response = await _apply(adapter_client, device_id, {"bgp": 6561})
+    assert response.status_code == 202, response.text
+
+    async def successor():
+        result = await _put_bgp(adapter_client, device_id, "64514", seq=6562, query="?store_only=true")
+        assert result.status_code == 200
+
+    client, recorder = recorded_client("bgp-exact-selection", on_sync_from=successor)
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+    job = await job_row(job_id)
+    assert job.status is JobStatus.succeeded
+    assert job.result["bgp_count_by_outcome"] == {"in_sync": 1, "apply_failed": 0}
+    bodies = recorder.bodies("bgp-reconciler:bgp-config")
+    router = bodies[0]["bgp-reconciler:bgp-config"][0]["router"][0]
+    assert router["asn"] == 64512
+    assert router["scope"][0]["address-family"] == [{"afi": "ipv4-unicast"}]
+    assert router["scope"][0]["peer"][0]["remote-as"] == "64513"
+    assert router["scope"][0]["peer"][0]["peer-address-family"] == [{"afi": "ipv4-unicast", "enabled": True}]
+
+
+async def test_interface_config_action_apply_executes_the_selected_document(adapter_client):
+    """A later interface push cannot replace the selected attribute at worker claim time."""
+    from nso_adapter.store.models import JobStatus
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="interface-exact-selection", netbox_device_id=9997)
+    await seed_settings(device_id, auto_apply=False)
+    selected = await _put_interface_attrs(
+        adapter_client,
+        device_id,
+        "selected description",
+        seq=6571,
+        query="?store_only=true",
+    )
+    assert selected.status_code == 200, selected.text
+    response = await _apply(adapter_client, device_id, {"interface_config": 6571})
+    assert response.status_code == 202, response.text
+
+    async def successor():
+        result = await _put_interface_attrs(
+            adapter_client,
+            device_id,
+            "successor description",
+            seq=6572,
+            query="?store_only=true",
+        )
+        assert result.status_code == 200, result.text
+
+    client, recorder = recorded_client("interface-exact-selection", on_sync_from=successor)
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+    job = await job_row(job_id)
+    assert job.status is JobStatus.succeeded
+    bodies = recorder.bodies("interface-reconciler:interface-config")
+    assert [body["interface-reconciler:interface-config"][0]["description"] for body in bodies] == [
+        "selected description"
+    ]
+
+
+async def test_static_route_action_apply_executes_the_selected_plan(adapter_client):
+    """A later static-route push cannot replace the selected rows or PUT classification."""
+    from nso_adapter.store.models import JobStatus
+    from tests.api.test_static_route_identity import seed_intent
+    from tests.core.test_generation_protocol import job_row, run_head
+    from tests.core.test_static_route_put import wire
+    from tests.core.test_static_route_removal import SrFake, sr_client
+
+    device_id = await seed_device(nso_device_name="static-route-exact-selection", netbox_device_id=9999)
+    await seed_settings(device_id, auto_apply=False)
+    await seed_intent(device_id, [{"triple": _B, "route_id": 1, "deployed_key": list(_A)}])
+    selected = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_B, route_id=1, generation=1)],
+        seq=6591,
+        query="?store_only=true",
+    )
+    assert selected.status_code == 200, selected.text
+    response = await _apply(adapter_client, device_id, {"static_route": 6591})
+    assert response.status_code == 202, response.text
+
+    successor = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_C, route_id=1, generation=2)],
+        seq=6592,
+        query="?store_only=true",
+    )
+    assert successor.status_code == 200, successor.text
+
+    fake = SrFake("static-route-exact-selection", service=[wire(_A)])
+    job_id = await run_head(device_id, sr_client(fake))
+    assert job_id is not None
+    assert (await job_row(job_id)).status is JobStatus.succeeded
+    assert fake.sent_keys() == {_B}
+
+
+async def test_static_route_removal_generation_records_deployed_predecessor_authority(adapter_client):
+    """The removal document records both the removed triple and its deployed predecessor."""
+    from tests.api.test_static_route_identity import seed_intent
+
+    device_id = await seed_device(nso_device_name="static-route-recorded-removal", netbox_device_id=10000)
+    await seed_settings(device_id, auto_apply=False)
+    await seed_intent(device_id, [{"triple": _B, "route_id": 1, "deployed_key": list(_A)}])
+
+    deleted = await _put_routes(
+        adapter_client,
+        device_id,
+        [],
+        seq=6601,
+        deleted=[deleted_route(1, [_B])],
+    )
+    assert deleted.status_code == 200, deleted.text
+    (generation,) = await _generations(device_id)
+    recorded = generation.document["static_route"]["_execution"]["removal"]
+    assert recorded["authorized_removal_keys"] == [list(_A), list(_B)]
+    assert len(recorded["tombstone_ids"]) == 1
+
+
+async def test_static_route_action_removal_records_store_only_deletion_authority(adapter_client):
+    """Manual Apply records both keys without widening the pinned job-context wire shape."""
+    from nso_adapter.store.models import GenerationStatus
+    from tests.api.test_static_route_identity import seed_intent
+
+    device_id = await seed_device(nso_device_name="static-route-action-removal", netbox_device_id=10002)
+    await seed_settings(device_id, auto_apply=True)
+    await seed_intent(device_id, [{"triple": _B, "route_id": 1, "deployed_key": list(_A)}])
+    baseline = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_B, route_id=1, generation=1)],
+        seq=6600,
+    )
+    assert baseline.status_code == 200, baseline.text
+    await _settle((await _generations(device_id))[0].job_id, GenerationStatus.settled)
+    deleted = await _put_routes(
+        adapter_client,
+        device_id,
+        [],
+        seq=6602,
+        query="?store_only=true",
+        deleted=[deleted_route(1, [_B])],
+    )
+    assert deleted.status_code == 200, deleted.text
+
+    response = await _apply(adapter_client, device_id, {"static_route": 6602})
+
+    assert response.status_code == 202, response.text
+    generation = (await _generations(device_id))[-1]
+    job = {row.id: row for row in await _jobs(device_id)}[generation.job_id]
+    assert job.context == {"scope": "static_route", "removed": {"route": [list(_B)]}}
+    assert generation.allowed_removal_keys == {"route": [list(_A), list(_B)]}
+    recorded = generation.document["static_route"]["_execution"]["removal"]
+    assert recorded["authorized_removal_keys"] == [list(_A), list(_B)]
+    assert recorded["tombstone_ids"] == []
+
+
+async def test_static_route_removal_executes_recorded_authority_after_a_later_reclaim(adapter_client):
+    """A store-only reclaim after generation creation cannot weaken the recorded removal."""
+    from nso_adapter.store.models import JobStatus
+    from tests.api.test_static_route_identity import seed_intent
+    from tests.core.test_generation_protocol import job_row, run_head
+    from tests.core.test_static_route_put import wire
+    from tests.core.test_static_route_removal import SrFake, sr_client
+
+    device_id = await seed_device(nso_device_name="static-route-removal-exact", netbox_device_id=10001)
+    await seed_settings(device_id, auto_apply=False)
+    await seed_intent(device_id, [{"triple": _B, "route_id": 1, "deployed_key": list(_A)}])
+
+    deleted = await _put_routes(
+        adapter_client,
+        device_id,
+        [],
+        seq=6611,
+        deleted=[deleted_route(1, [_B])],
+    )
+    assert deleted.status_code == 200, deleted.text
+
+    reclaimed = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_B, route_id=1, generation=2)],
+        seq=6612,
+        query="?store_only=true",
+    )
+    assert reclaimed.status_code == 200, reclaimed.text
+
+    fake = SrFake("static-route-removal-exact", service=[wire(_A), wire(_B)])
+    job_id = await run_head(device_id, sr_client(fake))
+    assert job_id is not None
+    assert (await job_row(job_id)).status is JobStatus.succeeded
+    assert fake.sent_keys() == set()
+
+
+async def test_mixed_generation_executes_interface_section_from_its_document(adapter_client):
+    """A static-route lane cannot make the interface lane read live rows."""
+    from nso_adapter.core.generation import attach_to_job, create_generation
+    from nso_adapter.store.models import GenerationMode, Job, JobStatus, JobType
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="interface-mixed-exact-selection", netbox_device_id=9981)
+    await seed_settings(device_id, auto_apply=False)
+    selected = await _put_interface_attrs(
+        adapter_client,
+        device_id,
+        "selected description",
+        seq=6573,
+        query="?store_only=true",
+    )
+    assert selected.status_code == 200, selected.text
+    addresses = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/ip-intent?store_only=true",
+        json={"addresses": [{"interface": "GigabitEthernet0/1", "address": "198.18.10.1/30", "family": "ipv4"}]},
+        headers=AUTH | {"X-Push-Seq": "6574"},
+    )
+    assert addresses.status_code == 200, addresses.text
+    routes = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_A, route_id=1, generation=1)],
+        seq=6575,
+        query="?store_only=true",
+    )
+    assert routes.status_code == 200, routes.text
+
+    async with session() as db:
+        generation = await create_generation(
+            db,
+            device_id,
+            streams=("interface_config", "ip", "static_route"),
+            mode=GenerationMode.networked,
+        )
+        job = Job(job_type=JobType.apply, device_id=device_id)
+        db.add(job)
+        await db.flush()
+        assert await attach_to_job(db, generation, job)
+        await db.commit()
+        assert generation.stream_revisions == {"interface_config": 1, "ip": 1, "static_route": 1}
+
+    successor = await _put_interface_attrs(
+        adapter_client,
+        device_id,
+        "live successor description",
+        seq=6576,
+        query="?store_only=true",
+    )
+    assert successor.status_code == 200, successor.text
+
+    client, recorder = recorded_client("interface-mixed-exact-selection")
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+    assert (await job_row(job_id)).status is JobStatus.succeeded
+    bodies = recorder.bodies("interface-reconciler:interface-config")
+    assert [
+        body["interface-reconciler:interface-config"][0]["description"]
+        for body in bodies
+        if "description" in body["interface-reconciler:interface-config"][0]
+    ] == ["selected description"]
+
+
+async def test_interface_config_generation_records_creation_time_attribute_eligibility(adapter_client):
+    """The worker sends the recorded eligible subset after live eligibility changes."""
+    from nso_adapter.store.models import DbInterface, InterfaceAttrState, JobStatus, SyncState
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(
+        nso_device_name="interface-recorded-eligibility",
+        netbox_device_id=9998,
+        attributes=["description", "enabled"],
+    )
+    await seed_settings(device_id, auto_apply=False)
+    stored = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/intent?store_only=true",
+        json={
+            "attributes": [
+                {
+                    "interface": "GigabitEthernet0/1",
+                    "attribute": "description",
+                    "intent_value": "selected description",
+                },
+                {"interface": "GigabitEthernet0/1", "attribute": "enabled", "intent_value": True},
+            ]
+        },
+        headers=AUTH | {"X-Push-Seq": "6581"},
+    )
+    assert stored.status_code == 200, stored.text
+    async with session() as db:
+        iface = await db.scalar(
+            sa.select(DbInterface).where(
+                DbInterface.device_id == device_id,
+                DbInterface.name == "GigabitEthernet0/1",
+            )
+        )
+        enabled_state = await db.scalar(
+            sa.select(InterfaceAttrState).where(
+                InterfaceAttrState.interface_id == iface.id,
+                InterfaceAttrState.attribute == "enabled",
+            )
+        )
+        enabled_state.sync_state = SyncState.error
+        iface_id = iface.id
+        await db.commit()
+
+    response = await _apply(adapter_client, device_id, {"interface_config": 6581})
+
+    assert response.status_code == 202, response.text
+    (generation,) = await _generations(device_id)
+    execution = generation.document["interface_config"]["_execution"]
+    assert execution["eligible_interface_attributes"] == [{"interface_id": iface_id, "attribute": "description"}]
+    async with session() as db:
+        enabled_state = await db.scalar(
+            sa.select(InterfaceAttrState).where(
+                InterfaceAttrState.interface_id == iface_id,
+                InterfaceAttrState.attribute == "enabled",
+            )
+        )
+        description_state = await db.scalar(
+            sa.select(InterfaceAttrState).where(
+                InterfaceAttrState.interface_id == iface_id,
+                InterfaceAttrState.attribute == "description",
+            )
+        )
+        enabled_state.sync_state = SyncState.accepted
+        description_state.sync_state = SyncState.error
+        await db.commit()
+
+    client, recorder = recorded_client("interface-recorded-eligibility")
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+    assert (await job_row(job_id)).status is JobStatus.succeeded
+    bodies = recorder.bodies("interface-reconciler:interface-config")
+    assert [body["interface-reconciler:interface-config"][0] for body in bodies] == [
+        {
+            "device": "interface-recorded-eligibility",
+            "interface-name": "GigabitEthernet0/1",
+            "kind": "base",
+            "description": "selected description",
+        }
+    ]
+
+
+async def test_interface_config_generation_refuses_unresolvable_attribute_eligibility(adapter_client):
+    """A missing attr-state row refuses generation creation and leaves authority unchanged."""
+    from structlog.testing import capture_logs
+
+    from nso_adapter.store.models import DbInterface, InterfaceAttrState
+
+    device_id = await seed_device(nso_device_name="interface-unresolved-eligibility", netbox_device_id=9999)
+    await seed_settings(device_id, auto_apply=False)
+    stored = await _put_interface_attrs(
+        adapter_client,
+        device_id,
+        "selected description",
+        seq=6591,
+        query="?store_only=true",
+    )
+    assert stored.status_code == 200, stored.text
+    async with session() as db:
+        iface_id = await db.scalar(
+            sa.select(DbInterface.id).where(
+                DbInterface.device_id == device_id,
+                DbInterface.name == "GigabitEthernet0/1",
+            )
+        )
+        await db.execute(sa.delete(InterfaceAttrState).where(InterfaceAttrState.interface_id == iface_id))
+        await db.commit()
+
+    with capture_logs() as logs:
+        response = await _apply(adapter_client, device_id, {"interface_config": 6591})
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": {
+            "code": "apply_unexecutable",
+            "message": "Selected stream(s) cannot be applied faithfully: interface_config",
+            "detail": {"streams": {"interface_config": "interface_attribute_eligibility_unresolved"}},
+        }
+    }
+    assert await _generations(device_id) == []
+    assert await _jobs(device_id) == []
+    assert (await _stream(device_id, "interface_config")).authorized_revision == 0
+    warning = next(log for log in logs if log["event"] == "generation.interface_eligibility_unresolved")
+    assert warning["device_id"] == device_id
+    assert f"interface {iface_id}" in warning["detail"]
+    assert "attribute 'description'" in warning["detail"]
+    assert warning["exc_info"] is True
+
+
+async def test_unrelated_promotion_preserves_recorded_interface_eligibility(adapter_client):
+    """A VLAN-only promotion carries the interface plan without reading changed live state."""
+    from nso_adapter.store.models import DbInterface, InterfaceAttrState, JobStatus
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="unselected-interface-eligibility", netbox_device_id=10000)
+    await seed_settings(device_id, auto_apply=False)
+    stored_interface = await _put_interface_attrs(
+        adapter_client,
+        device_id,
+        "unselected description",
+        seq=6592,
+    )
+    assert stored_interface.status_code == 200, stored_interface.text
+    promoted_interface = await _apply(adapter_client, device_id, {"interface_config": 6592})
+    assert promoted_interface.status_code == 202, promoted_interface.text
+    interface_execution = (await _generations(device_id))[-1].document["interface_config"]["_execution"]
+    client, _ = recorded_client("unselected-interface-eligibility")
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+    assert (await job_row(job_id)).status is JobStatus.succeeded
+    async with session() as db:
+        interface_id = await db.scalar(
+            sa.select(DbInterface.id).where(
+                DbInterface.device_id == device_id,
+                DbInterface.name == "GigabitEthernet0/1",
+            )
+        )
+        await db.execute(sa.delete(InterfaceAttrState).where(InterfaceAttrState.interface_id == interface_id))
+        await db.commit()
+
+    stored_vlan = await _put_vlans(adapter_client, device_id, [10], seq=6593)
+    assert stored_vlan.status_code == 200, stored_vlan.text
+
+    response = await _apply(adapter_client, device_id, {"vlan": 6593})
+
+    assert response.status_code == 202, response.text
+    generation = (await _generations(device_id))[-1]
+    assert generation.stream_revisions == {"vlan": 1}
+    assert generation.document["interface_config"]["_execution"] == interface_execution
+
+
+async def test_coalesced_vlan_successor_preserves_interface_execution(adapter_client):
+    """The highest document keeps the immutable plan for every section the shared job executes."""
+    from nso_adapter.core.generation import generation_execution_sections
+    from nso_adapter.store.models import JobStatus
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="coalesced-interface-plan", netbox_device_id=10001)
+    await seed_settings(device_id, auto_apply=True)
+
+    interface_response = await _put_interface_attrs(
+        adapter_client,
+        device_id,
+        "selected description",
+        seq=6594,
+    )
+    assert interface_response.status_code == 200, interface_response.text
+    (interface_generation,) = await _generations(device_id)
+    interface_execution = interface_generation.document["interface_config"]["_execution"]
+
+    vlan_response = await _put_vlans(adapter_client, device_id, [10], seq=6595)
+    assert vlan_response.status_code == 200, vlan_response.text
+    interface_generation, vlan_generation = await _generations(device_id)
+    assert vlan_generation.job_id == interface_generation.job_id
+    assert vlan_generation.document["interface_config"]["_execution"] == interface_execution
+
+    async with session() as db:
+        assert await generation_execution_sections(db, vlan_generation.job_id) == frozenset(
+            {"interface_config", "vlan"}
+        )
+
+    client, _recorder = recorded_client("coalesced-interface-plan")
+    assert await run_head(device_id, client) == vlan_generation.job_id
+    assert (await job_row(vlan_generation.job_id)).status is JobStatus.succeeded
+
+
+async def test_failed_svi_document_send_with_no_stamp_rows_fails_generation(adapter_client):
+    from nso_adapter.store.models import GenerationStatus, JobStatus
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="svi-failed-empty-stamp", netbox_device_id=9993)
+    await seed_settings(device_id, auto_apply=False)
+    assert (await _put_svis(adapter_client, device_id, [100], seq=6601, query="?store_only=true")).status_code == 200
+    response = await _apply(adapter_client, device_id, {"svi": 6601})
+    assert response.status_code == 202, response.text
+
+    async def successor():
+        result = await _put_svis(adapter_client, device_id, [200], seq=6602, query="?store_only=true")
+        assert result.status_code == 200
+
+    client, _recorder = recorded_client("svi-failed-empty-stamp", on_sync_from=successor)
+    _reject_restconf_patches(client, "svi commit rejected")
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+
+    job = await job_row(job_id)
+    assert job.status is JobStatus.failed
+    assert job.result["svi_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
+    assert (await _generations(device_id))[0].status is GenerationStatus.failed
+    assert (await _stream(device_id, "svi")).applied_revision == 0
+
+
+async def test_failed_vlan_document_send_with_no_stamp_rows_fails_generation(adapter_client):
+    from nso_adapter.store.models import GenerationStatus, JobStatus
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="vlan-failed-empty-stamp", netbox_device_id=9994)
+    await seed_settings(device_id, auto_apply=False)
+    assert (await _put_vlans(adapter_client, device_id, [10], seq=6701, query="?store_only=true")).status_code == 200
+    response = await _apply(adapter_client, device_id, {"vlan": 6701})
+    assert response.status_code == 202, response.text
+
+    async def successor():
+        result = await _put_vlans(adapter_client, device_id, [20], seq=6702, query="?store_only=true")
+        assert result.status_code == 200
+
+    client, _recorder = recorded_client("vlan-failed-empty-stamp", on_sync_from=successor)
+    _reject_restconf_patches(client, "vlan commit rejected")
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+
+    job = await job_row(job_id)
+    assert job.status is JobStatus.failed
+    assert job.result["vlan_count_by_outcome"] == {"in_sync": 0, "apply_failed": 1}
+    assert (await _generations(device_id))[0].status is GenerationStatus.failed
+    assert (await _stream(device_id, "vlan")).applied_revision == 0
+
+
+async def test_failed_static_route_document_send_without_a_live_stamp_reports_the_route_error(adapter_client):
+    """The current send error belongs to the result even when no live row can store it."""
+    from nso_adapter.store.models import JobStatus
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="route-failed-empty-stamp", netbox_device_id=9995)
+    await seed_settings(device_id, auto_apply=True)
+    first = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_A, route_id=1, generation=1)],
+        seq=6901,
+    )
+    assert first.status_code == 200, first.text
+
+    successor = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_B, route_id=1, generation=2)],
+        seq=6902,
+        query="?store_only=true",
+    )
+    assert successor.status_code == 200, successor.text
+
+    client, _recorder = recorded_client("route-failed-empty-stamp")
+    _reject_restconf_patches(client, "static route commit rejected")
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+
+    job = await job_row(job_id)
+    assert job.status is JobStatus.failed
+    result = job.result["static_route_results"][0]
+    assert result["outcome"] == "apply_failed"
+    assert result["error"]["message"] == "NSO PATCH for static_route failed with status 400"
+
+
+async def test_reader_compare_miss_without_a_live_stamp_reports_the_route_error(adapter_client):
+    """A verification miss belongs to the result even when no live row can store it."""
+    from nso_adapter.store.models import JobStatus
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="route-rc-empty-stamp", netbox_device_id=9993)
+    await seed_settings(device_id, auto_apply=True)
+    first = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_A, route_id=1, generation=1)],
+        seq=6903,
+    )
+    assert first.status_code == 200, first.text
+
+    successor = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_B, route_id=1, generation=2)],
+        seq=6904,
+        query="?store_only=true",
+    )
+    assert successor.status_code == 200, successor.text
+
+    # The commit reports success while the device view never gains the key (#26 class).
+    client, _recorder = recorded_client(
+        "route-rc-empty-stamp",
+        device_state={"static-route": {"status": "ok", "route": []}},
+    )
+    job_id = await run_head(device_id, client)
+    assert job_id is not None
+
+    job = await job_row(job_id)
+    assert job.status is JobStatus.failed
+    result = job.result["static_route_results"][0]
+    assert result["outcome"] == "apply_failed"
+    assert result["error"]["code"] == "reader_compare_missing"
+
+
+async def test_recorded_static_route_put_is_refused_if_verification_is_disabled_at_execution(
+    adapter_client,
+    monkeypatch,
+):
+    """A creation-time PUT decision cannot bypass the worker's live replace gate."""
+    from nso_adapter.core.generation import attach_to_job, create_generation, note_write
+    from nso_adapter.store.models import GenerationMode, GenerationStatus, Job, JobStatus, JobType
+    from tests.core.test_generation_protocol import job_row, run_head
+    from tests.core.test_static_route_put import seed_rows, wire
+    from tests.core.test_static_route_removal import SrFake, sr_client
+
+    device_id = await seed_device(nso_device_name="recorded-put-gate", netbox_device_id=9996)
+    await seed_settings(device_id, auto_apply=True)
+    await seed_rows(device_id, [{"triple": _B, "route_id": 1, "deployed_key": list(_A)}])
+    async with session() as db:
+        await note_write(db, device_id, "static_route")
+        generation = await create_generation(
+            db,
+            device_id,
+            streams=("static_route",),
+            mode=GenerationMode.networked,
+        )
+        job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.queued)
+        db.add(job)
+        await db.flush()
+        assert await attach_to_job(db, generation, job)
+        await db.commit()
+        generation_id = generation.id
+        job_id = job.id
+        assert generation.document["static_route"]["_execution"]["apply"]["mode"] == "PUT"
+
+    monkeypatch.setattr("nso_adapter.nso.apply.VERIFY_AFTER_APPLY", False)
+    fake = SrFake("recorded-put-gate", service=[wire(_A)])
+    client = sr_client(fake)
+    assert await run_head(device_id, client) == job_id
+
+    assert fake.writes == [], "the worker executed the recorded destructive PUT"
+    client.sync_from.assert_not_awaited()
+    failed_job = await job_row(job_id)
+    assert failed_job.status is JobStatus.failed
+    assert failed_job.error["code"] == "static_route_put_verify_disabled"
+    assert (await _generations(device_id))[0].id == generation_id
+    assert (await _generations(device_id))[0].status is GenerationStatus.failed
 
 
 async def test_failed_networked_link_blocks_detach_successor(adapter_client):
@@ -811,32 +1678,76 @@ async def test_apply_settlement_fields_do_not_block_a_later_detach(adapter_clien
     assert job.context == {"scope": "static_route", "removed": {"route": [list(_B)]}, "detach": True}
 
 
-async def test_action_apply_refuses_a_live_read_stream_without_promoting_an_executable_subset(adapter_client):
-    """One live-read selection refuses the whole mixed request."""
-    device_id = await seed_device(nso_device_name="apply-live-read-refusal", netbox_device_id=9967)
+async def test_clear_removal_then_apply_reports_the_route_in_sync(adapter_client):
+    """A predecessor's proof fulfills the clear carried by the immutable apply document."""
+    from nso_adapter.store.models import GenerationStatus, JobStatus, JobType, StaticRouteIntent
+    from tests.core.test_generation_protocol import job_row, run_head
+    from tests.core.test_static_route_put import wire
+    from tests.core.test_static_route_removal import SrFake, run_removal_job, sr_client
+
+    device_id = await seed_device(nso_device_name="apply-clear-chain", netbox_device_id=9984)
+    await seed_settings(device_id, auto_apply=True)
+    baseline = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_A, route_id=1, generation=1, metric=10)],
+        seq=6801,
+    )
+    assert baseline.status_code == 200, baseline.text
+    await _settle((await _generations(device_id))[0].job_id, GenerationStatus.settled)
+
+    cleared = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_A, route_id=1, generation=2)],
+        seq=6802,
+    )
+    assert cleared.status_code == 200, cleared.text
+    removal, apply = (await _generations(device_id))[1:]
+    jobs = {job.id: job for job in await _jobs(device_id)}
+    assert jobs[removal.job_id].job_type is JobType.removal
+    assert jobs[apply.job_id].job_type is JobType.apply
+
+    fake = SrFake("apply-clear-chain", service=[wire(_A, metric=10)])
+    removal_job = await run_removal_job(device_id, removal.job_id, sr_client(fake))
+    assert removal_job.status is JobStatus.succeeded, removal_job.error
+    async with session() as db:
+        row = await db.scalar(sa.select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id))
+        assert row.pending_clear is None
+
+    assert await run_head(device_id, sr_client(fake)) == apply.job_id
+    apply_job = await job_row(apply.job_id)
+    assert apply_job.status is JobStatus.succeeded, apply_job.error
+    assert apply_job.result["static_route_results"][0]["outcome"] == "in_sync"
+
+
+async def test_action_apply_accepts_every_selected_document_stream(adapter_client):
+    """The final document section makes a mixed VLAN/static-route selection executable."""
+    device_id = await seed_device(nso_device_name="apply-all-documents", netbox_device_id=9967)
     await seed_settings(device_id, auto_apply=False)
     assert (await _put_vlans(adapter_client, device_id, [10], seq=4701, query="?store_only=true")).status_code == 200
-    assert (await _put_snmp(adapter_client, device_id, ["new"], seq=4702, query="?store_only=true")).status_code == 200
+    routes = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_A, route_id=1, generation=1)],
+        seq=4702,
+        query="?store_only=true",
+    )
+    assert routes.status_code == 200, routes.text
 
-    response = await _apply(adapter_client, device_id, {"vlan": 4701, "snmp": 4702})
+    response = await _apply(adapter_client, device_id, {"vlan": 4701, "static_route": 4702})
 
-    assert response.status_code == 409
-    assert response.json() == {
-        "error": {
-            "code": "apply_unexecutable",
-            "message": "Selected stream(s) cannot be applied faithfully: snmp",
-            "detail": {"streams": {"snmp": "live_read_execution"}},
-        }
-    }
-    assert await _generations(device_id) == []
-    assert await _jobs(device_id) == []
-    assert (await _stream(device_id, "vlan")).authorized_revision == 0
-    assert (await _stream(device_id, "snmp")).authorized_revision == 0
+    assert response.status_code == 202, response.text
+    (generation,) = await _generations(device_id)
+    assert generation.stream_revisions == {"static_route": 1, "vlan": 1}
+    assert len(await _jobs(device_id)) == 1
+    assert (await _stream(device_id, "vlan")).authorized_revision == 1
+    assert (await _stream(device_id, "static_route")).authorized_revision == 1
 
 
-async def test_action_apply_refuses_static_route_until_it_executes_from_the_document(adapter_client):
-    """Static-route workers still read live intent at execution time."""
-    device_id = await seed_device(nso_device_name="apply-static-live-read-refusal", netbox_device_id=9980)
+async def test_action_apply_accepts_static_route_once_it_executes_from_the_document(adapter_client):
+    """The manual Apply boundary includes static-route after its plan is recorded."""
+    device_id = await seed_device(nso_device_name="apply-static-document", netbox_device_id=9980)
     await seed_settings(device_id, auto_apply=False)
     stored = await _put_routes(
         adapter_client,
@@ -849,17 +1760,11 @@ async def test_action_apply_refuses_static_route_until_it_executes_from_the_docu
 
     response = await _apply(adapter_client, device_id, {"static_route": 6001})
 
-    assert response.status_code == 409
-    assert response.json() == {
-        "error": {
-            "code": "apply_unexecutable",
-            "message": "Selected stream(s) cannot be applied faithfully: static_route",
-            "detail": {"streams": {"static_route": "live_read_execution"}},
-        }
-    }
-    assert await _generations(device_id) == []
-    assert await _jobs(device_id) == []
-    assert (await _stream(device_id, "static_route")).authorized_revision == 0
+    assert response.status_code == 202, response.text
+    (generation,) = await _generations(device_id)
+    assert generation.stream_revisions == {"static_route": 1}
+    assert len(await _jobs(device_id)) == 1
+    assert (await _stream(device_id, "static_route")).authorized_revision == 1
 
 
 async def test_action_apply_reports_every_skipped_selection_reason(adapter_client):
@@ -992,8 +1897,8 @@ async def test_interface_promotion_refuses_an_unresolved_interface_id(adapter_cl
             )
 
 
-async def test_action_apply_refuses_interface_streams_that_execute_from_live_rows(adapter_client):
-    """Interface execution cannot certify the selected stored revision."""
+async def test_action_apply_accepts_ip_stream_that_executes_from_interface_document(adapter_client):
+    """The IP lane is executable because its containing interface section moved to the document."""
     device_id = await seed_device(nso_device_name="apply-interface-list", netbox_device_id=9969)
     await seed_settings(device_id, auto_apply=False)
     first = await adapter_client.put(
@@ -1010,13 +1915,15 @@ async def test_action_apply_refuses_interface_streams_that_execute_from_live_row
 
     response = await _apply(adapter_client, device_id, {"ip": 4901})
 
-    assert response.status_code == 409
-    assert response.json()["error"]["detail"] == {
-        "streams": {"ip": "live_read_execution"},
-    }
-    assert await _generations(device_id) == []
-    assert await _jobs(device_id) == []
-    assert (await _stream(device_id, "ip")).authorized_revision == 0
+    assert response.status_code == 202, response.text
+    (generation,) = await _generations(device_id)
+    assert generation.stream_revisions == {"ip": 1}
+    assert [row["address"] for row in generation.document["interface_config"]["interface_ip_intent"]] == [
+        "198.18.10.1/30",
+        "198.18.10.5/30",
+    ]
+    assert len(await _jobs(device_id)) == 1
+    assert (await _stream(device_id, "ip")).authorized_revision == 1
 
 
 async def test_apply_static_route_removal_keeps_apply_bookkeeping_job(adapter_client):
@@ -1087,26 +1994,28 @@ async def test_non_static_detach_mix_keeps_positive_delta_on_apply_link(adapter_
     assert apply.settlement_cohort == detach.settlement_cohort
 
 
-async def test_action_apply_refuses_bgp_until_its_graph_executes_from_the_document(adapter_client):
-    """The live-read BGP graph cannot execute an exact selected revision."""
+async def test_action_apply_accepts_bgp_once_its_graph_executes_from_the_document(adapter_client):
+    """The manual Apply boundary includes BGP after its graph becomes document-executed."""
     device_id = await seed_device(nso_device_name="apply-bgp-rebuild", netbox_device_id=9975)
     await seed_settings(device_id, auto_apply=False)
-    first = await adapter_client.put(
-        f"/api/v1/devices/{device_id}/bgp-intent?store_only=true",
-        json={"routers": [_bgp_router("64513")]},
-        headers=AUTH | {"X-Push-Seq": "5501"},
-    )
+    first = await _put_bgp(adapter_client, device_id, "64513", seq=5501, query="?store_only=true")
     assert first.status_code == 200, first.text
 
     response = await _apply(adapter_client, device_id, {"bgp": 5501})
 
-    assert response.status_code == 409
-    assert response.json()["error"]["detail"] == {
-        "streams": {"bgp": "live_read_execution"},
+    assert response.status_code == 202, response.text
+    (generation,) = await _generations(device_id)
+    assert generation.stream_revisions == {"bgp": 1}
+    assert set(generation.document["bgp"]) == {
+        "bgp_router_intent",
+        "bgp_scope_intent",
+        "bgp_af_intent",
+        "bgp_peer_intent",
+        "bgp_peer_af_intent",
+        "redistribution_intent",
     }
-    assert await _generations(device_id) == []
-    assert await _jobs(device_id) == []
-    assert (await _stream(device_id, "bgp")).authorized_revision == 0
+    assert len(await _jobs(device_id)) == 1
+    assert (await _stream(device_id, "bgp")).authorized_revision == 1
 
 
 async def test_promoted_static_route_detach_fails_when_proof_is_inconclusive(adapter_client):
@@ -1364,6 +2273,55 @@ async def test_action_apply_settlement_between_projection_and_generation_reads_i
         "skipped_detail": None,
         "generations": [],
     }
+
+
+def test_every_apply_unexecutable_reason_is_documented_and_live():
+    """The reason list is a stable machine contract, so both directions are pinned.
+
+    ``live_read_execution`` sat in the doc with no producer left, and
+    ``interface_attribute_eligibility_unresolved`` was raised without being documented.
+    Neither drift can recur silently: the doc list and the raise sites must match exactly.
+    """
+    import ast
+    from pathlib import Path
+
+    source_dir = Path(__file__).resolve().parents[2] / "nso_adapter"
+    contract = (Path(__file__).resolve().parents[2] / "docs" / "api-contract.md").read_text()
+
+    raised: set[str] = set()
+    accumulator_sites = 0
+    for path in source_dir.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            # Both shapes: the literal dict handed to the exception, and the dict a caller
+            # accumulates reasons into before raising.
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "ApplyUnexecutable":
+                raised |= {
+                    value.value
+                    for argument in node.args
+                    if isinstance(argument, ast.Dict)
+                    for value in argument.values
+                    if isinstance(value, ast.Constant) and isinstance(value.value, str)
+                }
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+                and any(
+                    isinstance(target, ast.Subscript) and getattr(target.value, "id", "") == "unexecutable"
+                    for target in node.targets
+                )
+            ):
+                accumulator_sites += 1
+                raised.add(node.value.value)
+
+    assert raised, "the reason scan found no raise site — the scan itself has drifted"
+    assert accumulator_sites == 1, "an ApplyUnexecutable accumulator producer changed shape"
+    reason_list = contract.split("<!-- apply-unexecutable-reasons:start -->", 1)[1].split(
+        "<!-- apply-unexecutable-reasons:end -->", 1
+    )[0]
+    documented = set(re.findall(r"^\s*- `([a-z_]+)`\s*$", reason_list, re.MULTILINE))
+    assert documented == raised, f"documented {sorted(documented)} != raised {sorted(raised)}"
 
 
 def _widen_apply_boundary(monkeypatch, *sections: str) -> None:

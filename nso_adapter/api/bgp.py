@@ -35,7 +35,6 @@ from nso_adapter.store.models import (
     DeviceBgpPeerGroupAddressFamily,
     DeviceBgpRouter,
     DeviceBgpScope,
-    DeviceSettings,
     RedistributionIntent,
 )
 
@@ -553,19 +552,6 @@ async def _sync_redistribution(
     return removed, cleared
 
 
-async def _maybe_enqueue_apply(db: AsyncSession, device_id: int, router_count: int, *, stream: str) -> None:
-    """Enqueue an apply job when the payload is non-empty and the device has auto_apply on."""
-    if router_count <= 0:
-        return
-    settings = (
-        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    ).scalar_one_or_none()
-    if settings and settings.auto_apply:
-        from nso_adapter.core.apply import enqueue_apply
-
-        await enqueue_apply(db, device_id, force=True, stream=stream)
-
-
 def _bgp_removed(
     existing_asns: set[str], existing_peers: set[str], routers: list[BgpRouterModel]
 ) -> tuple[list[str], list[str]]:
@@ -628,7 +614,16 @@ async def put_bgp_intent(
     removed_asns, removed_peers = _bgp_removed(existing_asns, existing_peers, body.routers)
     cleared = _bgp_cleared(before_values, body.routers) or redistribution_cleared
     shrank = bool(removed_asns or removed_peers or removed_redist)
-    if shrank or cleared:
+    removal_requested = shrank or cleared
+    from nso_adapter.core.generation import prepare_request_settlement
+
+    apply_requested, settlement_cohort = await prepare_request_settlement(
+        db,
+        device_id,
+        mutation_count=router_count,
+        removal_generation_count=int(removal_requested),
+    )
+    if removal_requested:
         from nso_adapter.core.removal import enqueue_removal, query_flag_marking
 
         # Thread the just-removed keys so the collateral guard can tell this intended
@@ -644,12 +639,15 @@ async def put_bgp_intent(
             marking=marks.marking,
             defer_retract=marks.defer_retract,
             promotes=(delivery.stream,),
+            settlement_cohort=settlement_cohort,
             removed={"router": removed_asns, "peer": removed_peers},
             retract=cleared,
             shrank=shrank,
         )
+    if apply_requested:
+        from nso_adapter.core.apply import enqueue_apply
 
-    await _maybe_enqueue_apply(db, device_id, router_count, stream=delivery.stream)
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
 
     result = {"device_id": device_id, "router_count": router_count}
     await record_response(db, device_id, delivery, result)

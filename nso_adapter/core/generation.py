@@ -63,11 +63,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.projection import (
-    ACTION_APPLY_EXECUTABLE_SECTIONS,
-    DOCUMENT_EXECUTED_SECTIONS,
+    EXECUTION_KEY,
+    InterfaceEligibilityUnresolved,
     is_intent_deletion,
     projection_row_state,
     projection_streams,
+    record_interface_execution,
     rows_by_intent_identity,
     snapshot_stream,
     stream_section,
@@ -79,6 +80,7 @@ from nso_adapter.store.models import (
     DeploymentGeneration,
     DeviceGenerationCounter,
     DeviceProjectionStream,
+    DeviceSettings,
     GenerationMode,
     GenerationStatus,
     IntentPushReceipt,
@@ -247,6 +249,42 @@ async def allocate_settlement_cohort(db: AsyncSession) -> int:
     if cohort is None:  # pragma: no cover - PostgreSQL nextval always returns one value
         raise RuntimeError("the settlement cohort sequence returned no value")
     return cohort
+
+
+async def request_settlement_cohort(db: AsyncSession, generation_count: int) -> int | None:
+    """Allocate one cohort exactly when this intent request promotes several generations."""
+    from nso_adapter.core.request_flags import STORE_ONLY
+
+    if generation_count < 0:
+        raise ValueError("generation_count cannot be negative")
+    if generation_count <= 1 or STORE_ONLY.get():
+        return None
+    return await allocate_settlement_cohort(db)
+
+
+async def auto_apply_requested(db: AsyncSession, device_id: int, mutation_count: int) -> bool:
+    """Return whether this request has intent and automatic apply is enabled."""
+    if mutation_count < 0:
+        raise ValueError("mutation_count cannot be negative")
+    if mutation_count == 0:
+        return False
+    settings = await db.scalar(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+    return bool(settings and settings.auto_apply)
+
+
+async def prepare_request_settlement(
+    db: AsyncSession,
+    device_id: int,
+    *,
+    mutation_count: int,
+    removal_generation_count: int,
+) -> tuple[bool, int | None]:
+    """Derive automatic apply and allocate a cohort for all request promotions."""
+    if removal_generation_count < 0:
+        raise ValueError("removal_generation_count cannot be negative")
+    apply_requested = await auto_apply_requested(db, device_id, mutation_count)
+    cohort = await request_settlement_cohort(db, removal_generation_count + int(apply_requested))
+    return apply_requested, cohort
 
 
 def _compose_document(fragments: dict[str, dict]) -> dict:
@@ -583,6 +621,11 @@ async def _enqueue_action_removal_links(
             raise ApplyUnexecutable({link.stream: "unresolved_interface_identity"}) from None
         if scope == "interface_config" and not context.interfaces:
             raise ApplyUnexecutable({link.stream: "no_executable_interface"})
+        allowed_removal_keys = context.removed
+        if scope == "static_route":
+            from nso_adapter.core.static_route_plan import promotion_removal_keys
+
+            allowed_removal_keys = promotion_removal_keys(link.removed)
         marking = DELETE_ORIGIN_MARKING if link.mode is GenerationMode.networked and link.removed else None
         if link.mode is GenerationMode.detach:
             marking = DETACH_MARKING
@@ -598,6 +641,7 @@ async def _enqueue_action_removal_links(
             settlement_cohort=cohort,
             interfaces=context.interfaces,
             removed=context.removed,
+            allowed_removal_keys=allowed_removal_keys,
             vault_refs=context.vault_refs,
             retract=bool(link.replacement),
             shrank=bool(link.removed),
@@ -648,13 +692,6 @@ async def create_action_apply(
     from nso_adapter.core.receipt import consume_promotion_provenance
 
     await lock_projection(db, device_id)
-    unexecutable = {
-        stream: "live_read_execution"
-        for stream in selected
-        if stream_section(stream) not in ACTION_APPLY_EXECUTABLE_SECTIONS
-    }
-    if unexecutable:
-        raise ApplyUnexecutable(unexecutable)
     selected_rows, skipped, skipped_detail = await _selected_promotions(db, device_id, selected)
     if not selected_rows:
         return ActionApplyResult([], skipped, skipped_detail)
@@ -744,6 +781,7 @@ async def create_generation(
     document: dict | None = None,
     removal_context: dict | None = None,
     settlement_cohort: int | None = None,
+    static_route_tombstone_ids: tuple[int, ...] = (),
 ) -> DeploymentGeneration:
     """Promote *streams* and store the immutable generation they authorize. Caller commits.
 
@@ -804,6 +842,7 @@ async def create_generation(
         stream_revisions=stream_revisions,
         removal_context=removal_context,
         settlement_cohort=settlement_cohort,
+        static_route_tombstone_ids=static_route_tombstone_ids,
     )
 
 
@@ -818,15 +857,61 @@ async def _store_generation(
     stream_revisions: dict,
     removal_context: dict | None,
     settlement_cohort: int | None,
+    static_route_tombstone_ids: tuple[int, ...],
 ) -> DeploymentGeneration:
     """Allocate the sequence and write the immutable row. The projection lock is held."""
+    body = deepcopy(document)
+    # Only a promotion freezes execution-time store facts. A reissue carries no promoted
+    # revisions and keeps its established live-store, job-row and tombstone-row semantics.
+    if stream_revisions:
+        promoted_sections = {stream_section(stream) for stream in stream_revisions}
+        if "interface_config" in body and "interface_config" not in promoted_sections:
+            # A complete successor document carries the authorized interface section. Keep
+            # its last immutable execution plan instead of resolving changed live state.
+            previous_document = await db.scalar(
+                select(DeploymentGeneration.document)
+                .where(
+                    DeploymentGeneration.device_id == device_id,
+                    DeploymentGeneration.document["interface_config"][EXECUTION_KEY].is_not(None),
+                )
+                .order_by(DeploymentGeneration.seq.desc())
+                .limit(1)
+            )
+            previous_execution = ((previous_document or {}).get("interface_config") or {}).get(EXECUTION_KEY)
+            if previous_execution is not None:
+                body["interface_config"][EXECUTION_KEY] = deepcopy(previous_execution)
+        if "interface_config" in promoted_sections:
+            if (removal_context or {}).get("scope") == "interface_config":
+                section = body.setdefault("interface_config", {})
+                section.setdefault("interface_intent", [])
+                section.setdefault("interface_ip_intent", [])
+            try:
+                await record_interface_execution(db, device_id, body)
+            except InterfaceEligibilityUnresolved as exc:
+                logger.warning(
+                    "generation.interface_eligibility_unresolved",
+                    device_id=device_id,
+                    detail=str(exc),
+                    exc_info=True,
+                )
+                raise ApplyUnexecutable({"interface_config": "interface_attribute_eligibility_unresolved"}) from None
+        from nso_adapter.core.static_route_plan import record_static_route_execution
+
+        await record_static_route_execution(
+            db,
+            device_id,
+            body,
+            removal_context=removal_context,
+            allowed_removal_keys=allowed_removal_keys,
+            tombstone_ids=static_route_tombstone_ids,
+        )
     generation = DeploymentGeneration(
         device_id=device_id,
         seq=await _next_seq(db, device_id),
         mode=mode,
         status=GenerationStatus.pending,
-        document=document,
-        digest=digest_document(mode, document, allowed_removal_keys),
+        document=body,
+        digest=digest_document(mode, body, allowed_removal_keys),
         allowed_removal_keys=allowed_removal_keys,
         source_push_seq=source_push_seq,
         stream_revisions=stream_revisions,
@@ -845,7 +930,7 @@ async def _store_generation(
         seq=generation.seq,
         mode=mode.value,
         streams=sorted(stream_revisions),
-        document_sections=sorted(document),
+        document_sections=sorted(body),
         digest=generation.digest[:12],
     )
     return generation
@@ -872,12 +957,12 @@ async def create_reissue_generation(
     here: the force-removal action is exempt from it at its own choke point
     (:func:`core.removal.enqueue_removal`) and the two scheduled producers carry no request.
 
-    It therefore settles NOTHING: ``stream_revisions`` is empty. The document composes every
-    authorized stream so the write stays complete, but the job behind it executes ONE
-    removal context's scope, and settlement advances exactly what a generation lists. Listing
+    It therefore settles NOTHING: ``stream_revisions`` is empty. Its composed authorized
+    fragments carry no execution plan. The job behind it executes ONE removal context's
+    scope from live state, and settlement advances exactly what a generation lists. Listing
     every authorized revision let a static-route reissue certify a VLAN revision whose own
-    deployment had failed or been abandoned — a lane marked applied by a write that never
-    carried it. ``source_push_seq`` stays: it is provenance, not a settlement target.
+    deployment had failed or been abandoned. The reissue never carried that lane.
+    ``source_push_seq`` stays: it is provenance, not a settlement target.
     """
     await lock_projection(db, device_id)
     rows = (
@@ -896,6 +981,7 @@ async def create_reissue_generation(
         stream_revisions={},
         removal_context=removal_context,
         settlement_cohort=None,
+        static_route_tombstone_ids=(),
     )
 
 
@@ -913,20 +999,17 @@ async def _job_generations(db: AsyncSession, job_id: int) -> list[DeploymentGene
     )
 
 
-async def document_execution_sections(db: AsyncSession, job_id: int) -> frozenset[str] | None:
-    """Return the exact document sections this job can execute without live reads.
+async def generation_execution_sections(db: AsyncSession, job_id: int) -> frozenset[str] | None:
+    """Return the sections carried by this job, or ``None`` when it carries no generation.
 
-    Adjacent generations can share one apply job. Restrict the run only when every stream
-    carried by every generation is document-executed, or an earlier live-read generation
-    could settle without being sent. ``None`` keeps that mixed job on the legacy runner.
+    Adjacent generations can share one apply job. Their streams form the execution boundary,
+    and every selected section uses the highest generation's complete document.
     """
-    streams = {
-        stream for generation in await _job_generations(db, job_id) for stream in (generation.stream_revisions or {})
-    }
-    sections = frozenset(stream_section(stream) for stream in streams)
-    if sections and sections <= DOCUMENT_EXECUTED_SECTIONS:
-        return sections
-    return None
+    generations = await _job_generations(db, job_id)
+    if not generations:
+        return None
+    streams = {stream for generation in generations for stream in (generation.stream_revisions or {})}
+    return frozenset(stream_section(stream) for stream in streams)
 
 
 class GenerationTampered(RuntimeError):
@@ -1119,10 +1202,10 @@ async def settle_job_generations(
     Runs INSIDE the terminal transaction, so a generation can never be settled by a status
     write that was rolled back. On success each carried stream is stamped applied at THE
     REVISION THE GENERATION CARRIED — never at the store's current revision, which may
-    already hold writes this deployment never contained (§G2). A marking-split removal can
-    put the same stream revision in two generations. That revision is stamped only after
-    every cohort member has either settled or been explicitly abandoned, and only when at
-    least one member settled successfully.
+    already hold writes this deployment never contained (§G2). A cohort is request-atomic:
+    every stream it carries is stamped only after at least one member settles and every
+    member is either settled or explicitly abandoned. A live or failed member withholds all
+    streams in the request.
     """
     carried = await _job_generations(db, job_id)
     if not carried:
@@ -1148,9 +1231,23 @@ async def settle_job_generations(
             seqs=[g.seq for g in carried],
         )
         return
+    cohorts = {generation.settlement_cohort for generation in carried if generation.settlement_cohort is not None}
+    cohort_generations = []
+    if cohorts:
+        cohort_generations = list(
+            (
+                await db.execute(
+                    select(DeploymentGeneration).where(DeploymentGeneration.settlement_cohort.in_(sorted(cohorts)))
+                )
+            )
+            .scalars()
+            .all()
+        )
+    target_generations = [generation for generation in carried if generation.settlement_cohort is None]
+    target_generations.extend(cohort_generations)
     targets = {
         (generation.device_id, stream, revision, generation.settlement_cohort)
-        for generation in carried
+        for generation in target_generations
         for stream, revision in (generation.stream_revisions or {}).items()
     }
     await _stamp_applied_revisions(db, targets, now)
@@ -1196,21 +1293,20 @@ async def _stamp_applied_revisions(
 
 async def _stamp_settled_cohort(db: AsyncSession, settlement_cohort: int, now: datetime) -> None:
     """Re-evaluate one cohort after a blocker becomes explicitly crossable."""
-    settled = (
+    cohort_generations = (
         (
             await db.execute(
-                select(DeploymentGeneration).where(
-                    DeploymentGeneration.settlement_cohort == settlement_cohort,
-                    DeploymentGeneration.status == GenerationStatus.settled,
-                )
+                select(DeploymentGeneration).where(DeploymentGeneration.settlement_cohort == settlement_cohort)
             )
         )
         .scalars()
         .all()
     )
+    if not any(generation.status is GenerationStatus.settled for generation in cohort_generations):
+        return
     targets: set[tuple[int, str, int, int | None]] = {
         (generation.device_id, stream, revision, settlement_cohort)
-        for generation in settled
+        for generation in cohort_generations
         for stream, revision in (generation.stream_revisions or {}).items()
     }
     await _stamp_applied_revisions(db, targets, now)
@@ -1567,6 +1663,7 @@ __all__ = [
     "advance_device_generations",
     "advance_generations_locked",
     "allocate_settlement_cohort",
+    "auto_apply_requested",
     "attach_to_job",
     "require_attach_to_job",
     "consume_last_enqueued_generation_id",
@@ -1574,15 +1671,17 @@ __all__ = [
     "create_action_apply",
     "create_reissue_generation",
     "digest_document",
-    "document_execution_sections",
+    "generation_execution_sections",
     "executable_head",
     "executing_generation",
     "job_admissible",
     "lock_projection",
     "mark_job_generations_running",
     "note_write",
+    "prepare_request_settlement",
     "recover_generations",
     "reconcile_generation",
+    "request_settlement_cohort",
     "requeue_job_generations",
     "retry_generation",
     "settle_job_generations",

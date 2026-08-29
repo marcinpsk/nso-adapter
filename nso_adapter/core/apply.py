@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
@@ -26,15 +26,22 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, internal_error, terminalize
-from nso_adapter.core.generation import document_execution_sections, executing_generation, note_write
+from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, JobError, internal_error, terminalize
+from nso_adapter.core.generation import executing_generation, generation_execution_sections, note_write
 from nso_adapter.core.projection import (
-    DOCUMENT_EXECUTED_SECTIONS,
+    INTERFACE_ATTRIBUTE_ELIGIBLE_STATES,
+    hydrate_interface_execution,
     hydrate_section,
     intent_state,
     section_models,
 )
-from nso_adapter.core.static_route_plan import SrPlan, authorized_clear_fields, build_plan
+from nso_adapter.core.static_route_plan import (
+    SrPlan,
+    authorized_clear_fields,
+    build_plan,
+    hydrate_static_route_apply_plan,
+    recorded_static_route_apply_mode,
+)
 from nso_adapter.nso.apply import NsoApplyError
 from nso_adapter.store.models import (
     BfdIntent,
@@ -74,12 +81,7 @@ from nso_adapter.store.models import (
 logger = structlog.get_logger(__name__)
 
 # Statuses eligible for apply (decision Q in plan — force=True pushes all of these)
-_FORCE_ELIGIBLE = {
-    SyncState.accepted,
-    SyncState.apply_failed,
-    SyncState.drifted,
-    SyncState.in_sync,
-}
+_FORCE_ELIGIBLE = set(INTERFACE_ATTRIBUTE_ELIGIBLE_STATES)
 # force=False only pushes these
 _NO_FORCE_ELIGIBLE = {
     SyncState.accepted,
@@ -588,6 +590,7 @@ async def _static_route_bookkeeping(
     job_id: int,
     reg=None,
     send_failed: bool,
+    stamp_of: dict | None = None,
 ) -> tuple[list[dict], tuple[int, int] | None, list[dict]]:
     """Consume, CAS and record — the ONE transaction §4.6 requires, minus its commit.
 
@@ -645,6 +648,7 @@ async def _static_route_bookkeeping(
 
     results: list[dict] = []
     for row in plan.rows:
+        stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
         outcome = SR_UNPROVEN
         if send_failed or residue_found:
             outcome = SR_APPLY_FAILED
@@ -652,10 +656,17 @@ async def _static_route_bookkeeping(
             outcome = SR_APPLY_FAILED
         elif _sr_row_proven(row, proof, conclusive=conclusive) and not residue_blocks:
             outcome = await _settle_proven_row(
-                db, device, plan, proof, row, put_delivered=put_delivered, cas=cas_by_row.get(row.id)
+                db,
+                device,
+                plan,
+                proof,
+                row,
+                stamp=stamp,
+                put_delivered=put_delivered,
+                cas=cas_by_row.get(row.id),
             )
-        if residue_err is not None:
-            row.last_apply_error = residue_err
+        if residue_err is not None and stamp is not None:
+            stamp.last_apply_error = residue_err
         if outcome is SR_UNPROVEN:
             logger.warning(
                 "static_route.route_unproven",
@@ -686,7 +697,11 @@ async def _static_route_bookkeeping(
                 # reader-compare miss, residue or a stage error), so nothing is lost.
                 "generation": row.intent_generation,
                 "outcome": outcome,
-                "error": row.last_apply_error if outcome == SR_APPLY_FAILED else None,
+                "error": (
+                    residue_err or row.last_apply_error or (stamp.last_apply_error if stamp is not None else None)
+                )
+                if outcome == SR_APPLY_FAILED
+                else None,
             }
         )
 
@@ -695,7 +710,7 @@ async def _static_route_bookkeeping(
     return results, (0, len(plan.rows)), [{"error": residue_message, "code": RESIDUE_FOUND_CODE}]
 
 
-async def _settle_proven_row(db, device, plan, proof: SrProof, row, *, put_delivered: bool, cas) -> str:
+async def _settle_proven_row(db, device, plan, proof: SrProof, row, *, stamp, put_delivered: bool, cas) -> str:
     """CAS and consume for one row whose own key is proven present → its outcome.
 
     Two things can still block ``in_sync`` after the key proof: an undelivered replacement
@@ -712,6 +727,9 @@ async def _settle_proven_row(db, device, plan, proof: SrProof, row, *, put_deliv
     )
     from nso_adapter.store.static_route_store import CAS_ROW, CAS_TOMBSTONE, cas_deployed_key
 
+    if stamp is None:
+        # A successor changed or deleted this row before the selected generation ran.
+        return SR_UNPROVEN
     if replacement_open(row) and not put_delivered:
         # The merge added the new triple and left the predecessor. Recording the new triple
         # as deployed would destroy the only pointer to what is still on the device.
@@ -735,25 +753,32 @@ async def _settle_proven_row(db, device, plan, proof: SrProof, row, *, put_deliv
     pending = pending_clear_fields(row.pending_clear)
     if not pending:
         return SR_IN_SYNC
+    # The immutable document records the carrier as it stood when this generation was
+    # created. A preceding removal generation can prove and consume some or all of that
+    # carrier before this apply runs. The matching live stamp is safe evidence of that
+    # predecessor outcome: the document/live join already compared every intent field and
+    # authorization stamp, while pending_clear is apply bookkeeping by design.
+    fulfilled = pending - pending_clear_fields(stamp.pending_clear)
     if not put_delivered:
         # Only the PUT path delivers a clear: the merge body omits the leaf but the merge
-        # never drops one. Promotion is by DELIVERY (A1), so a PATCH consumes nothing.
-        return SR_UNPROVEN
+        # never drops one. A preceding removal can already have fulfilled the obligation.
+        return SR_IN_SYNC if pending == fulfilled else SR_UNPROVEN
     entry = proof.entries.get(triple_of(row))
-    proven = {field for field in pending if entry is not None and leaf_is_neutral(field, entry)}
-    if proven:
-        carrier = row.pending_clear or {}
-        remaining_auth = sorted({*(carrier.get(AUTHORIZED) or ())} - proven)
-        remaining_store = sorted({*(carrier.get(STORE_ONLY) or ())} - proven)
-        row.pending_clear = (
+    device_proven = {field for field in pending - fulfilled if entry is not None and leaf_is_neutral(field, entry)}
+    if device_proven:
+        carrier = stamp.pending_clear or {}
+        remaining_auth = sorted({*(carrier.get(AUTHORIZED) or ())} - device_proven)
+        remaining_store = sorted({*(carrier.get(STORE_ONLY) or ())} - device_proven)
+        stamp.pending_clear = (
             {AUTHORIZED: remaining_auth, STORE_ONLY: remaining_store} if (remaining_auth or remaining_store) else None
         )
         logger.info(
             "static_route.pending_clear_consumed",
             device_id=device.id,
             row_id=row.id,
-            fields=sorted(proven),
+            fields=sorted(device_proven),
         )
+    proven = fulfilled | device_proven
     return SR_IN_SYNC if pending == proven else SR_UNPROVEN
 
 
@@ -771,6 +796,7 @@ async def _settle_static_routes(
     scope_outcomes: dict,
     scope_failures: dict,
     reg=None,
+    stamp_of: dict | None = None,
 ) -> list[dict] | None:
     """Run §4.4's proof and §4.5/§4.6's bookkeeping for the static-route scope.
 
@@ -803,7 +829,15 @@ async def _settle_static_routes(
         want_fields=want_fields,
     )
     results, adjusted, extra_fails = await _static_route_bookkeeping(
-        db, device, plan, proof, put_delivered=put_delivered, job_id=job_id, reg=reg, send_failed=send_failed
+        db,
+        device,
+        plan,
+        proof,
+        put_delivered=put_delivered,
+        job_id=job_id,
+        reg=reg,
+        send_failed=send_failed,
+        stamp_of=stamp_of,
     )
     if adjusted is not None:
         scope_outcomes["static_route"] = adjusted
@@ -1111,14 +1145,14 @@ class _Scope(NamedTuple):
     #: lists differ whenever a successor moved a row (#1522 §G1).
     push: list | None = None
     #: Where a finding about a PUSHED row is recorded: ``{row id -> the live row}``. ``None``
-    #: for a live-read scope, where the pushed row IS the live row. A pushed row absent from
+    #: for a generationless scope, where the pushed row IS the live row. A pushed row absent from
     #: the map has no live counterpart left — it still fails the scope, it simply leaves no
     #: bookkeeping behind, because a transient hydrated row's stamp goes nowhere.
     stamp_of: dict | None = None
 
     @property
     def sent(self) -> list:
-        """Return the rows this scope's body carries. Equal to ``rows`` for a live-read scope.
+        """Return the rows this scope's body carries. Equal to ``rows`` for a generationless scope.
 
         Whether the scope RUNS is decided by this and never by ``rows``, and so is what the
         post-apply presence check looks for: an empty stamp list means the deployment records
@@ -1144,32 +1178,65 @@ def _is_eligible(row, force: bool) -> bool:
 
 async def _collect_eligible(db: AsyncSession, model, device_id: int, force: bool) -> list:
     """All Apply-eligible rows of *model* for this device (one device-scoped query)."""
-    rows = (await db.execute(select(model).where(model.device_id == device_id))).scalars().all()
+    if model is InterfaceIpIntent:
+        stmt = (
+            select(InterfaceIpIntent)
+            .join(DbInterface, InterfaceIpIntent.interface_id == DbInterface.id)
+            .where(DbInterface.device_id == device_id)
+        )
+    else:
+        stmt = select(model).where(model.device_id == device_id)
+    rows = (await db.execute(stmt)).scalars().all()
     return [r for r in rows if _is_eligible(r, force)]
-
-
-#: The intent models a document-executed section is built from.
-_DOCUMENT_MODELS = section_models(DOCUMENT_EXECUTED_SECTIONS)
 
 
 class _Rows(NamedTuple):
     """One model's contribution to an apply pass, split by what each half is FOR.
 
     *push* is what reaches the device AND what the post-apply presence check looks for;
-    *stamp* is what records the outcome. They are the same list for a live-read section. For
-    a document-executed one they differ on purpose: *push* is rebuilt from the generation's
+    *stamp* is what records the outcome. They are the same list for a generationless job. For
+    a generated one they differ on purpose: *push* is rebuilt from the generation's
     immutable document (transient rows that must never reach the store), while *stamp* is the
     LIVE rows this deployment actually carried — a row the successor added, changed or
     re-authorized after this generation was cut is not stamped by a deployment that never
     carried it.
 
-    *stamp_of* joins the two: pushed-row id -> the live row a finding about it is recorded
-    on. ``None`` when the two lists are the same objects.
+    *stamp_of* joins the two: pushed-row model and id -> the live row a finding about it
+    is recorded on. The model is part of the key because aggregate sections contain tables
+    whose primary-key sequences overlap. ``None`` means the two lists are the same objects.
     """
 
     push: list
     stamp: list
     stamp_of: dict | None = None
+
+
+def _stamp_key(row) -> tuple[type, object]:
+    return type(row), getattr(row, "id", None)
+
+
+def _stamp_join(document_rows: Sequence, live_rows: Sequence) -> dict[tuple[type, object], Any]:
+    """Map document rows to live rows that still hold the same intent."""
+    live_by_id = {row.id: row for row in live_rows}
+    return {
+        _stamp_key(row): live
+        for row in document_rows
+        if (live := live_by_id.get(row.id)) is not None and intent_state(live) == intent_state(row)
+    }
+
+
+def _combine_rows(*groups: _Rows) -> _Rows:
+    """Combine one section's model collections without losing their stamp joins."""
+    push = [row for group in groups for row in group.push]
+    stamp = [row for group in groups for row in group.stamp]
+    if all(group.stamp_of is None for group in groups):
+        return _Rows(push=push, stamp=stamp)
+    stamp_of = {
+        key: row
+        for group in groups
+        for key, row in (group.stamp_of or {_stamp_key(live): live for live in group.stamp}).items()
+    }
+    return _Rows(push=push, stamp=stamp, stamp_of=stamp_of)
 
 
 def _reject_transient_stamps(scope_label: str, rows) -> None:
@@ -1192,12 +1259,9 @@ def _reject_transient_stamps(scope_label: str, rows) -> None:
 class _Projection:
     """Where one apply run reads the rows it deploys (#1522 §G1).
 
-    Built once per run. For a section in :data:`DOCUMENT_EXECUTED_SECTIONS` the rows come
-    from the executing generation's stored document, so a successor committing between the
-    worker's ``running`` commit and this read cannot be deployed under the wrong
-    generation's identity. Every other section still reads live rows — see
-    :data:`core.projection.LIVE_READ_SECTIONS` for what each one needs from #1522's
-    aggregate device-intent builder before it can join.
+    Built once per run. Every generated section comes from the executing generation's
+    stored document, so a successor committing between the worker's ``running`` commit and
+    this read cannot be deployed under the wrong generation's identity.
 
     A ``document`` of None is the one job that carries no generation: an Apply on a device
     nothing was ever written for. Its live read returns nothing either, so the two agree.
@@ -1216,40 +1280,42 @@ class _Projection:
         self._force = force
         self._document = document
         self._sections = sections
-        self._models = section_models(sections) if sections is not None else None
-        self._hydrated: dict[type, list] | None = None
+        self._hydrated: dict[str, dict[type, list]] = {}
+        self._live: dict[tuple[type, bool], list] = {}
 
-    def _document_rows(self) -> dict[type, list]:
-        if self._hydrated is None:
-            if self._document is None:
-                raise RuntimeError("document rows requested without a deployment document")
-            rows: dict[type, list] = {}
-            sections = (
-                self._sections
-                if self._sections is not None
-                else DOCUMENT_EXECUTED_SECTIONS.intersection(self._document)
-            )
-            for section in sections:
-                rows.update(hydrate_section(self._document, section))
-            self._hydrated = rows
-        return self._hydrated
+    def _document_rows(self, section: str) -> dict[type, list]:
+        if self._document is None:
+            raise RuntimeError("document rows requested without a deployment document")
+        if section not in self._hydrated:
+            self._hydrated[section] = hydrate_section(self._document, section)
+        return self._hydrated[section]
 
-    async def collect(self, model) -> _Rows:
-        if self._models is not None and model not in self._models:
+    async def collect(self, model, *, section: str, force: bool | None = None) -> _Rows:
+        if model not in section_models({section}):
+            raise ValueError(f"{model.__name__} does not belong to projection section {section!r}")
+        if self._sections is not None and section not in self._sections:
             return _Rows(push=[], stamp=[])
-        live = await _collect_eligible(self._db, model, self._device_id, self._force)
-        if self._document is None or model not in _DOCUMENT_MODELS:
+        effective_force = self._force if force is None else force
+        live_key = (model, effective_force)
+        if live_key not in self._live:
+            self._live[live_key] = await _collect_eligible(self._db, model, self._device_id, effective_force)
+        live = self._live[live_key]
+        if model is RedistributionIntent:
+            live = [row for row in live if row.dest_protocol == section]
+        if self._document is None:
             return _Rows(push=live, stamp=live)
-        document_rows = self._document_rows().get(model, [])
-        push = [row for row in document_rows if _is_eligible(row, self._force)]
+        if self._sections is None and section not in self._document:
+            return _Rows(push=[], stamp=[])
+        document_rows = self._document_rows(section).get(model, [])
+        push = [row for row in document_rows if _is_eligible(row, effective_force)]
         # Matched on CONTENT, not on the id alone. A successor push rewrites a row in place,
         # so the id it kept says nothing about whether this document carried what the row now
         # holds; stamping on the id would report the successor's intent as applied by a
         # deployment that never sent it. A row whose content moved simply stays pending and
         # the successor's own generation stamps it.
-        carried = {row.id: intent_state(row) for row in push}
-        stamp = [row for row in live if carried.get(row.id) == intent_state(row)]
-        return _Rows(push=push, stamp=stamp, stamp_of={row.id: row for row in stamp})
+        stamp_of = _stamp_join(push, live)
+        stamp = [row for row in live if _stamp_key(row) in stamp_of]
+        return _Rows(push=push, stamp=stamp, stamp_of=stamp_of)
 
 
 async def _maybe_sync_from(db: AsyncSession, client, device_name: str, device_id: int) -> None:
@@ -1274,11 +1340,11 @@ async def _maybe_sync_from(db: AsyncSession, client, device_name: str, device_id
 
 
 async def _collect_attr_eligibility(db: AsyncSession, ifaces: dict, force: bool) -> tuple[list, list]:
-    """Snapshot every interface-attribute intent row; return (snapshot, eligible 3-tuples).
+    """Snapshot every interface-attribute intent row; return (snapshot, eligible sends).
 
     Eligibility for attributes is keyed off the attr_state's sync_state (not last_apply_at):
     every accepted row is snapshotted, but only those whose state is in the force/no-force
-    set are returned as ``(attr_state, intent_row, iface)`` for the per-attribute pass.
+    set are returned for the per-attribute pass.
     """
     eligible_statuses = _FORCE_ELIGIBLE if force else _NO_FORCE_ELIGIBLE
     snapshot: list[dict] = []
@@ -1306,7 +1372,7 @@ async def _collect_attr_eligibility(db: AsyncSession, ifaces: dict, force: bool)
                 }
             )
             if attr_state and attr_state.sync_state in eligible_statuses:
-                eligible.append((attr_state, intent_row, iface))
+                eligible.append(_AttributeApply(attr_state, intent_row, iface, intent_row))
     return snapshot, eligible
 
 
@@ -1336,6 +1402,110 @@ async def _collect_ip_eligibility(db: AsyncSession, ifaces: dict, force: bool) -
     return snapshot, by_iface
 
 
+class _AttributeApply(NamedTuple):
+    """One recorded attribute send and the live rows it may stamp."""
+
+    state: InterfaceAttrState | None
+    push: InterfaceIntent
+    interface: DbInterface
+    stamp: InterfaceIntent | None
+
+
+async def _collect_document_interface(
+    db: AsyncSession,
+    source: _Projection,
+    document: dict,
+) -> tuple[dict, list[dict], list[_AttributeApply], list[dict], dict, _Rows]:
+    """Hydrate interface rows and consume their creation-time execution context."""
+    execution = hydrate_interface_execution(document)
+    document_attr_rows = source._document_rows("interface_config").get(InterfaceIntent, [])
+    interface_ids = list(execution.interfaces)
+    live_attr_rows = (
+        (await db.execute(select(InterfaceIntent).where(InterfaceIntent.interface_id.in_(interface_ids))))
+        .scalars()
+        .all()
+        if interface_ids
+        else []
+    )
+    attr_stamp_of = _stamp_join(document_attr_rows, live_attr_rows)
+    ip_rows = await source.collect(InterfaceIpIntent, section="interface_config")
+    states = (
+        (await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id.in_(interface_ids))))
+        .scalars()
+        .all()
+        if interface_ids
+        else []
+    )
+    state_by_key = {(state.interface_id, state.attribute): state for state in states}
+    eligible: list[_AttributeApply] = []
+    intent_snapshot: list[dict] = []
+    for row in document_attr_rows:
+        key = (row.interface_id, row.attribute)
+        iface = execution.interfaces.get(row.interface_id)
+        if iface is None:
+            raise ValueError(f"interface_config document has no context for interface id {row.interface_id}")
+        is_eligible = key in execution.eligible_attributes
+        intent_snapshot.append(
+            {
+                "interface": iface.name,
+                "attribute": row.attribute,
+                "intent_value": row.intent_value,
+                "accepted_at": row.accepted_at.isoformat() if row.accepted_at else None,
+                "status_at_snapshot": "eligible" if is_eligible else "ineligible",
+            }
+        )
+        if not is_eligible:
+            continue
+        stamp = attr_stamp_of.get(_stamp_key(row))
+        eligible.append(_AttributeApply(state_by_key.get(key) if stamp is not None else None, row, iface, stamp))
+
+    ip_by_iface: dict[int, list] = {}
+    ip_snapshot: list[dict] = []
+    for row in ip_rows.push:
+        iface = execution.interfaces.get(row.interface_id)
+        if iface is None:
+            raise ValueError(f"interface_config document has no context for interface id {row.interface_id}")
+        ip_by_iface.setdefault(row.interface_id, []).append(row)
+        ip_snapshot.append(
+            {
+                "interface": iface.name,
+                "address": row.address,
+                "family": row.family,
+                "secondary": row.secondary,
+                "vrf": row.vrf,
+                "accepted_at": row.accepted_at.isoformat() if row.accepted_at else None,
+            }
+        )
+    return execution.interfaces, intent_snapshot, eligible, ip_snapshot, ip_by_iface, ip_rows
+
+
+async def _collect_interface_apply_rows(
+    db: AsyncSession,
+    source: _Projection,
+    generation,
+    execution_sections: frozenset[str] | None,
+    device_id: int,
+    force: bool,
+) -> tuple[dict, list[dict], list, list[dict], dict, dict | None]:
+    """Select no rows, generationless live rows, or the recorded interface document."""
+    if execution_sections is not None and "interface_config" not in execution_sections:
+        return {}, [], [], [], {}, None
+    if generation is not None:
+        ifaces, intent_snapshot, attrs, ip_snapshot, ips, ip_rows = await _collect_document_interface(
+            db,
+            source,
+            generation.document,
+        )
+        return ifaces, intent_snapshot, attrs, ip_snapshot, ips, ip_rows.stamp_of
+    ifaces = {
+        iface.id: iface
+        for iface in (await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))).scalars().all()
+    }
+    intent_snapshot, attrs = await _collect_attr_eligibility(db, ifaces, force)
+    ip_snapshot, ips = await _collect_ip_eligibility(db, ifaces, force)
+    return ifaces, intent_snapshot, attrs, ip_snapshot, ips, None
+
+
 async def _apply_attributes(eligible, apply_fn, *, client, device_name, job_id, now) -> tuple[int, int, list]:
     """Commit each (interface, attribute) individually and transition its attr_state.
 
@@ -1345,7 +1515,8 @@ async def _apply_attributes(eligible, apply_fn, *, client, device_name, job_id, 
     ok = 0
     failed = 0
     failures: list[dict] = []
-    for attr_state, intent_row, iface in eligible:
+    for item in eligible:
+        attr_state, intent_row, iface, stamp = item
         routed_kind = _nokia_attr_kind(iface)
         try:
             await apply_fn(
@@ -1368,8 +1539,9 @@ async def _apply_attributes(eligible, apply_fn, *, client, device_name, job_id, 
                 attribute=intent_row.attribute,
                 error=exc.message,
             )
-            attr_state.sync_state = SyncState.apply_failed
-            intent_row.last_apply_error = {"code": exc.code, "message": exc.message, "detail": exc.detail}
+            if attr_state is not None and stamp is not None:
+                attr_state.sync_state = SyncState.apply_failed
+                stamp.last_apply_error = {"code": exc.code, "message": exc.message, "detail": exc.detail}
             failed += 1
             failures.append({"interface": iface.name, "attribute": intent_row.attribute, "error": exc.message})
         except ClaimLostError:
@@ -1383,21 +1555,33 @@ async def _apply_attributes(eligible, apply_fn, *, client, device_name, job_id, 
                 interface=iface.name,
                 attribute=intent_row.attribute,
             )
-            attr_state.sync_state = SyncState.apply_failed
-            intent_row.last_apply_error = internal_error(exc)
+            if attr_state is not None and stamp is not None:
+                attr_state.sync_state = SyncState.apply_failed
+                stamp.last_apply_error = internal_error(exc)
             failed += 1
             failures.append(
                 {"interface": iface.name, "attribute": intent_row.attribute, "error": internal_error(exc)["message"]}
             )
         else:
-            attr_state.sync_state = SyncState.in_sync
-            intent_row.last_apply_at = now
-            intent_row.last_apply_error = None
+            if attr_state is not None and stamp is not None:
+                attr_state.sync_state = SyncState.in_sync
+                stamp.last_apply_at = now
+                stamp.last_apply_error = None
             ok += 1
     return ok, failed, failures
 
 
-async def _apply_ips(by_iface, ifaces, apply_fn, *, client, device_name, job_id, now) -> tuple[int, int, list]:
+async def _apply_ips(
+    by_iface,
+    ifaces,
+    apply_fn,
+    *,
+    client,
+    device_name,
+    job_id,
+    now,
+    stamp_of: dict | None = None,
+) -> tuple[int, int, list]:
     """Push IP intent one interface at a time (each interface is one commit unit).
 
     Returns (in_sync, apply_failed, failures); the counts are per-row, the failures
@@ -1423,7 +1607,9 @@ async def _apply_ips(by_iface, ifaces, apply_fn, *, client, device_name, job_id,
         except NsoApplyError as exc:
             logger.error("apply.ip_failed", job_id=job_id, device=device_name, interface=iface.name, error=exc.message)
             for row in ip_rows:
-                row.last_apply_error = {"code": exc.code, "message": exc.message, "detail": exc.detail}
+                stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
+                if stamp is not None:
+                    stamp.last_apply_error = {"code": exc.code, "message": exc.message, "detail": exc.detail}
             failed += len(ip_rows)
             failures.append({"interface": iface.name, "error": exc.message})
         except ClaimLostError:
@@ -1433,13 +1619,17 @@ async def _apply_ips(by_iface, ifaces, apply_fn, *, client, device_name, job_id,
         except Exception as exc:
             logger.exception("apply.ip_unexpected_error", job_id=job_id, interface=iface.name)
             for row in ip_rows:
-                row.last_apply_error = internal_error(exc)
+                stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
+                if stamp is not None:
+                    stamp.last_apply_error = internal_error(exc)
             failed += len(ip_rows)
             failures.append({"interface": iface.name, "error": internal_error(exc)["message"]})
         else:
             for row in ip_rows:
-                row.last_apply_at = now
-                row.last_apply_error = None
+                stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
+                if stamp is not None:
+                    stamp.last_apply_at = now
+                    stamp.last_apply_error = None
             ok += len(ip_rows)
     return ok, failed, failures
 
@@ -1460,7 +1650,7 @@ def _build_interface_config_entries(attr_eligible, ip_by_iface, ifaces, device_n
     def _entry(name: str) -> dict:
         return by_name.setdefault(name, {"device": device_name, "interface-name": name})
 
-    for _attr_state, intent_row, iface in attr_eligible:
+    for _attr_state, intent_row, iface, _stamp in attr_eligible:
         entry = _entry(iface.name)
         if intent_row.attribute == "description":
             entry["description"] = intent_row.intent_value if intent_row.intent_value is not None else ""
@@ -1809,32 +1999,38 @@ def _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now,
     """
     ok = failed = 0
     failures: list[dict] = []
-    for attr_state, intent_row, iface in attr_eligible:
+    for attr_state, intent_row, iface, stamp in attr_eligible:
         if commit_error is None:
-            attr_state.sync_state = SyncState.in_sync
-            intent_row.last_apply_at = now
-            intent_row.last_apply_error = None
+            if attr_state is not None and stamp is not None:
+                attr_state.sync_state = SyncState.in_sync
+                stamp.last_apply_at = now
+                stamp.last_apply_error = None
             ok += 1
         elif iface_failed:
-            attr_state.sync_state = SyncState.apply_failed
-            intent_row.last_apply_error = err
+            if attr_state is not None and stamp is not None:
+                attr_state.sync_state = SyncState.apply_failed
+                stamp.last_apply_error = err
             failed += 1
             failures.append({"interface": iface.name, "attribute": intent_row.attribute, "error": msg})
-        else:
+        elif attr_state is not None:
             attr_state.sync_state = snapshot[attr_state]
     return ok, failed, failures
 
 
-def _stamp_ip_atomic(ip_rows_flat, commit_error, iface_failed, err, msg, now) -> tuple[int, int, list]:
+def _stamp_ip_atomic(ip_rows_flat, commit_error, iface_failed, err, msg, now, stamp_of=None) -> tuple[int, int, list]:
     """Stamp IP rows from the single atomic outcome (pending rows untouched, retried next apply)."""
     if commit_error is None:
         for row in ip_rows_flat:
-            row.last_apply_at = now
-            row.last_apply_error = None
+            stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
+            if stamp is not None:
+                stamp.last_apply_at = now
+                stamp.last_apply_error = None
         return len(ip_rows_flat), 0, []
     if iface_failed:
         for row in ip_rows_flat:
-            row.last_apply_error = err
+            stamp = row if stamp_of is None else stamp_of.get(_stamp_key(row))
+            if stamp is not None:
+                stamp.last_apply_error = err
         return 0, len(ip_rows_flat), ([{"error": msg}] if ip_rows_flat else [])
     return 0, 0, []
 
@@ -2000,6 +2196,8 @@ async def _static_route_followon_put(
     scope_failures: dict,
     reader_compare: dict,
     reader_compare_unverifiable: dict,
+    stamp_rows: list,
+    stamp_of: dict | None,
 ) -> tuple[bool, dict[int, str]]:
     """Deliver the ``PUT``-mode replacement the combined transaction cannot (§4.9).
 
@@ -2022,7 +2220,8 @@ async def _static_route_followon_put(
     scope_ok, scope_failed, fails = await _run_scope(
         "static_route",
         _static_route_coro(client, device, plan, outbox=outbox),
-        plan.rows,
+        stamp_rows,
+        sent_rows=plan.rows,
         job_id=job_id,
         device_name=device_name,
         now=now,
@@ -2039,6 +2238,7 @@ async def _static_route_followon_put(
             job_id=job_id,
             device_name=device_name,
             timeout=_VERIFY_PER_CALL_TIMEOUT,
+            stamp_of=stamp_of,
         )
         if status is not None:
             reader_compare["static_route"] = status
@@ -2061,15 +2261,17 @@ def _stamp_batch_scopes_atomic(sent_rows, stamp_rows, offenders, commit_error, e
         sent = sent_rows.get(scope_key) or []
         if not sent:
             continue
-        stamped = stamp_rows.get(scope_key) or []
-        _reject_transient_stamps(scope_key, stamped)
+        stamps = stamp_rows.get(scope_key) or []
+        _reject_transient_stamps(scope_key, stamps)
         if commit_error is None:
-            for row in stamped:
+            for row in stamps:
                 row.last_apply_at = now
                 row.last_apply_error = None
             scope_outcomes[scope_key] = (len(sent), 0)
         elif root_key in offenders:
-            for row in stamped:
+            for row in sent:
+                row.last_apply_error = err
+            for row in stamps:
                 row.last_apply_error = err
             scope_outcomes[scope_key] = (0, len(sent))
             scope_failures[scope_key] = [{"error": msg}]
@@ -2098,8 +2300,13 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
 
     # Snapshot attr states, then mark deploying (parity with the per-scope path); a pending
     # (rolled-back, non-offender) attr is reverted to its snapshot rather than left deploying.
-    snapshot = {attr_state: attr_state.sync_state for attr_state, _ir, _if in attr_eligible}
-    for attr_state, _ir, _if in attr_eligible:
+    attr_stamps = [item.stamp for item in attr_eligible if item.stamp is not None]
+    ip_stamps = list((elig.get("ip_stamp_of") or {}).values())
+    _reject_transient_stamps("interface_config", [*attr_stamps, *ip_stamps])
+    snapshot = {
+        item.state: item.state.sync_state for item in attr_eligible if item.state is not None and item.stamp is not None
+    }
+    for attr_state in snapshot:
         attr_state.sync_state = SyncState.deploying
     await db.commit()
 
@@ -2114,8 +2321,8 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
         # bug, not a scope's own bad intent, which _stage_atomic_modules isolates. Revert the
         # attrs we just marked 'deploying' so they aren't stuck forever, then re-raise so
         # run_apply fails the job with the real error.
-        for attr_state, _ir, _if in attr_eligible:
-            attr_state.sync_state = snapshot[attr_state]
+        for attr_state, state in snapshot.items():
+            attr_state.sync_state = state
         await db.commit()
         raise
 
@@ -2130,7 +2337,15 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
 
     iface_failed = (_IFACE_CONFIG_ROOT in offenders) if iface_entries else False
     attr_outcome = _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot)
-    ip_outcome = _stamp_ip_atomic(ip_rows_flat, commit_error, iface_failed, err, msg, now)
+    ip_outcome = _stamp_ip_atomic(
+        ip_rows_flat,
+        commit_error,
+        iface_failed,
+        err,
+        msg,
+        now,
+        stamp_of=elig.get("ip_stamp_of"),
+    )
     scope_outcomes, scope_failures = _stamp_batch_scopes_atomic(
         staged_sent, staged_stamp, offenders, commit_error, err, msg, now
     )
@@ -2141,6 +2356,8 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
         stamped = rows.stamp.get(scope_key) or []
         _reject_transient_stamps(scope_key, stamped)
         stage_err = {"code": stage_exc.code, "message": stage_exc.message, "detail": stage_exc.detail}
+        for row in rows.sent.get(scope_key) or []:
+            row.last_apply_error = stage_err
         for row in stamped:
             row.last_apply_error = stage_err
         # Counted against what the body WOULD have carried: a scope whose live rows a
@@ -2188,6 +2405,8 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
             scope_failures=scope_failures,
             reader_compare=reader_compare,
             reader_compare_unverifiable=reader_compare_unverifiable,
+            stamp_rows=elig["stamp"].get("static_route") or [],
+            stamp_of=rows.stamp_of.get("static_route"),
         )
         sr_put_delivered = True
 
@@ -2206,6 +2425,7 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
             scope_outcomes=scope_outcomes,
             scope_failures=scope_failures,
             reg=reg,
+            stamp_of=rows.stamp_of.get("static_route"),
         )
 
     await _finalize_job(
@@ -2428,9 +2648,9 @@ def _reader_compare_walk(
     ``missing`` still beats ``partial``). A missing key stamps its rows ``reader_compare_missing``
     and fails the scope. Returns ``(ok, failed, fails, status, evidence)``.
 
-    *translated* names what the deployment SENT. *stamp_of* maps a sent row's id onto the live
-    row that records a finding about it, and is ``None`` when the sent row IS the live row. A
-    sent row with no live counterpart — a successor rewrote it in place — still FAILS the
+    *translated* names what the deployment SENT. *stamp_of* maps a sent row's model and id
+    onto the live row that records a finding about it. It is ``None`` when the sent row IS
+    the live row. A sent row with no live counterpart still FAILS the
     scope; it just leaves no ``last_apply_error`` behind, because stamping the transient
     hydrated row would write to an object no session flushes.
 
@@ -2468,13 +2688,17 @@ def _reader_compare_walk(
             f"success but the key(s) never landed (silent writer drop, #26 class)"
         )
         sent = row_by_id[rid]
-        target = sent if stamp_of is None else stamp_of.get(getattr(sent, "id", None))
+        current_error = {
+            "code": "reader_compare_missing",
+            "message": msg,
+            "detail": {"scope": scope},
+        }
+        # The sent row can be document-hydrated and have no live stamp after a successor
+        # rewrite. Keep this pass's error on that in-memory carrier for the per-route result.
+        sent.last_apply_error = current_error
+        target = sent if stamp_of is None else stamp_of.get(_stamp_key(sent))
         if target is not None:
-            target.last_apply_error = {
-                "code": "reader_compare_missing",
-                "message": msg,
-                "detail": {"scope": scope},
-            }
+            target.last_apply_error = current_error
         fails.append({"error": msg})
     logger.error("apply.reader_compare_missing", job_id=job_id, device=device_name, scope=scope, missing=len(missing))
     # Clamped: ``ok`` counts rows this pass STAMPED, and a successor-rewritten scope stamps
@@ -2880,6 +3104,20 @@ async def _finalize_job(
     )
 
 
+def _refuse_unverifiable_recorded_put(generation, execution_sections) -> None:
+    """Refuse a recorded destructive PUT when verification is disabled at execution."""
+    from nso_adapter.nso import apply as nso_apply
+
+    if generation is None or "static_route" not in (execution_sections or ()):
+        return
+    if recorded_static_route_apply_mode(generation.document) == "PUT" and not nso_apply.VERIFY_AFTER_APPLY:
+        raise JobError(
+            "static_route_put_verify_disabled",
+            "Static-route PUT verification is disabled at worker execution. "
+            "The recorded destructive replace was not sent.",
+        )
+
+
 async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int, force: bool, *, reg=None) -> None:
     """Run the apply body: sync-from, snapshot intent, push each scope, finalize the job.
 
@@ -2910,87 +3148,130 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     device = await db.get(Device, device_id)
     if not device:
         raise ValueError(f"Device {device_id} not found")
-    client = get_nso_client(device.nso_instance)
-    device_name = device.nso_device_name
-
-    # ── Step 0: sync-from before apply (best-effort) ──
-    await _maybe_sync_from(db, client, device_name, device_id)
 
     # WHAT this run deploys is decided by the generation the job carries, not by the store as
     # it stands now (#1522 §G1). Between the worker committing `running` and this point a
     # successor push can commit; without the stored document it would be deployed here, under
     # this generation's identity and settled as this generation's revision.
     generation = await executing_generation(db, job_id)
-    document_sections = await document_execution_sections(db, job_id)
+    execution_sections = await generation_execution_sections(db, job_id)
+    _refuse_unverifiable_recorded_put(generation, execution_sections)
 
-    # ── Step 1: snapshot intent + collect every scope this job is allowed to execute ──
-    if document_sections is None or "interface_config" in document_sections:
-        ifaces = {
-            iface.id: iface
-            for iface in (await db.execute(select(DbInterface).where(DbInterface.device_id == device_id)))
-            .scalars()
-            .all()
-        }
-        intent_snapshot, attr_eligible = await _collect_attr_eligibility(db, ifaces, force)
-        ip_snapshot, ip_eligible_by_iface = await _collect_ip_eligibility(db, ifaces, force)
-    else:
-        ifaces = {}
-        intent_snapshot, attr_eligible = [], []
-        ip_snapshot, ip_eligible_by_iface = [], {}
+    client = get_nso_client(device.nso_instance)
+    device_name = device.nso_device_name
+
+    # ── Step 0: sync-from before apply (best-effort) ──
+    await _maybe_sync_from(db, client, device_name, device_id)
 
     source = _Projection(
         db,
         device_id,
         force,
         generation.document if generation is not None else None,
-        document_sections,
+        execution_sections,
     )
 
-    snmp_comm = (await source.collect(SnmpCommunityIntent)).push
-    snmp_user = (await source.collect(SnmpV3UserIntent)).push
-    snmp_host = (await source.collect(SnmpHostIntent)).push
-    snmp_sysinfo_rows = (await source.collect(SnmpSystemInfoIntent)).push
-    snmp_sysinfo = snmp_sysinfo_rows[0] if snmp_sysinfo_rows else None
-    snmp_rows = [*snmp_comm, *snmp_user, *snmp_host, *([snmp_sysinfo] if snmp_sysinfo else [])]
+    # ── Step 1: snapshot intent + collect every scope this job is allowed to execute ──
+    (
+        ifaces,
+        intent_snapshot,
+        attr_eligible,
+        ip_snapshot,
+        ip_eligible_by_iface,
+        interface_ip_stamp_of,
+    ) = await _collect_interface_apply_rows(
+        db,
+        source,
+        generation,
+        execution_sections,
+        device_id,
+        force,
+    )
 
-    sr_eligible = (await source.collect(StaticRouteIntent)).push
-    # #1396 R2 §3: ONE classifier decides the static-route mode and snapshots the rows the
-    # body is built from, the rows this pass stamps, the keys the guard may see disappear
-    # and the tombstones the body must retain.
-    if document_sections is None or "static_route" in document_sections:
+    snmp_comm_rows = await source.collect(SnmpCommunityIntent, section="snmp")
+    snmp_user_rows = await source.collect(SnmpV3UserIntent, section="snmp")
+    snmp_host_rows = await source.collect(SnmpHostIntent, section="snmp")
+    snmp_sysinfo_rows = await source.collect(SnmpSystemInfoIntent, section="snmp")
+    snmp_rows = _combine_rows(snmp_comm_rows, snmp_user_rows, snmp_host_rows, snmp_sysinfo_rows)
+    snmp_comm = snmp_comm_rows.push
+    snmp_user = snmp_user_rows.push
+    snmp_host = snmp_host_rows.push
+    snmp_sysinfo = snmp_sysinfo_rows.push[0] if snmp_sysinfo_rows.push else None
+
+    sr_eligible_rows = await source.collect(StaticRouteIntent, section="static_route")
+    sr_eligible = sr_eligible_rows.push
+    if generation is not None and "static_route" in (execution_sections or ()):
+        sr_all_rows = await source.collect(StaticRouteIntent, section="static_route", force=True)
+        sr_plan = hydrate_static_route_apply_plan(generation.document, eligible_rows=sr_eligible)
+        sr_stamp_of = sr_all_rows.stamp_of
+        sr_stamp_rows = [
+            stamp for row in sr_plan.rows if (stamp := (sr_stamp_of or {}).get(_stamp_key(row))) is not None
+        ]
+    elif generation is None:
+        # Generationless jobs predate document execution and still serve explicit local runs.
         sr_plan = await build_plan(db, device, eligible_rows=sr_eligible)
+        sr_stamp_rows = sr_plan.rows
+        sr_stamp_of = None
     else:
         sr_plan = SrPlan("PATCH", [], set(), [], [], 0)
+        sr_stamp_rows = []
+        sr_stamp_of = {}
     # What the static-route send learned, for §4.4's proof: the verify verdict and the exact
     # route keys the body carried. Filled by the scope coroutine, read after it returns.
     sr_outbox: dict = {}
-    logging_eligible = (await source.collect(LoggingHostIntent)).push
-    logging_levels_rows = (await source.collect(LoggingLevelsIntent)).push
-    logging_levels = logging_levels_rows[0] if logging_levels_rows else None
-    logging_rows = [*logging_eligible, *([logging_levels] if logging_levels else [])]
-    svi_eligible = (await source.collect(SviIntent)).push
-    subif_eligible = (await source.collect(SubinterfaceIntent)).push
-    vlan_rows = await source.collect(VlanIntent)
-    bfd_eligible = (await source.collect(BfdIntent)).push
-    mtu_eligible = (await source.collect(InterfaceMtuIntent)).push
-    l2_eligible = (await source.collect(L2SapIntent)).push
-    isis_eligible = (await source.collect(IsisInterfaceIntent)).push
-    isis_process_eligible = (await source.collect(IsisProcessIntent)).push
-    isis_flex_eligible = (await source.collect(IsisFlexAlgoIntent)).push
-    isis_level_eligible = (await source.collect(IsisLevelIntent)).push
-    bgp_eligible = (await source.collect(BgpRouterIntent)).push
-    if bgp_eligible:
-        # Eagerly load BGP relationships for apply (avoids lazy-raise on the worker greenlet).
+    logging_host_rows = await source.collect(LoggingHostIntent, section="logging")
+    logging_level_rows = await source.collect(LoggingLevelsIntent, section="logging")
+    logging_rows = _combine_rows(logging_host_rows, logging_level_rows)
+    logging_eligible = logging_host_rows.push
+    logging_levels = logging_level_rows.push[0] if logging_level_rows.push else None
+    svi_rows = await source.collect(SviIntent, section="svi")
+    subif_rows = await source.collect(SubinterfaceIntent, section="subinterface")
+    vlan_rows = await source.collect(VlanIntent, section="vlan")
+    bfd_rows = await source.collect(BfdIntent, section="bfd")
+    mtu_rows = await source.collect(InterfaceMtuIntent, section="interface_mtu")
+    l2_rows = await source.collect(L2SapIntent, section="l2_sap")
+    isis_iface_rows = await source.collect(IsisInterfaceIntent, section="isis")
+    isis_process_rows = await source.collect(IsisProcessIntent, section="isis")
+    isis_flex_rows = await source.collect(IsisFlexAlgoIntent, section="isis")
+    isis_level_rows = await source.collect(IsisLevelIntent, section="isis")
+    redist_isis_rows = await source.collect(RedistributionIntent, section="isis")
+    isis_rows = _combine_rows(
+        isis_iface_rows,
+        isis_process_rows,
+        redist_isis_rows,
+        isis_flex_rows,
+        isis_level_rows,
+    )
+    bgp_router_rows = await source.collect(BgpRouterIntent, section="bgp")
+    if bgp_router_rows.push and not sa_inspect(bgp_router_rows.push[0]).transient:
+        # Live BGP rows still need their relationship collections loaded.
         from nso_adapter.core.bgp_load import attach_bgp_relationships
 
-        await attach_bgp_relationships(db, bgp_eligible)
-    rp_eligible = (await source.collect(RoutePolicyObjectIntent)).push
-    ospf_instance_eligible = (await source.collect(OspfInstanceIntent)).push
-    ospf_iface_eligible = (await source.collect(OspfInterfaceIntent)).push
-    redist_eligible = (await source.collect(RedistributionIntent)).push
-    redist_ospf = [r for r in redist_eligible if r.dest_protocol == "ospf"]
-    redist_isis = [r for r in redist_eligible if r.dest_protocol == "isis"]
-    redist_bgp = [r for r in redist_eligible if r.dest_protocol == "bgp"]
+        await attach_bgp_relationships(db, bgp_router_rows.push)
+    redist_bgp_rows = await source.collect(RedistributionIntent, section="bgp")
+    bgp_rows = _combine_rows(bgp_router_rows, redist_bgp_rows)
+    bgp_eligible = bgp_router_rows.push
+    redist_bgp = redist_bgp_rows.push
+    rp_rows = await source.collect(RoutePolicyObjectIntent, section="route_policy")
+    ospf_instance_rows = await source.collect(OspfInstanceIntent, section="ospf")
+    ospf_iface_rows = await source.collect(OspfInterfaceIntent, section="ospf")
+    redist_ospf_rows = await source.collect(RedistributionIntent, section="ospf")
+    ospf_rows = _combine_rows(ospf_instance_rows, ospf_iface_rows, redist_ospf_rows)
+
+    svi_eligible = svi_rows.push
+    subif_eligible = subif_rows.push
+    bfd_eligible = bfd_rows.push
+    mtu_eligible = mtu_rows.push
+    l2_eligible = l2_rows.push
+    isis_eligible = isis_iface_rows.push
+    isis_process_eligible = isis_process_rows.push
+    isis_flex_eligible = isis_flex_rows.push
+    isis_level_eligible = isis_level_rows.push
+    redist_isis = redist_isis_rows.push
+    rp_eligible = rp_rows.push
+    ospf_instance_eligible = ospf_instance_rows.push
+    ospf_iface_eligible = ospf_iface_rows.push
+    redist_ospf = redist_ospf_rows.push
 
     job.context = {"force": force, "intent_snapshot": intent_snapshot, "ip_snapshot": ip_snapshot}
     now = datetime.now(UTC)
@@ -3005,12 +3286,12 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         [
             attr_eligible,
             ip_eligible_by_iface,
-            snmp_rows,
+            snmp_rows.push,
             # From the PLAN, never the eligible list: in PUT mode a force=False apply can
             # have an empty eligible list and a non-empty body, and _finalize_job's
             # all-zero early success would then report a clean no-op AFTER a real PUT.
             sr_plan.rows,
-            logging_rows,
+            logging_rows.push,
             svi_eligible,
             subif_eligible,
             vlan_rows.push,
@@ -3025,7 +3306,9 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             rp_eligible,
             ospf_instance_eligible,
             ospf_iface_eligible,
-            redist_eligible,
+            redist_ospf,
+            redist_isis,
+            redist_bgp,
         ]
     )
 
@@ -3037,22 +3320,18 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             "ifaces": ifaces,
             "attr": attr_eligible,
             "ip_by_iface": ip_eligible_by_iface,
+            "ip_stamp_of": interface_ip_stamp_of,
             "subif": subif_eligible,
-            "snmp_rows": snmp_rows,
+            "snmp_rows": snmp_rows.push,
             "snmp_comm": snmp_comm,
             "snmp_user": snmp_user,
             "snmp_host": snmp_host,
             "snmp_sysinfo": snmp_sysinfo,
-            "static_route": sr_eligible,
+            "static_route": sr_plan.rows,
             "logging": logging_eligible,
             "logging_levels": logging_levels,
             "svi": svi_eligible,
-            # push ≠ stamp for a document-executed scope: the combined body is the executing
-            # generation's document, the bookkeeping goes on the live rows it carried, and
-            # ``stamp_of`` is how a finding about a pushed row reaches its live counterpart.
             "vlan": vlan_rows.push,
-            "stamp": {"vlan": vlan_rows.stamp},
-            "stamp_of": {"vlan": vlan_rows.stamp_of},
             "bfd": bfd_eligible,
             "mtu": mtu_eligible,
             "l2_sap": l2_eligible,
@@ -3067,6 +3346,37 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
             "redist_ospf": redist_ospf,
             "redist_isis": redist_isis,
             "redist_bgp": redist_bgp,
+            # The body uses the document rows. Bookkeeping uses matching live rows.
+            "stamp": {
+                "snmp": snmp_rows.stamp,
+                "static_route": sr_stamp_rows,
+                "logging": logging_rows.stamp,
+                "svi": svi_rows.stamp,
+                "subinterface": subif_rows.stamp,
+                "vlan": vlan_rows.stamp,
+                "bfd": bfd_rows.stamp,
+                "interface_mtu": mtu_rows.stamp,
+                "l2_sap": l2_rows.stamp,
+                "isis": isis_rows.stamp,
+                "bgp": bgp_rows.stamp,
+                "route_policy": rp_rows.stamp,
+                "ospf": ospf_rows.stamp,
+            },
+            "stamp_of": {
+                "snmp": snmp_rows.stamp_of,
+                "static_route": sr_stamp_of,
+                "logging": logging_rows.stamp_of,
+                "svi": svi_rows.stamp_of,
+                "subinterface": subif_rows.stamp_of,
+                "vlan": vlan_rows.stamp_of,
+                "bfd": bfd_rows.stamp_of,
+                "interface_mtu": mtu_rows.stamp_of,
+                "l2_sap": l2_rows.stamp_of,
+                "isis": isis_rows.stamp_of,
+                "bgp": bgp_rows.stamp_of,
+                "route_policy": rp_rows.stamp_of,
+                "ospf": ospf_rows.stamp_of,
+            },
         }
         await _run_atomic_apply(db, device, client, device_name, job, job_id, now, elig, sr_plan=sr_plan, reg=reg)
         # §4.11 retry path, on BOTH apply implementations: the atomic path is a separate
@@ -3076,8 +3386,12 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         return
 
     # ── Step 2: mark attribute states deploying ──
-    for attr_state, _intent_row, _iface in attr_eligible:
-        attr_state.sync_state = SyncState.deploying
+    attr_stamps = [item.stamp for item in attr_eligible if item.stamp is not None]
+    ip_stamps = list((interface_ip_stamp_of or {}).values())
+    _reject_transient_stamps("interface_config", [*attr_stamps, *ip_stamps])
+    for item in attr_eligible:
+        if item.state is not None and item.stamp is not None:
+            item.state.sync_state = SyncState.deploying
     await db.commit()
 
     # ── Step 3–6: per-item attribute + IP passes ──
@@ -3092,6 +3406,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         device_name=device_name,
         job_id=job_id,
         now=now,
+        stamp_of=interface_ip_stamp_of,
     )
 
     deferred_rp_capability: list[NsoApplyError] = []
@@ -3109,7 +3424,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         _Scope(
             "snmp",
             "snmp",
-            snmp_rows,
+            snmp_rows.stamp,
             lambda: apply_snmp_config(
                 client=client,
                 device_name=device_name,
@@ -3118,38 +3433,48 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
                 host_intents=snmp_host,
                 system_info_intent=snmp_sysinfo,
             ),
+            push=snmp_rows.push,
+            stamp_of=snmp_rows.stamp_of,
         ),
         _Scope(
             "static_route",
             "static_route",
             # plan.rows, not the eligible list: in PUT mode the body is every ACCEPTED row
-            # (an eligible-only body retracts every accepted-and-clean route), so those are
-            # exactly the rows this pass stamps. In PATCH mode the two are the same list.
-            sr_plan.rows,
+            # (an eligible-only body retracts every accepted-and-clean route). Only matching
+            # live rows receive bookkeeping for the recorded body.
+            sr_stamp_rows,
             lambda: _static_route_coro(client, device, sr_plan, outbox=sr_outbox),
+            push=sr_plan.rows,
+            stamp_of=sr_stamp_of,
         ),
         _Scope(
             "logging",
             "logging",
-            logging_rows,
+            logging_rows.stamp,
             lambda: apply_logging_config(
                 client=client,
                 device_name=device_name,
                 host_intent_rows=logging_eligible,
                 levels_intent_row=logging_levels,
             ),
+            push=logging_rows.push,
+            stamp_of=logging_rows.stamp_of,
         ),
         _Scope(
             "svi",
             "svi",
-            svi_eligible,
+            svi_rows.stamp,
             lambda: apply_svi_config(client=client, device_name=device_name, svi_intent_rows=svi_eligible),
+            push=svi_rows.push,
+            stamp_of=svi_rows.stamp_of,
         ),
         _Scope(
             "subinterface",
             "subif",
-            subif_eligible,
+            subif_rows.stamp,
             lambda: apply_subinterface_config(client=client, device_name=device_name, subif_intent_rows=subif_eligible),
+            push=subif_rows.push,
+            stamp_of=subif_rows.stamp_of,
         ),
         _Scope(
             "vlan",
@@ -3164,25 +3489,31 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         _Scope(
             "bfd",
             "bfd",
-            bfd_eligible,
+            bfd_rows.stamp,
             lambda: apply_bfd_config(client=client, device_name=device_name, bfd_intent_rows=bfd_eligible),
+            push=bfd_rows.push,
+            stamp_of=bfd_rows.stamp_of,
         ),
         _Scope(
             "interface_mtu",
             "interface_mtu",
-            mtu_eligible,
+            mtu_rows.stamp,
             lambda: apply_mtu_config(client=client, device_name=device_name, mtu_intent_rows=mtu_eligible),
+            push=mtu_rows.push,
+            stamp_of=mtu_rows.stamp_of,
         ),
         _Scope(
             "l2_sap",
             "l2_sap",
-            l2_eligible,
+            l2_rows.stamp,
             lambda: apply_l2_saps(client=client, device_name=device_name, sap_intent_rows=l2_eligible),
+            push=l2_rows.push,
+            stamp_of=l2_rows.stamp_of,
         ),
         _Scope(
             "isis",
             "isis",
-            [*isis_eligible, *isis_process_eligible, *redist_isis, *isis_flex_eligible, *isis_level_eligible],
+            isis_rows.stamp,
             lambda: apply_isis_interfaces(
                 client=client,
                 device_name=device_name,
@@ -3192,31 +3523,37 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
                 flex_algo_rows=isis_flex_eligible,
                 level_rows=isis_level_eligible,
             ),
+            push=isis_rows.push,
+            stamp_of=isis_rows.stamp_of,
         ),
         _Scope(
             "bgp",
             "bgp",
-            [*bgp_eligible, *redist_bgp],
+            bgp_rows.stamp,
             lambda: apply_bgp_config(
                 client=client,
                 device_name=device_name,
                 router_intent_rows=bgp_eligible,
                 redistribution_rows=redist_bgp,
             ),
+            push=bgp_rows.push,
+            stamp_of=bgp_rows.stamp_of,
         ),
         _Scope(
             "route_policy",
             "route_policy",
-            rp_eligible,
+            rp_rows.stamp,
             lambda: apply_route_policy_config(
                 client=client, device_name=device_name, intent_rows=rp_eligible, ned_id=device.ned_id
             ),
-            _record_rp_capability,
+            on_nso_error=_record_rp_capability,
+            push=rp_rows.push,
+            stamp_of=rp_rows.stamp_of,
         ),
         _Scope(
             "ospf",
             "ospf",
-            [*ospf_instance_eligible, *ospf_iface_eligible, *redist_ospf],
+            ospf_rows.stamp,
             lambda: apply_ospf_config(
                 client=client,
                 device_name=device_name,
@@ -3224,6 +3561,8 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
                 interface_intent_rows=ospf_iface_eligible,
                 redistribution_rows=redist_ospf,
             ),
+            push=ospf_rows.push,
+            stamp_of=ospf_rows.stamp_of,
         ),
     ]
 
@@ -3302,6 +3641,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
         scope_outcomes=scope_outcomes,
         scope_failures=scope_failures,
         reg=reg,
+        stamp_of=sr_stamp_of,
     )
 
     # ── Step 7: finalize ── (any_eligible computed up front, before the atomic branch)
@@ -3391,6 +3731,11 @@ async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -
             # §4.6's single transaction exists to prevent. Nothing further is written, the
             # post-apply refresh is skipped, and claim recovery decides (G38).
             raise
+        except JobError as exc:
+            logger.warning("apply.refused", job_id=job_id, device_id=device_id, code=exc.error["code"])
+            await db.rollback()
+            if await _write_terminal(db, job_id, JobStatus.failed, None, exc.error, reg):
+                await _commit_terminal(db, job_id)
         except Exception as exc:
             logger.exception("apply.unexpected_error", job_id=job_id, device_id=device_id)
             # Roll back first: if the failure came from a DB error the session is in a

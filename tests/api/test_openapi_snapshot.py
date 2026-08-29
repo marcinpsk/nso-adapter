@@ -155,6 +155,16 @@ def test_action_apply_documents_its_internal_error_envelope(openapi_schema):
     }
 
 
+def test_device_generation_limit_schema_matches_the_runtime_bounds(openapi_schema):
+    from nso_adapter.api.pagination import LIMIT_MAX, LIMIT_MIN
+
+    parameters = openapi_schema["paths"]["/api/v1/devices/{device_id}/generations"]["get"]["parameters"]
+    limit = next(parameter for parameter in parameters if parameter["name"] == "limit")
+
+    assert limit["schema"]["minimum"] == LIMIT_MIN
+    assert limit["schema"]["maximum"] == LIMIT_MAX
+
+
 def _resolve_pointer(doc, ref: str) -> bool:
     """True iff a local ``#/...`` JSON-pointer ``$ref`` resolves in ``doc`` (RFC 6901)."""
     node = doc

@@ -21,6 +21,7 @@ from nso_adapter.core.static_route_plan import (
     SR_CLEAR_FIELDS,
     build_plan,
     fence_open,
+    hydrate_static_route_apply_plan,
     replacement_open,
 )
 from nso_adapter.nso.apply import apply_static_routes, static_route_entry
@@ -571,6 +572,68 @@ async def test_plan_snapshots_tombstones_and_the_watermark(adapter_client):
     assert plan.allowed == {A, C}
 
 
+async def test_generation_records_the_complete_static_route_apply_plan(adapter_client):
+    """Generation creation freezes every fact that selects PATCH versus PUT."""
+    from nso_adapter.core.generation import create_generation, note_write
+    from nso_adapter.store.models import GenerationMode
+
+    device_id = await seed_device(nso_device_name="sr-recorded-plan", netbox_device_id=7014)
+    ids = await _seed_rows(device_id, [{"triple": B, "route_id": 2, "deployed_key": list(A)}])
+    tomb_id = await _seed_tombstone(device_id, C, deployed_key=list(A))
+
+    async with session() as db:
+        await note_write(db, device_id, "static_route")
+        generation = await create_generation(
+            db,
+            device_id,
+            streams=("static_route",),
+            mode=GenerationMode.networked,
+        )
+        await db.commit()
+
+    recorded = generation.document["static_route"]["_execution"]["apply"]
+    assert recorded == {
+        "mode": "PUT",
+        "row_ids": [ids[B]],
+        "allowed_removal_keys": [list(A), list(C)],
+        "tombstone_ids": [tomb_id],
+        "cas": [
+            {
+                "row_id": ids[B],
+                "route_id": 2,
+                "sent_triple": list(B),
+                "expected_old": list(A),
+            }
+        ],
+        "tombstone_id_watermark": tomb_id,
+    }
+
+
+async def test_recorded_plan_rejects_a_malformed_sent_triple(adapter_client):
+    from nso_adapter.core.generation import create_generation, note_write
+    from nso_adapter.store.models import GenerationMode
+
+    device_id = await seed_device(nso_device_name="sr-malformed-recorded-plan", netbox_device_id=7015)
+    await _seed_rows(device_id, [{"triple": B, "route_id": 2, "deployed_key": list(A)}])
+
+    async with session() as db:
+        await note_write(db, device_id, "static_route")
+        generation = await create_generation(
+            db,
+            device_id,
+            streams=("static_route",),
+            mode=GenerationMode.networked,
+        )
+        document = generation.document
+
+    document["static_route"]["_execution"]["apply"]["cas"][0]["sent_triple"] = list(B[:2])
+
+    # Pinned: the plan raises from four independent checks, and the CAS-coordinate one is a
+    # plausible alternative source with no eligible rows.
+    with pytest.raises(ValueError, match="must contain three values"):
+        hydrate_static_route_apply_plan(document, eligible_rows=[])
+
+
 async def test_plan_writes_nothing(adapter_client):
     """``build_plan`` is read-only — no stamping, no consumption, no HTTP."""
     from nso_adapter.store.models import Device, StaticRouteIntent
@@ -614,3 +677,102 @@ def test_the_carrier_accessors_read_an_absent_carrier_as_empty():
     for carrier in (None, {}, {"authorized": [], "store_only": []}):
         assert pending_clear_fields(carrier) == set()
         assert authorized_clear_fields(carrier) == set()
+
+
+# ── the one clear-candidate rule (creation-time plan and live reissue) ───────
+
+
+class _ClearRow:
+    _ids = iter(range(1, 1000))
+
+    def __init__(self, triple, *, pending_clear=None, deployed_key=None, **leaves):
+        self.id = next(self._ids)
+        self.vrf, self.prefix, self.next_hop = triple
+        self.pending_clear = pending_clear
+        self.deployed_key = deployed_key
+        for name, value in leaves.items():
+            setattr(self, name, value)
+
+
+def test_candidate_clear_fields_pins_the_wire_set_rules():
+    """permanent True->False is a clear; metric at 0 is wire-set; open replacements wait."""
+    from nso_adapter.core.static_route_plan import candidate_clear_fields
+
+    cleared = _ClearRow(A, pending_clear={"authorized": ["permanent"]}, permanent=False)
+    assert candidate_clear_fields(cleared) == ("permanent",)
+
+    metric_zero = _ClearRow(A, pending_clear={"authorized": ["metric"]}, metric=0)
+    assert candidate_clear_fields(metric_zero) == ()
+
+    metric_gone = _ClearRow(A, pending_clear={"authorized": ["metric"]}, metric=None)
+    assert candidate_clear_fields(metric_gone) == ("metric",)
+
+    open_replacement = _ClearRow(B, pending_clear={"authorized": ["permanent"]}, permanent=False, deployed_key=list(C))
+    assert candidate_clear_fields(open_replacement) == ()
+
+    store_only = _ClearRow(A, pending_clear={"store_only": ["permanent"]}, permanent=False)
+    assert candidate_clear_fields(store_only) == ()
+
+
+def test_clears_suppressed_matches_the_two_removal_modes():
+    from nso_adapter.core.static_route_plan import clears_suppressed
+
+    assert clears_suppressed({}) is False
+    assert clears_suppressed({"detach": True}) is True
+    assert clears_suppressed({"retract_deferred": True}) is True
+
+
+async def test_promoted_and_live_reissue_plans_carry_identical_clears(adapter_client):
+    """Drift guard: the creation-time classifier and the live reissue path share one rule."""
+    from nso_adapter.core.projection import EXECUTION_KEY
+    from nso_adapter.core.removal import _sr_execution_plan
+    from nso_adapter.core.static_route_plan import (
+        _serialize_removal_plan,
+        classify_removal_plan,
+        hydrate_static_route_removal_plan,
+    )
+    from nso_adapter.store.models import Device, StaticRouteIntent
+
+    device_id = await seed_device(nso_device_name="sr-clear-parity", netbox_device_id=9891)
+    ids = await _seed_rows(
+        device_id,
+        [
+            {"triple": A, "route_id": 1, "deployed_key": list(A)},
+            {"triple": B, "route_id": 2, "deployed_key": list(C)},
+            {"triple": C, "route_id": 3, "deployed_key": list(C)},
+        ],
+    )
+    async with session() as db:
+        carriers = {
+            ids[A]: ({"authorized": ["permanent"]}, {"permanent": False}),
+            ids[B]: ({"authorized": ["permanent"]}, {"permanent": False}),
+            ids[C]: ({"authorized": ["metric"]}, {"metric": 0}),
+        }
+        for row_id, (carrier, leaves) in carriers.items():
+            row = await db.get(StaticRouteIntent, row_id)
+            row.pending_clear = carrier
+            for name, value in leaves.items():
+                setattr(row, name, value)
+        await db.commit()
+
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        live = await _sr_execution_plan(db, device, {}, job_id=None)
+        rows = (
+            (
+                await db.execute(
+                    sa.select(StaticRouteIntent)
+                    .where(StaticRouteIntent.device_id == device_id)
+                    .order_by(StaticRouteIntent.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        promoted = classify_removal_plan(rows, [], allowed_removal_keys={}, context={})
+
+    document = {"static_route": {EXECUTION_KEY: {"removal": _serialize_removal_plan(promoted)}}}
+    hydrated = hydrate_static_route_removal_plan(document)
+    assert hydrated.clears == promoted.clears
+    assert live.clears == promoted.clears
+    assert [(clear.key, clear.fields) for clear in promoted.clears] == [(A, ("permanent",))]

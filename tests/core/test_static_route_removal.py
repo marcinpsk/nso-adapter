@@ -23,11 +23,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from nso_adapter.core.claim import acquire_claim, release_claim
-from nso_adapter.store.models import Job, JobStatus, JobType, StaticRouteIntent, StaticRouteTombstone
+from nso_adapter.store.models import Job, JobStatus, StaticRouteIntent, StaticRouteTombstone
 from tests.conftest import seed_device, session, start_job
+from tests.core.removal_helpers import seed_removal_job
 from tests.core.test_static_route_put import A, B, C, D, seed_apply_job, seed_rows, wire
 
 pytestmark = pytest.mark.anyio
@@ -163,21 +164,6 @@ def sr_client(fake: SrFake):
 
 
 # ── seeding / running ────────────────────────────────────────────────────────
-
-
-async def seed_removal_job(device_id: int, context: dict) -> int:
-    async with session() as db:
-        # Started, at attempt 1: see seed_apply_job in test_static_route_put.
-        job = Job(
-            job_type=JobType.removal,
-            device_id=device_id,
-            status=JobStatus.running,
-            run_attempt=1,
-            context={"scope": "static_route", **context},
-        )
-        db.add(job)
-        await db.commit()
-        return job.id
 
 
 async def seed_tomb(
@@ -385,6 +371,8 @@ async def test_c4_5_detach_with_a_null_deployed_key_still_drops_the_triple(adapt
 @pytest.mark.parametrize("shape", ["triple", "deployed_key"])
 async def test_c4_6_a_reclaimed_key_is_not_dropped(adapter_client, shape):
     """C4.6 — another route claims ``A``; deleting it would retract a live route's config."""
+    from structlog.testing import capture_logs
+
     device_id = await seed_device(nso_device_name=f"sr-c46-{shape}", netbox_device_id=7406 + len(shape))
     spec = {"triple": A, "route_id": 2} if shape == "triple" else {"triple": D, "route_id": 2, "deployed_key": list(A)}
     await seed_rows(device_id, [spec])
@@ -394,11 +382,14 @@ async def test_c4_6_a_reclaimed_key_is_not_dropped(adapter_client, shape):
     await seed_tomb(device_id, A, job_id=job_id, route_id=1)
     await seed_tomb(device_id, B, job_id=job_id, route_id=3)
 
-    job = await run_removal_job(device_id, job_id, sr_client(fake))
+    with capture_logs() as logs:
+        job = await run_removal_job(device_id, job_id, sr_client(fake))
 
     assert job.status == JobStatus.succeeded
     assert fake.sent_keys() == {A}, "A is claimed by a live row — it is no longer this deletion's to drop"
     assert fake.device_keys == {A}
+    warnings = [log for log in logs if log["event"] == "static_route.removal_key_reclaimed"]
+    assert len(warnings) == 1
 
 
 async def test_c4_7_a_fully_superseded_removal_issues_no_http_at_all(adapter_client):
@@ -966,14 +957,34 @@ async def test_any_carried_static_route_generation_makes_unproven_removal_fail(a
     job_id = await seed_removal_job(device_id, {"removed": {"route": [list(A)]}})
     mode = GenerationMode.networked
     async with session() as db:
-        for seq, stream_revisions in ((1, {"vlan": 1}), (2, {"static_route": 1})):
+        # After the reissue the seeder minted: this case is about the two generations the
+        # job goes on to CARRY, so they take the next sequences rather than colliding.
+        base = await db.scalar(
+            select(func.max(DeploymentGeneration.seq)).where(DeploymentGeneration.device_id == device_id)
+        )
+        for seq, stream_revisions in ((base + 1, {"vlan": 1}), (base + 2, {"static_route": 1})):
+            document = {}
+            if "static_route" in stream_revisions:
+                document = {
+                    "static_route": {
+                        "_execution": {
+                            "removal": {
+                                "authorized_removal_keys": [list(A)],
+                                "claimed_keys": [],
+                                "tombstone_ids": [],
+                                "candidate_clears": [],
+                                "reclaimed_keys": [],
+                            }
+                        }
+                    }
+                }
             db.add(
                 DeploymentGeneration(
                     device_id=device_id,
                     seq=seq,
                     mode=mode,
-                    document={},
-                    digest=digest_document(mode, {}, {}),
+                    document=document,
+                    digest=digest_document(mode, document, {}),
                     allowed_removal_keys={},
                     source_push_seq={},
                     stream_revisions=stream_revisions,
@@ -1000,13 +1011,29 @@ async def test_non_static_generation_does_not_make_carrierless_removal_fail(adap
     job_id = await seed_removal_job(device_id, {"removed": {"route": [list(A)]}})
     mode = GenerationMode.networked
     async with session() as db:
+        base = await db.scalar(
+            select(func.max(DeploymentGeneration.seq)).where(DeploymentGeneration.device_id == device_id)
+        )
+        document = {
+            "static_route": {
+                "_execution": {
+                    "removal": {
+                        "authorized_removal_keys": [list(A)],
+                        "claimed_keys": [],
+                        "tombstone_ids": [],
+                        "candidate_clears": [],
+                        "reclaimed_keys": [],
+                    }
+                }
+            }
+        }
         db.add(
             DeploymentGeneration(
                 device_id=device_id,
-                seq=1,
+                seq=base + 1,
                 mode=mode,
-                document={},
-                digest=digest_document(mode, {}, {}),
+                document=document,
+                digest=digest_document(mode, document, {}),
                 allowed_removal_keys={},
                 source_push_seq={},
                 stream_revisions={"vlan": 1},

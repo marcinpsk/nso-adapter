@@ -4,10 +4,10 @@
 
 Canonical forms (always stored fully qualified, plugin and adapter alike):
 
-* ``<mount>/<path...>#<key>`` — one secret field (SNMP communities, derived
-  v3 ``#auth``/``#priv`` refs)
-* ``<mount>/<path...>`` — a secret path whose fields are fixed by convention
-  (SNMP v3 users: fields ``auth``/``priv``)
+* ``<mount>/<path...>#<key>`` — one secret field. The SNMP intent API requires
+  this form for communities and for both SNMPv3 secret fields.
+* ``<mount>/<path...>`` — a secret path. Only the generic secrets API uses this
+  form for path-level operations.
 
 This dialect is mount-explicit and deliberately distinct from
 :meth:`nso_adapter.secrets.base.SecretsProvider.get` references
@@ -53,10 +53,10 @@ class VaultRef:
 def parse_vault_ref(reference: str, *, require_key: bool | None = None) -> VaultRef:
     """Parse a fully-qualified Vault reference into (mount, path, key).
 
-    ``require_key=True`` rejects refs without ``#key`` (community-style),
-    ``require_key=False`` rejects refs with one (v3 path-style), ``None``
-    accepts both. Raises :class:`VaultRefError` on any malformed input; the
-    message contains only the reference text (refs are non-secret).
+    ``require_key=True`` rejects refs without ``#key`` (SNMP intent fields).
+    ``require_key=False`` rejects refs with a key (generic secrets path operations).
+    ``None`` accepts both. Raises :class:`VaultRefError` on malformed input. The
+    message contains only the reference text (references are not secrets).
     """
     if not isinstance(reference, str) or not reference:
         raise VaultRefError(f"empty vault_ref {reference!r}")

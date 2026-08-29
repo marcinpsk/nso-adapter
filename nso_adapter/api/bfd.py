@@ -26,7 +26,7 @@ from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant, iso_z
 from nso_adapter.core.removal import is_cleared
 from nso_adapter.store import outcome_store
-from nso_adapter.store.models import BfdIntent, Device, DeviceBfdInterface, DeviceSettings
+from nso_adapter.store.models import BfdIntent, Device, DeviceBfdInterface
 
 logger = structlog.get_logger(__name__)
 
@@ -196,20 +196,33 @@ async def put_bfd_intent(
         count += 1
 
     await db.flush()
+    from nso_adapter.core.generation import prepare_request_settlement
+
+    apply_requested, settlement_cohort = await prepare_request_settlement(
+        db,
+        device_id,
+        mutation_count=count,
+        removal_generation_count=int(bool(removed or cleared)),
+    )
     replaced = False
     if removed or cleared:
         from nso_adapter.core.removal import replace_on_removal
         from nso_adapter.nso.apply import apply_bfd_config
 
-        replaced = await replace_on_removal(db, device, removed, BfdIntent, apply_bfd_config, retract=cleared)
+        replaced = await replace_on_removal(
+            db,
+            device,
+            removed,
+            BfdIntent,
+            apply_bfd_config,
+            retract=cleared,
+            settlement_cohort=settlement_cohort,
+        )
 
-    settings = (
-        await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    ).scalar_one_or_none()
-    if settings and settings.auto_apply and count > 0:
+    if apply_requested:
         from nso_adapter.core.apply import enqueue_apply
 
-        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
 
     result = {"device_id": device_id, "count": count, "removed": len(removed), "replaced": replaced}
     await record_response(db, device_id, delivery, result)

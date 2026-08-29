@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from nso_adapter.core.generation import ApplyUnexecutable
 from nso_adapter.core.receipt import PromotionProvenanceUnexecutable
 
 logger = structlog.get_logger(__name__)
@@ -185,6 +186,23 @@ async def projection_gone_handler(request: Request, exc: Exception) -> JSONRespo
     return JSONResponse(
         status_code=404,
         content={"error": {"code": "not_found", "message": "Device not found", "detail": {}}},
+    )
+
+
+async def apply_unexecutable_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Refuse generation creation when its selected projection cannot execute exactly."""
+    assert isinstance(exc, ApplyUnexecutable)
+    reasons = exc.reasons
+    streams = sorted(reasons)
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": {
+                "code": "apply_unexecutable",
+                "message": f"Selected stream(s) cannot be applied faithfully: {', '.join(streams)}",
+                "detail": {"streams": reasons},
+            }
+        },
     )
 
 

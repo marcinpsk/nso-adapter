@@ -19,16 +19,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
 from nso_adapter.api.errors import RESP_401, RESP_404, RESP_422_VALIDATION, ResponseSpec, api_error
+from nso_adapter.api.pagination import DEFAULT_PAGE, validate_page_limit
 from nso_adapter.api.timestamps import iso_z
 from nso_adapter.store.meta import get_store_incarnation
 from nso_adapter.store.models import Job, JobStatus
 
 router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
-
-#: The default page size, unchanged from before the feed existed (S3.4).
-DEFAULT_PAGE = 100
-LIMIT_MIN = 1
-LIMIT_MAX = 500
 
 STORE_INCARNATION_HEADER = "X-Store-Incarnation"
 
@@ -131,12 +127,7 @@ async def list_jobs(
             "validation_error",
             "status cannot filter the ascending settlement feed; use the descending list",
         )
-    if not LIMIT_MIN <= limit <= LIMIT_MAX:
-        # Not clamped: a caller that asked for 5000 and silently received 500 believes it
-        # holds the whole page, and advances its cursor as if it did.
-        raise api_error(422, "validation_error", f"limit must be between {LIMIT_MIN} and {LIMIT_MAX}: {limit}")
-
-    query = select(Job).limit(limit)
+    query = select(Job).limit(validate_page_limit(limit))
     if device_id is not None:
         query = query.where(Job.device_id == device_id)
     if status is not None:

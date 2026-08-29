@@ -1528,6 +1528,95 @@
         "title": "DeviceFailoverOut",
         "type": "object"
       },
+      "DeviceGenerationOut": {
+        "description": "One deployment generation, with every receipt-facing field always present.",
+        "properties": {
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "digest": {
+            "title": "Digest",
+            "type": "string"
+          },
+          "generation_id": {
+            "title": "Generation Id",
+            "type": "integer"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/GenerationMode"
+          },
+          "seq": {
+            "title": "Seq",
+            "type": "integer"
+          },
+          "settlement_cohort": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Settlement Cohort"
+          },
+          "source_push_seq": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": "Source Push Seq",
+            "type": "object"
+          },
+          "status": {
+            "$ref": "#/components/schemas/GenerationStatus"
+          },
+          "stream_revisions": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Stream Revisions",
+            "type": "object"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "generation_id",
+          "seq",
+          "status",
+          "job_id",
+          "mode",
+          "settlement_cohort",
+          "digest",
+          "stream_revisions",
+          "source_push_seq",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "DeviceGenerationOut",
+        "type": "object"
+      },
       "DeviceOut": {
         "properties": {
           "degraded_surfaces": {
@@ -2229,6 +2318,28 @@
         ],
         "title": "ForceRemovalBody",
         "type": "object"
+      },
+      "GenerationMode": {
+        "description": "How a deployment generation reaches NSO (#1522 \u00a7G1).\n\n``networked`` commits to the device; ``detach`` commits ``no-networking`` and re-aligns\nCDB with a sync-from, dropping service governance without touching the device (#106).\nThe mode is part of the generation's identity: two adjacent generations of different\nmodes may never be coalesced into one device write.",
+        "enum": [
+          "networked",
+          "detach"
+        ],
+        "title": "GenerationMode",
+        "type": "string"
+      },
+      "GenerationStatus": {
+        "description": "A deployment generation's lifecycle (#1522 \u00a7G1 + \u00a7H2's success barrier).\n\n``settled`` and ``abandoned`` are the only statuses a successor may cross. ``failed``\n(the executing job reported a failure) and ``outcome_unknown`` (nobody observed the\noutcome \u2014 a crashed or revoked run) both BLOCK every later generation of the device\nuntil the head is retried into ``settled`` or explicitly reconciled to ``abandoned``.",
+        "enum": [
+          "pending",
+          "running",
+          "settled",
+          "failed",
+          "outcome_unknown",
+          "abandoned"
+        ],
+        "title": "GenerationStatus",
+        "type": "string"
       },
       "HTTPValidationError": {
         "properties": {
@@ -10678,6 +10789,107 @@
         "summary": "Refresh Capability",
         "tags": [
           "capability"
+        ]
+      }
+    },
+    "/api/v1/devices/{device_id}/generations": {
+      "get": {
+        "operationId": "list_device_generations_api_v1_devices__device_id__generations_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "since_seq",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": -9223372036854775808,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since Seq"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/DeviceGenerationOut"
+                  },
+                  "title": "Response List Device Generations Api V1 Devices  Device Id  Generations Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer token"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Device not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request validation failed (envelope shape)"
+          }
+        },
+        "security": [
+          {
+            "_OptionalBearer": []
+          }
+        ],
+        "summary": "List Device Generations",
+        "tags": [
+          "devices"
         ]
       }
     },

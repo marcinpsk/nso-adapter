@@ -29,7 +29,6 @@ from nso_adapter.store.models import (
     DeviceRoutePolicyPrefixListEntry,
     DeviceRoutePolicyRouteMap,
     DeviceRoutePolicyRouteMapEntry,
-    DeviceSettings,
     RoutePolicyObjectIntent,
 )
 
@@ -476,7 +475,16 @@ async def put_route_policy_intent(
         if await _upsert_route_policy_object(db, device_id, obj, before_entries, now):
             cleared = True  # a term/line/member disappeared, or a leaf inside one was blanked
 
-    if removed or cleared:
+    removal_requested = bool(removed or cleared)
+    from nso_adapter.core.generation import prepare_request_settlement
+
+    apply_requested, settlement_cohort = await prepare_request_settlement(
+        db,
+        device_id,
+        mutation_count=upserted,
+        removal_generation_count=int(removal_requested),
+    )
+    if removal_requested:
         from nso_adapter.core.removal import replace_on_removal
         from nso_adapter.nso.apply import apply_route_policy_config
 
@@ -490,14 +498,12 @@ async def put_route_policy_intent(
             RoutePolicyObjectIntent,
             apply_route_policy_config,
             retract=cleared,
+            settlement_cohort=settlement_cohort,
         )
-
-    settings_result = await db.execute(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
-    settings = settings_result.scalar_one_or_none()
-    if settings and settings.auto_apply and upserted > 0:
+    if apply_requested:
         from nso_adapter.core.apply import enqueue_apply
 
-        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
+        await enqueue_apply(db, device_id, force=True, stream=delivery.stream, settlement_cohort=settlement_cohort)
 
     # Which community-list members can this device's NED NOT hold? The apply path
     # silently skips them (a wildcard color on Nokia has no exact ext-community), which
