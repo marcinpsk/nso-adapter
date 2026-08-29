@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any, cast
 
 from sqlalchemy.engine import CursorResult
@@ -65,7 +66,7 @@ def require_postgresql_url(database_url: str, *, label: str = "database_url") ->
     return database_url
 
 
-def init_db(database_url: str) -> None:
+def init_db(database_url: str, *, application_name: str = "nso-adapter.store") -> None:
     """Bind the process-global engine and session factory to *database_url*.
 
     Refuses any non-PostgreSQL scheme up front, so a misconfiguration fails at startup
@@ -77,14 +78,33 @@ def init_db(database_url: str) -> None:
     # unreachable-probe timeout (~10s), and normal API/sync traffic shares this pool. Keep
     # it comfortably above failover_probe_concurrency (capped at 16 in api/config.py) so a
     # worst-case tick can't starve the pool: 20 + 10 overflow = 30, leaving 14 for everyone else.
-    _engine = create_async_engine(database_url, pool_size=20, max_overflow=10, pool_pre_ping=True, echo=False)
+    _engine = create_async_engine(
+        database_url,
+        pool_size=20,
+        max_overflow=10,
+        pool_pre_ping=True,
+        echo=False,
+        connect_args={"server_settings": {"application_name": application_name}},
+    )
     _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
 
 
-async def get_session() -> AsyncGenerator[AsyncSession, None]:
+@asynccontextmanager
+async def session() -> AsyncIterator[AsyncSession]:
+    """Open one store session and close it before the caller continues.
+
+    Internal code uses this context manager. An early return or exception then awaits
+    ``AsyncSession.close()`` instead of leaving the generator suspended until finalization.
+    """
     assert _session_factory is not None, "DB not initialised — call init_db() first"
     async with _session_factory() as session:
         yield session
+
+
+async def get_session() -> AsyncGenerator[AsyncSession, None]:
+    """Yield one request-scoped session for FastAPI dependency injection."""
+    async with session() as db:
+        yield db
 
 
 def get_engine():

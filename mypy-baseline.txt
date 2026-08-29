@@ -1,1 +1,0 @@
-nso_adapter/core/failover.py:0: error: Argument 3 to "_revert_address" has incompatible type "str | None"; expected "str"  [arg-type]

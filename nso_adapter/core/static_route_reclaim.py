@@ -34,6 +34,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import acquire_claim, claim_session, lock_claim, release_claim
+from nso_adapter.core.request_flags import DELETE_ORIGIN_MARKING, DETACH_MARKING
 from nso_adapter.store.models import Device, Job, JobStatus, StaticRouteTombstone
 
 logger = structlog.get_logger(__name__)
@@ -167,17 +168,22 @@ async def reclaim_one_device(device_id: int, *, db: AsyncSession | None = None) 
             proof = await _read_device(
                 client,
                 device,
-                need_device_state="delete_origin" in markings,
-                need_service="detach" in markings,
+                need_device_state=DELETE_ORIGIN_MARKING in markings,
+                need_service=DETACH_MARKING in markings,
             )
-            if "detach" in markings:
+            if DETACH_MARKING in markings:
                 from nso_adapter.core.removal import _sr_sync_from
 
                 proof.sync_ok = await _sr_sync_from(client, device, {}, job_id=0)
 
             consumable: list[int] = []
             for row in rows:
-                if _delete_origin_proven(row, proof) if row.marking == "delete_origin" else _detach_proven(row, proof):
+                proven = (
+                    _delete_origin_proven(row, proof)
+                    if row.marking == DELETE_ORIGIN_MARKING
+                    else _detach_proven(row, proof)
+                )
+                if proven:
                     consumable.append(row.id)
                 else:
                     await reissue_removal_job(conn, device_id, row)

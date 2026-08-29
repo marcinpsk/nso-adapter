@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 pytestmark = pytest.mark.anyio
 
@@ -39,7 +39,7 @@ async def put_intent(client, device_id: int, routes: list[dict], *, query: str =
     resp = await client.put(
         f"/api/v1/devices/{device_id}/static-route-intent{query}",
         json={"routes": routes},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200, resp.text
     return resp.json()
@@ -199,7 +199,7 @@ async def test_c1_11c_another_scope_still_enqueues_on_a_real_clear(adapter_clien
         resp = await adapter_client.put(
             f"/api/v1/devices/{device_id}/vlan-intent",
             json={"vlans": [{"vlan_id": 10, "name": name}]},
-            headers=AUTH,
+            headers=AUTH | push_seq(),
         )
         assert resp.status_code == 200, resp.text
     assert len(await removal_jobs(device_id)) == 1

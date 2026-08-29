@@ -629,17 +629,20 @@ async def put_bgp_intent(
     cleared = _bgp_cleared(before_values, body.routers) or redistribution_cleared
     shrank = bool(removed_asns or removed_peers or removed_redist)
     if shrank or cleared:
-        from nso_adapter.core.removal import enqueue_removal
+        from nso_adapter.core.removal import enqueue_removal, query_flag_marking
 
         # Thread the just-removed keys so the collateral guard can tell this intended
         # retraction from an orphaned service row (redistribute rows are nested,
         # non-guarded content — only the keyed router/peer lists matter here).
         # retract: a cleared owned scalar is not an un-own — the PUT-replace must actually
         # reach the device, or the merge-PATCH silently leaves the old leaf in place (#83).
+        marks = query_flag_marking(deletes=shrank)
         await enqueue_removal(
             db,
             device_id,
             "bgp",
+            marking=marks.marking,
+            defer_retract=marks.defer_retract,
             promotes=(delivery.stream,),
             removed={"router": removed_asns, "peer": removed_peers},
             retract=cleared,

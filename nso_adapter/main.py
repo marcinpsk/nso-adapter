@@ -10,7 +10,6 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from nso_adapter import __version__
@@ -22,6 +21,7 @@ from nso_adapter.api.config import router as config_router
 from nso_adapter.api.devices import router as devices_router
 from nso_adapter.api.errors import (
     ApiError,
+    api_error,
     api_error_handler,
     framework_http_error_handler,
     projection_gone_handler,
@@ -30,6 +30,7 @@ from nso_adapter.api.errors import (
 )
 from nso_adapter.api.health import router as health_router
 from nso_adapter.api.intent import router as intent_router
+from nso_adapter.api.intent_receipts import router as intent_receipts_router
 from nso_adapter.api.interface_ip import router as interface_ip_router
 from nso_adapter.api.interface_mtu import router as interface_mtu_router
 from nso_adapter.api.interfaces import router as interfaces_router
@@ -54,22 +55,14 @@ from nso_adapter.api.vlan import router as vlan_router
 from nso_adapter.config import get_config, get_env_settings
 from nso_adapter.core.generation import DeviceProjectionGone
 from nso_adapter.core.importer import register_nso_client, set_netbox_client
-from nso_adapter.core.request_flags import (
-    DELETE_ORIGIN,
-    PUSH_SEQ,
-    PUSH_SEQ_VALIDATION_MESSAGE,
-    STORE_ONLY,
-    InvalidPushSequence,
-    parse_push_seq,
-    parse_store_only,
-)
+from nso_adapter.core.request_flags import BACKFILL_ONLY, DELETE_ORIGIN, STORE_ONLY, parse_request_flag
 from nso_adapter.core.scheduler import start_scheduler, stop_scheduler
 from nso_adapter.core.worker import start_workers, stop_workers
 from nso_adapter.notifications.persistent_subscriber import persistent_subscriber
 from nso_adapter.notifications.sse_subscriber import SSESubscriber
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.secrets import make_provider
-from nso_adapter.store.db import get_engine, get_session, init_db
+from nso_adapter.store.db import get_engine, init_db, session
 
 logger = structlog.get_logger(__name__)
 
@@ -190,12 +183,11 @@ class _DeviceRefreshCoalescer:
         client = self._clients.get(nso_instance)
         if client is None:
             return
-        async for db in get_session():
+        async with session() as db:
             device = await db.get(Device, device_id)  # RE-FETCH by id — never a foreign session's row
             if device is None:
                 return
             await refresh_all_surfaces_for_device(db, device, client, refresh_source="notification", atomic=False)
-            break
         # Notify AFTER the refresh and BEFORE the dirty check (codex R1-F5 ordering): the
         # plugin reconciles the refreshed mirror; failures are swallowed (best-effort).
         nb_client = get_netbox_client()
@@ -265,7 +257,7 @@ def _make_sse_event_handler(
             return
 
         async def _run() -> None:
-            async for db in get_session():
+            async with session() as db:
                 await _dispatch_netconf_change(cfg, parsed, db, clients, coalescer)
 
         task = asyncio.create_task(_run())
@@ -384,30 +376,41 @@ def create_app() -> FastAPI:
     app.add_exception_handler(DeviceProjectionGone, projection_gone_handler)
 
     @app.middleware("http")
-    async def _store_only_flag(request, call_next):
+    async def _request_mode_flags(request, call_next):
         # ?store_only=true → this request must not create device-touching jobs
         # (removal/apply); ?delete_origin=true → this intent push comes from a NetBox
         # object DELETION, so a shrink may retract from the device (unmarked shrinks
         # detach instead, #106). Both guarded at the enqueue choke points in core.
         # See core/request_flags.py for why these are request-scoped, not per-endpoint.
-        # X-Push-Seq is the plugin claim's identity: the key receipt admission dedupes on
-        # (#1522 §G2). A present header that cannot be a claim identity is refused HERE,
-        # before any handler runs — downgrading it to an unkeyed write would silently drop
-        # this delivery's replay protection.
-        try:
-            seq = parse_push_seq(request.headers.get("X-Push-Seq"))
-        except InvalidPushSequence:
-            return JSONResponse(
-                status_code=422,
-                content={"error": {"code": "validation_error", "message": PUSH_SEQ_VALIDATION_MESSAGE, "detail": {}}},
-            )
-        token = STORE_ONLY.set(parse_store_only(request.query_params.get("store_only")))
-        del_token = DELETE_ORIGIN.set(parse_store_only(request.query_params.get("delete_origin")))
-        seq_token = PUSH_SEQ.set(seq)
+        # The third piece of a delivery's identity, X-Push-Seq, is NOT parsed here: it is a
+        # declared parameter of every in-protocol intent PUT and nothing else consumes it,
+        # so it lives on the delivery dependency where OpenAPI can see it.
+        modes = {}
+        for parameter in ("store_only", "delete_origin", "backfill_only"):
+            raw = request.query_params.get(parameter)
+            try:
+                modes[parameter] = parse_request_flag(raw)
+            except ValueError:
+                return await api_error_handler(
+                    request,
+                    api_error(
+                        422,
+                        "validation_error",
+                        f"{parameter} must be a boolean",
+                        {"parameter": parameter},
+                    ),
+                )
+
+        token = STORE_ONLY.set(modes["store_only"])
+        del_token = DELETE_ORIGIN.set(modes["delete_origin"])
+        # ?backfill_only=true → an id-backfill pass that opens a device's replacement fence and
+        # writes nothing else (#1503 §4.4). Parsed here with its two siblings so the three
+        # request modes have one spelling; only the static-route stream implements it.
+        backfill_token = BACKFILL_ONLY.set(modes["backfill_only"])
         try:
             return await call_next(request)
         finally:
-            PUSH_SEQ.reset(seq_token)
+            BACKFILL_ONLY.reset(backfill_token)
             DELETE_ORIGIN.reset(del_token)
             STORE_ONLY.reset(token)
 
@@ -429,6 +432,7 @@ def create_app() -> FastAPI:
     app.include_router(devices_router)
     app.include_router(scope_router)
     app.include_router(intent_router)
+    app.include_router(intent_receipts_router)
     app.include_router(actions_router)
     app.include_router(interfaces_router)
     app.include_router(lag_topology_router)

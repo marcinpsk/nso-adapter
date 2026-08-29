@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 import pytest
 
 from nso_adapter.api.timestamps import iso_z
-from tests.conftest import VALID_TOKEN, seed_device
+from tests.conftest import VALID_TOKEN, push_seq, seed_device
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -51,7 +51,7 @@ DETERMINISTIC = [
 @pytest.mark.parametrize("suffix,body,expected", DETERMINISTIC)
 async def test_distinct_intent_result_golden(adapter_client, suffix, body, expected):
     device_id = await seed_device(nso_device_name=f"wr-{suffix}", netbox_device_id=8010)
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/{suffix}", json=body, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/{suffix}", json=body, headers=AUTH | push_seq())
     assert resp.status_code == 200
     assert resp.json() == {"device_id": device_id, **expected}
 
@@ -63,7 +63,7 @@ async def test_snmp_intent_result_golden(adapter_client, monkeypatch):
     monkeypatch.setattr(snmp_mod, "datetime", _FrozenDatetime)
     device_id = await seed_device(nso_device_name="wr-snmp", netbox_device_id=8011)
     body = {"hosts": [{"address": "10.0.0.9", "version": "2c", "notify_type": "trap", "community_or_user": "public"}]}
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH | push_seq())
     assert resp.status_code == 200
     assert resp.json() == {
         "device_id": device_id,
@@ -82,7 +82,7 @@ async def test_ip_intent_result_golden(adapter_client, monkeypatch):
     monkeypatch.setattr(ip_mod, "datetime", _FrozenDatetime)
     device_id = await seed_device(nso_device_name="wr-ip", netbox_device_id=8012)
     body = {"addresses": [{"interface": "GE0/0", "address": "10.0.0.1/24", "family": "ipv4"}]}
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", json=body, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/ip-intent", json=body, headers=AUTH | push_seq())
     assert resp.status_code == 200
     assert resp.json() == {
         "device_id": device_id,

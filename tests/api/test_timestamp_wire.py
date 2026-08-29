@@ -23,7 +23,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 _AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -178,7 +178,7 @@ async def test_intent_put_with_a_zoneless_accepted_at_round_trips_the_same_insta
                 }
             ]
         },
-        headers=_AUTH,
+        headers=_AUTH | push_seq(),
     )
     assert put.status_code == 200, put.text
 

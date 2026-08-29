@@ -43,9 +43,9 @@ def test_migration_chains_off_the_static_route_identity_revision():
     assert_single_head_containing(module.revision)
 
 
-def test_device_claim_table_shape(pg_admin):
+def test_device_claim_table_shape(pg_provisioner):
     module = _module()
-    with private_database(pg_admin, "dcshape") as sync_url:
+    with private_database(pg_provisioner, "dcshape") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         with engine_on(sync_url) as engine:
             insp = sa.inspect(engine)
@@ -70,10 +70,10 @@ def test_device_claim_table_shape(pg_admin):
             assert any(all(p in c for p in PURPOSES) for c in checks), checks
 
 
-def test_device_claim_foreign_keys_carry_their_intended_delete_rule(pg_admin):
+def test_device_claim_foreign_keys_carry_their_intended_delete_rule(pg_provisioner):
     """Completes the four new FK actions this program owes (two here, two on the tombstone)."""
     module = _module()
-    with private_database(pg_admin, "dcfk") as sync_url:
+    with private_database(pg_provisioner, "dcfk") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         with engine_on(sync_url) as engine:
             rules = delete_rules(engine, "device_claim")
@@ -81,10 +81,10 @@ def test_device_claim_foreign_keys_carry_their_intended_delete_rule(pg_admin):
             assert rules["job_id"] == "SET NULL"
 
 
-def test_downgrade_drops_the_table(pg_admin):
+def test_downgrade_drops_the_table(pg_provisioner):
     """Named by revision id in both directions, never "head"/"-1"."""
     module = _module()
-    with private_database(pg_admin, "dcdown") as sync_url:
+    with private_database(pg_provisioner, "dcdown") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         alembic(sync_url, "downgrade", module.down_revision)
         with engine_on(sync_url) as engine:
@@ -216,14 +216,14 @@ async def test_deleting_the_owning_job_nulls_job_id_and_keeps_the_claim(adapter_
 _Q4_MIGRATION = "f1a3c9e7b204_queued_job_dedupe_index.py"
 
 
-def test_queued_dedupe_index_replaces_the_active_one(pg_admin):
+def test_queued_dedupe_index_replaces_the_active_one(pg_provisioner):
     from tests.store.migration_harness import index_predicates
 
     module = load_migration(_Q4_MIGRATION)
     assert module.down_revision == "c7e4b8a05d19"
     assert_single_head_containing(module.revision)
 
-    with private_database(pg_admin, "q4idx") as sync_url:
+    with private_database(pg_provisioner, "q4idx") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         with engine_on(sync_url) as engine:
             ixs = index_predicates(engine, "jobs")
@@ -246,7 +246,7 @@ def test_queued_dedupe_index_replaces_the_active_one(pg_admin):
 _PROVISION_INDEX_MIGRATION = "b8d4f1c2e7a3_provision_admission_index.py"
 
 
-def test_provision_pair_index_is_on_the_two_context_expressions(pg_admin):
+def test_provision_pair_index_is_on_the_two_context_expressions(pg_provisioner):
     """Parity proves model ≡ migration; this proves either one is RIGHT.
 
     Both expressions asserted verbatim: an index on a different context key — ``address``,
@@ -258,7 +258,7 @@ def test_provision_pair_index_is_on_the_two_context_expressions(pg_admin):
     assert module.down_revision == "f1a3c9e7b204"
     assert_single_head_containing(module.revision)
 
-    with private_database(pg_admin, "provix") as sync_url:
+    with private_database(pg_provisioner, "provix") as sync_url:
         alembic(sync_url, "upgrade", module.revision)
         with engine_on(sync_url) as engine:
             assert index_predicates(engine, "jobs")["uq_job_active_provision_pair"] == (
@@ -274,7 +274,7 @@ def test_provision_pair_index_is_on_the_two_context_expressions(pg_admin):
             assert "uq_job_active_provision_pair" not in index_predicates(engine, "jobs")
 
 
-def test_upgrade_reconciles_duplicates_the_missing_index_allowed(pg_admin):
+def test_upgrade_reconciles_duplicates_the_missing_index_allowed(pg_provisioner):
     """The exact legacy state the old check-then-insert could produce must still upgrade.
 
     A migration that cannot install leaves the adapter unable to start, so the duplicates
@@ -283,7 +283,7 @@ def test_upgrade_reconciles_duplicates_the_missing_index_allowed(pg_admin):
     exactly as they are.
     """
     module = load_migration(_PROVISION_INDEX_MIGRATION)
-    with private_database(pg_admin, "provdup") as sync_url:
+    with private_database(pg_provisioner, "provdup") as sync_url:
         alembic(sync_url, "upgrade", module.down_revision)
         with engine_on(sync_url) as engine, engine.begin() as conn:
             for token, status, context in (

@@ -26,7 +26,7 @@ import pytest
 from sqlalchemy import select, text
 
 from nso_adapter.store.models import Job, JobStatus, JobType
-from tests.conftest import seed_device, session
+from tests.conftest import push_seq, seed_device, session
 from tests.core.test_static_route_put import (
     A,
     B,
@@ -486,7 +486,7 @@ async def test_p0_3_the_put_echo_tracks_the_row_the_result_reports(adapter_clien
                 {"route_id": 8, "generation": 1, "vrf": B2[0], "prefix": B2[1], "next_hop": B2[2], "metric": 5},
             ]
         },
-        headers={"Authorization": "Bearer test-bearer-token"},
+        headers={"Authorization": "Bearer test-bearer-token"} | push_seq(),
     )
     assert put.status_code == 200
     echoed = {item["route_id"]: item["fingerprint"] for item in put.json()["routes"]}

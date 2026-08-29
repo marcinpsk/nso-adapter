@@ -17,7 +17,8 @@ Three guards, per the 1329 plan §2.8.2:
 * structural  - the migration declares exactly the 25 pairs, and both directions
   carry the explicit UTC ``USING`` clause (asserted on the module source AND on
   the SQL alembic actually renders, per column).
-* downgrade   - symmetric: seed at head, downgrade, same instants; upgrade again.
+* downgrade   - symmetric: seed at this revision, downgrade, same instants; upgrade
+  to head again (from-head downgrades stopped at a6d4f2c8e1b3, which is irreversible).
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from pathlib import Path
 
 import sqlalchemy as sa
 
-from tests.conftest import ADMIN_URL, _drop_database, _url_for
+from tests.conftest import PROVISIONER_URL, _drop_database, _url_for
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -148,20 +149,24 @@ def _alembic(sync_url: str, *args: str) -> str:
 
 
 @contextmanager
-def _private_database(pg_admin, tag: str):
+def _private_database(pg_provisioner, tag: str):
     """A database of our own — the template clone is useless here (already at head)."""
     name = f"nsoadp_ts{tag}_{uuid.uuid4().hex[:8]}"
-    with pg_admin.connect() as conn:
+    with pg_provisioner.connect() as conn:
         conn.exec_driver_sql(f'CREATE DATABASE "{name}"')
     try:
         yield _url_for(name, driver="postgresql+psycopg2")
     finally:
-        _drop_database(pg_admin, name, expect_clean=False)
+        _drop_database(pg_provisioner, name, expect_clean=False)
 
 
 @contextmanager
 def _engine_on(sync_url: str):
-    engine = sa.create_engine(sync_url, poolclass=sa.pool.NullPool)
+    engine = sa.create_engine(
+        sync_url,
+        poolclass=sa.pool.NullPool,
+        connect_args={"application_name": "tests.timestamp_migration"},
+    )
     try:
         yield engine
     finally:
@@ -206,11 +211,11 @@ def _reflected_tz_flags(engine) -> dict[tuple[str, str], bool]:
     return {(t, c): bool(by_table[t][c].timezone) for t, c in _COLUMNS}
 
 
-def test_migration_converts_every_naive_column_to_the_same_utc_instant(pg_admin, monkeypatch):
+def test_migration_converts_every_naive_column_to_the_same_utc_instant(pg_provisioner, monkeypatch):
     module = _load_migration()
     monkeypatch.setenv("PGOPTIONS", f"-c timezone={_TZ}")  # same mechanism the subprocess uses
 
-    with _private_database(pg_admin, "conv") as sync_url:
+    with _private_database(pg_provisioner, "conv") as sync_url:
         _alembic(sync_url, "upgrade", module.down_revision)
 
         with _engine_on(sync_url) as engine:
@@ -248,8 +253,8 @@ def test_migration_declares_all_25_columns_with_an_explicit_utc_using_clause():
     # ...and per column, on the SQL alembic actually renders. `--sql` is offline mode: the URL
     # is never connected to. The loop above proves one source-level clause; this proves all 25
     # rendered statements carry it.
-    up = _alembic(ADMIN_URL, "upgrade", f"{module.down_revision}:{module.revision}", "--sql")
-    down = _alembic(ADMIN_URL, "downgrade", f"{module.revision}:{module.down_revision}", "--sql")
+    up = _alembic(PROVISIONER_URL, "upgrade", f"{module.down_revision}:{module.revision}", "--sql")
+    down = _alembic(PROVISIONER_URL, "downgrade", f"{module.revision}:{module.down_revision}", "--sql")
     for table, col in _COLUMNS:
         assert (
             f"ALTER TABLE {table} ALTER COLUMN {col} TYPE TIMESTAMP WITH TIME ZONE USING {col} AT TIME ZONE 'UTC'" in up
@@ -260,12 +265,14 @@ def test_migration_declares_all_25_columns_with_an_explicit_utc_using_clause():
         )
 
 
-def test_downgrade_restores_naive_utc_and_re_upgrade_is_idempotent(pg_admin, monkeypatch):
+def test_downgrade_restores_naive_utc_and_re_upgrade_is_idempotent(pg_provisioner, monkeypatch):
     module = _load_migration()  # fail with the same import error as the others when it is missing
     monkeypatch.setenv("PGOPTIONS", f"-c timezone={_TZ}")
 
-    with _private_database(pg_admin, "down") as sync_url:
-        _alembic(sync_url, "upgrade", "head")
+    with _private_database(pg_provisioner, "down") as sync_url:
+        # Stop at this migration's own revision: a later migration (a6d4f2c8e1b3) refuses
+        # to downgrade, so a from-head downgrade can never reach down_revision again.
+        _alembic(sync_url, "upgrade", module.revision)
 
         with _engine_on(sync_url) as engine:
             _assert_session_timezone(engine)

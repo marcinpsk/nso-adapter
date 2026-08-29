@@ -28,7 +28,10 @@ from tests.conftest import session as store_session
 async def snapshot_engine(pg_url):
     """An engine on this test's private clone. The schema is already there (the template
     is built by ``alembic upgrade head``), so there is nothing to create."""
-    engine = create_async_engine(pg_url)
+    engine = create_async_engine(
+        pg_url,
+        connect_args={"server_settings": {"application_name": "tests.snapshot_engine"}},
+    )
     try:
         yield engine
     finally:
@@ -143,6 +146,7 @@ async def test_family_get_serves_snapshot_across_midrequest_commit(adapter_clien
         make_url(engine.url).set(drivername="postgresql+psycopg2").render_as_string(hide_password=False),
         isolation_level="AUTOCOMMIT",
         poolclass=sa.pool.NullPool,
+        connect_args={"application_name": "tests.snapshot_mid_request_writer"},
     )
 
     async with store_session() as db:

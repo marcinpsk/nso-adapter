@@ -24,7 +24,7 @@ from nso_adapter.store.models import (
     SnmpSystemInfoIntent,
     SnmpV3UserIntent,
 )
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -90,7 +90,7 @@ async def test_put_rejects_a_community_vault_ref_the_writer_cannot_render(adapte
     body = _full_body()
     body["communities"] = [{"label": "ro1", "vault_ref": bad_ref, "access": "RO"}]
 
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH | push_seq())
 
     assert resp.status_code == 422
     comms, _, _, _ = await _read_intent(device_id)
@@ -103,7 +103,7 @@ async def test_put_rejects_an_unmappable_host_version(adapter_client):
     body = _full_body()
     body["hosts"] = [{"address": "10.0.1.100", "version": "9", "notify_type": "trap", "community_or_user": "ro1"}]
 
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH | push_seq())
 
     assert resp.status_code == 422
 
@@ -115,7 +115,7 @@ async def test_put_accepts_the_bare_2_version_spelling(adapter_client):
     body = _full_body()
     body["hosts"] = [{"address": "10.0.1.100", "version": "2", "notify_type": "trap", "community_or_user": "ro1"}]
 
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH | push_seq())
 
     assert resp.status_code == 200
     _, _, hosts, _ = await _read_intent(device_id)
@@ -129,7 +129,9 @@ async def test_put_accepts_the_bare_2_version_spelling(adapter_client):
 async def test_put_creates_all_collections(adapter_client):
     device_id = await seed_device(nso_device_name="snmp-put-dev", netbox_device_id=960)
 
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH | push_seq()
+    )
 
     assert resp.status_code == 200
     body = resp.json()
@@ -182,7 +184,7 @@ async def test_v3_protocol_and_host_port_fields_roundtrip(adapter_client):
         ],
     }
 
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH | push_seq())
     assert resp.status_code == 200
 
     _, users, hosts, _ = await _read_intent(device_id)
@@ -196,7 +198,7 @@ async def test_v3_protocol_and_host_port_fields_roundtrip(adapter_client):
 
 @pytest.mark.anyio
 async def test_put_unknown_device_404(adapter_client):
-    resp = await adapter_client.put("/api/v1/devices/9999/snmp-intent", json=_full_body(), headers=AUTH)
+    resp = await adapter_client.put("/api/v1/devices/9999/snmp-intent", json=_full_body(), headers=AUTH | push_seq())
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "not_found"
 
@@ -220,7 +222,7 @@ async def test_put_explicit_accepted_at_is_preserved(adapter_client):
             }
         ],
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=body, headers=AUTH | push_seq())
     assert resp.status_code == 200
 
     comms, *_ = await _read_intent(device_id)
@@ -233,13 +235,13 @@ async def test_put_explicit_accepted_at_is_preserved(adapter_client):
 @pytest.mark.anyio
 async def test_put_updates_existing_rows_in_place(adapter_client):
     device_id = await seed_device(nso_device_name="snmp-upd-dev", netbox_device_id=962)
-    await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH)
+    await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH | push_seq())
 
     # Re-PUT same keys with changed fields → updated, not duplicated.
     changed = _full_body()
     changed["communities"][0]["access"] = "RW"
     changed["communities"][0]["acl"] = "99"
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=changed, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=changed, headers=AUTH | push_seq())
     assert resp.status_code == 200
 
     comms, *_ = await _read_intent(device_id)
@@ -251,7 +253,7 @@ async def test_put_updates_existing_rows_in_place(adapter_client):
 @pytest.mark.anyio
 async def test_put_drops_absent_rows(adapter_client):
     device_id = await seed_device(nso_device_name="snmp-drop-dev", netbox_device_id=963)
-    await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH)
+    await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH | push_seq())
 
     # PUT a body keeping only ro1 + dropping users/hosts/system_info entirely.
     trimmed = {
@@ -260,7 +262,7 @@ async def test_put_drops_absent_rows(adapter_client):
         "hosts": [],
         "system_info": None,
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=trimmed, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=trimmed, headers=AUTH | push_seq())
     assert resp.status_code == 200
     assert resp.json() == {
         "device_id": device_id,
@@ -279,11 +281,13 @@ async def test_put_drops_absent_rows(adapter_client):
 @pytest.mark.anyio
 async def test_put_system_info_null_deletes_existing(adapter_client):
     device_id = await seed_device(nso_device_name="snmp-sys-dev", netbox_device_id=964)
-    await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH)
+    await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH | push_seq())
 
     keep_rest = _full_body()
     keep_rest["system_info"] = None
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=keep_rest, headers=AUTH)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/snmp-intent", json=keep_rest, headers=AUTH | push_seq()
+    )
     assert resp.status_code == 200
     assert resp.json()["has_system_info"] is False
 
@@ -310,7 +314,9 @@ async def test_put_auto_apply_enqueues_job(adapter_client):
     device_id = await seed_device(nso_device_name="snmp-auto-dev", netbox_device_id=965)
     await _seed_settings(device_id, auto_apply=True)
 
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH | push_seq()
+    )
     assert resp.status_code == 200
 
     async with session() as db:
@@ -327,7 +333,7 @@ async def test_put_no_auto_apply_enqueues_nothing(adapter_client):
     device_id = await seed_device(nso_device_name="snmp-noauto-dev", netbox_device_id=966)
     # auto_apply defaults off (no DeviceSettings row at all)
 
-    await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH)
+    await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH | push_seq())
 
     async with session() as db:
         jobs = (await db.execute(select(Job).where(Job.device_id == device_id))).scalars().all()
@@ -361,14 +367,14 @@ async def test_put_removal_enqueues_async_removal_job(adapter_client, monkeypatc
     monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", _fake_get_client)
     monkeypatch.setattr("nso_adapter.nso.apply.apply_snmp_config", _fake_apply)
 
-    await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH)
+    await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH | push_seq())
     # No device call during a pure-add PUT.
     assert captured == {}
 
     # Drop rw1 → a removal → an async removal job is queued (the PUT does NOT call the device).
     trimmed = _full_body()
     trimmed["communities"] = [trimmed["communities"][0]]  # keep ro1 only
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=trimmed, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=trimmed, headers=AUTH | push_seq())
     assert resp.status_code == 200
     assert captured == {}  # still no inline device commit — deferred to the worker
 
@@ -407,7 +413,9 @@ async def test_put_no_removal_enqueues_nothing(adapter_client):
 
     device_id = await seed_device(nso_device_name="snmp-norm-dev", netbox_device_id=968)
 
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH | push_seq()
+    )
     assert resp.status_code == 200
 
     async with session() as db:

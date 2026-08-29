@@ -61,9 +61,9 @@ async def ensure_settle_counters() -> int:
     (or a lifespan startup) whose remaining work would be skipped for the whole interval. One
     device vanishing under the sweep is normal, and it costs exactly that device's row.
     """
-    from nso_adapter.store.db import execute_dml, get_session
+    from nso_adapter.store.db import execute_dml, session
 
-    async for db in get_session():
+    async with session() as db:
         missing = (
             (
                 await db.execute(

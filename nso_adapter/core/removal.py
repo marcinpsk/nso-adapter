@@ -25,11 +25,19 @@ from functools import cache
 from typing import NamedTuple
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, JobError, error_envelope
 from nso_adapter.core.projection import stream_for_model
+from nso_adapter.core.request_flags import (
+    AUTHORIZED_PROVENANCE,
+    DELETE_ORIGIN_MARKING,
+    DETACH_MARKING,
+    REMOVAL_MARKINGS,
+    STORE_ONLY_PROVENANCE,
+    request_marking,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -221,7 +229,19 @@ def _guard_specs() -> dict[str, _GuardSpec]:
     }
 
 
-def is_cleared(before, after) -> bool:
+_EXPLICIT_FALSE_EMISSION_FIELDS = frozenset(
+    {
+        ("isis_interface_intent", "bfd_enabled"),
+        ("isis_interface_intent", "frr_enabled"),
+        ("isis_process_intent", "overload_bit"),
+        ("isis_process_intent", "microloop_avoidance"),
+        ("isis_level_intent", "wide_metrics_only"),
+        ("isis_level_intent", "disabled"),
+    }
+)
+
+
+def is_cleared(before, after, *, emission_field: tuple[str, str] | None = None) -> bool:
     """Whether an owned scalar went from SET to UNSET — the #83 retract trigger.
 
     A merge-PATCH apply never drops a leaf the writer omits, so a value that goes back to
@@ -235,13 +255,15 @@ def is_cleared(before, after) -> bool:
       writers emit these only when truthy (``if row.vrf:``), so an empty string is just as
       undroppable as a None.
 
-    A boolean flipping ``True -> False`` is NOT a clear: the writers emit ``False``
-    explicitly (isis ``microloop-avoidance: false``), so the merge-PATCH does carry it and
-    no retract is needed. Treating it as one would fire a real device PUT-replace on every
-    toggle-off.
+    A boolean flipping ``True -> False`` is NOT a clear. The audited IS-IS tri-state
+    fields in ``_EXPLICIT_FALSE_EMISSION_FIELDS`` emit both boolean values and omit only
+    ``None``, so ``False -> None`` is a clear for those fields. Other callers keep the
+    general rule that a prior ``False`` is unset.
     """
-    if before is None or before is False or before == "":
+    if before is None or before == "":
         return False  # was already unset — nothing to retract
+    if before is False:
+        return after is None and emission_field in _EXPLICIT_FALSE_EMISSION_FIELDS
     if after is None:
         return True
     if isinstance(before, str) and isinstance(after, str):
@@ -983,9 +1005,11 @@ async def _replace_static_route(
 
     tombstones, authorized, claimed, rows, reclaimed = await _sr_authorization(db, device, context, job_id=job_id)
     detach = bool(context.get("detach"))
-    # A no-networking PUT can never remove a leaf from the device, so a detach delivers no
-    # clear at all — the carrier keeps it for the next networked retract.
-    candidate_clears = {} if detach else _sr_candidate_clears(rows)
+    # A no-networking PUT can never remove a leaf from the device, and a push that also
+    # un-owned rows deferred its clear at enqueue time (§4.5), which a NETWORKED job of a
+    # marking-split request can be. Either way the carrier keeps it for the next retract.
+    deliver_clears = not detach and not context.get("retract_deferred")
+    candidate_clears = _sr_candidate_clears(rows) if deliver_clears else {}
 
     tombstone_ids = tuple(t.id for t in tombstones)
 
@@ -1638,12 +1662,169 @@ async def _dispatch_scope(
     return None
 
 
+async def _record_pending_clears(
+    db: AsyncSession,
+    device_id: int,
+    streams: tuple[str, ...],
+    *,
+    provenance: str,
+) -> None:
+    """Record pending clears without weakening an existing authorization."""
+    from nso_adapter.store.models import DeviceProjectionStream, StreamPendingClear
+
+    for stream in sorted(set(streams)):
+        revision = await db.scalar(
+            select(DeviceProjectionStream.desired_revision).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == stream,
+            )
+        )
+        if revision is None:
+            raise RuntimeError(f"device {device_id} stream {stream!r} has no accepted write to record")
+        # uq_stream_pending_clear: at most ONE row per (device, stream); its provenance is
+        # the row's current standing, upgraded in place (store_only -> authorized).
+        existing = (
+            await db.execute(
+                select(StreamPendingClear).where(
+                    StreamPendingClear.device_id == device_id,
+                    StreamPendingClear.stream == stream,
+                )
+            )
+        ).scalar_one_or_none()
+
+        if provenance == STORE_ONLY_PROVENANCE:
+            if existing is None:
+                db.add(
+                    StreamPendingClear(
+                        device_id=device_id,
+                        stream=stream,
+                        provenance=STORE_ONLY_PROVENANCE,
+                        revision=revision,
+                    )
+                )
+            elif existing.provenance == STORE_ONLY_PROVENANCE:
+                existing.revision = max(existing.revision, revision)
+            continue
+
+        if existing is None:
+            db.add(
+                StreamPendingClear(
+                    device_id=device_id,
+                    stream=stream,
+                    provenance=AUTHORIZED_PROVENANCE,
+                    revision=revision,
+                )
+            )
+        else:
+            existing.provenance = AUTHORIZED_PROVENANCE
+            existing.revision = max(revision, existing.revision)
+    await db.flush()
+
+
+async def _promote_parked_clears(
+    db: AsyncSession,
+    device_id: int,
+    streams: tuple[str, ...],
+) -> None:
+    """Authorize parked rows for streams this authorized push re-asserts; never create."""
+    from nso_adapter.store.models import DeviceProjectionStream, StreamPendingClear
+
+    for stream in sorted(set(streams)):
+        # uq_stream_pending_clear: at most ONE row per (device, stream).
+        row = (
+            await db.execute(
+                select(StreamPendingClear).where(
+                    StreamPendingClear.device_id == device_id,
+                    StreamPendingClear.stream == stream,
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            continue
+        revision = await db.scalar(
+            select(DeviceProjectionStream.desired_revision).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == stream,
+            )
+        )
+        row.provenance = AUTHORIZED_PROVENANCE
+        row.revision = max(row.revision, revision or 0)
+    await db.flush()
+
+
+async def _settle_pending_clears_at_admission(
+    db: AsyncSession,
+    device_id: int,
+    scope: str,
+    promotes: tuple[str, ...],
+    *,
+    mode,
+    force: bool,
+) -> None:
+    """Settle stream obligations for the carrier this admission created.
+
+    Keyed off the admitted carrier's MODE, not the request's retract: a networked
+    replace of the stream delivers every recorded omission (discharge); a detach
+    re-asserts the omitting store state and authorizes a parked row (promote).
+    """
+    from nso_adapter.store.models import GenerationMode
+
+    if force:
+        await _discharge_pending_clears(db, device_id, scope)
+    elif scope != "static_route":
+        if mode is GenerationMode.networked:
+            await _discharge_pending_clear_streams(db, device_id, promotes)
+        else:
+            await _promote_parked_clears(db, device_id, promotes)
+
+
+async def _discharge_pending_clear_streams(
+    db: AsyncSession,
+    device_id: int,
+    streams: tuple[str, ...],
+) -> None:
+    """Delete obligations whose clears have gained a networked carrier."""
+    from nso_adapter.store.models import StreamPendingClear
+
+    await db.execute(
+        delete(StreamPendingClear).where(
+            StreamPendingClear.device_id == device_id,
+            StreamPendingClear.stream.in_(streams),
+        )
+    )
+
+
+async def _discharge_pending_clears(db: AsyncSession, device_id: int, scope: str) -> None:
+    """Discharge every stream the operator's force-removal flush affects."""
+    from nso_adapter.core.projection import section_streams
+
+    await _discharge_pending_clear_streams(db, device_id, section_streams(scope))
+
+
+def _refuse_unmarked_deletion(scope: str, marking: str | None, *, deletes: bool, force: bool) -> None:
+    """Refuse a deleting removal that carries no marking (#106); the force reissue is exempt."""
+    if marking is None and deletes and not force:
+        raise ValueError(f"an unmarked deletion of {scope!r} would commit networked instead of detaching")
+
+
+def _refuse_deferred_delete_origin(scope: str, marking: str | None, *, retract: bool, defer_retract: bool) -> None:
+    """Refuse a deferred retract on a delete-origin job (static_route defers by design).
+
+    The job's networked generation would discharge the clear it just recorded as deferred.
+    """
+    if retract and defer_retract and scope != "static_route" and marking == DELETE_ORIGIN_MARKING:
+        raise ValueError(f"a deferred retract of {scope!r} cannot ride a delete-origin removal job")
+
+
 async def enqueue_removal(
     db: AsyncSession,
     device_id: int,
     scope: str,
     *,
+    marking: str | None,
+    defer_retract: bool,
     promotes: tuple[str, ...],
+    settlement_cohort: int | None = None,
     interfaces: list[str] | None = None,
     removed: dict[str, list] | None = None,
     vault_refs: dict[str, str] | None = None,
@@ -1656,10 +1837,25 @@ async def enqueue_removal(
     Non-blocking: the intent PUT returns immediately and the worker runs the
     (potentially slow) device commit in the background via :func:`run_removal`.
 
+    *marking* is the deletion provenance of THIS job's rows and decides how the job
+    commits: ``delete_origin`` retracts from the device, ``detach`` un-owns without touching
+    it (#106), and ``None`` says the job deletes nothing at all (a pure cleared-scalar
+    retract, which is never a detach; see *retract*). It is an ARGUMENT, never a read of
+    ``?delete_origin``: one request can delete at both markings and then needs one job per
+    marking, because ``detach`` is a job-wide dispatch switch (§4.5,
+    :func:`enqueue_static_route_removals`).
+
+    *defer_retract* is the whole-REQUEST fact that an un-own rides along. It cannot be
+    derived from this job's own rows once a request produces several jobs, and it is what
+    holds a clear back: one PUT-replace cannot both network a clear and leave an un-own
+    off the device.
+
     *promotes* names the projection STREAMS this removal authorizes, and it is stated by the
     caller rather than derived from *scope*: two endpoints share the ``interface_config``
     scope and two share ``isis``, so promoting the whole section would authorize the sibling
     lane's un-promoted store-only state (#103). An endpoint passes its own delivery stream.
+    *settlement_cohort* makes all promoted generations created by one request a settlement
+    barrier. It stays NULL when the request creates only this generation.
     *force* names none — see below.
     *interfaces* scopes an ``interface_config`` removal to the affected interface names.
     *removed* maps each YANG list to the keys the trigger JUST deleted so the
@@ -1682,23 +1878,26 @@ async def enqueue_removal(
     only and must never retract FASTMAP-owned config from the device. *force* is
     exempt — the operator force-removal action is an explicit device flush.
 
-    *force* is also the one caller that PROMOTES NOTHING. It re-deploys state an earlier
-    push already authorized, with the collateral guard off, so its generation is a reissue
-    (:func:`core.generation.create_reissue_generation`) carrying ``stream_revisions={}``: no
-    store write stands behind it to authorize, and there is nothing for its settlement to
-    certify. Promoting the family's streams instead authorized — and then marked applied —
-    whatever un-promoted store-only state the sibling lanes held, for instances this job does
-    not even send (``interface_config`` flushes exactly *interfaces*).
+    *force* is also the one caller that PROMOTES NOTHING and carries NO marking. It
+    re-deploys state an earlier push already authorized, with the collateral guard off, so
+    its generation is a reissue (:func:`core.generation.create_reissue_generation`) carrying
+    ``stream_revisions={}``: no store write stands behind it to authorize, and there is
+    nothing for its settlement to certify. Promoting the family's streams instead
+    authorized — and then marked applied — whatever un-promoted store-only state the sibling
+    lanes held, for instances this job does not even send (``interface_config`` flushes
+    exactly *interfaces*).
     """
     from nso_adapter.core.generation import attach_to_job, create_generation, create_reissue_generation
-    from nso_adapter.core.request_flags import DELETE_ORIGIN, STORE_ONLY
+    from nso_adapter.core.request_flags import STORE_ONLY
     from nso_adapter.store.models import GenerationMode, Job, JobStatus, JobType
 
     if scope not in VALID_REMOVAL_SCOPES:
         raise ValueError(f"Unknown removal scope {scope!r}")
-    if STORE_ONLY.get() and not force:
-        logger.info("removal.skipped_store_only", device_id=device_id, scope=scope)
-        return None
+    if marking is not None and marking not in REMOVAL_MARKINGS:
+        raise ValueError(f"Unknown removal marking {marking!r}")
+    if force and marking is not None:
+        raise ValueError(f"a force-removal of {scope!r} carries no deletion marking; got {marking!r}")
+    store_only = STORE_ONLY.get()
     context: dict = {"scope": scope}
     if interfaces:
         context["interfaces"] = interfaces
@@ -1720,14 +1919,29 @@ async def enqueue_removal(
     # both. Networking it would strip the un-owned row's config off the device (the #106
     # damage); not networking it leaves the cleared leaf. Safety wins — but the deferred
     # retract is recorded, never silently dropped (intent-integrity). The next push that
-    # carries no un-own retracts it.
-    un_own = (shrank or bool(context.get("removed"))) and not DELETE_ORIGIN.get()
-    if retract and un_own:
+    # carries no un-own retracts it. `_replace_static_route` reads the flag back and builds
+    # a body without the clear, so a NETWORKED job of a mixed request defers it too.
+    deletes = shrank or bool(context.get("removed"))
+    _refuse_unmarked_deletion(scope, marking, deletes=deletes, force=force)
+    _refuse_deferred_delete_origin(scope, marking, retract=retract, defer_retract=defer_retract)
+    if retract and defer_retract:
         context["retract_deferred"] = True
         logger.warning("removal.retract_deferred", device_id=device_id, scope=scope)
+    # Record only when this admission gives the clear no networked carrier. A pure clear
+    # gets a networked job below and needs no durable pending-clear row.
+    if retract and scope != "static_route" and (defer_retract or store_only):
+        await _record_pending_clears(
+            db,
+            device_id,
+            promotes,
+            provenance=STORE_ONLY_PROVENANCE if store_only else AUTHORIZED_PROVENANCE,
+        )
+    if store_only and not force:
+        logger.info("removal.skipped_store_only", device_id=device_id, scope=scope)
+        return None
     if force:
         context["force"] = True
-    elif not DELETE_ORIGIN.get() and not (retract and not un_own):
+    elif marking == DETACH_MARKING and not (retract and not deletes):
         # Unmarked shrink = un-own ("NetBox stops governing"), NOT an object deletion:
         # detach — drop service governance without touching the device (#106). Only a
         # push the plugin marked ?delete_origin=true (a NetBox object DELETE), a cleared
@@ -1752,6 +1966,7 @@ async def enqueue_removal(
             mode=mode,
             allowed_removal_keys=context.get("removed") or {},
             removal_context=context,
+            settlement_cohort=settlement_cohort,
         )
     job = Job(
         job_type=JobType.removal,
@@ -1762,7 +1977,8 @@ async def enqueue_removal(
     db.add(job)
     await db.flush()
     await attach_to_job(db, generation, job)
-    logger.info("removal.enqueued", device_id=device_id, scope=scope, job_id=job.id)
+    await _settle_pending_clears_at_admission(db, device_id, scope, promotes, mode=mode, force=force)
+    logger.info("removal.enqueued", device_id=device_id, scope=scope, job_id=job.id, marking=marking)
     return job
 
 
@@ -1771,6 +1987,108 @@ def _removal_scope(context: dict) -> str:
     if not isinstance(scope, str):
         raise ValueError("Removal job context has no string scope")
     return scope
+
+
+class RemovalMarking(NamedTuple):
+    """What one intent PUT's deletions are marked with, for a ``query_flag`` scope.
+
+    ``defer_retract`` is the whole-request fact :func:`enqueue_removal` needs and cannot
+    derive: an un-own rides along, so a cleared leaf cannot go out on this push.
+    """
+
+    marking: str
+    defer_retract: bool
+
+
+def query_flag_marking(*, deletes: bool) -> RemovalMarking:
+    """Return the marking facts for a scope still marked by ``?delete_origin=`` (§4.5).
+
+    ``?delete_origin`` marks the WHOLE request, so every row such a push deletes carries the
+    same provenance and one job covers them all. Static routes mark PER OBJECT and group
+    their deletions themselves; see :func:`enqueue_static_route_removals`.
+
+    *deletes* says this push drops rows (or nested content) rather than only clearing a
+    leaf; it is what makes an unmarked push an un-own.
+    """
+    marking = request_marking()
+    return RemovalMarking(marking, deletes and marking == DETACH_MARKING)
+
+
+#: Marking order when one push deletes at both: the networked retraction FIRST. The detach
+#: commits no-networking and then runs ``sync-from``, which is slow and fails the job when it
+#: cannot complete; a failed head blocks its successors (#1522 §H2), so ordering the detach
+#: first would let a re-sync flake hold back the device write the operator actually asked for.
+_MARKING_ORDER: tuple[str, ...] = (DELETE_ORIGIN_MARKING, DETACH_MARKING)
+
+
+async def enqueue_static_route_removals(
+    db: AsyncSession,
+    device_id: int,
+    *,
+    promotes: tuple[str, ...],
+    removed: dict[str, list],
+    tombstones=(),
+    retract: bool = False,
+    settlement_cohort: int | None = None,
+) -> list:
+    """Queue ONE marking-homogeneous removal job per marking this push deleted at (§4.5).
+
+    *removed* maps a marking to the route keys deleted with it, and *tombstones* are the
+    carriers written for those keys. Each is stamped with the job that owns ITS marking, so
+    a job's authority is exactly its own rows (``_sr_authorization`` reads tombstones by job).
+
+    One job cannot carry both markings. ``detach`` is a job-wide dispatch switch: it decides
+    whether the whole PUT-replace commits ``no-networking``, so a mixed job would either
+    leave a delete-origin retraction off the device or play an un-own's reverse diff against
+    it (#106). The jobs are ordered by :data:`_MARKING_ORDER` and each takes its own
+    deployment generation, so the device's ordered chain runs them one at a time.
+
+    A cleared leaf is one whole-request fact and rides the FIRST job only (two jobs
+    delivering it would push the same retraction twice), and it is deferred whenever any of
+    the request's rows is an un-own, exactly as an unsplit push defers it today.
+
+    Every job promotes the same streams, because one store state stands behind them all.
+    The caller supplies *settlement_cohort* when the request also creates an apply
+    generation. A marking split allocates its own cohort when no request cohort was supplied.
+
+    Returns the jobs in creation order, or ``[]`` on a store-only request (no device write,
+    and no carrier was written either).
+    """
+    from nso_adapter.core.generation import allocate_settlement_cohort
+
+    present = [marking for marking in _MARKING_ORDER if removed.get(marking)]
+    if not present and not retract:
+        return []
+    if settlement_cohort is None and len(present) > 1:
+        settlement_cohort = await allocate_settlement_cohort(db)
+    jobs: dict = {}
+    # A pure clear deletes nothing, so it carries no marking at all and is never a detach.
+    for index, marking in enumerate(present or [None]):
+        job = await enqueue_removal(
+            db,
+            device_id,
+            "static_route",
+            marking=marking,
+            defer_retract=DETACH_MARKING in present,
+            promotes=promotes,
+            settlement_cohort=settlement_cohort,
+            removed=removed_map("static_route", removed[marking]) if marking is not None else None,
+            retract=retract and index == 0,
+            shrank=marking is not None,
+        )
+        if job is None:
+            # Store-only, and the flag is request-scoped: no job was created for any marking.
+            return []
+        jobs[marking] = job
+    for tombstone in tombstones:
+        owner = jobs.get(tombstone.marking)
+        if owner is None:
+            raise RuntimeError(
+                f"static_route removal: carrier marked {tombstone.marking!r} has no job: "
+                f"the markings passed were {sorted(removed)}"
+            )
+        tombstone.job_id = owner.id
+    return list(jobs.values())
 
 
 async def run_removal(job_id: int, device_id: int, reg=None) -> None:
@@ -1786,10 +2104,10 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
     """
     from nso_adapter.core.claim import terminalize
     from nso_adapter.core.importer import get_nso_client
-    from nso_adapter.store.db import get_session
+    from nso_adapter.store.db import session
     from nso_adapter.store.models import Device, Job, JobStatus
 
-    async for db in get_session():
+    async with session() as db:
         row = (await db.execute(select(Job.id, Job.context).where(Job.id == job_id))).one_or_none()
         if row is None:
             return
@@ -1985,10 +2303,13 @@ async def replace_on_removal(
     if scope is None:
         logger.error("removal.unknown_model", model=store_model.__name__)
         return False
+    marks = query_flag_marking(deletes=bool(removed))
     job = await enqueue_removal(
         db,
         device.id,
         scope,
+        marking=marks.marking,
+        defer_retract=marks.defer_retract,
         # The stream comes from the same model the scope does, so a model that later moves
         # into a split section promotes ITS lane and not its sibling's.
         promotes=(stream_for_model(store_model),),

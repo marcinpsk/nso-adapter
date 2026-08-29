@@ -16,6 +16,7 @@ having already executed DDL on the wrong engine. Both entry points share one val
 
 from __future__ import annotations
 
+import ast
 import subprocess
 import sys
 from pathlib import Path
@@ -25,6 +26,7 @@ import pytest
 from nso_adapter.store import db as store_db
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+_SOURCE_ROOT = _REPO_ROOT / "nso_adapter"
 
 _RETIRED_URL = "sqlite+aiosqlite:///tmp/x.db"  # a rejection fixture; the store is never run against sqlite
 _RETIRED_SCHEME = _RETIRED_URL.split("://", 1)[0]
@@ -74,6 +76,18 @@ def test_init_db_binds_a_postgresql_url():
     assert engine is not None
     assert engine.dialect.name == "postgresql"
     assert store_db._session_factory is not None
+
+
+def test_internal_store_sessions_use_the_context_manager():
+    """Internal callers must close sessions before they return or break."""
+    offenders = []
+    for path in sorted(_SOURCE_ROOT.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("get_session"):
+                offenders.append(f"{path.relative_to(_REPO_ROOT)}:{node.lineno}")
+
+    assert not offenders, f"Internal code calls the FastAPI session dependency: {offenders}"
 
 
 # ── the migration runner: the container entrypoint's FIRST database contact ──────────────

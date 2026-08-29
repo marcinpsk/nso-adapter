@@ -58,20 +58,24 @@ def _alembic(sync_url: str, *args: str) -> str:
 
 
 @contextmanager
-def _private_database(pg_admin, tag: str):
+def _private_database(pg_provisioner, tag: str):
     """A database of our own — the per-test template clone is already at head."""
     name = f"nsoadp_sr{tag}_{uuid.uuid4().hex[:8]}"
-    with pg_admin.connect() as conn:
+    with pg_provisioner.connect() as conn:
         conn.exec_driver_sql(f'CREATE DATABASE "{name}"')
     try:
         yield _url_for(name, driver="postgresql+psycopg2")
     finally:
-        _drop_database(pg_admin, name, expect_clean=False)
+        _drop_database(pg_provisioner, name, expect_clean=False)
 
 
 @contextmanager
 def _engine_on(sync_url: str):
-    engine = sa.create_engine(sync_url, poolclass=sa.pool.NullPool)
+    engine = sa.create_engine(
+        sync_url,
+        poolclass=sa.pool.NullPool,
+        connect_args={"application_name": "tests.static_route_identity_migration"},
+    )
     try:
         yield engine
     finally:
@@ -143,9 +147,9 @@ def test_migration_chains_off_its_parent_and_the_graph_stays_single_headed():
     assert module.revision in ancestry, f"{module.revision} is not an ancestor of head {heads[0]}"
 
 
-def test_intent_columns_and_partial_unique_index(pg_admin):
+def test_intent_columns_and_partial_unique_index(pg_provisioner):
     module = _load_migration()
-    with _private_database(pg_admin, "cols") as sync_url:
+    with _private_database(pg_provisioner, "cols") as sync_url:
         _alembic(sync_url, "upgrade", module.revision)
         with _engine_on(sync_url) as engine:
             route_id = _column(engine, "static_route_intent", "route_id")
@@ -164,18 +168,18 @@ def test_intent_columns_and_partial_unique_index(pg_admin):
             )
 
 
-def test_identity_constraint_is_deferrable_initially_deferred(pg_admin):
+def test_identity_constraint_is_deferrable_initially_deferred(pg_provisioner):
     """§3.7: an immediate constraint rejects legal same-payload swaps and reclaims."""
     module = _load_migration()
-    with _private_database(pg_admin, "defer") as sync_url:
+    with _private_database(pg_provisioner, "defer") as sync_url:
         _alembic(sync_url, "upgrade", module.revision)
         with _engine_on(sync_url) as engine:
             assert _deferrability(engine, "uq_staticrouteintent_identity") == (True, True)
 
 
-def test_tombstone_table_shape(pg_admin):
+def test_tombstone_table_shape(pg_provisioner):
     module = _load_migration()
-    with _private_database(pg_admin, "tomb") as sync_url:
+    with _private_database(pg_provisioner, "tomb") as sync_url:
         _alembic(sync_url, "upgrade", module.revision)
         with _engine_on(sync_url) as engine:
             insp = sa.inspect(engine)
@@ -200,10 +204,10 @@ def test_tombstone_table_shape(pg_admin):
             assert ixs["ix_srt_unclaimed"] == (("device_id", "id"), False, _TOMBSTONE_UNCLAIMED_PREDICATE)
 
 
-def test_new_foreign_keys_carry_their_intended_delete_rule(pg_admin):
+def test_new_foreign_keys_carry_their_intended_delete_rule(pg_provisioner):
     """B9: a DDL-only assertion passes against a restrictive FK that then breaks offboard."""
     module = _load_migration()
-    with _private_database(pg_admin, "fk") as sync_url:
+    with _private_database(pg_provisioner, "fk") as sync_url:
         _alembic(sync_url, "upgrade", module.revision)
         with _engine_on(sync_url) as engine:
             rules = _delete_rules(engine, "static_route_tombstone")
@@ -220,9 +224,9 @@ _SEED_DEVICE = (
 )
 
 
-def test_backfill_sets_deployed_key_only_for_applied_rows(pg_admin):
+def test_backfill_sets_deployed_key_only_for_applied_rows(pg_provisioner):
     module = _load_migration()
-    with _private_database(pg_admin, "fill") as sync_url:
+    with _private_database(pg_provisioner, "fill") as sync_url:
         _alembic(sync_url, "upgrade", module.down_revision)
         with _engine_on(sync_url) as engine, engine.begin() as conn:
             conn.exec_driver_sql(_SEED_DEVICE)
@@ -253,14 +257,14 @@ def test_backfill_sets_deployed_key_only_for_applied_rows(pg_admin):
             )
 
 
-def test_downgrade_restores_the_previous_shape(pg_admin):
+def test_downgrade_restores_the_previous_shape(pg_provisioner):
     """Both directions named by revision id, never "head"/"-1".
 
     A successor migration would make "-1" revert only that successor, leave this
     migration's schema in place, and turn every assertion below into a false pass.
     """
     module = _load_migration()
-    with _private_database(pg_admin, "down") as sync_url:
+    with _private_database(pg_provisioner, "down") as sync_url:
         _alembic(sync_url, "upgrade", module.revision)
         _alembic(sync_url, "downgrade", module.down_revision)
         with _engine_on(sync_url) as engine:

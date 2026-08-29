@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 TS = datetime(2026, 6, 10, 9, 0, 0, tzinfo=UTC)
@@ -269,7 +269,9 @@ async def test_intent_put_carries_next_hop_vrf_and_interface_next_hop(adapter_cl
             }
         ]
     }
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/static-route-intent", json=body, headers=AUTH)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/static-route-intent", json=body, headers=AUTH | push_seq()
+    )
     assert resp.status_code == 200
 
     async with session() as db:
@@ -284,7 +286,9 @@ async def test_intent_put_carries_next_hop_vrf_and_interface_next_hop(adapter_cl
     # Re-PUT the same key with the forms cleared → the update branch must clear them too.
     body["routes"][0].pop("next_hop_vrf")
     body["routes"][0].pop("interface_next_hop")
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/static-route-intent", json=body, headers=AUTH)
+    resp = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/static-route-intent", json=body, headers=AUTH | push_seq()
+    )
     assert resp.status_code == 200
     async with session() as db:
         row = (

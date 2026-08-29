@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 import pytest
 
 from nso_adapter.api.timestamps import iso_z
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -96,7 +96,7 @@ async def test_put_intent_result_golden(adapter_client, monkeypatch):
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
         json={"attributes": [{"interface": "GigabitEthernet0/0", "attribute": "description", "intent_value": "x"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
     assert resp.json() == {"device_id": device_id, "attribute_count": 1, "updated_at": FROZEN_Z}
@@ -116,7 +116,11 @@ async def test_get_intent_summary_golden(adapter_client):
         await db.commit()
 
     body = (await adapter_client.get(f"/api/v1/devices/{device_id}/intent-summary", headers=AUTH)).json()
-    assert body == {"device_id": device_id, "scopes": {"vlan_intent": {"count": 1, "applied": 1, "failed": 1}}}
+    assert body == {
+        "device_id": device_id,
+        "scopes": {"vlan_intent": {"count": 1, "applied": 1, "failed": 1}},
+        "pending_clear": {},
+    }
 
 
 def test_frozen_now_is_fixed():

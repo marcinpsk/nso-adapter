@@ -307,13 +307,16 @@ async def put_ip_intent(
     # every other service's replace_on_removal, and always runs (removal is not auto_apply-gated).
     replaced = False
     if removed_interfaces:
-        from nso_adapter.core.removal import enqueue_removal
+        from nso_adapter.core.removal import enqueue_removal, query_flag_marking
 
+        marks = query_flag_marking(deletes=True)
         replaced = (
             await enqueue_removal(
                 db,
                 device_id,
                 "interface_config",
+                marking=marks.marking,
+                defer_retract=marks.defer_retract,
                 # The ADDRESS lane only: an un-promoted store-only write to the attribute lane
                 # is not authorized by an address push (#103).
                 promotes=(delivery.stream,),

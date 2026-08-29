@@ -24,6 +24,7 @@ GENERATION_IMMUTABLE_COLUMNS: tuple[str, ...] = (
     "source_push_seq",
     "stream_revisions",
     "removal_context",
+    "settlement_cohort",
     "created_at",
 )
 
@@ -41,10 +42,12 @@ def _compare(col: str) -> str:
     return f"NEW.{col}{cast} IS DISTINCT FROM OLD.{col}{cast}"
 
 
-def generation_immutability_ddl() -> tuple[str, ...]:
+def generation_immutability_ddl(
+    columns: tuple[str, ...] = GENERATION_IMMUTABLE_COLUMNS,
+) -> tuple[str, ...]:
     """Return the statements that install the trigger, in order."""
-    predicate = "\n        OR ".join(_compare(col) for col in GENERATION_IMMUTABLE_COLUMNS)
-    columns = ", ".join(GENERATION_IMMUTABLE_COLUMNS)
+    predicate = "\n        OR ".join(_compare(col) for col in columns)
+    column_names = ", ".join(columns)
     return (
         # No printf placeholders in the message: SQLAlchemy's DDL construct percent-formats
         # its statement, so a literal % here would break the create_all path.
@@ -54,7 +57,7 @@ BEGIN
     IF {predicate} THEN
         RAISE EXCEPTION USING
             ERRCODE = 'integrity_constraint_violation',
-            MESSAGE = 'deployment_generation ' || OLD.id || ' is immutable: {columns} may not be updated';
+            MESSAGE = 'deployment_generation ' || OLD.id || ' is immutable: {column_names} may not be updated';
     END IF;
     RETURN NEW;
 END;

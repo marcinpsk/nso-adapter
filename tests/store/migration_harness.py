@@ -75,20 +75,24 @@ def assert_single_head_containing(revision: str) -> None:
 
 
 @contextmanager
-def private_database(pg_admin, tag: str):
+def private_database(pg_provisioner, tag: str):
     """A database of our own, at no particular revision."""
     name = f"nsoadp_{tag}_{uuid.uuid4().hex[:8]}"
-    with pg_admin.connect() as conn:
+    with pg_provisioner.connect() as conn:
         conn.exec_driver_sql(f'CREATE DATABASE "{name}"')
     try:
         yield _url_for(name, driver="postgresql+psycopg2")
     finally:
-        _drop_database(pg_admin, name, expect_clean=False)
+        _drop_database(pg_provisioner, name, expect_clean=False)
 
 
 @contextmanager
 def engine_on(sync_url: str):
-    engine = sa.create_engine(sync_url, poolclass=sa.pool.NullPool)
+    engine = sa.create_engine(
+        sync_url,
+        poolclass=sa.pool.NullPool,
+        connect_args={"application_name": "tests.migration_harness"},
+    )
     try:
         yield engine
     finally:

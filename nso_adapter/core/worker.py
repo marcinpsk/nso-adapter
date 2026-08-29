@@ -58,7 +58,7 @@ from nso_adapter.core.claim import (
     terminalize,
     terminalize_running,
 )
-from nso_adapter.store.db import get_session
+from nso_adapter.store.db import session
 from nso_adapter.store.models import DeviceClaim, Job, JobStatus, JobType
 
 logger = structlog.get_logger(__name__)
@@ -109,7 +109,7 @@ async def _discover_candidates() -> list[int | None]:
     claim would invert the lock order against recovery, which holds the claim and reaches for
     the job.
     """
-    async for db in get_session():
+    async with session() as db:
         rows = (
             await db.execute(
                 select(Job.device_id, func.min(Job.created_at).label("oldest"))
@@ -204,7 +204,7 @@ async def _start_head_under_claim(device_id: int, reg: ClaimRegistration) -> tup
     """
     from nso_adapter.core.generation import job_admissible, mark_job_generations_running
 
-    async for db in get_session():
+    async with session() as db:
         await lock_claim(db, reg)  # claim -> jobs, per the global lock order
 
         candidates = (
@@ -271,7 +271,7 @@ async def _claim_next_claimless_job() -> tuple[int, None, JobType, int] | None:
     claim machinery and the per-device FIFO. Teardown is specified never to create one, so
     this is a belt against a bug, not a routine path.
     """
-    async for db in get_session():
+    async with session() as db:
         job = await db.scalar(
             select(Job)
             .where(Job.device_id.is_(None), Job.status == JobStatus.queued)
@@ -316,7 +316,7 @@ async def _mark_failed(job_id: int, code: str, message: str, reg: ClaimRegistrat
     already made, or a fresh worker's ``running``. The attempt on *reg* is the second half
     of that guard, and it covers the claimless lane too, which has no claim to lock.
     """
-    async for db in get_session():
+    async with session() as db:
         if reg is not None:
             try:
                 await lock_claim(db, reg)
@@ -360,7 +360,7 @@ async def _heartbeat(job_id: int, reg: ClaimRegistration | None = None) -> None:
             await asyncio.sleep(_HEARTBEAT_INTERVAL)
             live = reg if (reg is not None and reg.registered) else None
             revoked = False
-            async for db in get_session():
+            async with session() as db:
                 now = _now()
                 if live is not None:
                     held = await db.scalar(
@@ -752,7 +752,7 @@ async def _requeue_own_claim(job_id: int, job_type: JobType, *, run_attempt: int
     if disposition_for(job_type) is not JobStatus.queued:
         return
     try:
-        async for db in get_session():
+        async with session() as db:
             landed = await terminalize_running(db, job_id, status=JobStatus.queued, expected_attempt=run_attempt)
             await db.commit()
             if landed is not None:
@@ -800,7 +800,7 @@ async def requeue_orphaned_jobs() -> None:
     ``apply`` still ends ``failed`` rather than requeued: never silently re-push operator
     intent that may have changed since.
     """
-    async for db in get_session():
+    async with session() as db:
         cutoff = _now() - timedelta(seconds=PROVISION_STALE_AFTER)
         # NULL heartbeat = started by a prior process that never stamped one → treat as stale.
         stale = or_(Job.heartbeat_at.is_(None), Job.heartbeat_at < cutoff)

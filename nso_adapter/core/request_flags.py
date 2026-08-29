@@ -19,6 +19,7 @@ to thread a flag.
 from __future__ import annotations
 
 from contextvars import ContextVar
+from typing import Final, Literal, get_args
 
 STORE_ONLY: ContextVar[bool] = ContextVar("store_only", default=False)
 
@@ -27,52 +28,69 @@ STORE_ONLY: ContextVar[bool] = ContextVar("store_only", default=False)
 # this from the device". Every UNMARKED intent shrink is an un-own ("NetBox stops
 # governing") and its removal job runs as a DETACH — no-networking replace + sync-from,
 # device untouched (tracker #106: a real PUT-replace of an ADOPTED entry plays FASTMAP's
-# reverse diff against the live device and stripped an IOS route-map filter). Guarded at
-# the same enqueue choke point as STORE_ONLY so the safe default holds for every intent
-# endpoint without each one threading a flag.
+# reverse diff against the live device and stripped an IOS route-map filter). Read ONCE per
+# request, by :func:`request_marking`, and passed on as an explicit argument from there:
+# a removal job's marking is part of its identity, and a request can produce one job per
+# marking (#1503 §4.5).
 DELETE_ORIGIN: ContextVar[bool] = ContextVar("delete_origin", default=False)
 
-# ``PUSH_SEQ`` carries the plugin's ``X-Push-Seq`` header: the identity of the outbox claim
-# this request delivers. It is the key receipt admission dedupes on (#1522 §G2) and the
-# provenance recorded on every projection write and on the generation a normal write
-# promotes. Request-scoped at the same layer as the two flags above, for the same reason.
-PUSH_SEQ: ContextVar[int | None] = ContextVar("push_seq", default=None)
+# ``BACKFILL_ONLY`` carries ``?backfill_only=true``: the pusher is opening a device's
+# replacement fence, not delivering content. The pass adopts the ``route_id`` of every row the
+# payload still names, prunes the uncorrelated NULL-id rows that hold the fence shut, and does
+# nothing else — no content write, no tombstone, no job. It exists because an ordinary push
+# that omits a deleted route destroys the before-image that route's pending deletion needs
+# (#1503 §4.4, OQ-O-8). Only the static-route stream implements it; any other in-protocol
+# delivery carrying it is refused at the boundary, never silently treated as an ordinary push.
+BACKFILL_ONLY: ContextVar[bool] = ContextVar("backfill_only", default=False)
+
+#: The deletion provenance one removal job carries. ``delete_origin`` retracts from the
+#: device; ``detach`` un-owns without touching it. The values are also the
+#: ``static_route_tombstone.marking`` domain, one source of truth for both.
+DELETE_ORIGIN_MARKING = "delete_origin"
+DETACH_MARKING = "detach"
+REMOVAL_MARKINGS: tuple[str, ...] = (DELETE_ORIGIN_MARKING, DETACH_MARKING)
+
+#: The provenance one pending-clear obligation carries. ``authorized`` was promoted by a
+#: normal claim. ``store_only`` is parked and never deploys.
+AUTHORIZED_PROVENANCE: Final = "authorized"
+STORE_ONLY_PROVENANCE: Final = "store_only"
+#: The API-visible domain; the tuple derives from it, and the guard below pins the
+#: named constants to the same values (Literal cannot reference them, PEP 586).
+PendingClearProvenance = Literal["authorized", "store_only"]
+PENDING_CLEAR_PROVENANCES: tuple[str, ...] = get_args(PendingClearProvenance)
+if PENDING_CLEAR_PROVENANCES != (AUTHORIZED_PROVENANCE, STORE_ONLY_PROVENANCE):
+    raise AssertionError("pending-clear provenance domains diverged")
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
+_FALSY = frozenset({"0", "false", "no", "off"})
 
-#: The admissible ``X-Push-Seq`` domain. The upper bound is the BIGINT the receipt and the
-#: projection row store it in: a wider value must be refused at the boundary, because the
-#: alternative is an asyncpg range error deep inside the mutation — a 500 for a client
-#: mistake, after part of the request has already run.
+#: The admissible ``X-Push-Seq`` domain, and the bounds DECLARED on every in-protocol intent
+#: PUT (:func:`api.intent_push.get_intent_delivery`). The upper bound is the BIGINT the
+#: receipt and the projection row store it in: a wider value must be refused at the boundary,
+#: because the alternative is an asyncpg range error deep inside the mutation — a 500 for a
+#: client mistake, after part of the request has already run.
 MIN_PUSH_SEQ = 1
 MAX_PUSH_SEQ = 2**63 - 1
-PUSH_SEQ_VALIDATION_MESSAGE = f"X-Push-Seq must be an integer between {MIN_PUSH_SEQ} and {MAX_PUSH_SEQ}"
 
 
-class InvalidPushSequence(ValueError):
-    """The request carried an ``X-Push-Seq`` that cannot identify a claim."""
-
-
-def parse_store_only(raw: str | None) -> bool:
-    """Parse a raw boolean query value (mirrors FastAPI's bool query coercion)."""
-    return raw is not None and raw.strip().lower() in _TRUTHY
-
-
-def parse_push_seq(raw: str | None) -> int | None:
-    """Parse the ``X-Push-Seq`` header. Absent → None; present and unusable → raises.
-
-    A PRESENT header that cannot be a claim identity is a client error and is refused, not
-    downgraded: silently treating it as absent turns a keyed, replay-protected delivery into
-    an unkeyed one, and the plugin's retry then applies a second time under a receipt nobody
-    wrote. Absence itself stays legal — the ratified #1503 contract keeps lacp/switchport
-    out of the protocol as claim-less direct-apply deliveries.
-    """
+def parse_request_flag(raw: str | None) -> bool:
+    """Parse one request-mode boolean, or refuse an unknown spelling."""
     if raw is None:
-        return None
-    try:
-        seq = int(raw.strip())
-    except ValueError:
-        raise InvalidPushSequence(PUSH_SEQ_VALIDATION_MESSAGE) from None
-    if not MIN_PUSH_SEQ <= seq <= MAX_PUSH_SEQ:
-        raise InvalidPushSequence(PUSH_SEQ_VALIDATION_MESSAGE)
-    return seq
+        return False
+    normalized = raw.strip().lower()
+    if normalized in _TRUTHY:
+        return True
+    if normalized in _FALSY:
+        return False
+    raise ValueError("invalid boolean query value")
+
+
+def request_marking() -> str:
+    """Return the deletion provenance THIS request marks the rows it deletes with.
+
+    The one read of :data:`DELETE_ORIGIN` on the removal path. Everything downstream takes
+    the marking as an argument, so a request that deletes at both markings (§4.5's
+    per-object static routes) can build one job per marking instead of one job whose
+    job-wide ``detach`` flag would misdeliver half of them.
+    """
+    return DELETE_ORIGIN_MARKING if DELETE_ORIGIN.get() else DETACH_MARKING

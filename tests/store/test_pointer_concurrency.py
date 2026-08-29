@@ -39,7 +39,10 @@ from nso_adapter.store.models import Device, DeviceStaticRoute, RefreshOutcome, 
 async def pointer_engine(pg_url):
     """An engine on this test's private clone. The schema is already there (the template is
     built by ``alembic upgrade head``), so there is nothing to create."""
-    engine = create_async_engine(pg_url)
+    engine = create_async_engine(
+        pg_url,
+        connect_args={"server_settings": {"application_name": "tests.pointer_engine"}},
+    )
     try:
         yield engine
     finally:
@@ -52,7 +55,11 @@ async def lock_probe(pg_url):
 
     Its own engine, so polling can never queue behind the very transactions it observes.
     """
-    engine = create_async_engine(pg_url, isolation_level="AUTOCOMMIT")
+    engine = create_async_engine(
+        pg_url,
+        isolation_level="AUTOCOMMIT",
+        connect_args={"server_settings": {"application_name": "tests.pointer_lock_probe"}},
+    )
     try:
         async with engine.connect() as conn:
             yield conn

@@ -14,6 +14,7 @@ nine-handler fan-out is gone).
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -293,10 +294,11 @@ async def test_sse_handler_dispatches_parsed_frame(monkeypatch):
 
     monkeypatch.setattr("nso_adapter.main._dispatch_netconf_change", rec_dispatch)
 
+    @asynccontextmanager
     async def fake_session():
         yield "DB-SESSION"
 
-    monkeypatch.setattr("nso_adapter.main.get_session", fake_session)
+    monkeypatch.setattr("nso_adapter.main.session", fake_session)
     dispatch_tasks: set[asyncio.Task] = set()
     handler = _make_sse_event_handler(SimpleNamespace(scheduler=_scheduler()), {"i": object()}, dispatch_tasks)
 
@@ -319,10 +321,11 @@ async def test_sse_handler_logs_and_does_not_leak_failed_dispatch(monkeypatch):
 
     monkeypatch.setattr("nso_adapter.main._dispatch_netconf_change", boom_dispatch)
 
+    @asynccontextmanager
     async def fake_session():
         yield "DB-SESSION"
 
-    monkeypatch.setattr("nso_adapter.main.get_session", fake_session)
+    monkeypatch.setattr("nso_adapter.main.session", fake_session)
     dispatch_tasks: set[asyncio.Task] = set()
     handler = _make_sse_event_handler(SimpleNamespace(scheduler=_scheduler()), {"i": object()}, dispatch_tasks)
 
@@ -485,7 +488,10 @@ async def test_dispose_engine_noop_when_unset(monkeypatch):
 async def test_dispose_engine_disposes_real_engine(monkeypatch, pg_url):
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    engine = create_async_engine(pg_url)
+    engine = create_async_engine(
+        pg_url,
+        connect_args={"server_settings": {"application_name": "tests.lifespan.dispose_engine"}},
+    )
     monkeypatch.setattr("nso_adapter.main.get_engine", lambda: engine)
 
     await _dispose_engine()  # real engine, real dispose
@@ -576,7 +582,7 @@ def test_build_netbox_client_defaults_verify_true(clean_netbox_registry):
 
 
 @pytest.fixture
-def unmigrated_pg_url(pg_admin):
+def unmigrated_pg_url(pg_provisioner):
     """A database with NO schema whatsoever — plain CREATE DATABASE, never TEMPLATE.
 
     The normal ``pg_url`` clone is already at head, so a reintroduced ``create_all`` there
@@ -588,12 +594,12 @@ def unmigrated_pg_url(pg_admin):
     from tests.conftest import _drop_database, _url_for
 
     name = f"nsoadp_empty_{uuid_mod.uuid4().hex[:8]}"
-    with pg_admin.connect() as conn:
+    with pg_provisioner.connect() as conn:
         conn.exec_driver_sql(f'CREATE DATABASE "{name}"')
     try:
         yield _url_for(name, driver="postgresql+asyncpg")
     finally:
-        _drop_database(pg_admin, name, expect_clean=True)
+        _drop_database(pg_provisioner, name, expect_clean=True)
 
 
 async def test_init_database_never_materializes_schema(monkeypatch, unmigrated_pg_url):
@@ -613,7 +619,10 @@ async def test_init_database_never_materializes_schema(monkeypatch, unmigrated_p
     def _tables(conn):
         return set(sa.inspect(conn).get_table_names())
 
-    engine = create_async_engine(unmigrated_pg_url)
+    engine = create_async_engine(
+        unmigrated_pg_url,
+        connect_args={"server_settings": {"application_name": "tests.lifespan.schema_probe"}},
+    )
     try:
         async with engine.connect() as conn:
             before = await conn.run_sync(_tables)

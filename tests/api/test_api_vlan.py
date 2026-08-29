@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.conftest import VALID_TOKEN, seed_device, seed_switchport, seed_vlan_database, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, seed_switchport, seed_vlan_database, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -112,14 +112,14 @@ async def _count_vlan_intent(device_id: int) -> int:
 async def test_put_vlan_intent_stores_and_full_replaces(adapter_client):
     device_id = await seed_device(nso_device_name="vlan-wp", netbox_device_id=1250)
     body = {"vlans": [{"vlan_id": 10, "name": "MGMT"}, {"vlan_id": 2213, "name": "RENAMED"}]}
-    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/vlan-intent", json=body, headers=AUTH)
+    resp = await adapter_client.put(f"/api/v1/devices/{device_id}/vlan-intent", json=body, headers=AUTH | push_seq())
     assert resp.status_code == 200 and resp.json()["count"] == 2
     assert await _count_vlan_intent(device_id) == 2
     # full-replace: one VLAN → the other is deleted
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/vlan-intent",
         json={"vlans": [{"vlan_id": 2213, "name": "RENAMED"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.json()["count"] == 1
     assert await _count_vlan_intent(device_id) == 1
@@ -127,5 +127,5 @@ async def test_put_vlan_intent_stores_and_full_replaces(adapter_client):
 
 @pytest.mark.anyio
 async def test_put_vlan_intent_unknown_device_404(adapter_client):
-    resp = await adapter_client.put("/api/v1/devices/999999/vlan-intent", json={"vlans": []}, headers=AUTH)
+    resp = await adapter_client.put("/api/v1/devices/999999/vlan-intent", json={"vlans": []}, headers=AUTH | push_seq())
     assert resp.status_code == 404

@@ -21,7 +21,7 @@ from sqlalchemy import select
 
 from nso_adapter.core import importer as imp
 from nso_adapter.store.models import DbInterface, InterfaceAttrState, InterfaceIntent, SyncState
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -82,7 +82,7 @@ async def test_put_intent_stamps_accepted_and_writes_intent_table(adapter_client
     resp = await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
         json={"attributes": [{"interface": "GE0/0", "attribute": "description", "intent_value": "op-desc"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert resp.status_code == 200
 

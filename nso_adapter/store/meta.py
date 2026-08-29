@@ -17,7 +17,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from nso_adapter.store.db import get_session
+from nso_adapter.store.db import session
 from nso_adapter.store.models import StoreMeta
 
 logger = structlog.get_logger(__name__)
@@ -35,7 +35,7 @@ async def ensure_store_meta() -> tuple[str, datetime]:
     the loser's INSERT violates ``id=1`` and re-reads the winner.
     """
     global _cached
-    async for db in get_session():
+    async with session() as db:
         row = (await db.execute(select(StoreMeta))).scalar_one_or_none()
         if row is None:
             row = StoreMeta(id=1, incarnation=str(uuid.uuid4()))

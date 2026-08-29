@@ -309,11 +309,12 @@ async def test_enqueue_apply_admitted_while_an_apply_runs(adapter_client):
 # ── run_apply ─────────────────────────────────────────────────────────────────
 
 
-async def test_run_apply_job_not_found(adapter_client):
+async def test_run_apply_job_not_found(adapter_client, store_engine):
     """run_apply exits early when job_id doesn't exist in DB."""
     device_id = await _seed_device("rtr-a10", 110)
     # Should not raise — just log and return
     await run_apply(job_id=99999, device_id=device_id)
+    assert store_engine.sync_engine.pool.checkedout() == 0
 
 
 async def test_run_apply_device_not_found(adapter_client):

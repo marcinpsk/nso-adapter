@@ -17,7 +17,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -203,7 +203,7 @@ async def test_a_worker_cannot_start_the_winner_before_the_endpoint_commits(adap
         adapter_client.put(
             f"/api/v1/devices/{device_id}/bfd-intent",
             json={"interfaces": [{"interface_name": "Ethernet1", "min_tx": 900}]},
-            headers=AUTH,
+            headers=AUTH | push_seq(),
         )
     )
     await asyncio.wait_for(held.wait(), timeout=10)

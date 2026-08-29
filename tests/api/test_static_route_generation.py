@@ -16,7 +16,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import select
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 pytestmark = pytest.mark.anyio
 
@@ -32,7 +32,9 @@ def entry(triple: tuple[str, str, str], **extra) -> dict:
 
 
 async def push(client, device_id: int, routes: list[dict]):
-    return await client.put(f"/api/v1/devices/{device_id}/static-route-intent", json={"routes": routes}, headers=AUTH)
+    return await client.put(
+        f"/api/v1/devices/{device_id}/static-route-intent", json={"routes": routes}, headers=AUTH | push_seq()
+    )
 
 
 async def stored_generations(device_id: int) -> dict[tuple, int | None]:

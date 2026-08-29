@@ -17,7 +17,7 @@ from nso_adapter.store.models import (
     ManagedScope,
     SyncState,
 )
-from tests.conftest import VALID_TOKEN, session
+from tests.conftest import VALID_TOKEN, push_seq, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -40,14 +40,18 @@ async def _seed_device_with_interface(nso_device_name: str, netbox_id: int):
 
 
 async def test_put_intent_device_not_found(adapter_client):
-    response = await adapter_client.put("/api/v1/devices/99992/intent", json={"attributes": []}, headers=AUTH)
+    response = await adapter_client.put(
+        "/api/v1/devices/99992/intent", json={"attributes": []}, headers=AUTH | push_seq()
+    )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "not_found"
 
 
 async def test_put_intent_empty_attributes(adapter_client):
     device_id, _ = await _seed_device_with_interface("intent-dev-01", 1200)
-    response = await adapter_client.put(f"/api/v1/devices/{device_id}/intent", json={"attributes": []}, headers=AUTH)
+    response = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/intent", json={"attributes": []}, headers=AUTH | push_seq()
+    )
     assert response.status_code == 200
     result = response.json()
     assert result.pop("updated_at") is not None
@@ -61,7 +65,7 @@ async def test_put_intent_inserts_known_interface(adapter_client):
         json={
             "attributes": [{"interface": "GigabitEthernet0/2", "attribute": "description", "intent_value": "my-desc"}]
         },
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert response.status_code == 200
     assert response.json()["attribute_count"] == 1
@@ -74,7 +78,7 @@ async def test_put_intent_unknown_interface_lands(adapter_client):
     response = await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
         json={"attributes": [{"interface": "ae0.7", "attribute": "description", "intent_value": "val"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert response.status_code == 200
     assert response.json()["attribute_count"] == 1
@@ -112,7 +116,7 @@ async def test_put_intent_transitions_imported_to_accepted(adapter_client):
         json={
             "attributes": [{"interface": "GigabitEthernet0/2", "attribute": "description", "intent_value": "new-val"}]
         },
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert response.status_code == 200
 
@@ -133,7 +137,7 @@ async def test_put_intent_auto_apply_triggers_enqueue(adapter_client):
     response = await adapter_client.put(
         f"/api/v1/devices/{device_id}/intent",
         json={"attributes": [{"interface": "GigabitEthernet0/2", "attribute": "description", "intent_value": "v"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert response.status_code == 200
     async with session() as db:
@@ -155,7 +159,7 @@ async def test_put_intent_replaces_existing_intent(adapter_client):
     first = await adapter_client.put(
         url,
         json={"attributes": [{"interface": "GigabitEthernet0/2", "attribute": "description", "intent_value": "first"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert first.status_code == 200
     second = await adapter_client.put(
@@ -163,7 +167,7 @@ async def test_put_intent_replaces_existing_intent(adapter_client):
         json={
             "attributes": [{"interface": "GigabitEthernet0/2", "attribute": "description", "intent_value": "second"}]
         },
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert second.status_code == 200
     assert second.json()["attribute_count"] == 1
@@ -172,7 +176,7 @@ async def test_put_intent_replaces_existing_intent(adapter_client):
     other = await adapter_client.put(
         f"/api/v1/devices/{other_device_id}/intent",
         json={"attributes": [{"interface": "GigabitEthernet0/2", "attribute": "description", "intent_value": "other"}]},
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert other.status_code == 200
 
@@ -221,7 +225,7 @@ async def test_get_intent_returns_set_intent(adapter_client):
                 }
             ]
         },
-        headers=AUTH,
+        headers=AUTH | push_seq(),
     )
     assert pushed.status_code == 200
     response = await adapter_client.get(url, headers=AUTH)

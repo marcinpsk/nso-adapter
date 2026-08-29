@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 import sqlalchemy as sa
 
-from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
@@ -116,9 +116,9 @@ async def test_removal_generation_precedes_auto_apply(adapter_client, endpoint, 
     await _enable_auto_apply(device_id, seed_interface=endpoint == "ip")
     url = f"/api/v1/devices/{device_id}/{endpoint}-intent"
 
-    seeded = await adapter_client.put(f"{url}?store_only=true", json=before, headers=AUTH)
+    seeded = await adapter_client.put(f"{url}?store_only=true", json=before, headers=AUTH | push_seq())
     assert seeded.status_code == 200, seeded.text
-    changed = await adapter_client.put(url, json=after, headers=AUTH)
+    changed = await adapter_client.put(url, json=after, headers=AUTH | push_seq())
     assert changed.status_code == 200, changed.text
 
     assert await _generation_jobs(device_id) == [("detach", "removal"), ("networked", "apply")]

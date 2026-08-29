@@ -266,6 +266,16 @@ def test_flags_a_dict_literal_values_mapping():
     assert len(scan_source(src, "t.py")) == 2
 
 
+def test_flags_a_dict_literal_passed_to_an_unrelated_call():
+    """The guard deliberately fails closed for suspicious mappings passed to any call."""
+    src = 'def f(report):\n    report({"status": JobStatus.failed, "settle_seq": 3})\n'
+    hits = scan_source(src, "t.py")
+    assert [(h.line, h.what) for h in hits] == [
+        (2, "assigns a terminal JobStatus directly"),
+        (2, "writes Job.settle_seq directly"),
+    ]
+
+
 def test_flags_a_dict_literal_bound_to_a_name_first():
     """``vals = {...}`` handed to ``.values(vals)`` is the same physical write, one line up."""
     src = 'def f(u):\n    vals = {"status": JobStatus.failed, "settle_seq": 3}\n    u.values(vals)\n'

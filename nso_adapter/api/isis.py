@@ -371,7 +371,14 @@ async def _sync_keyed_intent(
             row = make_row(entry)
             db.add(row)
         apply_fields(row, entry, accepted)
-        if before is not None and any(is_cleared(before[f], getattr(row, f)) for f in state_fields):
+        if before is not None and any(
+            is_cleared(
+                before[f],
+                getattr(row, f),
+                emission_field=(model.__tablename__, f),
+            )
+            for f in state_fields
+        ):
             cleared = True
         count += 1
     return count, deleted, cleared
@@ -622,14 +629,17 @@ async def put_isis_interface_intent(
     deleted = iface_deleted or proc_deleted or level_deleted or redist_deleted
     cleared = iface_cleared or proc_cleared or level_cleared or redist_cleared
     if deleted or cleared:
-        from nso_adapter.core.removal import enqueue_removal
+        from nso_adapter.core.removal import enqueue_removal, query_flag_marking
 
         removed_ifaces = sorted(pre_iface_keys - {(e.interface_name, e.af) for e in body.interfaces})
         removed_procs = sorted(pre_proc_tags - {p.process_tag for p in body.processes})
+        marks = query_flag_marking(deletes=deleted)
         await enqueue_removal(
             db,
             device_id,
             "isis",
+            marking=marks.marking,
+            defer_retract=marks.defer_retract,
             promotes=(delivery.stream,),
             removed={"interface-config": removed_ifaces, "process-config": removed_procs},
             retract=cleared,
@@ -763,10 +773,18 @@ async def put_isis_flex_algo_intent(
     # no orphan allowance.
     removal_queued = False
     if removed_keys or cleared:
-        from nso_adapter.core.removal import enqueue_removal
+        from nso_adapter.core.removal import enqueue_removal, query_flag_marking
 
+        marks = query_flag_marking(deletes=bool(removed_keys))
         job = await enqueue_removal(
-            db, device_id, "isis", promotes=(delivery.stream,), retract=cleared, shrank=bool(removed_keys)
+            db,
+            device_id,
+            "isis",
+            marking=marks.marking,
+            defer_retract=marks.defer_retract,
+            promotes=(delivery.stream,),
+            retract=cleared,
+            shrank=bool(removed_keys),
         )
         removal_queued = job is not None
 

@@ -2,7 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Unit tests for core/onboarding.py — onboard_device, rekey_device, offboard_device, set_scope.
 
-These tests exercise the DB-layer logic directly via the store's get_session(),
+These tests exercise the DB-layer logic directly via the store's session context manager,
 bypassing the HTTP layer.  The `adapter_client` fixture is still required to
 ensure init_db() has run (creating schema) before any DB call.
 """

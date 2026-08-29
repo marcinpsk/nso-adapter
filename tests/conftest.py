@@ -12,7 +12,8 @@ import threading
 import time
 import uuid
 import warnings
-from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -26,6 +27,7 @@ from sqlalchemy.orm import Session as SyncSession
 from nso_adapter.bindings.netbox.client import NetboxClient
 from nso_adapter.main import create_app
 from nso_adapter.nso.client import NsoClient
+from nso_adapter.store.db import session
 
 # Hermetic tests: ignore any ambient DATABASE_URL. The dev container sets one to
 # point at the dev Postgres; without this, get_config()'s env override would make
@@ -45,8 +47,25 @@ def pytest_xdist_auto_num_workers(config: pytest.Config) -> int:
 
 VALID_TOKEN = "test-bearer-token"
 
+# Every in-protocol intent PUT REQUIRES X-Push-Seq (a header-less delivery is a 422), so a
+# test that pushes is a claim sender like any other. The counter only ever increases, and
+# starts above every sequence any test spells out, so an auto-keyed push can never be judged
+# stale against a hand-written one. Sequences are compared per (device, stream); the tests
+# seed their own devices, so xdist workers each running this counter cannot collide.
+_push_seq_counter = itertools.count(1_000_000)
+
+
+def push_seq(seq: int | None = None) -> dict[str, str]:
+    """The ``X-Push-Seq`` header for one delivery — merge it into a test's auth headers.
+
+    Pass *seq* only when the test asserts on the sequence itself (a replay, a stale
+    redelivery, a recorded receipt); otherwise take the next unused one.
+    """
+    return {"X-Push-Seq": str(next(_push_seq_counter) if seq is None else seq)}
+
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-ADMIN_URL = os.environ.get(
+PROVISIONER_URL = os.environ.get(
     "NSO_ADAPTER_TEST_DB_URL",
     "postgresql+psycopg2://postgres:postgres@127.0.0.1:55433/postgres",
 )
@@ -59,24 +78,36 @@ _clone_seq = itertools.count()
 
 def _url_for(dbname: str, *, driver: str) -> str:
     # NB: str(URL) masks the password as literal '***' — always render_as_string.
-    return make_url(ADMIN_URL).set(drivername=driver, database=dbname).render_as_string(hide_password=False)
+    return make_url(PROVISIONER_URL).set(drivername=driver, database=dbname).render_as_string(hide_password=False)
 
 
 #: How long a straggler may take to disappear before it counts as leaked.
 _TEARDOWN_GRACE_S = 15.0
 
 
-def _client_backends(conn, name: str) -> list:
+@dataclass(frozen=True, slots=True)
+class ClientBackend:
+    """Diagnostic identity and state for one leaked PostgreSQL client backend."""
+
+    pid: int
+    application_name: str
+    backend_start: datetime
+    state: str | None
+    xact_start: datetime | None
+
+
+def _client_backends(conn, name: str) -> list[ClientBackend]:
     # backend_type filter: PG's own autovacuum worker can be inside the clone at DROP
     # time and is not a leaked test session — only client backends count as stragglers.
-    return conn.exec_driver_sql(
-        "SELECT pid, state FROM pg_stat_activity "
+    rows = conn.exec_driver_sql(
+        "SELECT pid, application_name, backend_start, state, xact_start FROM pg_stat_activity "
         f"WHERE datname = '{name}' AND pid <> pg_backend_pid() "
         "AND backend_type = 'client backend'"
     ).fetchall()
+    return [ClientBackend(*row) for row in rows]
 
 
-def _drop_database(admin, name: str, *, expect_clean: bool) -> None:
+def _drop_database(provisioner, name: str, *, expect_clean: bool) -> None:
     """Report stragglers BEFORE forcing. FORCE is last-resort cleanup, not the mechanism.
 
     A surviving connection means a fixture failed to close a session — a test bug we want
@@ -88,7 +119,7 @@ def _drop_database(admin, name: str, *, expect_clean: bool) -> None:
     state is excluded — an ``idle`` connection that never goes away IS the leak this guard
     exists to catch, and filtering on state would hide exactly that.
     """
-    with admin.connect() as conn:
+    with provisioner.connect() as conn:
         rows = _client_backends(conn, name)
         if rows and expect_clean:
             deadline = time.monotonic() + _TEARDOWN_GRACE_S
@@ -105,10 +136,15 @@ def _drop_database(admin, name: str, *, expect_clean: bool) -> None:
 
 
 @pytest.fixture(scope="session")
-def pg_admin():
-    """AUTOCOMMIT admin engine for CREATE/DROP DATABASE. Sync + session-scoped on purpose:
+def pg_provisioner():
+    """AUTOCOMMIT provisioner engine for CREATE/DROP DATABASE. Sync + session-scoped on purpose:
     an asyncpg pool created on a session-scoped loop and used from per-test loops is UB."""
-    engine = sa.create_engine(ADMIN_URL, isolation_level="AUTOCOMMIT", poolclass=sa.pool.NullPool)
+    engine = sa.create_engine(
+        PROVISIONER_URL,
+        isolation_level="AUTOCOMMIT",
+        poolclass=sa.pool.NullPool,
+        connect_args={"application_name": "tests.pg_provisioner"},
+    )
     try:
         with engine.connect() as conn:
             conn.exec_driver_sql("SELECT 1")  # FAIL LOUD: no silent skip lane any more
@@ -118,12 +154,12 @@ def pg_admin():
 
 
 @pytest.fixture(scope="session")
-def pg_template(pg_admin):
+def pg_template(pg_provisioner):
     """Build the schema ONCE — via alembic, the schema production runs — into a database
     used only as a clone source. Wrapped so a SETUP failure (broken migration chain, bad
     ALTER) still drops the half-built template instead of leaking it."""
     name = f"nsoadp_{_RUN}_tmpl"
-    with pg_admin.connect() as conn:
+    with pg_provisioner.connect() as conn:
         conn.exec_driver_sql(f'CREATE DATABASE "{name}"')
     try:
         try:
@@ -139,18 +175,18 @@ def pg_template(pg_admin):
             raise RuntimeError(f"template build failed:\n{exc.stderr.decode()}") from exc
         yield name
     finally:
-        _drop_database(pg_admin, name, expect_clean=False)  # build connections are ours
+        _drop_database(pg_provisioner, name, expect_clean=False)  # build connections are ours
 
 
 @pytest.fixture
-def pg_database(pg_admin, pg_template):
+def pg_database(pg_provisioner, pg_template):
     """A PRIVATE database per test, cloned from the template."""
     worker = os.environ.get("PYTEST_XDIST_WORKER", "m")  # xdist-ready, xdist-optional
     name = f"nsoadp_{_RUN}_{worker}_{next(_clone_seq):05d}"  # always << 63 bytes
-    with pg_admin.connect() as conn:
+    with pg_provisioner.connect() as conn:
         conn.exec_driver_sql(f'CREATE DATABASE "{name}" TEMPLATE "{pg_template}"')
     try:
-        with pg_admin.connect() as conn:
+        with pg_provisioner.connect() as conn:
             # Fail fast instead of wedging: the family fence is real on PG and can block.
             # CREATE DATABASE ... TEMPLATE does NOT copy pg_db_role_setting — set per clone.
             for stmt in (
@@ -162,7 +198,7 @@ def pg_database(pg_admin, pg_template):
         yield name
     finally:
         # An ALTER failure above must not leak the clone — hence the try wrapping it.
-        _drop_database(pg_admin, name, expect_clean=True)
+        _drop_database(pg_provisioner, name, expect_clean=True)
 
 
 @pytest.fixture
@@ -174,27 +210,16 @@ def pg_url(pg_database) -> str:
 def pg_sync_session(pg_database):
     """Sync Session for the ORM-model tests. Schema comes from the template; FK
     enforcement is native — no PRAGMA."""
-    engine = sa.create_engine(_url_for(pg_database, driver="postgresql+psycopg2"), poolclass=sa.pool.NullPool)
+    engine = sa.create_engine(
+        _url_for(pg_database, driver="postgresql+psycopg2"),
+        poolclass=sa.pool.NullPool,
+        connect_args={"application_name": "tests.pg_sync_session"},
+    )
     try:
         with SyncSession(engine) as s:
             yield s
     finally:
         engine.dispose()
-
-
-@asynccontextmanager
-async def session():
-    """One store session with deterministic close — replaces the historical
-    ``get_session`` async-for-with-break loops, whose ``break`` left the
-    generator (and its connection) suspended until GC."""
-    from nso_adapter.store.db import get_session
-
-    gen = get_session()
-    db = await anext(gen)
-    try:
-        yield db
-    finally:
-        await gen.aclose()
 
 
 # Enforceable zero-skip gate (pytest's -rs only REPORTS skips; it never fails the run).
@@ -277,7 +302,7 @@ async def store_engine(pg_url):
     """
     from nso_adapter.store import db as store_db
 
-    store_db.init_db(pg_url)
+    store_db.init_db(pg_url, application_name="tests.store_engine")
     engine = store_db.get_engine()
     try:
         yield engine
@@ -301,7 +326,11 @@ async def rival_engine(store_engine, pg_url):
     gone before the clone is dropped (``_drop_database(..., expect_clean=True)`` fails the
     test otherwise, which is the point).
     """
-    engine = create_async_engine(pg_url, poolclass=sa.pool.NullPool)
+    engine = create_async_engine(
+        pg_url,
+        poolclass=sa.pool.NullPool,
+        connect_args={"server_settings": {"application_name": "tests.rival_engine"}},
+    )
     try:
         yield engine
     finally:
