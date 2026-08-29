@@ -1025,7 +1025,12 @@ async def test_a_pending_head_bound_to_a_running_job_is_corruption(adapter_clien
     assert await _job_status(head.job_id) is JobStatus.running
 
 
-async def test_advancement_yields_to_a_worker_starting_the_carrier(adapter_client, rival_engine):
+class _InjectedFailure(Exception):
+    """Raised by the early-failure arm to model a mid-test assertion blowing up."""
+
+
+@pytest.mark.parametrize("fail_early", [False, True], ids=["success", "early-failure"])
+async def test_advancement_yields_to_a_worker_starting_the_carrier(adapter_client, rival_engine, fail_early):
     """The two lock orders are opposed, so the carrier read must be NOWAIT, not blocking.
 
     Advancement holds the head generation row and wants the job; the worker holds the job
@@ -1038,7 +1043,7 @@ async def test_advancement_yields_to_a_worker_starting_the_carrier(adapter_clien
     from nso_adapter.core import generation as generation_mod
     from nso_adapter.core.generation import advance_device_generations, mark_job_generations_running
     from nso_adapter.store.db import get_engine
-    from nso_adapter.store.models import GenerationStatus, Job, JobStatus
+    from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, Job, JobStatus
 
     device_id = await _device("gen-advance-carrier-nowait", 9744)
     await _vlan(device_id, 99)
@@ -1076,6 +1081,7 @@ async def test_advancement_yields_to_a_worker_starting_the_carrier(adapter_clien
         with patch("nso_adapter.core.generation._locked_executable_head", new=gated):
             advancing = asyncio.create_task(advance_device_generations(device_id))
             starting = asyncio.create_task(start_the_job(worker))
+            injected = None
             try:
                 try:
                     await asyncio.wait_for(head_locked.wait(), timeout=10)
@@ -1084,11 +1090,18 @@ async def test_advancement_yields_to_a_worker_starting_the_carrier(adapter_clien
                 finally:
                     worker_blocked.set()
 
+                if fail_early:
+                    # The early-failure arm models an assertion below blowing up while
+                    # the tasks still run; the outer finally must clean both up.
+                    raise _InjectedFailure()
+
                 # (a) no deadlock, and no stale queued carrier handed back as a successor.
                 assert await asyncio.wait_for(advancing, timeout=20) is None, (
                     "advancement took over a carrier a worker is starting"
                 )
                 await asyncio.wait_for(starting, timeout=20)
+            except _InjectedFailure as exc:
+                injected = exc
             finally:
                 # A failed assertion above must not leave either task holding an open
                 # transaction and its locks on the shared test database.
@@ -1097,6 +1110,15 @@ async def test_advancement_yields_to_a_worker_starting_the_carrier(adapter_clien
                         task.cancel()
                         with contextlib.suppress(asyncio.CancelledError, Exception):
                             await task
+
+    if fail_early:
+        assert injected is not None
+        assert starting.done() and advancing.done()
+        # The cleanup released every lock: a fresh transaction can take the head row NOWAIT.
+        async with session() as db:
+            row = await db.get(DeploymentGeneration, head.id, with_for_update={"nowait": True})
+            assert row is not None
+        return
 
     # (b) the worker's transition landed whole, and a re-run reads that truthful state.
     (running,) = await _generations(device_id)
