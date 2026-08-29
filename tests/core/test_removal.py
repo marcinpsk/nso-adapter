@@ -2201,8 +2201,21 @@ async def test_enqueue_removal_force_refuses_to_promote(adapter_client):
         await note_projection_write(db, device_id, "svi")
         with pytest.raises(ValueError, match="promotes nothing"):
             await enqueue_removal(
-                db, device_id, "svi", marking=None, defer_retract=False, promotes=("svi",), force=True
+                db,
+                device_id,
+                "svi",
+                marking=None,
+                defer_retract=True,
+                promotes=("svi",),
+                retract=True,
+                force=True,
             )
+        # The refusal must precede ALL store work: a late check let _record_pending_clears
+        # write rows for exactly the promoted streams before raising.
+        from nso_adapter.store.models import StreamPendingClear
+
+        leftover = (await db.execute(select(StreamPendingClear))).scalars().all()
+        assert leftover == [], "force refusal ran after pending-clear store work"
 
 
 async def test_enqueue_removal_force_refuses_a_composed_document(adapter_client):

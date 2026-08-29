@@ -1733,8 +1733,11 @@ def _refuse_force_incompatible(
     allowed_removal_keys,
     settlement_cohort,
     static_route_tombstone_ids,
+    promotes,
 ) -> None:
     """Refuse the arguments a reissue cannot honor: it skips the guard and records no plan."""
+    if promotes:
+        raise ValueError(f"a force-removal of {scope!r} promotes nothing; got {promotes!r}")
     if marking is not None:
         raise ValueError(f"a force-removal of {scope!r} carries no deletion marking; got {marking!r}")
     if document is not None:
@@ -2004,6 +2007,7 @@ async def enqueue_removal(
             allowed_removal_keys,
             settlement_cohort,
             static_route_tombstone_ids,
+            promotes,
         )
     store_only = STORE_ONLY.get()
     context: dict = {"scope": scope}
@@ -2063,8 +2067,6 @@ async def enqueue_removal(
     # The context rides the GENERATION either way, not only the job: a retry of a blocked
     # head has to rebuild a job that commits the same operation, down to the detach flag.
     if force:
-        if promotes:
-            raise ValueError(f"a force-removal of {scope!r} promotes nothing; got {promotes!r}")
         generation = await create_reissue_generation(
             db,
             device_id,
