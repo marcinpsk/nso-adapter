@@ -25,7 +25,7 @@ from functools import cache
 from typing import NamedTuple
 
 import structlog
-from sqlalchemy import delete, select
+from sqlalchemy import delete, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, JobError, error_envelope
@@ -1251,18 +1251,19 @@ async def _commit_terminal_removal(db: AsyncSession, job_id: int) -> None:
 
 
 async def _finalize_static_route_removal(db, job_id: int, device, client, out: SrRemoval, *, reg) -> bool:
-    """Prove the write, then consume and finalize in ONE claim-guarded transaction (§4.4/§4.6).
+    """Prove the write, then consume and finalize in one claim-guarded transaction.
 
     The status-coupling rule is the most breakable invariant in R2: R1's sweeper only re-issues
     a tombstone whose owner is NULL or ``failed`` (G17), so a job that leaves a tombstone
     unconsumed must NOT end ``succeeded`` — the carrier would be stranded with no retry path.
-    A removal that owns no carrier keeps OQ-R2-1's leniency and succeeds while recording that
-    it proved nothing.
+    An Apply-promoted context is also a carrier: its attached generation and job context are
+    the only durable retry obligation after enqueue consumes receipt provenance. A removal
+    that owns none of these carriers keeps the apply-side leniency and records that it proved nothing.
 
     Returns whether the job ended ``succeeded``.
     """
     from nso_adapter.core.claim import ClaimRegistration, lock_claim, terminalize
-    from nso_adapter.store.models import JobStatus
+    from nso_adapter.store.models import DeploymentGeneration, JobStatus
 
     result: dict = {"scope": "static_route", "removal_branch": out.branch}
     if out.authorized:
@@ -1290,7 +1291,17 @@ async def _finalize_static_route_removal(db, job_id: int, device, client, out: S
     else:
         proven, residue_found, per_field = await _sr_networked_proof(db, client, device, out, result)
 
-    owns_carrier = bool(out.tombstone_ids) or bool(out.clears)
+    with db.no_autoflush:
+        promotes_static_route = await db.scalar(
+            select(
+                exists().where(
+                    DeploymentGeneration.job_id == job_id,
+                    DeploymentGeneration.stream_revisions["static_route"].as_string().is_not(None),
+                )
+            )
+        )
+    promoted_context = bool(out.authorized) and bool(promotes_static_route)
+    owns_carrier = bool(out.tombstone_ids) or bool(out.clears) or promoted_context
     consume = proven and not residue_found
 
     # The lock FIRST and held to COMMIT. no_autoflush is the lock ORDER: an ORM SELECT that
@@ -1831,6 +1842,7 @@ async def enqueue_removal(
     force: bool = False,
     retract: bool = False,
     shrank: bool = False,
+    document: dict | None = None,
 ):
     """Queue an async ``removal`` job that PUT-replaces *scope*'s service.
 
@@ -1886,8 +1898,16 @@ async def enqueue_removal(
     authorized — and then marked applied — whatever un-promoted store-only state the sibling
     lanes held, for instances this job does not even send (``interface_config`` flushes
     exactly *interfaces*).
+
+    *document* is the composed document the promoted generation deploys, stated by the caller
+    that already built it. A reissue composes its own, so *force* refuses it here rather than
+    dropping it silently. The same refusal applies to *marking* and *promotes*.
     """
-    from nso_adapter.core.generation import attach_to_job, create_generation, create_reissue_generation
+    from nso_adapter.core.generation import (
+        create_generation,
+        create_reissue_generation,
+        require_attach_to_job,
+    )
     from nso_adapter.core.request_flags import STORE_ONLY
     from nso_adapter.store.models import GenerationMode, Job, JobStatus, JobType
 
@@ -1897,6 +1917,8 @@ async def enqueue_removal(
         raise ValueError(f"Unknown removal marking {marking!r}")
     if force and marking is not None:
         raise ValueError(f"a force-removal of {scope!r} carries no deletion marking; got {marking!r}")
+    if force and document is not None:
+        raise ValueError(f"a force-removal of {scope!r} composes its own reissue document; got one to deploy")
     store_only = STORE_ONLY.get()
     context: dict = {"scope": scope}
     if interfaces:
@@ -1965,6 +1987,7 @@ async def enqueue_removal(
             streams=promotes,
             mode=mode,
             allowed_removal_keys=context.get("removed") or {},
+            document=document,
             removal_context=context,
             settlement_cohort=settlement_cohort,
         )
@@ -1976,7 +1999,7 @@ async def enqueue_removal(
     )
     db.add(job)
     await db.flush()
-    await attach_to_job(db, generation, job)
+    await require_attach_to_job(db, generation, job)
     await _settle_pending_clears_at_admission(db, device_id, scope, promotes, mode=mode, force=force)
     logger.info("removal.enqueued", device_id=device_id, scope=scope, job_id=job.id, marking=marking)
     return job
@@ -2248,6 +2271,144 @@ _ROUTE_POLICY_FAMILY_LISTS: dict[str, str] = {
     "as_path": "as-path",
     "route_map": "route-map",
 }
+
+
+class PromotionRemovalContext(NamedTuple):
+    """Existing removal-runner inputs derived from an immutable projection delta."""
+
+    interfaces: list[str] | None
+    removed: dict[str, list] | None
+    vault_refs: dict[str, str] | None
+
+
+class PromotionInterfaceUnresolved(ValueError):
+    """A projection delta refers to an interface row that no longer exists."""
+
+
+def _row_keys(rows: dict[str, list[dict]], table: str, *fields: str) -> list:
+    values = []
+    for row in rows.get(table, []):
+        key = tuple(row.get(field) for field in fields)
+        values.append(key[0] if len(key) == 1 else key)
+    return sorted(set(values), key=str)
+
+
+_PROMOTION_GUARD_FIELDS: dict[str, tuple[tuple[str, str, tuple[str, ...]], ...]] = {
+    "vlan": (("vlan_intent", "vlan", ("vlan_id",)),),
+    "bfd": (("bfd_intent", "interface", ("interface_name",)),),
+    "svi": (("svi_intent", "interface", ("interface_name",)),),
+    "subinterface": (("subinterface_intent", "interface", ("interface_name",)),),
+    "interface_mtu": (("interface_mtu_intent", "interface", ("interface_name",)),),
+    "logging": (("logging_host_intent", "host", ("address",)),),
+    "l2_sap": (("l2_sap_intent", "sap", ("service_name", "sap_id")),),
+    "static_route": (("static_route_intent", "route", ("vrf", "prefix", "next_hop")),),
+    "snmp": (
+        ("snmp_community_intent", "community", ("label",)),
+        ("snmp_v3_user_intent", "v3-user", ("username",)),
+        ("snmp_host_intent", "host", ("address",)),
+    ),
+    "bgp": (
+        ("bgp_router_intent", "router", ("asn",)),
+        ("bgp_peer_intent", "peer", ("peer_address",)),
+    ),
+    "ospf": (
+        ("ospf_instance_intent", "process-config", ("process_id",)),
+        ("ospf_interface_intent", "interface-config", ("interface_name",)),
+    ),
+    "isis": (
+        ("isis_process_intent", "process-config", ("process_tag",)),
+        ("isis_interface_intent", "interface-config", ("interface_name", "af")),
+    ),
+}
+
+
+async def _promotion_interface_context(
+    db: AsyncSession,
+    device_id: int,
+    removed_rows: dict[str, list[dict]],
+    replacement_rows: dict[str, list[dict]],
+) -> tuple[list[str], dict[str, list]]:
+    from nso_adapter.store.models import DbInterface
+
+    all_rows = [
+        row
+        for tables in (removed_rows, replacement_rows)
+        for rows in tables.values()
+        for row in rows
+        if isinstance(row.get("interface_id"), int)
+    ]
+    interface_ids = sorted({row["interface_id"] for row in all_rows})
+    names_by_id: dict[int, str] = {}
+    if interface_ids:
+        names_by_id = dict(
+            (
+                await db.execute(
+                    select(DbInterface.id, DbInterface.name).where(
+                        DbInterface.device_id == device_id,
+                        DbInterface.id.in_(interface_ids),
+                    )
+                )
+            )
+            .tuples()
+            .all()
+        )
+    unresolved = sorted(set(interface_ids) - names_by_id.keys())
+    if unresolved:
+        raise PromotionInterfaceUnresolved(f"unresolved interface ids: {unresolved}")
+    # Every integer interface id in all_rows is present in names_by_id.
+    interfaces = sorted({names_by_id[row["interface_id"]] for row in all_rows})
+    # Keep this filter for id-less rows, which all_rows excludes.
+    address_keys = [
+        (names_by_id[row["interface_id"]], row.get("address") or "", row.get("vrf") or "")
+        for row in removed_rows.get("interface_ip_intent", [])
+        if row.get("interface_id") in names_by_id
+    ]
+    removed = {"address": sorted(set(address_keys))} if address_keys else {}
+    return interfaces, removed
+
+
+async def promotion_removal_context(
+    db: AsyncSession,
+    device_id: int,
+    scope: str,
+    removed_rows: dict[str, list[dict]],
+    *,
+    replacement_rows: dict[str, list[dict]] | None = None,
+) -> PromotionRemovalContext:
+    """Build the normal enqueue inputs for one selected projection stream.
+
+    This is the Apply-side inverse of the existing intent endpoints. It maps store keys to
+    the same guarded YANG labels and interface instance list those endpoints pass to
+    :func:`enqueue_removal`. The runner therefore keeps sole ownership of guard, detach,
+    residue, carrier, and proof behavior.
+    """
+    if scope not in VALID_REMOVAL_SCOPES:  # pragma: no cover - caller validates first
+        raise ValueError(f"Unknown removal scope {scope!r}")
+
+    removed: dict[str, list] = {}
+    interfaces: list[str] | None = None
+    vault_refs: dict[str, str] | None = None
+
+    for table, label, fields in _PROMOTION_GUARD_FIELDS.get(scope, ()):
+        if keys := _row_keys(removed_rows, table, *fields):
+            removed[label] = keys
+    if scope == "route_policy":
+        for row in removed_rows.get("route_policy_object_intent", []):
+            family = row.get("family")
+            family_list = _ROUTE_POLICY_FAMILY_LISTS.get(family) if isinstance(family, str) else None
+            if family_list:
+                removed.setdefault(family_list, []).append(row.get("name"))
+    if scope == "snmp":
+        refs = {
+            row["label"]: row["vault_ref"]
+            for row in removed_rows.get("snmp_community_intent", [])
+            if row.get("label") and row.get("vault_ref")
+        }
+        vault_refs = refs or None
+    if scope == "interface_config":
+        interfaces, removed = await _promotion_interface_context(db, device_id, removed_rows, replacement_rows or {})
+
+    return PromotionRemovalContext(interfaces, removed or None, vault_refs)
 
 
 def removed_map(scope: str, removed) -> dict[str, list]:

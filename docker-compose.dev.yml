@@ -45,7 +45,14 @@ services:
       - POSTGRES_PASSWORD=nso
       - POSTGRES_DB=nso_adapter
     volumes:
-      - nso_adapter_pgdata:/var/lib/postgresql/data
+      # 18+ images refuse a mount at .../data: the mount point moved to the parent dir.
+      # A volume written under the 16 layout holds its cluster at the volume ROOT, which
+      # the 18 entrypoint finds as an old database at /var/lib/postgresql and refuses to
+      # start against. To KEEP that data, pin the image back to postgres:16-alpine with the
+      # old `:/var/lib/postgresql/data` mount, pg_dump, then restore into 18. To discard it
+      # (dev data is disposable), `docker compose -f docker-compose.dev.yml down -v` drops
+      # the volume and the next start re-inits under /var/lib/postgresql/18/docker.
+      - nso_adapter_pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U nso -d nso_adapter"]
       interval: 5s
@@ -69,7 +76,7 @@ services:
     # PGDATA on tmpfs + durability off: the data is worthless by construction, and
     # CREATE DATABASE ... TEMPLATE is dominated by fsync.
     tmpfs:
-      - /var/lib/postgresql/data
+      - /var/lib/postgresql
     command: >
       postgres -c fsync=off -c full_page_writes=off -c synchronous_commit=off
                -c wal_level=minimal -c max_wal_senders=0 -c shared_buffers=256MB

@@ -27,14 +27,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, internal_error, terminalize
-from nso_adapter.core.generation import executing_generation, note_write
+from nso_adapter.core.generation import document_execution_sections, executing_generation, note_write
 from nso_adapter.core.projection import (
     DOCUMENT_EXECUTED_SECTIONS,
     hydrate_section,
     intent_state,
     section_models,
 )
-from nso_adapter.core.static_route_plan import authorized_clear_fields, build_plan
+from nso_adapter.core.static_route_plan import SrPlan, authorized_clear_fields, build_plan
 from nso_adapter.nso.apply import NsoApplyError
 from nso_adapter.store.models import (
     BfdIntent,
@@ -1203,11 +1203,20 @@ class _Projection:
     nothing was ever written for. Its live read returns nothing either, so the two agree.
     """
 
-    def __init__(self, db: AsyncSession, device_id: int, force: bool, document: dict | None):
+    def __init__(
+        self,
+        db: AsyncSession,
+        device_id: int,
+        force: bool,
+        document: dict | None,
+        sections: frozenset[str] | None = None,
+    ):
         self._db = db
         self._device_id = device_id
         self._force = force
         self._document = document
+        self._sections = sections
+        self._models = section_models(sections) if sections is not None else None
         self._hydrated: dict[type, list] | None = None
 
     def _document_rows(self) -> dict[type, list]:
@@ -1215,12 +1224,19 @@ class _Projection:
             if self._document is None:
                 raise RuntimeError("document rows requested without a deployment document")
             rows: dict[type, list] = {}
-            for section in DOCUMENT_EXECUTED_SECTIONS.intersection(self._document):
+            sections = (
+                self._sections
+                if self._sections is not None
+                else DOCUMENT_EXECUTED_SECTIONS.intersection(self._document)
+            )
+            for section in sections:
                 rows.update(hydrate_section(self._document, section))
             self._hydrated = rows
         return self._hydrated
 
     async def collect(self, model) -> _Rows:
+        if self._models is not None and model not in self._models:
+            return _Rows(push=[], stamp=[])
         live = await _collect_eligible(self._db, model, self._device_id, self._force)
         if self._document is None or model not in _DOCUMENT_MODELS:
             return _Rows(push=live, stamp=live)
@@ -2900,20 +2916,35 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     # ── Step 0: sync-from before apply (best-effort) ──
     await _maybe_sync_from(db, client, device_name, device_id)
 
-    # ── Step 1: snapshot intent + collect every scope's eligible rows ──
-    ifaces = {
-        iface.id: iface
-        for iface in (await db.execute(select(DbInterface).where(DbInterface.device_id == device_id))).scalars().all()
-    }
-    intent_snapshot, attr_eligible = await _collect_attr_eligibility(db, ifaces, force)
-    ip_snapshot, ip_eligible_by_iface = await _collect_ip_eligibility(db, ifaces, force)
-
     # WHAT this run deploys is decided by the generation the job carries, not by the store as
     # it stands now (#1522 §G1). Between the worker committing `running` and this point a
     # successor push can commit; without the stored document it would be deployed here, under
     # this generation's identity and settled as this generation's revision.
     generation = await executing_generation(db, job_id)
-    source = _Projection(db, device_id, force, generation.document if generation is not None else None)
+    document_sections = await document_execution_sections(db, job_id)
+
+    # ── Step 1: snapshot intent + collect every scope this job is allowed to execute ──
+    if document_sections is None or "interface_config" in document_sections:
+        ifaces = {
+            iface.id: iface
+            for iface in (await db.execute(select(DbInterface).where(DbInterface.device_id == device_id)))
+            .scalars()
+            .all()
+        }
+        intent_snapshot, attr_eligible = await _collect_attr_eligibility(db, ifaces, force)
+        ip_snapshot, ip_eligible_by_iface = await _collect_ip_eligibility(db, ifaces, force)
+    else:
+        ifaces = {}
+        intent_snapshot, attr_eligible = [], []
+        ip_snapshot, ip_eligible_by_iface = [], {}
+
+    source = _Projection(
+        db,
+        device_id,
+        force,
+        generation.document if generation is not None else None,
+        document_sections,
+    )
 
     snmp_comm = (await source.collect(SnmpCommunityIntent)).push
     snmp_user = (await source.collect(SnmpV3UserIntent)).push
@@ -2926,7 +2957,10 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     # #1396 R2 §3: ONE classifier decides the static-route mode and snapshots the rows the
     # body is built from, the rows this pass stamps, the keys the guard may see disappear
     # and the tombstones the body must retain.
-    sr_plan = await build_plan(db, device, eligible_rows=sr_eligible)
+    if document_sections is None or "static_route" in document_sections:
+        sr_plan = await build_plan(db, device, eligible_rows=sr_eligible)
+    else:
+        sr_plan = SrPlan("PATCH", [], set(), [], [], 0)
     # What the static-route send learned, for §4.4's proof: the verify verdict and the exact
     # route keys the body carried. Filled by the scope coroutine, read after it returns.
     sr_outbox: dict = {}

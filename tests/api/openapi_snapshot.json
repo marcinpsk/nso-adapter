@@ -1,6 +1,195 @@
 {
   "components": {
     "schemas": {
+      "ActionApplyGenerationOut": {
+        "properties": {
+          "digest": {
+            "title": "Digest",
+            "type": "string"
+          },
+          "generation_id": {
+            "title": "Generation Id",
+            "type": "integer"
+          },
+          "job_id": {
+            "title": "Job Id",
+            "type": "integer"
+          },
+          "mode": {
+            "enum": [
+              "networked",
+              "detach"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "seq": {
+            "title": "Seq",
+            "type": "integer"
+          },
+          "source_push_seq": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": "Source Push Seq",
+            "type": "object"
+          },
+          "stream_revisions": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Stream Revisions",
+            "type": "object"
+          }
+        },
+        "required": [
+          "generation_id",
+          "seq",
+          "job_id",
+          "mode",
+          "source_push_seq",
+          "stream_revisions",
+          "digest"
+        ],
+        "title": "ActionApplyGenerationOut",
+        "type": "object"
+      },
+      "ActionApplyIn": {
+        "description": "The exact push sequences this manual Apply is allowed to promote.",
+        "properties": {
+          "selected": {
+            "additionalProperties": {
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "title": "Selected",
+            "type": "object"
+          }
+        },
+        "required": [
+          "selected"
+        ],
+        "title": "ActionApplyIn",
+        "type": "object"
+      },
+      "ActionApplyOut": {
+        "properties": {
+          "device_id": {
+            "title": "Device Id",
+            "type": "integer"
+          },
+          "generations": {
+            "items": {
+              "$ref": "#/components/schemas/ActionApplyGenerationOut"
+            },
+            "title": "Generations",
+            "type": "array"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "outcome": {
+            "enum": [
+              "promoted",
+              "no_op"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "selected": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Selected",
+            "type": "object"
+          },
+          "skipped": {
+            "additionalProperties": {
+              "enum": [
+                "superseded",
+                "already_applied",
+                "already_authorized",
+                "no_receipt",
+                "backfill_only",
+                "revision_mismatch"
+              ],
+              "type": "string"
+            },
+            "title": "Skipped",
+            "type": "object"
+          },
+          "skipped_detail": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/ActionApplySkippedDetailOut"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skipped Detail"
+          }
+        },
+        "required": [
+          "device_id",
+          "outcome",
+          "selected",
+          "skipped",
+          "skipped_detail",
+          "generations"
+        ],
+        "title": "ActionApplyOut",
+        "type": "object"
+      },
+      "ActionApplySkippedDetailOut": {
+        "properties": {
+          "generation_id": {
+            "title": "Generation Id",
+            "type": "integer"
+          },
+          "seq": {
+            "title": "Seq",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "running",
+              "failed",
+              "outcome_unknown",
+              "abandoned"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "generation_id",
+          "seq",
+          "status"
+        ],
+        "title": "ActionApplySkippedDetailOut",
+        "type": "object"
+      },
       "ApplyDiffOut": {
         "description": "apply-diff preview \u2014 {scope: native_delta} for scopes with a non-empty change.",
         "properties": {
@@ -1638,6 +1827,7 @@
               "internal",
               "not_implemented",
               "nso_commit_failed",
+              "apply_unexecutable",
               "ambiguous_device",
               "bad_request",
               "community_not_found",
@@ -9227,7 +9417,7 @@
     },
     "/api/v1/devices/{device_id}/actions/apply": {
       "post": {
-        "description": "Phase 2 \u2014 push accepted NetBox intent to NSO via reconcile-commit service.",
+        "description": "Atomically promote the selected pushes and enqueue their immutable generation chain.",
         "operationId": "action_apply_api_v1_devices__device_id__actions_apply_post",
         "parameters": [
           {
@@ -9240,12 +9430,32 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActionApplyIn"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionApplyOut"
+                }
+              }
+            },
+            "description": "No selected stream required a job"
+          },
           "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/JobTriggerOut"
+                  "$ref": "#/components/schemas/ActionApplyOut"
                 }
               }
             },
@@ -9290,6 +9500,16 @@
               }
             },
             "description": "Request validation failed (envelope shape)"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal adapter invariant failed"
           }
         },
         "security": [

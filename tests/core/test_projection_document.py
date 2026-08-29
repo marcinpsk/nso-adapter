@@ -24,8 +24,13 @@ pytestmark = pytest.mark.anyio
 
 
 def test_every_section_is_either_document_executed_or_names_its_blocker():
-    """No third state. Adding a section forces a decision about how it deploys."""
-    from nso_adapter.core.projection import DOCUMENT_EXECUTED_SECTIONS, LIVE_READ_SECTIONS, projection_sections
+    """No third state. Manual selection and execution stay equal but distinct concepts."""
+    from nso_adapter.core.projection import (
+        ACTION_APPLY_EXECUTABLE_SECTIONS,
+        DOCUMENT_EXECUTED_SECTIONS,
+        LIVE_READ_SECTIONS,
+        projection_sections,
+    )
 
     partition = DOCUMENT_EXECUTED_SECTIONS | set(LIVE_READ_SECTIONS)
     assert partition == projection_sections(), (
@@ -34,6 +39,12 @@ def test_every_section_is_either_document_executed_or_names_its_blocker():
     )
     assert not (DOCUMENT_EXECUTED_SECTIONS & set(LIVE_READ_SECTIONS)), "a section cannot be both"
     assert all(reason for reason in LIVE_READ_SECTIONS.values()), "every live-read section must state why"
+    assert ACTION_APPLY_EXECUTABLE_SECTIONS == DOCUMENT_EXECUTED_SECTIONS, (
+        "manual Apply may select exactly the sections that execute from their documents"
+    )
+    assert ACTION_APPLY_EXECUTABLE_SECTIONS is not DOCUMENT_EXECUTED_SECTIONS, (
+        "selection and execution answer different questions even while their members match"
+    )
 
 
 def test_every_projection_column_has_a_supported_json_round_trip():
@@ -76,6 +87,12 @@ def test_hydrate_section_accepts_an_explicitly_empty_section():
     assert hydrate_section({"vlan": {}}, "vlan") == {}
 
 
+def test_composing_an_empty_promoted_stream_preserves_its_section():
+    from nso_adapter.core.generation import _compose_document
+
+    assert _compose_document({"vlan": {}}) == {"vlan": {}}
+
+
 async def test_a_snapshot_hydrates_back_into_the_rows_it_was_taken_from(adapter_client):
     """Round-trip fidelity, including the types JSON cannot hold natively."""
     from nso_adapter.core.projection import hydrate_section, snapshot_stream
@@ -115,6 +132,24 @@ def test_hydrating_a_row_without_its_primary_key_is_refused():
         hydrate_section({"vlan": {"vlan_intent": [{"device_id": 1, "vlan_id": 10}]}}, "vlan")
     with pytest.raises(ValueError, match="primary key"):
         hydrate_section({"vlan": {"vlan_intent": [{"id": None, "device_id": 1, "vlan_id": 10}]}}, "vlan")
+
+
+def test_only_the_static_route_tables_carry_a_correlation_column():
+    """``projection_row_state`` drops these by NAME, for every table.
+
+    They are NetBox lineage the device payload never renders, so dropping them stops a
+    correlation-only repair from reading as a device delta. A table that gained a column of
+    either name for real content would have it silently dropped instead, so pin the fact.
+    """
+    from nso_adapter.core.projection import _SECTION_TABLES, CORRELATION_COLUMNS
+
+    carriers = {
+        spec.model.__tablename__
+        for specs in _SECTION_TABLES.values()
+        for spec in specs
+        if CORRELATION_COLUMNS & {column.key for column in spec.model.__table__.columns}
+    }
+    assert carriers == {"static_route_intent", "static_route_tombstone"}
 
 
 # ── stream ownership: the authorization partition ────────────────────────────

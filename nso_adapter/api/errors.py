@@ -26,6 +26,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from nso_adapter.core.receipt import PromotionProvenanceUnexecutable
+
 logger = structlog.get_logger(__name__)
 
 # Closed set. Every member is documented in docs/api-contract.md (error body).
@@ -42,6 +44,7 @@ ErrorCode = Literal[
     "internal",
     "not_implemented",
     "nso_commit_failed",
+    "apply_unexecutable",
     # per-endpoint
     "ambiguous_device",
     "bad_request",
@@ -185,6 +188,21 @@ async def projection_gone_handler(request: Request, exc: Exception) -> JSONRespo
     )
 
 
+async def promotion_provenance_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Refuse a push that cannot execute deletion provenance from an earlier revision."""
+    assert isinstance(exc, PromotionProvenanceUnexecutable)
+    stream = exc.stream
+    return await api_error_handler(
+        request,
+        api_error(
+            409,
+            "apply_unexecutable",
+            str(exc),
+            {"streams": {stream: "outstanding_deletion_provenance"}},
+        ),
+    )
+
+
 #: How many innermost traceback frames the unhandled-exception log keeps.
 _WHERE_FRAMES = 5
 
@@ -280,6 +298,7 @@ RESP_409_PUSH_SEQ_OR_DEVICE_BUSY: ResponseSpec = {
 RESP_422_VALIDATION: ResponseSpec = {
     422: {**_ENVELOPE_SCHEMA, "description": "Request validation failed (envelope shape)"}
 }
+RESP_500_INTERNAL: ResponseSpec = {500: {**_ENVELOPE_SCHEMA, "description": "Internal adapter invariant failed"}}
 RESP_501: ResponseSpec = {501: {**_ENVELOPE_SCHEMA, "description": "Not supported by the configured provider"}}
 RESP_502_NSO: ResponseSpec = {502: {**_ENVELOPE_SCHEMA, "description": "NSO unreachable"}}
 RESP_502: ResponseSpec = {502: {**_ENVELOPE_SCHEMA, "description": "Upstream (NSO/Vault) operation failed"}}

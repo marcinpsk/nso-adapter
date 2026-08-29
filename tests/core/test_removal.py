@@ -164,9 +164,13 @@ async def test_replace_on_removal_unknown_model_returns_false(adapter_client):
 
 
 def test_enqueue_removal_requires_a_promotion_disposition():
-    parameter = inspect.signature(enqueue_removal).parameters["promotes"]
+    parameters = inspect.signature(enqueue_removal).parameters
 
-    assert parameter.default is inspect.Parameter.empty
+    for name in ("promotes", "marking", "defer_retract"):
+        assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameters[name].default is inspect.Parameter.empty, (
+            f"{name} gained a default; a silent default misdispatches the removal"
+        )
 
 
 async def test_enqueue_removal_rejects_unknown_scope(adapter_client):
@@ -1749,6 +1753,23 @@ async def test_enqueue_removal_force_refuses_to_promote(adapter_client):
         with pytest.raises(ValueError, match="promotes nothing"):
             await enqueue_removal(
                 db, device_id, "svi", marking=None, defer_retract=False, promotes=("svi",), force=True
+            )
+
+
+async def test_enqueue_removal_force_refuses_a_composed_document(adapter_client):
+    """A reissue composes its own document; accepting one and dropping it deploys the wrong bytes."""
+    device_id = await _seed_device(nso_device_name="sw-force-document")
+    async with session() as db:
+        with pytest.raises(ValueError, match="composes its own reissue document"):
+            await enqueue_removal(
+                db,
+                device_id,
+                "svi",
+                marking=None,
+                defer_retract=False,
+                promotes=(),
+                force=True,
+                document={"svi": {"svi_intent": []}},
             )
 
 

@@ -47,7 +47,9 @@
     `nso_unreachable`, `netbox_unreachable`, `conflict`, `internal`.
   - Phase 2: `not_implemented` (apply endpoint pre-M4),
     `nso_commit_failed` (M5+, reconcile-commit refused or partially
-    failed; `error.detail.attributes` lists the failed ones).
+    failed; `error.detail.attributes` lists the failed ones), and
+    `apply_unexecutable` (409, a selected stream cannot be delivered faithfully by its
+    existing apply or removal runner; `error.detail.streams` maps each stream to its reason).
   - Per-endpoint: `ambiguous_device` (device lookup matches >1),
     `bad_request` (malformed action parameter), `community_not_found`
     (SNMP harvest), `harvest_unsupported_ned`, `invalid_vault_ref`
@@ -641,37 +643,100 @@ A concurrent retry or abandon also returns `409 conflict`, with an empty
 `error.detail` object.
 
 ### `POST /api/v1/devices/{id}/actions/apply` (Phase 2)
-Push accepted NetBox intent to NSO via the reconcile-commit service (Spike
-**S2**, milestone **M4**). Until M4 ships, this endpoint returns `501`:
+
+Atomically promote the exact intent pushes selected by the caller and enqueue their
+immutable deployment-generation chain. The selector maps the adapter's receipt stream name
+to the `X-Push-Seq` that the plugin drained:
+
 ```json
-{ "error": { "code": "not_implemented",
-             "message": "apply action requires Phase 2 NSO reconcile service (Spike S2 / M4)",
-             "detail": { "spike": "S2", "milestone": "M4",
-                         "docs": "docs/00-plan.md#11-phase-2-kickoff-2026-05-23" } } }
+{ "selected": { "vlan": 4711 } }
 ```
 
-Once M4 lands, normal contract:
+The selector uses push sequences, not current revisions, because the plugin already owns
+these values in its drain bookkeeping and the adapter receipts use the same identity. A
+selected sequence is a strict integer in the receipt domain `1..2^63-1`. A value outside
+that domain returns `422 validation_error`.
 
-- Body: empty, or `{ "force": true }` (default `true` — see decision Q in
-  `docs/00-plan.md` §11). `force=true` pushes every eligible attribute on
-  the device (`accepted` / `apply_failed` / `drifted` / `in_sync`) so the
-  operator can "shake the tree". `force=false` skips `in_sync` attributes
-  (idempotent NSO no-op avoided).
-- → `202 { "job_id": <int> }`. Same 409 concurrency rule as other actions.
-- The apply worker (see `nso-adapter.md` §7a):
-  1. Snapshots the device's `interface_intent` rows at job start into the
-     `job.context` field — this snapshot is the audit trail; the plugin's
-     live state may move on.
-  2. For each in-scope attribute: writes via the reconcile-commit service,
-     status transitions `accepted`/`drifted`/`apply_failed` → `deploying`.
-  3. On NSO commit success: status → `in_sync`, `last_apply_at` updated.
-  4. On NSO commit failure: status → `apply_failed`, NSO error captured in
-     `last_apply_error`; intent value **unchanged**; no rollback attempted
-     (decision O).
-- New error codes for this endpoint:
-  - `not_implemented` (501) — pre-M4.
-  - `nso_commit_failed` (502) — the apply ran but at least one attribute's
-    commit failed; `error.detail.attributes` lists the failed ones.
+A stream is promotable only when its latest durable receipt and projection row both match the
+selected sequence. A later push never rides an earlier selection. Every stale selection is
+reported under `skipped`: `superseded` for an older sequence, `already_applied` when its
+revision settled, `already_authorized` when its generation is still unsettled or was
+abandoned, `no_receipt` when the adapter has no matching receipt, `backfill_only` when the
+matching receipt was admitted in backfill-only mode, and `revision_mismatch` when the
+receipt matches but the projection row does not. `backfill_only` is terminal for that
+sequence: the receipt exists and holds it, but a backfill repairs correlation only, so no
+retry of the same selection can promote it.
+`skipped_detail` is keyed by stream; only its CONTENT is conditional — the key itself is
+always present. It identifies the generation for
+each `already_authorized` skip whose owning generation can be identified. Each member has
+the shape `{ "generation_id": <int>, "seq": <int>, "status": "<status>" }`. The value is
+`null` when no member qualifies. The retry and abandon actions own the
+identified generation. Apply cannot replace it with weaker work.
+An empty selection, or a request in which every selection is skipped, returns `200` with an
+explicit no-op and no `job_id`:
+
+```json
+{ "device_id": 1, "outcome": "no_op",
+  "selected": { "vlan": 4711 },
+  "skipped": { "vlan": "already_authorized" },
+  "skipped_detail": {
+    "vlan": { "generation_id": 80, "seq": 3, "status": "abandoned" }
+  },
+  "generations": [] }
+```
+
+A promotion returns the complete ordered chain. Each link has its queued job. The success
+barrier decides when each successor job may start. The response returns `202`, and its
+top-level `job_id` is the first job in that chain.
+
+```json
+{
+  "device_id": 1,
+  "outcome": "promoted",
+  "job_id": 501,
+  "selected": { "vlan": 4711 },
+  "skipped": {},
+  "skipped_detail": null,
+  "generations": [
+    { "generation_id": 81, "seq": 4, "job_id": 501, "mode": "networked",
+      "source_push_seq": { "vlan": 4711 },
+      "stream_revisions": { "vlan": 7 }, "digest": "<sha256>" }
+  ]
+}
+```
+
+Promotion, document storage, cohort allocation, generation creation, and job enqueue occur
+in one transaction under the device projection lock. Removal work uses the ordinary
+`enqueue_removal` path and its existing scope runner. Networked removal generations precede
+the apply generation; detach removal generations follow it, so the top-level `job_id` names
+the first networked removal when one exists. The networked intermediate document
+retains every detach-only row. The detach generation stores the selected desired document.
+All links in the request share one non-null `settlement_cohort`; a singleton leaves it null.
+A failed head blocks every successor through the ordinary generation success barrier.
+
+Apply refuses the whole request with `409 apply_unexecutable` when any selected stream cannot
+be routed faithfully through those runners. The refusal names each stream and reason. It does
+not promote or enqueue a subset. Reasons are stable machine codes:
+`live_read_execution`, `mixed_detach_replacement`, `no_executable_interface`, and
+`unresolved_interface_identity`. A push can also return `outstanding_deletion_provenance`
+when its receipt still carries deletion work.
+
+The current manual-Apply boundary is exactly `DOCUMENT_EXECUTED_SECTIONS`, which currently
+contains only `vlan`. Every other selected stream refuses with `409 apply_unexecutable` and
+reason `live_read_execution`, because its runner reads the live intent store and cannot
+guarantee that it executes the selected revision. Static route remains outside the boundary:
+its companion apply reads live `StaticRouteIntent`, and removal claim subtraction also reads
+live claims. A store-only push between Apply and worker start could otherwise deploy
+unselected state under the selected generation. `ACTION_APPLY_EXECUTABLE_SECTIONS` declares
+this boundary. It widens when a section moves into `DOCUMENT_EXECUTED_SECTIONS` as the
+aggregate document builder lands.
+
+Deletion provenance from a store-only revision remains an execution obligation. If a later
+ordinary push would promote that stream without executing the carried deletion, the entire
+push refuses with `409 apply_unexecutable` and reason `outstanding_deletion_provenance`.
+The transaction rollback preserves the earlier receipt and its provenance. The error message
+directs the caller to Apply that receipt when its stream is document-executed, then retry the
+later push.
 
 **Reconcile commit (brownfield guardrail).** Every reconciler-service write (apply,
 update, and removal PUT-replace) is committed with the NSO RESTCONF
@@ -1161,15 +1226,17 @@ Response lists are sorted and do not preserve request order. The receipt's
 `request_digest` covers the body as sent — array order included — so two orderings of one
 request are different delivery identities, not one replayed receipt.
 
-#### `409` before any effect: `fence_shut` and `store_only_deletion`
+#### `409` before any effect: `fence_shut`
 
-A genuine deletion needs a tombstone — the only carrier of the deletion once the intent row
-is gone. No tombstone is written while the device's replacement fence is shut (some row still
-carries no `route_id`) or the request is `?store_only=true`. A request carrying a genuine
-deletion under either condition is refused with `409 conflict` and
-`error.detail.reason = "fence_shut"` or `"store_only_deletion"`, **before any effect**: no row
-deleted, no tombstone, no job, and no receipt — so the sequence is not burned and the pusher
-can abandon the claim and re-send at a new one. `error.detail.route_ids` names the ids.
+A genuine deletion needs a tombstone, the only carrier of the deletion once the intent row
+is gone for an immediately promoted request. No tombstone is written while the device's
+replacement fence is shut (some row still carries no `route_id`), so a normal request with a
+genuine deletion is refused with `409 conflict` and `error.detail.reason = "fence_shut"`
+before any effect. `error.detail.route_ids` names the ids.
+
+A `?store_only=true` request writes no tombstone and no job. It stores each removed row's
+deletion marking in the durable receipt instead. A later `actions/apply` can promote that
+exact push sequence and construct its networked and detach links without losing provenance.
 
 #### `?backfill_only=true` — opening the fence
 
@@ -2041,9 +2108,14 @@ Every `PUT /api/v1/devices/{id}/*-intent` endpoint below (and `vlan-intent`,
   absent from the body are deleted from the mirror. An empty list clears the
   scope.
 - `accepted_at` per row; defaults to *now* when omitted.
-- Storing intent **never touches the device**. If `auto_apply` is enabled in
-  the device settings, an apply job is enqueued; otherwise the next explicit
-  `actions/apply` commits it via the scope's `*-reconciler` NSO service.
+- Storing intent **never touches the device synchronously**. If `auto_apply` is enabled in
+  the device settings, an ordinary non-store-only PUT enqueues the scope's apply job.
+  Otherwise the intent remains stored in the mirror.
+- Explicit `actions/apply` promotes only document-executed sections, currently `vlan`.
+  Selecting a live-read section such as `logging` or `bgp` returns `409 apply_unexecutable`
+  with reason `live_read_execution`. To deploy one of those sections, enable `auto_apply`
+  and send an ordinary non-store-only intent PUT. Use a new `X-Push-Seq` when resending a
+  stored payload because receipt replay returns the recorded response without new work.
 - Where dropping a row from a keyed NSO service list requires it, the adapter
   queues an async removal job (see [Removal propagation](#removal-propagation)).
 - → `200` `{ "device_id": 1, "count": <rows stored>, "removed": <rows dropped> }`.
@@ -2084,14 +2156,17 @@ stream in the affected section in the same transaction. It records no new row.
 
 That PUT-replace is a synchronous device commit that can exceed the plugin's HTTP
 client timeout (~30s). So it does **not** run inline in the intent PUT: when an
-intent PUT drops one or more rows it enqueues a **`removal`** job (a new
-`jobtype` enum value), atomically with the row deletes, and returns immediately.
+intent PUT drops one or more rows it enqueues **`removal`** jobs (a `jobtype`
+enum value), one per deletion-marking group. A request whose drops carry both
+delete-origin and detach markings produces a networked job and a detach job
+atomically with the row deletes, and returns immediately.
 `?store_only=true` is the exception: it updates the mirror without authorizing the
-drop on the device, so it enqueues no removal job (and no apply job, whatever the
+drop on the device, so it enqueues no removal jobs (and no apply job, whatever the
 device's `auto_apply` setting) — clients must not wait for jobs it never creates.
-A worker runs the job in the background, re-reading the **current** accepted rows
-and PUT-replacing the service — so the job is idempotent and is requeued (not
-failed) after a worker restart. Scope is carried in `Job.context.scope` (one of
+A worker runs each job in the background and PUT-replaces the service. A promoted
+removal in a document-executed section renders from its generation's immutable
+document; a force-reissue renders from the current accepted rows. Either way the
+job is idempotent and is requeued (not failed) after a worker restart. Scope is carried in `Job.context.scope` (one of
 `route_policy · bfd · svi · subinterface · static_route · interface_mtu · vlan ·
 logging · l2_sap · ospf · bgp · isis · interface_config · snmp`). Job status is
 observable via `GET …/jobs` like any other job; a failed removal records

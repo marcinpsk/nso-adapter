@@ -475,13 +475,26 @@ async def test_the_final_settled_cohort_member_rechecks_every_carried_stream(ada
     assert streams == {"static_route": 1, "vlan": 1}
 
 
-async def test_an_unchanged_apply_settles_after_the_same_revision_was_abandoned(adapter_client):
-    """An abandoned deployment at revision 1 does not block a later Apply of revision 1."""
+async def test_an_abandoned_removal_revision_cannot_be_repromoted_as_a_plain_apply(adapter_client):
+    """Retry or reconcile owns an authorized but unapplied revision."""
     from nso_adapter.store.models import GenerationStatus, JobStatus
 
     device_id = await _device("gen-abandoned-same-revision", 9713)
     await _vlan(device_id, 41)
+    await _vlan(device_id, 42)
     await _push(adapter_client, device_id)
+    assert await _finish(device_id, JobStatus.succeeded) is not None
+
+    _vlans[device_id] = [41]
+    await _push(adapter_client, device_id, store_only=True)
+    selected = (await _stream(device_id, "vlan")).source_push_seq
+    first_apply = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/apply",
+        json={"selected": {"vlan": selected}},
+        headers=_AUTH,
+    )
+    assert first_apply.status_code == 202
+    removal = (await _generations(device_id))[1]
 
     assert await _finish(device_id, JobStatus.failed) is not None
     abandon = await adapter_client.post(
@@ -490,15 +503,21 @@ async def test_an_unchanged_apply_settles_after_the_same_revision_was_abandoned(
     )
     assert abandon.status_code == 202
 
-    apply = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/apply", headers=_AUTH)
-    assert apply.status_code == 202
-    first, second = await _generations(device_id)
-    assert first.status is GenerationStatus.abandoned
-    assert first.stream_revisions == second.stream_revisions == {"vlan": 1}
-
-    assert await _finish(device_id, JobStatus.succeeded) == second.job_id
+    apply = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/apply",
+        json={"selected": {"vlan": selected}},
+        headers=_AUTH,
+    )
+    assert apply.status_code == 200
+    assert apply.json()["outcome"] == "no_op"
+    assert apply.json()["skipped"] == {"vlan": "already_authorized"}
+    assert apply.json()["skipped_detail"] == {
+        "vlan": {"generation_id": removal.id, "seq": removal.seq, "status": "abandoned"}
+    }
+    assert len(await _generations(device_id)) == 2
+    assert (await _generations(device_id))[1].status is GenerationStatus.abandoned
     stream = await _stream(device_id, "vlan")
-    assert (stream.desired_revision, stream.authorized_revision, stream.applied_revision) == (1, 1, 1)
+    assert (stream.desired_revision, stream.authorized_revision, stream.applied_revision) == (2, 2, 1)
 
 
 # ── §H2: the success barrier ─────────────────────────────────────────────────
@@ -1311,12 +1330,11 @@ async def test_f6_a_a_reissue_certifies_no_section_revision(adapter_client):
     )
 
 
-async def test_f7_a_manual_apply_promotes_a_section_committed_alongside_it(adapter_client, rival_engine):
-    """§H4 — the Apply selects its sections UNDER the projection lock, not before it.
+async def test_manual_apply_ignores_an_unselected_section_committed_alongside_it(adapter_client, rival_engine):
+    """The caller's selected push remains the authorization boundary under the lock.
 
-    The rival holds the lock with an uncommitted snmp write. Selecting first and locking
-    second reads the projection before that write is visible, so the Apply promotes vlan
-    alone and the snmp intent is silently left undeployed.
+    The rival commits an SNMP write before the Apply acquires the projection lock. The Apply
+    still promotes only the VLAN push the caller selected.
     """
     from nso_adapter.core.generation import note_write
     from nso_adapter.store.db import get_engine
@@ -1324,22 +1342,27 @@ async def test_f7_a_manual_apply_promotes_a_section_committed_alongside_it(adapt
     device_id = await _device("gen-apply-under-lock", 9766, auto_apply=False)
     await _vlan(device_id, 68)
     await _push(adapter_client, device_id)
+    selected = (await _stream(device_id, "vlan")).source_push_seq
 
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
     async with rival() as holder:
         await note_write(holder, device_id, "snmp")
 
-        applying = asyncio.create_task(adapter_client.post(f"/api/v1/devices/{device_id}/actions/apply", headers=_AUTH))
-        await _wait_for_relation_lock(get_engine(), "device_generation_counter")
+        applying = asyncio.create_task(
+            adapter_client.post(
+                f"/api/v1/devices/{device_id}/actions/apply",
+                json={"selected": {"vlan": selected}},
+                headers=_AUTH,
+            )
+        )
+        await _wait_for_relation_lock(get_engine(), "device_generation_counter", timeout=30.0)
         assert not applying.done(), "the Apply did not wait for the projection lock"
         await holder.commit()
-        resp = await asyncio.wait_for(applying, timeout=10)
+        resp = await asyncio.wait_for(applying, timeout=30)
 
     assert resp.status_code == 202
     (generation,) = await _generations(device_id)
-    assert sorted(generation.stream_revisions) == ["snmp", "vlan"], (
-        "the Apply omitted a section committed while it was selecting"
-    )
+    assert sorted(generation.stream_revisions) == ["vlan"]
 
 
 async def test_f3_c_a_lost_status_race_refuses_instead_of_acting_twice(adapter_client):

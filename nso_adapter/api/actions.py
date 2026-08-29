@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Actions API — async device actions (sync, check-sync_state, connect, apply, sync-notify).
+"""Actions API: async device actions (sync, check-sync_state, connect, apply, sync-notify).
 
-All actions return 202 with {job_id}.
+Async actions return 202 with a top-level {job_id}. Apply also returns its generation chain.
 409 is returned if a job is already queued/running for the device.
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from typing import Annotated, Literal
+
+from fastapi import APIRouter, Depends, Response
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
@@ -19,12 +21,19 @@ from nso_adapter.api.errors import (
     RESP_409,
     RESP_409_ACTIVE_JOB,
     RESP_422_VALIDATION,
+    RESP_500_INTERNAL,
     api_error,
 )
 from nso_adapter.core.jobs import enqueue_job
+from nso_adapter.core.request_flags import MAX_PUSH_SEQ, MIN_PUSH_SEQ
 from nso_adapter.store.models import DeploymentGeneration, Device, JobType
 
 router = APIRouter(prefix="/api/v1/devices", tags=["actions"])
+
+SelectedPushSequence = Annotated[
+    int,
+    Field(strict=True, ge=MIN_PUSH_SEQ, le=MAX_PUSH_SEQ),
+]
 
 # All action endpoints emit 401 (token) + 422 (device_id path); the responses fragments
 # below add the ones each endpoint actually raises. The trigger POSTs go through
@@ -44,6 +53,58 @@ class ApplyDiffOut(BaseModel):
     device_id: int
     outformat: str
     diffs: dict[str, str]
+
+
+class ActionApplyIn(BaseModel):
+    """The exact push sequences this manual Apply is allowed to promote."""
+
+    selected: dict[str, SelectedPushSequence]
+
+    @field_validator("selected")
+    @classmethod
+    def _validate_selected(cls, selected: dict[str, int]) -> dict[str, int]:
+        from nso_adapter.core.projection import projection_streams
+
+        unknown = set(selected) - projection_streams()
+        if unknown:
+            raise ValueError(f"unknown projection streams: {sorted(unknown)}")
+        return dict(sorted(selected.items()))
+
+
+class ActionApplyGenerationOut(BaseModel):
+    generation_id: int
+    seq: int
+    job_id: int
+    mode: Literal["networked", "detach"]
+    source_push_seq: dict[str, int | None]
+    stream_revisions: dict[str, int]
+    digest: str
+
+
+class ActionApplySkippedDetailOut(BaseModel):
+    generation_id: int
+    seq: int
+    status: Literal["pending", "running", "failed", "outcome_unknown", "abandoned"]
+
+
+class ActionApplyOut(BaseModel):
+    device_id: int
+    outcome: Literal["promoted", "no_op"]
+    job_id: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    selected: dict[str, int]
+    skipped: dict[
+        str,
+        Literal[
+            "superseded",
+            "already_applied",
+            "already_authorized",
+            "no_receipt",
+            "backfill_only",
+            "revision_mismatch",
+        ],
+    ]
+    skipped_detail: dict[str, ActionApplySkippedDetailOut] | None
+    generations: list[ActionApplyGenerationOut]
 
 
 async def _trigger(
@@ -210,19 +271,76 @@ async def sync_notify(
     "/{device_id}/actions/apply",
     status_code=202,
     dependencies=[Depends(verify_token)],
-    response_model=JobTriggerOut,
-    responses=_TRIGGER_ERRORS,
+    response_model=ActionApplyOut,
+    responses={
+        200: {"model": ActionApplyOut, "description": "No selected stream required a job"},
+        **_TRIGGER_ERRORS,
+        **RESP_500_INTERNAL,
+    },
 )
 async def action_apply(
     device_id: int,
+    body: ActionApplyIn,
+    response: Response,
     db: AsyncSession = Depends(get_db),
 ):
-    """Phase 2 — push accepted NetBox intent to NSO via reconcile-commit service."""
+    """Atomically promote the selected pushes and enqueue their immutable generation chain."""
+    from nso_adapter.core.generation import ApplyAlreadyQueued, ApplyUnexecutable, create_action_apply
     from nso_adapter.core.request_flags import STORE_ONLY
 
     if STORE_ONLY.get():
         raise api_error(422, "validation_error", "store_only is not valid for the Apply action")
-    return await _trigger(device_id, JobType.apply, db)
+
+    device = await db.get(Device, device_id)
+    if not device:
+        raise api_error(404, "not_found", "Device not found")
+    try:
+        apply_result = await create_action_apply(db, device_id, body.selected)
+    except ApplyAlreadyQueued as exc:
+        await db.rollback()
+        raise api_error(
+            409,
+            "conflict",
+            "A job is already running for this device",
+            {"job_id": exc.job_id},
+        ) from None
+    except ApplyUnexecutable as exc:
+        await db.rollback()
+        streams = sorted(exc.reasons)
+        raise api_error(
+            409,
+            "apply_unexecutable",
+            f"Selected stream(s) cannot be applied faithfully: {', '.join(streams)}",
+            {"streams": exc.reasons},
+        ) from None
+    generations = [
+        {
+            "generation_id": generation.id,
+            "seq": generation.seq,
+            "job_id": generation.job_id,
+            "mode": generation.mode.value,
+            "source_push_seq": generation.source_push_seq,
+            "stream_revisions": generation.stream_revisions,
+            "digest": generation.digest,
+        }
+        for generation in apply_result.generations
+    ]
+    if not generations:
+        response.status_code = 200
+    job_id = generations[0]["job_id"] if generations else None
+    if generations and job_id is None:
+        raise api_error(500, "internal", "The promoted generation chain has no executable head job")
+    result = {
+        "device_id": device_id,
+        "outcome": "promoted" if generations else "no_op",
+        "job_id": job_id,
+        "selected": body.selected,
+        "skipped": apply_result.skipped,
+        "skipped_detail": apply_result.skipped_detail or None,
+        "generations": generations,
+    }
+    await db.commit()
+    return result
 
 
 class BarrierActionOut(BaseModel):

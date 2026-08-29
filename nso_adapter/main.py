@@ -25,6 +25,7 @@ from nso_adapter.api.errors import (
     api_error_handler,
     framework_http_error_handler,
     projection_gone_handler,
+    promotion_provenance_handler,
     unhandled_exception_response,
     validation_error_handler,
 )
@@ -55,7 +56,15 @@ from nso_adapter.api.vlan import router as vlan_router
 from nso_adapter.config import get_config, get_env_settings
 from nso_adapter.core.generation import DeviceProjectionGone
 from nso_adapter.core.importer import register_nso_client, set_netbox_client
-from nso_adapter.core.request_flags import BACKFILL_ONLY, DELETE_ORIGIN, STORE_ONLY, parse_request_flag
+from nso_adapter.core.receipt import PromotionProvenanceUnexecutable
+from nso_adapter.core.request_flags import (
+    BACKFILL_ONLY,
+    DELETE_ORIGIN,
+    MAX_PUSH_SEQ,
+    MIN_PUSH_SEQ,
+    STORE_ONLY,
+    parse_request_flag,
+)
 from nso_adapter.core.scheduler import start_scheduler, stop_scheduler
 from nso_adapter.core.worker import start_workers, stop_workers
 from nso_adapter.notifications.persistent_subscriber import persistent_subscriber
@@ -65,6 +74,21 @@ from nso_adapter.secrets import make_provider
 from nso_adapter.store.db import get_engine, init_db, session
 
 logger = structlog.get_logger(__name__)
+
+
+def _preserve_exact_openapi_integer_bounds(app: FastAPI) -> None:
+    """Restore integer bounds that FastAPI coerces to imprecise JSON floats."""
+    generated_openapi = app.openapi
+
+    def openapi():
+        schema = generated_openapi()
+        selected = schema["components"]["schemas"]["ActionApplyIn"]["properties"]["selected"]
+        sequence = selected["additionalProperties"]
+        sequence["minimum"] = MIN_PUSH_SEQ
+        sequence["maximum"] = MAX_PUSH_SEQ
+        return schema
+
+    app.openapi = openapi  # type: ignore[method-assign]
 
 
 def _init_secrets(app: FastAPI, cfg, env):
@@ -374,6 +398,7 @@ def create_app() -> FastAPI:
     app.add_exception_handler(StarletteHTTPException, framework_http_error_handler)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(DeviceProjectionGone, projection_gone_handler)
+    app.add_exception_handler(PromotionProvenanceUnexecutable, promotion_provenance_handler)
 
     @app.middleware("http")
     async def _request_mode_flags(request, call_next):
@@ -457,6 +482,7 @@ def create_app() -> FastAPI:
     app.include_router(redistribution_router)
     app.include_router(jobs_router)
     app.include_router(config_router)
+    _preserve_exact_openapi_integer_bounds(app)
     return app
 
 

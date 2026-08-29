@@ -79,6 +79,7 @@ async def test_apply_returns_501(adapter_client):
     """apply action on unknown device returns 404."""
     resp = await adapter_client.post(
         "/api/v1/devices/9999/actions/apply",
+        json={"selected": {}},
         headers={"Authorization": f"Bearer {VALID_TOKEN}"},
     )
     assert resp.status_code == 404

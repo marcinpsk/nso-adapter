@@ -39,8 +39,8 @@ from decimal import Decimal
 from functools import cache
 from typing import Any, NamedTuple
 
+from sqlalchemy import UniqueConstraint, select
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.store.models import (
@@ -85,11 +85,14 @@ class _Spec(NamedTuple):
     mapper rather than restated, so a schema change cannot leave a stale column name here.
     *discriminator* is the one case where a table serves several sections at once — a
     redistribution row belongs to the section named by its destination protocol.
+    *lifecycle* marks a proof carrier whose disappearance is settlement, not new intent.
     """
 
     model: Any
     parent: Any | None = None
     discriminator: tuple[str, str] | None = None
+    identity: tuple[str, ...] | None = None
+    lifecycle: bool = False
 
 
 _SECTION_TABLES: dict[str, tuple[_Spec, ...]] = {
@@ -101,7 +104,14 @@ _SECTION_TABLES: dict[str, tuple[_Spec, ...]] = {
     ),
     # Tombstones ride the static-route section: an unconsumed one changes which entries the
     # document must retain verbatim, so a document built without them is a different document.
-    "static_route": (_Spec(StaticRouteIntent), _Spec(StaticRouteTombstone)),
+    "static_route": (
+        _Spec(StaticRouteIntent),
+        _Spec(
+            StaticRouteTombstone,
+            identity=("route_id", "vrf", "prefix", "next_hop", "marking", "created_at"),
+            lifecycle=True,
+        ),
+    ),
     "logging": (_Spec(LoggingHostIntent), _Spec(LoggingLevelsIntent)),
     "svi": (_Spec(SviIntent),),
     "subinterface": (_Spec(SubinterfaceIntent),),
@@ -236,6 +246,9 @@ def projection_streams() -> frozenset[str]:
     mismatched = {s: (sec, endpoints[s]) for s, sec in _stream_section().items() if endpoints[s] != sec}
     if mismatched:
         raise RuntimeError(f"streams whose section differs from what their endpoint promotes: {mismatched}")
+    for stream_specs in _stream_tables().values():
+        for spec in stream_specs:
+            _identity_fields(spec)
     return streams
 
 
@@ -301,7 +314,8 @@ def _row_dict(row) -> dict:
     return {attr.key: _jsonable(getattr(row, attr.key)) for attr in sa_inspect(type(row)).column_attrs}
 
 
-_SPEC_BY_MODEL: dict[Any, _Spec] = {spec.model: spec for specs in _SECTION_TABLES.values() for spec in specs}
+_SPEC_BY_MODEL: dict[type, _Spec] = {spec.model: spec for specs in _SECTION_TABLES.values() for spec in specs}
+_SPEC_BY_TABLE: dict[str, _Spec] = {spec.model.__tablename__: spec for spec in _SPEC_BY_MODEL.values()}
 
 
 def _fk_column(model: Any, parent: Any):
@@ -312,6 +326,103 @@ def _fk_column(model: Any, parent: Any):
             if fk.column.table.name == parent_table:
                 return column
     raise RuntimeError(f"{model.__name__} has no foreign key to {parent.__name__}")
+
+
+@cache
+def _identity_fields(spec: _Spec) -> tuple[str, ...]:
+    """Return the table's schema-defined logical key, excluding its scope column."""
+    if spec.identity is not None:
+        return spec.identity
+    scope = _fk_column(spec.model, spec.parent).name if spec.parent is not None else "device_id"
+    candidates = [
+        tuple(column.name for column in constraint.columns)
+        for constraint in spec.model.__table__.constraints
+        if isinstance(constraint, UniqueConstraint) and scope in constraint.columns
+    ]
+    candidates.extend(
+        (column.name,) for column in spec.model.__table__.columns if column.unique and column.name == scope
+    )
+    if len(candidates) != 1:
+        raise RuntimeError(
+            f"{spec.model.__name__} needs one durable projection identity containing {scope!r}, got {candidates}"
+        )
+    return tuple(field for field in candidates[0] if field != scope)
+
+
+def _rows_by_id(fragment: dict[str, list[dict]], table: str, by_id: dict[str, dict]) -> dict:
+    """Return *table*'s ``{id: row}`` map, built once per index pass and reused per row."""
+    index = by_id.get(table)
+    if index is None:
+        index = {row.get("id"): row for row in fragment.get(table, [])}
+        by_id[table] = index
+    return index
+
+
+def _row_identity(fragment: dict[str, list[dict]], spec: _Spec, row: dict, by_id: dict[str, dict]) -> tuple:
+    parent_identity: tuple = ()
+    if spec.parent is not None:
+        fk = _fk_column(spec.model, spec.parent)
+        parent_id = row.get(fk.name)
+        parent_spec = _SPEC_BY_MODEL.get(spec.parent)
+        if parent_spec is None:
+            # DbInterface is outside the projection and is not rebuilt by an intent PUT.
+            parent_identity = (parent_id,)
+        else:
+            parent_table = spec.parent.__tablename__
+            parent_row = _rows_by_id(fragment, parent_table, by_id).get(parent_id)
+            if parent_row is None:
+                raise RuntimeError(f"{spec.model.__tablename__} row references missing {parent_table} id {parent_id!r}")
+            parent_identity = _row_identity(fragment, parent_spec, parent_row, by_id)
+    return (*parent_identity, *(row.get(field) for field in _identity_fields(spec)))
+
+
+def rows_by_intent_identity(fragment: dict[str, list[dict]], table: str) -> dict[tuple, dict]:
+    """Index one projection table by its durable logical identity.
+
+    Root identities come from the model's unique constraint. Child identities prepend the
+    logical parent identity, so full-replace writers can mint new database ids without making
+    unchanged BGP scopes, peers, or address families look deleted.
+
+    Each parent table is indexed by id ONCE per call: BGP repeats the lineage walk at four
+    levels, so scanning the parent list per row is quadratic in the fragment size.
+    """
+    spec = _SPEC_BY_TABLE.get(table)
+    if spec is None:
+        raise ValueError(f"unknown projection table {table!r}")
+    by_id: dict[str, dict] = {}
+    indexed: dict[tuple, dict] = {}
+    for row in fragment.get(table, []):
+        identity = _row_identity(fragment, spec, row, by_id)
+        if identity in indexed:
+            raise RuntimeError(f"{table} projection contains duplicate durable identity {identity!r}")
+        indexed[identity] = row
+    return indexed
+
+
+def is_intent_deletion(table: str, identity: tuple, desired_rows: dict[tuple, dict]) -> bool:
+    """Whether a missing projection row is an operator intent deletion, not lifecycle."""
+    spec = _SPEC_BY_TABLE.get(table)
+    if spec is None:
+        raise ValueError(f"unknown projection table {table!r}")
+    return not spec.lifecycle and identity not in desired_rows
+
+
+#: NetBox lineage the device payload never renders (:func:`nso.apply.static_route_entry`
+#: writes neither). Kept in the snapshot for settlement correlation, excluded from the
+#: comparison state so a correlation-only repair does not enqueue an apply for an
+#: unchanged wire payload.
+CORRELATION_COLUMNS: frozenset[str] = frozenset({"route_id", "intent_generation"})
+
+
+def projection_row_state(table: str, row: dict) -> dict:
+    """Return device-facing row state without database identity, correlation or apply metadata."""
+    spec = _SPEC_BY_TABLE.get(table)
+    if spec is None:
+        raise ValueError(f"unknown projection table {table!r}")
+    excluded = {"id", "device_id", "accepted_at", *CORRELATION_COLUMNS, *APPLY_BOOKKEEPING_COLUMNS}
+    if spec.parent is not None:
+        excluded.add(_fk_column(spec.model, spec.parent).name)
+    return {key: value for key, value in row.items() if key not in excluded}
 
 
 def _scope_ids(model: Any, device_id: int):
@@ -346,6 +457,13 @@ async def _rows_for(db: AsyncSession, device_id: int, spec: _Spec) -> list[dict]
 #: ``test_projection_document.py`` pins the partition — so a new section cannot drift out of
 #: the protocol unnoticed, and closing a reason without wiring the section fails.
 DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset({"vlan"})
+
+#: The document-executed sections a manual Apply may select. This set equals
+#: :data:`DOCUMENT_EXECUTED_SECTIONS` today. The names remain separate because one states
+#: how a section executes and the other states whether an operator may select it. A section
+#: can join this set only after its companion apply and claim subtraction stop reading live
+#: intent.
+ACTION_APPLY_EXECUTABLE_SECTIONS: frozenset[str] = frozenset({"vlan"})
 
 #: Why each remaining section still reads live rows at apply time. Most await #1522's
 #: aggregate device-intent builder, which is the general producer of a complete document;
@@ -397,10 +515,12 @@ def section_models(sections) -> frozenset[type]:
     return frozenset(models)
 
 
-#: Columns an apply pass WRITES onto an intent row: the deployment's outcome, never the
-#: operator's intent. Excluded from :func:`intent_state` so a previous run's own stamps do
-#: not read as a successor's edit.
-APPLY_BOOKKEEPING_COLUMNS: frozenset[str] = frozenset({"last_apply_at", "last_apply_error"})
+#: Columns the apply side MUTATES on an intent row: deployment state, never the operator's
+#: intent. Excluded from every intent comparison so a previous run's settlement does not
+#: read as a successor's edit.
+APPLY_BOOKKEEPING_COLUMNS: frozenset[str] = frozenset(
+    {"last_apply_at", "last_apply_error", "pending_clear", "deployed_key"}
+)
 
 
 def intent_state(row) -> dict:
@@ -465,13 +585,17 @@ async def snapshot_stream(db: AsyncSession, device_id: int, stream: str) -> dict
 
 
 __all__ = [
+    "ACTION_APPLY_EXECUTABLE_SECTIONS",
     "APPLY_BOOKKEEPING_COLUMNS",
     "DOCUMENT_EXECUTED_SECTIONS",
     "LIVE_READ_SECTIONS",
     "hydrate_section",
     "intent_state",
+    "is_intent_deletion",
     "projection_sections",
+    "projection_row_state",
     "projection_streams",
+    "rows_by_intent_identity",
     "section_models",
     "section_streams",
     "snapshot_stream",
