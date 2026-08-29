@@ -2108,9 +2108,14 @@ Every `PUT /api/v1/devices/{id}/*-intent` endpoint below (and `vlan-intent`,
   absent from the body are deleted from the mirror. An empty list clears the
   scope.
 - `accepted_at` per row; defaults to *now* when omitted.
-- Storing intent **never touches the device**. If `auto_apply` is enabled in
-  the device settings, an apply job is enqueued; otherwise the next explicit
-  `actions/apply` commits it via the scope's `*-reconciler` NSO service.
+- Storing intent **never touches the device synchronously**. If `auto_apply` is enabled in
+  the device settings, an ordinary non-store-only PUT enqueues the scope's apply job.
+  Otherwise the intent remains stored in the mirror.
+- Explicit `actions/apply` promotes only document-executed sections, currently `vlan`.
+  Selecting a live-read section such as `logging` or `bgp` returns `409 apply_unexecutable`
+  with reason `live_read_execution`. To deploy one of those sections, enable `auto_apply`
+  and send an ordinary non-store-only intent PUT. Use a new `X-Push-Seq` when resending a
+  stored payload because receipt replay returns the recorded response without new work.
 - Where dropping a row from a keyed NSO service list requires it, the adapter
   queues an async removal job (see [Removal propagation](#removal-propagation)).
 - → `200` `{ "device_id": 1, "count": <rows stored>, "removed": <rows dropped> }`.
