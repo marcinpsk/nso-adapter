@@ -2280,7 +2280,9 @@ def test_every_apply_unexecutable_reason_is_documented_and_live():
 
     ``live_read_execution`` sat in the doc with no producer left, and
     ``interface_attribute_eligibility_unresolved`` was raised without being documented.
-    Neither drift can recur silently: the doc list and the raise sites must match exactly.
+    ``outstanding_deletion_provenance`` is emitted through the shared API-error helper rather
+    than ``ApplyUnexecutable``. Neither shape can drift silently: the doc list and every
+    ``apply_unexecutable`` producer must match exactly.
     """
     import ast
     from pathlib import Path
@@ -2301,6 +2303,20 @@ def test_every_apply_unexecutable_reason_is_documented_and_live():
                     for argument in node.args
                     if isinstance(argument, ast.Dict)
                     for value in argument.values
+                    if isinstance(value, ast.Constant) and isinstance(value.value, str)
+                }
+            if (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) == "api_error"
+                and len(node.args) >= 4
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "apply_unexecutable"
+            ):
+                raised |= {
+                    value.value
+                    for detail in ast.walk(node.args[3])
+                    if isinstance(detail, ast.Dict)
+                    for value in detail.values
                     if isinstance(value, ast.Constant) and isinstance(value.value, str)
                 }
             if (

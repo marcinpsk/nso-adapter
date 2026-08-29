@@ -763,11 +763,9 @@ not promote or enqueue a subset. Reasons are stable machine codes:
 - `interface_attribute_eligibility_unresolved`
 - `mixed_detach_replacement`
 - `no_executable_interface`
+- `outstanding_deletion_provenance`
 - `unresolved_interface_identity`
 <!-- apply-unexecutable-reasons:end -->
-
-A push can also return `outstanding_deletion_provenance`
-when its receipt still carries deletion work.
 
 The manual-Apply boundary is exactly `DOCUMENT_EXECUTED_SECTIONS`. It contains every section,
 so all sixteen streams are executable through `ACTION_APPLY_EXECUTABLE_SECTIONS`. SNMP
