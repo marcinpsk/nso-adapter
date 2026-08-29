@@ -17,7 +17,8 @@ Three guards, per the 1329 plan §2.8.2:
 * structural  - the migration declares exactly the 25 pairs, and both directions
   carry the explicit UTC ``USING`` clause (asserted on the module source AND on
   the SQL alembic actually renders, per column).
-* downgrade   - symmetric: seed at head, downgrade, same instants; upgrade again.
+* downgrade   - symmetric: seed at this revision, downgrade, same instants; upgrade
+  to head again (from-head downgrades stopped at a6d4f2c8e1b3, which is irreversible).
 """
 
 from __future__ import annotations
@@ -265,7 +266,9 @@ def test_downgrade_restores_naive_utc_and_re_upgrade_is_idempotent(pg_provisione
     monkeypatch.setenv("PGOPTIONS", f"-c timezone={_TZ}")
 
     with _private_database(pg_provisioner, "down") as sync_url:
-        _alembic(sync_url, "upgrade", "head")
+        # Stop at this migration's own revision: a later migration (a6d4f2c8e1b3) refuses
+        # to downgrade, so a from-head downgrade can never reach down_revision again.
+        _alembic(sync_url, "upgrade", module.revision)
 
         with _engine_on(sync_url) as engine:
             _assert_session_timezone(engine)
