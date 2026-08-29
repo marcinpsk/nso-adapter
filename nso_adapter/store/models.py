@@ -504,7 +504,9 @@ class DeviceGenerationCounter(Base):
     for without an isolation-level change (see the module docstring).
 
     Created lazily by an upsert, unlike :class:`DeviceSettleCounter`. The caller already
-    holds ``devices FOR UPDATE``, so creation stays on the shared device-before-counter graph.
+    holds ``devices FOR NO KEY UPDATE`` (``lock_projection``'s ``key_share=True`` lock,
+    which still excludes rival writers but admits FK ``FOR KEY SHARE`` validation), so
+    creation stays on the shared device-before-counter graph.
     """
 
     __tablename__ = "device_generation_counter"
