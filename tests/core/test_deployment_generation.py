@@ -461,8 +461,20 @@ async def test_the_final_settled_cohort_member_rechecks_every_carried_stream(ada
     async with session() as db:
         await note_write(db, device_id, "vlan")
         await note_write(db, device_id, "static_route")
-        first_job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.running, context={})
-        final_job = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.running, context={})
+        first_job = Job(
+            job_type=JobType.apply,
+            device_id=device_id,
+            status=JobStatus.running,
+            coalescible=False,
+            context={},
+        )
+        final_job = Job(
+            job_type=JobType.removal,
+            device_id=device_id,
+            status=JobStatus.running,
+            coalescible=False,
+            context={},
+        )
         db.add_all([first_job, final_job])
         await db.flush()
 
