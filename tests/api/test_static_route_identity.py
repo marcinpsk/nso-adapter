@@ -174,12 +174,61 @@ async def read_jobs(device_id: int) -> list[dict]:
         return [{"id": r.id, "job_type": r.job_type.value, "context": r.context} for r in rows]
 
 
-async def put_intent(client, device_id: int, routes: list[dict], *, query: str = ""):
+async def put_intent(
+    client, device_id: int, routes: list[dict], *, query: str = "", deleted_routes: list[dict] | None = None
+):
     return await client.put(
         f"/api/v1/devices/{device_id}/static-route-intent{query}",
-        json={"routes": routes},
+        json={"routes": routes, "deleted_routes": deleted_routes or []},
         headers=AUTH | push_seq(),
     )
+
+
+@pytest.mark.parametrize(
+    ("first_query", "replay_query", "suffix"),
+    [
+        ("?delete_origin=true", "", "flag-first"),
+        ("", "?delete_origin=true", "flag-replay"),
+    ],
+)
+async def test_delete_origin_is_inert_in_static_route_receipt_identity(
+    adapter_client,
+    first_query,
+    replay_query,
+    suffix,
+):
+    from nso_adapter.core.receipt import latest_receipt
+
+    device_id = await seed_device(nso_device_name=f"sr-replay-{suffix}", netbox_device_id=None)
+    await seed_intent(
+        device_id,
+        [
+            {"triple": A, "route_id": 7, "deployed_key": list(A)},
+            {"triple": B, "route_id": 8, "deployed_key": list(B)},
+        ],
+    )
+    url = f"/api/v1/devices/{device_id}/static-route-intent"
+    body = {
+        "routes": [],
+        "deleted_routes": [{"route_id": 7, "triples": [entry(A)], "unverified": False}],
+    }
+    headers = AUTH | {"X-Push-Seq": "9001"}
+
+    first = await adapter_client.put(url + first_query, json=body, headers=headers)
+    replay = await adapter_client.put(url + replay_query, json=body, headers=headers)
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert await read_intent(device_id) == []
+    assert {row["route_id"]: row["marking"] for row in await read_tombstones(device_id)} == {
+        7: "delete_origin",
+        8: "detach",
+    }
+    assert len(await read_jobs(device_id)) == 2
+    async with session() as db:
+        receipt = await latest_receipt(db, device_id, "static_route")
+        assert receipt.delete_origin is False
 
 
 async def enable_auto_apply(device_id: int) -> None:
@@ -342,16 +391,33 @@ async def test_delete_and_tombstone_roll_back_together(adapter_client, monkeypat
     )
 
     boom = RuntimeError("forced failure after the tombstone/delete DML")
+    seen_markings = []
 
-    async def _explode(*args, **kwargs):
+    async def _explode(db, *args, **kwargs):
+        from nso_adapter.store.models import StaticRouteTombstone
+
+        tombstones = (
+            await db.scalars(
+                select(StaticRouteTombstone)
+                .where(StaticRouteTombstone.device_id == device_id)
+                .order_by(StaticRouteTombstone.id)
+            )
+        ).all()
+        seen_markings.extend((row.route_id, row.marking) for row in tombstones)
         raise boom
 
     # Imported inside the handler, so patch it at its source module.
     monkeypatch.setattr("nso_adapter.core.apply.enqueue_apply", _explode)
 
-    resp = await put_intent(adapter_client, device_id, [entry(A, route_id=7)])
+    resp = await put_intent(
+        adapter_client,
+        device_id,
+        [entry(A, route_id=7)],
+        deleted_routes=[{"route_id": 8, "triples": [entry(B)], "unverified": False}],
+    )
     assert resp.status_code == 500, resp.text
     assert resp.json() == {"error": {"code": "internal", "message": "Internal server error", "detail": {}}}
+    assert seen_markings == [(8, "delete_origin")]
 
     # Row 8 is still live, and nothing claims authority to delete it.
     rows = await read_intent(device_id)
@@ -457,12 +523,17 @@ async def test_never_applied_row_gets_a_detach_tombstone(adapter_client):
     assert removals[0]["context"]["detach"] is True
 
 
-async def test_never_applied_delete_origin_authorizes_the_triple_only(adapter_client):
-    """M1.12 — a NULL deployed_key must not read as unrestricted deletion authority."""
+async def test_never_applied_deleted_route_authorizes_the_triple_only(adapter_client):
+    """M1.12: a NULL deployed_key must not read as unrestricted deletion authority."""
     device_id = await seed_device(nso_device_name="sr-m1-12", netbox_device_id=9713)
     await seed_intent(device_id, [{"triple": A, "route_id": 7, "deployed_key": None}])
 
-    resp = await put_intent(adapter_client, device_id, [], query="?delete_origin=true")
+    resp = await put_intent(
+        adapter_client,
+        device_id,
+        [],
+        deleted_routes=[{"route_id": 7, "triples": [entry(A)], "unverified": False}],
+    )
     assert resp.status_code == 200
 
     tombs = await read_tombstones(device_id)
@@ -482,12 +553,17 @@ async def test_never_applied_delete_origin_authorizes_the_triple_only(adapter_cl
     assert removals[0]["context"]["removed"] == {"route": [list(A)]}
 
 
-async def test_applied_delete_origin_tombstone_carries_the_deployed_key(adapter_client):
-    """OQ2 — with a proven predecessor the authorized set is {triple} ∪ {deployed_key}."""
+async def test_applied_deleted_route_tombstone_carries_the_deployed_key(adapter_client):
+    """OQ2: with a proven predecessor the authorized set is {triple} ∪ {deployed_key}."""
     device_id = await seed_device(nso_device_name="sr-m1-12b", netbox_device_id=9714)
     await seed_intent(device_id, [{"triple": B, "route_id": 7, "deployed_key": list(A)}])
 
-    resp = await put_intent(adapter_client, device_id, [], query="?delete_origin=true")
+    resp = await put_intent(
+        adapter_client,
+        device_id,
+        [],
+        deleted_routes=[{"route_id": 7, "triples": [entry(B)], "unverified": False}],
+    )
     assert resp.status_code == 200
 
     assert await read_tombstones(device_id) == [

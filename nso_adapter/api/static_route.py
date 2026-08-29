@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import structlog
@@ -33,7 +34,6 @@ from nso_adapter.core.request_flags import (
     DELETE_ORIGIN_MARKING,
     DETACH_MARKING,
     STORE_ONLY,
-    request_marking,
 )
 from nso_adapter.core.static_route_plan import (
     SR_CLEAR_FIELDS,
@@ -218,11 +218,9 @@ class DeletedRoute(BaseModel):
 
 class StaticRouteIntentUpdate(BaseModel):
     routes: list[StaticRouteEntry]
-    #: The deletion authority this push carries (§4.4). ``null`` is the PRE-ACTIVATION shape:
-    #: the scope is still marked by ``?delete_origin=`` for the whole request. A list — empty
-    #: included — means the push marks PER OBJECT and the query flag no longer applies to
-    #: this scope. O3 makes the field required and retires the null arm with it.
-    deleted_routes: list[DeletedRoute] | None = None
+    #: The required deletion authority this push carries (§4.4). An empty list means no
+    #: deletions are carried. Every push marks removals per object.
+    deleted_routes: list[DeletedRoute]
 
 
 class StaticRouteIntentEcho(BaseModel):
@@ -319,7 +317,7 @@ def _reject_payload_duplicates(routes: list[StaticRouteEntry]) -> None:
         seen_route_ids.add(item.route_id)
 
 
-def _reject_deletion_payload(records: list[DeletedRoute] | None) -> None:
+def _reject_deletion_payload(records: list[DeletedRoute]) -> None:
     """Payload-internal refusals for the deletion authority. No store read, so they run first.
 
     A backfill-only pass carries no authority AT ALL: its whole purpose is to open a device's
@@ -334,7 +332,7 @@ def _reject_deletion_payload(records: list[DeletedRoute] | None) -> None:
             {"reason": "backfill_carries_deletions", "route_ids": [r.route_id for r in records]},
         )
     seen: set[int] = set()
-    for record in records or ():
+    for record in records:
         if record.route_id in seen:
             # Emission is id-oriented, exactly one outcome per id: two records for one pk
             # cannot both be answered, and a partition that names it twice is rejected.
@@ -347,10 +345,10 @@ def _reject_deletion_payload(records: list[DeletedRoute] | None) -> None:
         seen.add(record.route_id)
 
 
-def _deletion_records(records: list[DeletedRoute] | None) -> list[DeletionRecord]:
+def _deletion_records(records: list[DeletedRoute]) -> list[DeletionRecord]:
     """Wire records → the classifier's own shape, with each lineage deduplicated in order."""
     out: list[DeletionRecord] = []
-    for record in records or ():
+    for record in records:
         triples: list[tuple[str, str, str]] = []
         for triple in record.triples:
             key = (triple.vrf, triple.prefix, triple.next_hop)
@@ -479,6 +477,7 @@ async def put_static_route_intent(
     second then applies a plan whose premise is gone, and the deferred identity constraint
     surfaces it as a 500 instead of the sequentially correct answer.
     """
+    delivery = replace(delivery, identity=replace(delivery.identity, delete_origin=False))
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
@@ -610,7 +609,7 @@ async def _apply_static_route_intent(
     partition = classify_deletions(_deletion_records(body.deleted_routes), removed_rows)
     _refuse_unmarkable_deletions(partition, fence_open=fence_open)
 
-    markings = _removal_markings(removed_rows, partition, per_object=body.deleted_routes is not None)
+    markings = _removal_markings(removed_rows, partition)
     promotion_deletions = [
         {
             "table": "static_route_intent",
@@ -907,16 +906,12 @@ def _refuse_unmarkable_deletions(partition, *, fence_open: bool) -> None:
         )
 
 
-def _removal_markings(removed_rows, partition, *, per_object: bool) -> dict[int, str]:
+def _removal_markings(removed_rows, partition) -> dict[int, str]:
     """Each removed row's deletion provenance, by intent-row id.
 
-    *per_object* is the payload's own answer (§4.5): a push that carries ``deleted_routes``
-    marks each row by whether a NetBox deletion actually authorized it, and ``?delete_origin``
-    stops applying to this scope. Without the list the scope is still request-marked, which is
-    every production push until O3 activates the field.
+    Every push carries ``deleted_routes`` (§4.5), so each row is marked by whether a NetBox
+    deletion authorized it. The request-wide ``?delete_origin`` flag does not apply here.
     """
-    if not per_object:
-        return {row.id: request_marking() for row in removed_rows}
     return {
         row.id: (DELETE_ORIGIN_MARKING if row.id in partition.genuine_row_ids else DETACH_MARKING)
         for row in removed_rows

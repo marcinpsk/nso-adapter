@@ -42,7 +42,7 @@ MINIMAL_BODIES: dict[str, dict] = {
     "/api/v1/devices/{device_id}/ospf-intent": {},
     "/api/v1/devices/{device_id}/route-policy-intent": {"objects": []},
     "/api/v1/devices/{device_id}/snmp-intent": {},
-    "/api/v1/devices/{device_id}/static-route-intent": {"routes": []},
+    "/api/v1/devices/{device_id}/static-route-intent": {"routes": [], "deleted_routes": []},
     "/api/v1/devices/{device_id}/subinterface-intent": {"interfaces": []},
     "/api/v1/devices/{device_id}/svi-intent": {"interfaces": []},
     "/api/v1/devices/{device_id}/vlan-intent": {"vlans": []},

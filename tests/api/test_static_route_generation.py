@@ -33,7 +33,9 @@ def entry(triple: tuple[str, str, str], **extra) -> dict:
 
 async def push(client, device_id: int, routes: list[dict]):
     return await client.put(
-        f"/api/v1/devices/{device_id}/static-route-intent", json={"routes": routes}, headers=AUTH | push_seq()
+        f"/api/v1/devices/{device_id}/static-route-intent",
+        json={"routes": routes, "deleted_routes": []},
+        headers=AUTH | push_seq(),
     )
 
 
