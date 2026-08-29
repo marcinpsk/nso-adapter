@@ -1210,6 +1210,47 @@ async def test_startup_recovery_isolates_a_detach_head_without_context(adapter_c
     assert await _job_status(recovered_healthy.job_id) is JobStatus.queued
 
 
+async def test_startup_recovery_isolates_a_database_failure(adapter_client):
+    from sqlalchemy.exc import DBAPIError
+
+    from nso_adapter.core import generation as generation_module
+    from nso_adapter.core.generation import create_generation, note_write, recover_generations
+    from nso_adapter.store.models import GenerationMode, JobStatus
+
+    failing_device = await _device("gen-recover-db-failure", 9798)
+    healthy_device = await _device("gen-recover-after-db-failure", 9799)
+    for device_id, vlan_id in ((failing_device, 99), (healthy_device, 100)):
+        await _vlan(device_id, vlan_id)
+
+    async with session() as db:
+        for device_id in (failing_device, healthy_device):
+            await note_write(db, device_id, "vlan")
+            generation = await create_generation(
+                db,
+                device_id,
+                streams=("vlan",),
+                mode=GenerationMode.networked,
+            )
+            assert generation.job_id is None
+        await db.commit()
+
+    advance_device_generations = generation_module.advance_device_generations
+
+    async def fail_one_device(device_id):
+        if device_id == failing_device:
+            raise DBAPIError("SELECT carrier", {}, RuntimeError("transient database failure"), True)
+        return await advance_device_generations(device_id)
+
+    with patch("nso_adapter.core.generation.advance_device_generations", new=fail_one_device):
+        await recover_generations()
+
+    (unchanged_failure,) = await _generations(failing_device)
+    (recovered_healthy,) = await _generations(healthy_device)
+    assert unchanged_failure.job_id is None
+    assert recovered_healthy.job_id is not None
+    assert await _job_status(recovered_healthy.job_id) is JobStatus.queued
+
+
 async def test_standalone_advancement_takes_the_projection_lock(adapter_client, rival_engine):
     """Advancement must serialize with a writer before it reads or admits the head."""
     from sqlalchemy.ext.asyncio import async_sessionmaker

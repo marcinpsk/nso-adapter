@@ -1587,7 +1587,7 @@ async def recover_generations() -> int:
             await advance_device_generations(device_id)
         except GenerationCarrierCorruption:
             logger.error("generation.carrier_corruption_on_restart", device_id=device_id, exc_info=True)
-        except (DeviceProjectionGone, GenerationModeConflict):
+        except (DBAPIError, DeviceProjectionGone, GenerationModeConflict):
             logger.error("generation.recovery_failed_on_restart", device_id=device_id, exc_info=True)
     return len(stranded)
 
