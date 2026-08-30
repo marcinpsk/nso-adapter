@@ -184,14 +184,13 @@ async def put_subinterface_intent(
     replaced = False
     if removed or cleared:
         from nso_adapter.core.removal import replace_on_removal
-        from nso_adapter.nso.apply import apply_subinterface_config
 
         replaced = await replace_on_removal(
             db,
             device,
             removed,
             SubinterfaceIntent,
-            apply_subinterface_config,
+            stream=delivery.stream,
             retract=cleared,
             settlement_cohort=settlement_cohort,
         )

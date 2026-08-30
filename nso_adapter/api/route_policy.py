@@ -486,7 +486,6 @@ async def put_route_policy_intent(
     )
     if removal_requested:
         from nso_adapter.core.removal import replace_on_removal
-        from nso_adapter.nso.apply import apply_route_policy_config
 
         # retract=cleared: an object that only lost a term is still OWNED and accepted — nothing
         # is being un-owned, so the PUT-replace must actually reach the device rather than
@@ -496,7 +495,7 @@ async def put_route_policy_intent(
             device,
             removed,
             RoutePolicyObjectIntent,
-            apply_route_policy_config,
+            stream=delivery.stream,
             retract=cleared,
             settlement_cohort=settlement_cohort,
         )

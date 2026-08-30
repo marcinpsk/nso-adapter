@@ -4,8 +4,8 @@
 
 Removal no longer runs the device commit inline in the intent PUT; it enqueues a
 ``removal`` job that the worker runs in the background. These tests cover the
-enqueue path, the back-compat shim, and the job runner's scope dispatch — all
-against the REAL in-memory DB and real intent/Job rows (so the SQLAlchemy
+enqueue path, the endpoint helper, and the job runner's scope dispatch. They run
+against the real PostgreSQL test database and real intent/Job rows (so the SQLAlchemy
 ``select(...).where(...)`` filters actually run); only the NSO apply boundary is
 stubbed with a spy.
 """
@@ -24,6 +24,7 @@ from nso_adapter.core import removal as removal_mod
 from nso_adapter.core.removal import enqueue_removal, replace_on_removal
 from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import (
+    DeploymentGeneration,
     Device,
     IsisFlexAlgoIntent,
     IsisInterfaceIntent,
@@ -115,7 +116,7 @@ async def _seed_removal_job(device_id: int, scope: str = "vlan", context_extra: 
         return j.id
 
 
-# ── replace_on_removal (back-compat shim) ─────────────────────────────────────
+# ── replace_on_removal ──────────────────────────────────────────
 
 
 async def test_replace_on_removal_noop_when_nothing_removed(adapter_client):
@@ -123,20 +124,20 @@ async def test_replace_on_removal_noop_when_nothing_removed(adapter_client):
     device_id = await _seed_device()
     async with session() as db:
         device = await db.get(Device, device_id)
-        result = await replace_on_removal(db, device, [], VlanIntent)
+        result = await replace_on_removal(db, device, [], VlanIntent, stream="vlan")
         assert result is False
         assert (await db.execute(select(Job))).scalars().all() == []
 
 
 async def test_replace_on_removal_enqueues_job_and_commits(adapter_client):
-    """On removal, a `removal` job for the model's scope is enqueued + committed."""
+    """On removal, the explicit stream is promoted by the queued generation."""
     device_id = await _seed_device()
     async with session() as db:
         device = await db.get(Device, device_id)
-        await note_projection_write(db, device_id, "vlan")
-        ok = await replace_on_removal(db, device, [3366], VlanIntent)
+        revision = await note_projection_write(db, device_id, "bfd")
+        ok = await replace_on_removal(db, device, [3366], VlanIntent, stream="bfd")
         assert ok is True
-        await db.commit()  # the shim no longer commits: the caller owns the boundary
+        await db.commit()  # The caller owns the transaction boundary.
 
     # Re-read in a fresh session to prove it was committed, not merely flushed.
     async with session() as db:
@@ -147,6 +148,8 @@ async def test_replace_on_removal_enqueues_job_and_commits(adapter_client):
         assert job.device_id == device_id
         assert job.context == {"scope": "vlan", "removed": {"vlan": [3366]}, "detach": True}
         assert job.status == JobStatus.queued
+        generation = (await db.execute(select(DeploymentGeneration))).scalars().one()
+        assert generation.stream_revisions == {"bfd": revision}
 
 
 async def test_replace_on_removal_unknown_model_returns_false(adapter_client):
@@ -158,7 +161,7 @@ async def test_replace_on_removal_unknown_model_returns_false(adapter_client):
 
     async with session() as db:
         device = await db.get(Device, device_id)
-        ok = await replace_on_removal(db, device, [1], _Unmapped)
+        ok = await replace_on_removal(db, device, [1], _Unmapped, stream="vlan")
         assert ok is False
         assert (await db.execute(select(Job))).scalars().all() == []
 
@@ -1405,12 +1408,12 @@ async def test_generic_no_service_instance_skips_guard(adapter_client):
 
 
 async def test_replace_on_removal_threads_removed_keys(adapter_client):
-    """The shim maps each simple scope's removed store keys onto its YANG list."""
+    """The helper maps each simple scope's removed store keys onto its YANG list."""
     device_id = await _seed_device(nso_device_name="sw-shim")
     async with session() as db:
         device = await db.get(Device, device_id)
         await note_projection_write(db, device_id, "vlan")
-        ok = await replace_on_removal(db, device, [3366, 3377], VlanIntent)
+        ok = await replace_on_removal(db, device, [3366, 3377], VlanIntent, stream="vlan")
         assert ok is True
         await db.commit()
     async with session() as db:
@@ -1419,14 +1422,18 @@ async def test_replace_on_removal_threads_removed_keys(adapter_client):
 
 
 async def test_replace_on_removal_maps_route_policy_families(adapter_client):
-    """route_policy removed keys are (family, name); the shim buckets them into the
+    """route_policy removed keys are (family, name); the helper buckets them into the
     per-family YANG lists (community_list → community-list etc.)."""
     device_id = await _seed_device(nso_device_name="sw-shim-rp")
     async with session() as db:
         device = await db.get(Device, device_id)
         await note_projection_write(db, device_id, "route_policy")
         ok = await replace_on_removal(
-            db, device, [("community_list", "example-comm"), ("route_map", "RM-IN")], RoutePolicyObjectIntent
+            db,
+            device,
+            [("community_list", "example-comm"), ("route_map", "RM-IN")],
+            RoutePolicyObjectIntent,
+            stream="route_policy",
         )
         assert ok is True
         await db.commit()

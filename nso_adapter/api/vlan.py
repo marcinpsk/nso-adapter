@@ -292,14 +292,13 @@ async def put_vlan_intent(
     replaced = False
     if removed_vids or cleared:
         from nso_adapter.core.removal import replace_on_removal
-        from nso_adapter.nso.apply import apply_vlan_config
 
         replaced = await replace_on_removal(
             db,
             device,
             removed_vids,
             VlanIntent,
-            apply_vlan_config,
+            stream=delivery.stream,
             retract=cleared,
             settlement_cohort=settlement_cohort,
         )
