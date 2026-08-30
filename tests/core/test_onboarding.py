@@ -9,6 +9,8 @@ ensure init_db() has run (creating schema) before any DB call.
 
 from __future__ import annotations
 
+from uuid import uuid4
+
 import pytest
 from sqlalchemy import select
 
@@ -461,6 +463,63 @@ async def test_offboard_removes_device(adapter_client_with_nso):
         # Confirm gone
         gone = await db.get(Device, device_id)
         assert gone is None
+
+
+async def test_offboard_cascades_an_apply_stamped_generation(adapter_client_with_nso):
+    from sqlalchemy import text
+
+    from nso_adapter.core.generation import create_generation, note_write
+    from nso_adapter.core.onboarding import offboard_device
+    from nso_adapter.store.apply_attempt_store import begin_apply_attempt, complete_apply_attempt
+    from nso_adapter.store.models import DeploymentApplyAttempt, DeploymentGeneration, GenerationMode
+    from tests.conftest import seed_device
+
+    device_id = await seed_device(
+        nso_instance="nso-dev",
+        nso_device_name="offboard-apply-evidence",
+        netbox_device_id=403,
+    )
+    attempt_id = uuid4()
+    async with session() as db:
+        assert await begin_apply_attempt(db, attempt_id, device_id, {"vlan": 1}) is None
+        await note_write(db, device_id, "vlan", push_seq=1)
+        generation = await create_generation(
+            db,
+            device_id,
+            streams=("vlan",),
+            mode=GenerationMode.networked,
+            document={},
+            apply_attempt_id=attempt_id,
+        )
+        await complete_apply_attempt(
+            db,
+            attempt_id,
+            admission_state="admitted",
+            http_status=202,
+            response={"generations": [{"generation_id": generation.id}]},
+        )
+        await db.commit()
+        constraint = (
+            await db.execute(
+                text(
+                    "SELECT confdeltype, condeferrable, condeferred "
+                    "FROM pg_constraint "
+                    "WHERE conname = 'fk_generation_apply_attempt'"
+                )
+            )
+        ).one()
+
+    async with session() as db:
+        await offboard_device(db, await db.get(Device, device_id))
+
+    async with session() as db:
+        assert await db.get(Device, device_id) is None
+        assert await db.get(DeploymentApplyAttempt, attempt_id) is None
+        assert (
+            await db.scalar(select(DeploymentGeneration).where(DeploymentGeneration.apply_attempt_id == attempt_id))
+            is None
+        )
+    assert constraint == (b"a", True, True)
 
 
 async def test_offboard_cascades_interfaces_and_scope(adapter_client_with_nso):

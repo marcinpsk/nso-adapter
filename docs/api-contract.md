@@ -446,6 +446,101 @@ settlement cohort. `status` is one of `pending`, `running`, `settled`, `failed`,
 
 `404 not_found` if the device does not exist.
 
+### `POST /api/v1/devices/{id}/deployment-evidence`
+
+Return one unpaged snapshot of the device deployment barrier and the requested durable
+Apply attempts. The request accepts at most 100 **distinct** attempt UUIDs — repeats are
+collapsed before the bound is applied — and at most 10 000 list entries in total:
+
+```json
+{
+  "apply_attempt_ids": ["8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8"]
+}
+```
+
+The response contains:
+
+```json
+{
+  "device_id": 17,
+  "head": {
+    "generation_id": 301,
+    "seq": 44,
+    "status": "failed",
+    "mode": "networked",
+    "settlement_cohort": null,
+    "sections": ["vlan"],
+    "source_push_seq": {"vlan": 501},
+    "apply_attempt_id": "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8",
+    "carrier_job_id": 900,
+    "carrier_job_status": "failed",
+    "carrier_job_result": null,
+    "carrier_job_error": {"code": "nso_commit_failed", "message": "commit failed", "detail": {}},
+    "created_at": "2026-08-25T10:00:00Z",
+    "updated_at": "2026-08-25T10:01:00Z"
+  },
+  "blocked": true,
+  "write_work_pending": false,
+  "held_jobs": [901],
+  "pending_generations": 1,
+  "attempts": [
+    {
+      "apply_attempt_id": "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8",
+      "admission_state": "admitted",
+      "http_status": 202,
+      "response": {
+        "outcome": "promoted",
+        "skipped": {},
+        "skipped_detail": null,
+        "generations": [{"generation_id": 301}]
+      },
+      "generations": [
+        {
+          "generation_id": 301,
+          "seq": 44,
+          "status": "failed",
+          "sections": ["vlan"],
+          "source_push_seq": {"vlan": 501},
+          "carrier_job_id": 900,
+          "carrier_job_status": "failed",
+          "carrier_job_result": null,
+          "carrier_job_error": {"code": "nso_commit_failed", "message": "commit failed", "detail": {}},
+          "updated_at": "2026-08-25T10:01:00Z"
+        }
+      ]
+    }
+  ],
+  "unknown_apply_attempt_ids": []
+}
+```
+
+`head` is the device-wide executable head, not a cohort-scoped generation. `blocked` is
+true when that head is `failed` or `outcome_unknown`. `write_work_pending` is true only for a
+queued or running device-writing job that the generation barrier admits. A queued
+device-writing job that the barrier refuses appears in `held_jobs` and does not make
+`write_work_pending` true. `pending_generations` counts non-crossable generations after
+the head. No part of this response is paginated.
+
+`sections` contains unique document section names. `source_push_seq` is keyed by intent stream.
+This preserves both stream values when `interface_config` and `ip` map to the
+`interface_config` section, or when `isis` and `isis_flex_algo` map to the `isis` section.
+
+The stored attempt `response` is the complete replay body. Terminal generation evidence
+uses the carrier snapshot, so it remains available after the job row is pruned. An attempt
+referenced by a generation is never deleted. A deterministic rejection that stamps no
+generation is valid when its replay body omits `generations` or stores it as `null`.
+
+An ID in `unknown_apply_attempt_ids` is non-actionable. The caller must re-POST the
+identical request with the same UUID and selection. The retry waits for an in-flight
+transaction or replays its committed response. If the original transaction failed, the retry
+admits the request. The caller must not settle or roll back local intent from an unknown ID
+alone. A generation-bearing replay body is corrupt when it omits the generation list, uses
+a non-list value, contains invalid or duplicate IDs, or does not name exactly the generations
+stamped to its attempt. Corrupt evidence is also non-actionable. The endpoint returns the
+`500 internal` error envelope for this invariant failure. More than 100 **distinct** IDs
+returns `422 validation_error`, as does a raw list of more than 10 000 entries. A missing
+device returns `404 not_found`.
+
 ### `PATCH /api/v1/devices/{id}` — correct the mapping
 Request (any subset):
 ```json
@@ -642,8 +737,9 @@ Phase 2: the rest activate as M5–M6 land.
 ## Actions
 
 Unless an endpoint says otherwise, a job-producing action returns `202` with
-`{ "job_id": <int> }`. The generation actions allow the nullable value documented
-below. `apply-diff` is synchronous and creates no job.
+`{ "job_id": <int> }`. The generation actions also identify the generation they
+acted on and allow the nullable job value documented below. `apply-diff` is
+synchronous and creates no job.
 
 ### Execution and admission
 
@@ -658,9 +754,9 @@ queued job from starting.
 |---|---|
 | `actions/sync`, `actions/sync-from-nso`, `actions/detect-drift`, `actions/connect`, and `sync-notify` | Return `409 conflict` only when a queued job of the same requested job type already exists. `error.detail.job_id` identifies that queued job. A running job of that type permits a queued successor. Jobs of other types do not cause this conflict. |
 | `actions/force-removal` | Every valid request creates a new removal generation and a new dedicated removal job. The endpoint does not inspect active jobs and does not deduplicate repeated requests, including requests for the same scope. |
-| `actions/apply` | Evaluate the selection first. If no selected stream is promotable, return the documented `200` no-op without checking active jobs. If at least one stream is promotable, inspect queued and running jobs once. Return `409 conflict` with the first observed job by `(created_at, id)` in `error.detail.job_id` when any exists. Otherwise, promote and enqueue the generation chain. This is a point-in-time check in the device-locked transaction. A later action can enqueue after Apply commits. |
-| `actions/retry-generation` | Return `409 conflict` only when there is no blocked executable head or another barrier action already acted on it. Otherwise, create a fresh dedicated job for the blocked head and return `202`. Existing jobs and successor bindings remain unchanged. Unrelated queued or running jobs do not cause a conflict. |
-| `actions/abandon-generation` | Return `409 conflict` only when there is no blocked executable head or another barrier action already acted on it. Otherwise, abandon the head, ensure the next executable generation has a live carrier, and return `202`. Unrelated queued or running jobs do not cause a conflict. |
+| `actions/apply` | Require `apply_attempt_id`. Replay a completed request when its UUID, device, and complete canonical `selected` match. Return `409 conflict` when the UUID identifies a different request. For a new UUID, evaluate the selection first. If no selected stream is promotable, return the documented `200` no-op without checking active jobs. If at least one stream is promotable, inspect queued and running jobs once. Return `409 conflict` with the first observed job by `(created_at, id)` in `error.detail.job_id` when any exists. Otherwise, promote and enqueue the generation chain. This is a point-in-time check in the device-locked transaction. A later action can enqueue after Apply commits. |
+| `actions/retry-generation` | Return `409 conflict` only when there is no blocked executable head or another barrier action already acted on it. Otherwise, create a fresh dedicated job for the blocked head and return `202`. Existing jobs and successor bindings remain unchanged. Unrelated queued or running jobs do not cause a conflict. The request names the generation to act on; when it is not the current head, the 409 carries `error.detail.head_generation_id` naming the head. |
+| `actions/abandon-generation` | Return `409 conflict` only when there is no blocked executable head or another barrier action already acted on it. Otherwise, abandon the head, ensure the next executable generation has a live carrier, and return `202`. Unrelated queued or running jobs do not cause a conflict. The request names the generation to act on; when it is not the current head, the 409 carries `error.detail.head_generation_id` naming the head. |
 | `actions/apply-diff` | Create no job and apply no queue-admission rule. |
 
 ### `POST /api/v1/devices/{id}/actions/sync`
@@ -696,6 +792,8 @@ job.
 These actions are the two explicit exits from the deployment-generation success
 barrier. A failed or outcome-unknown head blocks every successor.
 
+The required request body is `{ "generation_id": <int> }`.
+
 - `retry-generation` creates a fresh dedicated job that executes the head's exact
   stored document under its stored mode, verifies the stored digest before
   execution, and reconstructs removal execution from the stored removal context.
@@ -704,29 +802,50 @@ barrier. A failed or outcome-unknown head blocks every successor.
   chain. The operator asserts that the state the generation was to establish is
   already present or is no longer required.
 
-Both return:
+Both return `202 { "generation_id": <int>, "seq": <int>, "job_id": <int|null> }`.
 
-`202 { "job_id": <int|null> }`
-
-For retry, `job_id` identifies the fresh job that will execute the blocked head.
-For abandon, `job_id` identifies the carrier of the successor made executable.
-It is `null` when abandoning the head makes no successor executable. This includes
+`generation_id` and `seq` identify the head that the action changed. For retry,
+`job_id` identifies the fresh job that will execute the blocked head. For abandon,
+`job_id` identifies the carrier of the successor made executable. It is `null` when
+abandoning the head makes no successor executable, including
 when a successor exists but is itself failed (for example the adjacent generation
 of the same failed carrier). Both actions return `409 conflict` when
 the device has no blocked generation; `error.detail.head_status` reports the
-current head status. A concurrent retry or abandon that loses the
-compare-and-set race returns `409 conflict`, with an empty `error.detail` object.
-Queued or running jobs of any type do not otherwise refuse these barrier actions.
+current head status. A request that names a generation other than the current
+blocked head returns `409 conflict`; `error.detail.head_generation_id` and
+`error.detail.head_status` identify that head. Queued or running jobs of any type
+do not otherwise refuse these barrier actions.
 
-### `POST /api/v1/devices/{id}/actions/apply` (Phase 2)
+### `POST /api/v1/devices/{id}/actions/apply` (A3)
 
 Atomically promote the exact intent pushes selected by the caller and enqueue their
 immutable deployment-generation chain. The selector maps the adapter's receipt stream name
 to the `X-Push-Seq` that the plugin drained:
 
 ```json
-{ "selected": { "vlan": 4711 } }
+{
+  "apply_attempt_id": "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8",
+  "selected": { "vlan": 4711 }
+}
 ```
+
+`apply_attempt_id` is required and is the durable identity of this manual Apply.
+No revision field is accepted. A missing UUID returns the house `422 validation_error`
+envelope.
+
+The adapter stores one `DeploymentApplyAttempt` for every admitted request. This includes
+a complete no-op and a deterministic rejection such as `409 apply_unexecutable`. The row
+contains the complete canonical selection, admission state, HTTP status, and exact response
+body. Generations created by the request carry its `apply_attempt_id`, including the
+Apply-composed removal generations it enqueues. Only generations reissued outside an
+admitted request leave it `null`: force-removal, retry-generation, and chain-advancement
+reissues.
+
+A repeat with the same UUID, same device and complete canonical `selected` returns the
+stored HTTP status and response body byte for byte. It performs no admission check and
+creates no generation or job. Reusing the UUID with a different device or selection returns
+`409 conflict`; `error.detail.mismatch` is `device_id` or `selected`. The conflict changes
+nothing.
 
 The selector uses push sequences, not current revisions, because the plugin already owns
 these values in its drain bookkeeping and the adapter receipts use the same identity. A
@@ -786,8 +905,11 @@ top-level `job_id` is the first job in that chain.
 }
 ```
 
-Promotion, document storage, cohort allocation, generation creation, and job enqueue occur
-in one transaction under the device projection lock. Removal work uses the ordinary
+The attempt row, promotion, document storage, cohort allocation, generation stamps, job
+enqueue, and replay body commit in one transaction under the device projection lock. An
+internal or transport failure rolls back all of them and leaves the UUID unknown. The caller
+must re-POST the identical request with the same UUID and selection. There is no received or
+in-progress attempt state. Removal work uses the ordinary
 `enqueue_removal` path and its existing scope runner. Networked removal generations precede
 the apply generation; detach removal generations follow it, so the top-level `job_id` names
 the first networked removal when one exists. The networked intermediate document
@@ -800,7 +922,8 @@ barrier.
 
 Apply refuses the whole request with `409 apply_unexecutable` when any selected stream cannot
 be routed faithfully through those runners. The refusal names each stream and reason. It does
-not promote or enqueue a subset. Reasons are stable machine codes:
+not promote or enqueue a subset. The adapter stores the rejection envelope on the attempt,
+and an identical retry replays it. Reasons are stable machine codes:
 
 <!-- apply-unexecutable-reasons:start -->
 - `interface_attribute_eligibility_unresolved`

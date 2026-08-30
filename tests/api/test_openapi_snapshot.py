@@ -73,15 +73,28 @@ def test_openapi_matches_committed_snapshot(openapi_schema):
         )
 
 
-def test_generation_actions_document_both_conflict_details(openapi_schema):
-    assert openapi_schema["components"]["schemas"]["BarrierActionOut"]["required"] == ["job_id"]
+def test_generation_actions_document_the_generation_cas(openapi_schema):
+    schemas = openapi_schema["components"]["schemas"]
+    assert schemas["BarrierActionIn"]["required"] == ["generation_id"]
+    assert schemas["BarrierActionOut"]["required"] == ["generation_id", "seq", "job_id"]
 
     for action in ("retry-generation", "abandon-generation"):
         operation = openapi_schema["paths"][f"/api/v1/devices/{{device_id}}/actions/{action}"]["post"]
         description = operation["description"]
 
+        assert operation["requestBody"] == {
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/BarrierActionIn"},
+                }
+            },
+            "required": True,
+        }
+        assert operation["responses"]["409"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/ErrorEnvelope"
+        }
         assert "error.detail.head_status" in description
-        assert "empty detail" in description
+        assert "error.detail.head_generation_id" in description
 
 
 def test_action_apply_requires_skipped_detail(openapi_schema):
@@ -91,16 +104,42 @@ def test_action_apply_requires_skipped_detail(openapi_schema):
     assert {"type": "null"} in schema["properties"]["skipped_detail"]["anyOf"]
 
 
-def test_api_contract_documents_both_generation_action_conflicts():
+def test_action_apply_requires_an_attempt_id(openapi_schema):
+    schema = openapi_schema["components"]["schemas"]["ActionApplyIn"]
+
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["apply_attempt_id", "selected"]
+    assert schema["properties"]["apply_attempt_id"] == {
+        "format": "uuid",
+        "title": "Apply Attempt Id",
+        "type": "string",
+    }
+
+
+def test_api_contract_documents_the_generation_action_cas():
     contract = (SNAPSHOT_PATH.parents[2] / "docs" / "api-contract.md").read_text()
+    actions_table = contract.split("### Execution and admission", maxsplit=1)[1].split(
+        "### `POST /api/v1/devices/{id}/actions/sync`",
+        maxsplit=1,
+    )[0]
+    moved_head_sentence = (
+        "The request names the generation to act on; when it is not the current head, the 409 "
+        "carries `error.detail.head_generation_id` naming the head."
+    )
+    for action in ("retry-generation", "abandon-generation"):
+        row = next(line for line in actions_table.splitlines() if f"`actions/{action}`" in line)
+        assert moved_head_sentence in row
+
     section = contract.split(
         "### `POST /api/v1/devices/{id}/actions/{retry,abandon}-generation`",
         maxsplit=1,
     )[1].split("\n### ", maxsplit=1)[0]
     section = " ".join(section.split())
 
+    assert '`{ "generation_id": <int> }`' in section
+    assert '`202 { "generation_id": <int>, "seq": <int>, "job_id": <int|null> }`' in section
     assert "error.detail.head_status" in section
-    assert "empty `error.detail`" in section
+    assert "error.detail.head_generation_id" in section
 
 
 def test_api_contract_documents_the_skipped_detail_null_shape():
@@ -112,6 +151,22 @@ def test_api_contract_documents_the_skipped_detail_null_shape():
     assert "only its CONTENT is conditional" in section
     assert "The value is\n`null` when no member qualifies" in section
     assert '"skipped_detail": null' in section
+
+
+def test_api_contract_documents_apply_attempt_identity_and_recovery():
+    contract = (SNAPSHOT_PATH.parents[2] / "docs" / "api-contract.md").read_text()
+    section = contract.split("### `POST /api/v1/devices/{id}/actions/apply`", maxsplit=1)[1].split(
+        "\n### ", maxsplit=1
+    )[0]
+    section = " ".join(section.split())
+
+    assert '"apply_attempt_id": "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8"' in section
+    assert "`apply_attempt_id` is required" in section
+    assert "same device and complete canonical `selected`" in section
+    assert "stored HTTP status and response body byte for byte" in section
+    assert "`error.detail.mismatch` is `device_id` or `selected`" in section
+    assert "re-POST the identical request with the same UUID and selection" in section
+    assert "No revision field is accepted" in section
 
 
 def test_no_disambiguation_qualified_component_names(openapi_schema):
@@ -176,7 +231,8 @@ def test_action_conflict_descriptions_match_their_admission_rules(openapi_schema
 
     apply = openapi_schema["paths"]["/api/v1/devices/{device_id}/actions/apply"]["post"]
     assert apply["responses"]["409"]["description"] == (
-        "A job is already queued or running for this device, or a selected stream cannot be applied faithfully"
+        "The Apply UUID identifies a different request, a job is already queued or running, "
+        "or a selected stream cannot be applied faithfully"
     )
 
 

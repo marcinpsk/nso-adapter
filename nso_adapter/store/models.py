@@ -8,6 +8,7 @@ Schema aligns with docs/nso-adapter.md §5:
 from __future__ import annotations
 
 import enum
+import uuid
 from datetime import datetime
 
 from sqlalchemy import (
@@ -20,6 +21,7 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Sequence,
@@ -31,6 +33,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from nso_adapter.core.request_flags import PENDING_CLEAR_PROVENANCES, REMOVAL_MARKINGS
@@ -641,6 +644,24 @@ class IntentPushReceipt(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
 
+class DeploymentApplyAttempt(Base):
+    """One durable manual Apply admission and its complete replay body."""
+
+    __tablename__ = "deployment_apply_attempt"
+    __table_args__ = (
+        UniqueConstraint("id", "device_id", name="uq_apply_attempt_id_device"),
+        Index("ix_apply_attempt_device", "device_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    device_id: Mapped[int] = mapped_column(Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False)
+    selected: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    admission_state: Mapped[str] = mapped_column(Text, nullable=False)
+    http_status: Mapped[int] = mapped_column(Integer, nullable=False)
+    response: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
+
+
 class DeploymentGeneration(Base):
     """One immutable, ordered unit of device deployment (#1522 §G1).
 
@@ -663,8 +684,17 @@ class DeploymentGeneration(Base):
     __tablename__ = "deployment_generation"
     __table_args__ = (
         UniqueConstraint("device_id", "seq", name="uq_generation_seq_per_device"),
+        ForeignKeyConstraint(
+            ["apply_attempt_id", "device_id"],
+            ["deployment_apply_attempt.id", "deployment_apply_attempt.device_id"],
+            name="fk_generation_apply_attempt",
+            ondelete="NO ACTION",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
         Index("ix_generation_device_status", "device_id", "status"),
         Index("ix_generation_job", "job_id"),
+        Index("ix_generation_device_apply_attempt", "device_id", "apply_attempt_id"),
         Index(
             "ix_generation_settlement_cohort",
             "settlement_cohort",
@@ -704,7 +734,16 @@ class DeploymentGeneration(Base):
     #: same operation, and the failed job's row is not a safe place to read it back from.
     #: NULL for a generation an apply produced — those need no context beyond the document.
     removal_context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    apply_attempt_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        nullable=True,
+    )
     job_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
+    #: Terminal carrier evidence survives the SET NULL relationship above and job pruning.
+    carrier_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    carrier_job_status: Mapped[str | None] = mapped_column(Text, nullable=True)
+    carrier_job_result: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    carrier_job_error: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"), default=0)
     last_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
