@@ -675,10 +675,11 @@ def test_evidence_enforces_attempt_id_bound_with_linear_validation_time():
 def test_evidence_enforces_attempt_id_bound_for_colliding_uuids():
     from pydantic import ValidationError
 
-    from nso_adapter.api.devices import DeploymentEvidenceIn
+    from nso_adapter.api.devices import _DEPLOYMENT_EVIDENCE_RAW_LIMIT, DeploymentEvidenceIn
 
-    colliding_ints = [value * sys.hash_info.modulus for value in range(1, 20_001)]
+    colliding_ints = [value * sys.hash_info.modulus for value in range(1, _DEPLOYMENT_EVIDENCE_RAW_LIMIT)]
     assert all(value < 2**128 for value in colliding_ints)
+    assert len(colliding_ints) < _DEPLOYMENT_EVIDENCE_RAW_LIMIT, "the dedupe loop must be the thing that fires"
     attempt_ids = [str(uuid.UUID(int=value)) for value in colliding_ints]
 
     started = time.perf_counter()

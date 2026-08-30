@@ -212,9 +212,9 @@ def test_action_apply_documents_its_internal_error_envelope(openapi_schema):
 
 def test_action_abandon_documents_the_successor_carrier_identity(openapi_schema):
     operation = openapi_schema["paths"]["/api/v1/devices/{device_id}/actions/abandon-generation"]["post"]
+    description = " ".join(operation["description"].split())
 
-    assert "successor carrier" in operation["description"]
-    assert "null" in operation["description"]
+    assert "``job_id`` identifies the successor carrier this action released, or is ``null``" in description
 
 
 def test_action_conflict_descriptions_match_their_admission_rules(openapi_schema):
