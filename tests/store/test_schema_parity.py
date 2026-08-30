@@ -108,7 +108,8 @@ def _snapshot(engine) -> dict:
                 # CHECK constraints compared by their reflected SQL text (names may be generated).
                 "checks": sorted(c["sqltext"] for c in insp.get_check_constraints(table)),
             }
-        snap["__job_queue_class_trigger__"] = tuple(conn.execute(_JOB_TRIGGER_SQL).one())
+        job_trigger = conn.execute(_JOB_TRIGGER_SQL).one_or_none()
+        snap["__job_queue_class_trigger__"] = tuple(job_trigger) if job_trigger is not None else ()
     # PostgreSQL ENUM types are schema-level, not per-table: compare their label sets so an
     # enum value-set divergence (a migration adding/renaming a member) is caught too.
     snap["__enums__"] = {e["name"]: tuple(e["labels"]) for e in insp.get_enums()}
