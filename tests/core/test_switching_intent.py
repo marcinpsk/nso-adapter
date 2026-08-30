@@ -317,6 +317,67 @@ async def test_switchport_replacement_preserves_root_and_retained_tag_identity(a
     assert row.last_apply_error is None
 
 
+@pytest.mark.anyio
+async def test_replacements_keep_loaded_child_collections_current(adapter_client):
+    device_id = await seed_device(nso_device_name="switching-loaded-collections", netbox_device_id=1617)
+    async with session() as db:
+        await replace_lag_snapshot(
+            db,
+            device_id,
+            (
+                LagBundleSnapshot(
+                    name="Port-channel1",
+                    lag_id=1,
+                    members=(
+                        LagMemberSnapshot(interface_name="Gi0/1"),
+                        LagMemberSnapshot(interface_name="Gi0/2"),
+                    ),
+                ),
+            ),
+        )
+        await replace_switchport_snapshot(
+            db,
+            device_id,
+            (SwitchportSnapshot(interface_name="Gi0/3", mode="trunk", tagged_vlans=(10, 20)),),
+        )
+        lag_row = await db.scalar(
+            select(LagBundleIntent)
+            .where(LagBundleIntent.device_id == device_id)
+            .options(selectinload(LagBundleIntent.members))
+        )
+        switchport_row = await db.scalar(
+            select(SwitchportIntent)
+            .where(SwitchportIntent.device_id == device_id)
+            .options(selectinload(SwitchportIntent.tagged_vlans))
+        )
+        assert lag_row is not None
+        assert switchport_row is not None
+
+        await replace_lag_snapshot(
+            db,
+            device_id,
+            (
+                LagBundleSnapshot(
+                    name="Port-channel1",
+                    lag_id=1,
+                    members=(
+                        LagMemberSnapshot(interface_name="Gi0/2"),
+                        LagMemberSnapshot(interface_name="Gi0/4"),
+                    ),
+                ),
+            ),
+        )
+        await replace_switchport_snapshot(
+            db,
+            device_id,
+            (SwitchportSnapshot(interface_name="Gi0/3", mode="trunk", tagged_vlans=(20, 30)),),
+        )
+
+        assert {member.interface_name for member in lag_row.members} == {"Gi0/2", "Gi0/4"}
+        assert {tag.vlan_id for tag in switchport_row.tagged_vlans} == {20, 30}
+        await db.rollback()
+
+
 def test_obsolete_direct_nso_switching_paths_are_absent():
     repository = Path(__file__).resolve().parents[2]
     assert not (repository / "nso_adapter/core/lag_intent.py").exists()

@@ -228,6 +228,38 @@ async def test_apply_lag_config_requires_auth(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_apply_lag_config_requires_explicit_snapshot_without_mutating_store(adapter_client):
+    device_id = await seed_device(nso_device_name="lag-required-snapshot", netbox_device_id=None)
+    stored = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/lag-config/apply",
+        json={"bundles": [{"name": "Port-channel1", "lag_id": 1}]},
+        headers=AUTH,
+    )
+    assert stored.status_code == 200
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/lag-config/apply",
+        json={},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    async with session() as db:
+        names = (
+            (
+                await db.execute(
+                    text("SELECT name FROM lag_bundle_intent WHERE device_id = :device_id"),
+                    {"device_id": device_id},
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert names == ["Port-channel1"]
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "bundles",
     [

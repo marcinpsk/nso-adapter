@@ -5587,6 +5587,9 @@
             "type": "array"
           }
         },
+        "required": [
+          "bundles"
+        ],
         "title": "LagConfigApplyRequest",
         "type": "object"
       },
@@ -8918,6 +8921,9 @@
             "type": "array"
           }
         },
+        "required": [
+          "interfaces"
+        ],
         "title": "SwitchportApplyRequest",
         "type": "object"
       },

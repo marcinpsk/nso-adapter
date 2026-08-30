@@ -57,7 +57,7 @@ class SwitchportApply(_StrictSwitchportRequest):
 
 
 class SwitchportApplyRequest(_StrictSwitchportRequest):
-    interfaces: list[SwitchportApply] = Field(default_factory=list)
+    interfaces: list[SwitchportApply]
 
     @field_validator("interfaces")
     @classmethod

@@ -141,12 +141,12 @@ async def replace_lag_snapshot(
         desired_member_names = {member.interface_name for member in bundle.members}
         for name, existing_member in current_members.items():
             if name not in desired_member_names:
-                await db.delete(existing_member)
+                lag_row.members.remove(existing_member)
         for member in bundle.members:
             desired_member = current_members.get(member.interface_name)
             if desired_member is None:
-                desired_member = LagMemberIntent(lag_bundle_id=lag_row.id, interface_name=member.interface_name)
-                db.add(desired_member)
+                desired_member = LagMemberIntent(interface_name=member.interface_name)
+                lag_row.members.append(desired_member)
             desired_member.mode = member.mode
             desired_member.port_priority = member.port_priority
 
@@ -210,10 +210,10 @@ async def replace_switchport_snapshot(
         current_tags = {tag.vlan_id: tag for tag in switchport_row.tagged_vlans}
         for vlan_id, tag_row in current_tags.items():
             if vlan_id not in desired_tags:
-                await db.delete(tag_row)
+                switchport_row.tagged_vlans.remove(tag_row)
         for vlan_id in interface.tagged_vlans:
             if vlan_id not in current_tags:
-                db.add(SwitchportTaggedVlanIntent(switchport_id=switchport_row.id, vlan_id=vlan_id))
+                switchport_row.tagged_vlans.append(SwitchportTaggedVlanIntent(vlan_id=vlan_id))
 
     await db.flush()
     return ReplacementSummary(count=len(interfaces), removed=len(removed))

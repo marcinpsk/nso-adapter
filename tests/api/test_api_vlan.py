@@ -129,6 +129,38 @@ async def test_apply_switchport_device_not_found(adapter_client):
 
 
 @pytest.mark.anyio
+async def test_apply_switchport_requires_explicit_snapshot_without_mutating_store(adapter_client):
+    device_id = await seed_device(nso_device_name="switchport-required-snapshot", netbox_device_id=None)
+    stored = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/switchport/apply",
+        json={"interfaces": [{"interface_name": "Gi0/1", "untagged_vlan": 10}]},
+        headers=AUTH,
+    )
+    assert stored.status_code == 200
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/switchport/apply",
+        json={},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    async with session() as db:
+        names = (
+            (
+                await db.execute(
+                    text("SELECT interface_name FROM switchport_intent WHERE device_id = :device_id"),
+                    {"device_id": device_id},
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert names == ["Gi0/1"]
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "interfaces",
     [

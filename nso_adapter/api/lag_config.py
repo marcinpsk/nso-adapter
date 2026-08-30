@@ -58,7 +58,7 @@ class LagBundleApply(_StrictRequestModel):
 
 
 class LagConfigApplyRequest(_StrictRequestModel):
-    bundles: list[LagBundleApply] = Field(default_factory=list)
+    bundles: list[LagBundleApply]
 
     @field_validator("bundles")
     @classmethod
