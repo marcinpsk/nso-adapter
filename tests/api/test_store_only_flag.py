@@ -17,6 +17,8 @@ is that NO device-touching job may ever be created.
 
 from __future__ import annotations
 
+from uuid import uuid4
+
 import pytest
 from sqlalchemy import select
 
@@ -252,7 +254,7 @@ async def test_store_only_manual_apply_is_rejected_without_a_job(adapter_client)
 
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/apply?store_only=true",
-        json={"selected": {}},
+        json={"apply_attempt_id": str(uuid4()), "selected": {}},
         headers=AUTH,
     )
 

@@ -33,7 +33,13 @@ async def test_start_job_returns_the_attempt_under_an_expiring_session(store_eng
     starts a lazy load outside the greenlet: ``MissingGreenlet``, not an attempt.
     """
     async with session() as db:
-        job = Job(job_type=JobType.provision, device_id=None, status=JobStatus.queued, context={})
+        job = Job(
+            job_type=JobType.provision,
+            device_id=None,
+            status=JobStatus.queued,
+            coalescible=False,
+            context={},
+        )
         db.add(job)
         await db.commit()
         job_id = job.id

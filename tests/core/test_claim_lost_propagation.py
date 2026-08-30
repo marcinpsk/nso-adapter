@@ -117,7 +117,13 @@ async def test_run_with_db_propagates_claim_lost_without_failing_the_job(adapter
 
     device_id = await seed_device(nso_device_name="cl-rwd", netbox_device_id=9990)
     async with session() as db:
-        job = Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued, context={})
+        job = Job(
+            job_type=JobType.sync,
+            device_id=device_id,
+            status=JobStatus.queued,
+            coalescible=True,
+            context={},
+        )
         db.add(job)
         await db.commit()
         job_id = job.id
@@ -141,7 +147,13 @@ async def test_mark_job_failed_cannot_overwrite_recovery(adapter_client):
 
     device_id = await seed_device(nso_device_name="cl-mjf", netbox_device_id=9991)
     async with session() as db:
-        job = Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.running, context={})
+        job = Job(
+            job_type=JobType.sync,
+            device_id=device_id,
+            status=JobStatus.running,
+            coalescible=True,
+            context={},
+        )
         db.add(job)
         await db.commit()
         job_id = job.id
@@ -171,7 +183,13 @@ async def test_mark_job_failed_still_writes_for_the_holder(adapter_client):
 
     device_id = await seed_device(nso_device_name="cl-mjf-ok", netbox_device_id=9992)
     async with session() as db:
-        job = Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.running, context={})
+        job = Job(
+            job_type=JobType.sync,
+            device_id=device_id,
+            status=JobStatus.running,
+            coalescible=True,
+            context={},
+        )
         db.add(job)
         await db.commit()
         job_id = job.id
@@ -190,7 +208,13 @@ async def test_mark_job_failed_without_a_registration_is_unchanged(adapter_clien
 
     job_id = None
     async with session() as db:
-        job = Job(job_type=JobType.provision, device_id=None, status=JobStatus.running, context={})
+        job = Job(
+            job_type=JobType.provision,
+            device_id=None,
+            status=JobStatus.running,
+            coalescible=False,
+            context={},
+        )
         db.add(job)
         await db.commit()
         job_id = job.id
@@ -206,7 +230,13 @@ async def test_worker_mark_failed_cannot_overwrite_recovery(adapter_client):
 
     device_id = await seed_device(nso_device_name="cl-wmf", netbox_device_id=9993)
     async with session() as db:
-        job = Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued, context={})
+        job = Job(
+            job_type=JobType.sync,
+            device_id=device_id,
+            status=JobStatus.queued,
+            coalescible=True,
+            context={},
+        )
         db.add(job)
         await db.commit()
         job_id = job.id

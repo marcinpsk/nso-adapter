@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from tests.conftest import VALID_TOKEN, seed_device, session
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
@@ -175,7 +177,7 @@ async def test_rekey_device_clears_interface_state_retains_jobs(adapter_client_w
     # Seed an interface and a completed job for this device
     async with session() as db:
         db.add(DbInterface(device_id=device_id, name="Gi0/0"))
-        db.add(Job(device_id=device_id, job_type=JobType.sync, status=JobStatus.succeeded))
+        db.add(Job(device_id=device_id, job_type=JobType.sync, status=JobStatus.succeeded, coalescible=True))
         await db.commit()
 
     resp = await adapter_client_with_nso.patch(
@@ -210,15 +212,24 @@ async def test_offboard_device_happy_path(adapter_client_with_nso):
     assert check.status_code == 404
 
 
-async def test_offboard_device_with_active_job_succeeds_and_nullifies_job(adapter_client_with_nso):
-    """DELETE a device that has a running job → 204; job row survives with device_id=None."""
+async def test_offboard_device_terminalizes_and_detaches_running_orphan(adapter_client_with_nso):
+    """DELETE terminalizes and detaches a stale running job."""
     from nso_adapter.store.models import Job, JobStatus, JobType
 
     device_id = await seed_device(nso_instance="nso-dev", nso_device_name="active-job-dev", netbox_device_id=401)
 
     job_id = None
     async with session() as db:
-        job = Job(device_id=device_id, job_type=JobType.sync, status=JobStatus.running)
+        stale_at = datetime.now(UTC) - timedelta(days=1)
+        job = Job(
+            device_id=device_id,
+            job_type=JobType.sync,
+            status=JobStatus.running,
+            coalescible=True,
+            run_attempt=1,
+            started_at=stale_at,
+            heartbeat_at=stale_at,
+        )
         db.add(job)
         await db.commit()
         await db.refresh(job)
@@ -227,11 +238,16 @@ async def test_offboard_device_with_active_job_succeeds_and_nullifies_job(adapte
     resp = await adapter_client_with_nso.delete(f"/api/v1/devices/{device_id}", headers=AUTH)
     assert resp.status_code == 204
 
-    # Job must still exist but device_id must be NULL
     async with session() as db:
         surviving_job = await db.get(Job, job_id)
         assert surviving_job is not None, "job row must survive offboard"
-        assert surviving_job.device_id is None, "job device_id must be nullified on offboard"
+        assert surviving_job.status is JobStatus.failed
+        assert surviving_job.device_id is None
+        assert surviving_job.error == {
+            "code": "device_offboarded_orphan",
+            "message": "The device was offboarded after this job lost its worker",
+            "detail": {},
+        }
 
 
 async def test_offboard_device_unknown_returns_404(adapter_client):

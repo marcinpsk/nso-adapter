@@ -159,8 +159,14 @@ parallel names (`adapter_bearer_token`, `api_token`, `bearer_token`, etc.).
   ```
   Codes: `unauthorized`, `not_found`, `validation_error`, `nso_unreachable`,
   `netbox_unreachable`, `conflict`, `internal`.
-- Concurrency: one job per device at a time — a second request returns
-  `409 conflict` with the running job id in `error.detail.job_id`.
+- Concurrency is heterogeneous. `DeviceClaim` permits one executing device job at
+  a time. Sync, sync-from-NSO, detect-drift, connect, and sync-notify return `409`
+  only for a queued job of the same requested type; running jobs permit successors.
+  Force-removal always creates a distinct job and does not deduplicate by scope.
+  Manual Apply returns `200` before its active-job check when nothing is promotable;
+  otherwise its point-in-time check returns `409` for any queued or running job.
+  Retry and abandon check only the blocked generation barrier and may return `202`
+  while unrelated queued or running jobs coexist.
 - Device ID = integer PK in the adapter DB, **not** the NSO device name.
 - `PATCH /devices/{id}` re-keys mapping (changing `nso_device_name` or
   `nso_instance`); interface state is cleared, job history retained.

@@ -8,10 +8,9 @@ invisible to settlement, and silently, because nothing else about the row looks 
 
 ``tests/test_no_direct_terminal_write.py`` is the mechanical half: it fails the build on a
 seventeenth writer. This is the behavioral half: each of the sixteen sites in §2.2's
-inventory is driven through its real production path and its allocation is observed. The two
-exempt sites — the claimless-corruption failure and offboard's bulk write — are pinned as
-exempt rather than left unstated, because both are device-less by construction and a cursor
-scoped to a device can never reach them.
+inventory that the schema permits is driven through its real production path. The detached
+non-provision CHECK makes the claimless-corruption guard unreachable. Offboard's bulk write
+is the remaining exempt site because it is device-less by construction.
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ from nso_adapter.core import jobs as jobs_mod
 from nso_adapter.core import worker as worker_mod
 from nso_adapter.core.claim import ClaimRegistration, acquire_claim, release_claim
 from nso_adapter.store.models import DeviceSettleCounter, Job, JobStatus, JobType
-from tests.conftest import seed_device, session
+from tests.conftest import attach_apply_generation, seed_device, session
 from tests.core.test_jobs import _nso_client_for_connect
 from tests.core.test_static_route_put import A, B, wire
 from tests.core.test_static_route_removal import SrFake, run_removal_job, seed_removal_job, seed_tomb, sr_client
@@ -46,6 +45,7 @@ async def _running_job(device_id: int | None, job_type: JobType, *, context: dic
             job_type=job_type,
             device_id=device_id,
             status=JobStatus.running,
+            coalescible=job_type not in (JobType.removal, JobType.provision),
             run_attempt=1,
             context=context,
         )
@@ -56,7 +56,12 @@ async def _running_job(device_id: int | None, job_type: JobType, *, context: dic
 
 async def _queued_job(device_id: int | None, job_type: JobType) -> int:
     async with session() as db:
-        job = Job(job_type=job_type, device_id=device_id, status=JobStatus.queued)
+        job = Job(
+            job_type=job_type,
+            device_id=device_id,
+            status=JobStatus.queued,
+            coalescible=job_type not in (JobType.removal, JobType.provision),
+        )
         db.add(job)
         await db.commit()
         return job.id
@@ -135,13 +140,6 @@ async def _t4_run_provision_success() -> tuple[int, int]:
     return device_id, job_id
 
 
-async def _t5_claimless_corruption() -> tuple[None, int]:
-    """``core/worker.py`` the orphaned-claimless failure — EXEMPT: device_id IS NULL by selection."""
-    job_id = await _queued_job(None, JobType.sync)  # not a provision → corrupt claimless row
-    assert await worker_mod._claim_next_claimless_job() is None
-    return None, job_id
-
-
 async def _t6_worker_mark_failed() -> tuple[int, int]:
     """``core/worker.py`` ``_mark_failed`` — the worker-machinery fault path."""
     device_id = await seed_device(nso_device_name="inv-t6", netbox_device_id=8306)
@@ -211,6 +209,7 @@ async def _t11_apply_nothing_eligible() -> tuple[int, int]:
 
     device_id = await seed_device(nso_device_name="inv-t11", netbox_device_id=8311)
     job_id = await _apply_job(device_id)
+    await attach_apply_generation(job_id, device_id)
     reg = await _claim_for(device_id, job_id)
     try:
         with (
@@ -246,6 +245,7 @@ async def _t12_apply_all_ok() -> tuple[int, int]:
     device_id = await seed_device(nso_device_name="inv-t12", netbox_device_id=8312)
     job_id = await _apply_job(device_id)
     await _seed_accepted_static_route(device_id)
+    await attach_apply_generation(job_id, device_id)
     reg = await _claim_for(device_id, job_id)
     try:
         with (
@@ -269,6 +269,7 @@ async def _t13_apply_any_failed() -> tuple[int, int]:
     device_id = await seed_device(nso_device_name="inv-t13", netbox_device_id=8313)
     job_id = await _apply_job(device_id)
     await _seed_accepted_static_route(device_id)
+    await attach_apply_generation(job_id, device_id)
     err = NsoApplyError(code="nso_error", message="route rejected", detail={})
     reg = await _claim_for(device_id, job_id)
     try:
@@ -291,6 +292,7 @@ async def _t14_run_apply_fallback() -> tuple[int, int]:
 
     device_id = await seed_device(nso_device_name="inv-t14", netbox_device_id=8314)
     job_id = await _apply_job(device_id)
+    await attach_apply_generation(job_id, device_id)
     reg = await _claim_for(device_id, job_id)
     try:
         # The device the apply is pointed at does not exist, so _execute_apply raises out.
@@ -346,7 +348,6 @@ _INVENTORY = {
     "T2": Site(_t2_run_with_db_success, JobStatus.succeeded, True),
     "T3": Site(_t3_run_connect_success, JobStatus.succeeded, True),
     "T4": Site(_t4_run_provision_success, JobStatus.succeeded, True),
-    "T5": Site(_t5_claimless_corruption, JobStatus.failed, False),
     "T6": Site(_t6_worker_mark_failed, JobStatus.failed, True),
     "T7": Site(_t7_removal_residue_found, JobStatus.failed, True),
     "T8": Site(_t8_removal_proven, JobStatus.succeeded, True),
@@ -363,7 +364,7 @@ _INVENTORY = {
 
 @pytest.mark.parametrize("site_id", list(_INVENTORY))
 async def test_every_terminal_writer_allocates(adapter_client, site_id):
-    """S2.3 (P0.8) — all 14 device-bound sites allocate; the 2 device-less sites do not.
+    """S2.3 (P0.8): all 14 device-bound sites allocate; the device-less site does not.
 
     Forbidden: any site producing a terminal, device-bound job with ``settle_seq IS NULL``.
     Such a job is permanently invisible to a settlement consumer, and nothing about the row
@@ -410,7 +411,7 @@ async def test_a_superseded_requeue_that_lands_failed_allocates_once(adapter_cli
     or allocating for a requeue that stayed ``queued``, which is not a terminal write at all.
     """
     from nso_adapter.core.claim import terminalize_running
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from tests.core.test_settle_token import _queue, _start_run
 
     device_id = await seed_device(nso_device_name="inv-superseded", netbox_device_id=8320)
@@ -418,7 +419,7 @@ async def test_a_superseded_requeue_that_lands_failed_allocates_once(adapter_cli
     _jid, _dev, _jt, reg = await _start_run(device_id, job_id)
 
     async with session() as db:
-        created, winner = await admit_queued_job(db, device_id, JobType.sync)
+        created, winner = await admit_coalescible_job(db, device_id, JobType.sync)
         await db.commit()
         successor_id = (created or winner).id
 
@@ -449,7 +450,7 @@ async def test_a_rejected_recovery_write_allocates_nothing(adapter_client, monke
 
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from tests.core.test_settle_token import _queue, _recover, _start_run
 
     device_id = await seed_device(nso_device_name="inv-delayed", netbox_device_id=8321)
@@ -490,7 +491,7 @@ async def test_a_rejected_recovery_write_allocates_nothing(adapter_client, monke
                 await other.commit()
             await _start_run(device_id, jid)
             async with rival() as other:
-                await admit_queued_job(other, device_id, JobType.sync)
+                await admit_coalescible_job(other, device_id, JobType.sync)
                 await other.commit()
         return await real_terminalize_running(db, jid, **kwargs)
 
@@ -505,11 +506,11 @@ async def test_a_rejected_recovery_write_allocates_nothing(adapter_client, monke
     assert await _last_seq(device_id) == 0, "last_seq moved for a write that was refused"
 
 
-async def test_device_null_terminal_jobs_are_exempt(adapter_client):
-    """S2.5 — a provision that fails before acquiring a device, and the claimless corruption.
+async def test_device_null_provision_failure_is_exempt(adapter_client):
+    """S2.5: a provision that fails before acquiring a device remains unsequenced.
 
-    Forbidden: either allocating. Both are terminal and both are device-less, permanently:
-    a device-scoped cursor can never reach them, and there is no counter to allocate from.
+    It is terminal and device-less. A device-scoped cursor cannot reach it, and there is no
+    counter to allocate from.
     """
     job_id = await _running_job(None, JobType.provision, context={"nso_instance": "nso-dev", "device_name": "inv-fail"})
 
@@ -523,8 +524,3 @@ async def test_device_null_terminal_jobs_are_exempt(adapter_client):
     assert failed_provision.status is JobStatus.failed
     assert failed_provision.device_id is None
     assert failed_provision.settle_seq is None
-
-    _none, corrupt_id = await _t5_claimless_corruption()
-    corrupt = await _job_row(corrupt_id)
-    assert corrupt.status is JobStatus.failed
-    assert corrupt.settle_seq is None

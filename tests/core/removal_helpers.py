@@ -31,6 +31,7 @@ async def seed_removal_job(device_id: int, context: dict) -> int:
             job_type=JobType.removal,
             device_id=device_id,
             status=JobStatus.running,
+            coalescible=False,
             run_attempt=1,
             context=full_context,
         )

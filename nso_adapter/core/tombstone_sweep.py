@@ -23,6 +23,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import acquire_claim, claim_session, lock_claim, release_claim
+from nso_adapter.core.jobs import create_dedicated_job
 from nso_adapter.core.request_flags import DETACH_MARKING
 from nso_adapter.core.static_route_plan import as_triple, triple_of
 from nso_adapter.store.models import Job, JobStatus, JobType, StaticRouteTombstone
@@ -81,7 +82,7 @@ async def reissue_removal_job(conn: AsyncSession, device_id: int, row: StaticRou
     device's ordered chain, so it cannot cross a blocked head and a later push cannot cross
     it (#1522 §H2).
     """
-    from nso_adapter.core.generation import create_reissue_generation
+    from nso_adapter.core.generation import GenerationCarrierCorruption, attach_to_job, create_reissue_generation
     from nso_adapter.store.models import GenerationMode
 
     context = _removal_context(row)
@@ -92,10 +93,9 @@ async def reissue_removal_job(conn: AsyncSession, device_id: int, row: StaticRou
         removal_context=context,
         allowed_removal_keys=context["removed"],
     )
-    job = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued, context=context)
-    conn.add(job)
-    await conn.flush()
-    generation.job_id = job.id
+    job = await create_dedicated_job(conn, device_id, JobType.removal, context=context)
+    if not await attach_to_job(conn, generation, job):
+        raise GenerationCarrierCorruption(f"dedicated carrier {job.id} rejected generation {generation.id}")
     row.job_id = job.id
     await conn.flush()
     return job
@@ -127,9 +127,10 @@ async def sweep_one_device(device_id: int, *, db: AsyncSession | None = None) ->
     created = 0
     try:
         async with claim_session(db) as conn:
-            # Guard first, then tombstones, then jobs — §3.9's order. No `devices` row
-            # lock: the claim is the exclusion, and a same-device rival already lost.
+            from nso_adapter.core.generation import lock_projection
+
             await lock_claim(conn, reg)
+            await lock_projection(conn, device_id)
             ids = sorted(
                 (
                     await conn.execute(

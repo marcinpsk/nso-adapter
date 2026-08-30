@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -758,7 +759,7 @@ async def test_f5_c_a_detach_head_is_re_admittable(adapter_client):
     assert (await generations(device_id))[-1].status is GenerationStatus.pending
 
 
-# ── Finding 6 — the three generation-less producers ──────────────────────────
+# ── Finding 6: every device-writing producer attaches a generation ──────────
 
 
 async def test_f6_a_manual_apply_creates_a_generation_from_authorized_state(adapter_client):
@@ -772,7 +773,7 @@ async def test_f6_a_manual_apply_creates_a_generation_from_authorized_state(adap
     selected_seq = (await stream_row(device_id, "vlan")).source_push_seq
     resp = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/apply",
-        json={"selected": {"vlan": selected_seq}},
+        json={"apply_attempt_id": str(uuid4()), "selected": {"vlan": selected_seq}},
         headers=AUTH,
     )
     assert resp.status_code == 202
@@ -821,7 +822,7 @@ async def test_f6_c_the_reclaimer_reissue_gives_its_job_a_generation(adapter_cli
     device_id = await seed_device(nso_device_name="gen-reclaim", netbox_device_id=9816)
     async with session() as db:
         # R1's handoff set: the owning removal job SUCCEEDED without proving anything.
-        owner = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.succeeded)
+        owner = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.succeeded, coalescible=False)
         db.add(owner)
         await db.flush()
         db.add(
@@ -885,6 +886,83 @@ async def _block_the_head(client, device_id: int, device_name: str):
     return head
 
 
+@pytest.mark.parametrize("action", ["retry-generation", "abandon-generation"])
+@pytest.mark.parametrize(
+    "request_kwargs",
+    [{}, {"json": {"generation_id": None}}],
+    ids=["missing-body", "invalid-generation-id"],
+)
+async def test_barrier_actions_require_a_valid_generation_id_body(
+    adapter_client,
+    action,
+    request_kwargs,
+):
+    device_id = await seed_device(nso_device_name=f"gen-body-{action}", netbox_device_id=None)
+    await seed_settings(device_id)
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/{action}",
+        headers=AUTH,
+        **request_kwargs,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+@pytest.mark.parametrize("action", ["retry-generation", "abandon-generation"])
+async def test_barrier_action_refuses_a_stale_generation_id(adapter_client, action):
+    device_name = f"gen-{action}-stale"
+    device_id = await seed_device(nso_device_name=device_name, netbox_device_id=None)
+    await seed_settings(device_id)
+    head = await _block_the_head(adapter_client, device_id, device_name)
+    before = (head.status, head.job_id)
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/{action}",
+        json={"generation_id": head.id + 1},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == {
+        "code": "conflict",
+        "message": "This request names a generation that is not the device's current head",
+        "detail": {
+            "head_generation_id": head.id,
+            "head_status": head.status.value,
+        },
+    }
+    current = (await generations(device_id))[0]
+    assert (current.status, current.job_id) == before
+
+
+@pytest.mark.parametrize("action", ["retry-generation", "abandon-generation"])
+async def test_barrier_action_names_the_current_head_even_when_it_is_not_blocked(adapter_client, action):
+    device_id = await seed_device(nso_device_name=f"gen-moved-{action}", netbox_device_id=None)
+    await seed_settings(device_id)
+    head = await _block_the_head(adapter_client, device_id, f"gen-moved-{action}")
+    assert (await put_vlans(adapter_client, device_id, [10, 20])).status_code == 200
+    abandoned = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/abandon-generation",
+        json={"generation_id": head.id},
+        headers=AUTH,
+    )
+    assert abandoned.status_code == 202
+    successor = next(g for g in await generations(device_id) if g.id != head.id)
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/{action}",
+        json={"generation_id": head.id},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["error"]["detail"]
+    assert detail["head_generation_id"] == successor.id
+    assert detail["head_status"] == successor.status.value
+
+
 async def test_f5_d_the_retry_endpoint_re_admits_the_blocked_head(adapter_client):
     from nso_adapter.store.models import GenerationStatus
 
@@ -893,9 +971,17 @@ async def test_f5_d_the_retry_endpoint_re_admits_the_blocked_head(adapter_client
     head = await _block_the_head(adapter_client, device_id, "gen-retry-api")
     assert head.status is GenerationStatus.failed
 
-    resp = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/retry-generation", headers=AUTH)
+    resp = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/retry-generation",
+        json={"generation_id": head.id},
+        headers=AUTH,
+    )
     assert resp.status_code == 202
-    assert resp.json() == {"job_id": (await generations(device_id))[0].job_id}
+    assert resp.json() == {
+        "generation_id": head.id,
+        "seq": head.seq,
+        "job_id": (await generations(device_id))[0].job_id,
+    }
 
     good, rec = recorded_client("gen-retry-api")
     await run_head(device_id, good)
@@ -908,14 +994,22 @@ async def test_f5_e_the_abandon_endpoint_releases_the_successors(adapter_client)
 
     device_id = await seed_device(nso_device_name="gen-abandon-api", netbox_device_id=9819)
     await seed_settings(device_id)
-    await _block_the_head(adapter_client, device_id, "gen-abandon-api")
+    head = await _block_the_head(adapter_client, device_id, "gen-abandon-api")
     assert (await put_vlans(adapter_client, device_id, [10, 20])).status_code == 200
 
-    resp = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/abandon-generation", headers=AUTH)
+    resp = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/abandon-generation",
+        json={"generation_id": head.id},
+        headers=AUTH,
+    )
     assert resp.status_code == 202
 
     chain = await generations(device_id)
-    assert resp.json() == {"job_id": chain[1].job_id}
+    assert resp.json() == {
+        "generation_id": head.id,
+        "seq": head.seq,
+        "job_id": chain[1].job_id,
+    }
     assert chain[0].status is GenerationStatus.abandoned
     client, rec = recorded_client("gen-abandon-api")
     await run_head(device_id, client)
@@ -927,8 +1021,13 @@ async def test_f5_f_the_barrier_controls_refuse_when_nothing_is_blocked(adapter_
     device_id = await seed_device(nso_device_name=f"gen-nothing-{action}", netbox_device_id=None)
     await seed_settings(device_id)
     assert (await put_vlans(adapter_client, device_id, [10])).status_code == 200
+    (head,) = await generations(device_id)
 
-    resp = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/{action}", headers=AUTH)
+    resp = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/{action}",
+        json={"generation_id": head.id},
+        headers=AUTH,
+    )
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "conflict"
 
@@ -958,9 +1057,14 @@ async def test_f5_g_an_outcome_unknown_head_answers_both_barrier_exits(adapter_c
     (head,) = await generations(device_id)
     assert head.status is GenerationStatus.outcome_unknown
 
-    resp = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/{action}", headers=AUTH)
+    resp = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/{action}",
+        json={"generation_id": head.id},
+        headers=AUTH,
+    )
     assert resp.status_code == 202, resp.text
-    assert set(resp.json()) == {"job_id"}
+    assert set(resp.json()) == {"generation_id", "seq", "job_id"}
+    assert (resp.json()["generation_id"], resp.json()["seq"]) == (head.id, head.seq)
     if action == "retry-generation":
         assert resp.json()["job_id"] is not None
     else:

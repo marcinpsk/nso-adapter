@@ -60,7 +60,14 @@ async def _seed_job(device_id: int, status, job_type=None) -> int:
     from nso_adapter.store.models import Job, JobType
 
     async with session() as db:
-        job = Job(job_type=job_type or JobType.removal, device_id=device_id, status=status, context={})
+        effective_type = job_type or JobType.removal
+        job = Job(
+            job_type=effective_type,
+            device_id=device_id,
+            status=status,
+            coalescible=effective_type not in (JobType.removal, JobType.provision),
+            context={},
+        )
         db.add(job)
         await db.commit()
         return job.id
@@ -115,6 +122,63 @@ async def test_an_unowned_tombstone_gets_a_job_and_the_stamp(adapter_client):
     jobs = await _removal_jobs(device_id)
     assert len(jobs) == 1
     assert await _tombstones(device_id) == [(tombstone_id, jobs[0]["id"])]
+
+
+async def test_a_sweep_rejects_a_carrier_that_cannot_take_its_generation(adapter_client, monkeypatch):
+    import nso_adapter.core.tombstone_sweep as sweep_mod
+    from nso_adapter.core.generation import (
+        GenerationCarrierCorruption,
+        attach_to_job,
+        create_reissue_generation,
+    )
+    from nso_adapter.core.jobs import create_dedicated_job
+    from nso_adapter.store.models import DeploymentGeneration, GenerationMode, Job, JobType, StaticRouteTombstone
+
+    device_id = await seed_device(nso_device_name="sw-m5-rejected-carrier", netbox_device_id=9642)
+    tombstone_id = await _seed_tombstone(device_id)
+    context = {
+        "scope": "static_route",
+        "removed": {"route": [list(A)]},
+        "detach": True,
+        "tombstone_ids": [tombstone_id],
+    }
+    async with session() as db:
+        first = await create_reissue_generation(
+            db,
+            device_id,
+            mode=GenerationMode.detach,
+            removal_context=context,
+            allowed_removal_keys=context["removed"],
+        )
+        carrier = await create_dedicated_job(db, device_id, JobType.removal, context=context)
+        assert await attach_to_job(db, first, carrier)
+        carrier_id = carrier.id
+        await db.commit()
+
+    async def _occupied_carrier(db, _device_id, _job_type, *, context=None):
+        carrier = await db.get(Job, carrier_id)
+        assert carrier is not None
+        return carrier
+
+    monkeypatch.setattr(sweep_mod, "create_dedicated_job", _occupied_carrier)
+
+    with pytest.raises(
+        GenerationCarrierCorruption,
+        match=rf"dedicated carrier {carrier_id} rejected generation \d+",
+    ):
+        await sweep_tombstones()
+
+    async with session() as db:
+        generations = (
+            await db.scalars(
+                sa.select(DeploymentGeneration)
+                .where(DeploymentGeneration.device_id == device_id)
+                .order_by(DeploymentGeneration.seq)
+            )
+        ).all()
+        tombstone = await db.get(StaticRouteTombstone, tombstone_id)
+    assert [(generation.seq, generation.job_id) for generation in generations] == [(1, carrier_id)]
+    assert tombstone is not None and tombstone.job_id is None
 
 
 async def test_a_failed_owner_is_swept_again(adapter_client):

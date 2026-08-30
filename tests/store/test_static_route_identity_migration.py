@@ -338,7 +338,13 @@ async def test_deleting_the_owning_job_nulls_job_id_and_keeps_the_tombstone(adap
 
     device_id = await seed_device(nso_device_name="sr-tomb-job", netbox_device_id=9602)
     async with session() as db:
-        job = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.succeeded, context={})
+        job = Job(
+            job_type=JobType.removal,
+            device_id=device_id,
+            status=JobStatus.succeeded,
+            coalescible=False,
+            context={},
+        )
         db.add(job)
         await db.commit()
         job_id = job.id

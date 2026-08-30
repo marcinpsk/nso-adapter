@@ -8,6 +8,7 @@ Schema aligns with docs/nso-adapter.md §5:
 from __future__ import annotations
 
 import enum
+import uuid
 from datetime import datetime
 
 from sqlalchemy import (
@@ -20,6 +21,7 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Sequence,
@@ -31,10 +33,11 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from nso_adapter.core.request_flags import PENDING_CLEAR_PROVENANCES, REMOVAL_MARKINGS
-from nso_adapter.store.ddl import generation_immutability_ddl
+from nso_adapter.store.ddl import generation_immutability_ddl, job_coalescible_immutability_ddl
 
 
 class Base(DeclarativeBase):
@@ -359,27 +362,29 @@ class InterfaceAttrState(Base):
 class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
-        # At most one QUEUED job per (device, job_type). Closes the enqueue TOCTOU: the
-        # check-then-insert cannot materialise two queued rows of a type even under
-        # concurrent schedulers/SSE/API.
-        #
-        # Scoped to QUEUED, not queued-or-running: a running job must not refuse its own
-        # successor, because the successor is what carries the newer intent. Execution is
-        # serialized by the per-device claim instead, which is the only gate that can span a
-        # job's whole lifetime — an apply goes terminal while its claim is still held through
-        # the post-apply refresh.
-        #
-        # Removals stay EXEMPT, and that is deliberate rather than an oversight:
-        # enqueue_removal queues one job per scope (bgp/isis/snmp/…) on the same device and
-        # every one of them must run. Their FIFO ordering comes from the worker's per-device
-        # head claim, not from uniqueness. Provision rows carry device_id=NULL (NULLs are
-        # distinct) and dedup by context.
+        CheckConstraint(
+            "job_type <> 'removal' OR NOT coalescible",
+            name="ck_job_removal_not_coalescible",
+        ),
+        CheckConstraint(
+            "job_type <> 'provision' OR NOT coalescible",
+            name="ck_job_provision_not_coalescible",
+        ),
+        CheckConstraint(
+            "job_type <> 'provision' OR status NOT IN ('queued', 'running') OR device_id IS NULL",
+            name="ck_job_active_provision_without_device",
+        ),
+        CheckConstraint(
+            "job_type = 'provision' OR device_id IS NOT NULL OR status IN ('succeeded', 'failed')",
+            name="ck_job_detached_non_provision_terminal",
+        ),
+        # One queued coalescible job per device and type; core.jobs keeps its inference target together.
         Index(
             "uq_job_queued_per_device_type",
             "device_id",
             "job_type",
             unique=True,
-            postgresql_where=text("status = 'queued' AND job_type <> 'removal'"),
+            postgresql_where=text("status = 'queued' AND coalescible"),
         ),
         # At most one ACTIVE provision per (nso_instance, device_name) — the dedupe key for
         # rows the index above cannot reach, because a provision runs before the adapter
@@ -413,6 +418,7 @@ class Job(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     job_type: Mapped[JobType] = mapped_column(Enum(JobType))
     status: Mapped[JobStatus] = mapped_column(Enum(JobStatus), default=JobStatus.queued)
+    coalescible: Mapped[bool] = mapped_column(Boolean, nullable=False)
     device_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("devices.id"), nullable=True)
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -500,10 +506,10 @@ class DeviceGenerationCounter(Base):
     from, which is what gives generation creation the single consistent snapshot §G1 calls
     for without an isolation-level change (see the module docstring).
 
-    Created lazily by an upsert, unlike :class:`DeviceSettleCounter`: generation creation is
-    never a terminal transaction, so the FK check's ``FOR KEY SHARE`` on ``devices`` closes
-    no cycle here — the deadlock that forbids a lazy settle counter does not exist on this
-    path.
+    Created lazily by an upsert, unlike :class:`DeviceSettleCounter`. The caller already
+    holds ``devices FOR NO KEY UPDATE`` (``lock_projection``'s ``key_share=True`` lock,
+    which still excludes rival writers but admits FK ``FOR KEY SHARE`` validation), so
+    creation stays on the shared device-before-counter graph.
     """
 
     __tablename__ = "device_generation_counter"
@@ -638,6 +644,24 @@ class IntentPushReceipt(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
 
+class DeploymentApplyAttempt(Base):
+    """One durable manual Apply admission and its complete replay body."""
+
+    __tablename__ = "deployment_apply_attempt"
+    __table_args__ = (
+        UniqueConstraint("id", "device_id", name="uq_apply_attempt_id_device"),
+        Index("ix_apply_attempt_device", "device_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    device_id: Mapped[int] = mapped_column(Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False)
+    selected: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    admission_state: Mapped[str] = mapped_column(Text, nullable=False)
+    http_status: Mapped[int] = mapped_column(Integer, nullable=False)
+    response: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
+
+
 class DeploymentGeneration(Base):
     """One immutable, ordered unit of device deployment (#1522 §G1).
 
@@ -660,8 +684,22 @@ class DeploymentGeneration(Base):
     __tablename__ = "deployment_generation"
     __table_args__ = (
         UniqueConstraint("device_id", "seq", name="uq_generation_seq_per_device"),
+        ForeignKeyConstraint(
+            ["apply_attempt_id", "device_id"],
+            ["deployment_apply_attempt.id", "deployment_apply_attempt.device_id"],
+            name="fk_generation_apply_attempt",
+            ondelete="NO ACTION",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
         Index("ix_generation_device_status", "device_id", "status"),
         Index("ix_generation_job", "job_id"),
+        Index(
+            "ix_generation_device_apply_attempt",
+            "device_id",
+            "apply_attempt_id",
+            postgresql_where=text("apply_attempt_id IS NOT NULL"),
+        ),
         Index(
             "ix_generation_settlement_cohort",
             "settlement_cohort",
@@ -701,7 +739,16 @@ class DeploymentGeneration(Base):
     #: same operation, and the failed job's row is not a safe place to read it back from.
     #: NULL for a generation an apply produced — those need no context beyond the document.
     removal_context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    apply_attempt_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        nullable=True,
+    )
     job_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
+    #: Terminal carrier evidence survives the SET NULL relationship above and job pruning.
+    carrier_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    carrier_job_status: Mapped[str | None] = mapped_column(Text, nullable=True)
+    carrier_job_result: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    carrier_job_error: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"), default=0)
     last_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
@@ -709,9 +756,9 @@ class DeploymentGeneration(Base):
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-# ``create_all`` installs the SAME immutability trigger the migration does, rendered from
-# the one definition in store.ddl — the schema-parity test compares tables, not triggers, so
-# a create_all-only database would otherwise silently accept a rewritten generation.
+# create_all installs the same live triggers as the Alembic schema path.
+for _statement in job_coalescible_immutability_ddl():
+    event.listen(Job.__table__, "after_create", DDL(_statement))
 for _statement in generation_immutability_ddl():
     event.listen(DeploymentGeneration.__table__, "after_create", DDL(_statement))
 

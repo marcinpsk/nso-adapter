@@ -23,6 +23,7 @@ import ipaddress
 import json
 from functools import cache
 from typing import NamedTuple
+from uuid import UUID
 
 import structlog
 from sqlalchemy import delete, exists, select
@@ -1008,8 +1009,8 @@ async def _replace_static_route(
     Promoted generation creation records the removal classification under the projection lock:
 
     1. every tombstone owned by THIS job contributes ``{triple} ∪ {deployed_key}`` (X6);
-       a job that owns none falls back to ``context["removed"]["route"]`` (fence-shut and
-       legacy jobs);
+       a job that owns none falls back to ``context["removed"]["route"]`` (including a
+       fence-shut removal);
     2. supersession subtracts every key the selected plan claims as its ``triple`` or
        its ``deployed_key``. A promotion uses the recorded document. A reissue uses current
        accepted intent;
@@ -1734,6 +1735,7 @@ def _refuse_force_incompatible(
     settlement_cohort,
     static_route_tombstone_ids,
     promotes,
+    apply_attempt_id,
 ) -> None:
     """Refuse the arguments a reissue cannot honor: it skips the guard and records no plan."""
     if promotes:
@@ -1748,6 +1750,8 @@ def _refuse_force_incompatible(
         raise ValueError(
             f"a force-removal of {scope!r} settles no promoted revisions; got settlement cohort {settlement_cohort}"
         )
+    if apply_attempt_id is not None:
+        raise ValueError(f"a force-removal of {scope!r} carries no Apply attempt; got {apply_attempt_id}")
     if static_route_tombstone_ids:
         raise ValueError(
             f"a force-removal of {scope!r} records no execution plan; got tombstone ids "
@@ -1927,6 +1931,7 @@ async def enqueue_removal(
     shrank: bool = False,
     document: dict | None = None,
     static_route_tombstone_ids: tuple[int, ...] = (),
+    apply_attempt_id: UUID | None = None,
 ):
     """Queue an async ``removal`` job that PUT-replaces *scope*'s service.
 
@@ -1985,15 +1990,17 @@ async def enqueue_removal(
 
     *document* is the composed document the promoted generation deploys, stated by the caller
     that already built it. A reissue composes its own, so *force* refuses it here rather than
-    dropping it silently. The same refusal applies to *marking* and *promotes*.
+    dropping it silently. The same refusal applies to *apply_attempt_id*, *marking*, and
+    *promotes*.
     """
     from nso_adapter.core.generation import (
         create_generation,
         create_reissue_generation,
         require_attach_to_job,
     )
+    from nso_adapter.core.jobs import create_dedicated_job
     from nso_adapter.core.request_flags import STORE_ONLY
-    from nso_adapter.store.models import GenerationMode, Job, JobStatus, JobType
+    from nso_adapter.store.models import GenerationMode, JobType
 
     if scope not in VALID_REMOVAL_SCOPES:
         raise ValueError(f"Unknown removal scope {scope!r}")
@@ -2008,6 +2015,7 @@ async def enqueue_removal(
             settlement_cohort,
             static_route_tombstone_ids,
             promotes,
+            apply_attempt_id,
         )
     store_only = STORE_ONLY.get()
     context: dict = {"scope": scope}
@@ -2086,15 +2094,9 @@ async def enqueue_removal(
             removal_context=context,
             settlement_cohort=settlement_cohort,
             static_route_tombstone_ids=static_route_tombstone_ids,
+            apply_attempt_id=apply_attempt_id,
         )
-    job = Job(
-        job_type=JobType.removal,
-        device_id=device_id,
-        status=JobStatus.queued,
-        context=context,
-    )
-    db.add(job)
-    await db.flush()
+    job = await create_dedicated_job(db, device_id, JobType.removal, context=context)
     await require_attach_to_job(db, generation, job)
     await _settle_pending_clears_at_admission(db, device_id, scope, promotes, mode=mode, force=force)
     logger.info("removal.enqueued", device_id=device_id, scope=scope, job_id=job.id, marking=marking)

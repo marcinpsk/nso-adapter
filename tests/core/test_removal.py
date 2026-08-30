@@ -15,6 +15,7 @@ from __future__ import annotations
 import inspect
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
@@ -102,6 +103,7 @@ async def _seed_removal_job(device_id: int, scope: str = "vlan", context_extra: 
             job_type=JobType.removal,
             device_id=device_id,
             status=JobStatus.running,
+            coalescible=False,
             run_attempt=1,
             context=context,
         )
@@ -954,6 +956,7 @@ async def test_run_removal_refuses_a_job_that_carries_no_generation(adapter_clie
             job_type=JobType.removal,
             device_id=device_id,
             status=JobStatus.running,
+            coalescible=False,
             run_attempt=1,
             context={"scope": scope},
         )
@@ -986,6 +989,7 @@ async def test_run_removal_refuses_a_static_route_force_job_that_carries_no_gene
             job_type=JobType.removal,
             device_id=device_id,
             status=JobStatus.running,
+            coalescible=False,
             run_attempt=1,
             context={"scope": "static_route", "force": True},
         )
@@ -1023,7 +1027,15 @@ async def test_run_removal_marks_failed_even_when_session_poisoned(adapter_clien
     async def poison(db, device, client, scope, context=None):
         # A duplicate PK insert → IntegrityError → AsyncSession enters needs-rollback,
         # exactly like a failed flush during the PUT-replace's row bookkeeping.
-        db.add(Job(id=job_id, job_type=JobType.removal, device_id=device.id, status=JobStatus.queued))
+        db.add(
+            Job(
+                id=job_id,
+                job_type=JobType.removal,
+                device_id=device.id,
+                status=JobStatus.queued,
+                coalescible=False,
+            )
+        )
         await db.flush()
 
     with (
@@ -2241,8 +2253,9 @@ async def test_enqueue_removal_force_refuses_a_composed_document(adapter_client)
         ({"allowed_removal_keys": {}}, "skips the collateral guard; got allowed removal keys"),
         ({"static_route_tombstone_ids": (7,)}, r"records no execution plan; got tombstone ids \[7\]"),
         ({"settlement_cohort": 42}, "settles no promoted revisions; got settlement cohort 42"),
+        ({"apply_attempt_id": uuid4()}, "carries no Apply attempt"),
     ],
-    ids=["allowed-removal-keys", "static-route-tombstone-ids", "settlement-cohort"],
+    ids=["allowed-removal-keys", "static-route-tombstone-ids", "settlement-cohort", "apply-attempt-id"],
 )
 async def test_enqueue_removal_force_refuses_generation_only_arguments(adapter_client, kwargs, message):
     device_id = await _seed_device(nso_device_name="sw-force-generation-metadata")

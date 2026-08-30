@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Actions API: async device actions (sync, check-sync_state, connect, apply, sync-notify).
+"""Actions API: async device actions and deployment-generation barrier exits.
 
-Async actions return 202 with a top-level {job_id}. Apply also returns its generation chain.
-409 is returned if a job is already queued/running for the device.
+The device claim permits one executing device job. Admission is endpoint-specific:
+ordinary triggers reject queued jobs of the requested type, Apply checks all queued
+and running jobs after it finds promotable work, and barrier actions ignore unrelated jobs.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Annotated, Literal
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.api.deps import get_db, verify_token
@@ -19,7 +22,8 @@ from nso_adapter.api.errors import (
     RESP_401,
     RESP_404_DEVICE,
     RESP_409,
-    RESP_409_ACTIVE_JOB,
+    RESP_409_APPLY_CONFLICT,
+    RESP_409_QUEUED_ACTION,
     RESP_422_VALIDATION,
     RESP_500_INTERNAL,
     api_error,
@@ -35,10 +39,9 @@ SelectedPushSequence = Annotated[
     Field(strict=True, ge=MIN_PUSH_SEQ, le=MAX_PUSH_SEQ),
 ]
 
-# All action endpoints emit 401 (token) + 422 (device_id path); the responses fragments
-# below add the ones each endpoint actually raises. The trigger POSTs go through
-# _trigger (404 + 409-active-job); force-removal / apply-diff raise 400 bad_request.
-_TRIGGER_ERRORS = {**RESP_401, **RESP_404_DEVICE, **RESP_409_ACTIVE_JOB, **RESP_422_VALIDATION}
+# Trigger endpoints add their queued same-type conflict to the common action errors.
+_ACTION_ERRORS = {**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION}
+_TRIGGER_ERRORS = {**_ACTION_ERRORS, **RESP_409_QUEUED_ACTION}
 
 
 class JobTriggerOut(BaseModel):
@@ -58,17 +61,21 @@ class ApplyDiffOut(BaseModel):
 class ActionApplyIn(BaseModel):
     """The exact push sequences this manual Apply is allowed to promote."""
 
+    model_config = ConfigDict(extra="forbid")
+
+    apply_attempt_id: UUID
     selected: dict[str, SelectedPushSequence]
 
     @field_validator("selected")
     @classmethod
     def _validate_selected(cls, selected: dict[str, int]) -> dict[str, int]:
         from nso_adapter.core.projection import projection_streams
+        from nso_adapter.store.apply_attempt_store import canonical_selected
 
         unknown = set(selected) - projection_streams()
         if unknown:
             raise ValueError(f"unknown projection streams: {sorted(unknown)}")
-        return dict(sorted(selected.items()))
+        return canonical_selected(selected)
 
 
 class ActionApplyGenerationOut(BaseModel):
@@ -107,6 +114,12 @@ class ActionApplyOut(BaseModel):
     generations: list[ActionApplyGenerationOut]
 
 
+def _apply_http_response(status_code: int, body: dict) -> Response:
+    """Serialize first delivery and replay with one byte-stable representation."""
+    content = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return Response(content=content, status_code=status_code, media_type="application/json")
+
+
 async def _trigger(
     device_id: int,
     job_type: JobType,
@@ -118,7 +131,12 @@ async def _trigger(
 
     job, created = await enqueue_job(device_id, job_type, db)
     if not created:
-        raise api_error(409, "conflict", "A job is already running for this device", {"job_id": job.id})
+        raise api_error(
+            409,
+            "conflict",
+            "A job of the requested type is already queued for this device",
+            {"job_id": job.id},
+        )
     return {"job_id": job.id}
 
 
@@ -261,8 +279,8 @@ async def sync_notify(
 ):
     """Handle the NetBox plugin's notification that scope or intent changed for this device.
 
-    Triggers an immediate sync job. If a job is already running, returns 409 with
-    the existing job_id so the plugin can poll for the result.
+    A queued sync job returns 409 with its job id. A running sync job permits a queued
+    successor, and jobs of other types do not refuse the notification.
     """
     return await _trigger(device_id, JobType.sync, db)
 
@@ -274,45 +292,102 @@ async def sync_notify(
     response_model=ActionApplyOut,
     responses={
         200: {"model": ActionApplyOut, "description": "No selected stream required a job"},
-        **_TRIGGER_ERRORS,
+        **_ACTION_ERRORS,
+        **RESP_409_APPLY_CONFLICT,
         **RESP_500_INTERNAL,
     },
 )
 async def action_apply(
     device_id: int,
     body: ActionApplyIn,
-    response: Response,
     db: AsyncSession = Depends(get_db),
 ):
-    """Atomically promote the selected pushes and enqueue their immutable generation chain."""
-    from nso_adapter.core.generation import ApplyAlreadyQueued, ApplyUnexecutable, create_action_apply
+    """Promote selected pushes.
+
+    Check queued and running jobs only when the selection contains promotable work.
+    """
+    from nso_adapter.core.generation import ApplyJobConflict, ApplyUnexecutable, create_action_apply, lock_projection
     from nso_adapter.core.request_flags import STORE_ONLY
+    from nso_adapter.store.apply_attempt_store import (
+        ApplyAttemptIdentityMismatch,
+        begin_apply_attempt,
+        complete_apply_attempt,
+        replay_apply_attempt,
+    )
 
     if STORE_ONLY.get():
         raise api_error(422, "validation_error", "store_only is not valid for the Apply action")
 
-    device = await db.get(Device, device_id)
-    if not device:
-        raise api_error(404, "not_found", "Device not found")
+    # The UUID identity outranks the device lookup: an existing attempt POSTed at any
+    # other device (even a nonexistent one) is an identity conflict, not a 404.
     try:
-        apply_result = await create_action_apply(db, device_id, body.selected)
-    except ApplyAlreadyQueued as exc:
+        stored = await replay_apply_attempt(db, body.apply_attempt_id, device_id, body.selected)
+    except ApplyAttemptIdentityMismatch as exc:
         await db.rollback()
         raise api_error(
             409,
             "conflict",
-            "A job is already running for this device",
-            {"job_id": exc.job_id},
+            "Apply attempt UUID belongs to a different request identity",
+            {"mismatch": exc.mismatch},
         ) from None
-    except ApplyUnexecutable as exc:
+    if stored is not None:
         await db.rollback()
-        streams = sorted(exc.reasons)
+        return _apply_http_response(stored.http_status, stored.response)
+    device = await db.get(Device, device_id)
+    if not device:
+        raise api_error(404, "not_found", "Device not found")
+    await lock_projection(db, device_id)
+    try:
+        stored = await begin_apply_attempt(db, body.apply_attempt_id, device_id, body.selected)
+    except ApplyAttemptIdentityMismatch as exc:
+        await db.rollback()
         raise api_error(
             409,
-            "apply_unexecutable",
-            f"Selected stream(s) cannot be applied faithfully: {', '.join(streams)}",
-            {"streams": exc.reasons},
+            "conflict",
+            "Apply attempt UUID belongs to a different request identity",
+            {"mismatch": exc.mismatch},
         ) from None
+    if stored is not None:
+        await db.rollback()
+        return _apply_http_response(stored.http_status, stored.response)
+    try:
+        async with db.begin_nested():
+            apply_result = await create_action_apply(db, device_id, body.selected, body.apply_attempt_id)
+    except ApplyJobConflict as exc:
+        result = {
+            "error": {
+                "code": "conflict",
+                "message": "A job is already queued or running for this device",
+                "detail": {"job_id": exc.job_id},
+            }
+        }
+        await complete_apply_attempt(
+            db,
+            body.apply_attempt_id,
+            admission_state="rejected",
+            http_status=409,
+            response=result,
+        )
+        await db.commit()
+        return _apply_http_response(409, result)
+    except ApplyUnexecutable as exc:
+        streams = sorted(exc.reasons)
+        result = {
+            "error": {
+                "code": "apply_unexecutable",
+                "message": f"Selected stream(s) cannot be applied faithfully: {', '.join(streams)}",
+                "detail": {"streams": exc.reasons},
+            }
+        }
+        await complete_apply_attempt(
+            db,
+            body.apply_attempt_id,
+            admission_state="rejected",
+            http_status=409,
+            response=result,
+        )
+        await db.commit()
+        return _apply_http_response(409, result)
     generations = [
         {
             "generation_id": generation.id,
@@ -325,27 +400,40 @@ async def action_apply(
         }
         for generation in apply_result.generations
     ]
-    if not generations:
-        response.status_code = 200
+    status_code = 202 if generations else 200
     job_id = generations[0]["job_id"] if generations else None
     if generations and job_id is None:
         raise api_error(500, "internal", "The promoted generation chain has no executable head job")
-    result = {
+    payload: dict[str, object] = {
         "device_id": device_id,
         "outcome": "promoted" if generations else "no_op",
-        "job_id": job_id,
         "selected": body.selected,
         "skipped": apply_result.skipped,
         "skipped_detail": apply_result.skipped_detail or None,
         "generations": generations,
     }
+    if job_id is not None:
+        payload["job_id"] = job_id
+    await complete_apply_attempt(
+        db,
+        body.apply_attempt_id,
+        admission_state="admitted",
+        http_status=status_code,
+        response=payload,
+    )
     await db.commit()
-    return result
+    return _apply_http_response(status_code, payload)
+
+
+class BarrierActionIn(BaseModel):
+    generation_id: int
 
 
 class BarrierActionOut(BaseModel):
     """The job admitted after retrying or abandoning a blocked head."""
 
+    generation_id: int
+    seq: int
     job_id: int | None
 
 
@@ -353,15 +441,17 @@ class BarrierActionOut(BaseModel):
 _HEAD_ALREADY_ACTED_ON = "This device's blocked deployment generation was already acted on"
 
 
-async def _blocked_head(db: AsyncSession, device_id: int) -> DeploymentGeneration:
+async def _blocked_head(
+    db: AsyncSession,
+    device_id: int,
+    expected_generation_id: int,
+) -> DeploymentGeneration:
     """Return the device's blocked head, or 404/409 explaining why there is nothing to do.
 
     The head is read UNDER the device's projection lock, held to this request's commit. Both
-    exits act on "the current head", so two operator requests that read it unlocked can each
-    decide it is theirs: two retries duplicate the removal, and a retry racing an abandon
-    leaves a queued job executing a generation the operator gave up on. The lock also orders
-    these against the intent pushes that create successors, which is the same lock every
-    accepted projection write already takes.
+    exits compare the current head with the generation named by the operator. The lock also
+    orders these requests against intent pushes that create successors. It is the same lock
+    every accepted projection write already takes.
 
     An offboard committing inside that lock raises ``DeviceProjectionGone``, which the app's
     own handler turns into this same 404 envelope for every route that can hit it.
@@ -373,6 +463,13 @@ async def _blocked_head(db: AsyncSession, device_id: int) -> DeploymentGeneratio
         raise api_error(404, "not_found", "Device not found")
     await lock_projection(db, device_id)
     head = await executable_head(db, device_id)
+    if head is not None and head.id != expected_generation_id:
+        raise api_error(
+            409,
+            "conflict",
+            "This request names a generation that is not the device's current head",
+            {"head_generation_id": head.id, "head_status": head.status.value},
+        )
     if head is None or head.status not in BLOCKED_STATUSES:
         raise api_error(
             409,
@@ -392,6 +489,7 @@ async def _blocked_head(db: AsyncSession, device_id: int) -> DeploymentGeneratio
 )
 async def action_retry_generation(
     device_id: int,
+    body: BarrierActionIn,
     db: AsyncSession = Depends(get_db),
 ):
     """Re-admit this device's blocked deployment generation (#1522 §H2).
@@ -400,12 +498,14 @@ async def action_retry_generation(
     SAME document, mode and digest — it is re-sent, never rebuilt — and its successors go
     back to waiting behind it. Use it after fixing whatever the device refused.
 
-    A request with no blocked head returns 409 with ``error.detail.head_status``. A
-    compare-and-set race returns 409 with an empty detail.
+    The required body names the generation to retry. A request naming a generation
+    that is not the current head returns 409 with ``error.detail.head_generation_id``
+    naming the head. A request with no blocked head returns 409 with
+    ``error.detail.head_status``.
     """
     from nso_adapter.core.generation import GenerationNotBlocked, retry_generation
 
-    head = await _blocked_head(db, device_id)
+    head = await _blocked_head(db, device_id, body.generation_id)
     try:
         job = await retry_generation(db, head.id)
     except GenerationNotBlocked:
@@ -414,7 +514,7 @@ async def action_retry_generation(
         await db.rollback()
         raise api_error(409, "conflict", _HEAD_ALREADY_ACTED_ON) from None
     await db.commit()
-    return {"job_id": job.id if job else None}
+    return {"generation_id": head.id, "seq": head.seq, "job_id": job.id if job else None}
 
 
 @router.post(
@@ -426,27 +526,36 @@ async def action_retry_generation(
 )
 async def action_abandon_generation(
     device_id: int,
+    body: BarrierActionIn,
     db: AsyncSession = Depends(get_db),
 ):
     """Give up on this device's blocked generation so its successors may run (#1522 §H2).
 
     The other exit. Deliberately destructive of intent: this deployment is recorded as never
     delivered and the chain moves past it, so the operator is asserting that the device state
-    it was meant to establish is either already there or no longer wanted.
+    it was meant to establish is either already there or no longer wanted. The response
+    ``generation_id`` and ``seq`` identify the abandoned head. ``job_id`` identifies the
+    successor carrier this action released, or is ``null`` when no successor is executable.
 
-    A request with no blocked head returns 409 with ``error.detail.head_status``. A
-    compare-and-set race returns 409 with an empty detail.
+    The required body names the generation to abandon. A request naming a generation
+    that is not the current head returns 409 with ``error.detail.head_generation_id``
+    naming the head. A request with no blocked head returns 409 with
+    ``error.detail.head_status``.
     """
     from nso_adapter.core.generation import GenerationNotBlocked, reconcile_generation
 
-    head = await _blocked_head(db, device_id)
+    head = await _blocked_head(db, device_id, body.generation_id)
     try:
         successor = await reconcile_generation(db, head.id)
     except GenerationNotBlocked:
         await db.rollback()
         raise api_error(409, "conflict", _HEAD_ALREADY_ACTED_ON) from None
     await db.commit()
-    return {"job_id": successor.id if successor else None}
+    return {
+        "generation_id": head.id,
+        "seq": head.seq,
+        "job_id": successor.id if successor else None,
+    }
 
 
 @router.get(

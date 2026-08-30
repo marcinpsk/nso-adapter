@@ -164,14 +164,14 @@ async def test_a_specific_handler_still_wins_over_the_catch_all():
 
     @app.get("/_test/conflict")
     async def _conflict():
-        raise api_error(409, "conflict", "a job is already running", {"device_id": 7})
+        raise api_error(409, "conflict", "a queued action already exists", {"device_id": 7})
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get("/_test/conflict")
 
     assert resp.status_code == 409
     assert resp.json() == {
-        "error": {"code": "conflict", "message": "a job is already running", "detail": {"device_id": 7}}
+        "error": {"code": "conflict", "message": "a queued action already exists", "detail": {"device_id": 7}}
     }
 
 

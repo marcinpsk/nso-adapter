@@ -131,9 +131,19 @@ async def test_teardown_terminalizes_queued_jobs_instead_of_orphaning_them(adapt
 
     device_id = await seed_device(nso_device_name="td-queued", netbox_device_id=9501)
     async with session() as db:
-        db.add(Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued, context={}))
-        db.add(Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued, context={}))
-        db.add(Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.succeeded, context={}))
+        db.add(Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued, coalescible=True, context={}))
+        db.add(
+            Job(
+                job_type=JobType.removal,
+                device_id=device_id,
+                status=JobStatus.queued,
+                coalescible=False,
+                context={},
+            )
+        )
+        db.add(
+            Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.succeeded, coalescible=True, context={})
+        )
         await db.commit()
 
     await _offboard(device_id)

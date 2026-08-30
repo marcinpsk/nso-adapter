@@ -32,6 +32,7 @@ _REWRITES = {
     "stream_revisions": "CAST('{\"vlan\": 7}' AS json)",
     "removal_context": 'CAST(\'{"scope": "vlan"}\' AS json)',
     "settlement_cohort": "42",
+    "apply_attempt_id": "CAST('00000000-0000-4000-8000-000000000001' AS uuid)",
     "created_at": "now() - interval '1 day'",
 }
 
@@ -97,7 +98,7 @@ def test_the_lifecycle_columns_stay_writable(pg_sync_session):
     from nso_adapter.store.models import Job, JobStatus, JobType
 
     _device_id, _other_device_id, generation_id = _seed(pg_sync_session)
-    job = Job(job_type=JobType.apply, device_id=_device_id, status=JobStatus.queued)
+    job = Job(job_type=JobType.apply, device_id=_device_id, status=JobStatus.queued, coalescible=True)
     pg_sync_session.add(job)
     pg_sync_session.flush()
 

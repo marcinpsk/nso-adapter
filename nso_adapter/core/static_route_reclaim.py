@@ -145,7 +145,10 @@ async def reclaim_one_device(device_id: int, *, db: AsyncSession | None = None) 
     consumed = reissued = 0
     try:
         async with claim_session(db) as conn:
+            from nso_adapter.core.generation import lock_projection
+
             await lock_claim(conn, reg)
+            await lock_projection(conn, device_id)
             device = await conn.get(Device, device_id)
             rows = list(
                 (
