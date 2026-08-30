@@ -4,8 +4,8 @@
 
 Removal no longer runs the device commit inline in the intent PUT; it enqueues a
 ``removal`` job that the worker runs in the background. These tests cover the
-enqueue path, the endpoint helper, and the job runner's scope dispatch — all
-against the REAL in-memory DB and real intent/Job rows (so the SQLAlchemy
+enqueue path, the endpoint helper, and the job runner's scope dispatch. They run
+against the real PostgreSQL test database and real intent/Job rows (so the SQLAlchemy
 ``select(...).where(...)`` filters actually run); only the NSO apply boundary is
 stubbed with a spy.
 """

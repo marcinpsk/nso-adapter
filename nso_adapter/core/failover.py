@@ -443,7 +443,8 @@ async def _failback_flip_probe(
         address_before = None
         logger.warning("failover.failback_blocked", device=name, reason=_BLOCKED_ADDRESS_UNREADABLE, error=repr(exc))
     if address_before is None:
-        fo.failback_blocked_reason = _BLOCKED_ADDRESS_UNREADABLE
+        if fo.failback_blocked_reason != _BLOCKED_ACTIVE_OOB_CONFLICT:
+            fo.failback_blocked_reason = _BLOCKED_ADDRESS_UNREADABLE
         return True  # ran → re-arm normally; retried on the next interval
     if fo.failback_blocked_reason == _BLOCKED_ADDRESS_UNREADABLE:
         fo.failback_blocked_reason = None  # the read recovered; the reason is stale on every branch

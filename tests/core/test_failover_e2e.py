@@ -33,6 +33,7 @@ class _NsoSim:
         self.always_reachable = False  # address-agnostic "always up" — for multi-device tests
         self.patches: list[str] = []
         self.connects = 0
+        self.get_address_failures = 0
         # When set, a connect while NSO is dialing this address raises an *unexpected* error
         # (not an httpx error probe_reachable swallows) — models a probe blowing up mid-flip.
         self.raise_on_connect_addr: str | None = None
@@ -58,6 +59,9 @@ class _NsoSim:
             self.patches.append(entry["address"])
             return httpx.Response(204, request=request)
         if method == "GET":
+            if self.get_address_failures:
+                self.get_address_failures -= 1
+                return httpx.Response(503, request=request)
             body = {"tailf-ncs:device": [{"name": "ra1", "address": self.address}]}
             return httpx.Response(200, json=body, request=request)
         return httpx.Response(404, request=request)
@@ -524,6 +528,32 @@ async def test_active_oob_report_conflict_keeps_liveness(adapter_client, monkeyp
     assert row.manual_override is False
     assert row.oob_healthy is True
     assert row.oob_health_checked_at is not None
+
+
+async def test_active_oob_report_conflict_survives_address_read_failure(adapter_client, monkeypatch):
+    """A transient NSO read failure cannot erase a durable ingestion conflict."""
+    from nso_adapter.core.failover import upsert_failover_ips
+
+    sim = _NsoSim(address="192.0.2.5")
+    sim.reachable_addrs = {"192.0.2.5"}
+    sim.get_address_failures = 1
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    device_id = await _seed(active=ActiveAddress.oob.value)
+
+    async with session() as db:
+        dev = await db.get(Device, device_id)
+        assert dev is not None
+        assert await upsert_failover_ips(db, dev, "192.0.2.5", "192.0.2.5") is True
+        await db.commit()
+
+    await _arm(device_id, primary_due=True, oob_due=False)
+    await sched._scheduled_failover_probe()
+    assert (await _load(device_id)).failback_blocked_reason == "active_oob_address_conflict"
+
+    await _arm(device_id, primary_due=True, oob_due=False)
+    await sched._scheduled_failover_probe()
+    assert (await _load(device_id)).failback_blocked_reason == "active_oob_address_conflict"
 
 
 async def test_upsert_refuses_to_clear_the_oob_ip_the_device_lives_on(adapter_client):

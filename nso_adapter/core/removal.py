@@ -2546,7 +2546,7 @@ async def replace_on_removal(
 
     The scope is derived from ``store_model``. The caller states the endpoint's
     projection *stream* explicitly, so promotion authorization does not depend on
-    reversing the model ownership map. *removed* — the just-removed store keys — is
+    reversing the model ownership map. *removed* contains the just-removed store keys. It is
     threaded into the job context so the collateral guard can tell the intended
     retraction from an orphaned service row. Returns True if a removal job was queued.
 
