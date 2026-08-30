@@ -556,8 +556,8 @@ async def test_active_oob_report_conflict_survives_address_read_failure(adapter_
     assert (await _load(device_id)).failback_blocked_reason == "active_oob_address_conflict"
 
 
-async def test_upsert_refuses_to_clear_the_oob_ip_the_device_lives_on(adapter_client):
-    """NULLing oob_ip while active-on-OOB deletes the failback path's way home.
+async def test_upsert_retains_active_oob_and_accepts_distinct_primary(adapter_client):
+    """A conflict retains active OOB but accepts a distinct primary failback target.
 
     The stored OOB address is retained (the way back stays known), the stuck state is
     surfaced on the row, and a later usable OOB address clears it again.

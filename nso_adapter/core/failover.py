@@ -671,8 +671,8 @@ async def upsert_failover_ips(db: AsyncSession, device: Device, primary_ip: str 
 
     While the device is active on OOB, its stored OOB address is also the address NSO is
     dialing. A conflicting report cannot replace that address or promote it into the
-    primary role. The established roles stay in place until failback, and the conflict is
-    surfaced on the row. Returns True if anything changed.
+    primary role. A distinct reported primary can replace the stored primary as the future
+    failback target. The conflict is surfaced on the row. Returns True if anything changed.
     """
     existing = (
         await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device.id))
