@@ -598,24 +598,6 @@ def test_hydrating_a_row_without_its_primary_key_is_refused():
         hydrate_section({"vlan": {"vlan_intent": [{"id": None, "device_id": 1, "vlan_id": 10}]}}, "vlan")
 
 
-def test_only_the_static_route_tables_carry_a_correlation_column():
-    """``projection_row_state`` drops these by NAME, for every table.
-
-    They are NetBox lineage the device payload never renders, so dropping them stops a
-    correlation-only repair from reading as a device delta. A table that gained a column of
-    either name for real content would have it silently dropped instead, so pin the fact.
-    """
-    from nso_adapter.core.projection import _SECTION_TABLES, CORRELATION_COLUMNS
-
-    carriers = {
-        spec.model.__tablename__
-        for specs in _SECTION_TABLES.values()
-        for spec in specs
-        if CORRELATION_COLUMNS & {column.key for column in spec.model.__table__.columns}
-    }
-    assert carriers == {"static_route_intent", "static_route_tombstone"}
-
-
 def test_hydrating_a_known_table_under_the_wrong_section_is_refused():
     """A document cannot smuggle one section's rows into another section."""
     from nso_adapter.core.projection import hydrate_section

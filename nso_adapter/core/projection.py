@@ -425,19 +425,16 @@ def is_intent_deletion(table: str, identity: tuple, desired_rows: dict[tuple, di
     return not spec.lifecycle and identity not in desired_rows
 
 
-#: NetBox lineage the device payload never renders (:func:`nso.apply.static_route_entry`
-#: writes neither). Kept in the snapshot for settlement correlation, excluded from the
-#: comparison state so a correlation-only repair does not enqueue an apply for an
-#: unchanged wire payload.
-CORRELATION_COLUMNS: frozenset[str] = frozenset({"route_id", "intent_generation"})
-
-
 def projection_row_state(table: str, row: dict) -> dict:
-    """Return device-facing row state without database identity, correlation or apply metadata."""
+    """Return the row state that the device-facing renderer consumes."""
     spec = _SPEC_BY_TABLE.get(table)
     if spec is None:
         raise ValueError(f"unknown projection table {table!r}")
-    excluded = {"id", "device_id", "accepted_at", *CORRELATION_COLUMNS, *APPLY_BOOKKEEPING_COLUMNS}
+    if spec.model is StaticRouteIntent:
+        from nso_adapter.nso.apply import static_route_entry
+
+        return static_route_entry(row)
+    excluded = {"id", "device_id", "accepted_at", *APPLY_BOOKKEEPING_COLUMNS}
     if spec.parent is not None:
         excluded.add(_fk_column(spec.model, spec.parent).name)
     return {key: value for key, value in row.items() if key not in excluded}

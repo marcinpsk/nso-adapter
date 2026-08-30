@@ -333,6 +333,39 @@ def test_c1_6b_omission_rules_are_not_falsiness():
     }
 
 
+def test_static_route_projection_state_uses_the_wire_renderer_for_serialized_rows():
+    """ORM and document rows compare by emitted leaves, not stored metadata."""
+    from nso_adapter.core.projection import projection_row_state
+
+    orm_row = _RenderRow(
+        vrf="RED",
+        prefix="10.5.0.0/24",
+        next_hop="192.0.2.9",
+        interface_next_hop="GigabitEthernet0/0",
+        next_hop_vrf="BLUE",
+        metric=10,
+        permanent=True,
+        tag=100,
+        name="old name",
+    )
+    document_row = vars(orm_row) | {
+        "id": 1,
+        "device_id": 2,
+        "route_id": 3,
+        "intent_generation": 4,
+        "accepted_at": "2026-08-30T12:00:00+00:00",
+        "pending_clear": None,
+    }
+    expected = static_route_entry(orm_row)
+
+    assert static_route_entry(document_row) == expected
+    assert projection_row_state("static_route_intent", document_row) == expected
+
+    metadata_edit = document_row | {"name": "new name", "route_id": 30, "intent_generation": 40}
+    assert projection_row_state("static_route_intent", metadata_edit) == expected
+    assert projection_row_state("static_route_intent", document_row | {"metric": 20}) != expected
+
+
 # ── C1.7 — extra_entries ─────────────────────────────────────────────────────
 
 
