@@ -1772,6 +1772,182 @@ async def test_action_apply_accepts_static_route_once_it_executes_from_the_docum
     assert (await _stream(device_id, "static_route")).authorized_revision == 1
 
 
+async def test_action_apply_settles_name_only_static_route_without_device_work(adapter_client):
+    """A store-only name edit advances settlement without another generation or job."""
+    from nso_adapter.store.models import GenerationStatus, StaticRouteIntent
+
+    device_id = await seed_device(nso_device_name="apply-static-name-only", netbox_device_id=9983)
+    await seed_settings(device_id, auto_apply=False)
+    baseline = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_A, route_id=1, generation=1, name="old name")],
+        seq=6011,
+        query="?store_only=true",
+    )
+    assert baseline.status_code == 200, baseline.text
+    assert (await _apply(adapter_client, device_id, {"static_route": 6011})).status_code == 202
+    await _settle((await _generations(device_id))[0].job_id, GenerationStatus.settled)
+
+    renamed = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_A, route_id=1, generation=2, name="new name")],
+        seq=6012,
+        query="?store_only=true",
+    )
+    assert renamed.status_code == 200, renamed.text
+    async with session() as db:
+        assert (
+            await db.scalar(sa.select(StaticRouteIntent.name).where(StaticRouteIntent.device_id == device_id))
+            == "new name"
+        )
+
+    response = await _apply(adapter_client, device_id, {"static_route": 6012})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "device_id": device_id,
+        "outcome": "no_op",
+        "selected": {"static_route": 6012},
+        "skipped": {"static_route": "already_applied"},
+        "skipped_detail": None,
+        "generations": [],
+    }
+    assert len(await _generations(device_id)) == 1
+    assert len(await _jobs(device_id)) == 1
+    stream = await _stream(device_id, "static_route")
+    assert (stream.desired_revision, stream.authorized_revision, stream.applied_revision) == (2, 2, 2)
+    authorized = stream.authorized_document["static_route_intent"][0]
+    assert (authorized["name"], authorized["route_id"], authorized["intent_generation"]) == ("new name", 1, 2)
+
+    repeated = await _apply(adapter_client, device_id, {"static_route": 6012})
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["skipped"] == {"static_route": "already_applied"}
+    assert len(await _generations(device_id)) == 1
+    assert len(await _jobs(device_id)) == 1
+
+
+async def test_action_apply_keeps_static_route_metric_edits_generation_backed(adapter_client):
+    """A rendered route edit still requires device work after a settled baseline."""
+    from nso_adapter.store.models import GenerationStatus
+
+    device_id = await seed_device(nso_device_name="apply-static-metric", netbox_device_id=9984)
+    await seed_settings(device_id, auto_apply=False)
+    assert (
+        await _put_routes(
+            adapter_client,
+            device_id,
+            [route_entry(_A, route_id=1, generation=1, metric=10)],
+            seq=6021,
+            query="?store_only=true",
+        )
+    ).status_code == 200
+    assert (await _apply(adapter_client, device_id, {"static_route": 6021})).status_code == 202
+    await _settle((await _generations(device_id))[0].job_id, GenerationStatus.settled)
+    assert (
+        await _put_routes(
+            adapter_client,
+            device_id,
+            [route_entry(_A, route_id=1, generation=2, metric=20)],
+            seq=6022,
+            query="?store_only=true",
+        )
+    ).status_code == 200
+
+    response = await _apply(adapter_client, device_id, {"static_route": 6022})
+
+    assert response.status_code == 202, response.text
+    assert response.json()["outcome"] == "promoted"
+    generations = await _generations(device_id)
+    assert len(generations) == 2
+    assert generations[1].document["static_route"]["static_route_intent"][0]["metric"] == 20
+    assert len(await _jobs(device_id)) == 2
+    stream = await _stream(device_id, "static_route")
+    assert (stream.desired_revision, stream.authorized_revision, stream.applied_revision) == (2, 2, 1)
+
+
+@pytest.mark.parametrize("blocked_status", ["failed", "outcome_unknown"])
+async def test_action_apply_does_not_settle_name_only_route_across_blocked_predecessor(
+    adapter_client,
+    blocked_status,
+):
+    """Renderer equivalence cannot advance settlement past an unresolved generation."""
+    from nso_adapter.store.models import GenerationStatus
+
+    suffix = 0 if blocked_status == "failed" else 1
+    device_id = await seed_device(
+        nso_device_name=f"apply-static-name-{blocked_status}",
+        netbox_device_id=9985 + suffix,
+    )
+    await seed_settings(device_id, auto_apply=False)
+    assert (
+        await _put_routes(
+            adapter_client,
+            device_id,
+            [route_entry(_A, route_id=1, generation=1, name="old name")],
+            seq=6031 + suffix * 10,
+            query="?store_only=true",
+        )
+    ).status_code == 200
+    baseline_seq = 6031 + suffix * 10
+    assert (await _apply(adapter_client, device_id, {"static_route": baseline_seq})).status_code == 202
+    baseline = (await _generations(device_id))[0]
+    await _settle(baseline.job_id, GenerationStatus(blocked_status))
+    changed_seq = baseline_seq + 1
+    assert (
+        await _put_routes(
+            adapter_client,
+            device_id,
+            [route_entry(_A, route_id=1, generation=2, name="new name")],
+            seq=changed_seq,
+            query="?store_only=true",
+        )
+    ).status_code == 200
+
+    response = await _apply(adapter_client, device_id, {"static_route": changed_seq})
+
+    assert response.status_code == 202, response.text
+    assert response.json()["outcome"] == "promoted"
+    generations = await _generations(device_id)
+    assert [generation.status for generation in generations] == [
+        GenerationStatus(blocked_status),
+        GenerationStatus.pending,
+    ]
+    assert len(await _jobs(device_id)) == 2
+    stream = await _stream(device_id, "static_route")
+    assert (stream.desired_revision, stream.authorized_revision, stream.applied_revision) == (2, 2, 0)
+
+
+async def test_ordinary_auto_apply_name_only_route_edit_stays_generation_backed(adapter_client):
+    """The local settlement rule belongs only to the explicit Apply action."""
+    from nso_adapter.store.models import GenerationStatus
+
+    device_id = await seed_device(nso_device_name="auto-static-name-only", netbox_device_id=9987)
+    await seed_settings(device_id, auto_apply=True)
+    baseline = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_A, route_id=1, generation=1, name="old name")],
+        seq=6051,
+    )
+    assert baseline.status_code == 200, baseline.text
+    await _settle((await _generations(device_id))[0].job_id, GenerationStatus.settled)
+
+    renamed = await _put_routes(
+        adapter_client,
+        device_id,
+        [route_entry(_A, route_id=1, generation=2, name="new name")],
+        seq=6052,
+    )
+
+    assert renamed.status_code == 200, renamed.text
+    assert len(await _generations(device_id)) == 2
+    assert len(await _jobs(device_id)) == 2
+    stream = await _stream(device_id, "static_route")
+    assert (stream.desired_revision, stream.authorized_revision, stream.applied_revision) == (2, 2, 1)
+
+
 async def test_action_apply_reports_every_skipped_selection_reason(adapter_client):
     from nso_adapter.store.models import GenerationStatus
 
@@ -2184,9 +2360,12 @@ async def test_consumed_static_route_tombstone_is_not_planned_as_an_intent_delet
         replacement,
         _has_positive_delta(projection.authorized_document, desired),
     )
-    networked_links, detach_links, apply_streams = _plan_action_links({"static_route": promotion})
+    networked_links, detach_links, apply_streams, wire_equivalent_streams = _plan_action_links(
+        {"static_route": promotion}
+    )
     assert len(networked_links) == 1
     assert detach_links == []
+    assert wire_equivalent_streams == set()
     # The push clears a metric and bumps the correlation columns; neither ADDS payload, so
     # the replacement link carries the whole desired state and no apply rides beside it.
     assert apply_streams == set()

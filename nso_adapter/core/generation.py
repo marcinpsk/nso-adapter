@@ -576,10 +576,11 @@ async def _selected_promotions(
 
 def _plan_action_links(
     promotions: dict[str, _Promotion],
-) -> tuple[list[_RemovalLink], list[_RemovalLink], set[str]]:
+) -> tuple[list[_RemovalLink], list[_RemovalLink], set[str], set[str]]:
     networked_links: list[_RemovalLink] = []
     detach_links: list[_RemovalLink] = []
     apply_streams: set[str] = set()
+    wire_equivalent_streams: set[str] = set()
     unexecutable: dict[str, str] = {}
     for stream, promotion in promotions.items():
         has_networked = any(promotion.networked.values())
@@ -595,14 +596,52 @@ def _plan_action_links(
         if has_detach:
             detach_links.append(_RemovalLink(stream, GenerationMode.detach, promotion.detached, {}))
         if not (has_networked or has_detach or has_replacement):
-            apply_streams.add(stream)
+            if stream == "static_route" and not promotion.positive:
+                wire_equivalent_streams.add(stream)
+            else:
+                apply_streams.add(stream)
         elif promotion.positive:
             # A removal runner delivers only its selected negative delta. The apply runner
             # delivers every addition and edit in the same promoted stream.
             apply_streams.add(stream)
     if unexecutable:
         raise ApplyUnexecutable(unexecutable)
-    return networked_links, detach_links, apply_streams
+    return networked_links, detach_links, apply_streams, wire_equivalent_streams
+
+
+def _has_pending_static_route_clear(fragment: dict) -> bool:
+    """Whether a static-route fragment carries a clear that still needs device proof."""
+    return any(row.get("pending_clear") for row in fragment.get("static_route_intent", ()))
+
+
+async def _can_settle_wire_equivalent(
+    db: AsyncSession,
+    device_id: int,
+    promotion: _Promotion,
+) -> bool:
+    """Whether metadata-only promotion can advance without crossing unfinished work."""
+    if promotion.row.authorized_revision != promotion.row.applied_revision:
+        return False
+    if _has_pending_static_route_clear(promotion.desired):
+        return False
+    predecessor_id = await db.scalar(
+        select(DeploymentGeneration.id)
+        .where(
+            DeploymentGeneration.device_id == device_id,
+            DeploymentGeneration.status.not_in(_CROSSABLE),
+        )
+        .order_by(DeploymentGeneration.seq)
+        .limit(1)
+    )
+    return predecessor_id is None
+
+
+def _settle_wire_equivalent(promotion: _Promotion) -> None:
+    """Advance one renderer-equivalent stream while retaining its complete metadata."""
+    promotion.row.authorized_revision = promotion.row.desired_revision
+    promotion.row.applied_revision = promotion.row.desired_revision
+    promotion.row.authorized_document = deepcopy(promotion.desired)
+    promotion.row.updated_at = _now()
 
 
 async def _enqueue_action_removal_links(
@@ -747,7 +786,14 @@ async def create_action_apply(
     intermediate_all = dict(authorized)
     intermediate_all.update(intermediate_fragments)
     intermediate_document = _compose_document(intermediate_all)
-    networked_links, detach_links, apply_streams = _plan_action_links(promotions)
+    networked_links, detach_links, apply_streams, wire_equivalent_streams = _plan_action_links(promotions)
+    for stream in wire_equivalent_streams:
+        promotion = promotions[stream]
+        if await _can_settle_wire_equivalent(db, device_id, promotion):
+            _settle_wire_equivalent(promotion)
+            skipped[stream] = "already_applied"
+        else:
+            apply_streams.add(stream)
 
     link_count = len(networked_links) + len(detach_links) + bool(apply_streams)
     cohort = await allocate_settlement_cohort(db) if link_count > 1 else None
