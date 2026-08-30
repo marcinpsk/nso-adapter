@@ -31,7 +31,7 @@ import sqlalchemy as sa
 from nso_adapter.core import worker as worker_mod
 from nso_adapter.store.device_settle import MissingSettleCounter
 from nso_adapter.store.models import Device, DeviceSettleCounter, Job, JobStatus, JobType
-from tests.conftest import _drop_database, _url_for, seed_device, session
+from tests.conftest import _drop_database, _url_for, attach_apply_generation, seed_device, session
 
 pytestmark = pytest.mark.anyio
 
@@ -62,6 +62,7 @@ async def _stranded_running_job(device_id: int, job_type: JobType = JobType.appl
             job_type=job_type,
             device_id=device_id,
             status=JobStatus.running,
+            coalescible=job_type not in (JobType.removal, JobType.provision),
             run_attempt=1,
             heartbeat_at=datetime.now(UTC) - timedelta(seconds=worker_mod.PROVISION_STALE_AFTER + 600),
         )
@@ -325,7 +326,13 @@ async def test_a_failed_allocation_never_takes_a_second_terminal_write(adapter_c
 
     device_id = await seed_device(nso_device_name=f"lc-alloc-{failure}", netbox_device_id=8631)
     async with session() as db:
-        job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.running, run_attempt=1)
+        job = Job(
+            job_type=JobType.apply,
+            device_id=device_id,
+            status=JobStatus.running,
+            coalescible=True,
+            run_attempt=1,
+        )
         db.add(job)
         db.add(
             StaticRouteIntent(
@@ -335,6 +342,7 @@ async def test_a_failed_allocation_never_takes_a_second_terminal_write(adapter_c
         await db.commit()
         job_id = job.id
 
+    await attach_apply_generation(job_id, device_id)
     if failure == "missing_row":
         await _drop_counter(device_id)  # a concurrent offboard cascaded it away
     else:

@@ -141,7 +141,7 @@ async def test_scheduled_sync_all_handles_skip_and_error(adapter_client, monkeyp
             db.add(ManagedScope(device_id=dev.id, attribute="description"))
             await db.commit()
 
-    # first device: job already active (created=False, skip branch); second: enqueue raises (error branch)
+    # The first device has a queued same-type winner; the second enqueue raises.
     enqueue = AsyncMock(side_effect=[(SimpleNamespace(id=1), False), RuntimeError("boom")])
     monkeypatch.setattr("nso_adapter.core.jobs.enqueue_job", enqueue)
 

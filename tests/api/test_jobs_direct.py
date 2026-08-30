@@ -18,7 +18,7 @@ async def _seed_device_and_job(nso_device_name: str, netbox_id: int, status: Job
         d = Device(nso_instance="nso-dev", nso_device_name=nso_device_name, netbox_device_id=netbox_id)
         db.add(d)
         await db.flush()
-        j = Job(device_id=d.id, job_type=JobType.sync, status=status)
+        j = Job(device_id=d.id, job_type=JobType.sync, status=status, coalescible=True)
         db.add(j)
         await db.commit()
         await db.refresh(j)
@@ -82,7 +82,13 @@ async def test_list_jobs_breaks_a_created_at_tie_by_id(adapter_client):
         await db.flush()
         ids = []
         for _ in range(4):
-            j = Job(device_id=d.id, job_type=JobType.sync, status=JobStatus.succeeded, created_at=stamp)
+            j = Job(
+                device_id=d.id,
+                job_type=JobType.sync,
+                status=JobStatus.succeeded,
+                coalescible=True,
+                created_at=stamp,
+            )
             db.add(j)
             await db.flush()
             ids.append(j.id)
@@ -137,6 +143,7 @@ async def test_job_out_serializes_context(adapter_client):
             device_id=d.id,
             job_type=JobType.removal,
             status=JobStatus.queued,
+            coalescible=False,
             context={"scope": "isis", "force": True},
         )
         db.add(j)

@@ -35,7 +35,13 @@ async def _terminal_job(
 ) -> int:
     """A job that ran and settled, through the real allocator — so it carries a sequence."""
     async with session() as db:
-        job = Job(job_type=job_type, device_id=device_id, status=JobStatus.running, run_attempt=1)
+        job = Job(
+            job_type=job_type,
+            device_id=device_id,
+            status=JobStatus.running,
+            coalescible=job_type not in (JobType.removal, JobType.provision),
+            run_attempt=1,
+        )
         db.add(job)
         await db.flush()
         await terminalize(db, job.id, status=status, expect=JobStatus.running, run_attempt=1)
@@ -45,7 +51,13 @@ async def _terminal_job(
 
 async def _pending_job(device_id: int, *, status: JobStatus, job_type: JobType) -> int:
     async with session() as db:
-        job = Job(job_type=job_type, device_id=device_id, status=status, run_attempt=0)
+        job = Job(
+            job_type=job_type,
+            device_id=device_id,
+            status=status,
+            coalescible=job_type not in (JobType.removal, JobType.provision),
+            run_attempt=0,
+        )
         db.add(job)
         await db.commit()
         return job.id

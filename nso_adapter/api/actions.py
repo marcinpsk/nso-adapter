@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Actions API: async device actions (sync, check-sync_state, connect, apply, sync-notify).
+"""Actions API: async device actions and deployment-generation barrier exits.
 
-Async actions return 202 with a top-level {job_id}. Apply also returns its generation chain.
-409 is returned if a job is already queued/running for the device.
+The device claim permits one executing device job. Admission is endpoint-specific:
+ordinary triggers reject queued jobs of the requested type, Apply checks all queued
+and running jobs after it finds promotable work, and barrier actions ignore unrelated jobs.
 """
 
 from __future__ import annotations
@@ -19,7 +20,8 @@ from nso_adapter.api.errors import (
     RESP_401,
     RESP_404_DEVICE,
     RESP_409,
-    RESP_409_ACTIVE_JOB,
+    RESP_409_APPLY_CONFLICT,
+    RESP_409_QUEUED_ACTION,
     RESP_422_VALIDATION,
     RESP_500_INTERNAL,
     api_error,
@@ -35,10 +37,9 @@ SelectedPushSequence = Annotated[
     Field(strict=True, ge=MIN_PUSH_SEQ, le=MAX_PUSH_SEQ),
 ]
 
-# All action endpoints emit 401 (token) + 422 (device_id path); the responses fragments
-# below add the ones each endpoint actually raises. The trigger POSTs go through
-# _trigger (404 + 409-active-job); force-removal / apply-diff raise 400 bad_request.
-_TRIGGER_ERRORS = {**RESP_401, **RESP_404_DEVICE, **RESP_409_ACTIVE_JOB, **RESP_422_VALIDATION}
+# Trigger endpoints add their queued same-type conflict to the common action errors.
+_ACTION_ERRORS = {**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION}
+_TRIGGER_ERRORS = {**_ACTION_ERRORS, **RESP_409_QUEUED_ACTION}
 
 
 class JobTriggerOut(BaseModel):
@@ -118,7 +119,12 @@ async def _trigger(
 
     job, created = await enqueue_job(device_id, job_type, db)
     if not created:
-        raise api_error(409, "conflict", "A job is already running for this device", {"job_id": job.id})
+        raise api_error(
+            409,
+            "conflict",
+            "A job of the requested type is already queued for this device",
+            {"job_id": job.id},
+        )
     return {"job_id": job.id}
 
 
@@ -261,8 +267,8 @@ async def sync_notify(
 ):
     """Handle the NetBox plugin's notification that scope or intent changed for this device.
 
-    Triggers an immediate sync job. If a job is already running, returns 409 with
-    the existing job_id so the plugin can poll for the result.
+    A queued sync job returns 409 with its job id. A running sync job permits a queued
+    successor, and jobs of other types do not refuse the notification.
     """
     return await _trigger(device_id, JobType.sync, db)
 
@@ -274,7 +280,8 @@ async def sync_notify(
     response_model=ActionApplyOut,
     responses={
         200: {"model": ActionApplyOut, "description": "No selected stream required a job"},
-        **_TRIGGER_ERRORS,
+        **_ACTION_ERRORS,
+        **RESP_409_APPLY_CONFLICT,
         **RESP_500_INTERNAL,
     },
 )
@@ -284,8 +291,11 @@ async def action_apply(
     response: Response,
     db: AsyncSession = Depends(get_db),
 ):
-    """Atomically promote the selected pushes and enqueue their immutable generation chain."""
-    from nso_adapter.core.generation import ApplyAlreadyQueued, ApplyUnexecutable, create_action_apply
+    """Promote selected pushes.
+
+    Check queued and running jobs only when the selection contains promotable work.
+    """
+    from nso_adapter.core.generation import ApplyJobConflict, ApplyUnexecutable, create_action_apply
     from nso_adapter.core.request_flags import STORE_ONLY
 
     if STORE_ONLY.get():
@@ -296,12 +306,12 @@ async def action_apply(
         raise api_error(404, "not_found", "Device not found")
     try:
         apply_result = await create_action_apply(db, device_id, body.selected)
-    except ApplyAlreadyQueued as exc:
+    except ApplyJobConflict as exc:
         await db.rollback()
         raise api_error(
             409,
             "conflict",
-            "A job is already running for this device",
+            "A job is already queued or running for this device",
             {"job_id": exc.job_id},
         ) from None
     except ApplyUnexecutable as exc:
@@ -432,7 +442,9 @@ async def action_abandon_generation(
 
     The other exit. Deliberately destructive of intent: this deployment is recorded as never
     delivered and the chain moves past it, so the operator is asserting that the device state
-    it was meant to establish is either already there or no longer wanted.
+    it was meant to establish is either already there or no longer wanted. The response
+    ``job_id`` identifies the successor carrier this action released, or is ``null`` when no
+    successor is executable.
 
     A request with no blocked head returns 409 with ``error.detail.head_status``. A
     compare-and-set race returns 409 with an empty detail.

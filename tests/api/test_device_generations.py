@@ -30,7 +30,7 @@ async def _seed_generation_chain(device_id: int) -> tuple[int, int, int]:
     )
 
     async with session() as db:
-        job = Job(job_type=JobType.apply, device_id=device_id)
+        job = Job(job_type=JobType.apply, device_id=device_id, coalescible=True)
         db.add(job)
         await db.flush()
 

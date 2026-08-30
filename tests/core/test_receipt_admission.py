@@ -505,6 +505,28 @@ async def test_a_keyed_invalid_utf8_body_is_a_validation_error(adapter_client):
     }
 
 
+async def test_a_keyed_syntactically_invalid_json_body_is_a_validation_error(adapter_client):
+    """Decodable text that is not JSON is a json_invalid RequestValidationError.
+
+    Unlike the invalid-UTF8 sibling (Starlette 400 -> flat envelope), FastAPI parses a
+    decodable body itself, so this path answers through the validation handler with the
+    pydantic error list in ``detail``. This is still the one documented envelope.
+    """
+    device_id = await seed_device(nso_device_name="rcp-not-json", netbox_device_id=None)
+
+    response = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/vlan-intent",
+        content=b"not json",
+        headers={**AUTH, "Content-Type": "application/json", "X-Push-Seq": "11"},
+    )
+
+    assert response.status_code == 422
+    body = response.json()
+    assert set(body) == {"error"}
+    assert body["error"]["code"] == "validation_error"
+    assert [e["type"] for e in body["error"]["detail"]["errors"]] == ["json_invalid"]
+
+
 async def test_a_keyed_undecodable_body_is_a_validation_error(adapter_client):
     """An undecodable body raises UnicodeDecodeError, which is NOT a JSONDecodeError.
 

@@ -477,7 +477,13 @@ async def test_c1_9b_dispatch_scope_receives_the_job_id_and_the_registration(ada
 
     device_id = await seed_device(nso_device_name="sr-thread", netbox_device_id=7010)
     async with session() as db:
-        job = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued, context={"scope": "vlan"})
+        job = Job(
+            job_type=JobType.removal,
+            device_id=device_id,
+            status=JobStatus.queued,
+            coalescible=False,
+            context={"scope": "vlan"},
+        )
         db.add(job)
         await db.commit()
         job_id = job.id
@@ -510,7 +516,13 @@ async def test_c1_9c_a_revoked_claim_propagates_instead_of_failing_the_job(adapt
 
     device_id = await seed_device(nso_device_name="sr-revoked", netbox_device_id=7011)
     async with session() as db:
-        job = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.queued, context={"scope": "vlan"})
+        job = Job(
+            job_type=JobType.removal,
+            device_id=device_id,
+            status=JobStatus.queued,
+            coalescible=False,
+            context={"scope": "vlan"},
+        )
         db.add(job)
         await db.commit()
         job_id = job.id

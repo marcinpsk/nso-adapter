@@ -59,7 +59,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.projection import (
@@ -74,10 +74,10 @@ from nso_adapter.core.projection import (
     stream_section,
 )
 from nso_adapter.core.receipt import promotion_deletion_identity
-from nso_adapter.store.db import execute_dml
 from nso_adapter.store.models import (
     SETTLEMENT_COHORT_SEQUENCE,
     DeploymentGeneration,
+    Device,
     DeviceGenerationCounter,
     DeviceProjectionStream,
     DeviceSettings,
@@ -95,6 +95,8 @@ logger = structlog.get_logger(__name__)
 _CROSSABLE = (GenerationStatus.settled, GenerationStatus.abandoned)
 #: A job that is still going to run (or is running) covers its generations.
 _LIVE_JOB = (JobStatus.queued, JobStatus.running)
+#: PostgreSQL ``lock_not_available``: what a refused ``FOR UPDATE NOWAIT`` reports.
+_LOCK_NOT_AVAILABLE = "55P03"
 
 
 class DeviceProjectionGone(RuntimeError):
@@ -109,11 +111,11 @@ class GenerationModeConflict(RuntimeError):
     """
 
 
-class ApplyAlreadyQueued(RuntimeError):
-    """The selected promotion cannot attach to a new apply job."""
+class ApplyJobConflict(RuntimeError):
+    """The selected promotion observed a queued or running device job."""
 
     def __init__(self, job_id: int):
-        super().__init__(f"apply job {job_id} is already queued")
+        super().__init__(f"job {job_id} is already queued or running")
         self.job_id = job_id
 
 
@@ -156,24 +158,22 @@ async def lock_projection(db: AsyncSession, device_id: int) -> None:
 
     Taken by EVERY accepted write, store-only included: a store-only repair that slipped in
     between two of the document's SELECTs would put state into a generation nobody
-    authorized. The lock is the counter row, so the same acquisition that orders the
-    writers also orders the sequence they allocate.
+    authorized. The device row orders projection writers against offboard. The counter row
+    then orders the sequence they allocate.
 
-    The row is created lazily under a SAVEPOINT — this is never a terminal transaction, so
-    the FK check's ``FOR KEY SHARE`` on ``devices`` closes no cycle here (contrast
-    :mod:`store.device_settle`, where a lazy create WOULD deadlock against offboard).
+    FOR NO KEY UPDATE, not FOR UPDATE: it must exclude teardown and a rival projection
+    writer, but not the FOR KEY SHARE that job admission (``jobs.py``) and PostgreSQL's own
+    FK validation take on the same row.
     """
-    try:
-        async with db.begin_nested():
-            await db.execute(
-                pg_insert(DeviceGenerationCounter)
-                .values(device_id=device_id, last_seq=0)
-                .on_conflict_do_nothing(index_elements=["device_id"])
-            )
-    except IntegrityError:
-        # The FK found no device: it was offboarded under this write. `from None` keeps the
-        # driver's request-echoing exception out of the traceback.
-        raise DeviceProjectionGone(f"device {device_id} no longer exists") from None
+    held_device = await db.scalar(select(Device.id).where(Device.id == device_id).with_for_update(key_share=True))
+    if held_device is None:
+        raise DeviceProjectionGone(f"device {device_id} no longer exists")
+    async with db.begin_nested():
+        await db.execute(
+            pg_insert(DeviceGenerationCounter)
+            .values(device_id=device_id, last_seq=0)
+            .on_conflict_do_nothing(index_elements=["device_id"])
+        )
     held = await db.scalar(
         select(DeviceGenerationCounter.device_id)
         .where(DeviceGenerationCounter.device_id == device_id)
@@ -664,7 +664,7 @@ async def _enqueue_action_apply_job(
     document: dict,
     cohort: int | None,
 ) -> DeploymentGeneration:
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
 
     generation = await create_generation(
         db,
@@ -674,9 +674,9 @@ async def _enqueue_action_apply_job(
         document=document,
         settlement_cohort=cohort,
     )
-    created, winner = await admit_queued_job(db, device_id, JobType.apply)
+    created, winner = await admit_coalescible_job(db, device_id, JobType.apply)
     if winner is not None:
-        raise ApplyAlreadyQueued(winner.id)
+        raise ApplyJobConflict(winner.id)
     if created is None:  # pragma: no cover - bounded admission retries exhausted
         raise RuntimeError(f"could not admit an apply job for device {device_id}")
     await require_attach_to_job(db, generation, created)
@@ -702,7 +702,7 @@ async def create_action_apply(
         .limit(1)
     )
     if active_job_id is not None:
-        raise ApplyAlreadyQueued(active_job_id)
+        raise ApplyJobConflict(active_job_id)
 
     if "static_route" in selected_rows:
         await _promote_static_route_clears(db, device_id)
@@ -1000,7 +1000,7 @@ async def _job_generations(db: AsyncSession, job_id: int) -> list[DeploymentGene
 
 
 async def generation_execution_sections(db: AsyncSession, job_id: int) -> frozenset[str] | None:
-    """Return the sections carried by this job, or ``None`` when it carries no generation.
+    """Return the sections carried by this job, or ``None`` for an invalid carrier.
 
     Adjacent generations can share one apply job. Their streams form the execution boundary,
     and every selected section uses the highest generation's complete document.
@@ -1017,7 +1017,10 @@ class GenerationTampered(RuntimeError):
 
 
 async def executing_generation(db: AsyncSession, job_id: int) -> DeploymentGeneration | None:
-    """Return the generation a job must deploy, digest verified. ``None`` if it carries none.
+    """Return the generation a job must deploy, digest verified.
+
+    ``None`` identifies a job that carries no generation. Reads do not call this function,
+    and device-writing runners refuse that invalid state before sending device config.
 
     A job may carry several ADJACENT generations of the same mode (the queued-winner
     coalescing that already exists). Each document is the COMPLETE outbound device document,
@@ -1074,6 +1077,7 @@ async def attach_to_job(db: AsyncSession, generation: DeploymentGeneration, job:
 
     Raises :class:`GenerationModeConflict` when the job carries the other mode — coalescing
     across the networked/detach boundary is forbidden, and there is no correct reordering.
+    A dedicated job rejects every second generation, including a contiguous one.
 
     An EMPTY job always accepts: it was created for this generation, and whether it may
     START is the barrier's question (:func:`job_admissible`), asked again when a worker
@@ -1081,6 +1085,14 @@ async def attach_to_job(db: AsyncSession, generation: DeploymentGeneration, job:
     """
     carried = await _job_generations(db, job.id)
     if carried:
+        if not job.coalescible:
+            logger.info(
+                "generation.attach_declined_dedicated",
+                job_id=job.id,
+                generation_id=generation.id,
+                carried_generation_id=carried[-1].id,
+            )
+            return False
         if carried[-1].mode is not generation.mode:
             raise GenerationModeConflict(
                 f"job {job.id} carries mode {carried[-1].mode.value}; generation {generation.id} is "
@@ -1141,10 +1153,8 @@ async def job_admissible(db: AsyncSession, job_id: int, device_id: int) -> bool:
     """Ask the success barrier whether a worker may start *job_id* now (§H2).
 
     A READ carrying no generation is unaffected: a sync never deploys a document and must
-    not queue behind a blocked write. A device-WRITING job carrying no generation is a
-    different matter — an Apply on a device nothing was ever written for, or a job whose
-    generation was abandoned — and it may not cross a blocked head either, or it deploys
-    over a device state nobody established.
+    not queue behind a blocked write. A device-WRITING carrier without a generation is
+    invalid. Its runner fails closed, but it still cannot cross a blocked head.
     """
     carried = await _job_generations(db, job_id)
     if not carried:
@@ -1159,7 +1169,7 @@ async def job_admissible(db: AsyncSession, job_id: int, device_id: int) -> bool:
         if blocked is None:
             return True
         logger.warning(
-            "generation.blocked_generationless_write",
+            "generation.blocked_write_without_generation",
             job_id=job_id,
             device_id=device_id,
             job_type=str(job_type),
@@ -1326,76 +1336,31 @@ async def requeue_job_generations(db: AsyncSession, job_id: int) -> None:
     )
 
 
-def _job_for(generation: DeploymentGeneration) -> Job:
-    """Build the job that executes *generation*, from the generation alone.
+class GenerationCarrierCorruption(RuntimeError):
+    """A pending executable head has a carrier state that recovery cannot repair safely."""
 
-    A removal's context lives on the GENERATION, so a retry never has to read it back off
-    the job that failed carrying it — which may have been requeued, superseded, or had its
-    context rewritten by its own run.
-    """
+
+async def _create_dedicated_carrier(db: AsyncSession, generation: DeploymentGeneration) -> Job:
+    """Create and attach one fresh dedicated carrier from *generation*. Caller commits."""
+    from nso_adapter.core.jobs import create_dedicated_job
+
     if generation.removal_context:
-        return Job(
-            job_type=JobType.removal,
-            device_id=generation.device_id,
-            status=JobStatus.queued,
+        job = await create_dedicated_job(
+            db,
+            generation.device_id,
+            JobType.removal,
             context=dict(generation.removal_context),
         )
-    if generation.mode is GenerationMode.detach:
+    elif generation.mode is GenerationMode.detach:
         # Unreachable through enqueue_removal, which always records the context. Raising
         # beats the alternative: an apply job would NETWORK the very retraction the detach
         # exists to keep off the device.
-        raise RuntimeError(f"detach generation {generation.id} carries no removal context")
-    return Job(job_type=JobType.apply, device_id=generation.device_id, status=JobStatus.queued)
-
-
-async def _queue_job_for(db: AsyncSession, generation: DeploymentGeneration) -> Job:
-    """Give *generation* a queued job, TAKING OVER the successors' one if one exists.
-
-    At most one queued job per (device, type) exists — the admission dedupe index — so this
-    cannot simply insert another when a successor already holds one. It takes that job over
-    instead: the successors it carried go back to unattached ``pending`` and get their own
-    job once this head settles. Which is the barrier: the head runs first, alone, with its
-    own document.
-    """
-    spec = _job_for(generation)
-    existing = await db.scalar(
-        select(Job)
-        .where(
-            Job.device_id == generation.device_id,
-            Job.job_type == spec.job_type,
-            Job.status == JobStatus.queued,
-            select(DeploymentGeneration.id).where(DeploymentGeneration.job_id == Job.id).exists(),
-        )
-        # Removals are exempt from the queued-job dedupe index, so several can be queued at
-        # once; ordered so the takeover target is the OLDEST rather than whatever the planner
-        # happened to return, and so two concurrent callers contend on the same row.
-        .order_by(Job.created_at, Job.id)
-        .limit(1)
-        .with_for_update()
-    )
-    if existing is None:
-        db.add(spec)
-        await db.flush()
-        return spec
-    released = await execute_dml(
-        db,
-        sa_update(DeploymentGeneration)
-        .where(DeploymentGeneration.job_id == existing.id, DeploymentGeneration.id != generation.id)
-        .values(job_id=None, updated_at=_now())
-        .execution_options(synchronize_session=False),
-    )
-    if spec.context is not None:
-        # A removal's context IS its operation. An apply's is written by the run itself, so
-        # there is nothing to carry over and blanking it would drop the previous run's audit.
-        existing.context = spec.context
-    await db.flush()
-    logger.info(
-        "generation.took_over_queued_job",
-        job_id=existing.id,
-        generation_id=generation.id,
-        released=released.rowcount,
-    )
-    return existing
+        raise GenerationCarrierCorruption(f"detach generation {generation.id} carries no removal context")
+    else:
+        job = await create_dedicated_job(db, generation.device_id, JobType.apply)
+    if not await attach_to_job(db, generation, job):
+        raise GenerationCarrierCorruption(f"dedicated carrier {job.id} rejected generation {generation.id}")
+    return job
 
 
 class GenerationNotBlocked(RuntimeError):
@@ -1448,11 +1413,9 @@ async def retry_generation(db: AsyncSession, generation_id: int) -> Job | None:
     if expected != generation.digest:
         raise GenerationTampered(f"generation {generation_id} digest does not match its document")
     await _claim_blocked_head(db, generation_id, GenerationStatus.pending)
-    job = await _queue_job_for(db, generation)
     generation.status = GenerationStatus.pending
-    generation.job_id = job.id
     generation.updated_at = _now()
-    await db.flush()
+    job = await _create_dedicated_carrier(db, generation)
     logger.warning(
         "generation.retry_admitted",
         generation_id=generation_id,
@@ -1466,7 +1429,7 @@ async def retry_generation(db: AsyncSession, generation_id: int) -> Job | None:
 
 
 async def reconcile_generation(db: AsyncSession, generation_id: int) -> Job | None:
-    """Abandon a blocked head and return the released successor's live job. Caller commits.
+    """Abandon a blocked head and return the released successor's carrier. Caller commits.
 
     The explicit exit §H2 names. Only a ``failed`` or ``outcome_unknown`` generation can be
     abandoned: settling one by decree would claim a device write that never happened, and
@@ -1496,28 +1459,29 @@ async def reconcile_generation(db: AsyncSession, generation_id: int) -> Job | No
         device_id=generation.device_id,
         seq=generation.seq,
     )
-    await advance_generations_locked(db, generation.device_id)
-    successor = await executable_head(db, generation.device_id)
-    if successor is None or successor.status is not GenerationStatus.pending:
-        return None
-    return await _live_job(db, successor.job_id)
+    return await advance_generations_locked(db, generation.device_id)
 
 
-async def _live_job(db: AsyncSession, job_id: int | None) -> Job | None:
-    if job_id is None:
-        return None
-    return await db.scalar(select(Job).where(Job.id == job_id, Job.status.in_(_LIVE_JOB)))
-
-
-async def advance_generations_locked(db: AsyncSession, device_id: int) -> int:
-    """Give the device's executable head a job when it has none. Caller commits.
+async def advance_generations_locked(db: AsyncSession, device_id: int) -> Job | None:
+    """Ensure that the pending executable head has a queued carrier. Caller commits.
 
     The advancement itself, with no transaction of its own, so the two callers can each own
     their boundary: :func:`advance_device_generations` runs it after a job finishes and at
     startup, and :func:`reconcile_generation` runs it in the transaction that abandons the
     blocker — the one case where no job is going to finish and release the successor.
 
-    Idempotent by construction: it only acts on a head that is ``pending`` and uncovered.
+    Idempotent by construction: a covered head returns its current queued carrier. A stale
+    binding is cleared and replaced by a fresh dedicated carrier for this head only. A
+    pending head bound to a running carrier is corrupt because both states must change in one
+    worker transaction.
+
+    The carrier read is NOWAIT because the two lock orders are opposed and cannot be
+    reconciled: this path holds the head generation row and wants the job, while the worker
+    holds the job and wants the generation rows (``mark_job_generations_running``). Waiting
+    here closes that cycle into a deadlock, and a victimised worker propagates out of
+    ``_claim_next_job`` with its device claim already committed. An unavailable lock has one
+    meaning: a worker is starting this carrier right now. Thus, the head is covered and
+    advancement yields: no takeover, no successor reported.
 
     A REMOVAL head gets a job built from its OWN ``removal_context`` — never the shared
     queued apply. The test used to be the ``detach`` mode alone, which is the wrong question:
@@ -1526,66 +1490,38 @@ async def advance_generations_locked(db: AsyncSession, device_id: int) -> int:
     the entry the operator removed. Mode decides how the removal commits (#106); the
     presence of a removal context decides that it IS one.
     """
-    from nso_adapter.core.jobs import admit_queued_job
-
-    head = await executable_head(db, device_id)
+    head = await _locked_executable_head(db, device_id)
     if head is None or head.status is not GenerationStatus.pending:
-        return 0
-    if await _live_job(db, head.job_id) is not None:
-        return 0
+        return None
     if head.job_id is not None:
+        try:
+            # SAVEPOINT: a refused lock aborts the statement, and reconcile_generation runs
+            # this inside the transaction that already abandoned the blocker.
+            async with db.begin_nested():
+                carrier = await db.get(Job, head.job_id, populate_existing=True, with_for_update={"nowait": True})
+        except DBAPIError as exc:
+            if getattr(exc.orig, "sqlstate", None) != _LOCK_NOT_AVAILABLE:
+                raise
+            logger.info("generation.carrier_locked_by_worker", device_id=device_id, job_id=head.job_id, seq=head.seq)
+            return None
+        if carrier is not None and carrier.status is JobStatus.queued:
+            return carrier
+        if carrier is not None and carrier.status is JobStatus.running:
+            raise GenerationCarrierCorruption(f"pending generation {head.id} has running carrier {carrier.id}")
         head.job_id = None
         await db.flush()
-    if head.removal_context or head.mode is GenerationMode.detach:
-        removal_job = await _queue_job_for(db, head)
-        head.job_id = removal_job.id
-        await db.flush()
-        logger.info(
-            "generation.advanced_removal",
-            device_id=device_id,
-            job_id=removal_job.id,
-            seq=head.seq,
-            mode=head.mode.value,
-        )
-        return 1
-    created, winner = await admit_queued_job(db, device_id, JobType.apply)
-    job = created or winner
-    if job is None:  # pragma: no cover — sustained admission contention
-        # Nothing of ours is half-written: admit_queued_job works inside a SAVEPOINT it has
-        # already released. The head stays unattached and the next advancement retries it.
-        logger.warning("generation.advance_no_job", device_id=device_id, seq=head.seq)
-        return 0
-    attached = 0
-    following = (
-        (
-            await db.execute(
-                select(DeploymentGeneration)
-                .where(
-                    DeploymentGeneration.device_id == device_id,
-                    DeploymentGeneration.seq >= head.seq,
-                    DeploymentGeneration.status == GenerationStatus.pending,
-                )
-                .order_by(DeploymentGeneration.seq)
-            )
-        )
-        .scalars()
-        .all()
+    job = await _create_dedicated_carrier(db, head)
+    logger.info(
+        "generation.advanced",
+        device_id=device_id,
+        job_id=job.id,
+        seq=head.seq,
+        mode=head.mode.value,
     )
-    for generation in following:
-        if generation.job_id is not None and generation.job_id != job.id:
-            break
-        try:
-            if not await attach_to_job(db, generation, job):
-                break
-        except GenerationModeConflict:
-            break
-        attached += 1
-    if attached:
-        logger.info("generation.advanced", device_id=device_id, job_id=job.id, attached=attached)
-    return attached
+    return job
 
 
-async def advance_device_generations(device_id: int) -> int:
+async def advance_device_generations(device_id: int) -> Job | None:
     """Run :func:`advance_generations_locked` in its own transaction.
 
     Called after every job finishes, at startup, and after a push whose own admission left
@@ -1595,9 +1531,9 @@ async def advance_device_generations(device_id: int) -> int:
 
     async with session() as db:
         await lock_projection(db, device_id)
-        attached = await advance_generations_locked(db, device_id)
+        carrier = await advance_generations_locked(db, device_id)
         await db.commit()
-        return attached
+        return carrier
 
 
 async def recover_generations() -> int:
@@ -1647,16 +1583,22 @@ async def recover_generations() -> int:
     if stranded:
         logger.error("generation.outcome_unknown_on_restart", count=len(stranded), devices=sorted(set(stranded)))
     for device_id in devices:
-        await advance_device_generations(device_id)
+        try:
+            await advance_device_generations(device_id)
+        except GenerationCarrierCorruption:
+            logger.error("generation.carrier_corruption_on_restart", device_id=device_id, exc_info=True)
+        except (DBAPIError, DeviceProjectionGone, GenerationModeConflict):
+            logger.error("generation.recovery_failed_on_restart", device_id=device_id, exc_info=True)
     return len(stranded)
 
 
 __all__ = [
     "ActionApplyResult",
-    "ApplyAlreadyQueued",
+    "ApplyJobConflict",
     "ApplyUnexecutable",
     "BLOCKED_STATUSES",
     "DeviceProjectionGone",
+    "GenerationCarrierCorruption",
     "GenerationModeConflict",
     "GenerationNotBlocked",
     "GenerationTampered",

@@ -97,7 +97,7 @@ def test_the_lifecycle_columns_stay_writable(pg_sync_session):
     from nso_adapter.store.models import Job, JobStatus, JobType
 
     _device_id, _other_device_id, generation_id = _seed(pg_sync_session)
-    job = Job(job_type=JobType.apply, device_id=_device_id, status=JobStatus.queued)
+    job = Job(job_type=JobType.apply, device_id=_device_id, status=JobStatus.queued, coalescible=True)
     pg_sync_session.add(job)
     pg_sync_session.flush()
 

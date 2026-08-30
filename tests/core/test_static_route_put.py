@@ -23,7 +23,7 @@ import pytest
 from sqlalchemy import select
 
 from nso_adapter.store.models import Job, JobStatus, JobType
-from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
+from tests.conftest import VALID_TOKEN, attach_apply_generation, push_seq, seed_device, session
 
 pytestmark = pytest.mark.anyio
 
@@ -98,10 +98,18 @@ async def seed_apply_job(device_id: int) -> int:
     async with session() as db:
         # Seeded as the worker head leaves it: started, at attempt 1. A directly-invoked
         # runner never performs that transition, and its terminal CAS expects `running`.
-        job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.running, run_attempt=1)
+        job = Job(
+            job_type=JobType.apply,
+            device_id=device_id,
+            status=JobStatus.running,
+            coalescible=True,
+            run_attempt=1,
+        )
         db.add(job)
         await db.commit()
-        return job.id
+        job_id = job.id
+    await attach_apply_generation(job_id, device_id)
+    return job_id
 
 
 async def read_job(job_id: int) -> Job:

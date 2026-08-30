@@ -36,7 +36,13 @@ async def _seed_queued_apply(device_id: int) -> int:
     from nso_adapter.store.models import Job, JobStatus, JobType
 
     async with session() as db:
-        job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.queued, context={})
+        job = Job(
+            job_type=JobType.apply,
+            device_id=device_id,
+            status=JobStatus.queued,
+            coalescible=True,
+            context={},
+        )
         db.add(job)
         await db.commit()
         return job.id
@@ -57,11 +63,13 @@ async def _legacy_offboard(device_id: int, engine) -> None:
     because a "no deadlock" assertion against a fixture that could not deadlock either way
     proves nothing.
     """
-    from nso_adapter.store.models import BfdIntent, Device, Job
+    from nso_adapter.store.models import BfdIntent, Device, Job, JobStatus
 
     maker = async_sessionmaker(engine, expire_on_commit=False)
     async with maker() as db:
-        await db.execute(sa.update(Job).where(Job.device_id == device_id).values(device_id=None))
+        await db.execute(
+            sa.update(Job).where(Job.device_id == device_id).values(status=JobStatus.failed, device_id=None)
+        )
         await db.execute(sa.delete(BfdIntent).where(BfdIntent.device_id == device_id))
         await db.execute(sa.delete(Device).where(Device.id == device_id))
         await db.commit()

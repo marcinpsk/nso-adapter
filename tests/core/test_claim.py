@@ -35,10 +35,16 @@ pytestmark = pytest.mark.anyio
 
 
 async def _seed_job(device_id: int | None, job_type, status):
-    from nso_adapter.store.models import Job
+    from nso_adapter.store.models import Job, JobType
 
     async with session() as db:
-        job = Job(job_type=job_type, device_id=device_id, status=status, context={})
+        job = Job(
+            job_type=job_type,
+            device_id=device_id,
+            status=status,
+            coalescible=job_type not in (JobType.removal, JobType.provision),
+            context={},
+        )
         db.add(job)
         await db.commit()
         return job.id
@@ -146,7 +152,7 @@ async def test_provision_acquisition_sets_job_id(adapter_client):
     from nso_adapter.store.models import JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="cl-prov", netbox_device_id=9903)
-    job_id = await _seed_job(device_id, JobType.provision, JobStatus.running)
+    job_id = await _seed_job(None, JobType.provision, JobStatus.running)
 
     reg = await acquire_claim(device_id, "job", job_id=job_id)
     assert (await _claim_row(device_id)).job_id == job_id

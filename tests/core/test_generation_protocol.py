@@ -758,7 +758,7 @@ async def test_f5_c_a_detach_head_is_re_admittable(adapter_client):
     assert (await generations(device_id))[-1].status is GenerationStatus.pending
 
 
-# ── Finding 6 — the three generation-less producers ──────────────────────────
+# ── Finding 6: every device-writing producer attaches a generation ──────────
 
 
 async def test_f6_a_manual_apply_creates_a_generation_from_authorized_state(adapter_client):
@@ -821,7 +821,7 @@ async def test_f6_c_the_reclaimer_reissue_gives_its_job_a_generation(adapter_cli
     device_id = await seed_device(nso_device_name="gen-reclaim", netbox_device_id=9816)
     async with session() as db:
         # R1's handoff set: the owning removal job SUCCEEDED without proving anything.
-        owner = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.succeeded)
+        owner = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.succeeded, coalescible=False)
         db.add(owner)
         await db.flush()
         db.add(

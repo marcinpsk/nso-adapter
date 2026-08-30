@@ -1008,8 +1008,8 @@ async def _replace_static_route(
     Promoted generation creation records the removal classification under the projection lock:
 
     1. every tombstone owned by THIS job contributes ``{triple} ∪ {deployed_key}`` (X6);
-       a job that owns none falls back to ``context["removed"]["route"]`` (fence-shut and
-       legacy jobs);
+       a job that owns none falls back to ``context["removed"]["route"]`` (including a
+       fence-shut removal);
     2. supersession subtracts every key the selected plan claims as its ``triple`` or
        its ``deployed_key``. A promotion uses the recorded document. A reissue uses current
        accepted intent;
@@ -1992,8 +1992,9 @@ async def enqueue_removal(
         create_reissue_generation,
         require_attach_to_job,
     )
+    from nso_adapter.core.jobs import create_dedicated_job
     from nso_adapter.core.request_flags import STORE_ONLY
-    from nso_adapter.store.models import GenerationMode, Job, JobStatus, JobType
+    from nso_adapter.store.models import GenerationMode, JobType
 
     if scope not in VALID_REMOVAL_SCOPES:
         raise ValueError(f"Unknown removal scope {scope!r}")
@@ -2087,14 +2088,7 @@ async def enqueue_removal(
             settlement_cohort=settlement_cohort,
             static_route_tombstone_ids=static_route_tombstone_ids,
         )
-    job = Job(
-        job_type=JobType.removal,
-        device_id=device_id,
-        status=JobStatus.queued,
-        context=context,
-    )
-    db.add(job)
-    await db.flush()
+    job = await create_dedicated_job(db, device_id, JobType.removal, context=context)
     await require_attach_to_job(db, generation, job)
     await _settle_pending_clears_at_admission(db, device_id, scope, promotes, mode=mode, force=force)
     logger.info("removal.enqueued", device_id=device_id, scope=scope, job_id=job.id, marking=marking)

@@ -13,7 +13,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy import select
 
-from nso_adapter.core.apply import _nokia_routed_kind, enqueue_apply, run_apply
+from nso_adapter.core.apply import _nokia_routed_kind, enqueue_apply
+from nso_adapter.core.apply import run_apply as _run_apply_worker
 from nso_adapter.nso.client import NsoClient
 from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import (
@@ -27,7 +28,7 @@ from nso_adapter.store.models import (
     JobType,
     SyncState,
 )
-from tests.conftest import note_projection_write, session
+from tests.conftest import attach_apply_generation, note_projection_write, session
 
 # ── _nokia_routed_kind (pure: derives SR OS router context from kind/service/vrf) ──
 
@@ -221,22 +222,32 @@ async def _seed_device(name: str = "test-rtr", netbox_id: int = 1) -> int:
 
 
 async def _seed_apply_job(device_id: int, status: JobStatus = JobStatus.running) -> int:
-    """A job as the WORKER HEAD leaves it: started, at attempt 1.
+    """Create a job row as the worker head leaves it.
 
-    ``run_apply`` is invoked directly here, so nothing performs the ``queued -> running``
-    transition, and its terminal compare-and-set expects ``running`` (Appendix S §3.1).
+    The local ``run_apply`` harness attaches a generation after each test finishes seeding
+    intent. The real worker still receives only a generation-backed job.
     """
     async with session() as db:
         j = Job(
             job_type=JobType.apply,
             device_id=device_id,
             status=status,
+            coalescible=True,
             run_attempt=1 if status is JobStatus.running else 0,
         )
         db.add(j)
         await db.commit()
         await db.refresh(j)
         return j.id
+
+
+async def run_apply(job_id: int, device_id: int, force: bool = True, reg=None) -> None:
+    """Attach the immutable fixture document, then invoke the real Apply worker."""
+    async with session() as db:
+        job = await db.get(Job, job_id)
+    if job is not None:
+        await attach_apply_generation(job_id, job.device_id)
+    await _run_apply_worker(job_id=job_id, device_id=device_id, force=force, reg=reg)
 
 
 async def _seed_interface_with_intent(
@@ -281,7 +292,7 @@ async def _seed_interface_with_intent(
 
 
 async def test_enqueue_apply_creates_job(adapter_client):
-    """enqueue_apply creates an apply job when no active job exists."""
+    """enqueue_apply creates an Apply job when no queued Apply exists."""
     device_id = await _seed_device("rtr-a01", 101)
     async with session() as db:
         await note_projection_write(db, device_id, "vlan")
@@ -321,6 +332,42 @@ async def test_run_apply_job_not_found(adapter_client, store_engine):
     # Should not raise — just log and return
     await run_apply(job_id=99999, device_id=device_id)
     assert store_engine.sync_engine.pool.checkedout() == 0
+
+
+async def test_run_apply_refuses_a_job_without_a_generation_before_device_access(adapter_client):
+    """A corrupt carrier must not deploy whatever happens to be in the live store."""
+    device_id = await _seed_device("rtr-missing-generation", 109)
+    async with session() as db:
+        job = Job(
+            job_type=JobType.apply,
+            device_id=device_id,
+            status=JobStatus.running,
+            coalescible=True,
+            run_attempt=1,
+        )
+        db.add(job)
+        await db.commit()
+        job_id = job.id
+
+    client_requested = False
+
+    def _unexpected_client(_instance):
+        nonlocal client_requested
+        client_requested = True
+        raise AssertionError("an Apply without a generation must fail before device access")
+
+    with patch("nso_adapter.core.importer.get_nso_client", _unexpected_client):
+        await _run_apply_worker(job_id=job_id, device_id=device_id)
+
+    assert not client_requested
+    async with session() as db:
+        failed = await db.get(Job, job_id)
+        assert failed.status is JobStatus.failed
+        assert failed.error == {
+            "code": "apply_generation_missing",
+            "message": f"Apply job {job_id} carries no generation to deploy.",
+            "detail": {},
+        }
 
 
 async def test_run_apply_device_not_found(adapter_client):
@@ -956,11 +1003,11 @@ async def test_run_apply_unexpected_exception_on_attribute(adapter_client):
         )
 
 
-async def test_run_apply_no_force_filters_eligible(adapter_client):
-    """run_apply with force=False only applies accepted/apply_failed/drifted, not in_sync."""
+async def test_run_apply_does_not_reselect_recorded_interface_eligibility(adapter_client):
+    """Execution uses the generation's eligibility record, not current worker flags."""
     device_id = await _seed_device("rtr-a16", 116)
     job_id = await _seed_apply_job(device_id)
-    # in_sync is NOT eligible when force=False
+    # Generation creation records in_sync as eligible. Worker flags cannot revise that fact.
     await _seed_interface_with_intent(
         device_id=device_id,
         iface_name="GigabitEthernet0/3",
@@ -971,14 +1018,16 @@ async def test_run_apply_no_force_filters_eligible(adapter_client):
     )
 
     mock_client = AsyncMock()
-    with patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client):
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client),
+        patch("nso_adapter.nso.apply.apply_interface_attribute", new_callable=AsyncMock),
+    ):
         await run_apply(job_id=job_id, device_id=device_id, force=False)
 
     async with session() as db:
         job = await db.get(Job, job_id)
-        # in_sync is not in _NO_FORCE_ELIGIBLE, so nothing was applied
         assert job.status == JobStatus.succeeded
-        assert job.result["attribute_count_by_outcome"]["in_sync"] == 0
+        assert job.result["attribute_count_by_outcome"]["in_sync"] == 1
 
 
 async def test_run_apply_outer_exception(adapter_client):
@@ -1905,25 +1954,16 @@ async def test_run_apply_atomic_stages_all_scopes_in_one_commit(adapter_client, 
 async def test_run_apply_atomic_unrenderable_scope_does_not_take_down_the_job(adapter_client, monkeypatch):
     """A scope whose BODY cannot be built must fail alone — not the entire apply.
 
-    A legacy SnmpCommunityIntent whose vault_ref predates the mount/path#key contract makes
-    apply_snmp_config raise while _stage_atomic_modules is assembling the combined body.
-    That raise propagated out of _run_atomic_apply and failed the WHOLE job: interfaces,
-    IPs, BGP, IS-IS — every scope, none of which had anything wrong with it. Isolate the
-    offender: stamp its rows, drop it from the transaction, and commit the rest.
+    A renderer error while _stage_atomic_modules assembles the combined body must not fail
+    unrelated scopes. Isolate the offender, stamp its rows, drop it from the transaction,
+    and commit the rest.
     """
+    from nso_adapter.nso.apply import NsoApplyError
     from nso_adapter.store.models import SnmpCommunityIntent, StaticRouteIntent
 
     monkeypatch.setenv("NSO_ADAPTER_ATOMIC_APPLY", "1")
-    device_id = await _seed_device(name="sw01-legacy")
+    device_id = await _seed_device(name="sw01-unrenderable")
     await _seed_snmp_and_static_route(device_id)
-    async with session() as db:
-        row = (
-            (await db.execute(select(SnmpCommunityIntent).where(SnmpCommunityIntent.device_id == device_id)))
-            .scalars()
-            .one()
-        )
-        row.vault_ref = "network/netbox/snmp/legacy"  # pre-#121: no '#key'
-        await db.commit()
     job_id = await _seed_apply_job(device_id)
 
     mock_client = AsyncMock()
@@ -1931,6 +1971,13 @@ async def test_run_apply_atomic_unrenderable_scope_does_not_take_down_the_job(ad
     with ExitStack() as stack:
         stack.enter_context(patch("nso_adapter.core.importer.get_nso_client", return_value=mock_client))
         stack.enter_context(patch("nso_adapter.nso.apply.apply_combined", combined))
+        stack.enter_context(
+            patch(
+                "nso_adapter.nso.apply.apply_snmp_config",
+                new_callable=AsyncMock,
+                side_effect=NsoApplyError("invalid_vault_ref", "SNMP render refused its recorded reference"),
+            )
+        )
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
     # The healthy scopes still committed, without the offender's module.
@@ -2392,7 +2439,15 @@ async def test_run_apply_marks_failed_even_when_session_poisoned(adapter_client,
     async def _poison(db, job, job_id, device_id, force):
         # A real DB error (duplicate PK) puts the AsyncSession into a needs-rollback state,
         # exactly like a failed flush mid-apply; the failure handler must rollback first.
-        db.add(Job(id=job_id, job_type=JobType.apply, device_id=device_id, status=JobStatus.queued))
+        db.add(
+            Job(
+                id=job_id,
+                job_type=JobType.apply,
+                device_id=device_id,
+                status=JobStatus.queued,
+                coalescible=True,
+            )
+        )
         await db.flush()  # IntegrityError → session poisoned; propagates to run_apply's handler
 
     with patch("nso_adapter.core.apply._execute_apply", _poison):

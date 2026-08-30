@@ -102,6 +102,7 @@ async def _seed_removal_job(device_id: int, scope: str = "vlan", context_extra: 
             job_type=JobType.removal,
             device_id=device_id,
             status=JobStatus.running,
+            coalescible=False,
             run_attempt=1,
             context=context,
         )
@@ -954,6 +955,7 @@ async def test_run_removal_refuses_a_job_that_carries_no_generation(adapter_clie
             job_type=JobType.removal,
             device_id=device_id,
             status=JobStatus.running,
+            coalescible=False,
             run_attempt=1,
             context={"scope": scope},
         )
@@ -986,6 +988,7 @@ async def test_run_removal_refuses_a_static_route_force_job_that_carries_no_gene
             job_type=JobType.removal,
             device_id=device_id,
             status=JobStatus.running,
+            coalescible=False,
             run_attempt=1,
             context={"scope": "static_route", "force": True},
         )
@@ -1023,7 +1026,15 @@ async def test_run_removal_marks_failed_even_when_session_poisoned(adapter_clien
     async def poison(db, device, client, scope, context=None):
         # A duplicate PK insert → IntegrityError → AsyncSession enters needs-rollback,
         # exactly like a failed flush during the PUT-replace's row bookkeeping.
-        db.add(Job(id=job_id, job_type=JobType.removal, device_id=device.id, status=JobStatus.queued))
+        db.add(
+            Job(
+                id=job_id,
+                job_type=JobType.removal,
+                device_id=device.id,
+                status=JobStatus.queued,
+                coalescible=False,
+            )
+        )
         await db.flush()
 
     with (

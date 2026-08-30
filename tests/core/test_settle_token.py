@@ -25,10 +25,16 @@ pytestmark = pytest.mark.anyio
 
 
 async def _queue(device_id: int | None, job_type, *, context=None) -> int:
-    from nso_adapter.store.models import Job, JobStatus
+    from nso_adapter.store.models import Job, JobStatus, JobType
 
     async with session() as db:
-        job = Job(job_type=job_type, device_id=device_id, status=JobStatus.queued, context=context or {})
+        job = Job(
+            job_type=job_type,
+            device_id=device_id,
+            status=JobStatus.queued,
+            coalescible=job_type not in (JobType.removal, JobType.provision),
+            context=context or {},
+        )
         db.add(job)
         await db.commit()
         return job.id
@@ -162,7 +168,7 @@ async def test_delayed_recovery_cannot_terminalize_a_successor_run(adapter_clien
 
     S1.2 does not cover this: it drives a stale RUNNER, not a stale recovery actor.
     """
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from nso_adapter.store.models import Job, JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="s1-delayed", netbox_device_id=9903)
@@ -204,7 +210,7 @@ async def test_delayed_recovery_cannot_terminalize_a_successor_run(adapter_clien
             await _start_run(device_id, jid)
             # … and admission commits a queued same-type successor.
             async with rival() as other:
-                created, winner = await admit_queued_job(other, device_id, JobType.sync)
+                created, winner = await admit_coalescible_job(other, device_id, JobType.sync)
                 await other.commit()
                 successor_ids.append((created or winner).id)
         return await real_terminalize(db, jid, **kwargs)
@@ -343,7 +349,7 @@ async def test_a_superseded_requeue_returns_failed_not_queued(adapter_client):
     The caller may never read its requested status: only the returned one is the truth.
     """
     from nso_adapter.core.claim import terminalize_running
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from nso_adapter.store.models import JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="s1-superseded", netbox_device_id=9906)
@@ -351,7 +357,7 @@ async def test_a_superseded_requeue_returns_failed_not_queued(adapter_client):
     _jid, _dev, _jt, reg = await _start_run(device_id, job_id)
 
     async with session() as db:
-        created, winner = await admit_queued_job(db, device_id, JobType.sync)
+        created, winner = await admit_coalescible_job(db, device_id, JobType.sync)
         await db.commit()
         successor_id = (created or winner).id
 
@@ -369,7 +375,7 @@ async def test_a_superseded_requeue_abandons_its_generation(adapter_client):
     """The elected successor can cross a generation the stale run no longer owns."""
     from nso_adapter.core.claim import terminalize_running
     from nso_adapter.core.generation import job_admissible
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="s1-superseded-generation", netbox_device_id=9911)
@@ -379,7 +385,7 @@ async def test_a_superseded_requeue_abandons_its_generation(adapter_client):
     generation_id = await _running_generation(device_id, job_id)
 
     async with session() as db:
-        created, winner = await admit_queued_job(db, device_id, JobType.apply)
+        created, winner = await admit_coalescible_job(db, device_id, JobType.apply)
         await db.commit()
         successor_id = (created or winner).id
 
@@ -403,7 +409,7 @@ async def test_a_successor_inserted_mid_decision_lands_superseded(adapter_client
     transaction stays usable.
     """
     from nso_adapter.core.claim import terminalize_running
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, Job, JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="s1-midrace", netbox_device_id=9907)
@@ -425,7 +431,7 @@ async def test_a_successor_inserted_mid_decision_lands_superseded(adapter_client
             if not fired:
                 fired.append(True)
                 async with rival() as other:
-                    await admit_queued_job(other, device_id, JobType.apply)
+                    await admit_coalescible_job(other, device_id, JobType.apply)
                     await other.commit()
             return out
 
@@ -448,27 +454,16 @@ async def test_a_successor_inserted_mid_decision_lands_superseded(adapter_client
 # ── S1.5 / S1.7: the writers with no execution, and the device_id sentinel ───
 
 
-async def test_queued_sourced_writers_need_no_token(adapter_client, monkeypatch):
-    """S1.5 — offboarding and the claimless-corruption writer have nothing to name.
+async def test_offboard_queued_writer_needs_no_token(adapter_client, monkeypatch):
+    """S1.5: offboarding has no execution to name.
 
-    Forbidden: requiring a token from them, which would leave offboard unable to
-    terminalize a queued job at all. Both carry ``expect=queued`` instead, and offboard
-    goes through the dedicated bulk helper — a per-job helper cannot express its
-    unbounded row set.
+    Requiring a token would leave offboard unable to terminalize a queued job. Offboard
+    uses the bulk helper because a per-job helper cannot express its unbounded row set.
     """
     from nso_adapter.core import claim as claim_mod
     from nso_adapter.core.onboarding import offboard_device
     from nso_adapter.store.models import Device, Job, JobStatus, JobType
 
-    # (a) the claimless-corruption writer: a non-provision job with no device.
-    corrupt_id = await _queue(None, JobType.sync)
-    assert await worker_mod._claim_next_claimless_job() is None
-    corrupt = await _row(corrupt_id)
-    assert corrupt.status is JobStatus.failed
-    assert corrupt.error["code"] == "orphaned_claimless"
-    assert corrupt.run_attempt == 0, "a queued-sourced write must not start an execution"
-
-    # (b) offboard, through the bulk helper.
     device_id = await seed_device(nso_device_name="s1-queued-sourced", netbox_device_id=9908)
     queued_id = await _queue(device_id, JobType.sync)
 

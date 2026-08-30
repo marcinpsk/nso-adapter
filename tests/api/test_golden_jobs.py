@@ -34,6 +34,7 @@ async def _seed_job(device_id: int, **overrides) -> int:
             job_type=JobType.apply,
             device_id=device_id,
             status=JobStatus.succeeded,
+            coalescible=True,
             result={"ok": True},
             error=None,
             context={"scope": "bgp"},
@@ -78,7 +79,13 @@ async def test_list_jobs_nullable_golden(adapter_client):
     from nso_adapter.store.models import Job, JobStatus, JobType
 
     async with session() as db:
-        job = Job(job_type=JobType.provision, status=JobStatus.queued, created_at=TS, updated_at=TS)
+        job = Job(
+            job_type=JobType.provision,
+            status=JobStatus.queued,
+            coalescible=False,
+            created_at=TS,
+            updated_at=TS,
+        )
         db.add(job)
         await db.commit()
         job_id = job.id
@@ -118,7 +125,13 @@ async def test_the_default_page_is_unchanged_descending_at_100(adapter_client):
     async with session() as db:
         ids = []
         for _ in range(101):
-            job = Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.succeeded, created_at=TS)
+            job = Job(
+                job_type=JobType.sync,
+                device_id=device_id,
+                status=JobStatus.succeeded,
+                coalescible=True,
+                created_at=TS,
+            )
             db.add(job)
             await db.flush()
             ids.append(job.id)

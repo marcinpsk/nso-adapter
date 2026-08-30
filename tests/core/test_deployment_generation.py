@@ -17,6 +17,7 @@ the stored document, blocked-head retry) lives in ``test_generation_protocol.py`
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 from unittest.mock import patch
 
@@ -58,11 +59,23 @@ async def _wait_for_relation_lock(engine, relation: str, *, timeout: float = 5.0
             waiting = await probe.scalar(
                 sa.text(
                     "SELECT EXISTS ("
-                    "SELECT 1 FROM pg_stat_activity "
-                    "WHERE datname = current_database() "
-                    "AND pid <> pg_backend_pid() "
-                    "AND wait_event_type = 'Lock' "
-                    "AND position(:relation IN lower(query)) > 0"
+                    "SELECT 1 FROM pg_stat_activity AS activity "
+                    "WHERE activity.datname = current_database() "
+                    "AND activity.pid <> pg_backend_pid() "
+                    "AND activity.wait_event_type = 'Lock' "
+                    "AND cardinality(pg_blocking_pids(activity.pid)) > 0 "
+                    "AND position(:relation IN lower(activity.query)) > 0 "
+                    "AND EXISTS ("
+                    "SELECT 1 FROM pg_locks AS wait_lock "
+                    "WHERE wait_lock.pid = activity.pid "
+                    "AND NOT wait_lock.granted"
+                    ") "
+                    "AND EXISTS ("
+                    "SELECT 1 FROM pg_locks AS blocker_lock "
+                    "WHERE blocker_lock.pid = ANY(pg_blocking_pids(activity.pid)) "
+                    "AND blocker_lock.granted "
+                    "AND blocker_lock.relation = to_regclass(:relation)"
+                    ")"
                     ")"
                 ),
                 {"relation": relation.lower()},
@@ -71,6 +84,30 @@ async def _wait_for_relation_lock(engine, relation: str, *, timeout: float = 5.0
                 return
             await asyncio.sleep(0.02)
     raise AssertionError(f"no backend entered a lock wait on {relation!r} within {timeout:g}s")
+
+
+async def test_relation_lock_wait_requires_an_ungranted_lock(rival_engine):
+    """A granted lock on one relation must not impersonate a wait on that relation."""
+    from nso_adapter.store.db import get_engine
+
+    async with rival_engine.connect() as blocker, get_engine().connect() as waiter:
+        blocker_tx = await blocker.begin()
+        waiter_tx = await waiter.begin()
+        await blocker.execute(sa.text("LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE"))
+        await waiter.execute(sa.text("LOCK TABLE devices IN ACCESS SHARE MODE"))
+        blocked = asyncio.create_task(
+            waiter.execute(
+                sa.text("SELECT count(*) FROM jobs WHERE EXISTS (SELECT 1 FROM devices WHERE devices.id < 0)")
+            )
+        )
+        try:
+            await _wait_for_relation_lock(get_engine(), "jobs")
+            with pytest.raises(AssertionError, match="no backend entered a lock wait"):
+                await _wait_for_relation_lock(get_engine(), "devices", timeout=0.2)
+        finally:
+            await blocker_tx.rollback()
+            await blocked
+            await waiter_tx.rollback()
 
 
 async def _device(name: str, netbox_device_id: int, *, auto_apply: bool = True) -> int:
@@ -368,7 +405,7 @@ async def test_a_queued_job_coalesces_within_its_mode_and_settles_all_it_carried
 
     A still-queued networked job has sent nothing yet, so the writes that arrive before it
     starts are genuinely part of what it will deploy. The boundary is the job STARTING, not
-    the generation being created: once running, ``admit_queued_job`` hands the next write a
+    the generation being created: once running, ``admit_coalescible_job`` gives the next write a
     successor job instead (proven by the test above).
     """
     from nso_adapter.store.models import GenerationStatus, JobStatus
@@ -424,8 +461,20 @@ async def test_the_final_settled_cohort_member_rechecks_every_carried_stream(ada
     async with session() as db:
         await note_write(db, device_id, "vlan")
         await note_write(db, device_id, "static_route")
-        first_job = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.running, context={})
-        final_job = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.running, context={})
+        first_job = Job(
+            job_type=JobType.apply,
+            device_id=device_id,
+            status=JobStatus.running,
+            coalescible=False,
+            context={},
+        )
+        final_job = Job(
+            job_type=JobType.removal,
+            device_id=device_id,
+            status=JobStatus.running,
+            coalescible=False,
+            context={},
+        )
         db.add_all([first_job, final_job])
         await db.flush()
 
@@ -675,7 +724,7 @@ async def test_a_blocked_head_is_never_rebuilt_from_a_store_that_moved_on(adapte
 
 
 async def test_restart_gives_a_pending_uncovered_generation_a_job(adapter_client):
-    """A generation whose admission could not attach it must not be stranded by a restart."""
+    """Repeated restart recovery gives an uncovered head exactly one dedicated carrier."""
     from nso_adapter.core.generation import recover_generations
     from nso_adapter.store.models import DeploymentGeneration, Job, JobStatus
 
@@ -695,10 +744,18 @@ async def test_restart_gives_a_pending_uncovered_generation_a_job(adapter_client
         )
 
     await recover_generations()
+    await recover_generations()
 
     revived = (await _generations(device_id))[0]
     assert revived.job_id is not None, "a pending generation was left with no job to deploy it"
     assert await _job_status(revived.job_id) is JobStatus.queued
+    async with session() as db:
+        carriers = list(
+            (await db.execute(sa.select(Job).where(Job.device_id == device_id, Job.status == JobStatus.queued)))
+            .scalars()
+            .all()
+        )
+    assert [(job.id, job.coalescible) for job in carriers] == [(revived.job_id, False)]
 
 
 async def test_restart_marks_a_stranded_running_generation_unknown(adapter_client):
@@ -738,13 +795,18 @@ async def test_concurrent_creation_orders_by_commit_not_by_start(adapter_client,
     from nso_adapter.store.models import VlanIntent
 
     device_id = await _device("gen-concurrent", 9740)
+    # A non-FK update keeps the slow write open without locking the device row first.
+    async with session() as db:
+        db.add(VlanIntent(device_id=device_id, vlan_id=80, name="before"))
+        await db.commit()
 
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
     async with rival() as slow, rival() as fast:
         # The slow transaction starts FIRST and really writes, but has not yet reached the
         # projection lock — a SELECT-only "overlap" would prove nothing about ordering.
-        slow.add(VlanIntent(device_id=device_id, vlan_id=80, name="slow"))
-        await slow.flush()
+        await slow.execute(
+            sa.update(VlanIntent).where(VlanIntent.device_id == device_id, VlanIntent.vlan_id == 80).values(name="slow")
+        )
 
         await note_write(fast, device_id, "snmp")
         await enqueue_apply(fast, device_id, force=True, stream="snmp")
@@ -788,7 +850,7 @@ async def test_a_second_writer_cannot_allocate_until_the_first_commits(adapter_c
             await waiter.commit()
 
         blocked = asyncio.create_task(second_writer())
-        await _wait_for_relation_lock(get_engine(), "device_generation_counter")
+        await _wait_for_relation_lock(get_engine(), "devices")
         assert not blocked.done(), "the second promotion allocated a sequence under a held lock"
 
         await holder.commit()
@@ -804,23 +866,55 @@ async def test_the_projection_lock_serializes_two_writers(adapter_client, rival_
     from nso_adapter.store.db import get_engine
 
     device_id = await _device("gen-lock", 9741)
-    # The counter row must already EXIST, or the two writers would serialize on the insert
-    # conflict alone and the row lock this test is about would never be exercised.
-    async with session() as db:
-        await lock_projection(db, device_id)
-        await db.commit()
 
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
     async with rival() as holder, rival() as waiter:
         await lock_projection(holder, device_id)
 
         blocked = asyncio.create_task(lock_projection(waiter, device_id))
-        await _wait_for_relation_lock(get_engine(), "device_generation_counter")
+        await _wait_for_relation_lock(get_engine(), "devices")
         assert not blocked.done(), "a second projection writer was not serialized"
 
         await holder.commit()
         await asyncio.wait_for(blocked, timeout=5)
         await waiter.rollback()
+
+
+async def test_the_projection_lock_does_not_block_job_admission(adapter_client, rival_engine):
+    """The lock excludes rival writers and teardown, NOT the FOR KEY SHARE admission takes.
+
+    ``admit_coalescible_job`` locks the device row FOR KEY SHARE, and PostgreSQL takes the
+    same mode again to validate the inserted job's FK. A plain FOR UPDATE here would give
+    every ordinary push teardown-strength blocking against job creation.
+    """
+    from nso_adapter.core.generation import lock_projection
+    from nso_adapter.core.jobs import admit_coalescible_job
+    from nso_adapter.store.db import get_engine
+    from nso_adapter.store.models import Device, JobType
+
+    device_id = await _device("gen-lock-admit", 9743)
+
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+    async with rival() as holder, rival() as admitter, rival() as teardown:
+        await lock_projection(holder, device_id)
+
+        # PostgreSQL itself decides whether admission conflicts: a lock_timeout turns the
+        # wait into a failure instead of a hang, so no task is left blocked on the row.
+        await admitter.execute(sa.text("SET LOCAL lock_timeout = '2s'"))
+        created, winner = await admit_coalescible_job(admitter, device_id, JobType.sync)
+        assert created is not None and winner is None
+        await admitter.commit()
+
+        # The guard: the mode teardown uses is still excluded, so the lock still orders
+        # projection writes against offboard.
+        torn_down = asyncio.create_task(
+            teardown.execute(sa.select(Device.id).where(Device.id == device_id).with_for_update())
+        )
+        await _wait_for_relation_lock(get_engine(), "devices")
+        assert not torn_down.done(), "teardown crossed a held projection lock"
+        await holder.commit()
+        await asyncio.wait_for(torn_down, timeout=5)
+        await teardown.rollback()
 
 
 # ── mode boundary ────────────────────────────────────────────────────────────
@@ -900,8 +994,10 @@ async def test_a_pending_apply_head_replaces_its_terminal_job(adapter_client):
         job.status = JobStatus.failed
         await db.commit()
 
-    assert await advance_device_generations(device_id) == 1
+    carrier = await advance_device_generations(device_id)
     (advanced,) = await _generations(device_id)
+    assert carrier is not None and carrier.id == advanced.job_id
+    assert not carrier.coalescible
     assert advanced.job_id != stale_job_id
     assert await _job_status(advanced.job_id) is JobStatus.queued
 
@@ -916,6 +1012,249 @@ def test_standalone_advancement_has_no_unreachable_fallback():
 
     function = ast.parse(dedent(inspect.getsource(advance_device_generations))).body[0]
     assert isinstance(function.body[-1], ast.AsyncWith)
+
+
+async def test_a_pending_head_bound_to_a_running_job_is_corruption(adapter_client):
+    from nso_adapter.core.generation import GenerationCarrierCorruption, advance_device_generations
+    from nso_adapter.store.models import Job, JobStatus
+
+    device_id = await _device("gen-advance-running", 9775)
+    await _vlan(device_id, 94)
+    await _push(adapter_client, device_id)
+    (head,) = await _generations(device_id)
+
+    async with session() as db:
+        job = await db.get(Job, head.job_id)
+        job.status = JobStatus.running
+        job.run_attempt = 1
+        await db.commit()
+
+    with pytest.raises(GenerationCarrierCorruption, match="running carrier"):
+        await advance_device_generations(device_id)
+
+    (unchanged,) = await _generations(device_id)
+    assert unchanged.job_id == head.job_id
+    assert await _job_status(head.job_id) is JobStatus.running
+
+
+class _InjectedFailure(Exception):
+    """Raised by the early-failure arm to model a mid-test assertion blowing up."""
+
+
+@pytest.mark.parametrize("fail_early", [False, True], ids=["success", "early-failure"])
+async def test_advancement_yields_to_a_worker_starting_the_carrier(adapter_client, rival_engine, fail_early):
+    """The two lock orders are opposed, so the carrier read must be NOWAIT, not blocking.
+
+    Advancement holds the head generation row and wants the job; the worker holds the job
+    (FOR UPDATE SKIP LOCKED) and wants the generation rows
+    (:func:`mark_job_generations_running`). This drives exactly that interleaving with the
+    REAL worker transition, so a blocking carrier read closes the cycle into a PostgreSQL
+    deadlock. An unavailable lock means a worker is starting this carrier right now: the
+    head is covered, so advancement yields instead of taking it over.
+    """
+    from nso_adapter.core import generation as generation_mod
+    from nso_adapter.core.generation import advance_device_generations, mark_job_generations_running
+    from nso_adapter.store.db import get_engine
+    from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, Job, JobStatus
+
+    device_id = await _device("gen-advance-carrier-nowait", 9744)
+    await _vlan(device_id, 99)
+    await _push(adapter_client, device_id)
+    (head,) = await _generations(device_id)
+    assert head.job_id is not None
+    assert await _job_status(head.job_id) is JobStatus.queued
+
+    head_locked = asyncio.Event()
+    worker_blocked = asyncio.Event()
+    real_head = generation_mod._locked_executable_head
+
+    async def gated(db, locked_device_id):
+        """Hold the head generation lock until the worker is blocked behind it."""
+        result = await real_head(db, locked_device_id)
+        head_locked.set()
+        await asyncio.wait_for(worker_blocked.wait(), timeout=20)
+        return result
+
+    async def start_the_job(worker) -> None:
+        """``worker.py``: lock the job by exact id, then move ITS generations to running."""
+        locked = await worker.scalar(
+            sa.select(Job)
+            .where(Job.id == head.job_id, Job.status == JobStatus.queued)
+            .with_for_update(skip_locked=True)
+        )
+        assert locked is not None, "the worker could not claim the carrier it is starting"
+        await mark_job_generations_running(worker, locked.id)
+        locked.status = JobStatus.running
+        locked.run_attempt = locked.run_attempt + 1
+        await worker.commit()
+
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+    async with rival() as worker:
+        with patch("nso_adapter.core.generation._locked_executable_head", new=gated):
+            advancing = asyncio.create_task(advance_device_generations(device_id))
+            starting = asyncio.create_task(start_the_job(worker))
+            injected = None
+            try:
+                try:
+                    await asyncio.wait_for(head_locked.wait(), timeout=10)
+                    await _wait_for_relation_lock(get_engine(), "deployment_generation")
+                    assert not starting.done(), "the worker was never blocked on the head generation row"
+                finally:
+                    worker_blocked.set()
+
+                if fail_early:
+                    # The early-failure arm models an assertion below blowing up while
+                    # the tasks still run; the outer finally must clean both up.
+                    raise _InjectedFailure()
+
+                # (a) no deadlock, and no stale queued carrier handed back as a successor.
+                assert await asyncio.wait_for(advancing, timeout=20) is None, (
+                    "advancement took over a carrier a worker is starting"
+                )
+                await asyncio.wait_for(starting, timeout=20)
+            except _InjectedFailure as exc:
+                injected = exc
+            finally:
+                # A failed assertion above must not leave either task holding an open
+                # transaction and its locks on the shared test database.
+                for task in (starting, advancing):
+                    if not task.done():
+                        task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await task
+
+    if fail_early:
+        assert injected is not None
+        assert starting.done() and advancing.done()
+        # The cleanup released every lock: a fresh transaction can take the head row NOWAIT.
+        async with session() as db:
+            row = await db.get(DeploymentGeneration, head.id, with_for_update={"nowait": True})
+            assert row is not None
+        return
+
+    # (b) the worker's transition landed whole, and a re-run reads that truthful state.
+    (running,) = await _generations(device_id)
+    assert running.status is GenerationStatus.running
+    assert running.job_id == head.job_id, "the yield moved the head off the carrier being started"
+    assert await _job_status(head.job_id) is JobStatus.running
+
+    assert await advance_device_generations(device_id) is None
+    async with session() as db:
+        assert await db.scalar(sa.select(sa.func.count()).select_from(Job).where(Job.device_id == device_id)) == 1
+
+
+async def test_startup_recovery_isolates_a_corrupt_device(adapter_client):
+    from nso_adapter.core.generation import recover_generations
+    from nso_adapter.store.models import Job, JobStatus
+
+    corrupt_device = await _device("gen-recover-corrupt", 9794)
+    healthy_device = await _device("gen-recover-healthy", 9795)
+    for device_id, vlan_id in ((corrupt_device, 95), (healthy_device, 96)):
+        await _vlan(device_id, vlan_id)
+        await _push(adapter_client, device_id)
+    (corrupt_head,) = await _generations(corrupt_device)
+    (healthy_head,) = await _generations(healthy_device)
+    old_healthy_job_id = healthy_head.job_id
+
+    async with session() as db:
+        corrupt_job = await db.get(Job, corrupt_head.job_id)
+        corrupt_job.status = JobStatus.running
+        corrupt_job.run_attempt = 1
+        healthy_job = await db.get(Job, old_healthy_job_id)
+        healthy_job.status = JobStatus.failed
+        await db.commit()
+
+    await recover_generations()
+
+    (unchanged_corrupt,) = await _generations(corrupt_device)
+    (recovered_healthy,) = await _generations(healthy_device)
+    assert unchanged_corrupt.job_id == corrupt_head.job_id
+    assert await _job_status(corrupt_head.job_id) is JobStatus.running
+    assert recovered_healthy.job_id != old_healthy_job_id
+    assert await _job_status(recovered_healthy.job_id) is JobStatus.queued
+
+
+async def test_startup_recovery_isolates_a_detach_head_without_context(adapter_client):
+    from nso_adapter.core.generation import create_generation, note_write, recover_generations
+    from nso_adapter.store.models import GenerationMode, JobStatus
+
+    corrupt_device = await _device("gen-recover-missing-context", 9796)
+    healthy_device = await _device("gen-recover-after-context", 9797)
+    for device_id, vlan_id in ((corrupt_device, 97), (healthy_device, 98)):
+        await _vlan(device_id, vlan_id)
+
+    async with session() as db:
+        await note_write(db, corrupt_device, "vlan")
+        corrupt = await create_generation(
+            db,
+            corrupt_device,
+            streams=("vlan",),
+            mode=GenerationMode.detach,
+        )
+        await note_write(db, healthy_device, "vlan")
+        healthy = await create_generation(
+            db,
+            healthy_device,
+            streams=("vlan",),
+            mode=GenerationMode.networked,
+        )
+        await db.commit()
+
+    assert corrupt.job_id is None and healthy.job_id is None
+    await recover_generations()
+
+    (unchanged_corrupt,) = await _generations(corrupt_device)
+    (recovered_healthy,) = await _generations(healthy_device)
+    assert unchanged_corrupt.job_id is None
+    assert recovered_healthy.job_id is not None
+    assert await _job_status(recovered_healthy.job_id) is JobStatus.queued
+
+
+async def test_startup_recovery_isolates_a_database_failure(adapter_client):
+    from sqlalchemy.exc import DBAPIError
+
+    from nso_adapter.core import generation as generation_module
+    from nso_adapter.core.generation import create_generation, note_write, recover_generations
+    from nso_adapter.store.models import GenerationMode, JobStatus
+
+    devices = (
+        await _device("gen-recover-db-failure", 9798),
+        await _device("gen-recover-after-db-failure", 9799),
+    )
+    for device_id, vlan_id in zip(devices, (99, 100), strict=True):
+        await _vlan(device_id, vlan_id)
+
+    async with session() as db:
+        for device_id in devices:
+            await note_write(db, device_id, "vlan")
+            generation = await create_generation(
+                db,
+                device_id,
+                streams=("vlan",),
+                mode=GenerationMode.networked,
+            )
+            assert generation.job_id is None
+        await db.commit()
+
+    advance_device_generations = generation_module.advance_device_generations
+    recovery_order = []
+
+    async def fail_one_device(device_id):
+        recovery_order.append(device_id)
+        if len(recovery_order) == 1:
+            raise DBAPIError("SELECT carrier", {}, RuntimeError("transient database failure"), True)
+        return await advance_device_generations(device_id)
+
+    with patch("nso_adapter.core.generation.advance_device_generations", new=fail_one_device):
+        await recover_generations()
+
+    assert len(recovery_order) == 2
+    failed_device, recovered_device = recovery_order
+    (unchanged_failure,) = await _generations(failed_device)
+    (recovered_healthy,) = await _generations(recovered_device)
+    assert unchanged_failure.job_id is None
+    assert recovered_healthy.job_id is not None
+    assert await _job_status(recovered_healthy.job_id) is JobStatus.queued
 
 
 async def test_standalone_advancement_takes_the_projection_lock(adapter_client, rival_engine):
@@ -934,50 +1273,214 @@ async def test_standalone_advancement_takes_the_projection_lock(adapter_client, 
     async with rival() as holder:
         await lock_projection(holder, device_id)
         advancing = asyncio.create_task(advance_device_generations(device_id))
-        await _wait_for_relation_lock(get_engine(), "device_generation_counter")
+        await _wait_for_relation_lock(get_engine(), "devices")
         assert not advancing.done(), "advancement read the chain without the projection lock"
         await holder.commit()
 
-    assert await asyncio.wait_for(advancing, timeout=2) == 0
+    assert await asyncio.wait_for(advancing, timeout=2) is None
 
 
-async def test_f8_abandoning_a_head_hands_the_released_successor_a_job_at_once(adapter_client):
-    """#1558 rework 3, finding 3 — the abandon endpoint must advance the chain itself.
+@pytest.mark.parametrize("fail_early", [False, True], ids=["success", "early-failure"])
+async def test_concurrent_advancement_creates_one_carrier(adapter_client, fail_early):
+    """The second recovery revalidates the head and every exit closes both transactions."""
+    from nso_adapter.core import generation as generation_mod
+    from nso_adapter.store.db import get_engine
+    from nso_adapter.store.models import Job, JobStatus
 
-    Generation 3 was refused its job at admission (generation 2 sits in between), so nothing
-    carries it. Advancement otherwise runs only after a worker finishes a job or the process
-    restarts — and abandoning the blocker is exactly the case where no job will finish. The
-    successor sat ``pending`` with no job until some unrelated write happened along.
-    """
+    device_id = await _device("gen-advance-race", 9776)
+    await _vlan(device_id, 95)
+    await _push(adapter_client, device_id)
+    (head,) = await _generations(device_id)
+    async with session() as db:
+        await db.execute(sa.delete(Job).where(Job.id == head.job_id))
+        await db.commit()
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+    real = generation_mod.advance_generations_locked
+    tasks: list[asyncio.Task] = []
+
+    async def cleanup_tasks():
+        release.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def gated(db, locked_device_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            await release.wait()
+        return await real(db, locked_device_id)
+
+    async def run_race():
+        with patch("nso_adapter.core.generation.advance_generations_locked", new=gated):
+            first = asyncio.create_task(generation_mod.advance_device_generations(device_id))
+            tasks.append(first)
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=3)
+                second = asyncio.create_task(generation_mod.advance_device_generations(device_id))
+                tasks.append(second)
+                await _wait_for_relation_lock(get_engine(), "devices")
+                if fail_early:
+                    raise RuntimeError("injected early failure")
+                assert not second.done(), "the second recovery did not wait for the projection lock"
+                release.set()
+                return await asyncio.wait_for(asyncio.gather(first, second), timeout=10)
+            finally:
+                await cleanup_tasks()
+
+    if fail_early:
+        try:
+            with pytest.raises(RuntimeError, match="injected early failure"):
+                await run_race()
+            assert tasks and all(task.done() for task in tasks)
+        finally:
+            await cleanup_tasks()
+        return
+
+    first_carrier, second_carrier = await run_race()
+
+    assert first_carrier is not None and second_carrier is not None
+    assert first_carrier.id == second_carrier.id
+    async with session() as db:
+        carriers = list(
+            (await db.execute(sa.select(Job).where(Job.device_id == device_id, Job.status == JobStatus.queued)))
+            .scalars()
+            .all()
+        )
+    assert [(job.id, job.coalescible) for job in carriers] == [(first_carrier.id, False)]
+    assert (await _generations(device_id))[0].job_id == first_carrier.id
+
+
+async def _g1_g4_wedge(client, name: str, netbox_device_id: int):
+    """Build a blocked G2, uncovered G3, and queued G4 carrier."""
     from nso_adapter.store.models import GenerationStatus, JobStatus
 
-    device_id = await _device("gen-abandon-advance", 9768)
+    device_id = await _device(name, netbox_device_id)
     await _vlan(device_id, 69)
-    await _push(adapter_client, device_id)  # G1 networked -> apply job A
-    removal_job = await _shrink(adapter_client, device_id)  # G2 detach -> removal job R
-    await _push(adapter_client, device_id)  # G3 networked, noncontiguous -> no job
+    await _push(client, device_id)
+    removal_job = await _shrink(client, device_id)
+    await _push(client, device_id)
     first, second, third = await _generations(device_id)
-    assert third.job_id is None, "generation 3 was attached, so nothing needs releasing"
+    assert third.job_id is None
 
     assert await _finish(device_id, JobStatus.succeeded) == first.job_id
     assert await _finish(device_id, JobStatus.failed) == removal_job
     assert (await _generations(device_id))[1].status is GenerationStatus.failed
-    assert await _queued_jobs(device_id) == [], "the released successor already had a job"
 
-    resp = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/abandon-generation", headers=_AUTH)
-    assert resp.status_code == 202
+    await _vlan(device_id, 70)
+    await _push(client, device_id)
+    first, second, third, fourth = await _generations(device_id)
+    assert third.job_id is None
+    assert fourth.job_id is not None
+    return device_id, (first, second, third, fourth)
+
+
+async def test_abandoning_the_g1_g4_wedge_creates_a_fresh_g3_carrier(adapter_client):
+    """Abandon advances G3 without taking over or changing G4's queued carrier."""
+    from nso_adapter.store.models import DeploymentGeneration, GenerationStatus, Job
+
+    device_id, (first, second, third, fourth) = await _g1_g4_wedge(
+        adapter_client,
+        "gen-abandon-wedge",
+        9768,
+    )
+    fourth_before = await _job_snapshot(adapter_client, fourth.job_id)
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/abandon-generation",
+        headers=_AUTH,
+    )
+    assert response.status_code == 202, response.text
+    carrier_id = response.json()["job_id"]
+    assert carrier_id is not None
+    assert carrier_id not in {first.job_id, second.job_id, fourth.job_id}
 
     chain = await _generations(device_id)
     assert chain[1].status is GenerationStatus.abandoned
-    advanced = chain[2]
-    assert advanced.id == third.id and advanced.status is GenerationStatus.pending
-    assert advanced.job_id is not None, "the released successor was left with no job to deploy it"
-    assert await _job_status(advanced.job_id) is JobStatus.queued
-    claimed = await _claim_and_release()
-    assert claimed is not None and claimed[0] == advanced.job_id, (
-        "the successor's job is not the one a worker would pick up next"
+    assert (chain[2].id, chain[2].job_id) == (third.id, carrier_id)
+    assert chain[2].status is GenerationStatus.pending
+    assert (chain[3].id, chain[3].job_id) == (fourth.id, fourth.job_id)
+    assert await _job_snapshot(adapter_client, fourth.job_id) == fourth_before
+    async with session() as db:
+        carrier = await db.get(Job, carrier_id)
+        counts = dict(
+            (
+                await db.execute(
+                    sa.select(DeploymentGeneration.job_id, sa.func.count())
+                    .where(DeploymentGeneration.id.in_([third.id, fourth.id]))
+                    .group_by(DeploymentGeneration.job_id)
+                )
+            ).all()
+        )
+    assert carrier is not None and not carrier.coalescible
+    assert counts == {carrier_id: 1, fourth.job_id: 1}
+    assert response.json() == {"job_id": carrier_id}
+
+
+async def test_the_g3_recovery_carrier_runs_before_g4(adapter_client):
+    from nso_adapter.store.models import JobStatus
+
+    device_id, (_first, _second, _third, fourth) = await _g1_g4_wedge(
+        adapter_client,
+        "gen-abandon-worker-order",
+        9777,
     )
-    assert second.seq + 1 == advanced.seq, "an unrelated generation was advanced"
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/abandon-generation",
+        headers=_AUTH,
+    )
+    assert response.status_code == 202, response.text
+    carrier_id = response.json()["job_id"]
+
+    assert await _finish(device_id, JobStatus.succeeded) == carrier_id
+    assert await _job_status(fourth.job_id) is JobStatus.queued
+    assert await _finish(device_id, JobStatus.succeeded) == fourth.job_id
+
+
+async def test_abandon_without_a_successor_returns_a_null_job(adapter_client):
+    from nso_adapter.store.models import GenerationStatus
+
+    device_id = await _blocked_device(adapter_client, "gen-abandon-no-successor", 9778)
+    (head,) = await _generations(device_id)
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/abandon-generation",
+        headers=_AUTH,
+    )
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"job_id": None}
+    assert (await _generations(device_id))[0].status is GenerationStatus.abandoned
+
+
+async def test_abandoning_one_coalesced_failure_does_not_retry_the_other(adapter_client):
+    from nso_adapter.store.models import GenerationStatus, JobStatus
+
+    device_id = await _device("gen-abandon-coalesced-failure", 9779)
+    await _vlan(device_id, 71)
+    await _push(adapter_client, device_id)
+    await _vlan(device_id, 72)
+    await _push(adapter_client, device_id)
+    first, second = await _generations(device_id)
+    assert first.job_id == second.job_id
+    assert await _finish(device_id, JobStatus.failed) == first.job_id
+    first, second = await _generations(device_id)
+    assert (first.status, second.status) == (GenerationStatus.failed, GenerationStatus.failed)
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/abandon-generation",
+        headers=_AUTH,
+    )
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"job_id": None}
+    first, second = await _generations(device_id)
+    assert (first.status, second.status) == (GenerationStatus.abandoned, GenerationStatus.failed)
 
 
 @pytest.mark.parametrize("action", ["retry", "abandon"])
@@ -1013,7 +1516,7 @@ async def test_a_job_carrying_no_generation_is_never_blocked(adapter_client):
     assert await _finish(device_id, JobStatus.failed) == removal_job
 
     async with session() as db:
-        sync = Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued)
+        sync = Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued, coalescible=True)
         db.add(sync)
         await db.commit()
         sync_id = sync.id
@@ -1022,12 +1525,11 @@ async def test_a_job_carrying_no_generation_is_never_blocked(adapter_client):
     assert claimed is not None and claimed[0] == sync_id
 
 
-async def test_a_generationless_device_write_cannot_cross_a_blocked_head(adapter_client):
-    """A device-writing job carrying no generation must still respect the barrier.
+async def test_a_corrupt_device_write_without_a_generation_cannot_cross_a_blocked_head(adapter_client):
+    """An invalid device-writing carrier must still respect the barrier.
 
-    Every producer now creates one, but a job can still reach a worker without a generation:
-    an Apply on a device with nothing written, or a job whose generation was abandoned.
-    Admitting one behind a blocked head would deploy over a device state nobody established.
+    Every producer attaches a generation. This direct row represents database corruption;
+    admitting it behind a blocked head must not bypass generation order.
     """
     from nso_adapter.store.models import Job, JobStatus, JobType
 
@@ -1037,7 +1539,7 @@ async def test_a_generationless_device_write_cannot_cross_a_blocked_head(adapter
     assert await _finish(device_id, JobStatus.failed) == removal_job
 
     async with session() as db:
-        manual = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.queued)
+        manual = Job(job_type=JobType.apply, device_id=device_id, status=JobStatus.queued, coalescible=True)
         db.add(manual)
         await db.commit()
         manual_id = manual.id
@@ -1075,6 +1577,37 @@ async def _retry_head(device_id: int) -> int:
         job = await retry_generation(db, head.id)
         await db.commit()
         return job.id
+
+
+async def _retry_head_http(client, device_id: int) -> int:
+    response = await client.post(
+        f"/api/v1/devices/{device_id}/actions/retry-generation",
+        headers=_AUTH,
+    )
+    assert response.status_code == 202, response.text
+    return response.json()["job_id"]
+
+
+async def _job_snapshot(client, job_id: int) -> dict:
+    response = await client.get(f"/api/v1/jobs/{job_id}", headers=_AUTH)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def _blocked_apply_with_successor(client, name: str, netbox_device_id: int) -> tuple[int, int, int, int]:
+    from nso_adapter.store.models import JobStatus
+
+    device_id = await _device(name, netbox_device_id)
+    await _vlan(device_id, 66)
+    await _push(client, device_id)
+    (head,) = await _generations(device_id)
+    assert await _finish(device_id, JobStatus.failed) == head.job_id
+
+    await _vlan(device_id, 67)
+    await _push(client, device_id)
+    head, successor = await _generations(device_id)
+    assert successor.job_id is not None
+    return device_id, head.id, successor.id, successor.job_id
 
 
 async def test_f1_a_retried_removal_runs_past_a_blocked_apply_successor(adapter_client):
@@ -1128,76 +1661,98 @@ async def test_f1_b_retried_apply_runs_past_a_blocked_removal_successor(adapter_
     )
 
 
-async def test_f2_a_released_removal_successor_keeps_a_removal_job(adapter_client):
-    """A retry takeover releases a networked REMOVAL successor; it must not become an apply.
+async def test_f2_a_retry_preserves_force_removal_successor_identity(adapter_client):
+    """Retry creates a new carrier without changing a force-removal job."""
+    from nso_adapter.store.models import JobStatus
 
-    ``advance_device_generations`` routed only ``detach`` down the removal path, so a
-    delete-origin removal was handed an apply job — which settles the generation without
-    ever deleting anything.
-    """
-    from nso_adapter.store.models import GenerationMode, JobStatus, JobType
-
-    device_id = await _device("gen-released-removal", 9762, auto_apply=False)
+    device_id = await _device("gen-force-removal-identity", 9771)
     await _vlan(device_id, 63)
-    await _vlan(device_id, 64)
-    await _push(adapter_client, device_id)
+    removal_job = await _shrink(adapter_client, device_id, delete_origin=True)
+    assert await _finish(device_id, JobStatus.failed) == removal_job
 
-    # Two marked deletions: the first fails, the second queues its own removal job.
-    _vlans[device_id] = [63]
-    assert (await put_vlans(adapter_client, device_id, [63], query="?delete_origin=true")).status_code == 200
-    first_removal = (await _queued_jobs(device_id))[0].id
-    assert await _finish(device_id, JobStatus.failed) == first_removal
+    force = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/force-removal",
+        json={"scope": "vlan"},
+        headers=_AUTH,
+    )
+    assert force.status_code == 202, force.text
+    successor_job_id = force.json()["job_id"]
+    head, successor = await _generations(device_id)
+    assert successor.job_id == successor_job_id
+    before = await _job_snapshot(adapter_client, successor_job_id)
 
-    _vlans[device_id] = []
-    assert (await put_vlans(adapter_client, device_id, [], query="?delete_origin=true")).status_code == 200
-    chain = await _generations(device_id)
-    assert [g.mode for g in chain] == [GenerationMode.networked, GenerationMode.networked]
+    retry_job_id = await _retry_head_http(adapter_client, device_id)
 
-    # The retry takes the successor's queued removal job over, unattaching the successor.
-    retried = await _retry_head(device_id)
-    assert (await _generations(device_id))[1].job_id is None
-    assert await _finish(device_id, JobStatus.succeeded) == retried
+    assert retry_job_id != successor_job_id
+    after = await _job_snapshot(adapter_client, successor_job_id)
+    assert after == before
+    head_after, successor_after = await _generations(device_id)
+    assert (head_after.job_id, successor_after.job_id) == (retry_job_id, successor_job_id)
+    assert [generation.id for generation in (head_after, successor_after) if generation.job_id == retry_job_id] == [
+        head.id
+    ]
 
-    successor = (await _generations(device_id))[1]
-    assert successor.job_id is not None, "the released removal successor was never re-admitted"
+
+async def test_f2_b_retry_preserves_apply_successor_identity(adapter_client):
+    """Retry creates a new carrier without detaching an Apply successor."""
+    device_id, head_id, successor_id, successor_job_id = await _blocked_apply_with_successor(
+        adapter_client,
+        "gen-apply-identity",
+        9772,
+    )
+    before = await _job_snapshot(adapter_client, successor_job_id)
+
+    retry_job_id = await _retry_head_http(adapter_client, device_id)
+
+    assert retry_job_id != successor_job_id
+    after = await _job_snapshot(adapter_client, successor_job_id)
+    assert after == before
+    head, successor = await _generations(device_id)
+    assert (head.id, head.job_id) == (head_id, retry_job_id)
+    assert (successor.id, successor.job_id) == (successor_id, successor_job_id)
+
+
+async def test_f2_c_a_dedicated_job_rejects_a_second_generation(adapter_client):
+    from nso_adapter.core.generation import attach_to_job, create_generation, note_write
+    from nso_adapter.core.jobs import create_dedicated_job
+    from nso_adapter.store.models import GenerationMode, JobType
+
+    device_id = await _device("gen-dedicated-cardinality", 9773, auto_apply=False)
     async with session() as db:
-        from nso_adapter.store.models import Job
+        await note_write(db, device_id, "vlan")
+        first = await create_generation(db, device_id, streams=("vlan",), mode=GenerationMode.networked)
+        carrier = await create_dedicated_job(db, device_id, JobType.apply)
+        assert await attach_to_job(db, first, carrier)
 
-        job = await db.get(Job, successor.job_id)
-    assert job.job_type is JobType.removal, "a delete-origin removal was re-admitted as an apply"
-    assert job.context.get("scope") == "vlan"
-
-
-async def test_f2_b_retry_does_not_take_over_a_generationless_removal_job(adapter_client):
-    """A retry must preserve a queued legacy removal's only durable context."""
-    from nso_adapter.store.models import Job, JobStatus, JobType
-
-    device_id = await _blocked_device(adapter_client, "gen-retry-legacy-removal", 9768)
-    (failed,) = await _generations(device_id)
-    retry_context = failed.removal_context
-    legacy_context = {"scope": "bgp"}
-
-    async with session() as db:
-        legacy = Job(
-            job_type=JobType.removal,
-            device_id=device_id,
-            status=JobStatus.queued,
-            context=legacy_context,
-        )
-        db.add(legacy)
+        await note_write(db, device_id, "vlan")
+        second = await create_generation(db, device_id, streams=("vlan",), mode=GenerationMode.networked)
+        assert not await attach_to_job(db, second, carrier)
+        carrier_id = carrier.id
         await db.commit()
-        legacy_id = legacy.id
 
-    retried_id = await _retry_head(device_id)
+    first, second = await _generations(device_id)
+    assert first.job_id == carrier_id
+    assert second.job_id is None
+
+
+async def test_f2_d_worker_runs_the_retry_before_its_older_successor(adapter_client):
+    from nso_adapter.core.generation import job_admissible
+    from nso_adapter.store.models import JobStatus
+
+    device_id, _head_id, _successor_id, successor_job_id = await _blocked_apply_with_successor(
+        adapter_client,
+        "gen-retry-worker-order",
+        9774,
+    )
+    retry_job_id = await _retry_head_http(adapter_client, device_id)
 
     async with session() as db:
-        legacy = await db.get(Job, legacy_id)
-        retried = await db.get(Job, retried_id)
-    (generation,) = await _generations(device_id)
-    assert retried_id != legacy_id
-    assert legacy.context == legacy_context
-    assert retried.context == retry_context
-    assert generation.job_id == retried_id
+        assert not await job_admissible(db, successor_job_id, device_id)
+        assert await job_admissible(db, retry_job_id, device_id)
+
+    assert await _finish(device_id, JobStatus.succeeded) == retry_job_id
+    assert await _job_status(successor_job_id) is JobStatus.queued
+    assert await _finish(device_id, JobStatus.succeeded) == successor_job_id
 
 
 async def _blocked_device(client, name: str, netbox_device_id: int) -> int:
@@ -1209,6 +1764,136 @@ async def _blocked_device(client, name: str, netbox_device_id: int) -> int:
     removal_job = await _shrink(client, device_id, delete_origin=True)
     assert await _finish(device_id, JobStatus.failed) == removal_job
     return device_id
+
+
+async def _stored_job(job_id: int) -> dict:
+    from nso_adapter.store.models import Job
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        return {column.key: getattr(job, column.key) for column in Job.__table__.columns}
+
+
+def _normalize_stored_value(value, *, key: str | None = None):
+    if key in {"id", "device_id"}:
+        return "identity" if value is not None else None
+    if key and key.endswith("_at"):
+        return "set" if value is not None else None
+    if isinstance(value, dict):
+        return {name: _normalize_stored_value(item, key=name) for name, item in sorted(value.items())}
+    if isinstance(value, list):
+        return [_normalize_stored_value(item) for item in value]
+    return value
+
+
+async def _normalized_barrier_state(device_id: int, *, ignored_job_ids: tuple[int, ...] = ()) -> dict:
+    """Return all generation and carrier fields with storage identities normalized."""
+    from nso_adapter.core.generation import digest_document
+    from nso_adapter.store.models import DeploymentGeneration, Job
+
+    async with session() as db:
+        generations = list(
+            (
+                await db.execute(
+                    sa.select(DeploymentGeneration)
+                    .where(DeploymentGeneration.device_id == device_id)
+                    .order_by(DeploymentGeneration.seq)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        jobs = list(
+            (
+                await db.execute(
+                    sa.select(Job)
+                    .where(Job.device_id == device_id, Job.id.not_in(ignored_job_ids))
+                    .order_by(Job.created_at, Job.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    job_names = {job.id: f"job-{index}" for index, job in enumerate(jobs, start=1)}
+    normalized_jobs = []
+    for job in jobs:
+        row = {}
+        for column in Job.__table__.columns:
+            value = getattr(job, column.key)
+            if column.key == "id":
+                value = job_names[job.id]
+            elif column.key == "device_id":
+                value = "device"
+            else:
+                value = _normalize_stored_value(value, key=column.key)
+            row[column.key] = value
+        normalized_jobs.append(row)
+
+    normalized_generations = []
+    for generation in generations:
+        row = {}
+        valid_digest = generation.digest == digest_document(
+            generation.mode,
+            generation.document,
+            generation.allowed_removal_keys or {},
+        )
+        for column in DeploymentGeneration.__table__.columns:
+            value = getattr(generation, column.key)
+            if column.key == "id":
+                value = f"generation-{generation.seq}"
+            elif column.key == "device_id":
+                value = "device"
+            elif column.key == "job_id":
+                value = job_names.get(value)
+            elif column.key == "digest":
+                value = "valid" if valid_digest else "invalid"
+            elif column.key == "source_push_seq":
+                value = {stream: "push-seq" for stream in sorted(value)}
+            else:
+                value = _normalize_stored_value(value, key=column.key)
+            row[column.key] = value
+        normalized_generations.append(row)
+    return {"jobs": normalized_jobs, "generations": normalized_generations}
+
+
+@pytest.mark.parametrize("action", ["retry", "abandon"])
+@pytest.mark.parametrize("sync_status", ["queued", "running"])
+async def test_green_barrier_actions_ignore_cross_type_sync(adapter_client, action, sync_status):
+    """Retry and abandon preserve queued or running sync work and match a no-sync control."""
+    from nso_adapter.core import worker as worker_mod
+    from nso_adapter.core.claim import release_claim
+
+    control_id = await _blocked_device(adapter_client, f"gen-{action}-{sync_status}-control", 9780)
+    device_id = await _blocked_device(adapter_client, f"gen-{action}-{sync_status}-sync", 9781)
+    response = await adapter_client.post(f"/api/v1/devices/{device_id}/actions/sync", headers=_AUTH)
+    assert response.status_code == 202, response.text
+    sync_id = response.json()["job_id"]
+
+    registration = None
+    if sync_status == "running":
+        claimed = await worker_mod._claim_next_job()
+        assert claimed is not None and claimed[0] == sync_id
+        registration = claimed[3]
+    before = await _stored_job(sync_id)
+
+    try:
+        control = await adapter_client.post(
+            f"/api/v1/devices/{control_id}/actions/{action}-generation",
+            headers=_AUTH,
+        )
+        tested = await adapter_client.post(
+            f"/api/v1/devices/{device_id}/actions/{action}-generation",
+            headers=_AUTH,
+        )
+        assert (control.status_code, tested.status_code) == (202, 202)
+        assert await _stored_job(sync_id) == before
+        assert await _normalized_barrier_state(device_id, ignored_job_ids=(sync_id,)) == (
+            await _normalized_barrier_state(control_id)
+        )
+    finally:
+        if registration is not None:
+            await release_claim(registration)
 
 
 @asynccontextmanager
@@ -1238,6 +1923,8 @@ async def _first_request_holds_the_head():
 
 async def test_f3_a_two_concurrent_retries_admit_the_head_once(adapter_client):
     """Both operator requests target the same blocked head; only one may re-admit it."""
+    from nso_adapter.store.db import get_engine
+
     device_id = await _blocked_device(adapter_client, "gen-retry-race", 9763)
 
     url = f"/api/v1/devices/{device_id}/actions/retry-generation"
@@ -1245,12 +1932,8 @@ async def test_f3_a_two_concurrent_retries_admit_the_head_once(adapter_client):
         first = asyncio.create_task(adapter_client.post(url, headers=_AUTH))
         await asyncio.wait_for(parked.wait(), timeout=3)
         second = asyncio.create_task(adapter_client.post(url, headers=_AUTH))
-        # Inside the held window the rival either refuses outright or blocks on the first
-        # request's open transaction; completing here proves the refusal happened in-window.
-        # Keep this observation window below the database lock timeout.
-        in_window, _ = await asyncio.wait({second}, timeout=1)
-        if in_window:
-            assert second.result().status_code == 409, "the rival finished in the held window without refusing"
+        await _wait_for_relation_lock(get_engine(), "devices")
+        assert not second.done(), "the rival did not wait for the first request's device lock"
         release.set()
         one, two = await asyncio.wait_for(asyncio.gather(first, second), timeout=20)
 
@@ -1262,6 +1945,7 @@ async def test_f3_a_two_concurrent_retries_admit_the_head_once(adapter_client):
 
 async def test_f3_b_a_retry_and_an_abandon_cannot_both_win(adapter_client):
     """One request re-admits the head, the other gives up on it. Never both."""
+    from nso_adapter.store.db import get_engine
     from nso_adapter.store.models import GenerationStatus
 
     device_id = await _blocked_device(adapter_client, "gen-retry-abandon-race", 9764)
@@ -1271,10 +1955,8 @@ async def test_f3_b_a_retry_and_an_abandon_cannot_both_win(adapter_client):
         retrying = asyncio.create_task(adapter_client.post(f"{base}/retry-generation", headers=_AUTH))
         await asyncio.wait_for(parked.wait(), timeout=3)
         abandoning = asyncio.create_task(adapter_client.post(f"{base}/abandon-generation", headers=_AUTH))
-        # Same window proof as the retry race: an in-window completion must be the refusal.
-        in_window, _ = await asyncio.wait({abandoning}, timeout=1)
-        if in_window:
-            assert abandoning.result().status_code == 409, "the abandon finished in the held window without refusing"
+        await _wait_for_relation_lock(get_engine(), "devices")
+        assert not abandoning.done(), "the abandon did not wait for the retry's device lock"
         release.set()
         retry, abandon = await asyncio.wait_for(asyncio.gather(retrying, abandoning), timeout=20)
 
@@ -1355,7 +2037,7 @@ async def test_manual_apply_ignores_an_unselected_section_committed_alongside_it
                 headers=_AUTH,
             )
         )
-        await _wait_for_relation_lock(get_engine(), "device_generation_counter", timeout=30.0)
+        await _wait_for_relation_lock(get_engine(), "devices", timeout=30.0)
         assert not applying.done(), "the Apply did not wait for the projection lock"
         await holder.commit()
         resp = await asyncio.wait_for(applying, timeout=30)
@@ -1421,8 +2103,8 @@ async def test_f9_an_offboard_under_an_intent_put_answers_not_found(adapter_clie
         await offboarding.flush()  # the rows are gone but the delete is UNCOMMITTED
 
         putting = asyncio.create_task(put_vlans(adapter_client, device_id, [10]))
-        await _wait_for_relation_lock(get_engine(), "device_generation_counter")
-        assert not putting.done(), "the PUT did not reach the projection lock the offboard holds"
+        await _wait_for_relation_lock(get_engine(), "devices")
+        assert not putting.done(), "the PUT did not reach the device row lock the offboard holds"
 
         await offboarding.commit()
         resp = await asyncio.wait_for(putting, timeout=10)

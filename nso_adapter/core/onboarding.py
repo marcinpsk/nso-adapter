@@ -866,18 +866,23 @@ async def offboard_device(db: AsyncSession, device: Device) -> None:
 
     Holds the device claim for the whole teardown, so it can never dismantle a device a
     runner (or the tombstone sweeper) is working on, and takes its locks in §3.9's order:
-    ``device_claim -> devices -> intent/children -> jobs``. Deleting the intent roots
-    explicitly, BEFORE ``jobs``, is what removes the deadlock against an intent endpoint
-    that holds an intent row and reaches for the queued apply winner — leaving them to
-    ``db.delete(device)``'s cascade puts them after the job null-out.
+    ``device_claim -> devices -> device_generation_counter -> intent/children -> jobs``.
+    Deleting the intent roots explicitly, BEFORE ``jobs``, is what removes the deadlock
+    against an intent endpoint that holds an intent row and reaches for the queued apply
+    winner. Leaving them to ``db.delete(device)``'s cascade puts them after the job null-out.
 
     Raises :class:`ClaimUnavailableError` when the device stays claimed for the whole
     wait budget.
     """
     from sqlalchemy import delete, update
 
-    from nso_adapter.core.claim import acquire_claim_or_refuse, terminalize_queued_bulk
+    from nso_adapter.core.claim import (
+        acquire_claim_or_refuse,
+        terminalize_offboard_orphans_bulk,
+        terminalize_queued_bulk,
+    )
     from nso_adapter.store.models import (
+        DeviceGenerationCounter,
         InterfaceAttrState,
         InterfaceIntent,
         InterfaceIpIntent,
@@ -893,6 +898,7 @@ async def offboard_device(db: AsyncSession, device: Device) -> None:
     try:
         await lock_claim(db, reg)  # the guard, held to commit
         await db.execute(select(Device.id).where(Device.id == device_id).with_for_update())
+        await db.execute(delete(DeviceGenerationCounter).where(DeviceGenerationCounter.device_id == device_id))
 
         for model in intent_root_models():
             await db.execute(delete(model).where(model.device_id == device_id))
@@ -922,6 +928,16 @@ async def offboard_device(db: AsyncSession, device: Device) -> None:
             error={
                 "code": "device_offboarded",
                 "message": "The device was offboarded before this job ran",
+                "detail": {},
+            },
+        )
+        # The teardown claim proves residual non-terminal jobs are orphaned executions.
+        await terminalize_offboard_orphans_bulk(
+            db,
+            device_id,
+            error={
+                "code": "device_offboarded_orphan",
+                "message": "The device was offboarded after this job lost its worker",
                 "detail": {},
             },
         )

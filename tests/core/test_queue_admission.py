@@ -27,10 +27,16 @@ pytestmark = pytest.mark.anyio
 
 
 async def _add_job(device_id: int, job_type, status, *, context=None):
-    from nso_adapter.store.models import Job
+    from nso_adapter.store.models import Job, JobType
 
     async with session() as db:
-        job = Job(job_type=job_type, device_id=device_id, status=status, context=context or {})
+        job = Job(
+            job_type=job_type,
+            device_id=device_id,
+            status=status,
+            coalescible=job_type not in (JobType.removal, JobType.provision),
+            context=context or {},
+        )
         db.add(job)
         await db.commit()
         return job.id
@@ -65,27 +71,27 @@ async def test_admission_conflict_returns_empty_not_error(adapter_client):
     atomic admission exists to prevent. Conflict INFERENCE — index columns plus a matching
     predicate — returns an empty result instead.
     """
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from nso_adapter.store.models import JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="q2-infer", netbox_device_id=9800)
     existing = await _add_job(device_id, JobType.sync, JobStatus.queued)
 
     async with session() as db:
-        created, winner = await admit_queued_job(db, device_id, JobType.sync)
+        created, winner = await admit_coalescible_job(db, device_id, JobType.sync)
         assert created is None
         assert winner is not None and winner.id == existing
         await db.rollback()
 
 
 async def test_admission_inserts_when_nothing_is_queued(adapter_client):
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from nso_adapter.store.models import JobType
 
     device_id = await seed_device(nso_device_name="q2-fresh", netbox_device_id=9801)
 
     async with session() as db:
-        created, winner = await admit_queued_job(db, device_id, JobType.sync)
+        created, winner = await admit_coalescible_job(db, device_id, JobType.sync)
         assert winner is None
         assert created is not None
         await db.commit()
@@ -95,30 +101,29 @@ async def test_admission_inserts_when_nothing_is_queued(adapter_client):
 
 async def test_admission_ignores_a_running_job_of_the_same_type(adapter_client):
     """A running job must not refuse its successor — the successor carries newer intent."""
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from nso_adapter.store.models import JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="q2-running", netbox_device_id=9802)
     await _add_job(device_id, JobType.apply, JobStatus.running)
 
     async with session() as db:
-        created, winner = await admit_queued_job(db, device_id, JobType.apply)
+        created, winner = await admit_coalescible_job(db, device_id, JobType.apply)
         assert winner is None and created is not None
         await db.commit()
 
 
-async def test_removals_are_never_deduped(adapter_client):
-    """Exempt by design: one per scope, and every one must run."""
-    from nso_adapter.core.jobs import admit_queued_job
-    from nso_adapter.store.models import JobType
+async def test_dedicated_removals_are_not_constrained_by_the_queue_index(adapter_client):
+    """Dedicated removals do not occupy the coalescible uniqueness slot."""
+    from nso_adapter.store.models import JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="q2-removal", netbox_device_id=9803)
 
-    async with session() as db:
-        first, _ = await admit_queued_job(db, device_id, JobType.removal, context={"scope": "bgp"})
-        second, winner = await admit_queued_job(db, device_id, JobType.removal, context={"scope": "isis"})
-        await db.commit()
-    assert first is not None and second is not None and winner is None
+    first = await _add_job(device_id, JobType.removal, JobStatus.queued, context={"scope": "bgp"})
+    second = await _add_job(device_id, JobType.removal, JobStatus.queued, context={"scope": "isis"})
+
+    assert first != second
+    assert await _queued_of_type(device_id, JobType.removal) == [first, second]
 
 
 # ── the savepoint: a conflict must not poison the caller ─────────────────────
@@ -130,7 +135,7 @@ async def test_conflict_leaves_the_callers_intent_mutation_committable(adapter_c
     Mirrors the canonical endpoint shape: mutate intent, then admit. A conflict must leave
     the caller free to commit its own rows.
     """
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from nso_adapter.store.models import BfdIntent, JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="q2-savepoint", netbox_device_id=9804)
@@ -140,7 +145,7 @@ async def test_conflict_leaves_the_callers_intent_mutation_committable(adapter_c
         db.add(BfdIntent(device_id=device_id, interface_name="ge-0/0/0", min_tx=300))
         await db.flush()
 
-        created, winner = await admit_queued_job(db, device_id, JobType.apply)
+        created, winner = await admit_coalescible_job(db, device_id, JobType.apply)
         assert created is None and winner is not None
 
         await db.commit()  # must not raise
@@ -161,7 +166,7 @@ async def test_conflict_holds_the_winner_row_lock_until_the_caller_commits(adapt
     """
     from sqlalchemy.exc import DBAPIError
 
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from nso_adapter.store.models import Job, JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="q2-winlock", netbox_device_id=9805)
@@ -169,7 +174,7 @@ async def test_conflict_holds_the_winner_row_lock_until_the_caller_commits(adapt
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
 
     async with session() as db:
-        created, winner = await admit_queued_job(db, device_id, JobType.apply)
+        created, winner = await admit_coalescible_job(db, device_id, JobType.apply)
         assert created is None and winner.id == winner_id
 
         with pytest.raises(DBAPIError) as blocked:
@@ -216,7 +221,7 @@ async def test_winner_gone_running_creates_a_successor(adapter_client, rival_eng
     jobs_mod._lock_queued_winner = _steal_then_lock
     try:
         async with session() as db:
-            created, winner = await jobs_mod.admit_queued_job(db, device_id, JobType.apply)
+            created, winner = await jobs_mod.admit_coalescible_job(db, device_id, JobType.apply)
             await db.commit()
     finally:
         jobs_mod._lock_queued_winner = original
@@ -506,7 +511,7 @@ async def test_a_failing_insert_does_not_poison_the_caller(adapter_client):
     """
     from sqlalchemy.exc import IntegrityError
 
-    from nso_adapter.core.jobs import admit_queued_job
+    from nso_adapter.core.jobs import admit_coalescible_job
     from nso_adapter.store.models import BfdIntent, JobType
 
     device_id = await seed_device(nso_device_name="q2-fkfail", netbox_device_id=9812)
@@ -516,7 +521,7 @@ async def test_a_failing_insert_does_not_poison_the_caller(adapter_client):
         await db.flush()
 
         with pytest.raises(IntegrityError):
-            await admit_queued_job(db, 10_000_000, JobType.sync)  # no such device
+            await admit_coalescible_job(db, 10_000_000, JobType.sync)  # no such device
 
         await db.commit()  # the savepoint rolled back only the insert
 

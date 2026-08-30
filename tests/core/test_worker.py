@@ -28,7 +28,12 @@ async def _seed_device(nso_device_name: str = "wrk-rtr", netbox_id: int = 700) -
 
 async def _seed_job(device_id: int, job_type: JobType, status: JobStatus) -> int:
     async with session() as db:
-        j = Job(job_type=job_type, device_id=device_id, status=status)
+        j = Job(
+            job_type=job_type,
+            device_id=device_id,
+            status=status,
+            coalescible=job_type not in (JobType.removal, JobType.provision),
+        )
         db.add(j)
         await db.commit()
         await db.refresh(j)

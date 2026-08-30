@@ -39,7 +39,13 @@ async def _running_job(device_id: int, job_type: JobType = JobType.removal) -> i
     uniqueness index, so a device can hold two of them at once.
     """
     async with session() as db:
-        job = Job(job_type=job_type, device_id=device_id, status=JobStatus.running, run_attempt=1)
+        job = Job(
+            job_type=job_type,
+            device_id=device_id,
+            status=JobStatus.running,
+            coalescible=job_type not in (JobType.removal, JobType.provision),
+            run_attempt=1,
+        )
         db.add(job)
         await db.commit()
         return job.id
@@ -135,7 +141,13 @@ async def test_a_late_committed_insert_gets_a_higher_seq(adapter_client, rival_e
 
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
     async with rival() as pending:
-        early = Job(job_type=JobType.removal, device_id=device_id, status=JobStatus.running, run_attempt=1)
+        early = Job(
+            job_type=JobType.removal,
+            device_id=device_id,
+            status=JobStatus.running,
+            coalescible=False,
+            run_attempt=1,
+        )
         pending.add(early)
         await pending.flush()  # the id is taken; the row is NOT visible yet
         early_id = early.id
@@ -169,7 +181,7 @@ async def test_a_rejected_cas_burns_no_sequence(adapter_client, monkeypatch):
 
     device_id = await seed_device(nso_device_name="seq-refused", netbox_device_id=8105)
     async with session() as db:
-        job = Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued)
+        job = Job(job_type=JobType.sync, device_id=device_id, status=JobStatus.queued, coalescible=True)
         db.add(job)
         await db.commit()
         job_id = job.id
