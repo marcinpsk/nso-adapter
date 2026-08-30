@@ -5,10 +5,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Annotated
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -20,29 +20,52 @@ from nso_adapter.api.errors import (
     RESP_409_PUSH_SEQ,
     RESP_422_VALIDATION,
     IntentApplyResult,
+    StoredIntentResult,
     api_error,
 )
 from nso_adapter.api.intent_push import begin_delivery, get_intent_delivery
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant
-from nso_adapter.core.importer import get_nso_client
+from nso_adapter.core.generation import DeviceProjectionGone
 from nso_adapter.core.removal import is_cleared
-from nso_adapter.core.switchport_intent import apply_switchport_config as apply_switchport_core
+from nso_adapter.core.switching_intent import SwitchportSnapshot, replace_switchport_snapshot
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, DeviceSwitchport, DeviceVlan, VlanIntent
 
 router = APIRouter(prefix="/api/v1/devices", tags=["vlan"])
 
 
-class SwitchportApply(BaseModel):
-    interface_name: str
-    mode: str | None = None
-    untagged_vlan: int | None = None
-    tagged_vlans: list[int] = []
+Uint16 = Annotated[int, Field(strict=True, ge=0, le=65535)]
 
 
-class SwitchportApplyRequest(BaseModel):
-    interfaces: list[SwitchportApply] = []
+class _StrictSwitchportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class SwitchportApply(_StrictSwitchportRequest):
+    interface_name: str = Field(min_length=1, max_length=128)
+    mode: str | None = Field(default=None, max_length=16)
+    untagged_vlan: Uint16 | None = None
+    tagged_vlans: list[Uint16] = Field(default_factory=list)
+
+    @field_validator("tagged_vlans")
+    @classmethod
+    def _tagged_vlans_are_unique(cls, tagged_vlans: list[int]) -> list[int]:
+        if len(tagged_vlans) != len(set(tagged_vlans)):
+            raise ValueError("tagged_vlans values must be unique")
+        return tagged_vlans
+
+
+class SwitchportApplyRequest(_StrictSwitchportRequest):
+    interfaces: list[SwitchportApply] = Field(default_factory=list)
+
+    @field_validator("interfaces")
+    @classmethod
+    def _interface_names_are_unique(cls, interfaces: list[SwitchportApply]) -> list[SwitchportApply]:
+        names = [interface.interface_name for interface in interfaces]
+        if len(names) != len(set(names)):
+            raise ValueError("interface_name values must be unique")
+        return interfaces
 
 
 # ── Read-mirror response models ───────────────────────────────────────────────
@@ -149,48 +172,32 @@ async def get_switchport(device_id: int, db: AsyncSession = Depends(get_read_db)
     }
 
 
-# The apply result is a union envelope. It is documented via responses={200: {...}} with
-# response_model=None so the handler dict passes through untouched (zero wire risk) — a
-# Pydantic response_model would coerce/validate it. See core.switchport_intent for the branches.
-
-
-class SwitchportApplyDeployed(BaseModel):
-    status: Literal["deployed"]
-    device: str
-    interface_count: int
-
-
-class SwitchportApplyError(BaseModel):
-    status: Literal["error"]
-    error: str
-    message: str
-    detail: dict | None = None  # present only on an NSO commit failure (absent on no_nso_device_name)
-
-
-SwitchportApplyResult = SwitchportApplyDeployed | SwitchportApplyError
-
-
 @router.post(
     "/{device_id}/switchport/apply",
     dependencies=[Depends(verify_token)],
-    response_model=None,
-    responses={
-        200: {"model": SwitchportApplyResult, "description": "Apply result envelope (deployed | error)"},
-        **RESP_401,
-        **RESP_404_DEVICE,
-        **RESP_422_VALIDATION,
-    },
+    response_model=StoredIntentResult,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
 )
 async def apply_switchport(
     device_id: int,
     payload: SwitchportApplyRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    device = await db.get(Device, device_id)
-    if device is None:
+    interfaces = tuple(
+        SwitchportSnapshot(
+            interface_name=interface.interface_name,
+            mode=interface.mode,
+            untagged_vlan=interface.untagged_vlan,
+            tagged_vlans=tuple(interface.tagged_vlans),
+        )
+        for interface in payload.interfaces
+    )
+    try:
+        summary = await replace_switchport_snapshot(db, device_id, interfaces)
+    except DeviceProjectionGone:
         raise api_error(404, "not_found", "Device not found")
-    nso_client = get_nso_client(device.nso_instance)
-    return await apply_switchport_core(device, payload, nso_client)
+    await db.commit()
+    return {"status": "stored", "device_id": device_id, "count": summary.count, "removed": summary.removed}
 
 
 # ---------------------------------------------------------------------------

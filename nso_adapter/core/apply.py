@@ -874,8 +874,9 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
 
     Covers every scope ``run_apply`` pushes through the intent store: interface
     attributes/IPs, OSPF, IS-IS, BGP, route-policy, SNMP, static routes, logging, SVI,
-    subinterfaces, VLANs, BFD, and L2 SAPs (LAG/switchport are pushed out-of-band by the
-    plugin, not from this intent store, so they have no preview here). Each scope is a
+    subinterfaces, VLANs, BFD, and L2 SAPs. LAG and switchport snapshots are durable but
+    stay outside the current generation writer until the aggregate document cutover, so
+    they have no preview here. Each scope is a
     best-effort, isolated dry-run — one failing/slow scope never blocks the others.
     """
     from nso_adapter.core.importer import get_nso_client

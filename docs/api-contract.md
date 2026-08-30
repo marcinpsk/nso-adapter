@@ -985,8 +985,8 @@ Preview the per-scope **native device diff** the next Apply would push (NSO
 reconcile param makes the preview match the real reconcile commit). Synchronous —
 no job. `diffs` maps
 scope → native delta; scopes already in sync yield an empty delta and are
-omitted. LAG/switchport have no preview (pushed out-of-band by the plugin,
-not from the intent store).
+omitted. LAG and switchport have no preview until the aggregate document writer
+consumes their durable snapshots.
 
 ```json
 { "device_id": 1,
@@ -2438,18 +2438,22 @@ member `mode`/`port_priority`.
   ] }
 ```
 
-### `POST /api/v1/devices/{id}/lag-config/apply` → `200 | 404`
+### `POST /api/v1/devices/{id}/lag-config/apply` → `200 | 404 | 422`
 
-Synchronous direct apply (NOT the intent-mirror pattern — LAG is owned in
-NetBox and applied via the `lag-reconciler` service immediately). Body =
-the GET `bundles` shape.
+Claim-less full-snapshot store write for desired LAG state. Body = the GET
+`bundles` shape. `lag_id` stays required and is a strict `uint32`; optional
+LAG integer leaves are strict `uint16`. Bundle names and member interface names
+must be unique within the request.
 
 ```json
-{ "status": "deployed", "device": "lab01c-ra1", "bundle_count": 1 }
+{ "status": "stored", "device_id": 1, "count": 1, "removed": 0 }
 ```
 
-`status: "error"` (with `error`/`message`/`detail`) on NSO failure — the
-HTTP status stays 200; callers check `status`.
+The endpoint stores the snapshot atomically and does not contact NSO. It does
+not accept `X-Push-Seq` and creates no receipt, projection revision, generation,
+or job. `count` is the number of bundle roots now stored. `removed` is the
+number of previous bundle roots omitted by the replacement. Non-2xx responses
+use the standard error envelope.
 
 ---
 
@@ -2475,15 +2479,21 @@ L2 switchport read-mirror. `mode` ∈ `access` · `trunk` · `""` (unset);
   ] }
 ```
 
-### `POST /api/v1/devices/{id}/switchport/apply` → `200 | 404`
+### `POST /api/v1/devices/{id}/switchport/apply` → `200 | 404 | 422`
 
-Synchronous direct apply (like `lag-config/apply` — switchport is owned in
-NetBox, not mirrored as adapter intent). Body = `{ "interfaces": [...] }`
-with the GET row shape minus `source`.
+Claim-less full-snapshot store write for desired switchport state. Body =
+`{ "interfaces": [...] }` with the GET row shape minus `source`. VLAN values
+are strict `uint16`; interface names and each interface's tagged VLAN values
+must be unique within the request.
 
 ```json
-{ "status": "deployed", "device": "sw03", "interface_count": 2 }
+{ "status": "stored", "device_id": 1, "count": 2, "removed": 0 }
 ```
+
+The endpoint stores scalar VLAN values independently of the refresh-owned VLAN
+mirror and does not contact NSO. It creates no receipt, projection revision,
+generation, or job. `count` and `removed` describe top-level switchport roots.
+Non-2xx responses use the standard error envelope.
 
 ### `PUT /api/v1/devices/{id}/vlan-intent` → `200 | 404`
 
