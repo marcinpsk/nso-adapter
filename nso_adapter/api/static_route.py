@@ -717,10 +717,9 @@ async def _apply_static_route_intent(
     if removed_rows or cleared:
         from nso_adapter.core.removal import enqueue_static_route_removals
 
-        # Direct, not via `replace_on_removal`: that shim commits first and enqueues
-        # afterwards, which is what put the apply ahead of the removal and left the
-        # tombstone with no job to point at. One job per marking, each stamping its own
-        # carriers (§4.5). A homogeneous push, which is every push today, gets exactly one.
+        # Direct, not via `replace_on_removal`: static routes split removals by marking.
+        # Each job stamps its own carriers (§4.5). A homogeneous push, which is every
+        # push today, gets exactly one job.
         replaced = bool(
             await enqueue_static_route_removals(
                 db,

@@ -288,14 +288,13 @@ async def put_logging_intent(
     replaced = False
     if removal_requested:
         from nso_adapter.core.removal import replace_on_removal
-        from nso_adapter.nso.apply import apply_logging_config
 
         replaced = await replace_on_removal(
             db,
             device,
             removed,
             LoggingHostIntent,
-            apply_logging_config,
+            stream=delivery.stream,
             retract=cleared or levels_cleared,
             settlement_cohort=settlement_cohort,
         )

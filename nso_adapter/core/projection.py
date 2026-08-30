@@ -262,28 +262,6 @@ def stream_section(stream: str) -> str:
     return _stream_section()[stream]
 
 
-def stream_for_model(model: type) -> str:
-    """Return the stream that OWNS *model*'s table.
-
-    The ownership map read backwards, for the one caller that identifies its write by the
-    intent model rather than by the endpoint it arrived on
-    (:func:`core.removal.replace_on_removal`).
-
-    A model several sections share — ``RedistributionIntent`` belongs to IS-IS, BGP and OSPF,
-    told apart by a discriminator — has no single owner, and picking one would promote an
-    unrelated family. Refused, because only the endpoint knows which one it meant.
-    """
-    projection_streams()
-    owners = [stream for stream, specs in _stream_tables().items() if any(spec.model is model for spec in specs)]
-    if len(owners) != 1:
-        raise ValueError(
-            f"{model.__name__} belongs to no projection stream"
-            if not owners
-            else f"{model.__name__} is shared by streams {sorted(owners)} — name the stream at the call site"
-        )
-    return owners[0]
-
-
 def section_streams(section: str) -> tuple[str, ...]:
     """Return every stream that owns part of *section*, sorted.
 
@@ -836,6 +814,5 @@ __all__ = [
     "section_streams",
     "record_interface_execution",
     "snapshot_stream",
-    "stream_for_model",
     "stream_section",
 ]
