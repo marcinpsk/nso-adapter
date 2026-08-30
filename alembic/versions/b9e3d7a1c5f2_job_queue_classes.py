@@ -65,7 +65,8 @@ BEGIN
     ) THEN
         RAISE EXCEPTION USING
             ERRCODE = 'check_violation',
-            MESSAGE = 'device-bound Apply job is queued or running';
+            MESSAGE = 'cannot add job queue classes: a device-bound Apply job is queued or '
+                      'running; stop the workers and drain the Apply queue before upgrading';
     END IF;
 END;
 $$
@@ -102,8 +103,9 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;""",
     "DROP TRIGGER IF EXISTS job_coalescible_immutable ON jobs",
-    "CREATE TRIGGER job_coalescible_immutable BEFORE UPDATE ON jobs "
-    "FOR EACH ROW EXECUTE FUNCTION job_reject_coalescible_rewrite()",
+    "CREATE TRIGGER job_coalescible_immutable BEFORE UPDATE OF coalescible ON jobs "
+    "FOR EACH ROW WHEN (NEW.coalescible IS DISTINCT FROM OLD.coalescible) "
+    "EXECUTE FUNCTION job_reject_coalescible_rewrite()",
 )
 _JOB_COALESCIBLE_IMMUTABILITY_DROP_DDL = (
     "DROP TRIGGER IF EXISTS job_coalescible_immutable ON jobs",

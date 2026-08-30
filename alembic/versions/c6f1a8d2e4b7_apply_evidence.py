@@ -153,6 +153,7 @@ def upgrade() -> None:
         "deployment_generation",
         ["device_id", "apply_attempt_id"],
         unique=False,
+        postgresql_where=sa.text("apply_attempt_id IS NOT NULL"),
     )
     for statement in _GENERATION_IMMUTABILITY_DDL:
         op.execute(statement)

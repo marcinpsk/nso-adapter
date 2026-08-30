@@ -215,7 +215,13 @@ def test_migration_rejects_an_active_device_bound_apply_retry(
             job_id = _seed_job(conn, f"active-apply-{job_status}", "apply", job_status, device_id)
             _seed_generation(conn, device_id, job_id, 1, status=generation_status)
 
-        with pytest.raises(AssertionError, match="device-bound Apply job is queued or running"):
+        with pytest.raises(
+            AssertionError,
+            match=(
+                "cannot add job queue classes: a device-bound Apply job is queued or running; "
+                "stop the workers and drain the Apply queue before upgrading"
+            ),
+        ):
             alembic(sync_url, "upgrade", module.revision)
 
         with engine_on(sync_url) as engine:

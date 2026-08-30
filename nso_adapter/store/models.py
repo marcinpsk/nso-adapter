@@ -694,7 +694,12 @@ class DeploymentGeneration(Base):
         ),
         Index("ix_generation_device_status", "device_id", "status"),
         Index("ix_generation_job", "job_id"),
-        Index("ix_generation_device_apply_attempt", "device_id", "apply_attempt_id"),
+        Index(
+            "ix_generation_device_apply_attempt",
+            "device_id",
+            "apply_attempt_id",
+            postgresql_where=text("apply_attempt_id IS NOT NULL"),
+        ),
         Index(
             "ix_generation_settlement_cohort",
             "settlement_cohort",

@@ -39,6 +39,19 @@ _DEFERRABILITY_SQL = sa.text(
        AND t.relname = :table
     """
 )
+_JOB_TRIGGER_SQL = sa.text(
+    """
+    SELECT t.tgname, pg_get_triggerdef(t.oid, true), p.proname, p.prosrc
+      FROM pg_trigger t
+      JOIN pg_class c ON c.oid = t.tgrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_proc p ON p.oid = t.tgfoid
+     WHERE n.nspname = 'public'
+       AND c.relname = 'jobs'
+       AND t.tgname = 'job_coalescible_immutable'
+       AND NOT t.tgisinternal
+    """
+)
 
 
 def _deferrability(conn, table: str) -> dict[str, tuple[bool, str]]:
@@ -95,6 +108,7 @@ def _snapshot(engine) -> dict:
                 # CHECK constraints compared by their reflected SQL text (names may be generated).
                 "checks": sorted(c["sqltext"] for c in insp.get_check_constraints(table)),
             }
+        snap["__job_queue_class_trigger__"] = tuple(conn.execute(_JOB_TRIGGER_SQL).one())
     # PostgreSQL ENUM types are schema-level, not per-table: compare their label sets so an
     # enum value-set divergence (a migration adding/renaming a member) is caught too.
     snap["__enums__"] = {e["name"]: tuple(e["labels"]) for e in insp.get_enums()}
@@ -132,6 +146,12 @@ def _assert_job_queue_class_schema(snapshot: dict) -> None:
     assert sum("provision" in condition and "coalescible" in condition for condition in checks) == 1
     assert sum("provision" in condition and "device_id IS NULL" in condition for condition in checks) == 1
     assert sum("provision" in condition and "device_id IS NOT NULL" in condition for condition in checks) == 1
+    trigger_name, trigger_definition, function_name, function_source = snapshot["__job_queue_class_trigger__"]
+    assert trigger_name == "job_coalescible_immutable"
+    assert "BEFORE UPDATE OF coalescible ON jobs" in trigger_definition
+    assert "new.coalescible IS DISTINCT FROM old.coalescible" in trigger_definition
+    assert function_name == "job_reject_coalescible_rewrite"
+    assert "coalescible may not be updated" in function_source
 
 
 def test_alembic_baseline_matches_create_all(pg_provisioner):

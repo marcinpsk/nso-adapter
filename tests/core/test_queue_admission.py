@@ -115,6 +115,7 @@ async def test_admission_ignores_a_running_job_of_the_same_type(adapter_client):
 
 async def test_dedicated_removals_are_not_constrained_by_the_queue_index(adapter_client):
     """Dedicated removals do not occupy the coalescible uniqueness slot."""
+    from nso_adapter.core.jobs import admit_coalescible_job
     from nso_adapter.store.models import JobStatus, JobType
 
     device_id = await seed_device(nso_device_name="q2-removal", netbox_device_id=9803)
@@ -124,6 +125,11 @@ async def test_dedicated_removals_are_not_constrained_by_the_queue_index(adapter
 
     assert first != second
     assert await _queued_of_type(device_id, JobType.removal) == [first, second]
+
+    async with session() as db:
+        for job_type in (JobType.removal, JobType.provision):
+            with pytest.raises(ValueError, match=rf"^{job_type.value} jobs are not coalescible$"):
+                await admit_coalescible_job(db, device_id, job_type)
 
 
 # ── the savepoint: a conflict must not poison the caller ─────────────────────

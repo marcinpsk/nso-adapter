@@ -162,7 +162,7 @@ def test_apply_evidence_schema_and_attempt_retention(pg_provisioner):
             assert index_predicates(engine, "deployment_generation")["ix_generation_device_apply_attempt"] == (
                 ("device_id", "apply_attempt_id"),
                 False,
-                None,
+                "(apply_attempt_id IS NOT NULL)",
             )
             assert index_predicates(engine, "deployment_apply_attempt")["ix_apply_attempt_device"] == (
                 ("device_id",),

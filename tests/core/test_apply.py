@@ -2435,8 +2435,11 @@ async def test_run_apply_marks_failed_even_when_session_poisoned(adapter_client,
     failed-status, or the status commit itself throws and the job is stuck 'running' (#11)."""
     device_id = await _seed_device(name="rtr-poison")
     job_id = await _seed_apply_job(device_id)
+    poison_reached = False
 
-    async def _poison(db, job, job_id, device_id, force):
+    async def _poison(db, job, job_id, device_id, force, *, reg):
+        nonlocal poison_reached
+        poison_reached = True
         # A real DB error (duplicate PK) puts the AsyncSession into a needs-rollback state,
         # exactly like a failed flush mid-apply; the failure handler must rollback first.
         db.add(
@@ -2453,6 +2456,7 @@ async def test_run_apply_marks_failed_even_when_session_poisoned(adapter_client,
     with patch("nso_adapter.core.apply._execute_apply", _poison):
         await run_apply(job_id=job_id, device_id=device_id, force=True)
 
+    assert poison_reached, "the test double must reach the real database error"
     async with session() as db:
         assert (await db.get(Job, job_id)).status == JobStatus.failed
 

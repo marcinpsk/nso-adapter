@@ -101,8 +101,9 @@ def job_coalescible_immutability_ddl() -> tuple[str, ...]:
     return (
         job_reject_coalescible_rewrite(),
         f"DROP TRIGGER IF EXISTS {JOB_COALESCIBLE_IMMUTABLE_TRIGGER} ON jobs",
-        f"CREATE TRIGGER {JOB_COALESCIBLE_IMMUTABLE_TRIGGER} BEFORE UPDATE ON jobs "
-        f"FOR EACH ROW EXECUTE FUNCTION {_JOB_COALESCIBLE_FUNCTION}()",
+        f"CREATE TRIGGER {JOB_COALESCIBLE_IMMUTABLE_TRIGGER} BEFORE UPDATE OF coalescible ON jobs "
+        f"FOR EACH ROW WHEN (NEW.coalescible IS DISTINCT FROM OLD.coalescible) "
+        f"EXECUTE FUNCTION {_JOB_COALESCIBLE_FUNCTION}()",
     )
 
 

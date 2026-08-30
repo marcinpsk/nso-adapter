@@ -49,6 +49,18 @@ _TRIGGER_FUNCTION_SQL = sa.text(
        AND NOT t.tgisinternal
     """
 )
+_TRIGGER_DEFINITION_SQL = sa.text(
+    """
+    SELECT pg_get_triggerdef(t.oid, true)
+      FROM pg_trigger t
+      JOIN pg_class c ON c.oid = t.tgrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public'
+       AND c.relname = 'jobs'
+       AND t.tgname = :name
+       AND NOT t.tgisinternal
+    """
+)
 
 
 def _installed_function_source(engine) -> str | None:
@@ -59,6 +71,11 @@ def _installed_function_source(engine) -> str | None:
 def _installed_trigger_function(engine) -> str | None:
     with engine.connect() as conn:
         return conn.execute(_TRIGGER_FUNCTION_SQL, {"name": _TRIGGER}).scalar_one_or_none()
+
+
+def _installed_trigger_definition(engine) -> str | None:
+    with engine.connect() as conn:
+        return conn.execute(_TRIGGER_DEFINITION_SQL, {"name": _TRIGGER}).scalar_one_or_none()
 
 
 def _function_source(statement: str) -> str:
@@ -268,8 +285,11 @@ def test_create_all_installs_the_live_job_trigger_in_a_fresh_database(pg_provisi
             assert sa.inspect(engine).has_table("jobs")
             installed_source = _installed_function_source(engine)
             installed_trigger_function = _installed_trigger_function(engine)
+            installed_trigger_definition = _installed_trigger_definition(engine)
     assert installed_source == _function_source(job_coalescible_immutability_ddl()[0])
     assert installed_trigger_function == _FUNCTION
+    assert "BEFORE UPDATE OF coalescible ON jobs" in installed_trigger_definition
+    assert "new.coalescible IS DISTINCT FROM old.coalescible" in installed_trigger_definition
 
 
 def test_historical_job_trigger_does_not_track_the_live_helper(pg_provisioner, tmp_path, monkeypatch):
