@@ -2,6 +2,159 @@
 
 <!-- version list -->
 
+## v1.2.0 (2026-08-30)
+
+### Bug Fixes
+
+- Address adapter review findings
+  ([`c3b579b`](https://github.com/marcinpsk/nso-adapter/commit/c3b579b7986e6bb3c08100a5d7e1a99506cbe0ca))
+
+- Cover queue review findings
+  ([`774a642`](https://github.com/marcinpsk/nso-adapter/commit/774a642f96d69ee2aefe50c1bd6fb8d4d0ddd330))
+
+- **api**: Bound raw deployment-evidence id traversal
+  ([`11fc7b8`](https://github.com/marcinpsk/nso-adapter/commit/11fc7b869921ff5f4b7867c7cef8ef628b7f9e00))
+
+- **api**: Document both apply conflicts
+  ([`4306040`](https://github.com/marcinpsk/nso-adapter/commit/4306040c0e1481b5d6a3e2ed5b8ca38427fdd13a))
+
+- **api**: Split the deployment-evidence raw and distinct bounds
+  ([`39be9a6`](https://github.com/marcinpsk/nso-adapter/commit/39be9a6448bfa1cec250eed00a40aa6a861232ed))
+
+- **apply**: Refuse carriers without generations
+  ([`2d259cf`](https://github.com/marcinpsk/nso-adapter/commit/2d259cf191f9fd2a368a98c9fed6110ce4f127de))
+
+- **core**: Take the device row before the projection counter everywhere
+  ([`65e9411`](https://github.com/marcinpsk/nso-adapter/commit/65e9411f2cbebf637ca193f50e578f119892dbd4))
+
+- **evidence**: Deduplicate attempt IDs in linear time
+  ([`7064555`](https://github.com/marcinpsk/nso-adapter/commit/7064555c7e6b6df1079df38590950f5d8dc74bfb))
+
+- **evidence**: Resolve the PR #33 review wave
+  ([`b3f52e1`](https://github.com/marcinpsk/nso-adapter/commit/b3f52e19d14f58df1d294613d957582681c017c6))
+
+- **generation**: Isolate corrupt recovery heads
+  ([`dbef048`](https://github.com/marcinpsk/nso-adapter/commit/dbef0489cdc975b9e8f2e47608c10e8a86578ca6))
+
+- **generation**: Isolate recovery database failures
+  ([`afee5e4`](https://github.com/marcinpsk/nso-adapter/commit/afee5e49e2797ed2631e59d048ce016e3bda2e39))
+
+- **generation**: Isolate recovery-domain failures
+  ([`e1c0372`](https://github.com/marcinpsk/nso-adapter/commit/e1c0372c38d564019557c33547b456d9ae7e4256))
+
+- **generation**: Lock the carrier before trusting its status
+  ([`b08cc30`](https://github.com/marcinpsk/nso-adapter/commit/b08cc30a4b98f16c7a77db8dab7d8ab095697b02))
+
+- **generation**: Take the projection device lock as NO KEY UPDATE
+  ([`221c2db`](https://github.com/marcinpsk/nso-adapter/commit/221c2dbae6c03f429747a5916df2caebe5f823e6))
+
+- **generation**: Yield instead of blocking on a carrier a worker holds
+  ([`92be73e`](https://github.com/marcinpsk/nso-adapter/commit/92be73e63b5cf4938ad07e0a885b7523404d114e))
+
+- **onboarding**: Route offboard orphan terminalization through the claim module
+  ([`7d1d294`](https://github.com/marcinpsk/nso-adapter/commit/7d1d294720c612f08ba18ebc0199e71516e1343a))
+
+- **queue**: Reject invalid removal carriers
+  ([`b2e0bbd`](https://github.com/marcinpsk/nso-adapter/commit/b2e0bbde3088c2cdce42743f2e577b9bc1cc6822))
+
+- **review**: Resolve recovery review gate
+  ([`1f97569`](https://github.com/marcinpsk/nso-adapter/commit/1f97569c602fe85c219a6f8765b92fe8038d87c4))
+
+- **store**: The queue-class downgrade validates before recreating the old index
+  ([`482c894`](https://github.com/marcinpsk/nso-adapter/commit/482c89441f9bc09599ac4e3e649ba1bf89381c9f))
+
+- **test**: Handle schemas without job trigger
+  ([`343b7fd`](https://github.com/marcinpsk/nso-adapter/commit/343b7fddcb71b60f64ea26c479dd1931fb79c9a2))
+
+- **types**: Route the offboard bulk terminalize through execute_dml
+  ([`978fc06`](https://github.com/marcinpsk/nso-adapter/commit/978fc06644efc831cda45f7a12bf7d79816bac01))
+
+- **types**: Satisfy the mypy gate after rebasing onto develop
+  ([`cc8314d`](https://github.com/marcinpsk/nso-adapter/commit/cc8314d7a772f0bca5613684583aef1ed129413e))
+
+### Documentation
+
+- **api**: State the heterogeneous admission rules the adapter really has
+  ([`cf663df`](https://github.com/marcinpsk/nso-adapter/commit/cf663df4fe3fbcad7e32e13e8f308c7faa455afe))
+
+- **api**: State which generations carry the apply attempt id
+  ([`8f342f1`](https://github.com/marcinpsk/nso-adapter/commit/8f342f12630900d651bdfaaadc3dbd31f0ebd234))
+
+- **store**: State the projection lock's real strength
+  ([`12f1a40`](https://github.com/marcinpsk/nso-adapter/commit/12f1a40d43951140dd810564a8a45c096bf62ac9))
+
+### Features
+
+- **actions**: Barrier actions take the generation they act on
+  ([`23cd830`](https://github.com/marcinpsk/nso-adapter/commit/23cd830266e925f5043866f2c153848447e2c440))
+
+- **apply**: The Apply POST carries its durable attempt identity
+  ([`bce5486`](https://github.com/marcinpsk/nso-adapter/commit/bce54865690562db3797dcd3fbded0b78896b6e9))
+
+- **core**: Head-coverage advancement and truthful abandon identity
+  ([`e3b55a6`](https://github.com/marcinpsk/nso-adapter/commit/e3b55a6587a9dc93cf65f3a167fb82f68f42e1b0))
+
+- **core**: One job-construction seam and no recovery takeover
+  ([`425df74`](https://github.com/marcinpsk/nso-adapter/commit/425df74307533a6f6d6257e1cfda3e0eb3093f46))
+
+- **evidence**: Durable apply attempts and generation carrier snapshots
+  ([`4e19909`](https://github.com/marcinpsk/nso-adapter/commit/4e1990958617e22a0a63ae36bb6997a765f104b3))
+
+- **store**: Job queue classes - coalescible column, checks, index, trigger
+  ([`87f1489`](https://github.com/marcinpsk/nso-adapter/commit/87f1489a445c0edea14fddf67e4f44015a3d0386))
+
+### Performance Improvements
+
+- **store**: Index deployment_apply_attempt.device_id
+  ([`60a8dd7`](https://github.com/marcinpsk/nso-adapter/commit/60a8dd79fbbd28f34f5d2296c5d0a72113720815))
+
+### Refactoring
+
+- **sweep**: Attach reissue generations through the job choke point
+  ([`efa10ac`](https://github.com/marcinpsk/nso-adapter/commit/efa10acce9c9703a7f34206e5fdb4afed1af9460))
+
+### Testing
+
+- Classify every Job fixture and reconcile shapes the schema now forbids
+  ([`859767c`](https://github.com/marcinpsk/nso-adapter/commit/859767c1b9e3f63ea547672dbdf64f4d704383f1))
+
+- Probe the projection writer's NO KEY UPDATE wait
+  ([`d55470b`](https://github.com/marcinpsk/nso-adapter/commit/d55470baaca1975d74f361a73e7e24b5c858cde7))
+
+- Tighten adapter review coverage
+  ([`17bdb31`](https://github.com/marcinpsk/nso-adapter/commit/17bdb31c3fa28ca1e566ba1253099010d67092d4))
+
+- **api**: Enforce canonical barrier responses
+  ([`6b4d871`](https://github.com/marcinpsk/nso-adapter/commit/6b4d871bb1996895f8929e1dc5e7497f9c8e3fc1))
+
+- **api**: Pin the json_invalid envelope for syntactically invalid bodies
+  ([`03589c5`](https://github.com/marcinpsk/nso-adapter/commit/03589c563701c7103c10905dc68a58ce60eb5d9d))
+
+- **apply**: Seed immutable worker generations
+  ([`6e2e2b5`](https://github.com/marcinpsk/nso-adapter/commit/6e2e2b5de9f8e8a4ca54d1dc6acf694acef280da))
+
+- **generation**: Cancel the starting task when the yield assertion fails
+  ([`ee22866`](https://github.com/marcinpsk/nso-adapter/commit/ee22866894e380788e69b363c13dd8cf39012e0f))
+
+- **generation**: Classify settlement carriers
+  ([`5fd6f05`](https://github.com/marcinpsk/nso-adapter/commit/5fd6f05ce408d76308e622f06d0b8703fec033bb))
+
+- **generation**: Clean up concurrent recovery tasks
+  ([`0e991d7`](https://github.com/marcinpsk/nso-adapter/commit/0e991d788d28ff63b91fe79d64dc83204bd175de))
+
+- **generation**: Pin the yield test's failure-path cleanup
+  ([`5d01a8d`](https://github.com/marcinpsk/nso-adapter/commit/5d01a8d691b2ba0a09315d297042ea68bc372abc))
+
+- **store**: Coalescible-immutability trigger suite
+  ([`bac901e`](https://github.com/marcinpsk/nso-adapter/commit/bac901eff77094285cefa865e086625437c3d678))
+
+- **store**: Finish the pg_provisioner fixture rename at this level
+  ([`1c14613`](https://github.com/marcinpsk/nso-adapter/commit/1c146131c6a416c05ea4182bbe97cd60794d5868))
+
+- **store**: Finish the pg_provisioner fixture rename at this level
+  ([`0fa2500`](https://github.com/marcinpsk/nso-adapter/commit/0fa25003b050b8d12bcfdfe54ac51bfacdfdba92))
+
+
 ## v1.1.0 (2026-08-29)
 
 ### Bug Fixes
