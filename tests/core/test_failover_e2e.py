@@ -565,11 +565,13 @@ async def test_upsert_refuses_to_clear_the_oob_ip_the_device_lives_on(adapter_cl
         await db.commit()
         assert fo.failback_blocked_reason == "active_oob_address_conflict"
 
-        # Even a usable replacement cannot erase the address NSO is still dialing.
-        changed = await upsert_failover_ips(db, dev, "10.0.0.1", "192.0.2.9")
+        # A new primary is a safe failback target, but a usable OOB replacement still
+        # cannot erase the address NSO is dialing.
+        changed = await upsert_failover_ips(db, dev, "10.0.0.2", "192.0.2.9")
         await db.commit()
-        assert changed is False
-        assert (fo.oob_ip, fo.failback_blocked_reason) == (
+        assert changed is True
+        assert (fo.primary_ip, fo.oob_ip, fo.failback_blocked_reason) == (
+            "10.0.0.2",
             "192.0.2.5",
             "active_oob_address_conflict",
         )
@@ -577,7 +579,7 @@ async def test_upsert_refuses_to_clear_the_oob_ip_the_device_lives_on(adapter_cl
         # Once failback completes, the next report can replace the inactive OOB address.
         fo.active_address = ActiveAddress.primary.value
         await db.commit()
-        changed = await upsert_failover_ips(db, dev, "10.0.0.1", "192.0.2.9")
+        changed = await upsert_failover_ips(db, dev, "10.0.0.2", "192.0.2.9")
         await db.commit()
         assert changed is True
         assert (fo.oob_ip, fo.failback_blocked_reason) == ("192.0.2.9", None)
