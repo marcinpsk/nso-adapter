@@ -1014,7 +1014,7 @@ def static_route_entry(row: object) -> dict:
     """Render ONE static-route intent row as the wire entry the reconciler expects.
 
     The single renderer accepts both live ORM rows and serialized projection rows. The
-    body builder below, preview, promotion comparison and R2's per-route fingerprint all
+    body builder below, preview, promotion comparison and per-route fingerprint all
     call it, so none can drift from what is sent.
     """
     entry: dict = {
