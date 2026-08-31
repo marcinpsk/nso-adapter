@@ -695,7 +695,7 @@ async def upsert_failover_ips(db: AsyncSession, device: Device, primary_ip: str 
     if active_oob_conflict:
         logger.warning(
             "failover.active_oob_change_refused",
-            device=device.nso_device_name,
+            device_id=device.id,
             stored_primary=fo.primary_ip,
             stored_oob=fo.oob_ip,
             reported_primary=primary_ip,

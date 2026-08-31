@@ -562,6 +562,8 @@ async def test_upsert_retains_active_oob_and_accepts_distinct_primary(adapter_cl
     The stored OOB address is retained (the way back stays known), the stuck state is
     surfaced on the row, and a later usable OOB address clears it again.
     """
+    from structlog.testing import capture_logs
+
     from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
 
     async with session() as db:
@@ -571,9 +573,13 @@ async def test_upsert_retains_active_oob_and_accepts_distinct_primary(adapter_cl
         await set_initial_failover_state(db, dev.id, "10.0.0.1", "192.0.2.5", ActiveAddress.oob.value)
         await db.commit()
 
-        changed = await upsert_failover_ips(db, dev, "10.0.0.1", None)
+        with capture_logs() as logs:
+            changed = await upsert_failover_ips(db, dev, "10.0.0.1", None)
         await db.commit()
         assert changed is True  # the surfaced stuck state is a change
+        conflict_log = next(log for log in logs if log["event"] == "failover.active_oob_change_refused")
+        assert conflict_log["device_id"] == dev.id
+        assert "device" not in conflict_log
         fo = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == dev.id))).scalar_one()
         assert fo.oob_ip == "192.0.2.5", "the address the device lives on must be retained"
         assert fo.failback_blocked_reason == "active_oob_address_conflict"
