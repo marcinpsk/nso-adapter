@@ -2567,6 +2567,10 @@ async def replace_on_removal(
     if scope is None:
         logger.error("removal.unknown_model", model=store_model.__name__)
         return False
+    from nso_adapter.core.projection import stream_section
+
+    if stream_section(stream) != scope:
+        raise ValueError(f"stream {stream!r} does not belong to removal scope {scope!r}")
     marks = query_flag_marking(deletes=bool(removed))
     job = await enqueue_removal(
         db,

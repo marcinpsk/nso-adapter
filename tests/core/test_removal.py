@@ -134,8 +134,8 @@ async def test_replace_on_removal_enqueues_job_and_commits(adapter_client):
     device_id = await _seed_device()
     async with session() as db:
         device = await db.get(Device, device_id)
-        revision = await note_projection_write(db, device_id, "bfd")
-        ok = await replace_on_removal(db, device, [3366], VlanIntent, stream="bfd")
+        revision = await note_projection_write(db, device_id, "vlan")
+        ok = await replace_on_removal(db, device, [3366], VlanIntent, stream="vlan")
         assert ok is True
         await db.commit()  # The caller owns the transaction boundary.
 
@@ -149,7 +149,21 @@ async def test_replace_on_removal_enqueues_job_and_commits(adapter_client):
         assert job.context == {"scope": "vlan", "removed": {"vlan": [3366]}, "detach": True}
         assert job.status == JobStatus.queued
         generation = (await db.execute(select(DeploymentGeneration))).scalars().one()
-        assert generation.stream_revisions == {"bfd": revision}
+        assert generation.stream_revisions == {"vlan": revision}
+
+
+async def test_replace_on_removal_rejects_stream_from_another_scope(adapter_client):
+    """A removal cannot promote a revision owned by a different scope."""
+    device_id = await _seed_device()
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        await note_projection_write(db, device_id, "bfd")
+
+        with pytest.raises(ValueError, match="does not belong to removal scope 'vlan'"):
+            await replace_on_removal(db, device, [3366], VlanIntent, stream="bfd")
+
+        assert (await db.execute(select(Job))).scalars().all() == []
+        assert (await db.execute(select(DeploymentGeneration))).scalars().all() == []
 
 
 async def test_replace_on_removal_unknown_model_returns_false(adapter_client):
