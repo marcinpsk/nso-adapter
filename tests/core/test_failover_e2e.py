@@ -530,6 +530,33 @@ async def test_active_oob_report_conflict_keeps_liveness(adapter_client, monkeyp
     assert row.oob_health_checked_at is not None
 
 
+async def test_successful_failback_clears_active_oob_conflict(adapter_client, monkeypatch):
+    """A conflict marker is obsolete once the device returns to primary."""
+    from nso_adapter.config import get_config
+    from nso_adapter.core.failover import upsert_failover_ips
+
+    sim = _NsoSim(address="192.0.2.5")
+    sim.reachable_addrs = {"10.0.0.1", "192.0.2.5"}
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    device_id = await _seed(active=ActiveAddress.oob.value)
+
+    async with session() as db:
+        dev = await db.get(Device, device_id)
+        assert dev is not None
+        assert await upsert_failover_ips(db, dev, "192.0.2.5", "192.0.2.5") is True
+        row = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device_id))).scalar_one()
+        row.consecutive_successes = get_config().scheduler.failover_success_threshold - 1
+        await db.commit()
+
+    await _arm(device_id, primary_due=True, oob_due=False)
+    await sched._scheduled_failover_probe()
+
+    row = await _load(device_id)
+    assert row.active_address == ActiveAddress.primary.value
+    assert row.failback_blocked_reason is None
+
+
 async def test_active_oob_report_conflict_survives_address_read_failure(adapter_client, monkeypatch):
     """A transient NSO read failure cannot erase a durable ingestion conflict."""
     from nso_adapter.core.failover import upsert_failover_ips

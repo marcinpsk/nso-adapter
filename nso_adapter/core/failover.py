@@ -355,6 +355,7 @@ async def _switch_to_oob(
 async def _commit_failback(client: NsoClient, fo: DeviceFailover, name: str, cfg: TickConfig, now: datetime) -> None:
     # The flip already physically set the address to primary — just commit the state.
     fo.active_address = _PRIMARY
+    fo.failback_blocked_reason = None
     fo.consecutive_failures = 0
     fo.consecutive_successes = 0
     fo.last_switch_at = now
