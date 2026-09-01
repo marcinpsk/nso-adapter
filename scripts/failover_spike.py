@@ -152,16 +152,7 @@ async def run() -> None:
     else:
         print(f"[nso] device 15 → NSO device {target.get('name')!r} @ {target.get('address')}")
 
-    results: dict[str, list[float]] = {
-        "reach_connect_primary": [],
-        "unreach_capped_temp": [],
-        "unreach_true_temp": [],
-        "unreach_true_trusted": [],
-        "flip_cycle": [],
-        "op_set_address": [],
-        "op_disconnect": [],
-        "op_get_address": [],
-    }
+    results: dict[str, list[float]] = {}
 
     # ── Throwaway device: unreachable-connect + flip mechanics (no real device touched).
     ned_type, ned_id = _ned_of(target) if target else ("cli", "")
@@ -182,11 +173,11 @@ async def run() -> None:
 
         # Micro-ops on the temp device (CDB-local; representative regardless of device).
         e, _, _ = await _timed(client.set_address(TEMP_DEVICE, TEMP_ADDR))
-        results["op_set_address"].append(e)
+        results.setdefault("op_set_address", []).append(e)
         e, _, _ = await _timed(client.disconnect(TEMP_DEVICE))
-        results["op_disconnect"].append(e)
+        results.setdefault("op_disconnect", []).append(e)
         e, _, _ = await _timed(client.get_address(TEMP_DEVICE))
-        results["op_get_address"].append(e)
+        results.setdefault("op_get_address", []).append(e)
         print(_stat("op set_address", results["op_set_address"]))
         print(_stat("op disconnect", results["op_disconnect"]))
         print(_stat("op get_address", results["op_get_address"]))
@@ -236,7 +227,7 @@ async def run() -> None:
         print("[dev15] true unreachable on trusted device (primary → bogus, long timeout):")
         await client.set_address(name, BOGUS_ADDR)
         await client.disconnect(name)
-        results["unreach_true_trusted"] = await measure_unreachable(client, name, 40.0, 2, "unreach-trusted")
+        results["unreach_true_live"] = await measure_unreachable(client, name, 40.0, 2, "unreach-trusted")
     finally:
         # Unconditional restore — device 15 must end on its original (primary) address, connected.
         await client.set_address(name, orig_addr)
@@ -251,14 +242,14 @@ def _report(results: dict[str, list[float]], probe_timeout: float) -> None:
     print("\n" + "=" * 78)
     print("FAILOVER PERFORMANCE SPIKE — SUMMARY")
     print("=" * 78)
-    print(_stat("reachable connect (primary)", results["reach_connect_primary"]))
-    print(_stat(f"unreachable connect capped@{probe_timeout}s", results["unreach_capped_temp"]))
-    print(_stat("unreachable connect NSO-true (temp)", results["unreach_true_temp"]))
-    print(_stat("unreachable connect NSO-true (trusted)", results["unreach_true_trusted"]))
-    print(_stat("full flip cycle (set+disc+connect)", results["flip_cycle"]))
-    print(_stat("op set_address", results["op_set_address"]))
-    print(_stat("op disconnect", results["op_disconnect"]))
-    print(_stat("op get_address", results["op_get_address"]))
+    print(_stat("reachable connect (primary)", results.get("reach_connect_primary", [])))
+    print(_stat(f"unreachable connect capped@{probe_timeout}s", results.get("unreach_capped_temp", [])))
+    print(_stat("unreachable connect NSO-true (temp)", results.get("unreach_true_temp", [])))
+    print(_stat("unreachable connect NSO-true (trusted)", results.get("unreach_true_live", [])))
+    print(_stat("full flip cycle (set+disc+connect)", results.get("flip_cycle", [])))
+    print(_stat("op set_address", results.get("op_set_address", [])))
+    print(_stat("op disconnect", results.get("op_disconnect", [])))
+    print(_stat("op get_address", results.get("op_get_address", [])))
     print("=" * 78)
 
 
