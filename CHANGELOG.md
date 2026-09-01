@@ -2,6 +2,51 @@
 
 <!-- version list -->
 
+## v1.2.1 (2026-09-01)
+
+### Bug Fixes
+
+- **failover**: Clear stale conflict after failback
+  ([`46572a4`](https://github.com/marcinpsk/nso-adapter/commit/46572a4281f12ceed4e13d96b28de54b61a95ea6))
+
+- **failover**: Log adapter device identity
+  ([`85a3fc5`](https://github.com/marcinpsk/nso-adapter/commit/85a3fc5de9885dc1fd0da27d5dddcb24e0a694bb))
+
+- **failover**: Preserve durable conflict reasons
+  ([`826383d`](https://github.com/marcinpsk/nso-adapter/commit/826383db18a1746307ffe75b1e5b48bc82102a1c))
+
+- **failover**: Retain the active OOB address
+  ([`fdf287f`](https://github.com/marcinpsk/nso-adapter/commit/fdf287fde5514f3a9d2d894ee7d198b56e0b811c))
+
+- **removal**: Enforce stream scope ownership
+  ([`22ba3da`](https://github.com/marcinpsk/nso-adapter/commit/22ba3dabfd79f193aa8a5e88482b64c89a5b485b))
+
+- **removal**: Require explicit projection streams
+  ([`fa3e18a`](https://github.com/marcinpsk/nso-adapter/commit/fa3e18a4644b85233f078db71d3fd17c97c6fd20))
+
+- **scripts**: Avoid logging secret-shaped data
+  ([`4204fda`](https://github.com/marcinpsk/nso-adapter/commit/4204fdab7d0a05ec0fa6561eaebe63f6521934b7))
+
+- **scripts**: Use neutral timing bucket name
+  ([`dab69be`](https://github.com/marcinpsk/nso-adapter/commit/dab69beb8b56738b270f949b9b530a55db71deb8))
+
+- **static-route**: Settle renderer-equivalent applies
+  ([`9afcfdc`](https://github.com/marcinpsk/nso-adapter/commit/9afcfdc88e4454aaed9065190405ed8cb955ba1b))
+
+### Documentation
+
+- **failover**: Clarify active OOB conflict roles
+  ([`f3ae051`](https://github.com/marcinpsk/nso-adapter/commit/f3ae0510d2d3e81a247e726d3a9292bd49f7acba))
+
+- **static-route**: Use semantic fingerprint wording
+  ([`740df30`](https://github.com/marcinpsk/nso-adapter/commit/740df30daef387f7b6f2c8d0be59eb88e5b3edbc))
+
+### Testing
+
+- Strengthen removal and failover regressions
+  ([`d093bff`](https://github.com/marcinpsk/nso-adapter/commit/d093bffa8bcec59e8ff3fa9a47f274c8c3668298))
+
+
 ## v1.2.0 (2026-08-30)
 
 ### Bug Fixes
