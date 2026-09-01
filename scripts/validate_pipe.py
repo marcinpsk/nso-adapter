@@ -139,7 +139,7 @@ else:
             )
             if secret_resp.status_code == 200:
                 secret_data: dict = secret_resp.json().get("data", {}).get("data", {})
-                check("Vault KV read", True, f"Keys: {list(secret_data.keys())}")
+                check("Vault KV read", True)
                 for key in ("username", "password", "netbox_token", "adapter_token"):
                     check(f"  secret key '{key}' present", key in secret_data)
 

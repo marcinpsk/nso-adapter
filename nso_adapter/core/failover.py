@@ -259,9 +259,9 @@ async def _revert_address(client: NsoClient, name: str, address: str) -> None:
         logger.error("failover.revert_failed", device=name, address=address, error=repr(exc))
 
 
-# Why failback cannot proceed (surfaced on the row for the operator; #1630).
+# Why failback cannot proceed, surfaced on the row for the operator.
 _BLOCKED_ADDRESS_UNREADABLE = "address_unreadable"
-_BLOCKED_OOB_CLEARED = "oob_address_cleared"
+_BLOCKED_ACTIVE_OOB_CONFLICT = "active_oob_address_conflict"
 
 
 async def _is_manual_override(client: NsoClient, fo: DeviceFailover, name: str) -> bool:
@@ -355,6 +355,7 @@ async def _switch_to_oob(
 async def _commit_failback(client: NsoClient, fo: DeviceFailover, name: str, cfg: TickConfig, now: datetime) -> None:
     # The flip already physically set the address to primary — just commit the state.
     fo.active_address = _PRIMARY
+    fo.failback_blocked_reason = None
     fo.consecutive_failures = 0
     fo.consecutive_successes = 0
     fo.last_switch_at = now
@@ -433,7 +434,7 @@ async def _failback_flip_probe(
     """
     if job_active:
         return True
-    # One read serves the manual-override decision AND the revert target (#1630): a
+    # One read serves the manual-override decision and the revert target: a
     # disruptive flip whose way back is unknown must not start, so an unreadable current
     # address refuses the flip — unlike the non-disruptive checks, where "can't tell"
     # correctly does not block the loop.
@@ -443,7 +444,8 @@ async def _failback_flip_probe(
         address_before = None
         logger.warning("failover.failback_blocked", device=name, reason=_BLOCKED_ADDRESS_UNREADABLE, error=repr(exc))
     if address_before is None:
-        fo.failback_blocked_reason = _BLOCKED_ADDRESS_UNREADABLE
+        if fo.failback_blocked_reason != _BLOCKED_ACTIVE_OOB_CONFLICT:
+            fo.failback_blocked_reason = _BLOCKED_ADDRESS_UNREADABLE
         return True  # ran → re-arm normally; retried on the next interval
     if fo.failback_blocked_reason == _BLOCKED_ADDRESS_UNREADABLE:
         fo.failback_blocked_reason = None  # the read recovered; the reason is stale on every branch
@@ -453,7 +455,6 @@ async def _failback_flip_probe(
     if not _take_flip(flip_budget):
         return False
     fo.manual_override = False
-    fo.failback_blocked_reason = None
     await _set_address(client, name, primary_ip)  # flip to primary for the probe
     committed = False
     try:
@@ -667,7 +668,12 @@ async def upsert_failover_ips(db: AsyncSession, device: Device, primary_ip: str 
 
     Does NOT create a row when there is nothing to store (both IPs None and no existing
     row) — so the per-device scope reconcile doesn't litter empty rows for devices an
-    older plugin reports without IPs. Returns True if anything changed.
+    older plugin reports without IPs.
+
+    While the device is active on OOB, its stored OOB address is also the address NSO is
+    dialing. A conflicting report cannot replace that address or promote it into the
+    primary role. A distinct reported primary can replace the stored primary as the future
+    failback target. The conflict is surfaced on the row. Returns True if anything changed.
     """
     existing = (
         await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device.id))
@@ -678,10 +684,33 @@ async def upsert_failover_ips(db: AsyncSession, device: Device, primary_ip: str 
     if fo is None:
         fo = DeviceFailover(device_id=device.id)
         db.add(fo)
+
+    active_oob_conflict = bool(
+        fo.active_address == _OOB and fo.oob_ip and (oob_ip != fo.oob_ip or primary_ip == fo.oob_ip)
+    )
+    accepted_primary_ip = fo.primary_ip if active_oob_conflict and primary_ip == fo.oob_ip else primary_ip
+    accepted_oob_ip = fo.oob_ip if active_oob_conflict else oob_ip
+
     now = _utcnow()
     changed = False
-    if fo.primary_ip != primary_ip:
-        fo.primary_ip = primary_ip
+    if active_oob_conflict:
+        logger.warning(
+            "failover.active_oob_change_refused",
+            device_id=device.id,
+            stored_primary=fo.primary_ip,
+            stored_oob=fo.oob_ip,
+            reported_primary=primary_ip,
+            reported_oob=oob_ip,
+        )
+        if fo.failback_blocked_reason != _BLOCKED_ACTIVE_OOB_CONFLICT:
+            fo.failback_blocked_reason = _BLOCKED_ACTIVE_OOB_CONFLICT
+            changed = True
+    elif fo.failback_blocked_reason == _BLOCKED_ACTIVE_OOB_CONFLICT:
+        fo.failback_blocked_reason = None
+        changed = True
+
+    if fo.primary_ip != accepted_primary_ip:
+        fo.primary_ip = accepted_primary_ip
         # The counters described the address that just went away — a new address starts with
         # its full hysteresis budget, exactly as the OOB leg drops oob_healthy below.
         fo.consecutive_failures = 0
@@ -690,40 +719,16 @@ async def upsert_failover_ips(db: AsyncSession, device: Device, primary_ip: str 
         fo.last_probe_result = None
         fo.last_probe_target = None
         fo.last_probe_detail = None
-        if primary_ip:
+        if accepted_primary_ip:
             fo.next_primary_probe_at = now
         changed = True
-    if fo.oob_ip != oob_ip:
-        usable = bool(oob_ip) and oob_ip != fo.primary_ip
-        if fo.active_address == _OOB and fo.oob_ip and not usable:
-            # NSO is living on the stored OOB address; the report would delete the failback
-            # path's way home (#1630). Retain it, surface the stuck state for the operator.
-            logger.warning(
-                "failover.oob_clear_refused",
-                device=device.nso_device_name,
-                stored=fo.oob_ip,
-                reported=oob_ip,
-            )
-            if fo.failback_blocked_reason != _BLOCKED_OOB_CLEARED:
-                fo.failback_blocked_reason = _BLOCKED_OOB_CLEARED
-                changed = True
-        else:
-            fo.oob_ip = oob_ip
-            fo.oob_healthy = None
-            fo.oob_health_result = None
-            fo.oob_health_detail = None
-            fo.oob_health_checked_at = None
-            if oob_ip:
-                fo.next_oob_probe_at = now
-            changed = True
-    # The stuck marker clears whenever the report agrees on a USABLE stored address —
-    # including a re-report of the retained address itself, which skips the branch above.
-    if (
-        fo.failback_blocked_reason == _BLOCKED_OOB_CLEARED
-        and fo.oob_ip
-        and fo.oob_ip == oob_ip
-        and oob_ip != fo.primary_ip
-    ):
-        fo.failback_blocked_reason = None
+    if fo.oob_ip != accepted_oob_ip:
+        fo.oob_ip = accepted_oob_ip
+        fo.oob_healthy = None
+        fo.oob_health_result = None
+        fo.oob_health_detail = None
+        fo.oob_health_checked_at = None
+        if accepted_oob_ip:
+            fo.next_oob_probe_at = now
         changed = True
     return changed

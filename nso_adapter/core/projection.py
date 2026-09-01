@@ -262,28 +262,6 @@ def stream_section(stream: str) -> str:
     return _stream_section()[stream]
 
 
-def stream_for_model(model: type) -> str:
-    """Return the stream that OWNS *model*'s table.
-
-    The ownership map read backwards, for the one caller that identifies its write by the
-    intent model rather than by the endpoint it arrived on
-    (:func:`core.removal.replace_on_removal`).
-
-    A model several sections share — ``RedistributionIntent`` belongs to IS-IS, BGP and OSPF,
-    told apart by a discriminator — has no single owner, and picking one would promote an
-    unrelated family. Refused, because only the endpoint knows which one it meant.
-    """
-    projection_streams()
-    owners = [stream for stream, specs in _stream_tables().items() if any(spec.model is model for spec in specs)]
-    if len(owners) != 1:
-        raise ValueError(
-            f"{model.__name__} belongs to no projection stream"
-            if not owners
-            else f"{model.__name__} is shared by streams {sorted(owners)} — name the stream at the call site"
-        )
-    return owners[0]
-
-
 def section_streams(section: str) -> tuple[str, ...]:
     """Return every stream that owns part of *section*, sorted.
 
@@ -447,19 +425,16 @@ def is_intent_deletion(table: str, identity: tuple, desired_rows: dict[tuple, di
     return not spec.lifecycle and identity not in desired_rows
 
 
-#: NetBox lineage the device payload never renders (:func:`nso.apply.static_route_entry`
-#: writes neither). Kept in the snapshot for settlement correlation, excluded from the
-#: comparison state so a correlation-only repair does not enqueue an apply for an
-#: unchanged wire payload.
-CORRELATION_COLUMNS: frozenset[str] = frozenset({"route_id", "intent_generation"})
-
-
 def projection_row_state(table: str, row: dict) -> dict:
-    """Return device-facing row state without database identity, correlation or apply metadata."""
+    """Return the row state that the device-facing renderer consumes."""
     spec = _SPEC_BY_TABLE.get(table)
     if spec is None:
         raise ValueError(f"unknown projection table {table!r}")
-    excluded = {"id", "device_id", "accepted_at", *CORRELATION_COLUMNS, *APPLY_BOOKKEEPING_COLUMNS}
+    if spec.model is StaticRouteIntent:
+        from nso_adapter.nso.apply import static_route_entry
+
+        return static_route_entry(row)
+    excluded = {"id", "device_id", "accepted_at", *APPLY_BOOKKEEPING_COLUMNS}
     if spec.parent is not None:
         excluded.add(_fk_column(spec.model, spec.parent).name)
     return {key: value for key, value in row.items() if key not in excluded}
@@ -836,6 +811,5 @@ __all__ = [
     "section_streams",
     "record_interface_execution",
     "snapshot_stream",
-    "stream_for_model",
     "stream_section",
 ]

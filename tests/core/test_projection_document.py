@@ -598,24 +598,6 @@ def test_hydrating_a_row_without_its_primary_key_is_refused():
         hydrate_section({"vlan": {"vlan_intent": [{"id": None, "device_id": 1, "vlan_id": 10}]}}, "vlan")
 
 
-def test_only_the_static_route_tables_carry_a_correlation_column():
-    """``projection_row_state`` drops these by NAME, for every table.
-
-    They are NetBox lineage the device payload never renders, so dropping them stops a
-    correlation-only repair from reading as a device delta. A table that gained a column of
-    either name for real content would have it silently dropped instead, so pin the fact.
-    """
-    from nso_adapter.core.projection import _SECTION_TABLES, CORRELATION_COLUMNS
-
-    carriers = {
-        spec.model.__tablename__
-        for specs in _SECTION_TABLES.values()
-        for spec in specs
-        if CORRELATION_COLUMNS & {column.key for column in spec.model.__table__.columns}
-    }
-    assert carriers == {"static_route_intent", "static_route_tombstone"}
-
-
 def test_hydrating_a_known_table_under_the_wrong_section_is_refused():
     """A document cannot smuggle one section's rows into another section."""
     from nso_adapter.core.projection import hydrate_section
@@ -722,16 +704,13 @@ def test_an_unpaired_family_is_its_own_single_stream():
 
 def test_a_name_outside_either_vocabulary_is_refused():
     """The two vocabularies are different sizes, so one cannot stand in for the other."""
-    from nso_adapter.core.projection import section_streams, stream_for_model, stream_section
-    from nso_adapter.store.models import Device
+    from nso_adapter.core.projection import section_streams, stream_section
 
     with pytest.raises(ValueError, match="unknown projection stream"):
         stream_section("not_a_stream")
     with pytest.raises(ValueError, match="unknown projection section"):
         # A STREAM name, not a section: sixteen streams, fourteen sections.
         section_streams("ip")
-    with pytest.raises(ValueError, match="belongs to no projection stream"):
-        stream_for_model(Device)
 
 
 def test_section_models_validates_sections_and_is_exported():
@@ -743,29 +722,6 @@ def test_section_models_validates_sections_and_is_exported():
     with pytest.raises(ValueError, match="unknown projection section 'unknown'"):
         projection.section_models(["unknown"])
     assert "section_models" in projection.__all__
-
-
-def test_a_model_resolves_to_the_stream_that_owns_it():
-    """What ``replace_on_removal`` promotes on: the model, not the family it sits in."""
-    from nso_adapter.core.projection import stream_for_model
-    from nso_adapter.store.models import InterfaceIntent, InterfaceIpIntent, IsisFlexAlgoIntent, VlanIntent
-
-    assert stream_for_model(VlanIntent) == "vlan"
-    assert stream_for_model(InterfaceIntent) == "interface_config"
-    assert stream_for_model(InterfaceIpIntent) == "ip"
-    assert stream_for_model(IsisFlexAlgoIntent) == "isis_flex_algo"
-
-
-def test_a_model_several_families_share_has_no_single_owner():
-    """A redistribution row belongs to whichever protocol it points at, so it names no lane.
-
-    Answering with whichever stream came first would promote an unrelated family.
-    """
-    from nso_adapter.core.projection import stream_for_model
-    from nso_adapter.store.models import RedistributionIntent
-
-    with pytest.raises(ValueError, match="is shared by streams"):
-        stream_for_model(RedistributionIntent)
 
 
 async def test_a_snapshot_is_a_fragment_of_only_the_tables_its_stream_owns(adapter_client):

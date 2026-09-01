@@ -202,14 +202,13 @@ async def put_l2_sap_intent(
     replaced = False
     if removed:
         from nso_adapter.core.removal import replace_on_removal
-        from nso_adapter.nso.apply import apply_l2_saps
 
         replaced = await replace_on_removal(
             db,
             device,
             removed,
             L2SapIntent,
-            apply_l2_saps,
+            stream=delivery.stream,
             settlement_cohort=settlement_cohort,
         )
 

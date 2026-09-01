@@ -620,7 +620,7 @@ async def seed_device(
         return d.id
 
 
-async def note_projection_write(db, device_id: int, stream: str) -> None:
+async def note_projection_write(db, device_id: int, stream: str) -> int:
     """Record the projection write an intent endpoint performs before it enqueues (#1522 §G2).
 
     Production never reaches ``enqueue_apply``/``enqueue_removal`` without it — the mutation
@@ -629,7 +629,7 @@ async def note_projection_write(db, device_id: int, stream: str) -> None:
     """
     from nso_adapter.core.generation import note_write
 
-    await note_write(db, device_id, stream)
+    return await note_write(db, device_id, stream)
 
 
 async def attach_apply_generation(job_id: int, device_id: int) -> int:

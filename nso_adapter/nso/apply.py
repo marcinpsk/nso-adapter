@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from contextvars import ContextVar
 from typing import Any, cast
 
@@ -997,29 +998,42 @@ async def apply_snmp_config(
     )
 
 
-def static_route_entry(row) -> dict:
+def _static_route_required(row: object, field: str) -> Any:
+    if isinstance(row, Mapping):
+        return row[field]
+    return getattr(row, field)
+
+
+def _static_route_optional(row: object, field: str) -> Any:
+    if isinstance(row, Mapping):
+        return row.get(field)
+    return getattr(row, field, None)
+
+
+def static_route_entry(row: object) -> dict:
     """Render ONE static-route intent row as the wire entry the reconciler expects.
 
-    The single renderer: the body builder below, the preview and R2's per-route
-    fingerprint all call it, so a fingerprint cannot drift from what was sent.
+    The single renderer accepts both live ORM rows and serialized projection rows. The
+    body builder below, preview, promotion comparison and per-route fingerprint all
+    call it, so none can drift from what is sent.
     """
     entry: dict = {
-        "vrf": row.vrf,
-        "prefix": row.prefix,
-        "next-hop": row.next_hop,
+        "vrf": _static_route_required(row, "vrf"),
+        "prefix": _static_route_required(row, "prefix"),
+        "next-hop": _static_route_required(row, "next_hop"),
     }
     # Optional next-hop forms (IOS-XR): an egress/discard interface and an inter-VRF
     # (leaked) next-hop VRF. Absent on a plain IP next-hop.
-    if getattr(row, "interface_next_hop", None):
-        entry["interface-next-hop"] = row.interface_next_hop
-    if getattr(row, "next_hop_vrf", None):
-        entry["next-hop-vrf"] = row.next_hop_vrf
-    if row.metric is not None:
-        entry["metric"] = row.metric
-    if row.permanent is not None and row.permanent:
-        entry["permanent"] = row.permanent
-    if row.tag is not None:
-        entry["tag"] = row.tag
+    if interface_next_hop := _static_route_optional(row, "interface_next_hop"):
+        entry["interface-next-hop"] = interface_next_hop
+    if next_hop_vrf := _static_route_optional(row, "next_hop_vrf"):
+        entry["next-hop-vrf"] = next_hop_vrf
+    if (metric := _static_route_optional(row, "metric")) is not None:
+        entry["metric"] = metric
+    if permanent := _static_route_optional(row, "permanent"):
+        entry["permanent"] = permanent
+    if (tag := _static_route_optional(row, "tag")) is not None:
+        entry["tag"] = tag
     return entry
 
 

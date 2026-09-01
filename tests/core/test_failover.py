@@ -717,7 +717,7 @@ class FlakyNso(FakeNso):
 
 
 async def test_failback_flip_refused_when_current_address_is_unreadable(monkeypatch):
-    """#1630: a flip whose way back is unknown must not start.
+    """A flip whose way back is unknown must not start.
 
     The old code treated a failed manual-override read as "can't tell -> proceed",
     flipped, and then reverted to the stored oob_ip - None when the operator had
@@ -735,7 +735,7 @@ async def test_failback_flip_refused_when_current_address_is_unreadable(monkeypa
 
 
 async def test_failback_flip_reverts_to_the_address_nso_actually_had(monkeypatch):
-    """#1630: the revert target is the pre-flip read, never the stored oob_ip."""
+    """The revert target is the pre-flip read, never the stored oob_ip."""
     client = FakeNso(address="10.0.0.1")  # NSO found on the primary (a managed slot)
     fo = _failover_row(active="oob", oob="192.0.2.5")
     _stub_probe(monkeypatch, False)

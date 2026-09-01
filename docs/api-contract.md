@@ -885,6 +885,15 @@ explicit no-op and no `job_id`:
   "generations": [] }
 ```
 
+A selected static-route revision can also settle as this `200` no-op. This happens when its
+complete stored fragment renders to the same device payload as the last authorized fragment,
+the previous authorized revision has settled, and no deletion, replacement, pending clear, or
+unfinished generation blocks advancement. The adapter advances the selected stream's authorized
+and applied revisions together, keeps the complete desired fragment as its authorized document,
+consumes the selection, and reports `already_applied`. It creates no generation or job. An
+ordinary PUT with `auto_apply=true` remains generation-backed even when only non-rendered route
+metadata changed.
+
 A promotion returns the complete ordered chain. Each link has its queued job. The success
 barrier decides when each successor job may start. The response returns `202`, and its
 top-level `job_id` is the first job in that chain.

@@ -30,7 +30,6 @@ from sqlalchemy import delete, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, JobError, error_envelope
-from nso_adapter.core.projection import stream_for_model
 from nso_adapter.core.request_flags import (
     AUTHORIZED_PROVENANCE,
     DELETE_ORIGIN_MARKING,
@@ -110,8 +109,7 @@ _SIMPLE_TARGETS: dict[str, tuple[str, str]] = {
     "l2_sap": ("L2SapIntent", "apply_l2_saps"),
 }
 
-# Reverse map: intent store model name → removal scope, so the legacy
-# replace_on_removal(store_model, apply_callable) callers need no change.
+# Reverse map: intent store model name → removal scope.
 _SCOPE_BY_MODEL: dict[str, str] = {model: scope for scope, (model, _) in _SIMPLE_TARGETS.items()}
 
 # Scopes whose apply function translates values to the device's NED dialect and so
@@ -2539,21 +2537,18 @@ async def replace_on_removal(
     device,
     removed,
     store_model,
-    apply_callable=None,
     *,
+    stream: str,
     retract: bool = False,
     settlement_cohort: int | None = None,
 ) -> bool:
     """Enqueue an async removal job for *store_model*'s scope.
 
-    Back-compat shim: the per-service intent PUTs still call this with their
-    ``(store_model, apply_callable)``; the scope is derived from ``store_model`` and
-    the device commit now runs in a background ``removal`` job rather than inline.
-    *removed* — the just-removed store keys every caller already computes — is
+    The scope is derived from ``store_model``. The caller states the endpoint's
+    projection *stream* explicitly, so promotion authorization does not depend on
+    reversing the model ownership map. *removed* contains the just-removed store keys. It is
     threaded into the job context so the collateral guard can tell the intended
-    retraction from an orphaned service row. *apply_callable* is retained for
-    signature compatibility but superseded by the scope registry. Returns True if
-    a removal job was queued.
+    retraction from an orphaned service row. Returns True if a removal job was queued.
 
     *retract* says a CLEARED OWNED SCALAR caused (part of) this call — see
     :func:`is_cleared`. A clear is not a shrink: it removes no key, so a caller with
@@ -2572,6 +2567,10 @@ async def replace_on_removal(
     if scope is None:
         logger.error("removal.unknown_model", model=store_model.__name__)
         return False
+    from nso_adapter.core.projection import stream_section
+
+    if stream_section(stream) != scope:
+        raise ValueError(f"stream {stream!r} does not belong to removal scope {scope!r}")
     marks = query_flag_marking(deletes=bool(removed))
     job = await enqueue_removal(
         db,
@@ -2579,9 +2578,7 @@ async def replace_on_removal(
         scope,
         marking=marks.marking,
         defer_retract=marks.defer_retract,
-        # The stream comes from the same model the scope does, so a model that later moves
-        # into a split section promotes ITS lane and not its sibling's.
-        promotes=(stream_for_model(store_model),),
+        promotes=(stream,),
         settlement_cohort=settlement_cohort,
         removed=removed_map(scope, removed) if removed else None,
         retract=retract,

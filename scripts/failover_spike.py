@@ -227,7 +227,7 @@ async def run() -> None:
         print("[dev15] true unreachable on trusted device (primary → bogus, long timeout):")
         await client.set_address(name, BOGUS_ADDR)
         await client.disconnect(name)
-        results["unreach_true_trusted"] = await measure_unreachable(client, name, 40.0, 2, "unreach-trusted")
+        results["unreach_true_live"] = await measure_unreachable(client, name, 40.0, 2, "unreach-trusted")
     finally:
         # Unconditional restore — device 15 must end on its original (primary) address, connected.
         await client.set_address(name, orig_addr)
@@ -245,7 +245,7 @@ def _report(results: dict[str, list[float]], probe_timeout: float) -> None:
     print(_stat("reachable connect (primary)", results.get("reach_connect_primary", [])))
     print(_stat(f"unreachable connect capped@{probe_timeout}s", results.get("unreach_capped_temp", [])))
     print(_stat("unreachable connect NSO-true (temp)", results.get("unreach_true_temp", [])))
-    print(_stat("unreachable connect NSO-true (trusted)", results.get("unreach_true_trusted", [])))
+    print(_stat("unreachable connect NSO-true (trusted)", results.get("unreach_true_live", [])))
     print(_stat("full flip cycle (set+disc+connect)", results.get("flip_cycle", [])))
     print(_stat("op set_address", results.get("op_set_address", [])))
     print(_stat("op disconnect", results.get("op_disconnect", [])))

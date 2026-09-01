@@ -33,6 +33,7 @@ class _NsoSim:
         self.always_reachable = False  # address-agnostic "always up" — for multi-device tests
         self.patches: list[str] = []
         self.connects = 0
+        self.get_address_failures = 0
         # When set, a connect while NSO is dialing this address raises an *unexpected* error
         # (not an httpx error probe_reachable swallows) — models a probe blowing up mid-flip.
         self.raise_on_connect_addr: str | None = None
@@ -58,6 +59,9 @@ class _NsoSim:
             self.patches.append(entry["address"])
             return httpx.Response(204, request=request)
         if method == "GET":
+            if self.get_address_failures:
+                self.get_address_failures -= 1
+                return httpx.Response(503, request=request)
             body = {"tailf-ncs:device": [{"name": "ra1", "address": self.address}]}
             return httpx.Response(200, json=body, request=request)
         return httpx.Response(404, request=request)
@@ -495,12 +499,98 @@ async def test_manual_override_clears_once_address_restored(adapter_client, monk
     assert (await _load(device_id)).manual_override is False  # cleared (current address is managed)
 
 
-async def test_upsert_refuses_to_clear_the_oob_ip_the_device_lives_on(adapter_client):
-    """#1630: NULLing oob_ip while active-on-OOB deletes the failback path's way home.
+async def test_active_oob_report_conflict_keeps_liveness(adapter_client, monkeypatch):
+    """A report cannot collapse the active OOB address into the primary role.
+
+    NSO still dials the stored OOB address. Keep both established roles, surface the
+    conflicting report, and continue the active-address liveness probe.
+    """
+    from nso_adapter.core.failover import upsert_failover_ips
+
+    sim = _NsoSim(address="192.0.2.5")
+    sim.reachable_addrs = {"192.0.2.5"}
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    device_id = await _seed(active=ActiveAddress.oob.value)
+
+    async with session() as db:
+        dev = await db.get(Device, device_id)
+        assert dev is not None
+        assert await upsert_failover_ips(db, dev, "192.0.2.5", "192.0.2.5") is True
+        await db.commit()
+
+    await _arm(device_id, primary_due=True, oob_due=True)
+    await sched._scheduled_failover_probe()
+
+    row = await _load(device_id)
+    assert (row.primary_ip, row.oob_ip) == ("10.0.0.1", "192.0.2.5")
+    assert row.failback_blocked_reason == "active_oob_address_conflict"
+    assert row.manual_override is False
+    assert row.oob_healthy is True
+    assert row.oob_health_checked_at is not None
+
+
+async def test_successful_failback_clears_active_oob_conflict(adapter_client, monkeypatch):
+    """A conflict marker is obsolete once the device returns to primary."""
+    from nso_adapter.config import get_config
+    from nso_adapter.core.failover import upsert_failover_ips
+
+    sim = _NsoSim(address="192.0.2.5")
+    sim.reachable_addrs = {"10.0.0.1", "192.0.2.5"}
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    device_id = await _seed(active=ActiveAddress.oob.value)
+
+    async with session() as db:
+        dev = await db.get(Device, device_id)
+        assert dev is not None
+        assert await upsert_failover_ips(db, dev, "192.0.2.5", "192.0.2.5") is True
+        row = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == device_id))).scalar_one()
+        row.consecutive_successes = get_config().scheduler.failover_success_threshold - 1
+        await db.commit()
+
+    await _arm(device_id, primary_due=True, oob_due=False)
+    await sched._scheduled_failover_probe()
+
+    row = await _load(device_id)
+    assert row.active_address == ActiveAddress.primary.value
+    assert row.failback_blocked_reason is None
+
+
+async def test_active_oob_report_conflict_survives_address_read_failure(adapter_client, monkeypatch):
+    """A transient NSO read failure cannot erase a durable ingestion conflict."""
+    from nso_adapter.core.failover import upsert_failover_ips
+
+    sim = _NsoSim(address="192.0.2.5")
+    sim.reachable_addrs = {"192.0.2.5"}
+    sim.get_address_failures = 1
+    client = _client_for(sim)
+    monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", lambda *_: client)
+    device_id = await _seed(active=ActiveAddress.oob.value)
+
+    async with session() as db:
+        dev = await db.get(Device, device_id)
+        assert dev is not None
+        assert await upsert_failover_ips(db, dev, "192.0.2.5", "192.0.2.5") is True
+        await db.commit()
+
+    await _arm(device_id, primary_due=True, oob_due=False)
+    await sched._scheduled_failover_probe()
+    assert (await _load(device_id)).failback_blocked_reason == "active_oob_address_conflict"
+
+    await _arm(device_id, primary_due=True, oob_due=False)
+    await sched._scheduled_failover_probe()
+    assert (await _load(device_id)).failback_blocked_reason == "active_oob_address_conflict"
+
+
+async def test_upsert_retains_active_oob_and_accepts_distinct_primary(adapter_client):
+    """A conflict retains active OOB but accepts a distinct primary failback target.
 
     The stored OOB address is retained (the way back stays known), the stuck state is
     surfaced on the row, and a later usable OOB address clears it again.
     """
+    from structlog.testing import capture_logs
+
     from nso_adapter.core.failover import set_initial_failover_state, upsert_failover_ips
 
     async with session() as db:
@@ -510,12 +600,16 @@ async def test_upsert_refuses_to_clear_the_oob_ip_the_device_lives_on(adapter_cl
         await set_initial_failover_state(db, dev.id, "10.0.0.1", "192.0.2.5", ActiveAddress.oob.value)
         await db.commit()
 
-        changed = await upsert_failover_ips(db, dev, "10.0.0.1", None)
+        with capture_logs() as logs:
+            changed = await upsert_failover_ips(db, dev, "10.0.0.1", None)
         await db.commit()
         assert changed is True  # the surfaced stuck state is a change
+        conflict_log = next(log for log in logs if log["event"] == "failover.active_oob_change_refused")
+        assert conflict_log["device_id"] == dev.id
+        assert "device" not in conflict_log
         fo = (await db.execute(select(DeviceFailover).where(DeviceFailover.device_id == dev.id))).scalar_one()
         assert fo.oob_ip == "192.0.2.5", "the address the device lives on must be retained"
-        assert fo.failback_blocked_reason == "oob_address_cleared"
+        assert fo.failback_blocked_reason == "active_oob_address_conflict"
 
         # The degenerate report (oob == primary) is the same class.
         await upsert_failover_ips(db, dev, "10.0.0.1", "10.0.0.1")
@@ -532,10 +626,23 @@ async def test_upsert_refuses_to_clear_the_oob_ip_the_device_lives_on(adapter_cl
         # Re-refuse so the different-address tail below still exercises its own clear.
         await upsert_failover_ips(db, dev, "10.0.0.1", None)
         await db.commit()
-        assert fo.failback_blocked_reason == "oob_address_cleared"
+        assert fo.failback_blocked_reason == "active_oob_address_conflict"
 
-        # A usable OOB address restores normal behavior and clears the stuck marker.
-        changed = await upsert_failover_ips(db, dev, "10.0.0.1", "192.0.2.9")
+        # A new primary is a safe failback target, but a usable OOB replacement still
+        # cannot erase the address NSO is dialing.
+        changed = await upsert_failover_ips(db, dev, "10.0.0.2", "192.0.2.9")
+        await db.commit()
+        assert changed is True
+        assert (fo.primary_ip, fo.oob_ip, fo.failback_blocked_reason) == (
+            "10.0.0.2",
+            "192.0.2.5",
+            "active_oob_address_conflict",
+        )
+
+        # Once failback completes, the next report can replace the inactive OOB address.
+        fo.active_address = ActiveAddress.primary.value
+        await db.commit()
+        changed = await upsert_failover_ips(db, dev, "10.0.0.2", "192.0.2.9")
         await db.commit()
         assert changed is True
         assert (fo.oob_ip, fo.failback_blocked_reason) == ("192.0.2.9", None)
