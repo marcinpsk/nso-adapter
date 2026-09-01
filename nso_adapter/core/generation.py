@@ -164,8 +164,19 @@ def digest_document(mode: GenerationMode, document: dict, allowed_removal_keys: 
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+async def lock_device_document(db: AsyncSession, device_id: int) -> None:
+    """Serialize desired-state access for one device against writers and offboard.
+
+    ``FOR NO KEY UPDATE`` excludes teardown and a rival document writer while admitting
+    PostgreSQL's FK ``FOR KEY SHARE`` validation. The caller holds the lock to commit.
+    """
+    held_device = await db.scalar(select(Device.id).where(Device.id == device_id).with_for_update(key_share=True))
+    if held_device is None:
+        raise DeviceProjectionGone(f"device {device_id} no longer exists")
+
+
 async def lock_projection(db: AsyncSession, device_id: int) -> None:
-    """Serialize this device's projection against every other writer. Caller commits.
+    """Serialize this device's projection and generation counter. Caller commits.
 
     Taken by EVERY accepted write, store-only included: a store-only repair that slipped in
     between two of the document's SELECTs would put state into a generation nobody
@@ -176,9 +187,7 @@ async def lock_projection(db: AsyncSession, device_id: int) -> None:
     writer, but not the FOR KEY SHARE that job admission (``jobs.py``) and PostgreSQL's own
     FK validation take on the same row.
     """
-    held_device = await db.scalar(select(Device.id).where(Device.id == device_id).with_for_update(key_share=True))
-    if held_device is None:
-        raise DeviceProjectionGone(f"device {device_id} no longer exists")
+    await lock_device_document(db, device_id)
     async with db.begin_nested():
         await db.execute(
             pg_insert(DeviceGenerationCounter)
@@ -1750,6 +1759,7 @@ __all__ = [
     "executable_head",
     "executing_generation",
     "job_admissible",
+    "lock_device_document",
     "lock_projection",
     "mark_job_generations_running",
     "note_write",

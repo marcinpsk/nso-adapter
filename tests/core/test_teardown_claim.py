@@ -106,12 +106,12 @@ async def _offboard(device_id: int) -> None:
 
 
 async def test_teardown_deletes_every_intent_root_including_interface_intent(adapter_client):
-    """M6.21 — 22 direct roots seeded for real, plus the two interface-rooted families."""
+    """M6.21 — 24 direct roots seeded for real, plus the two interface-rooted families."""
     from nso_adapter.store.models import Device, InterfaceIntent
 
     device_id = await seed_device(nso_device_name="td-roots", netbox_device_id=9500)
     root_count = await _seed_every_intent_root(device_id)
-    assert root_count == 22, "the mapper's direct intent-root set moved; update the brief's enumeration"
+    assert root_count == 24, "the mapper's direct intent-root set moved; update the brief's enumeration"
 
     await _offboard(device_id)
 

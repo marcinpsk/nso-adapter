@@ -4,45 +4,69 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from nso_adapter.api.deps import get_db, get_read_db, verify_token
-from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, api_error
+from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATION, StoredIntentResult, api_error
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import iso_z, latest_refreshed
-from nso_adapter.core.importer import get_nso_client
-from nso_adapter.core.lag_intent import apply_lag_config as apply_lag_config_core
+from nso_adapter.core.generation import DeviceProjectionGone
+from nso_adapter.core.switching_intent import LagBundleSnapshot, LagMemberSnapshot, replace_lag_snapshot
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, LagBundleConfig
 
 router = APIRouter(prefix="/api/v1/devices", tags=["lag-config"])
 
 
-class LagMemberApply(BaseModel):
-    interface_name: str
-    mode: str | None = None
-    port_priority: int | None = None
+Uint16 = Annotated[int, Field(strict=True, ge=0, le=65535)]
+Uint32 = Annotated[int, Field(strict=True, ge=0, le=4294967295)]
 
 
-class LagBundleApply(BaseModel):
-    name: str
-    lag_id: int
-    min_links: int | None = None
-    system_priority: int | None = None
-    system_id: str | None = None
-    timer: str | None = None
-    admin_key: int | None = None
-    members: list[LagMemberApply] = []
+class _StrictRequestModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
-class LagConfigApplyRequest(BaseModel):
-    bundles: list[LagBundleApply] = []
+class LagMemberApply(_StrictRequestModel):
+    interface_name: str = Field(min_length=1, max_length=128)
+    mode: str | None = Field(default=None, max_length=16)
+    port_priority: Uint16 | None = None
+
+
+class LagBundleApply(_StrictRequestModel):
+    name: str = Field(min_length=1, max_length=128)
+    lag_id: Uint32
+    min_links: Uint16 | None = None
+    system_priority: Uint16 | None = None
+    system_id: str | None = Field(default=None, max_length=17)
+    timer: str | None = Field(default=None, max_length=8)
+    admin_key: Uint16 | None = None
+    members: list[LagMemberApply] = Field(default_factory=list)
+
+    @field_validator("members")
+    @classmethod
+    def _member_names_are_unique(cls, members: list[LagMemberApply]) -> list[LagMemberApply]:
+        names = [member.interface_name for member in members]
+        if len(names) != len(set(names)):
+            raise ValueError("member interface_name values must be unique within a bundle")
+        return members
+
+
+class LagConfigApplyRequest(_StrictRequestModel):
+    bundles: list[LagBundleApply]
+
+    @field_validator("bundles")
+    @classmethod
+    def _bundle_names_are_unique(cls, bundles: list[LagBundleApply]) -> list[LagBundleApply]:
+        names = [bundle.name for bundle in bundles]
+        if len(names) != len(set(names)):
+            raise ValueError("bundle name values must be unique")
+        return bundles
 
 
 # ── Read-mirror response models (GET /lag-config) ─────────────────────────────
@@ -142,44 +166,40 @@ async def get_lag_config(device_id: int, db: AsyncSession = Depends(get_read_db)
     }
 
 
-# Union result envelope, documented via responses={200: {...}} + response_model=None so the
-# handler dict passes through untouched (zero wire risk). See core.lag_intent for the branches.
-
-
-class LagConfigApplyDeployed(BaseModel):
-    status: Literal["deployed"]
-    device: str
-    bundle_count: int
-
-
-class LagConfigApplyError(BaseModel):
-    status: Literal["error"]
-    error: str
-    message: str
-    detail: dict | None = None  # present only on an NSO commit failure (absent on no_nso_device_name)
-
-
-LagConfigApplyResult = LagConfigApplyDeployed | LagConfigApplyError
-
-
 @router.post(
     "/{device_id}/lag-config/apply",
     dependencies=[Depends(verify_token)],
-    response_model=None,
-    responses={
-        200: {"model": LagConfigApplyResult, "description": "Apply result envelope (deployed | error)"},
-        **RESP_401,
-        **RESP_404_DEVICE,
-        **RESP_422_VALIDATION,
-    },
+    response_model=StoredIntentResult,
+    responses={**RESP_401, **RESP_404_DEVICE, **RESP_422_VALIDATION},
 )
 async def apply_lag_config(
     device_id: int,
     payload: LagConfigApplyRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    device = await db.get(Device, device_id)
-    if not device:
+    bundles = tuple(
+        LagBundleSnapshot(
+            name=bundle.name,
+            lag_id=bundle.lag_id,
+            min_links=bundle.min_links,
+            system_priority=bundle.system_priority,
+            system_id=bundle.system_id,
+            timer=bundle.timer,
+            admin_key=bundle.admin_key,
+            members=tuple(
+                LagMemberSnapshot(
+                    interface_name=member.interface_name,
+                    mode=member.mode,
+                    port_priority=member.port_priority,
+                )
+                for member in bundle.members
+            ),
+        )
+        for bundle in payload.bundles
+    )
+    try:
+        summary = await replace_lag_snapshot(db, device_id, bundles)
+    except DeviceProjectionGone:
         raise api_error(404, "not_found", "Device not found")
-    nso_client = get_nso_client(device.nso_instance)
-    return await apply_lag_config_core(device, payload, nso_client)
+    await db.commit()
+    return {"status": "stored", "device_id": device_id, "count": summary.count, "removed": summary.removed}
