@@ -34,6 +34,7 @@ store holds when a worker gets round to it.
 from __future__ import annotations
 
 from contextlib import suppress
+from copy import deepcopy
 from datetime import date, datetime
 from decimal import Decimal
 from functools import cache
@@ -61,6 +62,8 @@ from nso_adapter.store.models import (
     IsisLevelIntent,
     IsisProcessIntent,
     L2SapIntent,
+    LagBundleIntent,
+    LagMemberIntent,
     LoggingHostIntent,
     LoggingLevelsIntent,
     OspfInstanceIntent,
@@ -75,6 +78,8 @@ from nso_adapter.store.models import (
     StaticRouteTombstone,
     SubinterfaceIntent,
     SviIntent,
+    SwitchportIntent,
+    SwitchportTaggedVlanIntent,
     SyncState,
     VlanIntent,
 )
@@ -143,6 +148,10 @@ _SECTION_TABLES: dict[str, tuple[_Spec, ...]] = {
         _Spec(OspfInterfaceIntent),
         _Spec(RedistributionIntent, discriminator=("dest_protocol", "ospf")),
     ),
+    # Prepared by an Apply POST rather than an intent PUT (#1612): no receipt lane, no
+    # discriminator and no lifecycle carrier, and every identity comes from the schema.
+    "switchport": (_Spec(SwitchportIntent), _Spec(SwitchportTaggedVlanIntent, parent=SwitchportIntent)),
+    "lag": (_Spec(LagBundleIntent), _Spec(LagMemberIntent, parent=LagBundleIntent)),
     "interface_config": (
         _Spec(InterfaceIntent, parent=DbInterface),
         _Spec(InterfaceIpIntent, parent=DbInterface),
@@ -235,24 +244,52 @@ def projection_streams() -> frozenset[str]:
     cannot drift apart: an endpoint with no stream would promote a lane nothing owns tables
     for, and a stream no endpoint delivers to could never be authorized. Each stream's
     section must also be the family its endpoint declares it ``promotes``.
+
+    Eighteen streams, sixteen of them endpoint lanes. The two out-of-protocol streams are
+    prepared by an Apply POST (:data:`core.intent_protocol.OUT_OF_PROTOCOL_APPLY_POSTS`),
+    so the route pin replaces the two endpoint clauses for them: they promote no endpoint
+    section, they name a section spelled the same, and they are never split.
     """
-    from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS
+    from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS, OUT_OF_PROTOCOL_STREAMS
 
     projection_sections()
     streams = frozenset(_stream_tables())
     endpoints = {e.stream: e.promotes for e in INTENT_PUT_ENDPOINTS.values()}
-    if streams != set(endpoints):
+    expected = set(endpoints) | OUT_OF_PROTOCOL_STREAMS
+    if streams != expected:
         raise RuntimeError(
             f"projection streams and intent endpoints disagree: only-projection "
-            f"{sorted(streams - set(endpoints))}, only-endpoints {sorted(set(endpoints) - streams)}"
+            f"{sorted(streams - expected)}, only-endpoints {sorted(expected - streams)}"
         )
-    mismatched = {s: (sec, endpoints[s]) for s, sec in _stream_section().items() if endpoints[s] != sec}
+    overlap = set(endpoints) & OUT_OF_PROTOCOL_STREAMS
+    if overlap:
+        raise RuntimeError(f"streams that are both an intent PUT lane and an Apply POST: {sorted(overlap)}")
+    split_streams = {stream for split in _SPLIT_SECTION_STREAMS.values() for stream in split}
+    for stream in sorted(OUT_OF_PROTOCOL_STREAMS):
+        if stream not in _SECTION_TABLES:
+            raise RuntimeError(f"out-of-protocol stream {stream!r} names no section spelled the same")
+        if stream in split_streams:
+            raise RuntimeError(f"out-of-protocol stream {stream!r} may not share a split section")
+    mismatched = {
+        s: (sec, endpoints[s]) for s, sec in _stream_section().items() if s in endpoints and endpoints[s] != sec
+    }
     if mismatched:
         raise RuntimeError(f"streams whose section differs from what their endpoint promotes: {mismatched}")
     for stream_specs in _stream_tables().values():
         for spec in stream_specs:
             _identity_fields(spec)
     return streams
+
+
+def stream_tables(stream: str) -> tuple[str, ...]:
+    """Return the table names *stream* owns, parents before children.
+
+    Derived from the registry, so a writer that has to walk its own parent/child pair
+    reads the ownership from one place instead of restating it.
+    """
+    if stream not in projection_streams():
+        raise ValueError(f"unknown projection stream {stream!r}")
+    return tuple(spec.model.__tablename__ for spec in _stream_tables()[stream])
 
 
 def stream_section(stream: str) -> str:
@@ -494,10 +531,17 @@ ACTION_APPLY_EXECUTABLE_SECTIONS: frozenset[str] = DOCUMENT_EXECUTED_SECTIONS
 #: No section reads live intent to decide what a generation executes.
 LIVE_READ_SECTIONS: dict[str, str] = {}
 
+#: The sections that have no device writer yet, so manual Apply refuses to select them and
+#: force-removal refuses to address them (#1612). A COMPLETION PIN, not a capability flag:
+#: C9's aggregate sender moves both names into :data:`DOCUMENT_EXECUTED_SECTIONS`, empties
+#: this set and restores the two equalities the partition test carries.
+AWAITING_SENDER_SECTIONS: frozenset[str] = frozenset({"switchport", "lag"})
+
 #: Reserved section key for immutable interface and static-route execution metadata.
 EXECUTION_KEY = "_execution"
-#: The sections that record execution metadata under :data:`EXECUTION_KEY`.
-EXECUTION_METADATA_SECTIONS: frozenset[str] = frozenset({"interface_config", "static_route"})
+#: The sections that record execution metadata under :data:`EXECUTION_KEY`. The two
+#: switching sections carry the frozen encoding context there (#1612).
+EXECUTION_METADATA_SECTIONS: frozenset[str] = frozenset({"interface_config", "static_route", "switchport", "lag"})
 INTERFACE_ATTRIBUTE_ELIGIBLE_STATES: frozenset[SyncState] = frozenset(
     {
         SyncState.accepted,
@@ -776,6 +820,34 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
     return rows
 
 
+def fragment_tables(fragment: dict | None) -> dict[str, list[dict]]:
+    """Return a fragment's TABLES, without its execution metadata."""
+    return {table: rows for table, rows in (fragment or {}).items() if table != EXECUTION_KEY}
+
+
+def fragment_context(fragment: dict | None) -> dict | None:
+    """Return the encoding context a fragment was frozen with, or ``None`` for an unfrozen one."""
+    return ((fragment or {}).get(EXECUTION_KEY) or {}).get("context")
+
+
+def freeze_fragment(tables: dict[str, list[dict]], device) -> dict:
+    """Return the FRAGMENT for *tables*: the rows plus the state they must execute with.
+
+    The encoding context is read HERE, in the authorizing transaction, and preserved
+    verbatim: ``ned_id`` keeps an explicit null (a device with no NED id records ``null``
+    and dialect ``identity``), and ``dialect`` is the stable name of the dialect that NED id
+    resolves to, so an encode never re-reads the device row.
+    """
+    from nso_adapter.core.community_dialect import community_dialect_for
+
+    return {
+        **deepcopy(tables),
+        EXECUTION_KEY: {
+            "context": {"ned_id": device.ned_id, "dialect": community_dialect_for(device.ned_id).name},
+        },
+    }
+
+
 async def snapshot_stream(db: AsyncSession, device_id: int, stream: str) -> dict[str, list[dict]]:
     """Serialize the tables *stream* owns into one JSON-safe document FRAGMENT.
 
@@ -794,11 +866,15 @@ async def snapshot_stream(db: AsyncSession, device_id: int, stream: str) -> dict
 __all__ = [
     "ACTION_APPLY_EXECUTABLE_SECTIONS",
     "APPLY_BOOKKEEPING_COLUMNS",
+    "AWAITING_SENDER_SECTIONS",
     "DOCUMENT_EXECUTED_SECTIONS",
     "INTERFACE_ATTRIBUTE_ELIGIBLE_STATES",
     "EXECUTION_KEY",
     "InterfaceEligibilityUnresolved",
     "LIVE_READ_SECTIONS",
+    "fragment_context",
+    "fragment_tables",
+    "freeze_fragment",
     "hydrate_section",
     "hydrate_interface_execution",
     "intent_state",
@@ -812,4 +888,5 @@ __all__ = [
     "record_interface_execution",
     "snapshot_stream",
     "stream_section",
+    "stream_tables",
 ]

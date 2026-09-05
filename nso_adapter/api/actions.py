@@ -108,6 +108,9 @@ class ActionApplyOut(BaseModel):
             "no_receipt",
             "backfill_only",
             "revision_mismatch",
+            # The two out-of-protocol switching streams: no receipt, no push sequence.
+            "no_prepared_revision",
+            "awaiting_aggregate_sender",
         ],
     ]
     skipped_detail: dict[str, ActionApplySkippedDetailOut] | None
@@ -176,6 +179,7 @@ async def action_force_removal(
     settlement then certified them applied — the sibling lane's un-promoted store-only state
     included, on interfaces this job never sends.
     """
+    from nso_adapter.core.projection import AWAITING_SENDER_SECTIONS
     from nso_adapter.core.removal import VALID_REMOVAL_SCOPES, enqueue_removal
 
     device = await db.get(Device, device_id)
@@ -183,6 +187,15 @@ async def action_force_removal(
         raise api_error(404, "not_found", "Device not found")
     if body.scope not in VALID_REMOVAL_SCOPES:
         raise api_error(400, "bad_request", f"Unknown removal scope {body.scope!r}")
+    # Refused at ADMISSION, before any generation or job: a section with no device writer has
+    # no dispatch handler, and a failed head would block every later device write.
+    if body.scope in AWAITING_SENDER_SECTIONS:
+        raise api_error(
+            400,
+            "bad_request",
+            f"Removal scope {body.scope!r} has no device writer yet",
+            {"scope": body.scope, "reason": "awaiting_aggregate_sender"},
+        )
     if body.scope == "interface_config" and not body.interfaces:
         raise api_error(
             400,

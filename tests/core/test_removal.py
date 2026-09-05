@@ -242,12 +242,17 @@ async def test_enqueue_removal_rejects_unmarked_deletion(adapter_client):
 
 
 async def test_enqueue_removal_creates_job_for_each_valid_scope(adapter_client):
-    """Every reconciler scope (incl ospf/bgp) maps to a removal job."""
-    from nso_adapter.core.projection import section_streams
+    """Every reconciler scope (incl ospf/bgp) maps to a removal job.
+
+    Except the two that await their aggregate sender: they have no dispatch handler, and
+    admission refuses them before a job exists (#1612).
+    """
+    from nso_adapter.core.projection import AWAITING_SENDER_SECTIONS, section_streams
     from nso_adapter.core.removal import VALID_REMOVAL_SCOPES
 
+    dispatchable = VALID_REMOVAL_SCOPES - AWAITING_SENDER_SECTIONS
     device_id = await _seed_device()
-    for scope in VALID_REMOVAL_SCOPES:
+    for scope in dispatchable:
         async with session() as db:
             stream = section_streams(scope)[0]
             await note_projection_write(db, device_id, stream)
@@ -266,7 +271,7 @@ async def test_enqueue_removal_creates_job_for_each_valid_scope(adapter_client):
     # Every scope produced a real persisted removal job.
     async with session() as db:
         scopes = {j.context["scope"] for j in (await db.execute(select(Job))).scalars().all()}
-        assert scopes == VALID_REMOVAL_SCOPES
+        assert scopes == dispatchable
 
 
 # ── _dispatch_scope ───────────────────────────────────────────────────────────

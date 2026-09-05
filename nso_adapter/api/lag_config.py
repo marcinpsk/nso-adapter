@@ -17,7 +17,12 @@ from nso_adapter.api.errors import RESP_401, RESP_404_DEVICE, RESP_422_VALIDATIO
 from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import iso_z, latest_refreshed
 from nso_adapter.core.generation import DeviceProjectionGone
-from nso_adapter.core.switching_intent import LagBundleSnapshot, LagMemberSnapshot, replace_lag_snapshot
+from nso_adapter.core.switching_intent import (
+    LagBundleSnapshot,
+    LagMemberSnapshot,
+    SwitchingRequestRefused,
+    replace_lag_snapshot,
+)
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, LagBundleConfig
 
@@ -26,6 +31,7 @@ router = APIRouter(prefix="/api/v1/devices", tags=["lag-config"])
 
 Uint16 = Annotated[int, Field(strict=True, ge=0, le=65535)]
 Uint32 = Annotated[int, Field(strict=True, ge=0, le=4294967295)]
+RootName = Annotated[str, Field(min_length=1, max_length=128)]
 
 
 class _StrictRequestModel(BaseModel):
@@ -59,6 +65,10 @@ class LagBundleApply(_StrictRequestModel):
 
 class LagConfigApplyRequest(_StrictRequestModel):
     bundles: list[LagBundleApply]
+    #: The bundle roots this preparation authorizes RETRACTING from the device. Required,
+    #: an explicit empty list included: an omitted root with no marking is an un-own, and
+    #: the two cannot be told apart from the snapshot alone.
+    deleted_roots: list[RootName]
 
     @field_validator("bundles")
     @classmethod
@@ -198,8 +208,19 @@ async def apply_lag_config(
         for bundle in payload.bundles
     )
     try:
-        summary = await replace_lag_snapshot(db, device_id, bundles)
+        prepared = await replace_lag_snapshot(db, device_id, bundles, deleted_roots=payload.deleted_roots)
     except DeviceProjectionGone:
         raise api_error(404, "not_found", "Device not found")
+    except SwitchingRequestRefused as exc:
+        await db.rollback()
+        raise api_error(422, "validation_error", str(exc)) from None
     await db.commit()
-    return {"status": "stored", "device_id": device_id, "count": summary.count, "removed": summary.removed}
+    return {
+        "status": prepared.status,
+        "device_id": device_id,
+        "stream": prepared.stream,
+        "count": prepared.count,
+        "removed": prepared.removed,
+        "desired_revision": prepared.desired_revision,
+        "selection_revision": prepared.selection_revision,
+    }

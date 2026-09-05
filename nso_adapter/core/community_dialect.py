@@ -163,7 +163,12 @@ class CommunityDialect:
     """Default dialect: canonical == device wire form (IOS, IOS-XR, Junos).
 
     Subclasses override only the cases where their NED diverges from canonical.
+
+    ``name`` is the STABLE identifier a frozen execution context records, so an encode can
+    resolve its dialect from the stored document instead of re-reading the device row.
     """
+
+    name = "identity"
 
     def to_canonical(self, member: str) -> str:
         """Device wire form → canonical NetBox form (READ/import path)."""
@@ -198,6 +203,8 @@ class CommunityDialect:
 
 class _NokiaCommunityDialect(CommunityDialect):
     """Nokia SR OS (timos) community-member dialect."""
+
+    name = "nokia_timos"
 
     # SR OS ``policy-options community member`` keywords that pass through verbatim.
     # ``target``/``origin`` are route-target/route-origin extended communities;
@@ -268,16 +275,28 @@ class _NokiaCommunityDialect(CommunityDialect):
 
 # Default identity dialect, shared by every NED without a registered override.
 _DEFAULT_DIALECT = CommunityDialect()
+_NOKIA_DIALECT = _NokiaCommunityDialect()
 
 # NED-id prefix → dialect. Match is by ``startswith`` so version suffixes
 # (``timos-nc-23.10``) and bare prefixes (``timos-nc``) both resolve.
-_DIALECTS: tuple[tuple[str, CommunityDialect], ...] = (("timos-nc", _NokiaCommunityDialect()),)
+_NED_PREFIX_DIALECTS: tuple[tuple[str, CommunityDialect], ...] = (("timos-nc", _NOKIA_DIALECT),)
+
+#: Every registered dialect, addressable by the stable name a frozen context records.
+_DIALECTS: dict[str, CommunityDialect] = {dialect.name: dialect for dialect in (_DEFAULT_DIALECT, _NOKIA_DIALECT)}
 
 
 def community_dialect_for(ned_id: str | None) -> CommunityDialect:
     """Return the :class:`CommunityDialect` for *ned_id* (default = identity)."""
     if ned_id:
-        for prefix, dialect in _DIALECTS:
+        for prefix, dialect in _NED_PREFIX_DIALECTS:
             if ned_id.startswith(prefix):
                 return dialect
     return _DEFAULT_DIALECT
+
+
+def community_dialect_by_name(name: str) -> CommunityDialect:
+    """Return the dialect a frozen execution context names, or refuse an unknown one."""
+    dialect = _DIALECTS.get(name)
+    if dialect is None:
+        raise ValueError(f"unknown community dialect {name!r}")
+    return dialect

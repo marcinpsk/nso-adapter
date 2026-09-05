@@ -2440,20 +2440,48 @@ member `mode`/`port_priority`.
 
 ### `POST /api/v1/devices/{id}/lag-config/apply` → `200 | 404 | 422`
 
-Claim-less full-snapshot store write for desired LAG state. Body = the GET
-`bundles` shape. `lag_id` stays required and is a strict `uint32`; optional
-LAG integer leaves are strict `uint16`. Bundle names and member interface names
-must be unique within the request.
+Claim-less full-snapshot PREPARATION of desired LAG state. Body = the GET
+`bundles` shape plus a required `deleted_roots`. `lag_id` stays required and is
+a strict `uint32`; optional LAG integer leaves are strict `uint16`. Bundle names
+and member interface names must be unique within the request.
 
 ```json
-{ "status": "stored", "device_id": 1, "count": 1, "removed": 0 }
+{ "bundles": [ { "name": "lag-2", "lag_id": 2 } ], "deleted_roots": ["lag-1"] }
 ```
 
-The endpoint stores the snapshot atomically and does not contact NSO. It does
-not accept `X-Push-Seq` and creates no receipt, projection revision, generation,
-or job. `count` is the number of bundle roots now stored. `removed` is the
-number of previous bundle roots omitted by the replacement. Non-2xx responses
-use the standard error envelope.
+```json
+{ "status": "prepared", "device_id": 1, "stream": "lag", "count": 1,
+  "removed": 1, "desired_revision": 4, "selection_revision": 4 }
+```
+
+The POST prepares; the manual Apply authorizes. It stores the snapshot
+atomically, does not contact NSO, does not accept `X-Push-Seq`, and creates no
+receipt, generation or job. It DOES record one projection revision, and a normal
+request additionally records the prepared snapshot an Apply can select:
+`selection_revision` is that selection identity, and it is the integer to pass
+in the Apply's `selected` map. A `?store_only=true` request answers `stored`
+with `"selection_revision": null` and preserves the previously prepared
+snapshot, so an Apply selecting that revision still promotes what was prepared.
+
+`deleted_roots` names the bundle roots this preparation authorizes RETRACTING
+from the device; every other authorized root the snapshot omits detaches
+instead. It is required, an explicit empty list included, and it is validated
+against the AUTHORIZED roots: a repeated root, a root the snapshot still
+carries, and a root this device has not authorized are each a 422 that leaves
+the store and every revision untouched. `?delete_origin=true` and
+`?backfill_only=true` are a 422 here. A store-only request validates
+`deleted_roots` the same way and then records no provenance at all, because it
+authorizes nothing.
+
+The required `deleted_roots` field and the response fields beside it ship with
+the plugin's switching-delivery change, in the same version: the three
+repositories of this integration move together at 1.0, so there is no
+partial-rollout window and no older client to keep working. A request that omits
+the field is a coding error, and the 422 says so.
+
+`count` is the number of bundle roots now stored. `removed` is the number of
+previous bundle roots omitted by the replacement. Non-2xx responses use the
+standard error envelope.
 
 ---
 
@@ -2481,18 +2509,22 @@ L2 switchport read-mirror. `mode` ∈ `access` · `trunk` · `""` (unset);
 
 ### `POST /api/v1/devices/{id}/switchport/apply` → `200 | 404 | 422`
 
-Claim-less full-snapshot store write for desired switchport state. Body =
-`{ "interfaces": [...] }` with the GET row shape minus `source`. VLAN values
-are strict `uint16`; interface names and each interface's tagged VLAN values
-must be unique within the request.
+Claim-less full-snapshot PREPARATION of desired switchport state. Body =
+`{ "interfaces": [...], "deleted_roots": [...] }` with the GET row shape minus
+`source`. VLAN values are strict `uint16`; interface names and each interface's
+tagged VLAN values must be unique within the request.
 
 ```json
-{ "status": "stored", "device_id": 1, "count": 2, "removed": 0 }
+{ "status": "prepared", "device_id": 1, "stream": "switchport", "count": 2,
+  "removed": 0, "desired_revision": 1, "selection_revision": 1 }
 ```
 
-The endpoint stores scalar VLAN values independently of the refresh-owned VLAN
-mirror and does not contact NSO. It creates no receipt, projection revision,
-generation, or job. `count` and `removed` describe top-level switchport roots.
+The POST prepares and the manual Apply authorizes, with the same response
+fields, the same `deleted_roots` rules, the same store-only behaviour and the
+same version coupling as `POST .../lag-config/apply` above; `deleted_roots`
+names switchport interface roots. The endpoint stores scalar VLAN values independently of the
+refresh-owned VLAN mirror and does not contact NSO. It creates no receipt,
+generation or job. `count` and `removed` describe top-level switchport roots.
 Non-2xx responses use the standard error envelope.
 
 ### `PUT /api/v1/devices/{id}/vlan-intent` → `200 | 404`

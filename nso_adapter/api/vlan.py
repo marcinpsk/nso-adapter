@@ -28,7 +28,11 @@ from nso_adapter.api.read_state import FamilyReadState, read_state_payload
 from nso_adapter.api.timestamps import UtcInstant
 from nso_adapter.core.generation import DeviceProjectionGone
 from nso_adapter.core.removal import is_cleared
-from nso_adapter.core.switching_intent import SwitchportSnapshot, replace_switchport_snapshot
+from nso_adapter.core.switching_intent import (
+    SwitchingRequestRefused,
+    SwitchportSnapshot,
+    replace_switchport_snapshot,
+)
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device, DeviceSwitchport, DeviceVlan, VlanIntent
 
@@ -36,6 +40,7 @@ router = APIRouter(prefix="/api/v1/devices", tags=["vlan"])
 
 
 Uint16 = Annotated[int, Field(strict=True, ge=0, le=65535)]
+RootName = Annotated[str, Field(min_length=1, max_length=128)]
 
 
 class _StrictSwitchportRequest(BaseModel):
@@ -58,6 +63,9 @@ class SwitchportApply(_StrictSwitchportRequest):
 
 class SwitchportApplyRequest(_StrictSwitchportRequest):
     interfaces: list[SwitchportApply]
+    #: The switchport roots this preparation authorizes RETRACTING from the device.
+    #: Required, an explicit empty list included — see ``LagConfigApplyRequest``.
+    deleted_roots: list[RootName]
 
     @field_validator("interfaces")
     @classmethod
@@ -193,11 +201,22 @@ async def apply_switchport(
         for interface in payload.interfaces
     )
     try:
-        summary = await replace_switchport_snapshot(db, device_id, interfaces)
+        prepared = await replace_switchport_snapshot(db, device_id, interfaces, deleted_roots=payload.deleted_roots)
     except DeviceProjectionGone:
         raise api_error(404, "not_found", "Device not found")
+    except SwitchingRequestRefused as exc:
+        await db.rollback()
+        raise api_error(422, "validation_error", str(exc)) from None
     await db.commit()
-    return {"status": "stored", "device_id": device_id, "count": summary.count, "removed": summary.removed}
+    return {
+        "status": prepared.status,
+        "device_id": device_id,
+        "stream": prepared.stream,
+        "count": prepared.count,
+        "removed": prepared.removed,
+        "desired_revision": prepared.desired_revision,
+        "selection_revision": prepared.selection_revision,
+    }
 
 
 # ---------------------------------------------------------------------------
