@@ -685,6 +685,32 @@ async def _selected_promotions(
     return promotable, skipped, skipped_detail
 
 
+def _logical_table_state(fragment: dict | None) -> dict[str, dict]:
+    """Return a fragment's comparable table state: durable identity -> intent values.
+
+    Bookkeeping and surrogate columns are dropped by :func:`projection_row_state`, so this
+    answers "do these two fragments hold the same intent" and nothing else.
+    """
+    tables = fragment_tables(fragment)
+    return {
+        table: {
+            identity: projection_row_state(table, row)
+            for identity, row in rows_by_intent_identity(tables, table).items()
+        }
+        for table in sorted(tables)
+    }
+
+
+def _tables_unchanged(promotion: _Promotion) -> bool:
+    """Whether the promoted fragment holds exactly the intent the authorized one holds.
+
+    A separate question from ``positive`` and from the replacement predicate, and neither
+    implies it: a leaf moving between NULL and the empty string is a table delta the device
+    would see, yet it neither adds content nor loses merge-inexpressible content.
+    """
+    return _logical_table_state(promotion.row.authorized_document) == _logical_table_state(promotion.desired)
+
+
 def _wire_equivalent_streams() -> frozenset[str]:
     """Return the streams whose promotion may settle without a generation when nothing changed."""
     from nso_adapter.core.intent_protocol import OUT_OF_PROTOCOL_STREAMS
@@ -720,7 +746,12 @@ def _plan_action_links(
         if has_detach:
             detach_links.append(_RemovalLink(stream, GenerationMode.detach, promotion.detached, {}))
         if not (has_networked or has_detach or has_replacement):
-            if stream in settleable and not promotion.positive:
+            settles = stream in settleable and not promotion.positive
+            # The out-of-protocol streams promote a whole prepared fragment, so the absence of
+            # a delta is proven against the tables rather than inferred from two predicates.
+            if settles and promotion.revision is not None:
+                settles = _tables_unchanged(promotion)
+            if settles:
                 wire_equivalent_streams.add(stream)
             else:
                 apply_streams.add(stream)
@@ -916,7 +947,10 @@ async def create_action_apply(
         await _promote_static_route_clears(db, device_id)
 
     authorized = await _authorized_fragments(db, device_id)
-    device = await db.get(Device, device_id)
+    # populate_existing: the endpoint loads the device BEFORE it takes the projection lock and
+    # keeps the reference, so a plain get would serve that pre-lock copy and freeze a NED id a
+    # concurrent transaction has already replaced.
+    device = await db.get(Device, device_id, populate_existing=True)
     if device is None:  # pragma: no cover - lock_projection proved the device exists
         raise DeviceProjectionGone(f"device {device_id} no longer exists")
     promotions: dict[str, _Promotion] = {}
