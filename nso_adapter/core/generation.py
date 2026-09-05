@@ -666,7 +666,11 @@ async def _selected_promotions(
             continue
         if stream in OUT_OF_PROTOCOL_STREAMS:
             reason = _resolve_prepared_selection(row, selector)
-            selection = _Selection(row, None, selector) if reason is None else None
+            selection = None
+            if reason is None:
+                if row is None:  # pragma: no cover - a missing row is refused as no_prepared_revision
+                    raise RuntimeError(f"device {device_id} stream {stream!r} was selected without a projection row")
+                selection = _Selection(row, None, selector)
             detail = (
                 await _authorized_generation_detail(db, device_id, stream, selector)
                 if reason == "already_authorized"
@@ -679,6 +683,8 @@ async def _selected_promotions(
         if selection is not None:
             promotable[stream] = selection
             continue
+        if reason is None:  # pragma: no cover - every unselected stream names why
+            raise RuntimeError(f"device {device_id} stream {stream!r} was neither selected nor refused")
         skipped[stream] = reason
         if detail is not None:
             skipped_detail[stream] = detail
@@ -936,14 +942,15 @@ async def _enqueue_action_apply_job(
         frozen_fragments=frozen_fragments,
     )
     if removal_authority:
-        created = await create_dedicated_job(db, device_id, JobType.apply)
+        carrier = await create_dedicated_job(db, device_id, JobType.apply)
     else:
-        created, winner = await admit_coalescible_job(db, device_id, JobType.apply)
+        admitted, winner = await admit_coalescible_job(db, device_id, JobType.apply)
         if winner is not None:
             raise ApplyJobConflict(winner.id)
-        if created is None:  # pragma: no cover - bounded admission retries exhausted
+        if admitted is None:  # pragma: no cover - bounded admission retries exhausted
             raise RuntimeError(f"could not admit an apply job for device {device_id}")
-    await require_attach_to_job(db, generation, created)
+        carrier = admitted
+    await require_attach_to_job(db, generation, carrier)
     return generation
 
 
