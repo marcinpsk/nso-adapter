@@ -549,7 +549,18 @@ class DeviceProjectionStream(Base):
     """
 
     __tablename__ = "device_projection_stream"
-    __table_args__ = (UniqueConstraint("device_id", "stream", name="uq_projection_stream"),)
+    __table_args__ = (
+        UniqueConstraint("device_id", "stream", name="uq_projection_stream"),
+        CheckConstraint(
+            "(prepared_revision IS NULL AND prepared_tables IS NULL AND prepared_deletions IS NULL) OR "
+            "(prepared_revision IS NOT NULL AND prepared_tables IS NOT NULL AND prepared_deletions IS NOT NULL)",
+            name="ck_projection_stream_prepared_slot",
+        ),
+        CheckConstraint(
+            "prepared_revision IS NULL OR (prepared_revision > 0 AND prepared_revision <= desired_revision)",
+            name="ck_projection_stream_prepared_revision",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     device_id: Mapped[int] = mapped_column(
@@ -567,6 +578,15 @@ class DeviceProjectionStream(Base):
     #: NULL until the stream is promoted once — an unpromoted lane has nothing on the device
     #: the adapter authorized, so it contributes nothing.
     authorized_document: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    #: The PREPARED SLOT of an out-of-protocol stream (#1612): the snapshot one Apply POST
+    #: stored, the revision that selects it, and the deletion provenance resolved against the
+    #: authorized roots at that moment. The three are null together or present together, and a
+    #: present revision is one this device really reached, so a slot can never name a state no
+    #: write stands behind. Tables ONLY, with no execution metadata: the fragment is frozen at
+    #: authorization, inside the Apply that promotes it.
+    prepared_revision: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    prepared_tables: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    prepared_deletions: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
 
 

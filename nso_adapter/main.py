@@ -57,6 +57,7 @@ from nso_adapter.api.vlan import router as vlan_router
 from nso_adapter.config import get_config, get_env_settings
 from nso_adapter.core.generation import ApplyUnexecutable, DeviceProjectionGone
 from nso_adapter.core.importer import register_nso_client, set_netbox_client
+from nso_adapter.core.projection import projection_streams
 from nso_adapter.core.receipt import PromotionProvenanceUnexecutable
 from nso_adapter.core.request_flags import (
     BACKFILL_ONLY,
@@ -364,6 +365,9 @@ async def lifespan(app: FastAPI):
     )
 
     provider = _init_secrets(app, cfg, env)
+    # Fail the boot, not the first write: a stream with no tables or an endpoint with no
+    # stream is a wiring bug, and this validates the whole projection registry once.
+    projection_streams()
     await _init_database(cfg)
 
     nso_clients = _build_nso_clients(cfg, provider)

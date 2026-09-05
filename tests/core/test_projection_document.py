@@ -31,21 +31,27 @@ _INCREMENT_FOUR_SECTIONS = frozenset({"interface_config"})
 _INCREMENT_FIVE_SECTIONS = frozenset({"static_route"})
 
 
-def test_every_section_is_either_document_executed_or_names_its_blocker():
-    """No third state. Manual selection and execution stay equal but distinct concepts."""
+def test_every_section_is_either_document_executed_awaiting_a_sender_or_names_its_blocker():
+    """Three states, no fourth. Manual selection and execution stay equal but distinct."""
     from nso_adapter.core.projection import (
         ACTION_APPLY_EXECUTABLE_SECTIONS,
+        AWAITING_SENDER_SECTIONS,
         DOCUMENT_EXECUTED_SECTIONS,
         LIVE_READ_SECTIONS,
         projection_sections,
     )
 
-    partition = DOCUMENT_EXECUTED_SECTIONS | set(LIVE_READ_SECTIONS)
+    partition = DOCUMENT_EXECUTED_SECTIONS | set(LIVE_READ_SECTIONS) | AWAITING_SENDER_SECTIONS
     assert partition == projection_sections(), (
         f"sections with no disposition: {sorted(projection_sections() - partition)}; "
         f"unknown sections named: {sorted(partition - projection_sections())}"
     )
     assert not (DOCUMENT_EXECUTED_SECTIONS & set(LIVE_READ_SECTIONS)), "a section cannot be both"
+    assert not (DOCUMENT_EXECUTED_SECTIONS & AWAITING_SENDER_SECTIONS), "a section cannot be both"
+    assert not (set(LIVE_READ_SECTIONS) & AWAITING_SENDER_SECTIONS), "a section cannot be both"
+    assert AWAITING_SENDER_SECTIONS == {"switchport", "lag"}, (
+        "the completion pin C9 deletes names exactly the two sections with no device writer"
+    )
     assert all(reason for reason in LIVE_READ_SECTIONS.values()), "every live-read section must state why"
     assert ACTION_APPLY_EXECUTABLE_SECTIONS == DOCUMENT_EXECUTED_SECTIONS, (
         "manual Apply may select exactly the sections that execute from their documents"
@@ -142,6 +148,7 @@ def test_increment_four_sections_are_document_executed():
 def test_increment_five_completes_document_execution():
     from nso_adapter.core.projection import (
         ACTION_APPLY_EXECUTABLE_SECTIONS,
+        AWAITING_SENDER_SECTIONS,
         DOCUMENT_EXECUTED_SECTIONS,
         LIVE_READ_SECTIONS,
         projection_sections,
@@ -151,10 +158,13 @@ def test_increment_five_completes_document_execution():
 
     assert _INCREMENT_FIVE_SECTIONS <= DOCUMENT_EXECUTED_SECTIONS
     assert LIVE_READ_SECTIONS == {}
-    assert ACTION_APPLY_EXECUTABLE_SECTIONS == DOCUMENT_EXECUTED_SECTIONS == projection_sections()
     assert ACTION_APPLY_EXECUTABLE_SECTIONS is DOCUMENT_EXECUTED_SECTIONS
-    assert len(projection_streams()) == 16
-    assert all(stream_section(stream) in ACTION_APPLY_EXECUTABLE_SECTIONS for stream in projection_streams())
+    assert DOCUMENT_EXECUTED_SECTIONS | AWAITING_SENDER_SECTIONS == projection_sections()
+    assert len(projection_sections()) == 16
+    assert len(projection_streams()) == 18
+    assert {
+        stream for stream in projection_streams() if stream_section(stream) not in ACTION_APPLY_EXECUTABLE_SECTIONS
+    } == {"switchport", "lag"}
 
 
 @pytest.mark.parametrize(
@@ -692,6 +702,59 @@ def test_the_two_shared_families_split_their_tables_by_endpoint():
     assert tables("ip") == {"interface_ip_intent"}
     assert tables("isis_flex_algo") == {"isis_flex_algo_intent"}
     assert "isis_flex_algo_intent" not in tables("isis")
+
+
+def test_the_two_out_of_protocol_streams_are_the_only_streams_without_an_endpoint():
+    """Eighteen streams, sixteen receipt lanes: the two exceptions are named, not implied."""
+    from nso_adapter.core.intent_protocol import (
+        INTENT_PUT_ENDPOINTS,
+        INTENT_STREAMS,
+        OUT_OF_PROTOCOL_APPLY_POSTS,
+        OUT_OF_PROTOCOL_STREAMS,
+    )
+    from nso_adapter.core.projection import projection_streams, section_streams, stream_section
+
+    endpoint_streams = {endpoint.stream for endpoint in INTENT_PUT_ENDPOINTS.values()}
+    assert OUT_OF_PROTOCOL_STREAMS == {"switchport", "lag"}
+    assert OUT_OF_PROTOCOL_STREAMS == set(OUT_OF_PROTOCOL_APPLY_POSTS.values())
+    assert not (OUT_OF_PROTOCOL_STREAMS & endpoint_streams), "an Apply POST cannot also be a receipt lane"
+    assert not (OUT_OF_PROTOCOL_STREAMS & INTENT_STREAMS), "admit_push must never admit these two"
+    assert projection_streams() == endpoint_streams | OUT_OF_PROTOCOL_STREAMS
+    assert len(INTENT_STREAMS) == 16
+    for stream in OUT_OF_PROTOCOL_STREAMS:
+        assert stream_section(stream) == stream, "an out-of-protocol stream names its section verbatim"
+        assert section_streams(stream) == (stream,), "an out-of-protocol section is never split"
+
+
+def test_the_switching_identities_come_from_the_schema():
+    """No `identity=`: each switching table has one unique constraint holding its scope."""
+    from nso_adapter.core.projection import _SECTION_TABLES, _identity_fields
+
+    identities = {
+        spec.model.__tablename__: _identity_fields(spec)
+        for section in ("switchport", "lag")
+        for spec in _SECTION_TABLES[section]
+    }
+    assert identities == {
+        "switchport_intent": ("interface_name",),
+        "switchport_tagged_vlan_intent": ("vlan_id",),
+        "lag_bundle_intent": ("name",),
+        "lag_member_intent": ("interface_name",),
+    }
+    assert all(
+        spec.identity is None and spec.discriminator is None and not spec.lifecycle
+        for section in ("switchport", "lag")
+        for spec in _SECTION_TABLES[section]
+    )
+
+
+def test_the_switching_sections_are_registered_before_interface_config():
+    """Registry iteration still ends at interface_config (the #1522 amendment requires it)."""
+    from nso_adapter.core.projection import _SECTION_TABLES
+
+    names = list(_SECTION_TABLES)
+    assert names[-1] == "interface_config"
+    assert names[-3:-1] == ["switchport", "lag"]
 
 
 def test_an_unpaired_family_is_its_own_single_stream():

@@ -120,7 +120,18 @@ _NED_DIALECT_SCOPES: frozenset[str] = frozenset({"route_policy"})
 
 # OSPF/BGP/IS-IS have multi-row applies; interface_config is a compound-key (device,interface)
 # list whose removal PUT-replaces/deletes per-interface instances — all bespoke below.
-VALID_REMOVAL_SCOPES: set[str] = set(_SIMPLE_TARGETS) | {"ospf", "bgp", "isis", "interface_config", "snmp"}
+# switchport and lag have NO dispatch handler and no guard: they are here because
+# projection_sections() refuses any difference between this set and _SECTION_TABLES, and
+# C9 deletes this set outright. Admission refuses them (AWAITING_SENDER_SECTIONS).
+VALID_REMOVAL_SCOPES: set[str] = set(_SIMPLE_TARGETS) | {
+    "ospf",
+    "bgp",
+    "isis",
+    "interface_config",
+    "snmp",
+    "switchport",
+    "lag",
+}
 
 
 class RemovalBlockedError(Exception):
