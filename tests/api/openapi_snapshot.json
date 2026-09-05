@@ -134,7 +134,9 @@
                 "already_authorized",
                 "no_receipt",
                 "backfill_only",
-                "revision_mismatch"
+                "revision_mismatch",
+                "no_prepared_revision",
+                "awaiting_aggregate_sender"
               ],
               "type": "string"
             },
