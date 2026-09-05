@@ -378,6 +378,57 @@ async def test_apply_switchport_refuses_the_request_modes_it_does_not_implement(
 
 
 @pytest.mark.anyio
+async def test_apply_switchport_store_only_accepts_a_deletion_authority_and_records_none(adapter_client):
+    """A store-only replacement replaces the rows and the revision, and prepares nothing."""
+    from sqlalchemy import update
+
+    from nso_adapter.store.models import DeviceProjectionStream
+
+    device_id = await seed_device(nso_device_name="switchport-store-only-roots", netbox_device_id=None)
+    assert (await _post_switchport(adapter_client, device_id, _SWITCHPORT_A)).status_code == 200
+    async with session() as db:
+        authorized = (await _switchport_stream_row(device_id)).prepared_tables
+        await db.execute(
+            update(DeviceProjectionStream)
+            .where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == "switchport",
+            )
+            .values(authorized_document=authorized, authorized_revision=1)
+        )
+        await db.commit()
+
+    response = await _post_switchport(
+        adapter_client,
+        device_id,
+        {"interfaces": [], "deleted_roots": ["Gi0/1"]},
+        query="?store_only=true",
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "status": "stored",
+        "device_id": device_id,
+        "stream": "switchport",
+        "count": 0,
+        "removed": 1,
+        "desired_revision": 2,
+        "selection_revision": None,
+    }
+    row = await _switchport_stream_row(device_id)
+    assert (row.desired_revision, row.authorized_revision, row.prepared_revision) == (2, 1, 1)
+    assert row.authorized_document == authorized
+    async with session() as db:
+        assert (
+            await db.scalar(
+                text("SELECT count(*) FROM switchport_intent WHERE device_id = :device_id"),
+                {"device_id": device_id},
+            )
+            == 0
+        )
+
+
+@pytest.mark.anyio
 async def test_apply_switchport_requires_an_explicit_deletion_authority(adapter_client):
     device_id = await seed_device(nso_device_name="switchport-roots-required", netbox_device_id=None)
 

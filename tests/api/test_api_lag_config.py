@@ -462,8 +462,62 @@ async def test_apply_lag_config_refuses_an_invalid_deletion_authority(adapter_cl
 
 
 @pytest.mark.anyio
-async def test_apply_lag_config_store_only_refuses_a_deletion_authority(adapter_client):
+async def test_apply_lag_config_store_only_accepts_a_deletion_authority_and_records_none(adapter_client):
+    """A store-only replacement replaces the rows and the revision, and prepares nothing."""
+    from sqlalchemy import update
+
+    from nso_adapter.store.models import DeviceProjectionStream
+
     device_id = await seed_device(nso_device_name="lag-store-only-roots", netbox_device_id=None)
+    prepared = await _post_lag(adapter_client, device_id, _PREPARE_A)
+    assert prepared.status_code == 200, prepared.text
+    async with session() as db:
+        # The state an Apply promotion leaves behind, so Port-channel1 is AUTHORIZED.
+        authorized = (await _stream_row(device_id)).prepared_tables
+        await db.execute(
+            update(DeviceProjectionStream)
+            .where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == "lag",
+            )
+            .values(authorized_document=authorized, authorized_revision=1)
+        )
+        await db.commit()
+
+    response = await _post_lag(
+        adapter_client,
+        device_id,
+        {"bundles": [], "deleted_roots": ["Port-channel1"]},
+        query="?store_only=true",
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "status": "stored",
+        "device_id": device_id,
+        "stream": "lag",
+        "count": 0,
+        "removed": 1,
+        "desired_revision": 2,
+        "selection_revision": None,
+    }
+    row = await _stream_row(device_id)
+    assert (row.desired_revision, row.authorized_revision, row.prepared_revision) == (2, 1, 1)
+    assert row.authorized_document == authorized, "a store-only replacement authorizes nothing"
+    assert row.prepared_deletions == {"delete_origin": {}, "detach": {}, "owned_content": {}}
+    async with session() as db:
+        assert (
+            await db.scalar(
+                text("SELECT count(*) FROM lag_bundle_intent WHERE device_id = :device_id"),
+                {"device_id": device_id},
+            )
+            == 0
+        )
+
+
+@pytest.mark.anyio
+async def test_apply_lag_config_store_only_still_validates_the_deletion_authority(adapter_client):
+    device_id = await seed_device(nso_device_name="lag-store-only-invalid-roots", netbox_device_id=None)
 
     response = await _post_lag(
         adapter_client,
@@ -473,7 +527,7 @@ async def test_apply_lag_config_store_only_refuses_a_deletion_authority(adapter_
     )
 
     assert response.status_code == 422
-    assert "store-only" in response.json()["error"]["message"]
+    assert "not authorized" in response.json()["error"]["message"]
     assert await _stream_row(device_id) is None
 
 

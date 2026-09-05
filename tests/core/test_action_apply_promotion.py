@@ -2806,7 +2806,7 @@ async def test_backfill_only_never_answers_for_a_sequence_the_receipt_does_not_h
 _SWITCHING_STREAMS = ["lag", "switchport"]
 
 
-def _lag_body(roots: dict[str, list[int]], *, deleted_roots=(), scalar=None) -> dict:
+def _lag_body(roots: dict[str, list[int]], *, deleted_roots=(), scalar=None, extra=None) -> dict:
     return {
         "bundles": [
             {
@@ -2814,6 +2814,7 @@ def _lag_body(roots: dict[str, list[int]], *, deleted_roots=(), scalar=None) -> 
                 "lag_id": 1,
                 **({"admin_key": scalar} if scalar is not None else {}),
                 "members": [{"interface_name": f"Gi0/{child}"} for child in children],
+                **(extra or {}),
             }
             for name, children in roots.items()
         ],
@@ -2821,13 +2822,14 @@ def _lag_body(roots: dict[str, list[int]], *, deleted_roots=(), scalar=None) -> 
     }
 
 
-def _switchport_body(roots: dict[str, list[int]], *, deleted_roots=(), scalar=None) -> dict:
+def _switchport_body(roots: dict[str, list[int]], *, deleted_roots=(), scalar=None, extra=None) -> dict:
     return {
         "interfaces": [
             {
                 "interface_name": name,
                 **({"mode": scalar} if scalar is not None else {}),
                 "tagged_vlans": list(children),
+                **(extra or {}),
             }
             for name, children in roots.items()
         ],
@@ -2847,6 +2849,7 @@ _SHAPE = {
         "child_field": "interface_name",
         "child": lambda n: f"Gi0/{n}",
         "scalar": 7,
+        "text_leaf": "timer",
     },
     "switchport": {
         "path": "switchport/apply",
@@ -2857,15 +2860,18 @@ _SHAPE = {
         "child_field": "vlan_id",
         "child": lambda n: n,
         "scalar": "trunk",
+        "text_leaf": "mode",
     },
 }
 
 
-async def _prepare(client, device_id: int, stream: str, roots, *, deleted_roots=(), scalar=None, query: str = ""):
+async def _prepare(
+    client, device_id: int, stream: str, roots, *, deleted_roots=(), scalar=None, extra=None, query: str = ""
+):
     shape = _SHAPE[stream]
     return await client.post(
         f"/api/v1/devices/{device_id}/{shape['path']}{query}",
-        json=shape["body"](roots, deleted_roots=deleted_roots, scalar=scalar),
+        json=shape["body"](roots, deleted_roots=deleted_roots, scalar=scalar, extra=extra),
         headers=AUTH,
     )
 
@@ -3473,3 +3479,95 @@ async def test_force_removal_refuses_a_section_awaiting_its_aggregate_sender(ada
     assert response.json()["error"]["detail"] == {"scope": stream, "reason": "awaiting_aggregate_sender"}
     assert await _generations(device_id) == []
     assert await _jobs(device_id) == []
+
+
+# ── review r1: table equality is its own predicate ────────────────────────────
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+@pytest.mark.parametrize(("before", "after"), [(None, ""), ("", None)], ids=["null-to-empty", "empty-to-null"])
+async def test_a_null_to_empty_scalar_change_is_not_wire_equivalent(
+    adapter_client, sender_enabled_sections, stream, before, after
+):
+    """Neither predicate sees it: a clear is not cleared and an empty value is not positive."""
+    from nso_adapter.store.models import GenerationStatus
+
+    leaf = _SHAPE[stream]["text_leaf"]
+    device_id = await seed_device(nso_device_name=f"null-empty-{stream}-{before!r}", netbox_device_id=None)
+    first = (await _prepare(adapter_client, device_id, stream, {"A": [1]}, extra={leaf: before})).json()[
+        "selection_revision"
+    ]
+    assert (await _apply(adapter_client, device_id, {stream: first})).status_code == 202
+    for generation in await _generations(device_id):
+        await _settle(generation.job_id, GenerationStatus.settled)
+    baseline = len(await _generations(device_id))
+
+    changed = (await _prepare(adapter_client, device_id, stream, {"A": [1]}, extra={leaf: after})).json()[
+        "selection_revision"
+    ]
+    response = await _apply(adapter_client, device_id, {stream: changed})
+
+    assert response.status_code == 202, response.text
+    assert len(await _generations(device_id)) == baseline + 1, "a table delta must reach the device"
+    promoted = (await _generations(device_id))[-1]
+    row = next(
+        item
+        for item in promoted.document[stream][_SHAPE[stream]["root_table"]]
+        if item[_SHAPE[stream]["root_field"]] == "A"
+    )
+    assert row[leaf] == after
+
+
+async def test_the_frozen_context_reads_the_ned_id_committed_under_the_lock(
+    adapter_client, sender_enabled_sections, rival_engine
+):
+    """The device row is re-read under the projection lock, never served from the identity map."""
+    from nso_adapter.core.generation import create_action_apply, lock_device_document
+    from nso_adapter.store.apply_attempt_store import begin_apply_attempt
+    from nso_adapter.store.db import get_engine
+    from nso_adapter.store.models import Device
+    from tests.core.test_projection_lock_order import _backend_pid, _wait_for_blocked_query
+
+    device_id = await seed_device(nso_device_name="frozen-context-race", netbox_device_id=None)
+    await _set_ned_id(device_id, "cisco-ios-cli-6.95")
+    revision = (await _prepare(adapter_client, device_id, "lag", {"A": [1]})).json()["selection_revision"]
+    attempt_id = uuid4()
+    async with session() as db:
+        assert await begin_apply_attempt(db, attempt_id, device_id, {"lag": revision}) is None
+        await db.commit()
+
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+    async with session() as writer, rival() as blocker:
+        # The endpoint loads the device BEFORE it takes the projection lock, and keeps the
+        # reference for the whole handler, so the identity map really does hold it.
+        loaded = await writer.get(Device, device_id)
+        assert loaded.ned_id == "cisco-ios-cli-6.95"
+        writer_pid = await _backend_pid(writer)
+        blocker_pid = await _backend_pid(blocker)
+        await lock_device_document(blocker, device_id)
+
+        applying = asyncio.create_task(create_action_apply(writer, device_id, {"lag": revision}, attempt_id))
+        try:
+            await _wait_for_blocked_query(
+                get_engine(),
+                blocker_pid=blocker_pid,
+                waiter_pid=writer_pid,
+                relation="devices",
+                fragments=("from devices", "for no key update"),
+            )
+            assert not applying.done()
+            await blocker.execute(sa.update(Device).where(Device.id == device_id).values(ned_id="timos-nc-23.10"))
+            await blocker.commit()
+            await asyncio.wait_for(applying, timeout=10)
+        finally:
+            if not applying.done():
+                applying.cancel()
+                await asyncio.gather(applying, return_exceptions=True)
+        await writer.commit()
+        assert loaded is not None  # the handler's reference outlives the promotion
+
+    row = await _stream(device_id, "lag")
+    assert row.authorized_document["_execution"]["context"] == {
+        "ned_id": "timos-nc-23.10",
+        "dialect": "nokia_timos",
+    }

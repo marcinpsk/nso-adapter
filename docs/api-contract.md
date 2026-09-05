@@ -2469,8 +2469,9 @@ instead. It is required, an explicit empty list included, and it is validated
 against the AUTHORIZED roots: a repeated root, a root the snapshot still
 carries, and a root this device has not authorized are each a 422 that leaves
 the store and every revision untouched. `?delete_origin=true` and
-`?backfill_only=true` are a 422 here, and a store-only request requires an empty
-`deleted_roots`.
+`?backfill_only=true` are a 422 here. A store-only request validates
+`deleted_roots` the same way and then records no provenance at all, because it
+authorizes nothing.
 
 `count` is the number of bundle roots now stored. `removed` is the number of
 previous bundle roots omitted by the replacement. Non-2xx responses use the

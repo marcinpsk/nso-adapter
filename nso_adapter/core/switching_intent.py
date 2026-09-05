@@ -198,7 +198,9 @@ async def _prepare_snapshot(
     ``note_write`` runs exactly ONCE, with no push sequence, for a normal, an empty, an
     identical and a store-only replacement alike: ``desired_revision`` is what the store
     HOLDS. Only a normal replacement writes the slot; a store-only one preserves it, so an
-    Apply selecting the prepared revision still promotes exactly what was prepared.
+    Apply selecting the prepared revision still promotes exactly what was prepared. A
+    store-only request validates ``deleted_roots`` like any other and then records no
+    provenance at all, because it authorizes nothing.
     """
     from nso_adapter.core.request_flags import STORE_ONLY
 
@@ -208,8 +210,6 @@ async def _prepare_snapshot(
     if duplicates:
         raise SwitchingRequestRefused(f"deleted_roots repeats a root: {duplicates}")
     store_only = STORE_ONLY.get()
-    if store_only and marked:
-        raise SwitchingRequestRefused("a store-only replacement authorizes no deletion, so deleted_roots must be empty")
     kept = sorted(set(marked) & desired_roots)
     if kept:
         raise SwitchingRequestRefused(f"a deleted root is still present in this snapshot: {kept}")
