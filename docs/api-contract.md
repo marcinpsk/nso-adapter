@@ -2473,6 +2473,12 @@ the store and every revision untouched. `?delete_origin=true` and
 `deleted_roots` the same way and then records no provenance at all, because it
 authorizes nothing.
 
+The required `deleted_roots` field and the response fields beside it ship with
+the plugin's switching-delivery change, in the same version: the three
+repositories of this integration move together at 1.0, so there is no
+partial-rollout window and no older client to keep working. A request that omits
+the field is a coding error, and the 422 says so.
+
 `count` is the number of bundle roots now stored. `removed` is the number of
 previous bundle roots omitted by the replacement. Non-2xx responses use the
 standard error envelope.
@@ -2514,9 +2520,9 @@ tagged VLAN values must be unique within the request.
 ```
 
 The POST prepares and the manual Apply authorizes, with the same response
-fields, the same `deleted_roots` rules and the same store-only behaviour as
-`POST .../lag-config/apply` above; `deleted_roots` names switchport interface
-roots. The endpoint stores scalar VLAN values independently of the
+fields, the same `deleted_roots` rules, the same store-only behaviour and the
+same version coupling as `POST .../lag-config/apply` above; `deleted_roots`
+names switchport interface roots. The endpoint stores scalar VLAN values independently of the
 refresh-owned VLAN mirror and does not contact NSO. It creates no receipt,
 generation or job. `count` and `removed` describe top-level switchport roots.
 Non-2xx responses use the standard error envelope.
