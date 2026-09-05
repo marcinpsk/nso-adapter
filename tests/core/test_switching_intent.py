@@ -10,14 +10,16 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import select, text
+from sqlalchemy import update as sa_update
 from sqlalchemy.orm import selectinload
 
-from nso_adapter.core.generation import lock_device_document
+from nso_adapter.core.projection import hydrate_section, snapshot_stream
 from nso_adapter.core.switching_intent import (
     LagBundleSnapshot,
     LagMemberSnapshot,
     SwitchportSnapshot,
-    render_switching_sections,
+    encode_lag_section,
+    encode_switchport_section,
     replace_lag_snapshot,
     replace_switchport_snapshot,
 )
@@ -36,7 +38,7 @@ async def test_lag_replacement_rejects_duplicate_keys_without_mutating_snapshot(
     device_id = await seed_device(nso_device_name="lag-core-validation", netbox_device_id=1612)
     original = LagBundleSnapshot(name="Port-channel1", lag_id=1)
     async with session() as db:
-        await replace_lag_snapshot(db, device_id, (original,))
+        await replace_lag_snapshot(db, device_id, (original,), deleted_roots=[])
         await db.commit()
 
     async with session() as db:
@@ -48,6 +50,7 @@ async def test_lag_replacement_rejects_duplicate_keys_without_mutating_snapshot(
                     LagBundleSnapshot(name="Port-channel2", lag_id=2),
                     LagBundleSnapshot(name="Port-channel2", lag_id=3),
                 ),
+                deleted_roots=[],
             )
         await db.rollback()
 
@@ -76,7 +79,7 @@ async def test_lag_replacement_rejects_invalid_yang_values_before_mutation(adapt
     device_id = await seed_device(nso_device_name=f"lag-core-range-{message}", netbox_device_id=None)
     async with session() as db:
         with pytest.raises(ValueError, match=message):
-            await replace_lag_snapshot(db, device_id, (bundle,))
+            await replace_lag_snapshot(db, device_id, (bundle,), deleted_roots=[])
         await db.rollback()
 
     async with session() as db:
@@ -94,7 +97,7 @@ async def test_lag_replacement_preserves_identity_and_only_clears_evidence_on_ch
     )
     evidence_at = datetime(2026, 8, 1, tzinfo=UTC)
     async with session() as db:
-        await replace_lag_snapshot(db, device_id, (original,))
+        await replace_lag_snapshot(db, device_id, (original,), deleted_roots=[])
         row = await db.scalar(
             select(LagBundleIntent)
             .where(LagBundleIntent.device_id == device_id)
@@ -109,7 +112,7 @@ async def test_lag_replacement_preserves_identity_and_only_clears_evidence_on_ch
         await db.commit()
 
     async with session() as db:
-        await replace_lag_snapshot(db, device_id, (original,))
+        await replace_lag_snapshot(db, device_id, (original,), deleted_roots=[])
         await db.commit()
     async with session() as db:
         unchanged = await db.scalar(
@@ -129,7 +132,7 @@ async def test_lag_replacement_preserves_identity_and_only_clears_evidence_on_ch
         members=(LagMemberSnapshot(interface_name="Gi0/1", mode="active", port_priority=200),),
     )
     async with session() as db:
-        await replace_lag_snapshot(db, device_id, (changed,))
+        await replace_lag_snapshot(db, device_id, (changed,), deleted_roots=[])
         await db.commit()
     async with session() as db:
         row = (
@@ -182,7 +185,7 @@ async def test_switchport_replacement_rejects_invalid_graph_before_mutation(adap
     device_id = await seed_device(nso_device_name=f"switchport-core-{message}", netbox_device_id=None)
     async with session() as db:
         with pytest.raises(ValueError, match=message):
-            await replace_switchport_snapshot(db, device_id, interfaces)
+            await replace_switchport_snapshot(db, device_id, interfaces, deleted_roots=[])
         await db.rollback()
 
     async with session() as db:
@@ -193,7 +196,8 @@ async def test_switchport_replacement_rejects_invalid_graph_before_mutation(adap
 
 
 @pytest.mark.anyio
-async def test_switching_renderer_is_canonical_and_omits_empty_values_and_families(adapter_client):
+async def test_the_encoders_are_canonical_and_omit_empty_values_and_families(adapter_client):
+    """Snapshot -> hydrate -> encode: the wire form is a pure function of the stored rows."""
     device_id = await seed_device(nso_device_name="switching-render", netbox_device_id=1614)
     async with session() as db:
         await replace_lag_snapshot(
@@ -210,6 +214,7 @@ async def test_switching_renderer_is_canonical_and_omits_empty_values_and_famili
                     ),
                 ),
             ),
+            deleted_roots=[],
         )
         await replace_switchport_snapshot(
             db,
@@ -218,42 +223,39 @@ async def test_switching_renderer_is_canonical_and_omits_empty_values_and_famili
                 SwitchportSnapshot(interface_name="Gi0/2", tagged_vlans=(30, 20)),
                 SwitchportSnapshot(interface_name="Gi0/1", mode="access", untagged_vlan=10),
             ),
+            deleted_roots=[],
         )
         await db.commit()
 
+    context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
     async with session() as db:
-        await lock_device_document(db, device_id)
-        rendered = await render_switching_sections(db, device_id)
+        lag_document = {"lag": await snapshot_stream(db, device_id, "lag")}
+        switchport_document = {"switchport": await snapshot_stream(db, device_id, "switchport")}
         counter = await db.get(DeviceGenerationCounter, device_id)
         await db.rollback()
 
-    assert rendered == {
-        "lag": {
-            "bundle": [
-                {
-                    "name": "Port-channel1",
-                    "member": [
-                        {"interface-name": "Gi0/1", "mode": "active"},
-                        {"interface-name": "Gi0/2"},
-                    ],
-                },
-                {"name": "Port-channel2", "lag-id": 7},
-            ]
-        },
-        "switchport": {
-            "interface": [
-                {"interface-name": "Gi0/1", "mode": "access", "untagged-vlan": 10},
-                {"interface-name": "Gi0/2", "tagged-vlan": [20, 30]},
-            ]
-        },
+    assert encode_lag_section(hydrate_section(lag_document, "lag"), context) == {
+        "bundle": [
+            {
+                "name": "Port-channel1",
+                "member": [
+                    {"interface-name": "Gi0/1", "mode": "active"},
+                    {"interface-name": "Gi0/2"},
+                ],
+            },
+            {"name": "Port-channel2", "lag-id": 7},
+        ]
     }
-    assert counter is None
-
-    empty_device_id = await seed_device(nso_device_name="switching-render-empty", netbox_device_id=1615)
-    async with session() as db:
-        await lock_device_document(db, empty_device_id)
-        assert await render_switching_sections(db, empty_device_id) == {}
-        await db.rollback()
+    assert encode_switchport_section(hydrate_section(switchport_document, "switchport"), context) == {
+        "interface": [
+            {"interface-name": "Gi0/1", "mode": "access", "untagged-vlan": 10},
+            {"interface-name": "Gi0/2", "tagged-vlan": [20, 30]},
+        ]
+    }
+    # The preparation takes the projection lock, so the counter row exists after it.
+    assert counter is not None
+    assert encode_lag_section({}, context) == {}
+    assert encode_switchport_section({}, context) == {}
 
 
 @pytest.mark.anyio
@@ -262,7 +264,7 @@ async def test_switchport_replacement_preserves_root_and_retained_tag_identity(a
     original = SwitchportSnapshot(interface_name="Gi0/1", mode="trunk", tagged_vlans=(10, 20))
     evidence_at = datetime(2026, 8, 2, tzinfo=UTC)
     async with session() as db:
-        await replace_switchport_snapshot(db, device_id, (original,))
+        await replace_switchport_snapshot(db, device_id, (original,), deleted_roots=[])
         row = await db.scalar(
             select(SwitchportIntent)
             .where(SwitchportIntent.device_id == device_id)
@@ -277,7 +279,7 @@ async def test_switchport_replacement_preserves_root_and_retained_tag_identity(a
         await db.commit()
 
     async with session() as db:
-        await replace_switchport_snapshot(db, device_id, (original,))
+        await replace_switchport_snapshot(db, device_id, (original,), deleted_roots=[])
         await db.commit()
     async with session() as db:
         unchanged = await db.scalar(
@@ -294,7 +296,7 @@ async def test_switchport_replacement_preserves_root_and_retained_tag_identity(a
 
     changed = SwitchportSnapshot(interface_name="Gi0/1", mode="trunk", tagged_vlans=(20, 30))
     async with session() as db:
-        await replace_switchport_snapshot(db, device_id, (changed,))
+        await replace_switchport_snapshot(db, device_id, (changed,), deleted_roots=[])
         await db.commit()
     async with session() as db:
         row = await db.scalar(
@@ -334,11 +336,13 @@ async def test_replacements_keep_loaded_child_collections_current(adapter_client
                     ),
                 ),
             ),
+            deleted_roots=[],
         )
         await replace_switchport_snapshot(
             db,
             device_id,
             (SwitchportSnapshot(interface_name="Gi0/3", mode="trunk", tagged_vlans=(10, 20)),),
+            deleted_roots=[],
         )
         lag_row = await db.scalar(
             select(LagBundleIntent)
@@ -366,11 +370,13 @@ async def test_replacements_keep_loaded_child_collections_current(adapter_client
                     ),
                 ),
             ),
+            deleted_roots=[],
         )
         await replace_switchport_snapshot(
             db,
             device_id,
             (SwitchportSnapshot(interface_name="Gi0/3", mode="trunk", tagged_vlans=(20, 30)),),
+            deleted_roots=[],
         )
 
         assert {member.interface_name for member in lag_row.members} == {"Gi0/2", "Gi0/4"}
@@ -378,10 +384,149 @@ async def test_replacements_keep_loaded_child_collections_current(adapter_client
         await db.rollback()
 
 
+@pytest.mark.anyio
+async def test_the_encoders_accept_a_fragment_carrying_its_frozen_execution_context(adapter_client):
+    """Hydration ignores ``_execution`` on these two sections, so an encode never sees it."""
+    device_id = await seed_device(nso_device_name="switching-encode-execution", netbox_device_id=1620)
+    async with session() as db:
+        await replace_lag_snapshot(
+            db, device_id, (LagBundleSnapshot(name="Port-channel1", lag_id=1),), deleted_roots=[]
+        )
+        await db.commit()
+    async with session() as db:
+        tables = await snapshot_stream(db, device_id, "lag")
+        await db.rollback()
+
+    context = {"ned_id": None, "dialect": "identity"}
+    rows = hydrate_section({"lag": {**tables, "_execution": {"context": context}}}, "lag")
+
+    assert encode_lag_section(rows, context) == {"bundle": [{"name": "Port-channel1", "lag-id": 1}]}
+
+
+@pytest.mark.anyio
+async def test_a_preparation_records_one_revision_with_no_push_sequence(adapter_client):
+    from nso_adapter.store.models import DeviceProjectionStream
+
+    device_id = await seed_device(nso_device_name="switching-prepare-revision", netbox_device_id=1621)
+    async with session() as db:
+        prepared = await replace_lag_snapshot(
+            db, device_id, (LagBundleSnapshot(name="Port-channel1", lag_id=1),), deleted_roots=[]
+        )
+        await db.commit()
+
+    assert (prepared.status, prepared.stream, prepared.selection_revision) == ("prepared", "lag", 1)
+    async with session() as db:
+        row = await db.scalar(
+            select(DeviceProjectionStream).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == "lag",
+            )
+        )
+    assert (row.desired_revision, row.prepared_revision, row.source_push_seq) == (1, 1, None)
+
+
+@pytest.mark.anyio
+async def test_a_preparation_splits_the_authorized_rows_it_drops_into_three_groups(adapter_client):
+    """Marked root -> delete_origin; unmarked omitted root -> detach; dropped child -> owned_content."""
+    from nso_adapter.store.models import DeviceProjectionStream
+
+    device_id = await seed_device(nso_device_name="switching-provenance", netbox_device_id=1622)
+    authorized = (
+        LagBundleSnapshot(name="A", lag_id=1, members=(LagMemberSnapshot(interface_name="Gi0/1"),)),
+        LagBundleSnapshot(name="B", lag_id=2, members=(LagMemberSnapshot(interface_name="Gi0/2"),)),
+        LagBundleSnapshot(
+            name="C",
+            lag_id=3,
+            members=(LagMemberSnapshot(interface_name="Gi0/3"), LagMemberSnapshot(interface_name="Gi0/4")),
+        ),
+    )
+    async with session() as db:
+        await replace_lag_snapshot(db, device_id, authorized, deleted_roots=[])
+        tables = await snapshot_stream(db, device_id, "lag")
+        # The state an Apply promotion leaves behind: this stream's authorized fragment.
+        await db.execute(
+            sa_update(DeviceProjectionStream)
+            .where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == "lag",
+            )
+            .values(authorized_document=tables)
+        )
+        await db.commit()
+
+    async with session() as db:
+        await replace_lag_snapshot(
+            db,
+            device_id,
+            (LagBundleSnapshot(name="C", lag_id=3, members=(LagMemberSnapshot(interface_name="Gi0/3"),)),),
+            deleted_roots=["A"],
+        )
+        await db.commit()
+
+    async with session() as db:
+        groups = await db.scalar(
+            select(DeviceProjectionStream.prepared_deletions).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == "lag",
+            )
+        )
+
+    assert set(groups) == {"delete_origin", "detach", "owned_content"}
+    assert [item["name"] for item in groups["delete_origin"]["lag_bundle_intent"]] == ["A"]
+    assert [item["interface_name"] for item in groups["delete_origin"]["lag_member_intent"]] == ["Gi0/1"]
+    assert [item["name"] for item in groups["detach"]["lag_bundle_intent"]] == ["B"]
+    assert [item["interface_name"] for item in groups["detach"]["lag_member_intent"]] == ["Gi0/2"]
+    assert [item["interface_name"] for item in groups["owned_content"]["lag_member_intent"]] == ["Gi0/4"]
+    assert "lag_bundle_intent" not in groups["owned_content"], "C stays present and stays owned"
+
+
+@pytest.mark.anyio
+async def test_a_refused_preparation_leaves_the_store_and_every_revision_untouched(adapter_client):
+    from nso_adapter.core.switching_intent import SwitchingRequestRefused
+    from nso_adapter.store.models import DeviceProjectionStream
+
+    device_id = await seed_device(nso_device_name="switching-refusal", netbox_device_id=1623)
+    async with session() as db:
+        await replace_lag_snapshot(
+            db, device_id, (LagBundleSnapshot(name="Port-channel1", lag_id=1),), deleted_roots=[]
+        )
+        await db.commit()
+
+    async with session() as db:
+        with pytest.raises(SwitchingRequestRefused, match="not authorized"):
+            await replace_lag_snapshot(db, device_id, (), deleted_roots=["Port-channel1"])
+        await db.rollback()
+
+    async with session() as db:
+        row = await db.scalar(
+            select(DeviceProjectionStream).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == "lag",
+            )
+        )
+        names = (
+            (await db.execute(select(LagBundleIntent.name).where(LagBundleIntent.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+    assert (row.desired_revision, row.prepared_revision) == (1, 1)
+    assert names == ["Port-channel1"]
+
+
+def test_the_writer_stream_names_are_the_route_registry_names():
+    from nso_adapter.core.intent_protocol import OUT_OF_PROTOCOL_STREAMS
+    from nso_adapter.core.switching_intent import LAG_STREAM, SWITCHPORT_STREAM
+
+    assert {LAG_STREAM, SWITCHPORT_STREAM} == OUT_OF_PROTOCOL_STREAMS
+
+
 def test_obsolete_direct_nso_switching_paths_are_absent():
     repository = Path(__file__).resolve().parents[2]
     assert not (repository / "nso_adapter/core/lag_intent.py").exists()
     assert not (repository / "nso_adapter/core/switchport_intent.py").exists()
+
+    switching_source = (repository / "nso_adapter/core/switching_intent.py").read_text()
+    assert "render_switching_sections" not in switching_source, "the live renderer is replaced by pure encoders"
 
     apply_source = (repository / "nso_adapter/nso/apply.py").read_text()
     apply_tree = ast.parse(apply_source)

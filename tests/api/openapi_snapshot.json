@@ -5585,10 +5585,20 @@
             },
             "title": "Bundles",
             "type": "array"
+          },
+          "deleted_roots": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Deleted Roots",
+            "type": "array"
           }
         },
         "required": [
-          "bundles"
+          "bundles",
+          "deleted_roots"
         ],
         "title": "LagConfigApplyRequest",
         "type": "object"
@@ -8573,10 +8583,14 @@
         "type": "object"
       },
       "StoredIntentResult": {
-        "description": "Truthful result for a claim-less full-snapshot store write.",
+        "description": "Truthful result for a claim-less full-snapshot store write (#1612).\n\n``prepared`` says the snapshot is stored and SELECTABLE by a manual Apply; ``stored``\nsays a store-only replacement landed and prepared nothing. Neither word claims\nauthorization: only Apply authorizes, and only Apply reports deployment.\n``selection_revision`` is the whole selection identity, and it is null for ``stored``.",
         "properties": {
           "count": {
             "title": "Count",
+            "type": "integer"
+          },
+          "desired_revision": {
+            "title": "Desired Revision",
             "type": "integer"
           },
           "device_id": {
@@ -8587,17 +8601,38 @@
             "title": "Removed",
             "type": "integer"
           },
+          "selection_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selection Revision"
+          },
           "status": {
-            "const": "stored",
+            "enum": [
+              "prepared",
+              "stored"
+            ],
             "title": "Status",
+            "type": "string"
+          },
+          "stream": {
+            "title": "Stream",
             "type": "string"
           }
         },
         "required": [
           "status",
           "device_id",
+          "stream",
           "count",
-          "removed"
+          "removed",
+          "desired_revision",
+          "selection_revision"
         ],
         "title": "StoredIntentResult",
         "type": "object"
@@ -8913,6 +8948,15 @@
       "SwitchportApplyRequest": {
         "additionalProperties": false,
         "properties": {
+          "deleted_roots": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Deleted Roots",
+            "type": "array"
+          },
           "interfaces": {
             "items": {
               "$ref": "#/components/schemas/SwitchportApply"
@@ -8922,7 +8966,8 @@
           }
         },
         "required": [
-          "interfaces"
+          "interfaces",
+          "deleted_roots"
         ],
         "title": "SwitchportApplyRequest",
         "type": "object"
