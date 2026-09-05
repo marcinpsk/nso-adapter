@@ -3085,11 +3085,11 @@ async def test_a_no_generation_settlement_stamps_the_selected_revision(adapter_c
 # ── scenario 2: durable mixed deletion and detach ─────────────────────────────
 
 
-async def _authorize(client, device_id: int, stream: str, roots, *, scalar=None):
+async def _authorize(client, device_id: int, stream: str, roots, *, scalar=None, extra=None):
     """Prepare, Apply and settle one snapshot, so its roots become AUTHORIZED."""
     from nso_adapter.store.models import GenerationStatus
 
-    prepared = await _prepare(client, device_id, stream, roots, scalar=scalar)
+    prepared = await _prepare(client, device_id, stream, roots, scalar=scalar, extra=extra)
     assert prepared.status_code == 200, prepared.text
     revision = prepared.json()["selection_revision"]
     response = await _apply(client, device_id, {stream: revision})
@@ -3305,6 +3305,8 @@ async def test_a_companion_apply_generation_carries_the_removal_authority_on_a_d
     """Control 2f: the companion carries the same authority and no one may join its carrier."""
     from nso_adapter.core.generation import (
         advance_generations_locked,
+        executing_generation,
+        job_admissible,
         lock_projection,
     )
     from nso_adapter.store.models import GenerationStatus, Job
@@ -3325,6 +3327,7 @@ async def test_a_companion_apply_generation_carries_the_removal_authority_on_a_d
     assert companion.allowed_removal_keys == authority, "the companion carries the same authority"
     async with session() as db:
         carrier = await db.get(Job, companion.job_id)
+        assert await job_admissible(db, carrier.id, device_id) is False, "the removal link is still the head"
     assert carrier.coalescible is False, "a companion carrying authority takes a dedicated carrier"
 
     await _settle(removal.job_id, GenerationStatus.failed)
@@ -3346,9 +3349,16 @@ async def test_a_companion_apply_generation_carries_the_removal_authority_on_a_d
 
     async with session() as db:
         await lock_projection(db, device_id)
-        await advance_generations_locked(db, device_id)
+        released_carrier = await advance_generations_locked(db, device_id)
         await db.commit()
-    released = next(generation for generation in await _generations(device_id) if generation.id == companion.id)
+
+    # Read the released generation THROUGH its carrier, never by the id we already hold: an
+    # advancement that releases nothing, or the wrong generation, has to fail here.
+    assert released_carrier is not None, "abandoning the blocker must release the companion"
+    async with session() as db:
+        assert await job_admissible(db, released_carrier.id, device_id) is True
+        released = await executing_generation(db, released_carrier.id)
+    assert released is not None and released.id == companion.id
     assert "A" not in _roots_in(released.document, "lag"), "the released generation still omits the deleted root"
     assert released.allowed_removal_keys == authority
 
@@ -3696,3 +3706,37 @@ async def test_an_unrelated_producer_composes_the_authorized_switching_fragment(
         head = await executable_head(db, device_id)
         assert head is not None and head.id == outstanding.id, "the blocked head is the outstanding generation"
         assert later.job_id is None or await job_admissible(db, later.job_id, device_id) is False
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+@pytest.mark.parametrize(("before", "after"), [(None, ""), ("", None)], ids=["null-to-empty", "empty-to-null"])
+async def test_a_retained_root_edit_beside_a_detach_gets_a_networked_intermediate(
+    adapter_client, sender_enabled_sections, stream, before, after
+):
+    """Control 2a: a detach commits no-networking, so the edit needs its own networked link."""
+    from nso_adapter.store.models import GenerationMode
+
+    shape = _SHAPE[stream]
+    leaf = shape["text_leaf"]
+    device_id = await seed_device(nso_device_name=f"edit-detach-{stream}-{before!r}", netbox_device_id=None)
+    await _authorize(adapter_client, device_id, stream, {"A": [1], "B": [2]}, extra={leaf: before})
+    baseline = len(await _generations(device_id))
+
+    revision = (await _prepare(adapter_client, device_id, stream, {"A": [1]}, extra={leaf: after})).json()[
+        "selection_revision"
+    ]
+    response = await _apply(adapter_client, device_id, {stream: revision})
+
+    assert response.status_code == 202, response.text
+    chain = (await _generations(device_id))[baseline:]
+    assert [generation.mode for generation in chain] == [GenerationMode.networked, GenerationMode.detach]
+    intermediate, final = chain
+    assert sorted(_roots_in(intermediate.document, stream)) == ["A", "B"], "the intermediate retains the detached root"
+    assert _roots_in(final.document, stream) == ["A"]
+    for generation in chain:
+        edited = next(
+            item for item in generation.document[stream][shape["root_table"]] if item[shape["root_field"]] == "A"
+        )
+        assert edited[leaf] == after, "the edit rides both documents"
+    assert intermediate.settlement_cohort is not None
+    assert intermediate.settlement_cohort == final.settlement_cohort

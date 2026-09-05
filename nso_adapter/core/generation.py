@@ -711,6 +711,23 @@ def _tables_unchanged(promotion: _Promotion) -> bool:
     return _logical_table_state(promotion.row.authorized_document) == _logical_table_state(promotion.desired)
 
 
+def _retained_tables_changed(promotion: _Promotion) -> bool:
+    """Whether a RETAINED row's intent differs between the authorized and promoted fragments.
+
+    Restricted to identities BOTH fragments carry, so a removed root never reads as an edit.
+    Neither ``positive`` nor the replacement predicate sees a leaf moving between NULL and the
+    empty string, and a detach commits ``no-networking``, so a stream whose only removal work
+    is a detach would carry such an edit out on the final alone and never deliver it.
+    """
+    before = _logical_table_state(promotion.row.authorized_document)
+    after = _logical_table_state(promotion.desired)
+    return any(
+        identity in before.get(table, {}) and before[table][identity] != state
+        for table, rows in after.items()
+        for identity, state in rows.items()
+    )
+
+
 def _wire_equivalent_streams() -> frozenset[str]:
     """Return the streams whose promotion may settle without a generation when nothing changed."""
     from nso_adapter.core.intent_protocol import OUT_OF_PROTOCOL_STREAMS
@@ -758,6 +775,15 @@ def _plan_action_links(
         elif promotion.positive:
             # A removal runner delivers only its selected negative delta. The apply runner
             # delivers every addition and edit in the same promoted stream.
+            apply_streams.add(stream)
+        elif (
+            has_detach
+            and not (has_networked or has_replacement)
+            and promotion.revision is not None
+            and _retained_tables_changed(promotion)
+        ):
+            # Nothing else is scheduled to carry the intermediate document, and the detach
+            # final commits no-networking, so a retained-root edit needs this link to land.
             apply_streams.add(stream)
     if unexecutable:
         raise ApplyUnexecutable(unexecutable)
