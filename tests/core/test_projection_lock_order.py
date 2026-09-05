@@ -301,6 +301,7 @@ async def test_switching_writer_commits_before_real_offboard(adapter_client, riv
                     writer,
                     device_id,
                     (LagBundleSnapshot(name="Port-channel1", lag_id=1),),
+                    deleted_roots=[],
                 )
                 continue_offboard.set()
                 await _wait_for_blocked_query(
@@ -325,10 +326,11 @@ async def test_switching_writer_commits_before_real_offboard(adapter_client, riv
 
 async def test_document_snapshot_waits_for_a_switching_replacement(adapter_client, rival_engine):
     from nso_adapter.core.generation import lock_device_document
+    from nso_adapter.core.projection import hydrate_section, snapshot_stream
     from nso_adapter.core.switching_intent import (
         LagBundleSnapshot,
         LagMemberSnapshot,
-        render_switching_sections,
+        encode_lag_section,
         replace_lag_snapshot,
     )
     from nso_adapter.store.db import get_engine
@@ -349,13 +351,16 @@ async def test_document_snapshot_waits_for_a_switching_replacement(adapter_clien
                     members=(LagMemberSnapshot(interface_name="Gi0/1", mode="active"),),
                 ),
             ),
+            deleted_roots=[],
         )
 
         async def read_document():
             await lock_device_document(reader, device_id)
-            document = await render_switching_sections(reader, device_id)
+            fragment = await snapshot_stream(reader, device_id, "lag")
             await reader.rollback()
-            return document
+            return encode_lag_section(
+                hydrate_section({"lag": fragment}, "lag"), {"ned_id": None, "dialect": "identity"}
+            )
 
         reading = asyncio.create_task(read_document())
         try:
@@ -375,15 +380,13 @@ async def test_document_snapshot_waits_for_a_switching_replacement(adapter_clien
                 await asyncio.gather(reading, return_exceptions=True)
 
     assert document == {
-        "lag": {
-            "bundle": [
-                {
-                    "name": "Port-channel1",
-                    "lag-id": 1,
-                    "member": [{"interface-name": "Gi0/1", "mode": "active"}],
-                }
-            ]
-        }
+        "bundle": [
+            {
+                "name": "Port-channel1",
+                "lag-id": 1,
+                "member": [{"interface-name": "Gi0/1", "mode": "active"}],
+            }
+        ]
     }
 
 
@@ -418,13 +421,13 @@ async def _run_offboard_loser(kind: str, adapter_client, device_id: int):
     if kind == "lag_store":
         return await adapter_client.post(
             f"/api/v1/devices/{device_id}/lag-config/apply",
-            json={"bundles": [{"name": "Port-channel1", "lag_id": 1}]},
+            json={"bundles": [{"name": "Port-channel1", "lag_id": 1}], "deleted_roots": []},
             headers=_AUTH,
         )
     if kind == "switchport_store":
         return await adapter_client.post(
             f"/api/v1/devices/{device_id}/switchport/apply",
-            json={"interfaces": [{"interface_name": "Gi0/1", "untagged_vlan": 10}]},
+            json={"interfaces": [{"interface_name": "Gi0/1", "untagged_vlan": 10}], "deleted_roots": []},
             headers=_AUTH,
         )
     return await adapter_client.post(

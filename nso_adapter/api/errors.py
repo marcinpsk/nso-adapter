@@ -103,12 +103,21 @@ class IntentApplyResult(BaseModel):
 
 
 class StoredIntentResult(BaseModel):
-    """Truthful result for a claim-less full-snapshot store write."""
+    """Truthful result for a claim-less full-snapshot store write (#1612).
 
-    status: Literal["stored"]
+    ``prepared`` says the snapshot is stored and SELECTABLE by a manual Apply; ``stored``
+    says a store-only replacement landed and prepared nothing. Neither word claims
+    authorization: only Apply authorizes, and only Apply reports deployment.
+    ``selection_revision`` is the whole selection identity, and it is null for ``stored``.
+    """
+
+    status: Literal["prepared", "stored"]
     device_id: int
+    stream: str
     count: int
     removed: int
+    desired_revision: int
+    selection_revision: int | None
 
 
 class ApiError(HTTPException):

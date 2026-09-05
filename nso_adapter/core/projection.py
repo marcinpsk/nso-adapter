@@ -280,6 +280,17 @@ def projection_streams() -> frozenset[str]:
     return streams
 
 
+def stream_tables(stream: str) -> tuple[str, ...]:
+    """Return the table names *stream* owns, parents before children.
+
+    Derived from the registry, so a writer that has to walk its own parent/child pair
+    reads the ownership from one place instead of restating it.
+    """
+    if stream not in projection_streams():
+        raise ValueError(f"unknown projection stream {stream!r}")
+    return tuple(spec.model.__tablename__ for spec in _stream_tables()[stream])
+
+
 def stream_section(stream: str) -> str:
     """Return the document section *stream*'s fragment belongs to."""
     if stream not in projection_streams():
@@ -845,4 +856,5 @@ __all__ = [
     "record_interface_execution",
     "snapshot_stream",
     "stream_section",
+    "stream_tables",
 ]
