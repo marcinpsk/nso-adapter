@@ -434,6 +434,37 @@ async def db_session(store_engine, pg_url, tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def sender_enabled_sections(monkeypatch):
+    """Make ``switchport`` and ``lag`` executable for one test process (#1612).
+
+    The two sections sit in ``AWAITING_SENDER_SECTIONS`` until C9's aggregate sender lands,
+    so production Apply refuses to select them. Authorization is not gated on that sender:
+    everything up to and including settlement is testable now, and only actual device
+    transmission is not. This moves the two into ``DOCUMENT_EXECUTED_SECTIONS`` for the
+    duration of one test and restores both sets afterwards.
+    """
+    from nso_adapter.core import projection
+
+    def clear_caches() -> None:
+        for fn in (
+            projection._stream_tables,
+            projection._stream_section,
+            projection.projection_streams,
+            projection.projection_sections,
+        ):
+            fn.cache_clear()
+
+    executed = projection.DOCUMENT_EXECUTED_SECTIONS | projection.AWAITING_SENDER_SECTIONS
+    monkeypatch.setattr(projection, "AWAITING_SENDER_SECTIONS", frozenset())
+    monkeypatch.setattr(projection, "DOCUMENT_EXECUTED_SECTIONS", executed)
+    monkeypatch.setattr(projection, "ACTION_APPLY_EXECUTABLE_SECTIONS", executed)
+    clear_caches()
+    yield
+    monkeypatch.undo()
+    clear_caches()
+
+
+@pytest.fixture
 def fake_nso_client():
     """AsyncMock simulating NsoClient.
 
@@ -647,6 +678,7 @@ async def attach_apply_generation(job_id: int, device_id: int) -> int:
         mark_job_generations_running,
         note_write,
     )
+    from nso_adapter.core.intent_protocol import OUT_OF_PROTOCOL_STREAMS
     from nso_adapter.core.projection import projection_streams
     from nso_adapter.store.models import DeploymentGeneration, GenerationMode, Job, JobStatus
 
@@ -658,7 +690,9 @@ async def attach_apply_generation(job_id: int, device_id: int) -> int:
             return existing
         job = await db.get(Job, job_id)
         assert job is not None and job.device_id == device_id
-        streams = tuple(sorted(projection_streams()))
+        # The receipt lanes only: the two out-of-protocol streams promote a PREPARED slot,
+        # which an intent PUT never writes, so this stand-in has nothing to promote for them.
+        streams = tuple(sorted(projection_streams() - OUT_OF_PROTOCOL_STREAMS))
         for stream in streams:
             await note_write(db, device_id, stream)
         generation = await create_generation(

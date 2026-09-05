@@ -67,6 +67,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.core.projection import (
     EXECUTION_KEY,
     InterfaceEligibilityUnresolved,
+    fragment_context,
+    fragment_tables,
+    freeze_fragment,
     is_intent_deletion,
     projection_row_state,
     projection_streams,
@@ -484,12 +487,23 @@ async def _promote_static_route_clears(db: AsyncSession, device_id: int) -> None
 
 class _Promotion(NamedTuple):
     row: DeviceProjectionStream
-    receipt: IntentPushReceipt
+    receipt: IntentPushReceipt | None
     desired: dict
     networked: dict[str, list[dict]]
     detached: dict[str, list[dict]]
     replacement: dict[str, list[dict]]
     positive: bool
+    #: The revision an out-of-protocol selection resolved to, and ``None`` for a receipt
+    #: lane, whose promotion always carries the stream's whole ``desired_revision``.
+    revision: int | None = None
+
+
+class _Selection(NamedTuple):
+    """One resolved selected stream: its row, its receipt lane, and its prepared revision."""
+
+    row: DeviceProjectionStream
+    receipt: IntentPushReceipt | None
+    revision: int | None
 
 
 class _RemovalLink(NamedTuple):
@@ -499,12 +513,129 @@ class _RemovalLink(NamedTuple):
     replacement: dict[str, list[dict]]
 
 
+async def _authorized_generation_detail(db: AsyncSession, device_id: int, stream: str, revision: int) -> dict | None:
+    """Return the unsettled generation that already carries *revision*, as response detail."""
+    generation = await db.scalar(
+        select(DeploymentGeneration)
+        .where(
+            DeploymentGeneration.device_id == device_id,
+            DeploymentGeneration.status != GenerationStatus.settled,
+            DeploymentGeneration.stream_revisions[stream].as_string() == str(revision),
+        )
+        .order_by(DeploymentGeneration.seq)
+        .limit(1)
+    )
+    if generation is None:
+        return None
+    return {"generation_id": generation.id, "seq": generation.seq, "status": generation.status.value}
+
+
+def _resolve_prepared_selection(row: DeviceProjectionStream | None, revision: int) -> str | None:
+    """Return the skip reason for an out-of-protocol selection, or ``None`` to select it.
+
+    The selection identity is the prepared revision, not a push sequence: these two streams
+    carry no receipt. The order matters — an already applied or already authorized revision
+    must name itself rather than read as a missing preparation.
+    """
+    if row is None or row.prepared_revision is None:
+        return "no_prepared_revision"
+    if revision <= row.applied_revision:
+        return "already_applied"
+    if revision < row.authorized_revision:
+        return "superseded"
+    if revision == row.authorized_revision:
+        return "already_authorized"
+    if revision == row.prepared_revision:
+        return None
+    if revision < row.prepared_revision:
+        return "superseded"
+    return "no_prepared_revision"
+
+
+def _prepared_deletions(groups: dict | None) -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
+    """Split a preparation's persisted marking groups into networked and detach work.
+
+    ``owned_content`` is networked work in its own right: the root stays present and stays
+    owned, so no marking is possible, and the planner must still schedule an intermediate
+    that stops asserting the child.
+    """
+    resolved = groups or {}
+    networked: dict[str, list[dict]] = {}
+    for group in ("delete_origin", "owned_content"):
+        for table, rows in sorted((resolved.get(group) or {}).items()):
+            networked.setdefault(table, []).extend(deepcopy(rows))
+    return networked, deepcopy(resolved.get("detach") or {})
+
+
+def _switching_removal_keys(
+    stream: str, authorized_tables: dict[str, list[dict]], networked: dict[str, list[dict]]
+) -> dict[str, list]:
+    """Return the scope-qualified removal authority for one stream's networked omissions.
+
+    The identities come from the AUTHORIZED tables, because an owned-content child's root is
+    retained and so is absent from the networked rows: indexing the group alone could not
+    resolve the parent prefix. The label carries the scope, so two switching scopes selected
+    by one Apply cannot collide in the union.
+    """
+    section = stream_section(stream)
+    keys: dict[str, list] = {}
+    for table, rows in sorted(networked.items()):
+        removed_ids = {row.get("id") for row in rows}
+        identities = sorted(
+            identity
+            for identity, row in rows_by_intent_identity(authorized_tables, table).items()
+            if row.get("id") in removed_ids
+        )
+        if identities:
+            keys[f"{section}/{table}"] = [list(identity) for identity in identities]
+    return keys
+
+
+async def _resolve_receipt_selection(
+    db: AsyncSession,
+    device_id: int,
+    stream: str,
+    push_seq: int,
+    row: DeviceProjectionStream | None,
+    receipt: IntentPushReceipt | None,
+) -> tuple[_Selection | None, str | None, dict | None]:
+    """Resolve one receipt lane's selection, or the reason that selection is stale."""
+    if receipt is None or row is None:
+        return None, "no_receipt", None
+    if push_seq < receipt.push_seq:
+        return None, "superseded", None
+    if receipt.push_seq != push_seq:
+        return None, "no_receipt", None
+    # The receipt holds the selected sequence, so no client retry can turn it into a
+    # promotion: a backfill repairs correlation and authorizes no device work.
+    if receipt.backfill_only:
+        return None, "backfill_only", None
+    if row.source_push_seq != push_seq:
+        return None, "revision_mismatch", None
+    if row.desired_revision <= row.applied_revision:
+        return None, "already_applied", None
+    if row.authorized_revision >= row.desired_revision:
+        detail = await _authorized_generation_detail(db, device_id, stream, row.authorized_revision)
+        if detail is not None:
+            return None, "already_authorized", detail
+        await db.refresh(row, attribute_names=["desired_revision", "authorized_revision", "applied_revision"])
+        if row.authorized_revision >= row.desired_revision and row.applied_revision >= row.authorized_revision:
+            return None, "already_authorized", None
+        raise RuntimeError(
+            f"device {device_id} stream {stream!r} revision {row.authorized_revision} "
+            "is authorized but has no unsettled generation"
+        )
+    return _Selection(row, receipt, None), None, None
+
+
 async def _selected_promotions(
     db: AsyncSession,
     device_id: int,
     selected: dict[str, int],
-) -> tuple[dict[str, tuple[DeviceProjectionStream, IntentPushReceipt]], dict[str, str], dict[str, dict]]:
-    """Resolve exact selected receipts and report every stale selection."""
+) -> tuple[dict[str, _Selection], dict[str, str], dict[str, dict]]:
+    """Resolve exact selected receipts and prepared snapshots, and report every stale selection."""
+    from nso_adapter.core.intent_protocol import OUT_OF_PROTOCOL_STREAMS
+    from nso_adapter.core.projection import AWAITING_SENDER_SECTIONS
     from nso_adapter.core.receipt import latest_receipts
 
     rows = {
@@ -522,80 +653,64 @@ async def _selected_promotions(
             .all()
         )
     }
-    promotable: dict[str, tuple[DeviceProjectionStream, IntentPushReceipt]] = {}
+    promotable: dict[str, _Selection] = {}
     skipped: dict[str, str] = {}
     skipped_detail: dict[str, dict] = {}
-    receipts = await latest_receipts(db, device_id, selected)
-    for stream, push_seq in sorted(selected.items()):
+    keyed = {stream: value for stream, value in selected.items() if stream not in OUT_OF_PROTOCOL_STREAMS}
+    receipts = await latest_receipts(db, device_id, keyed)
+    for stream, selector in sorted(selected.items()):
         row = rows.get(stream)
-        receipt = receipts.get(stream)
-        if receipt is None or row is None:
-            skipped[stream] = "no_receipt"
+        if stream_section(stream) in AWAITING_SENDER_SECTIONS:
+            # No device writer yet, so the section is unselectable and never reaches a job.
+            skipped[stream] = "awaiting_aggregate_sender"
             continue
-        if push_seq < receipt.push_seq:
-            skipped[stream] = "superseded"
-            continue
-        if receipt.push_seq != push_seq:
-            skipped[stream] = "no_receipt"
-            continue
-        # The receipt holds the selected sequence, so no client retry can turn it into a
-        # promotion: a backfill repairs correlation and authorizes no device work.
-        if receipt.backfill_only:
-            skipped[stream] = "backfill_only"
-            continue
-        if row.source_push_seq != push_seq:
-            skipped[stream] = "revision_mismatch"
-            continue
-        if row.desired_revision <= row.applied_revision:
-            skipped[stream] = "already_applied"
-            continue
-        if row.authorized_revision >= row.desired_revision:
-            generation = await db.scalar(
-                select(DeploymentGeneration)
-                .where(
-                    DeploymentGeneration.device_id == device_id,
-                    DeploymentGeneration.status != GenerationStatus.settled,
-                    DeploymentGeneration.stream_revisions[stream].as_string() == str(row.authorized_revision),
-                )
-                .order_by(DeploymentGeneration.seq)
-                .limit(1)
+        if stream in OUT_OF_PROTOCOL_STREAMS:
+            reason = _resolve_prepared_selection(row, selector)
+            selection = _Selection(row, None, selector) if reason is None else None
+            detail = (
+                await _authorized_generation_detail(db, device_id, stream, selector)
+                if reason == "already_authorized"
+                else None
             )
-            if generation is None:
-                await db.refresh(
-                    row,
-                    attribute_names=["desired_revision", "authorized_revision", "applied_revision"],
-                )
-                if row.authorized_revision >= row.desired_revision and row.applied_revision >= row.authorized_revision:
-                    skipped[stream] = "already_authorized"
-                    continue
-                raise RuntimeError(
-                    f"device {device_id} stream {stream!r} revision {row.authorized_revision} "
-                    "is authorized but has no unsettled generation"
-                )
-            skipped[stream] = "already_authorized"
-            skipped_detail[stream] = {
-                "generation_id": generation.id,
-                "seq": generation.seq,
-                "status": generation.status.value,
-            }
+        else:
+            selection, reason, detail = await _resolve_receipt_selection(
+                db, device_id, stream, selector, row, receipts.get(stream)
+            )
+        if selection is not None:
+            promotable[stream] = selection
             continue
-        promotable[stream] = (row, receipt)
+        skipped[stream] = reason
+        if detail is not None:
+            skipped_detail[stream] = detail
     return promotable, skipped, skipped_detail
+
+
+def _wire_equivalent_streams() -> frozenset[str]:
+    """Return the streams whose promotion may settle without a generation when nothing changed."""
+    from nso_adapter.core.intent_protocol import OUT_OF_PROTOCOL_STREAMS
+
+    return frozenset({"static_route"}) | OUT_OF_PROTOCOL_STREAMS
 
 
 def _plan_action_links(
     promotions: dict[str, _Promotion],
 ) -> tuple[list[_RemovalLink], list[_RemovalLink], set[str], set[str]]:
+    from nso_adapter.core.intent_protocol import INTENT_STREAMS
+
     networked_links: list[_RemovalLink] = []
     detach_links: list[_RemovalLink] = []
     apply_streams: set[str] = set()
     wire_equivalent_streams: set[str] = set()
+    settleable = _wire_equivalent_streams()
     unexecutable: dict[str, str] = {}
     for stream, promotion in promotions.items():
         has_networked = any(promotion.networked.values())
         has_detach = any(promotion.detached.values())
         has_replacement = any(promotion.replacement.values())
-        if has_detach and has_replacement:
+        # Gated to the sixteen receipt lanes: for the two switching streams a retained-root
+        # clear beside a detach IS deliverable, as a networked intermediate that retains the
+        # detached root and carries the clear, followed by the detach final.
+        if has_detach and has_replacement and stream in INTENT_STREAMS:
             unexecutable[stream] = "mixed_detach_replacement"
             continue
         if has_networked or has_replacement:
@@ -605,7 +720,7 @@ def _plan_action_links(
         if has_detach:
             detach_links.append(_RemovalLink(stream, GenerationMode.detach, promotion.detached, {}))
         if not (has_networked or has_detach or has_replacement):
-            if stream == "static_route" and not promotion.positive:
+            if stream in settleable and not promotion.positive:
                 wire_equivalent_streams.add(stream)
             else:
                 apply_streams.add(stream)
@@ -633,6 +748,9 @@ async def _can_settle_wire_equivalent(
         return False
     if _has_pending_static_route_clear(promotion.desired):
         return False
+    # A pure context change over identical tables is a different deployment, not a no-op.
+    if fragment_context(promotion.desired) != fragment_context(promotion.row.authorized_document):
+        return False
     predecessor_id = await db.scalar(
         select(DeploymentGeneration.id)
         .where(
@@ -646,9 +764,14 @@ async def _can_settle_wire_equivalent(
 
 
 def _settle_wire_equivalent(promotion: _Promotion) -> None:
-    """Advance one renderer-equivalent stream while retaining its complete metadata."""
-    promotion.row.authorized_revision = promotion.row.desired_revision
-    promotion.row.applied_revision = promotion.row.desired_revision
+    """Advance one renderer-equivalent stream while retaining its complete metadata.
+
+    Stamps the RESOLVED selected revision, never ``desired_revision``: a store-only write
+    behind an out-of-protocol selection stays unselectable and unapplied.
+    """
+    revision = promotion.revision if promotion.revision is not None else promotion.row.desired_revision
+    promotion.row.authorized_revision = revision
+    promotion.row.applied_revision = revision
     promotion.row.authorized_document = deepcopy(promotion.desired)
     promotion.row.updated_at = _now()
 
@@ -662,6 +785,8 @@ async def _enqueue_action_removal_links(
     cohort: int | None,
     intermediate_document: dict,
     final_document: dict,
+    removal_authority: dict[str, list],
+    frozen_fragments: dict[str, dict],
 ) -> list[DeploymentGeneration]:
     from nso_adapter.core.removal import PromotionInterfaceUnresolved, enqueue_removal, promotion_removal_context
     from nso_adapter.core.request_flags import DELETE_ORIGIN_MARKING, DETACH_MARKING
@@ -686,6 +811,10 @@ async def _enqueue_action_removal_links(
             from nso_adapter.core.static_route_plan import promotion_removal_keys
 
             allowed_removal_keys = promotion_removal_keys(link.removed)
+        if link.mode is GenerationMode.networked:
+            # Every generation carrying the shared intermediate document omits the same rows,
+            # so it must carry the same authority; a detach link carries the final and none.
+            allowed_removal_keys = {**(allowed_removal_keys or {}), **removal_authority}
         marking = DELETE_ORIGIN_MARKING if link.mode is GenerationMode.networked and link.removed else None
         if link.mode is GenerationMode.detach:
             marking = DETACH_MARKING
@@ -707,6 +836,7 @@ async def _enqueue_action_removal_links(
             shrank=bool(link.removed),
             document=intermediate_document if link.mode is GenerationMode.networked else final_document,
             apply_attempt_id=apply_attempt_id,
+            frozen_fragments=frozen_fragments,
         )
         generation = await db.scalar(
             select(DeploymentGeneration).where(DeploymentGeneration.job_id == job.id).order_by(DeploymentGeneration.seq)
@@ -725,23 +855,37 @@ async def _enqueue_action_apply_job(
     apply_attempt_id: UUID,
     document: dict,
     cohort: int | None,
+    removal_authority: dict[str, list],
+    frozen_fragments: dict[str, dict],
 ) -> DeploymentGeneration:
-    from nso_adapter.core.jobs import admit_coalescible_job
+    """Create the companion Apply generation and give it a carrier.
+
+    It shares the intermediate document with the removal links, so it omits the same rows and
+    carries the same authority. A companion that carries authority takes a DEDICATED carrier:
+    an unrelated auto-Apply may otherwise join the coalescible one and execute the shared
+    document with an empty authority, which is exactly what the device-wide guard blocks.
+    """
+    from nso_adapter.core.jobs import admit_coalescible_job, create_dedicated_job
 
     generation = await create_generation(
         db,
         device_id,
         streams=tuple(sorted(streams)),
         mode=GenerationMode.networked,
+        allowed_removal_keys=dict(removal_authority) or None,
         document=document,
         settlement_cohort=cohort,
         apply_attempt_id=apply_attempt_id,
+        frozen_fragments=frozen_fragments,
     )
-    created, winner = await admit_coalescible_job(db, device_id, JobType.apply)
-    if winner is not None:
-        raise ApplyJobConflict(winner.id)
-    if created is None:  # pragma: no cover - bounded admission retries exhausted
-        raise RuntimeError(f"could not admit an apply job for device {device_id}")
+    if removal_authority:
+        created = await create_dedicated_job(db, device_id, JobType.apply)
+    else:
+        created, winner = await admit_coalescible_job(db, device_id, JobType.apply)
+        if winner is not None:
+            raise ApplyJobConflict(winner.id)
+        if created is None:  # pragma: no cover - bounded admission retries exhausted
+            raise RuntimeError(f"could not admit an apply job for device {device_id}")
     await require_attach_to_job(db, generation, created)
     return generation
 
@@ -772,21 +916,32 @@ async def create_action_apply(
         await _promote_static_route_clears(db, device_id)
 
     authorized = await _authorized_fragments(db, device_id)
+    device = await db.get(Device, device_id)
+    if device is None:  # pragma: no cover - lock_projection proved the device exists
+        raise DeviceProjectionGone(f"device {device_id} no longer exists")
     promotions: dict[str, _Promotion] = {}
     intermediate_fragments: dict[str, dict] = {}
-    for stream, (row, receipt) in selected_rows.items():
-        desired = await snapshot_stream(db, device_id, stream)
-        networked, detached = _fragment_deletions(row.authorized_document, desired, receipt)
-        replacement = _content_losing_rows(row.authorized_document, desired)
-        promotions[stream] = _Promotion(
-            row,
-            receipt,
-            desired,
-            networked,
-            detached,
-            replacement,
-            _has_positive_delta(row.authorized_document, desired),
-        )
+    frozen_fragments: dict[str, dict] = {}
+    removal_authority: dict[str, list] = {}
+    for stream, selection in selected_rows.items():
+        row, receipt, revision = selection
+        if revision is None:
+            desired = await snapshot_stream(db, device_id, stream)
+            networked, detached = _fragment_deletions(row.authorized_document, desired, receipt)
+            replacement = _content_losing_rows(row.authorized_document, desired)
+            positive = _has_positive_delta(row.authorized_document, desired)
+        else:
+            # The prepared snapshot is frozen ONCE here, and this fragment is what every
+            # link of the chain and the stored authorized document use.
+            tables = row.prepared_tables or {}
+            desired = freeze_fragment(tables, device)
+            frozen_fragments[stream] = desired
+            authorized_tables = fragment_tables(row.authorized_document)
+            networked, detached = _prepared_deletions(row.prepared_deletions)
+            replacement = _content_losing_rows(authorized_tables, tables)
+            positive = _has_positive_delta(authorized_tables, tables)
+            removal_authority.update(_switching_removal_keys(stream, authorized_tables, networked))
+        promotions[stream] = _Promotion(row, receipt, desired, networked, detached, replacement, positive, revision)
         intermediate_fragments[stream] = _retain_rows(desired, detached)
 
     final_fragments = dict(authorized)
@@ -814,6 +969,8 @@ async def create_action_apply(
         cohort=cohort,
         intermediate_document=intermediate_document,
         final_document=final_document,
+        removal_authority=removal_authority,
+        frozen_fragments=frozen_fragments,
     )
 
     if apply_streams:
@@ -824,6 +981,8 @@ async def create_action_apply(
             apply_attempt_id=apply_attempt_id,
             document=intermediate_document,
             cohort=cohort,
+            removal_authority=removal_authority,
+            frozen_fragments=frozen_fragments,
         )
         generations.append(generation)
 
@@ -836,11 +995,14 @@ async def create_action_apply(
             cohort=cohort,
             intermediate_document=intermediate_document,
             final_document=final_document,
+            removal_authority={},
+            frozen_fragments=frozen_fragments,
         )
     )
 
     for promotion in promotions.values():
-        consume_promotion_provenance(promotion.receipt)
+        if promotion.receipt is not None:
+            consume_promotion_provenance(promotion.receipt)
     await db.flush()
     return ActionApplyResult(generations, skipped, skipped_detail)
 
@@ -857,6 +1019,7 @@ async def create_generation(
     settlement_cohort: int | None = None,
     static_route_tombstone_ids: tuple[int, ...] = (),
     apply_attempt_id: UUID | None = None,
+    frozen_fragments: dict[str, dict] | None = None,
 ) -> DeploymentGeneration:
     """Promote *streams* and store the immutable generation they authorize. Caller commits.
 
@@ -867,7 +1030,13 @@ async def create_generation(
     *document* overrides the composition below with a complete document built elsewhere — the
     seam #1522's aggregate device-intent builder plugs into. *removal_context* is the job
     context a removal's generation must keep so a retry can rebuild the job that executes it.
+
+    *frozen_fragments* carries the already-frozen fragment of every out-of-protocol stream
+    named in *streams*. Those two streams promote their PREPARED slot, never a fresh
+    snapshot: the store-only isolation point is exactly that the live rows are not read here,
+    and the freeze happened once, in the Apply that resolved the selection.
     """
+    from nso_adapter.core.intent_protocol import OUT_OF_PROTOCOL_STREAMS
     from nso_adapter.core.request_flags import STORE_ONLY
 
     if STORE_ONLY.get():
@@ -878,7 +1047,33 @@ async def create_generation(
 
     stream_revisions: dict[str, int] = {}
     source_push_seq: dict[str, int | None] = {}
+    promoted: dict[str, dict] = {}
     for stream in sorted(set(streams)):
+        if stream in OUT_OF_PROTOCOL_STREAMS:
+            fragment = (frozen_fragments or {}).get(stream)
+            if fragment is None:
+                raise RuntimeError(
+                    f"device {device_id} stream {stream!r} promotes its frozen prepared fragment; none was given"
+                )
+            prepared = (
+                await db.execute(
+                    sa_update(DeviceProjectionStream)
+                    .where(
+                        DeviceProjectionStream.device_id == device_id,
+                        DeviceProjectionStream.stream == stream,
+                        DeviceProjectionStream.prepared_revision.is_not(None),
+                    )
+                    .values(authorized_revision=DeviceProjectionStream.prepared_revision, updated_at=_now())
+                    .returning(DeviceProjectionStream.prepared_revision)
+                    .execution_options(synchronize_session=False)
+                )
+            ).one_or_none()
+            if prepared is None:
+                raise RuntimeError(f"device {device_id} stream {stream!r} has no prepared snapshot to promote")
+            stream_revisions[stream] = prepared.prepared_revision
+            source_push_seq[stream] = None
+            promoted[stream] = deepcopy(fragment)
+            continue
         row = (
             await db.execute(
                 sa_update(DeviceProjectionStream)
@@ -895,8 +1090,8 @@ async def create_generation(
             raise RuntimeError(f"device {device_id} stream {stream!r} has no accepted write to promote")
         stream_revisions[stream] = row.desired_revision
         source_push_seq[stream] = row.source_push_seq
+        promoted[stream] = await snapshot_stream(db, device_id, stream)
 
-    promoted = {stream: await snapshot_stream(db, device_id, stream) for stream in sorted(stream_revisions)}
     # The promoted streams become the new last-authorized fragments, so the NEXT generation of
     # any other lane composes THIS state in rather than whatever the store drifts to.
     for stream, fragment in promoted.items():

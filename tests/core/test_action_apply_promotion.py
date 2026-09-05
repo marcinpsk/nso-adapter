@@ -2245,6 +2245,8 @@ async def test_promoted_static_route_detach_fails_when_proof_is_inconclusive(ada
             cohort=None,
             intermediate_document=document,
             final_document=document,
+            removal_authority={},
+            frozen_fragments={},
         )
         await complete_apply_attempt(
             db,
@@ -2792,5 +2794,682 @@ async def test_backfill_only_never_answers_for_a_sequence_the_receipt_does_not_h
 
     assert response.status_code == 200, response.text
     assert response.json()["skipped"] == {"static_route": expected}
+    assert await _generations(device_id) == []
+    assert await _jobs(device_id) == []
+
+
+# ── #1612: the two out-of-protocol switching streams ──────────────────────────
+#
+# The POST prepares and Apply authorizes. Every case runs through the real app and the real
+# store, parametrized over both streams: the two differ only in their wire shape.
+
+_SWITCHING_STREAMS = ["lag", "switchport"]
+
+
+def _lag_body(roots: dict[str, list[int]], *, deleted_roots=(), scalar=None) -> dict:
+    return {
+        "bundles": [
+            {
+                "name": name,
+                "lag_id": 1,
+                **({"admin_key": scalar} if scalar is not None else {}),
+                "members": [{"interface_name": f"Gi0/{child}"} for child in children],
+            }
+            for name, children in roots.items()
+        ],
+        "deleted_roots": list(deleted_roots),
+    }
+
+
+def _switchport_body(roots: dict[str, list[int]], *, deleted_roots=(), scalar=None) -> dict:
+    return {
+        "interfaces": [
+            {
+                "interface_name": name,
+                **({"mode": scalar} if scalar is not None else {}),
+                "tagged_vlans": list(children),
+            }
+            for name, children in roots.items()
+        ],
+        "deleted_roots": list(deleted_roots),
+    }
+
+
+#: Per-stream wire shape. ``scalar`` is a retained-root leaf a preparation can CLEAR, which
+#: is a table delta that is not positive (contract control 1c).
+_SHAPE = {
+    "lag": {
+        "path": "lag-config/apply",
+        "body": _lag_body,
+        "root_table": "lag_bundle_intent",
+        "child_table": "lag_member_intent",
+        "root_field": "name",
+        "child_field": "interface_name",
+        "child": lambda n: f"Gi0/{n}",
+        "scalar": 7,
+    },
+    "switchport": {
+        "path": "switchport/apply",
+        "body": _switchport_body,
+        "root_table": "switchport_intent",
+        "child_table": "switchport_tagged_vlan_intent",
+        "root_field": "interface_name",
+        "child_field": "vlan_id",
+        "child": lambda n: n,
+        "scalar": "trunk",
+    },
+}
+
+
+async def _prepare(client, device_id: int, stream: str, roots, *, deleted_roots=(), scalar=None, query: str = ""):
+    shape = _SHAPE[stream]
+    return await client.post(
+        f"/api/v1/devices/{device_id}/{shape['path']}{query}",
+        json=shape["body"](roots, deleted_roots=deleted_roots, scalar=scalar),
+        headers=AUTH,
+    )
+
+
+def _roots_in(document: dict, stream: str) -> list:
+    shape = _SHAPE[stream]
+    section = document.get(stream) or {}
+    return [row[shape["root_field"]] for row in section.get(shape["root_table"], [])]
+
+
+def _children_in(document: dict, stream: str) -> list:
+    shape = _SHAPE[stream]
+    section = document.get(stream) or {}
+    return [row[shape["child_field"]] for row in section.get(shape["child_table"], [])]
+
+
+async def _live_roots(device_id: int, stream: str) -> list:
+    shape = _SHAPE[stream]
+    async with session() as db:
+        return list(
+            (
+                await db.execute(
+                    sa.text(
+                        f"SELECT {shape['root_field']} FROM {shape['root_table']} "
+                        "WHERE device_id = :device_id ORDER BY id"
+                    ),
+                    {"device_id": device_id},
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+async def _set_ned_id(device_id: int, ned_id: str | None) -> None:
+    from nso_adapter.store.models import Device
+
+    async with session() as db:
+        await db.execute(sa.update(Device).where(Device.id == device_id).values(ned_id=ned_id))
+        await db.commit()
+
+
+async def _receipts(device_id: int) -> int:
+    from nso_adapter.store.models import IntentPushReceipt
+
+    async with session() as db:
+        return await db.scalar(
+            sa.select(sa.func.count()).select_from(IntentPushReceipt).where(IntentPushReceipt.device_id == device_id)
+        )
+
+
+# ── scenario 1: a prepared snapshot survives a store-only overwrite ───────────
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+async def test_a_prepared_snapshot_survives_a_store_only_overwrite(adapter_client, sender_enabled_sections, stream):
+    from nso_adapter.store.models import GenerationStatus
+
+    device_id = await seed_device(nso_device_name=f"prep-store-only-{stream}", netbox_device_id=None)
+    prepared = await _prepare(adapter_client, device_id, stream, {"A": [1]})
+    assert prepared.json()["status"] == "prepared"
+    revision = prepared.json()["selection_revision"]
+    stored = await _prepare(adapter_client, device_id, stream, {"B": [2]}, query="?store_only=true")
+    assert stored.json() == {**stored.json(), "status": "stored", "selection_revision": None}
+
+    row = await _stream(device_id, stream)
+    assert (row.prepared_revision, row.desired_revision, row.authorized_revision) == (revision, revision + 1, 0)
+    assert "_execution" not in row.prepared_tables
+    assert await _live_roots(device_id, stream) == ["B"]
+
+    response = await _apply(adapter_client, device_id, {stream: revision})
+
+    assert response.status_code == 202, response.text
+    assert response.json()["skipped"] == {}
+    generations = await _generations(device_id)
+    assert generations, "the prepared snapshot promotes"
+    for generation in generations:
+        assert generation.stream_revisions[stream] == revision
+        assert generation.source_push_seq[stream] is None
+        assert _roots_in(generation.document, stream) == ["A"], "the composed section is what was prepared"
+    assert await _live_roots(device_id, stream) == ["B"], "the live rows stay the store-only replacement"
+    row = await _stream(device_id, stream)
+    assert (row.desired_revision, row.authorized_revision, row.prepared_revision) == (revision + 1, revision, revision)
+    assert await _receipts(device_id) == 0, "these two streams carry no receipt"
+
+    for generation in generations:
+        await _settle(generation.job_id, GenerationStatus.settled)
+    row = await _stream(device_id, stream)
+    assert row.applied_revision == revision
+    assert row.prepared_revision == revision, "the slot survives until the next normal preparation"
+
+    superseded = await _apply(adapter_client, device_id, {stream: revision + 1})
+    assert superseded.json()["skipped"] == {stream: "no_prepared_revision"}
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+async def test_the_execution_context_is_frozen_at_authorization_not_at_preparation(
+    adapter_client, sender_enabled_sections, stream
+):
+    """Control 1a: the NED id in the authorized fragment is the one read by Apply."""
+    device_id = await seed_device(nso_device_name=f"freeze-time-{stream}", netbox_device_id=None)
+    await _set_ned_id(device_id, "cisco-ios-cli-6.95")
+    revision = (await _prepare(adapter_client, device_id, stream, {"A": [1]})).json()["selection_revision"]
+    await _set_ned_id(device_id, "timos-nc-23.10")
+
+    assert (await _apply(adapter_client, device_id, {stream: revision})).status_code == 202
+
+    row = await _stream(device_id, stream)
+    assert row.authorized_document["_execution"] == {"context": {"ned_id": "timos-nc-23.10", "dialect": "nokia_timos"}}
+    for generation in await _generations(device_id):
+        assert generation.document[stream]["_execution"]["context"]["ned_id"] == "timos-nc-23.10"
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+async def test_an_identical_re_preparation_settles_without_a_generation(
+    adapter_client, sender_enabled_sections, stream
+):
+    """Control 1b: no removal work, no table delta and an equal context settle wire-equivalently."""
+    from nso_adapter.store.models import GenerationStatus
+
+    device_id = await seed_device(nso_device_name=f"wire-equivalent-{stream}", netbox_device_id=None)
+    first = (await _prepare(adapter_client, device_id, stream, {"A": [1]})).json()["selection_revision"]
+    assert (await _apply(adapter_client, device_id, {stream: first})).status_code == 202
+    for generation in await _generations(device_id):
+        await _settle(generation.job_id, GenerationStatus.settled)
+    before = len(await _generations(device_id))
+
+    again = (await _prepare(adapter_client, device_id, stream, {"A": [1]})).json()["selection_revision"]
+    response = await _apply(adapter_client, device_id, {stream: again})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["skipped"] == {stream: "already_applied"}
+    assert len(await _generations(device_id)) == before, "an identical re-preparation creates no generation"
+    row = await _stream(device_id, stream)
+    assert (row.authorized_revision, row.applied_revision) == (again, again)
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+async def test_a_context_change_over_identical_tables_creates_a_generation(
+    adapter_client, sender_enabled_sections, stream
+):
+    """Control 1c, first half: table equality is not wire equivalence."""
+    from nso_adapter.store.models import GenerationStatus
+
+    device_id = await seed_device(nso_device_name=f"context-delta-{stream}", netbox_device_id=None)
+    await _set_ned_id(device_id, "cisco-ios-cli-6.95")
+    first = (await _prepare(adapter_client, device_id, stream, {"A": [1]})).json()["selection_revision"]
+    assert (await _apply(adapter_client, device_id, {stream: first})).status_code == 202
+    for generation in await _generations(device_id):
+        await _settle(generation.job_id, GenerationStatus.settled)
+    before = len(await _generations(device_id))
+    await _set_ned_id(device_id, "timos-nc-23.10")
+
+    again = (await _prepare(adapter_client, device_id, stream, {"A": [1]})).json()["selection_revision"]
+    response = await _apply(adapter_client, device_id, {stream: again})
+
+    assert response.status_code == 202, response.text
+    assert len(await _generations(device_id)) == before + 1
+    assert (await _generations(device_id))[-1].document[stream]["_execution"]["context"]["dialect"] == "nokia_timos"
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+async def test_a_retained_root_scalar_clear_creates_a_generation(adapter_client, sender_enabled_sections, stream):
+    """Control 1c, second half: a clear is a table delta that is not positive."""
+    from nso_adapter.store.models import GenerationStatus
+
+    device_id = await seed_device(nso_device_name=f"scalar-clear-{stream}", netbox_device_id=None)
+    first = (await _prepare(adapter_client, device_id, stream, {"A": [1]}, scalar=_SHAPE[stream]["scalar"])).json()[
+        "selection_revision"
+    ]
+    assert (await _apply(adapter_client, device_id, {stream: first})).status_code == 202
+    for generation in await _generations(device_id):
+        await _settle(generation.job_id, GenerationStatus.settled)
+    before = len(await _generations(device_id))
+
+    cleared = (await _prepare(adapter_client, device_id, stream, {"A": [1]})).json()["selection_revision"]
+    response = await _apply(adapter_client, device_id, {stream: cleared})
+
+    assert response.status_code == 202, response.text
+    assert len(await _generations(device_id)) > before
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+async def test_a_no_generation_settlement_stamps_the_selected_revision(adapter_client, sender_enabled_sections, stream):
+    """Control 1d: never desired_revision, so a store-only successor stays unselectable."""
+    from nso_adapter.store.models import GenerationStatus
+
+    device_id = await seed_device(nso_device_name=f"settle-stamps-{stream}", netbox_device_id=None)
+    first = (await _prepare(adapter_client, device_id, stream, {})).json()["selection_revision"]
+    assert (await _apply(adapter_client, device_id, {stream: first})).status_code == 202
+    for generation in await _generations(device_id):
+        await _settle(generation.job_id, GenerationStatus.settled)
+
+    revision = (await _prepare(adapter_client, device_id, stream, {})).json()["selection_revision"]
+    assert (await _prepare(adapter_client, device_id, stream, {"B": [2]}, query="?store_only=true")).status_code == 200
+
+    response = await _apply(adapter_client, device_id, {stream: revision})
+
+    assert response.status_code == 200, response.text
+    row = await _stream(device_id, stream)
+    assert (row.authorized_revision, row.applied_revision, row.desired_revision) == (
+        revision,
+        revision,
+        revision + 1,
+    )
+    later = await _apply(adapter_client, device_id, {stream: revision + 1})
+    assert later.json()["skipped"] == {stream: "no_prepared_revision"}
+
+
+# ── scenario 2: durable mixed deletion and detach ─────────────────────────────
+
+
+async def _authorize(client, device_id: int, stream: str, roots, *, scalar=None):
+    """Prepare, Apply and settle one snapshot, so its roots become AUTHORIZED."""
+    from nso_adapter.store.models import GenerationStatus
+
+    prepared = await _prepare(client, device_id, stream, roots, scalar=scalar)
+    assert prepared.status_code == 200, prepared.text
+    revision = prepared.json()["selection_revision"]
+    response = await _apply(client, device_id, {stream: revision})
+    assert response.status_code in (200, 202), response.text
+    for generation in await _generations(device_id):
+        if generation.status is not GenerationStatus.settled and generation.job_id is not None:
+            await _settle(generation.job_id, GenerationStatus.settled)
+    return revision
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+async def test_a_marked_root_retracts_and_an_unmarked_one_detaches(adapter_client, sender_enabled_sections, stream):
+    from nso_adapter.core.generation import digest_document
+    from nso_adapter.core.projection import hydrate_section
+    from nso_adapter.store.models import GenerationMode
+
+    shape = _SHAPE[stream]
+    device_id = await seed_device(nso_device_name=f"mixed-detach-{stream}", netbox_device_id=None)
+    await _authorize(adapter_client, device_id, stream, {"A": [1, 2], "B": [3, 4]})
+    before = len(await _generations(device_id))
+
+    revision = (await _prepare(adapter_client, device_id, stream, {}, deleted_roots=["A"])).json()["selection_revision"]
+    row = await _stream(device_id, stream)
+    assert [item[shape["root_field"]] for item in row.prepared_deletions["delete_origin"][shape["root_table"]]] == ["A"]
+    assert len(row.prepared_deletions["delete_origin"][shape["child_table"]]) == 2
+    assert [item[shape["root_field"]] for item in row.prepared_deletions["detach"][shape["root_table"]]] == ["B"]
+    assert row.prepared_deletions["owned_content"] == {}
+
+    assert (await _apply(adapter_client, device_id, {stream: revision})).status_code == 202
+
+    chain = (await _generations(device_id))[before:]
+    assert [generation.mode for generation in chain] == [GenerationMode.networked, GenerationMode.detach]
+    networked, detach = chain
+    assert _roots_in(networked.document, stream) == ["B"], "the intermediate retains the detached root"
+    assert sorted(_children_in(networked.document, stream)) == sorted(shape["child"](n) for n in (3, 4))
+    assert _roots_in(detach.document, stream) == [], "the final omits every removed root"
+    assert networked.settlement_cohort is not None
+    assert networked.settlement_cohort == detach.settlement_cohort
+    assert networked.allowed_removal_keys == {
+        f"{stream}/{shape['root_table']}": [["A"]],
+        f"{stream}/{shape['child_table']}": [["A", shape["child"](1)], ["A", shape["child"](2)]],
+    }
+    assert detach.allowed_removal_keys == {}, "a detach link carries no removal authority"
+    for generation in chain:
+        assert digest_document(generation.mode, generation.document, generation.allowed_removal_keys) == (
+            generation.digest
+        )
+        assert hydrate_section(generation.document, stream) is not None
+
+    # F9: the immutable generation keeps its authority when the slot is replaced.
+    assert (await _prepare(adapter_client, device_id, stream, {"C": [5]})).status_code == 200
+    assert (await _generations(device_id))[before].allowed_removal_keys == networked.allowed_removal_keys
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+async def test_the_removal_chain_settles_only_when_every_link_does(adapter_client, sender_enabled_sections, stream):
+    from nso_adapter.store.models import GenerationStatus
+
+    device_id = await seed_device(nso_device_name=f"chain-settle-{stream}", netbox_device_id=None)
+    await _authorize(adapter_client, device_id, stream, {"A": [1], "B": [2]})
+    before = len(await _generations(device_id))
+    revision = (await _prepare(adapter_client, device_id, stream, {}, deleted_roots=["A"])).json()["selection_revision"]
+    assert (await _apply(adapter_client, device_id, {stream: revision})).status_code == 202
+    networked, detach = (await _generations(device_id))[before:]
+
+    await _settle(networked.job_id, GenerationStatus.settled)
+    assert (await _stream(device_id, stream)).applied_revision != revision
+
+    await _settle(detach.job_id, GenerationStatus.settled)
+    assert (await _stream(device_id, stream)).applied_revision == revision
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+async def test_a_failed_first_link_blocks_the_second(adapter_client, sender_enabled_sections, stream):
+    from nso_adapter.core.generation import job_admissible
+    from nso_adapter.store.models import GenerationStatus
+
+    device_id = await seed_device(nso_device_name=f"chain-blocks-{stream}", netbox_device_id=None)
+    await _authorize(adapter_client, device_id, stream, {"A": [1], "B": [2]})
+    before = len(await _generations(device_id))
+    revision = (await _prepare(adapter_client, device_id, stream, {}, deleted_roots=["A"])).json()["selection_revision"]
+    assert (await _apply(adapter_client, device_id, {stream: revision})).status_code == 202
+    networked, detach = (await _generations(device_id))[before:]
+
+    await _settle(networked.job_id, GenerationStatus.failed)
+
+    async with session() as db:
+        assert await job_admissible(db, detach.job_id, device_id) is False
+    assert (await _stream(device_id, stream)).applied_revision != revision
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+async def test_an_addition_beside_a_detach_reaches_every_networked_link(
+    adapter_client, sender_enabled_sections, stream
+):
+    """Control 2a: a new root and an edit ride the networked links; detach subtrees stay intact."""
+    device_id = await seed_device(nso_device_name=f"add-beside-detach-{stream}", netbox_device_id=None)
+    await _authorize(adapter_client, device_id, stream, {"A": [1], "B": [2]})
+    before = len(await _generations(device_id))
+
+    revision = (await _prepare(adapter_client, device_id, stream, {"A": [1], "C": [5]})).json()["selection_revision"]
+    assert (await _apply(adapter_client, device_id, {stream: revision})).status_code == 202
+
+    chain = (await _generations(device_id))[before:]
+    networked = [generation for generation in chain if _roots_in(generation.document, stream) != []]
+    assert networked, "the addition produces at least one networked link"
+    for generation in networked:
+        roots = _roots_in(generation.document, stream)
+        assert "C" in roots, "the addition rides every networked link"
+    intermediate = next(generation for generation in chain if "B" in _roots_in(generation.document, stream))
+    assert sorted(_roots_in(intermediate.document, stream)) == ["A", "B", "C"]
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+async def test_a_retained_root_clear_beside_a_detach_is_not_refused(adapter_client, sender_enabled_sections, stream):
+    """Control 2b: mixed_detach_replacement is gated to the sixteen receipt lanes."""
+    shape = _SHAPE[stream]
+    device_id = await seed_device(nso_device_name=f"clear-detach-{stream}", netbox_device_id=None)
+    await _authorize(adapter_client, device_id, stream, {"A": [1], "B": [2]}, scalar=shape["scalar"])
+    before = len(await _generations(device_id))
+
+    revision = (await _prepare(adapter_client, device_id, stream, {"A": [1]})).json()["selection_revision"]
+    response = await _apply(adapter_client, device_id, {stream: revision})
+
+    assert response.status_code == 202, response.text
+    chain = (await _generations(device_id))[before:]
+    assert len(chain) == 2
+    intermediate, final = chain
+    assert sorted(_roots_in(intermediate.document, stream)) == ["A", "B"]
+    assert _roots_in(final.document, stream) == ["A"], "the final retains the cleared root and its children"
+    assert _children_in(final.document, stream) == [shape["child"](1)]
+    for generation in chain:
+        cleared = next(
+            item for item in generation.document[stream][shape["root_table"]] if item[shape["root_field"]] == "A"
+        )
+        assert cleared["admin_key" if stream == "lag" else "mode"] is None
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+async def test_a_child_dropped_under_a_retained_root_is_networked_by_itself(
+    adapter_client, sender_enabled_sections, stream
+):
+    """Controls 2c and 2d: an owned-content removal schedules an intermediate on its own."""
+    shape = _SHAPE[stream]
+    device_id = await seed_device(nso_device_name=f"owned-content-{stream}", netbox_device_id=None)
+    await _authorize(adapter_client, device_id, stream, {"A": [1, 2]})
+    before = len(await _generations(device_id))
+
+    revision = (await _prepare(adapter_client, device_id, stream, {"A": [1]})).json()["selection_revision"]
+    row = await _stream(device_id, stream)
+    assert [item[shape["child_field"]] for item in row.prepared_deletions["owned_content"][shape["child_table"]]] == [
+        shape["child"](2)
+    ]
+    assert row.prepared_deletions["delete_origin"] == {}
+    assert row.prepared_deletions["detach"] == {}
+
+    assert (await _apply(adapter_client, device_id, {stream: revision})).status_code == 202
+
+    chain = (await _generations(device_id))[before:]
+    assert len(chain) == 1
+    (networked,) = chain
+    assert _roots_in(networked.document, stream) == ["A"]
+    assert _children_in(networked.document, stream) == [shape["child"](1)]
+    assert networked.allowed_removal_keys == {f"{stream}/{shape['child_table']}": [["A", shape["child"](2)]]}
+
+
+async def test_one_apply_carries_both_switching_scopes_removal_authority(adapter_client, sender_enabled_sections):
+    """Control 2e: every networked generation carries the scope-qualified union."""
+    device_id = await seed_device(nso_device_name="multi-stream-union", netbox_device_id=None)
+    await _authorize(adapter_client, device_id, "lag", {"A": [1]})
+    await _authorize(adapter_client, device_id, "switchport", {"B": [2]})
+    before = len(await _generations(device_id))
+
+    lag_revision = (await _prepare(adapter_client, device_id, "lag", {}, deleted_roots=["A"])).json()[
+        "selection_revision"
+    ]
+    switchport_revision = (await _prepare(adapter_client, device_id, "switchport", {}, deleted_roots=["B"])).json()[
+        "selection_revision"
+    ]
+    response = await _apply(adapter_client, device_id, {"lag": lag_revision, "switchport": switchport_revision})
+
+    assert response.status_code == 202, response.text
+    chain = (await _generations(device_id))[before:]
+    union = {
+        "lag/lag_bundle_intent": [["A"]],
+        "lag/lag_member_intent": [["A", "Gi0/1"]],
+        "switchport/switchport_intent": [["B"]],
+        "switchport/switchport_tagged_vlan_intent": [["B", 2]],
+    }
+    networked = [generation for generation in chain if generation.allowed_removal_keys]
+    assert networked, "the deletion produces networked links"
+    for generation in networked:
+        assert generation.allowed_removal_keys == union
+
+
+async def test_a_companion_apply_generation_carries_the_removal_authority_on_a_dedicated_carrier(
+    adapter_client, sender_enabled_sections
+):
+    """Controls 2f and 2g: the companion carries the same authority and no one may join it."""
+    from nso_adapter.core.generation import advance_generations_locked, lock_projection
+    from nso_adapter.store.models import GenerationStatus, Job
+
+    device_id = await seed_device(nso_device_name="companion-authority", netbox_device_id=None)
+    await seed_settings(device_id, auto_apply=True)
+    await _authorize(adapter_client, device_id, "lag", {"A": [1]})
+    before = len(await _generations(device_id))
+
+    revision = (await _prepare(adapter_client, device_id, "lag", {"C": [5]}, deleted_roots=["A"])).json()[
+        "selection_revision"
+    ]
+    assert (await _apply(adapter_client, device_id, {"lag": revision})).status_code == 202
+
+    removal, companion = (await _generations(device_id))[before:]
+    authority = {"lag/lag_bundle_intent": [["A"]], "lag/lag_member_intent": [["A", "Gi0/1"]]}
+    assert removal.allowed_removal_keys == authority
+    assert companion.allowed_removal_keys == authority, "the companion carries the same authority"
+    async with session() as db:
+        carrier = await db.get(Job, companion.job_id)
+    assert carrier.coalescible is False, "a companion carrying authority takes a dedicated carrier"
+
+    await _settle(removal.job_id, GenerationStatus.failed)
+    isis = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        json={"interfaces": [{"interface_name": "Gi0/9", "af": "ipv4"}]},
+        headers=AUTH | {"X-Push-Seq": "7701"},
+    )
+    assert isis.status_code == 200, isis.text
+    isis_generation = (await _generations(device_id))[-1]
+    assert isis_generation.job_id != companion.job_id, "an unrelated auto-Apply never joins that carrier"
+
+    abandon = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/abandon-generation",
+        json={"generation_id": removal.id},
+        headers=AUTH,
+    )
+    assert abandon.status_code == 202, abandon.text
+
+    async with session() as db:
+        await lock_projection(db, device_id)
+        await advance_generations_locked(db, device_id)
+        await db.commit()
+    released = next(generation for generation in await _generations(device_id) if generation.id == companion.id)
+    assert "A" not in _roots_in(released.document, "lag"), "the released generation still omits the deleted root"
+    assert released.allowed_removal_keys == authority
+
+
+# ── scenario 3: restart after preparation, before authorization ───────────────
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+async def test_a_preparation_survives_a_connection_restart(adapter_client, sender_enabled_sections, stream):
+    from nso_adapter.store.db import get_engine
+
+    device_id = await seed_device(nso_device_name=f"restart-prepare-{stream}", netbox_device_id=None)
+    revision = (await _prepare(adapter_client, device_id, stream, {"A": [1]})).json()["selection_revision"]
+    await get_engine().dispose()
+
+    row = await _stream(device_id, stream)
+    assert (row.prepared_revision, row.desired_revision, row.authorized_revision) == (revision, revision, 0)
+    assert await _live_roots(device_id, stream) == ["A"]
+
+    attempt_id = uuid4()
+    first = await _apply(adapter_client, device_id, {stream: revision}, attempt_id=attempt_id)
+    assert first.status_code == 202, first.text
+    await get_engine().dispose()
+
+    replay = await _apply(adapter_client, device_id, {stream: revision}, attempt_id=attempt_id)
+    assert (replay.status_code, replay.json()) == (first.status_code, first.json())
+
+    before = len(await _generations(device_id))
+    fresh = await _apply(adapter_client, device_id, {stream: revision})
+    assert fresh.json()["skipped"] == {stream: "already_authorized"}
+    assert len(await _generations(device_id)) == before, "a new UUID creates no duplicate chain"
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+async def test_a_failed_promotion_commits_neither_the_promotion_nor_a_generation(
+    adapter_client, sender_enabled_sections, stream
+):
+    from nso_adapter.core.generation import create_action_apply, digest_document
+    from nso_adapter.store.apply_attempt_store import begin_apply_attempt
+    from nso_adapter.store.models import DeploymentGeneration, GenerationMode, GenerationStatus
+
+    device_id = await seed_device(nso_device_name=f"restart-atomic-{stream}", netbox_device_id=None)
+    revision = (await _prepare(adapter_client, device_id, stream, {"A": [1]})).json()["selection_revision"]
+
+    attempt_id = uuid4()
+    async with session() as db:
+        assert await begin_apply_attempt(db, attempt_id, device_id, {stream: revision}) is None
+        db.add(
+            DeploymentGeneration(
+                device_id=device_id,
+                seq=1,
+                mode=GenerationMode.networked,
+                status=GenerationStatus.settled,
+                document={},
+                digest=digest_document(GenerationMode.networked, {}, {}),
+                allowed_removal_keys={},
+                source_push_seq={},
+                stream_revisions={},
+            )
+        )
+        await db.commit()
+
+    async with session() as db:
+        with pytest.raises(IntegrityError) as exc_info:
+            await create_action_apply(db, device_id, {stream: revision}, attempt_id)
+        assert "uq_generation_seq_per_device" in str(exc_info.value)
+        await db.rollback()
+
+    row = await _stream(device_id, stream)
+    assert (row.authorized_revision, row.prepared_revision) == (0, revision)
+    assert len(await _generations(device_id)) == 1
+
+
+# ── scenario 4: composition with an IS-IS generation in flight ────────────────
+
+
+async def test_a_switching_apply_composes_the_authorized_isis_fragment_only(adapter_client, sender_enabled_sections):
+    from nso_adapter.store.models import GenerationStatus
+
+    device_id = await seed_device(nso_device_name="switching-with-isis", netbox_device_id=None)
+    await seed_settings(device_id, auto_apply=False)
+    isis = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent",
+        json={"interfaces": [{"interface_name": "Gi0/1", "af": "ipv4"}]},
+        headers=AUTH | {"X-Push-Seq": "8801"},
+    )
+    assert isis.status_code == 200, isis.text
+    assert (await _apply(adapter_client, device_id, {"isis": 8801})).status_code == 202
+    (isis_generation,) = await _generations(device_id)
+
+    lag_revision = (await _prepare(adapter_client, device_id, "lag", {"L1": [1]})).json()["selection_revision"]
+    later_isis = await adapter_client.put(
+        f"/api/v1/devices/{device_id}/isis-interface-intent?store_only=true",
+        json={"interfaces": [{"interface_name": "Gi0/2", "af": "ipv4"}]},
+        headers=AUTH | {"X-Push-Seq": "8802"},
+    )
+    assert later_isis.status_code == 200, later_isis.text
+    assert (await _prepare(adapter_client, device_id, "lag", {"L2": [2]}, query="?store_only=true")).status_code == 200
+
+    conflicted = await _apply(adapter_client, device_id, {"lag": lag_revision})
+    assert conflicted.status_code == 409, conflicted.text
+    assert (await _stream(device_id, "lag")).prepared_revision == lag_revision
+
+    await _settle(isis_generation.job_id, GenerationStatus.settled)
+    retried = await _apply(adapter_client, device_id, {"lag": lag_revision})
+
+    assert retried.status_code == 202, retried.text
+    promoted = (await _generations(device_id))[-1]
+    assert _roots_in(promoted.document, "lag") == ["L1"], "the store-only successor never enters the document"
+    isis_interfaces = [row["interface_name"] for row in promoted.document["isis"]["isis_interface_intent"]]
+    assert isis_interfaces == ["Gi0/1"], "only the authorized IS-IS fragment composes in"
+    assert promoted.stream_revisions == {"lag": lag_revision}
+
+
+# ── the production refusal: no sender, no selection, no job ───────────────────
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+async def test_apply_refuses_a_section_awaiting_its_aggregate_sender(adapter_client, stream):
+    device_id = await seed_device(nso_device_name=f"awaiting-sender-{stream}", netbox_device_id=None)
+    revision = (await _prepare(adapter_client, device_id, stream, {"A": [1]})).json()["selection_revision"]
+
+    response = await _apply(adapter_client, device_id, {stream: revision})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["skipped"] == {stream: "awaiting_aggregate_sender"}
+    assert response.json()["outcome"] == "no_op"
+    assert await _generations(device_id) == []
+    assert await _jobs(device_id) == []
+    row = await _stream(device_id, stream)
+    assert (row.prepared_revision, row.authorized_revision) == (revision, 0)
+
+
+@pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
+async def test_force_removal_refuses_a_section_awaiting_its_aggregate_sender(adapter_client, stream):
+    device_id = await seed_device(nso_device_name=f"awaiting-sender-force-{stream}", netbox_device_id=None)
+    assert (await _prepare(adapter_client, device_id, stream, {"A": [1]})).status_code == 200
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/force-removal",
+        json={"scope": stream},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["detail"] == {"scope": stream, "reason": "awaiting_aggregate_sender"}
     assert await _generations(device_id) == []
     assert await _jobs(device_id) == []

@@ -34,6 +34,7 @@ store holds when a worker gets round to it.
 from __future__ import annotations
 
 from contextlib import suppress
+from copy import deepcopy
 from datetime import date, datetime
 from decimal import Decimal
 from functools import cache
@@ -819,6 +820,34 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
     return rows
 
 
+def fragment_tables(fragment: dict | None) -> dict[str, list[dict]]:
+    """Return a fragment's TABLES, without its execution metadata."""
+    return {table: rows for table, rows in (fragment or {}).items() if table != EXECUTION_KEY}
+
+
+def fragment_context(fragment: dict | None) -> dict | None:
+    """Return the encoding context a fragment was frozen with, or ``None`` for an unfrozen one."""
+    return ((fragment or {}).get(EXECUTION_KEY) or {}).get("context")
+
+
+def freeze_fragment(tables: dict[str, list[dict]], device) -> dict:
+    """Return the FRAGMENT for *tables*: the rows plus the state they must execute with.
+
+    The encoding context is read HERE, in the authorizing transaction, and preserved
+    verbatim: ``ned_id`` keeps an explicit null (a device with no NED id records ``null``
+    and dialect ``identity``), and ``dialect`` is the stable name of the dialect that NED id
+    resolves to, so an encode never re-reads the device row.
+    """
+    from nso_adapter.core.community_dialect import community_dialect_for
+
+    return {
+        **deepcopy(tables),
+        EXECUTION_KEY: {
+            "context": {"ned_id": device.ned_id, "dialect": community_dialect_for(device.ned_id).name},
+        },
+    }
+
+
 async def snapshot_stream(db: AsyncSession, device_id: int, stream: str) -> dict[str, list[dict]]:
     """Serialize the tables *stream* owns into one JSON-safe document FRAGMENT.
 
@@ -843,6 +872,9 @@ __all__ = [
     "EXECUTION_KEY",
     "InterfaceEligibilityUnresolved",
     "LIVE_READ_SECTIONS",
+    "fragment_context",
+    "fragment_tables",
+    "freeze_fragment",
     "hydrate_section",
     "hydrate_interface_execution",
     "intent_state",
