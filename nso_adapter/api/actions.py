@@ -183,14 +183,33 @@ async def action_force_removal(
     settlement then certified them applied — the sibling lane's un-promoted store-only state
     included, on interfaces this job never sends.
     """
-    from nso_adapter.core.removal import enqueue_removal, valid_removal_scopes
+    from nso_adapter.core.generation import OperationSectionAbsent
+    from nso_adapter.core.removal import valid_removal_scopes
 
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
     if body.scope not in valid_removal_scopes():
         raise api_error(400, "bad_request", f"Unknown removal scope {body.scope!r}")
-    job = await enqueue_removal(
+    try:
+        job = await _force_removal_job(db, device_id, body)
+    except OperationSectionAbsent as absent:
+        # Nothing was ever authorized for this family, so there is no document section for the
+        # flush to act on and no carrier of ours to discharge. Refuse rather than create a
+        # generation whose operation plane could not be recorded.
+        raise api_error(
+            400,
+            "bad_request",
+            f"Nothing is authorized for {body.scope!r} on this device, so there is nothing to flush",
+            {"scope": body.scope, "reason": absent.reason},
+        ) from None
+    return await _force_removal_response(db, job)
+
+
+async def _force_removal_job(db: AsyncSession, device_id: int, body: ForceRemovalBody):
+    from nso_adapter.core.removal import enqueue_removal
+
+    return await enqueue_removal(
         db,
         device_id,
         body.scope,
@@ -200,6 +219,9 @@ async def action_force_removal(
         interfaces=body.interfaces,
         force=True,
     )
+
+
+async def _force_removal_response(db: AsyncSession, job) -> dict:
     await db.commit()
     return {"job_id": job.id}
 

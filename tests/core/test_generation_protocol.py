@@ -23,6 +23,7 @@ import pytest
 import sqlalchemy as sa
 
 from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
+from tests.core.removal_helpers import authorize_stream
 
 pytestmark = pytest.mark.anyio
 
@@ -525,6 +526,9 @@ async def test_f8_e_a_force_removal_authorizes_nothing_outside_the_interfaces_it
     await seed_settings(device_id, auto_apply=False)
 
     assert (await put_interface_attrs(adapter_client, device_id, {"Gi0/1": "managed"})).status_code == 200
+    # The attribute lane really was authorized once, which is what gives the flush a section to
+    # act on; the sibling address lane is a store-only repair and was never authorized.
+    await authorize_stream(device_id, "interface_config")
     resp = await put_ips(adapter_client, device_id, {"Gi0/2": "198.51.100.2/24"}, query="?store_only=true")
     assert resp.status_code == 200, resp.text
     assert await generations(device_id) == []
@@ -826,6 +830,9 @@ async def test_f6_b_the_tombstone_sweeper_gives_its_job_a_generation(adapter_cli
             )
         )
         await db.commit()
+    # What the deletion push that wrote the carrier left behind: without it the reissue has no
+    # section for its operation plane and creation refuses.
+    await authorize_stream(device_id, "static_route")
 
     assert await sweep_tombstones() == 1
 
@@ -857,6 +864,9 @@ async def test_f6_c_the_reclaimer_reissue_gives_its_job_a_generation(adapter_cli
             )
         )
         await db.commit()
+    # What the deletion push that wrote the carrier left behind: without it the reissue has no
+    # section for its operation plane and creation refuses.
+    await authorize_stream(device_id, "static_route")
 
     client, _rec = recorded_client("gen-reclaim")
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):

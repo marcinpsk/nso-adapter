@@ -3539,6 +3539,9 @@ async def test_apply_selects_a_claim_less_section_now_that_the_sender_writes_it(
 async def test_force_removal_admits_a_claim_less_section_now_that_the_sender_writes_it(adapter_client, stream):
     device_id = await seed_device(nso_device_name=f"sender-lands-force-{stream}", netbox_device_id=None)
     assert (await _prepare(adapter_client, device_id, stream, {"A": [1]})).status_code == 200
+    # A flush re-deploys AUTHORIZED state, so the Apply that authorized this family has to
+    # have happened: a prepared slot alone puts no section in the composed document.
+    assert (await _apply(adapter_client, device_id, {stream: 1})).status_code in (200, 202)
 
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/force-removal",
@@ -3547,10 +3550,10 @@ async def test_force_removal_admits_a_claim_less_section_now_that_the_sender_wri
     )
 
     assert response.status_code == 202, response.text
-    # A flush promotes nothing, so the prepared slot stays unauthorized and the reissue
+    # A flush promotes nothing, so it adds a reissue after the Apply's own generation and
     # deploys the document the device already had.
-    (generation,) = await _generations(device_id)
-    assert generation.stream_revisions == {}
+    flush = (await _generations(device_id))[-1]
+    assert flush.stream_revisions == {}
     assert await _jobs(device_id) != []
 
 

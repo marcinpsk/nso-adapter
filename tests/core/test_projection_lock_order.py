@@ -13,6 +13,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from tests.conftest import VALID_TOKEN, seed_device, session
+from tests.core.removal_helpers import authorize_static_route
 from tests.core.test_generation_protocol import put_vlans, seed_settings
 
 pytestmark = pytest.mark.anyio
@@ -100,7 +101,11 @@ async def _seed_tombstone(device_id: int, *, job_id: int | None = None) -> int:
         )
         db.add(row)
         await db.commit()
-        return row.id
+        tombstone_id = row.id
+    # What the deletion push that wrote the carrier promoted: a reissue composes only
+    # AUTHORIZED fragments, and creation refuses an operation with no section to live in.
+    await authorize_static_route(device_id)
+    return tombstone_id
 
 
 async def _seed_succeeded_removal(device_id: int) -> int:

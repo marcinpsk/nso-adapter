@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import select
 
 from nso_adapter.api.actions import (
     _trigger,
@@ -16,6 +17,7 @@ from nso_adapter.api.actions import (
 from nso_adapter.api.errors import ApiError
 from nso_adapter.store.models import Device, Job, JobStatus, JobType
 from tests.conftest import session
+from tests.core.removal_helpers import authorize_stream
 
 
 async def _seed_device(nso_device_name: str, netbox_id: int) -> int:
@@ -154,6 +156,7 @@ async def test_action_force_removal_enqueues_forced_removal_job(adapter_client):
     from nso_adapter.api.actions import ForceRemovalBody, action_force_removal
 
     device_id = await _seed_device("actions-frm-01", 1340)
+    await authorize_stream(device_id, "isis")
     async with session() as db:
         result = await action_force_removal(device_id=device_id, body=ForceRemovalBody(scope="isis"), db=db)
         job = await db.get(Job, result["job_id"])
@@ -185,6 +188,7 @@ async def test_action_force_removal_interface_config_needs_no_interface_list(ada
     from nso_adapter.api.actions import ForceRemovalBody, action_force_removal
 
     device_id = await _seed_device("actions-frm-03", 1342)
+    await authorize_stream(device_id, "interface_config")
     async with session() as db:
         result = await action_force_removal(device_id=device_id, body=ForceRemovalBody(scope="interface_config"), db=db)
         job = await db.get(Job, result["job_id"])
@@ -196,6 +200,7 @@ async def test_action_force_removal_interface_config_carries_the_interfaces(adap
     from nso_adapter.api.actions import ForceRemovalBody, action_force_removal
 
     device_id = await _seed_device("actions-frm-04", 1343)
+    await authorize_stream(device_id, "interface_config")
     async with session() as db:
         result = await action_force_removal(
             device_id=device_id,
@@ -208,6 +213,29 @@ async def test_action_force_removal_interface_config_carries_the_interfaces(adap
             "interfaces": ["GigabitEthernet0/1"],
             "force": True,
         }
+
+
+async def test_action_force_removal_refuses_a_family_nothing_authorized(adapter_client):
+    """A flush needs something of OURS on the device, and nothing is.
+
+    The operation plane names the carriers admission discharges, and it has nowhere to live in
+    a document that carries no such section. Creating the generation anyway would delete the
+    carrier and record nothing, so the request is refused before any job exists.
+    """
+    from nso_adapter.api.actions import ForceRemovalBody, action_force_removal
+
+    device_id = await _seed_device("actions-frm-05", 1344)
+    async with session() as db:
+        try:
+            await action_force_removal(device_id=device_id, body=ForceRemovalBody(scope="isis"), db=db)
+        except Exception as exc:
+            assert getattr(exc, "status_code", None) == 400
+            assert exc.detail["error"]["detail"] == {"scope": "isis", "reason": "no_authorized_section"}
+        else:
+            raise AssertionError("a flush of a never-authorized family must be refused")
+    async with session() as db:
+        jobs = (await db.execute(select(Job).where(Job.device_id == device_id))).scalars().all()
+        assert list(jobs) == [], "the refusal must leave no job behind"
 
 
 async def test_action_apply_diff_forwards_outformat(adapter_client):

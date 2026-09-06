@@ -42,35 +42,43 @@ async def seed_tomb(
         )
         db.add(tomb)
         await db.commit()
-        return tomb.id
+        tomb_id = tomb.id
+    # What the deletion push that wrote this carrier promoted. A reissue composes only
+    # AUTHORIZED fragments, so a fixture that skips this leaves the operation plane with no
+    # section to live in and generation creation refuses.
+    await authorize_static_route(device_id)
+    return tomb_id
 
 
-async def authorize_static_route(device_id: int) -> None:
-    """Freeze the device's current static-route state as its authorized fragment.
+async def authorize_stream(device_id: int, stream: str) -> None:
+    """Freeze the device's current state for *stream* as its authorized fragment.
 
-    What a real deletion push leaves behind: the rows and carriers it promoted, with the
-    context and apply plan it froze. A removal generation composes that fragment, so a
-    fixture that skips it produces a document with no section to operate on.
+    What a real push leaves behind: the rows and carriers it promoted, with the context and
+    proof it froze. Every generation composes those fragments, so a fixture that skips this
+    produces a document with no section for the operation to act on, which creation refuses.
     """
     from nso_adapter.core.generation import lock_projection, note_write
     from nso_adapter.core.projection import freeze_fragment, snapshot_stream
 
     async with session() as db:
         await lock_projection(db, device_id)
-        revision = await note_write(db, device_id, "static_route")
+        revision = await note_write(db, device_id, stream)
         device = await db.get(Device, device_id)
-        fragment = await freeze_fragment(
-            db, device, "static_route", await snapshot_stream(db, device_id, "static_route")
-        )
+        fragment = await freeze_fragment(db, device, stream, await snapshot_stream(db, device_id, stream))
         await db.execute(
             update(DeviceProjectionStream)
             .where(
                 DeviceProjectionStream.device_id == device_id,
-                DeviceProjectionStream.stream == "static_route",
+                DeviceProjectionStream.stream == stream,
             )
             .values(authorized_revision=revision, authorized_document=fragment)
         )
         await db.commit()
+
+
+async def authorize_static_route(device_id: int) -> None:
+    """Freeze the device's current static-route state as its authorized fragment."""
+    await authorize_stream(device_id, "static_route")
 
 
 async def seed_removal_job(device_id: int, context: dict, *, tombs: tuple[int, ...] = ()) -> int:

@@ -143,6 +143,22 @@ class ApplyUnexecutable(RuntimeError):
         self.reasons = reasons
 
 
+class OperationSectionAbsent(RuntimeError):
+    """An operation names a section the composed document does not carry.
+
+    Recording the operation plane is not optional: it is where the carriers this deployment
+    discharges are named, and admission deletes those carriers on the strength of it. Skipping
+    it and creating the generation anyway loses the record while the carrier is already gone,
+    so creation is REFUSED and the whole transaction rolls back with the carrier intact.
+    """
+
+    reason = "no_authorized_section"
+
+    def __init__(self, scope: str):
+        super().__init__(f"the device has no authorized {scope!r} section for this operation to act on")
+        self.scope = scope
+
+
 class ActionApplyResult(NamedTuple):
     generations: list[DeploymentGeneration]
     skipped: dict[str, str]
@@ -1340,27 +1356,29 @@ async def _store_generation(
     if scope is not None:
         section = body.get(scope)
         if section is None:
-            # The operation addresses a section this document does not carry: nothing has ever
-            # been authorized there, so there is no authority of ours to classify.
-            logger.warning("generation.operation_section_absent", device_id=device_id, scope=scope)
-        else:
-            # One deployment's facts, never a fragment's: which carriers this operation
-            # discharges, and — for static-route — how it classified the authority it was given.
-            operation: dict = {"pending_clear_ids": sorted(discharged_clear_ids)}
-            if scope == "static_route":
-                from nso_adapter.core.static_route_plan import build_static_route_operation
+            # The operation addresses a section this document does not carry, so its plane has
+            # nowhere to live. Refusing is the only safe answer: admission deletes the carriers
+            # the plane names, and a generation created without it would leave the deletion
+            # record gone and unrecorded. The whole transaction rolls back, carrier intact.
+            logger.error("generation.operation_section_absent", device_id=device_id, scope=scope)
+            raise OperationSectionAbsent(scope)
+        # One deployment's facts, never a fragment's: which carriers this operation
+        # discharges, and — for static-route — how it classified the authority it was given.
+        operation: dict = {"pending_clear_ids": sorted(discharged_clear_ids)}
+        if scope == "static_route":
+            from nso_adapter.core.static_route_plan import build_static_route_operation
 
-                operation.update(
-                    await build_static_route_operation(
-                        db,
-                        device_id,
-                        body,
-                        removal_context=removal_context,
-                        allowed_removal_keys=allowed_removal_keys,
-                        tombstone_ids=static_route_tombstone_ids,
-                    )
+            operation.update(
+                await build_static_route_operation(
+                    db,
+                    device_id,
+                    body,
+                    removal_context=removal_context,
+                    allowed_removal_keys=allowed_removal_keys,
+                    tombstone_ids=static_route_tombstone_ids,
                 )
-            section.setdefault(EXECUTION_KEY, {})["operation"] = operation
+            )
+        section.setdefault(EXECUTION_KEY, {})["operation"] = operation
     generation = DeploymentGeneration(
         device_id=device_id,
         seq=await _next_seq(db, device_id),

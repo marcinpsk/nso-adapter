@@ -177,7 +177,14 @@ async def sweep_one_device(device_id: int, *, db: AsyncSession | None = None) ->
 
 async def sweep_tombstones(*, db: AsyncSession | None = None) -> int:
     """One full pass over every device holding an uncarried deletion."""
+    from nso_adapter.core.generation import OperationSectionAbsent
+
     created = 0
     for device_id in await _devices_with_eligible_tombstones(db):
-        created += await sweep_one_device(device_id, db=db)
+        try:
+            created += await sweep_one_device(device_id, db=db)
+        except OperationSectionAbsent as exc:
+            # This ONE device has nothing authorized for the carrier to act on, which is a
+            # data condition, not a sweeper fault. Every other device still drains.
+            logger.warning("tombstone_sweep.no_authorized_section", device_id=device_id, error=str(exc))
     return created

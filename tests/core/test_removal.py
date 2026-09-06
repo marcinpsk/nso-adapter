@@ -42,7 +42,7 @@ from nso_adapter.store.models import (
 from tests.conftest import SNMP_COMMUNITY as _COMMUNITY
 from tests.conftest import SNMP_VAULT_REF as _REF
 from tests.conftest import note_projection_write, session
-from tests.core.removal_helpers import seed_removal_job
+from tests.core.removal_helpers import authorize_stream, seed_removal_job
 
 _NOW = datetime.now(UTC)
 
@@ -82,6 +82,11 @@ async def _seed_removal_job(device_id: int, scope: str = "vlan", context_extra: 
     context = {"scope": scope, **(context_extra or {})}
     stream = section_streams(scope)[0]
     mode = GenerationMode.detach if context.get("detach") else GenerationMode.networked
+    if context.get("force"):
+        # A flush re-deploys ALREADY-AUTHORIZED state, so the fixture must have some: a reissue
+        # composes only authorized fragments, and creation refuses an operation whose section
+        # the composed document does not carry.
+        await authorize_stream(device_id, stream)
     async with session() as db:
         if context.get("force"):
             # A force removal PROMOTES NOTHING, so it takes the reissue branch of
@@ -274,6 +279,7 @@ async def test_enqueue_removal_creates_job_for_each_valid_scope(adapter_client):
     # The claim-less pair promotes a PREPARED fragment, which only the Apply POST writes, so
     # the operator reaches them through the force path. Both are ordinary scopes now.
     for scope in sorted(CLAIM_LESS_SECTIONS):
+        await authorize_stream(device_id, section_streams(scope)[0])
         async with session() as db:
             job = await enqueue_removal(
                 db, device_id, scope, marking=None, defer_retract=False, promotes=(), force=True
@@ -1926,6 +1932,7 @@ async def test_enqueue_removal_delete_origin_is_real_retraction(adapter_client):
 
 async def test_enqueue_removal_force_is_real_retraction(adapter_client):
     device_id = await _seed_device(nso_device_name="sw-detach")
+    await authorize_stream(device_id, "svi")
     async with session() as db:
         job = await enqueue_removal(
             db,
@@ -1940,6 +1947,37 @@ async def test_enqueue_removal_force_is_real_retraction(adapter_client):
         await db.commit()
         assert job.context.get("force") is True
         assert "detach" not in job.context
+
+
+async def test_a_refused_flush_keeps_the_carrier_it_would_have_discharged(adapter_client):
+    """Refusing creation is what PRESERVES the obligation, and it must be atomic.
+
+    A store-only clear records a pending-clear carrier against a stream nothing has ever
+    authorized. Admission names the carriers it discharges in the immutable operation plane
+    and then deletes them; with no section to hold that plane, skipping it and creating the
+    generation anyway deleted the carrier and recorded nothing, and no retry could rebuild it.
+    """
+    from nso_adapter.core.generation import OperationSectionAbsent
+    from nso_adapter.store.models import StreamPendingClear
+
+    device_id = await _seed_device(nso_device_name="sw-clear-unauthorized")
+    async with session() as db:
+        db.add(StreamPendingClear(device_id=device_id, stream="interface_mtu", provenance="store_only", revision=1))
+        await db.commit()
+
+    async with session() as db:
+        with pytest.raises(OperationSectionAbsent) as excinfo:
+            await enqueue_removal(
+                db, device_id, "interface_mtu", marking=None, defer_retract=False, promotes=(), force=True
+            )
+        await db.rollback()
+    assert excinfo.value.reason == "no_authorized_section"
+
+    async with session() as db:
+        carriers = (await db.execute(select(StreamPendingClear))).scalars().all()
+        jobs = (await db.execute(select(Job).where(Job.device_id == device_id))).scalars().all()
+    assert [c.stream for c in carriers] == ["interface_mtu"], "the refusal discharged the carrier it refused to name"
+    assert list(jobs) == [], "a refused admission must leave no job behind"
 
 
 async def test_enqueue_removal_force_refuses_to_promote(adapter_client):
