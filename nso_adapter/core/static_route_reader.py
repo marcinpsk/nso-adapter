@@ -59,7 +59,11 @@ async def certified_static_route_section(client, device) -> CertifiedSection:
     state = await client.service_instance_state(STATIC_ROUTE_SERVICE_PATH, device.nso_device_name)
     if state.inconclusive:
         return CertifiedSection("inconclusive", None)
-    routes = _project(state.entry)
+    try:
+        routes = _project(state.entry)
+    except _Uncertifiable as exc:
+        logger.warning("static_route.section_uncertifiable", device=device.nso_device_name, reason=str(exc))
+        return CertifiedSection("inconclusive", None)
     if not routes:
         # An instance with no entry and no instance at all say the same thing, and the
         # consumers all treat "certified nothing here" alike.
@@ -67,13 +71,48 @@ async def certified_static_route_section(client, device) -> CertifiedSection:
     return CertifiedSection("present", {"route": routes})
 
 
+class _Uncertifiable(Exception):
+    """The instance parsed, but its static-route section is not a shape this can certify."""
+
+
 def _project(entry: dict | None) -> list[dict]:
-    """Return the static-route entries of a service instance, whatever level they sit at."""
-    if not entry:
+    """Return the static-route entries of a service instance, whatever level they sit at.
+
+    Every departure from the YANG shape raises: discarding it would report a malformed
+    answer as certified ABSENCE, and a consumption proof would then consume a carrier whose
+    key the service may still hold.
+    """
+    if entry is None:
         return []
+    if not isinstance(entry, dict):
+        raise _Uncertifiable(f"the instance is a {type(entry).__name__}, not an object")
     section = entry.get("static-route")
-    routes = (section or {}).get("route") if isinstance(section, dict) else entry.get("route")
-    return [route for route in (routes or []) if isinstance(route, dict)]
+    if section is None:
+        routes = entry.get("route")
+    elif isinstance(section, dict):
+        routes = section.get("route")
+    else:
+        raise _Uncertifiable(f"the static-route container is a {type(section).__name__}, not an object")
+    if routes is None:
+        return []
+    if not isinstance(routes, list):
+        raise _Uncertifiable(f"the route list is a {type(routes).__name__}, not a list")
+    for route in routes:
+        _certify_entry(route)
+    return list(routes)
+
+
+def _certify_entry(route: object) -> None:
+    """Refuse a route entry that is not one keyed object. ``vrf`` and ``next-hop`` may be empty."""
+    if not isinstance(route, dict):
+        raise _Uncertifiable(f"a route entry is a {type(route).__name__}, not an object")
+    prefix = route.get("prefix")
+    if not isinstance(prefix, str) or not prefix:
+        raise _Uncertifiable(f"a route entry carries no prefix key: {prefix!r}")
+    for leaf in ("vrf", "next-hop"):
+        value = route.get(leaf)
+        if value is not None and not isinstance(value, str):
+            raise _Uncertifiable(f"a route entry carries a non-string {leaf}: {value!r}")
 
 
 __all__ = ["STATIC_ROUTE_SERVICE_PATH", "CertifiedSection", "certified_static_route_section"]

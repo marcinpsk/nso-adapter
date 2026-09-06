@@ -73,6 +73,64 @@ async def test_an_empty_container_certifies_absence_and_an_uncertifiable_read_do
     assert unreadable.inconclusive and unreadable.entry is None
 
 
+@pytest.mark.parametrize(
+    ("label", "entry"),
+    [
+        ("route is an object", {"device": "reader-dev", "route": wire(A)}),
+        ("route is a string", {"device": "reader-dev", "route": "198.18.0.0/24"}),
+        ("an entry is a string", {"device": "reader-dev", "route": ["198.18.0.0/24"]}),
+        ("an entry carries no prefix", {"device": "reader-dev", "route": [{"vrf": "", "next-hop": "192.0.2.1"}]}),
+        ("the container is a list", {"device": "reader-dev", "static-route": [wire(A)]}),
+        ("a nested entry is a string", {"device": "reader-dev", "static-route": {"route": ["x"]}}),
+    ],
+)
+async def test_a_malformed_section_is_inconclusive_and_never_a_certified_absence(label, entry):
+    """A 200 the reader cannot parse REFUSES; discarding it would read as certified absence.
+
+    ``{"route": {...}}`` is the reachable case: it passes the client's envelope checks, and a
+    projection that iterated it would walk the object's KEYS, drop them all and certify that
+    the service holds nothing.
+    """
+    section = await certified_static_route_section(_reader(_State("present", entry)), _DEVICE)
+
+    assert section.inconclusive, label
+    assert section.entry is None
+
+
+async def test_a_well_formed_empty_route_list_still_certifies_absence():
+    """The negative control: an empty list is a shape the reader understands, so it certifies."""
+    for entry in ({"device": "reader-dev", "route": []}, {"device": "reader-dev", "static-route": {"route": []}}):
+        section = await certified_static_route_section(_reader(_State("present", entry)), _DEVICE)
+        assert (section.status, section.routes) == ("absent", [])
+
+
+async def test_a_reclaim_never_consumes_a_carrier_on_a_malformed_service_read(adapter_client):
+    """A malformed service answer proves nothing, so the carrier survives the drain.
+
+    Device-clean plus an uncertifiable service read is exactly the state a discarded
+    malformed body would have reported as both-clean, consuming the carrier and stranding
+    whatever the service still holds.
+    """
+    from nso_adapter.nso.client import ServiceInstanceState
+    from tests.core.removal_helpers import authorize_static_route
+    from tests.core.test_static_route_reclaim import owners, queued_removals, run_reclaim, seed_succeeded_owner
+
+    device_id = await seed_device(nso_device_name="sr-malformed-read", netbox_device_id=17205)
+    owner = await seed_succeeded_owner(device_id)
+    tomb = await seed_tomb(device_id, A, job_id=owner, route_id=1)
+    await authorize_static_route(device_id)
+
+    fake = SrFake("sr-malformed-read", service=[wire(A)], device=[wire(B)])
+    # A 200 whose route list is one OBJECT: the client's envelope checks pass and only the
+    # section projection can tell it is not a list of entries.
+    fake.state = lambda: ServiceInstanceState("present", {"device": "sr-malformed-read", "route": wire(A)})
+
+    assert await run_reclaim(sr_client(fake)) == (0, 1)
+    assert await tombstone_ids(device_id) == [tomb], "the carrier was consumed on an uncertifiable read"
+    (reissued,) = await queued_removals(device_id)
+    assert (await owners(device_id))[tomb] == reissued.id
+
+
 def test_the_shared_reader_is_the_only_certified_static_route_reader():
     """One module knows the path and the nesting, so the cutover changes one module.
 
