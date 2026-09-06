@@ -134,7 +134,6 @@ async def replace_lag_snapshot(
         if lag_row is None:
             lag_row = LagBundleIntent(device_id=device_id, name=bundle.name, accepted_at=accepted_at, members=[])
             db.add(lag_row)
-            await db.flush()
 
         for field in _LAG_SCALARS:
             setattr(lag_row, field, getattr(bundle, field))
@@ -204,7 +203,6 @@ async def replace_switchport_snapshot(
                 tagged_vlans=[],
             )
             db.add(switchport_row)
-            await db.flush()
 
         switchport_row.mode = interface.mode
         switchport_row.untagged_vlan = interface.untagged_vlan

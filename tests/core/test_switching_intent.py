@@ -403,6 +403,76 @@ async def test_replacements_keep_loaded_child_collections_current(adapter_client
         await db.rollback()
 
 
+@pytest.mark.anyio
+async def test_a_replacement_flushes_once_however_many_roots_it_writes(adapter_client):
+    """No loop-local flush supplies an id: the children cascade from their root."""
+    from sqlalchemy import event
+
+    device_id = await seed_device(nso_device_name="switching-flush-count", netbox_device_id=1619)
+    bundles = tuple(
+        LagBundleSnapshot(
+            name=f"Port-channel{index}",
+            lag_id=index,
+            members=(LagMemberSnapshot(interface_name=f"Gi0/{index}"),),
+        )
+        for index in (1, 2, 3)
+    )
+    interfaces = tuple(
+        SwitchportSnapshot(interface_name=f"Gi1/{index}", tagged_vlans=(index * 10,)) for index in (1, 2, 3)
+    )
+
+    async with session() as db:
+        flushes: list[int] = []
+
+        def count_flush(*_args) -> None:
+            flushes.append(1)
+
+        event.listen(db.sync_session, "after_flush", count_flush)
+        try:
+            await replace_lag_snapshot(db, device_id, bundles)
+            lag_flushes = len(flushes)
+            await replace_switchport_snapshot(db, device_id, interfaces)
+            switchport_flushes = len(flushes) - lag_flushes
+        finally:
+            event.remove(db.sync_session, "after_flush", count_flush)
+        await db.commit()
+
+    assert (lag_flushes, switchport_flushes) == (1, 1)
+    async with session() as db:
+        lag_rows = (
+            (
+                await db.execute(
+                    select(LagBundleIntent)
+                    .where(LagBundleIntent.device_id == device_id)
+                    .options(selectinload(LagBundleIntent.members))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        switchport_rows = (
+            (
+                await db.execute(
+                    select(SwitchportIntent)
+                    .where(SwitchportIntent.device_id == device_id)
+                    .options(selectinload(SwitchportIntent.tagged_vlans))
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert sorted((row.name, len(row.members)) for row in lag_rows) == [
+        ("Port-channel1", 1),
+        ("Port-channel2", 1),
+        ("Port-channel3", 1),
+    ]
+    assert sorted((row.interface_name, len(row.tagged_vlans)) for row in switchport_rows) == [
+        ("Gi1/1", 1),
+        ("Gi1/2", 1),
+        ("Gi1/3", 1),
+    ]
+
+
 def test_obsolete_direct_nso_switching_paths_are_absent():
     repository = Path(__file__).resolve().parents[2]
     assert not (repository / "nso_adapter/core/lag_intent.py").exists()
