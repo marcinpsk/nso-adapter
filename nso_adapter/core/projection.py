@@ -963,6 +963,10 @@ def hydrate_interface_execution(document: dict) -> InterfaceExecution:
     execution exactly what the freeze exists to fix.
     """
     section = document.get("interface_config") or {}
+    # The context is validated HERE, not only where the encoder reads it: this hydrator runs
+    # before any device I/O, and a pre-contract section with a valid proof would otherwise
+    # execute and only fail at the encode site.
+    section_context(document, "interface_config")
     proof = section_proof(document, "interface_config") or {}
     if not set(proof) <= {"interfaces", "attribute_eligibility"} or "interfaces" not in proof:
         raise ValueError("document section 'interface_config' has invalid execution proof")

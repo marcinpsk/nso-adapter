@@ -535,3 +535,62 @@ def test_scenario_5e_interface_records_merge_field_wise_and_refuse_a_conflict():
                 },
             }
         )
+
+
+# ── the hydration half: every stored fact is checked BEFORE any device I/O ────
+
+
+def test_hydration_refuses_a_section_that_never_recorded_a_context():
+    """A pre-contract section must fail before the worker touches NSO, not at the encode site.
+
+    The migration stamped the rows that existed when the contract landed. Anything that
+    slipped past it still hydrates a valid proof, and hydration runs first, so the check
+    belongs here as well as at the encoder.
+    """
+    from nso_adapter.core.projection import hydrate_interface_execution
+    from nso_adapter.core.static_route_plan import (
+        hydrate_static_route_apply_plan,
+        hydrate_static_route_removal_plan,
+    )
+
+    interface = {
+        "interface_config": {
+            "interface_intent": [],
+            "interface_ip_intent": [],
+            "_execution": {"proof": {"interfaces": {}, "attribute_eligibility": {}}},
+        }
+    }
+    with pytest.raises(ValueError, match="invalid execution context"):
+        hydrate_interface_execution(interface)
+
+    route = {
+        "static_route": {
+            "static_route_intent": [],
+            "static_route_tombstone": [],
+            "_execution": {
+                "proof": {
+                    "apply": {
+                        "mode": "PATCH",
+                        "row_ids": [],
+                        "allowed_removal_keys": [],
+                        "tombstone_ids": [],
+                        "cas": [],
+                        "tombstone_id_watermark": 0,
+                    }
+                },
+                "operation": {
+                    "removal": {
+                        "authorized_removal_keys": [],
+                        "claimed_keys": [],
+                        "tombstone_ids": [],
+                        "candidate_clears": [],
+                        "reclaimed_keys": [],
+                    }
+                },
+            },
+        }
+    }
+    with pytest.raises(ValueError, match="invalid execution context"):
+        hydrate_static_route_apply_plan(route)
+    with pytest.raises(ValueError, match="invalid execution context"):
+        hydrate_static_route_removal_plan(route)

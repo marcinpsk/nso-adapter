@@ -548,9 +548,12 @@ def recorded_static_route_apply_mode(document: dict) -> str | None:
 
 def hydrate_static_route_apply_plan(document: dict) -> SrPlan:
     """Hydrate the immutable apply plan from a generation document."""
-    from nso_adapter.core.projection import hydrate_section
+    from nso_adapter.core.projection import hydrate_section, section_context
     from nso_adapter.store.models import StaticRouteIntent, StaticRouteTombstone
 
+    # Validated HERE, before any device I/O: a pre-contract section with a valid plan would
+    # otherwise hydrate and only fail at the encode site.
+    section_context(document, "static_route")
     record = _recorded_apply(document)
     required = {"mode", "row_ids", "allowed_removal_keys", "tombstone_ids", "cas", "tombstone_id_watermark"}
     if not isinstance(record, dict) or set(record) != required or record.get("mode") not in {"PATCH", "PUT"}:
@@ -602,8 +605,9 @@ def _sr_key(value) -> Triple:
 
 def hydrate_static_route_removal_plan(document: dict) -> SrRemovalPlan:
     """Hydrate the immutable removal classification from a generation document."""
-    from nso_adapter.core.projection import section_operation
+    from nso_adapter.core.projection import section_context, section_operation
 
+    section_context(document, "static_route")
     record = section_operation(document, "static_route").get("removal")
     required = {"authorized_removal_keys", "claimed_keys", "tombstone_ids", "candidate_clears", "reclaimed_keys"}
     if not isinstance(record, dict) or set(record) != required:

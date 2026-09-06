@@ -827,7 +827,7 @@ async def test_a_frozen_removal_plan_round_trips_its_clears(adapter_client):
     There is no second classifier to drift from any more: a reissue reads the operation plane
     its own creation wrote, so the only rule left is that serialization round-trips.
     """
-    from nso_adapter.core.projection import EXECUTION_KEY
+    from nso_adapter.core.projection import EXECUTION_KEY, snapshot_stream
     from nso_adapter.core.static_route_plan import (
         _serialize_removal_plan,
         classify_removal_plan,
@@ -870,13 +870,15 @@ async def test_a_frozen_removal_plan_round_trips_its_clears(adapter_client):
             .all()
         )
         promoted = classify_removal_plan(rows, [], allowed_removal_keys={}, context={})
+        tables = await snapshot_stream(db, device_id, "static_route")
 
     document = {
         "static_route": {
+            **tables,
             EXECUTION_KEY: {
                 "context": {"ned_id": None, "dialect": "identity"},
                 "operation": {"removal": _serialize_removal_plan(promoted)},
-            }
+            },
         }
     }
     hydrated = hydrate_static_route_removal_plan(document)
