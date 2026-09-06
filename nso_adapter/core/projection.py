@@ -1096,12 +1096,13 @@ def retained_proof(
         for rows in retained.values():
             for row in rows:
                 key = str(row["interface_id"])
-                if key in interfaces:
-                    continue
                 record = (origin.get("interfaces") or {}).get(key)
                 if record is None:
                     raise ValueError(f"retained interface row references interface {key} with no recorded context")
-                interfaces[key] = deepcopy(record)
+                # MERGED, not skipped: the desired fragment may name the same interface with a
+                # field the source had populated and a refresh has since nulled, and taking the
+                # desired record whole would drop the binding the retained row must keep.
+                _merge_interface_records(stream, interfaces, record, key)
         if stream == "interface_config":
             eligibility = result.setdefault("attribute_eligibility", {})
             for row in retained.get(InterfaceIntent.__tablename__, []):

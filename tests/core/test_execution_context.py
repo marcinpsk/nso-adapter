@@ -642,3 +642,34 @@ def test_hydration_refuses_a_recorded_clear_the_documents_own_rows_do_not_descri
         hydrate_static_route_removal_plan(_document({**good, "key": ["", "198.18.9.0/24", "198.18.1.1"]}))
     with pytest.raises(ValueError, match="wire-unset"):
         hydrate_static_route_removal_plan(_document({**good, "fields": ["tag"]}))
+
+
+def test_a_retained_interface_record_merges_with_the_desired_one():
+    """The retained row keeps the binding its own authorization froze.
+
+    An importer refresh can null ``parent_binding`` and ``encap_tag`` on the interface the
+    desired fragment recorded. Skipping the source record whenever the desired proof already
+    names the interface encoded the retained address without its binding.
+    """
+    from nso_adapter.core.projection import retained_proof
+
+    bare = {
+        "id": 7,
+        "name": "1/1/1",
+        "kind": None,
+        "parent_binding": None,
+        "encap_tag": None,
+        "vrf": None,
+        "service": None,
+    }
+    bound = {**bare, "parent_binding": "lag-99", "encap_tag": "99"}
+    desired = {"interfaces": {"7": bare}, "attribute_eligibility": {"7/description": True}}
+    source = {"interfaces": {"7": bound}, "attribute_eligibility": {"7/description": True}}
+    retained = {"interface_intent": [{"interface_id": 7, "attribute": "description"}]}
+
+    merged = retained_proof("interface_config", desired, source, retained)
+    assert merged["interfaces"]["7"] == bound
+
+    conflicting = {"interfaces": {"7": {**bare, "parent_binding": "lag-1"}}, "attribute_eligibility": {}}
+    with pytest.raises(ValueError, match="conflicting 'parent_binding' values"):
+        retained_proof("interface_config", conflicting, source, retained)
