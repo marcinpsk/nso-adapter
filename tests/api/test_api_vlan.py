@@ -307,3 +307,92 @@ async def test_apply_switchport_accepts_the_trunk_all_mode(adapter_client):
         rendered = await render_switching_sections(db, device_id)
         await db.rollback()
     assert rendered["switchport"]["interface"] == [{"interface-name": "Gi0/1", "mode": "trunk-all"}]
+
+
+@pytest.mark.anyio
+async def test_apply_switchport_treats_an_empty_mode_as_unset(adapter_client):
+    """`""` and null both mean unset, so re-sending one for the other is not a change."""
+    from datetime import UTC, datetime
+
+    from sqlalchemy import update
+
+    from nso_adapter.store.models import SwitchportIntent
+
+    device_id = await seed_device(nso_device_name="switchport-empty-mode", netbox_device_id=1213)
+    stored = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/switchport/apply",
+        json={"interfaces": [{"interface_name": "Gi0/1", "untagged_vlan": 10}]},
+        headers=AUTH,
+    )
+    assert stored.status_code == 200, stored.text
+
+    evidence_at = datetime(2026, 9, 1, tzinfo=UTC)
+    async with session() as db:
+        await db.execute(
+            update(SwitchportIntent)
+            .where(SwitchportIntent.device_id == device_id)
+            .values(accepted_at=evidence_at, last_apply_at=evidence_at)
+        )
+        await db.commit()
+
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/switchport/apply",
+        json={"interfaces": [{"interface_name": "Gi0/1", "mode": "", "untagged_vlan": 10}]},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 200, response.text
+    async with session() as db:
+        row = (
+            await db.execute(
+                text("SELECT mode, accepted_at, last_apply_at FROM switchport_intent WHERE device_id = :device_id"),
+                {"device_id": device_id},
+            )
+        ).one()
+    assert row.mode is None, "the empty string is stored as the unset the renderer omits"
+    assert (row.accepted_at, row.last_apply_at) == (evidence_at, evidence_at), "an unchanged row keeps its evidence"
+
+
+@pytest.mark.anyio
+async def test_apply_lag_config_treats_an_empty_member_mode_as_unset(adapter_client):
+    """The LACP member mode carries the same ambiguity as the switchport one."""
+    from datetime import UTC, datetime
+
+    from sqlalchemy import update
+
+    from nso_adapter.store.models import LagBundleIntent
+
+    device_id = await seed_device(nso_device_name="lag-empty-member-mode", netbox_device_id=1214)
+    body = {"bundles": [{"name": "Port-channel1", "lag_id": 1, "members": [{"interface_name": "Gi0/1"}]}]}
+    stored = await adapter_client.post(f"/api/v1/devices/{device_id}/lag-config/apply", json=body, headers=AUTH)
+    assert stored.status_code == 200, stored.text
+
+    evidence_at = datetime(2026, 9, 1, tzinfo=UTC)
+    async with session() as db:
+        await db.execute(
+            update(LagBundleIntent)
+            .where(LagBundleIntent.device_id == device_id)
+            .values(accepted_at=evidence_at, last_apply_at=evidence_at)
+        )
+        await db.commit()
+
+    body["bundles"][0]["members"][0]["mode"] = ""
+    response = await adapter_client.post(f"/api/v1/devices/{device_id}/lag-config/apply", json=body, headers=AUTH)
+
+    assert response.status_code == 200, response.text
+    async with session() as db:
+        bundle = (
+            await db.execute(
+                text("SELECT accepted_at, last_apply_at FROM lag_bundle_intent WHERE device_id = :device_id"),
+                {"device_id": device_id},
+            )
+        ).one()
+        member_mode = await db.scalar(
+            text(
+                "SELECT m.mode FROM lag_member_intent m JOIN lag_bundle_intent b ON b.id = m.lag_bundle_id "
+                "WHERE b.device_id = :device_id"
+            ),
+            {"device_id": device_id},
+        )
+    assert member_mode is None
+    assert (bundle.accepted_at, bundle.last_apply_at) == (evidence_at, evidence_at)

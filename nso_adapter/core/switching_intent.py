@@ -21,11 +21,27 @@ from nso_adapter.store.models import (
 )
 
 
+def _unset(value: str | None) -> str | None:
+    """Return the ONE spelling of an unset mode leaf.
+
+    The wire and the store carry two spellings of the same thing: the plugin sends ``""``
+    for an interface with no mode, and an omitted key arrives as ``None``. They must reach
+    the store as one value, or re-sending either for the other reads as an edit and clears
+    the row's apply evidence. ``None`` is the canonical one, because that is what makes the
+    renderer OMIT the leaf: an empty string would be emitted, and the YANG leaf holds
+    ``access``, ``trunk`` or ``trunk-all`` and nothing else.
+    """
+    return value or None
+
+
 @dataclass(frozen=True, slots=True)
 class LagMemberSnapshot:
     interface_name: str
     mode: str | None = None
     port_priority: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mode", _unset(self.mode))
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +62,9 @@ class SwitchportSnapshot:
     mode: str | None = None
     untagged_vlan: int | None = None
     tagged_vlans: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mode", _unset(self.mode))
 
 
 @dataclass(frozen=True, slots=True)
