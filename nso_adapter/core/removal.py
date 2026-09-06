@@ -1521,9 +1521,13 @@ async def _replace_interface_config(
     For an interface with NO remaining accepted intent, DELETE the instance (FASTMAP reverts
     everything it created there — the operator wants nothing managed).
     """
-    from nso_adapter.core.apply import _nokia_routed_kind
     from nso_adapter.core.projection import hydrate_interface_execution
-    from nso_adapter.nso.apply import build_interface_config_entry, delete_interface_config, replace_interface_config
+    from nso_adapter.nso.apply import (
+        build_interface_config_entry,
+        delete_interface_config,
+        nokia_routed_kind,
+        replace_interface_config,
+    )
     from nso_adapter.store.models import DbInterface, InterfaceIntent, InterfaceIpIntent
 
     replacement = await _replacement_section(db, "interface_config", job_id)
@@ -1590,7 +1594,7 @@ async def _replace_interface_config(
         if not ip_rows and not attr_rows:
             await delete_interface_config(client, device.nso_device_name, name)
             continue
-        routed_kind = _nokia_routed_kind(iface)
+        routed_kind = nokia_routed_kind(iface)
         entry = build_interface_config_entry(
             device.nso_device_name,
             name,

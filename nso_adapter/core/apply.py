@@ -28,12 +28,16 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, JobError, internal_error, terminalize
+from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.core.generation import executing_generation, generation_execution_sections, note_write
 from nso_adapter.core.projection import (
+    InterfaceExecution,
+    TableCompare,
     hydrate_interface_execution,
     hydrate_section,
     intent_state,
     section_models,
+    section_registry,
 )
 from nso_adapter.core.static_route_plan import (
     SrPlan,
@@ -42,7 +46,7 @@ from nso_adapter.core.static_route_plan import (
     hydrate_static_route_apply_plan,
     recorded_static_route_apply_mode,
 )
-from nso_adapter.nso.apply import NsoApplyError
+from nso_adapter.nso.apply import NsoApplyError, nokia_routed_kind
 from nso_adapter.store.models import (
     BfdIntent,
     BgpRouterIntent,
@@ -81,36 +85,18 @@ from nso_adapter.store.models import (
 logger = structlog.get_logger(__name__)
 
 
-def _nokia_routed_kind(iface) -> str | None:
-    """Derive the SR OS router context (base|ies|vprn) for a Nokia routed interface.
-
-    The adapter's ``DbInterface.kind`` is the interface *type* (physical/logical/loopback/
-    lag); the router context comes from ``service``/``vrf``:
-      * VPRN — ``service`` set and ``vrf`` == ``service`` (VPRN addrs carry vrf=service-name)
-      * IES  — ``service`` set, global table (vrf empty)
-      * Base — no service
-    Returns None for non-routed interfaces (physical ports, LAGs) and for non-Nokia
-    devices (where ``kind`` is unset) so the IP lands via the normal port/interface path.
-    """
-    if iface.kind not in ("logical", "loopback"):
-        return None
-    if iface.service:
-        return "vprn" if (iface.vrf and iface.vrf == iface.service) else "ies"
-    return "base"
-
-
 def _nokia_attr_kind(iface) -> str | None:
     """SR OS context for a Nokia interface's description/admin-state write.
 
-    Extends :func:`_nokia_routed_kind` (base|ies|vprn for an L3 routed interface) with ``lag``:
+    Extends :func:`nokia_routed_kind` (base|ies|vprn for an L3 routed interface) with ``lag``:
     a Nokia LAG's description/admin-state live under ``configure lag <lag-N>``, not a port and
     not a router interface. Physical ports (and non-Nokia interfaces) return ``None`` → the
-    legacy ``configure port`` path. Distinct from ``_nokia_routed_kind`` because a LAG never
+    legacy ``configure port`` path. Distinct from ``nokia_routed_kind`` because a LAG never
     carries an IP, so the IP path must keep returning ``None`` for it.
     """
     if iface.kind == "lag":
         return "lag"
-    return _nokia_routed_kind(iface)
+    return nokia_routed_kind(iface)
 
 
 async def enqueue_apply(
@@ -245,7 +231,7 @@ async def _diff_interface_ips(db, nso_apply, client, device_name: str, ifaces: d
     ip_delta = ""
     for iface_id, rows in by_iface.items():
         iface = ifaces[iface_id]
-        rk = _nokia_routed_kind(iface)
+        rk = nokia_routed_kind(iface)
         try:
             delta = await nso_apply.apply_interface_ips(
                 client=client,
@@ -1505,7 +1491,7 @@ async def _apply_ips(
     failures: list[dict] = []
     for iface_id, ip_rows in by_iface.items():
         iface = ifaces[iface_id]
-        routed_kind = _nokia_routed_kind(iface)
+        routed_kind = nokia_routed_kind(iface)
         try:
             await apply_fn(
                 client=client,
@@ -1555,41 +1541,20 @@ def _build_interface_config_entries(attr_eligible, ip_by_iface, ifaces, device_n
 
     Both ride the same ``(device, interface-name)``-keyed interface-reconciler instance, so in
     a single atomic edit they MUST be one list item — two items with a duplicate key conflict.
+    The shape is the aggregate's ``interface`` container plus the instance key each staged
+    reconciler body still carries.
     """
-    from nso_adapter.nso.apply import _coerce_enabled_intent, build_interface_ip_entry
+    from nso_adapter.nso.apply import SectionExecution, encode_interface_config
 
-    by_name: dict[str, dict] = {}
-
-    def _entry(name: str) -> dict:
-        return by_name.setdefault(name, {"device": device_name, "interface-name": name})
-
-    for _attr_state, intent_row, iface, _stamp in attr_eligible:
-        entry = _entry(iface.name)
-        if intent_row.attribute == "description":
-            entry["description"] = intent_row.intent_value if intent_row.intent_value is not None else ""
-        elif intent_row.attribute == "enabled":
-            # Shared strict coercion (raises on garbage) — same as the per-scope path, so a
-            # corrupt value never silently disables the interface in the atomic body either.
-            entry["enabled"] = _coerce_enabled_intent(intent_row.intent_value)
-
-    for iface_id, rows in ip_by_iface.items():
-        iface = ifaces[iface_id]
-        routed_kind = _nokia_routed_kind(iface)
-        ip_entry = build_interface_ip_entry(
-            device_name,
-            iface.name,
-            rows,
-            kind=routed_kind,
-            service=iface.service if routed_kind in ("ies", "vprn") else None,
-            parent_binding=iface.parent_binding,
-            encap_tag=iface.encap_tag,
-        )
-        entry = _entry(iface.name)
-        for key, value in ip_entry.items():
-            if key not in ("device", "interface-name"):
-                entry[key] = value
-
-    return list(by_name.values())
+    eligible = frozenset((row.interface_id, row.attribute) for _state, row, _iface, _stamp in attr_eligible)
+    body = encode_interface_config(
+        {
+            "interface_intent": [row for _state, row, _iface, _stamp in attr_eligible],
+            "interface_ip_intent": [row for rows in ip_by_iface.values() for row in rows],
+        },
+        SectionExecution(None, community_dialect_for(None), InterfaceExecution(ifaces, eligible)),
+    )
+    return [{"device": device_name, **entry} for entry in body["interface"]]
 
 
 _RP_ROOT = "route-policy-reconciler:route-policy-config"
@@ -2369,41 +2334,14 @@ async def _run_atomic_apply(db, device, client, device_name, job, job_id, now, e
             logger.debug("apply.atomic.capability_clear_skipped", job_id=job_id)
 
 
-# Scope → (store model name, residue YANG-list label, row → key tuple), guard grain.
-# Key tuples are the store keys verbatim — the same store↔YANG key equivalence the
-# removal path already relies on. bgp and route_policy have bespoke expansion below.
+#: The table-comparison sections and their (model, residue YANG-list label, row -> key)
+#: entries, read off the section registry so the write side keeps ONE copy of them
+#: (#1522 memo A8). Key tuples are the store keys verbatim — the same store-to-YANG key
+#: equivalence the removal path relies on. bgp and route_policy expand bespokely below.
 _READER_COMPARE_SPECS: dict[str, list] = {
-    "static_route": [("StaticRouteIntent", "route", lambda r: (r.vrf, r.prefix, r.next_hop))],
-    "vlan": [("VlanIntent", "vlan", lambda r: (r.vlan_id,))],
-    "svi": [("SviIntent", "interface", lambda r: (r.interface_name,))],
-    "subinterface": [("SubinterfaceIntent", "interface", lambda r: (r.interface_name,))],
-    "bfd": [("BfdIntent", "interface", lambda r: (r.interface_name,))],
-    "interface_mtu": [("InterfaceMtuIntent", "interface", lambda r: (r.interface_name,))],
-    "logging": [("LoggingHostIntent", "host", lambda r: (r.address,))],
-    "l2_sap": [("L2SapIntent", "sap", lambda r: (r.service_name, r.sap_id))],
-    "isis": [
-        ("IsisInterfaceIntent", "interface-config", lambda r: (r.interface_name, r.af)),
-        ("IsisProcessIntent", "process-config", lambda r: (r.process_tag,)),
-    ],
-    "ospf": [
-        ("OspfInstanceIntent", "process-config", lambda r: (r.process_id,)),
-        ("OspfInterfaceIntent", "interface-config", lambda r: (r.interface_name,)),
-    ],
-    "snmp": [
-        # SnmpCommunityIntent's intent key is the human-readable label, while the export keys a
-        # community by sha256(community-string)[:16] — a digest of a secret the adapter never sees
-        # (it pushes a Vault triple; NSO resolves it). Demanding the LABEL be present would stamp
-        # reader_compare_missing on every successful SNMP apply, so the row used to be left out of
-        # the check entirely — leaving the one scope where a silent drop is a missing CREDENTIAL as
-        # the only scope the drop-detector did not cover.
-        #
-        # CR-A17: the adapter holds the vault_ref, so it can resolve the secret and compute that
-        # same digest. The key is emitted as the label here and TRANSLATED in _translate_expected
-        # (which drops the row when Vault cannot answer — unverifiable, never "missing").
-        ("SnmpCommunityIntent", "community", lambda r: (r.label,)),
-        ("SnmpV3UserIntent", "v3-user", lambda r: (r.username,)),
-        ("SnmpHostIntent", "host", lambda r: (r.address,)),
-    ],
+    section: list(entry.verify.entries)
+    for section, entry in section_registry().items()
+    if isinstance(entry.verify, TableCompare)
 }
 
 
@@ -2459,8 +2397,7 @@ def _reader_compare_expected(scope: str, rows, ned_id: str | None = None) -> lis
                     out.append((r, "peer", (p.peer_address,)))
         return out
     out = []
-    for model_name, label, keyfn in _READER_COMPARE_SPECS.get(scope, []):
-        model = getattr(m, model_name)
+    for model, label, keyfn in _READER_COMPARE_SPECS.get(scope, []):
         out.extend((r, label, keyfn(r)) for r in rows if isinstance(r, model))
     return out
 

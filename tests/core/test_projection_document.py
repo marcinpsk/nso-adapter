@@ -78,11 +78,11 @@ def test_every_projection_column_has_a_supported_json_round_trip():
     from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Integer, String, Text
     from sqlalchemy.dialects.postgresql import JSONB
 
-    from nso_adapter.core.projection import _SECTION_TABLES
+    from nso_adapter.core.projection import section_registry
 
     supported_types = {BigInteger, Boolean, DateTime, Integer, JSON, JSONB, String, Text}
     supported_python_types = {bool, bytes, date, datetime, Decimal, dict, int, str}
-    models = {spec.model for specs in _SECTION_TABLES.values() for spec in specs}
+    models = {spec.model for entry in section_registry().values() for spec in entry.tables}
     unsupported = []
     for model in sorted(models, key=lambda candidate: candidate.__name__):
         for column in model.__table__.columns:
@@ -664,10 +664,10 @@ def test_every_parented_table_has_a_local_durable_identity():
     referencing a missing parent. :func:`_attach_hydrated_relationships` refuses it; this
     fails first, on the schema itself.
     """
-    from nso_adapter.core.projection import _SECTION_TABLES, _SPEC_BY_MODEL, _identity_fields
+    from nso_adapter.core.projection import _SPEC_BY_MODEL, _identity_fields, section_registry
 
-    for specs in _SECTION_TABLES.values():
-        for spec in specs:
+    for entry in section_registry().values():
+        for spec in entry.tables:
             if spec.parent in _SPEC_BY_MODEL:
                 assert _identity_fields(spec), f"{spec.model.__tablename__} has no local durable identity"
 
@@ -728,12 +728,12 @@ def test_the_two_out_of_protocol_streams_are_the_only_streams_without_an_endpoin
 
 def test_the_switching_identities_use_the_durable_root_and_child_keys():
     """The LAG name stays the document key when its numeric ID is also unique."""
-    from nso_adapter.core.projection import _SECTION_TABLES, _identity_fields
+    from nso_adapter.core.projection import _identity_fields, section_registry
 
     identities = {
         spec.model.__tablename__: _identity_fields(spec)
         for section in ("switchport", "lag")
-        for spec in _SECTION_TABLES[section]
+        for spec in section_registry()[section].tables
     }
     assert identities == {
         "switchport_intent": ("interface_name",),
@@ -744,15 +744,15 @@ def test_the_switching_identities_use_the_durable_root_and_child_keys():
     assert all(
         spec.discriminator is None and not spec.lifecycle
         for section in ("switchport", "lag")
-        for spec in _SECTION_TABLES[section]
+        for spec in section_registry()[section].tables
     )
 
 
 def test_the_switching_sections_are_registered_before_interface_config():
     """Registry iteration still ends at interface_config (the #1522 amendment requires it)."""
-    from nso_adapter.core.projection import _SECTION_TABLES
+    from nso_adapter.core.projection import section_registry
 
-    names = list(_SECTION_TABLES)
+    names = list(section_registry())
     assert names[-1] == "interface_config"
     assert names[-3:-1] == ["switchport", "lag"]
 

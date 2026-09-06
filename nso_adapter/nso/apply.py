@@ -23,10 +23,11 @@ import json
 import os
 from collections.abc import Mapping
 from contextvars import ContextVar
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import structlog
 
+from nso_adapter.core.community_dialect import UNREPRESENTABLE, CommunityDialect, community_dialect_for
 from nso_adapter.core.isis_canon import isis_level
 from nso_adapter.nso.client import NsoClient, _url_key
 from nso_adapter.nso.nso_json import boundary_safe_dumps
@@ -595,6 +596,24 @@ async def apply_interface_attribute(
     return None
 
 
+def nokia_routed_kind(iface) -> str | None:
+    """Derive the SR OS router context (base|ies|vprn) for a Nokia routed interface.
+
+    The adapter's ``DbInterface.kind`` is the interface *type* (physical/logical/loopback/
+    lag); the router context comes from ``service``/``vrf``:
+      * VPRN — ``service`` set and ``vrf`` == ``service`` (VPRN addrs carry vrf=service-name)
+      * IES  — ``service`` set, global table (vrf empty)
+      * Base — no service
+    Returns None for non-routed interfaces (physical ports, LAGs) and for non-Nokia
+    devices (where ``kind`` is unset) so the IP lands via the normal port/interface path.
+    """
+    if iface.kind not in ("logical", "loopback"):
+        return None
+    if iface.service:
+        return "vprn" if (iface.vrf and iface.vrf == iface.service) else "ies"
+    return "base"
+
+
 def build_interface_ip_entry(
     device_name: str,
     interface_name: str,
@@ -611,7 +630,34 @@ def build_interface_ip_entry(
     so both emit byte-identical IP bodies. ``kind``/``service``/``parent_binding``/
     ``encap_tag`` carry the Nokia routed-interface context (ignored by IOS/Junos).
     """
-    entry: dict = {"device": device_name, "interface-name": interface_name}
+    return {
+        "device": device_name,
+        **build_interface_ip_body(
+            interface_name,
+            ip_intent_rows,
+            kind=kind,
+            service=service,
+            parent_binding=parent_binding,
+            encap_tag=encap_tag,
+        ),
+    }
+
+
+def build_interface_ip_body(
+    interface_name: str,
+    ip_intent_rows: list,
+    *,
+    kind: str | None = None,
+    service: str | None = None,
+    parent_binding: str | None = None,
+    encap_tag: str | None = None,
+) -> dict:
+    """Shape one interface's IP body — the same leaves, without the service instance key.
+
+    The aggregate keys its interface list by name alone, so the device leaf that made the
+    reconciler instance is added by the caller that still needs one.
+    """
+    entry: dict = {"interface-name": interface_name}
 
     # VRF is an interface-level concept; take the first non-empty VRF value.
     vrf = next((r.vrf for r in ip_intent_rows if r.vrf), None)
@@ -935,52 +981,16 @@ async def apply_snmp_config(
     vault_ref cannot yield the mandatory triples (a silent drop would delete that
     element from the device on a replace apply).
     """
-    entry: dict = {"device": device_name}
-
-    if community_intents:
-        entry["community"] = [
-            {
-                "name": c.label,
-                "access": _snmp_enum(c.access, _SNMP_ACCESS, "access", c.label),
-                **({"acl": c.acl} if c.acl else {}),
-                **_snmp_vault_triple(c.vault_ref, "", f"community {c.label}"),
-            }
-            for c in community_intents
-        ]
-
-    if v3_user_intents:
-        entry["v3-user"] = [
-            {
-                "username": u.username,
-                **({"group": u.group_name} if u.group_name else {}),
-                **({"auth-protocol": u.auth_protocol} if u.auth_protocol else {}),
-                **({"priv-protocol": u.priv_protocol} if u.priv_protocol else {}),
-                **(_snmp_vault_triple(u.auth_vault_ref, "auth-", f"v3-user {u.username}") if u.auth_vault_ref else {}),
-                **(_snmp_vault_triple(u.priv_vault_ref, "priv-", f"v3-user {u.username}") if u.priv_vault_ref else {}),
-            }
-            for u in v3_user_intents
-        ]
-
-    if host_intents:
-        entry["host"] = [
-            {
-                "address": h.address,
-                "version": _snmp_enum(h.version, _SNMP_VERSION, "version", h.address),
-                "notify-type": _snmp_enum(h.notify_type, _SNMP_NOTIFY, "notify_type", h.address),
-                # optional leaf: a binding-less host (ArcOS targets bind via
-                # target-parameters, not the target) must omit it, not send null
-                **({"community-or-user": h.community_or_user} if h.community_or_user else {}),
-                **({"port": h.port} if h.port is not None else {}),
-            }
-            for h in host_intents
-        ]
-
-    if system_info_intent:
-        if system_info_intent.location is not None:
-            entry["location"] = system_info_intent.location
-        if system_info_intent.contact is not None:
-            entry["contact"] = system_info_intent.contact
-
+    body = encode_snmp(
+        {
+            "snmp_community_intent": community_intents,
+            "snmp_v3_user_intent": v3_user_intents,
+            "snmp_host_intent": host_intents,
+            "snmp_system_info_intent": [system_info_intent] if system_info_intent else [],
+        },
+        _CONTEXT_FREE_EXECUTION,
+    )
+    entry = {"device": device_name, **body}
     return await _send_service_config(
         client,
         _SNMP_SERVICE_PATH,
@@ -1060,7 +1070,7 @@ async def apply_static_routes(
     store has no column for. A rendered row always WINS on a key collision: the store is
     the authority for a route it still owns.
     """
-    routes = [static_route_entry(row) for row in route_intent_rows]
+    routes = encode_static_route({"static_route_intent": route_intent_rows}, _CONTEXT_FREE_EXECUTION)["route"]
     if extra_entries:
         seen = {static_route_entry_key(entry) for entry in routes}
         for entry in extra_entries:
@@ -1130,37 +1140,14 @@ async def apply_logging_config(
     (apply_failed / stage_errors / removal_failed) until the gate opens or the
     operator un-manages the levels.
     """
-    hosts = []
-    for row in host_intent_rows:
-        entry: dict = {"address": row.address}
-        if row.port is not None:
-            entry["port"] = row.port
-        if row.severity:
-            entry["severity"] = row.severity
-        if row.facility:
-            entry["facility"] = row.facility
-        if row.transport:
-            entry["transport"] = row.transport
-        if row.vrf:
-            entry["vrf"] = row.vrf
-        if row.source:
-            entry["source"] = row.source
-        hosts.append(entry)
-
-    body: dict = {"device": device_name, "host": hosts}
-    if levels_intent_row is not None:
-        levels = {leaf: val for leaf, attr in _LOCAL_LEVEL_LEAVES if (val := getattr(levels_intent_row, attr))}
-        if levels and not local_levels_write_enabled():
-            raise NsoApplyError(
-                "local_levels_gated",
-                "accepted local-levels intent cannot be applied: the "
-                "NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE gate is off (open it once the "
-                "reloaded logging-reconciler is live, or un-manage the levels)",
-                {"device": device_name, "levels": levels},
-            )
-        if levels:
-            body["local-levels"] = levels
-
+    encoded = encode_logging(
+        {
+            "logging_host_intent": host_intent_rows,
+            "logging_levels_intent": [levels_intent_row] if levels_intent_row is not None else [],
+        },
+        _CONTEXT_FREE_EXECUTION,
+    )
+    body: dict = {"device": device_name, **encoded}
     return await _send_service_config(
         client,
         _LOGGING_SERVICE_PATH,
@@ -1189,19 +1176,13 @@ async def apply_svi_config(
     IPs ride the interface-reconciler. Reconcile mode (brownfield adoption).
     ``replace=True`` PUT-replaces the keyed instance so removed SVIs are reverted.
     """
-    interfaces = []
-    for row in svi_intent_rows:
-        entry: dict = {"interface-name": row.interface_name, "vlan-id": row.vlan_id, "type": row.svi_type}
-        if row.vrf:
-            entry["vrf"] = row.vrf
-        interfaces.append(entry)
-
+    body = encode_svi({"svi_intent": svi_intent_rows}, _CONTEXT_FREE_EXECUTION)
     return await _send_service_config(
         client,
         _SVI_SERVICE_PATH,
         "svi-reconciler:svi-config",
         device_name,
-        {"device": device_name, "interface": interfaces},
+        {"device": device_name, **body},
         scope="svi",
         replace=replace,
         dry_run=dry_run,
@@ -1250,7 +1231,10 @@ async def apply_subinterface_config(
         _SUBIF_SERVICE_PATH,
         "subinterface-reconciler:subif-config",
         device_name,
-        {"device": device_name, "interface": build_subif_interfaces(subif_intent_rows)},
+        {
+            "device": device_name,
+            **encode_subinterface({"subinterface_intent": subif_intent_rows}, _CONTEXT_FREE_EXECUTION),
+        },
         scope="subinterface",
         replace=replace,
         dry_run=dry_run,
@@ -1274,19 +1258,13 @@ async def apply_vlan_config(
     ``replace=True`` PUT-replaces the keyed instance (full desired list) so removed
     VLANs are reverted on the device. Raises NsoApplyError on failure.
     """
-    vlans = []
-    for row in vlan_intent_rows:
-        entry: dict = {"vlan-id": row.vlan_id}
-        if row.name:
-            entry["name"] = row.name
-        vlans.append(entry)
-
+    body = encode_vlan({"vlan_intent": vlan_intent_rows}, _CONTEXT_FREE_EXECUTION)
     return await _send_service_config(
         client,
         _VLAN_SERVICE_PATH,
         "vlan-reconciler:vlan-config",
         device_name,
-        {"device": device_name, "vlan": vlans},
+        {"device": device_name, **body},
         scope="vlan",
         replace=replace,
         dry_run=dry_run,
@@ -1310,23 +1288,13 @@ async def apply_bfd_config(
     interface ipv4 bfd). Reconcile mode. ``replace=True`` PUT-replaces the keyed
     instance so removed BFD interfaces are reverted.
     """
-    interfaces = []
-    for row in bfd_intent_rows:
-        entry: dict = {"interface-name": row.interface_name, "micro-bfd": bool(row.micro_bfd)}
-        if row.min_tx is not None:
-            entry["min-tx"] = row.min_tx
-        if row.min_rx is not None:
-            entry["min-rx"] = row.min_rx
-        if row.multiplier is not None:
-            entry["multiplier"] = row.multiplier
-        interfaces.append(entry)
-
+    body = encode_bfd({"bfd_intent": bfd_intent_rows}, _CONTEXT_FREE_EXECUTION)
     return await _send_service_config(
         client,
         _BFD_SERVICE_PATH,
         "bfd-reconciler:bfd-config",
         device_name,
-        {"device": device_name, "interface": interfaces},
+        {"device": device_name, **body},
         scope="bfd",
         replace=replace,
         dry_run=dry_run,
@@ -1351,23 +1319,13 @@ async def apply_mtu_config(
     Reconcile mode. ``replace=True`` PUT-replaces the keyed instance so removed
     MTU interfaces are reverted.
     """
-    interfaces = []
-    for row in mtu_intent_rows:
-        entry: dict = {"interface-name": row.interface_name}
-        if row.mtu is not None:
-            entry["mtu"] = row.mtu
-        if row.ip_mtu is not None:
-            entry["ip-mtu"] = row.ip_mtu
-        if row.mpls_mtu is not None:
-            entry["mpls-mtu"] = row.mpls_mtu
-        interfaces.append(entry)
-
+    body = encode_interface_mtu({"interface_mtu_intent": mtu_intent_rows}, _CONTEXT_FREE_EXECUTION)
     return await _send_service_config(
         client,
         _MTU_SERVICE_PATH,
         "mtu-reconciler:mtu-config",
         device_name,
-        {"device": device_name, "interface": interfaces},
+        {"device": device_name, **body},
         scope="interface_mtu",
         replace=replace,
         dry_run=dry_run,
@@ -1391,27 +1349,13 @@ async def apply_l2_saps(
     under an EXISTING epipe/vpls service (SAP-only). ``replace=True`` PUT-replaces
     the keyed instance so removed SAPs are reverted.
     """
-    saps = []
-    for row in sap_intent_rows:
-        entry: dict = {
-            "service-name": row.service_name,
-            "sap-id": row.sap_id,
-            "service-type": row.service_type,
-        }
-        if row.port:
-            entry["port"] = row.port
-        if row.outer_tag is not None:
-            entry["outer-tag"] = row.outer_tag
-        if row.inner_tag is not None:
-            entry["inner-tag"] = row.inner_tag
-        saps.append(entry)
-
+    body = encode_l2_sap({"l2_sap_intent": sap_intent_rows}, _CONTEXT_FREE_EXECUTION)
     return await _send_service_config(
         client,
         _L2_SAP_SERVICE_PATH,
         "l2-sap-reconciler:l2-sap-config",
         device_name,
-        {"device": device_name, "sap": saps},
+        {"device": device_name, **body},
         scope="l2_sap",
         replace=replace,
         dry_run=dry_run,
@@ -1591,16 +1535,17 @@ async def apply_isis_interfaces(
 
     Raises NsoApplyError on failure.
     """
-    processes = build_isis_process_payload(isis_process_rows, redistribution_rows, flex_algo_rows, level_rows)
-
-    interfaces = build_isis_interface_payload(isis_intent_rows)
-
-    service_body: dict = {"device": device_name}
-    if interfaces:
-        service_body["interface-config"] = interfaces
-    if processes:
-        service_body["process-config"] = processes
-
+    body = encode_isis(
+        {
+            "isis_process_intent": isis_process_rows or [],
+            "isis_interface_intent": isis_intent_rows or [],
+            "isis_level_intent": level_rows or [],
+            "isis_flex_algo_intent": flex_algo_rows or [],
+            "redistribution_intent": redistribution_rows or [],
+        },
+        _CONTEXT_FREE_EXECUTION,
+    )
+    service_body: dict = {"device": device_name, **body}
     return await _send_service_config(
         client,
         _ISIS_SERVICE_PATH,
@@ -1797,50 +1742,16 @@ async def apply_bgp_config(
 
     Raises NsoApplyError on failure.
     """
-    # Index redistribution by dest_ref
-    redist_by_af: dict[str, list[dict]] = {}
-    for row in redistribution_rows or []:
-        redist_by_af.setdefault(row.dest_ref, []).append(_bgp_redistribute_entry(row))
-
-    routers: list[dict] = []
-    # Indexes for orphan-redistribute merge (below): keyed by the string ASN / (asn,vrf)
-    # forms that appear in a redistribution dest_ref.
-    router_by_asn: dict[str, dict] = {}
-    scope_by_key: dict[tuple[str, str], dict] = {}
-    af_seen: set[tuple[str, str, str]] = set()
-    for r in router_intent_rows:
-        asn_str = str(r.asn)
-        scopes_out = []
-        for scope in r.scopes:
-            afs_out = []
-            for af in scope.address_families:
-                af_entry: dict = {"afi": af.af}
-                af_redist = redist_by_af.get(f"{asn_str}:{scope.vrf}:{af.af}", [])
-                if af_redist:
-                    af_entry["redistribute"] = af_redist
-                afs_out.append(af_entry)
-                af_seen.add((asn_str, scope.vrf, af.af))
-            scope_dict = {
-                "vrf": scope.vrf,
-                "address-family": afs_out,
-                "peer": [_bgp_peer_entry(peer) for peer in scope.peers],
-            }
-            scopes_out.append(scope_dict)
-            scope_by_key[(asn_str, scope.vrf)] = scope_dict
-        router_dict = {"asn": _parse_asn(r.asn), "scope": scopes_out}
-        if r.router_id:
-            router_dict["router-id"] = r.router_id  # bgp-reconciler leaf, sibling of asn
-        routers.append(router_dict)
-        router_by_asn[asn_str] = router_dict
-
-    _attach_orphan_bgp_redistribute(routers, redist_by_af, router_by_asn, scope_by_key, af_seen)
-
+    body = encode_bgp(
+        {"bgp_router_intent": router_intent_rows, "redistribution_intent": redistribution_rows or []},
+        _CONTEXT_FREE_EXECUTION,
+    )
     return await _send_service_config(
         client,
         _BGP_SERVICE_PATH,
         "bgp-reconciler:bgp-config",
         device_name,
-        {"device": device_name, "router": routers},
+        {"device": device_name, **body},
         scope="bgp",
         replace=replace,
         dry_run=dry_run,
@@ -1930,47 +1841,19 @@ async def apply_route_policy_config(
     and logged per-device on a real apply (``dry_run=False``) for the operator/auto-apply
     journal.
     """
-    from collections import defaultdict
-
-    from nso_adapter.core.community_dialect import UNREPRESENTABLE, community_dialect_for
-
     dialect = community_dialect_for(ned_id)
-
-    by_family: dict[str, list] = defaultdict(list)
-    for row in intent_rows:
-        entries = row.entries
-        if row.family == "route_map":
-            entries = [_normalize_route_map_entry(e) for e in entries if isinstance(e, dict)]
-        by_family[row.family].append(
-            {"name": row.name, "entries": entries, "invert_match": getattr(row, "invert_match", False)}
-        )
-
-    def _community_list_entry(obj: dict) -> dict:
-        """Translate this community's members to the device dialect, skipping any the NED can't hold."""
-        kept: list = []
-        for entry in obj["entries"]:
-            wire = dialect.from_canonical(entry["community"])
-            if wire is UNREPRESENTABLE:
-                if not dry_run:
-                    logger.warning(
-                        "apply.route_policy.member_skipped",
-                        device=device_name,
-                        ned_id=ned_id,
-                        community=obj["name"],
-                        member=entry["community"],
-                        reason="unrepresentable_on_ned",
-                    )
-                continue
-            kept.append({**entry, "community": wire} if wire != entry["community"] else entry)
-        return {"name": obj["name"], "invert-match": bool(obj.get("invert_match", False)), "entry": kept}
-
-    body = {
-        "device": device_name,
-        "prefix-list": [{"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("prefix_list", [])],
-        "community-list": [_community_list_entry(obj) for obj in by_family.get("community_list", [])],
-        "as-path": [{"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("as_path", [])],
-        "route-map": [{"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("route_map", [])],
-    }
+    rows = {"route_policy_object_intent": intent_rows}
+    if not dry_run:
+        for name, member in unrenderable_route_policy_members(rows, dialect):
+            logger.warning(
+                "apply.route_policy.member_skipped",
+                device=device_name,
+                ned_id=ned_id,
+                community=name,
+                member=member,
+                reason="unrepresentable_on_ned",
+            )
+    body = {"device": device_name, **encode_route_policy(rows, SectionExecution(ned_id, dialect))}
     return await _send_service_config(
         client,
         _ROUTE_POLICY_SERVICE_PATH,
@@ -2056,33 +1939,15 @@ async def apply_ospf_config(
 
     Raises NsoApplyError on failure.
     """
-    # Index redistribution by dest_ref (= str(process_id))
-    redist_by_proc: dict[str, list[dict]] = {}
-    for row in redistribution_rows or []:
-        redist_by_proc.setdefault(row.dest_ref, []).append(_redistribute_entry(row))
-
-    processes = [_ospf_process_entry(row, redist_by_proc.get(str(row.process_id), [])) for row in process_intent_rows]
-    emitted_pids = {p["process-id"] for p in processes}
-    # Redistribute rows whose OSPF process has no process row in this apply (parent already
-    # applied cleanly → filtered out) must still land via a minimal synthesized entry
-    # (parity with IS-IS/BGP). Only process-id + redistribute so a merge-PATCH doesn't
-    # touch the process's admin-state.
-    for pid, redist_list in redist_by_proc.items():
-        if pid not in emitted_pids:
-            processes.append({"process-id": pid, "redistribute": redist_list})
-            emitted_pids.add(pid)
-
-    interfaces = [_ospf_interface_entry(row) for row in interface_intent_rows]
-
-    service_body: dict = {"device": device_name}
-    # Only send interface-config when non-empty: an explicit `interface-config: []` on a
-    # keyed-list merge can be read as "replace with empty", over-deleting the device's
-    # existing OSPF interfaces on a process-only apply (IS-IS omits it the same way).
-    if interfaces:
-        service_body["interface-config"] = interfaces
-    if processes:
-        service_body["process-config"] = processes
-
+    body = encode_ospf(
+        {
+            "ospf_instance_intent": process_intent_rows,
+            "ospf_interface_intent": interface_intent_rows,
+            "redistribution_intent": redistribution_rows or [],
+        },
+        _CONTEXT_FREE_EXECUTION,
+    )
+    service_body: dict = {"device": device_name, **body}
     return await _send_service_config(
         client,
         _OSPF_SERVICE_PATH,
@@ -2094,3 +1959,460 @@ async def apply_ospf_config(
         dry_run=dry_run,
         stage=stage,
     )
+
+
+# ── The aggregate device-intent wire encoders (#1522 C9, memo A8) ─────────────────────
+#
+# One encoder per DOCUMENT SECTION: the section's stored rows plus its frozen execution
+# facts in, the YANG container body out. Pure — no device row, no live intent row, no
+# I/O — so the body a generation sends is a function of the document it froze and a
+# retry sends the same bytes. Rows are keyed by TABLE NAME, exactly as the stored
+# document keys them, and every declared table is present (empty when the section has no
+# such rows), so a table rename raises here instead of silently emitting an empty list.
+#
+# The per-service builders above delegate to these, so one shape reaches the wire until
+# the aggregate sender retires them.
+
+
+class SectionExecution(NamedTuple):
+    """The frozen facts an encoder may read besides its rows (#1522 memo A9).
+
+    *ned_id* and *dialect* are the section's persistent encoding CONTEXT, frozen with the
+    fragment that carries it; *proof* is the section's hydrated proof metadata, ``None``
+    for a section that declares none. Nothing here is read from a live device row.
+    """
+
+    ned_id: str | None
+    dialect: CommunityDialect
+    proof: Any = None
+
+
+#: One section's rows as an encoder reads them: table name -> the document's rows.
+SectionRows = Mapping[str, list[Any]]
+
+#: What to hand an encoder that reads no execution facts at all. Only ``route_policy``
+#: (NED-conditioned) and ``interface_config`` (proof-fed) read the argument.
+_CONTEXT_FREE_EXECUTION = SectionExecution(None, community_dialect_for(None))
+
+
+def encode_snmp(rows: SectionRows, execution: SectionExecution) -> dict:
+    """Encode the ``snmp`` container: communities, v3 users, trap hosts, location, contact.
+
+    Secret material never reaches the body: each Vault reference is split into the
+    mount/path/key triple the service resolves at commit time.
+    """
+    entry: dict = {}
+    community_intents = rows["snmp_community_intent"]
+    v3_user_intents = rows["snmp_v3_user_intent"]
+    host_intents = rows["snmp_host_intent"]
+    system_info = rows["snmp_system_info_intent"]
+
+    if community_intents:
+        entry["community"] = [
+            {
+                "name": c.label,
+                "access": _snmp_enum(c.access, _SNMP_ACCESS, "access", c.label),
+                **({"acl": c.acl} if c.acl else {}),
+                **_snmp_vault_triple(c.vault_ref, "", f"community {c.label}"),
+            }
+            for c in community_intents
+        ]
+
+    if v3_user_intents:
+        entry["v3-user"] = [
+            {
+                "username": u.username,
+                **({"group": u.group_name} if u.group_name else {}),
+                **({"auth-protocol": u.auth_protocol} if u.auth_protocol else {}),
+                **({"priv-protocol": u.priv_protocol} if u.priv_protocol else {}),
+                **(_snmp_vault_triple(u.auth_vault_ref, "auth-", f"v3-user {u.username}") if u.auth_vault_ref else {}),
+                **(_snmp_vault_triple(u.priv_vault_ref, "priv-", f"v3-user {u.username}") if u.priv_vault_ref else {}),
+            }
+            for u in v3_user_intents
+        ]
+
+    if host_intents:
+        entry["host"] = [
+            {
+                "address": h.address,
+                "version": _snmp_enum(h.version, _SNMP_VERSION, "version", h.address),
+                "notify-type": _snmp_enum(h.notify_type, _SNMP_NOTIFY, "notify_type", h.address),
+                # optional leaf: a binding-less host (ArcOS targets bind via
+                # target-parameters, not the target) must omit it, not send null
+                **({"community-or-user": h.community_or_user} if h.community_or_user else {}),
+                **({"port": h.port} if h.port is not None else {}),
+            }
+            for h in host_intents
+        ]
+
+    for info in system_info:
+        if info.location is not None:
+            entry["location"] = info.location
+        if info.contact is not None:
+            entry["contact"] = info.contact
+    return entry
+
+
+def encode_static_route(rows: SectionRows, execution: SectionExecution) -> dict:
+    """Encode the ``static-route`` container from the document's own routes.
+
+    Retention is NOT here: the ratified sender exception overlays the live certified
+    service entries of the frozen retained key set onto this body, after encoding.
+    """
+    return {"route": [static_route_entry(row) for row in rows["static_route_intent"]]}
+
+
+def encode_logging(rows: SectionRows, execution: SectionExecution) -> dict:
+    """Encode the ``logging`` container: remote syslog hosts plus the local-levels singleton.
+
+    A closed ``local-levels`` gate with accepted severities REFUSES rather than sending a
+    weaker host-only body, which would FASTMAP-retract severities the device already holds.
+    """
+    hosts = []
+    for row in rows["logging_host_intent"]:
+        entry: dict = {"address": row.address}
+        if row.port is not None:
+            entry["port"] = row.port
+        if row.severity:
+            entry["severity"] = row.severity
+        if row.facility:
+            entry["facility"] = row.facility
+        if row.transport:
+            entry["transport"] = row.transport
+        if row.vrf:
+            entry["vrf"] = row.vrf
+        if row.source:
+            entry["source"] = row.source
+        hosts.append(entry)
+
+    body: dict = {"host": hosts}
+    for levels_row in rows["logging_levels_intent"]:
+        levels = {leaf: value for leaf, attr in _LOCAL_LEVEL_LEAVES if (value := getattr(levels_row, attr))}
+        if levels and not local_levels_write_enabled():
+            raise NsoApplyError(
+                "local_levels_gated",
+                "accepted local-levels intent cannot be applied: the "
+                "NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE gate is off (open it once the "
+                "reloaded logging-reconciler is live, or un-manage the levels)",
+                {"levels": levels},
+            )
+        if levels:
+            body["local-levels"] = levels
+    return body
+
+
+def encode_svi(rows: SectionRows, execution: SectionExecution) -> dict:
+    """Encode the ``svi`` container: L3 VLAN interfaces (SVIs / IRBs)."""
+    interfaces = []
+    for row in rows["svi_intent"]:
+        entry: dict = {"interface-name": row.interface_name, "vlan-id": row.vlan_id, "type": row.svi_type}
+        if row.vrf:
+            entry["vrf"] = row.vrf
+        interfaces.append(entry)
+    return {"interface": interfaces}
+
+
+def encode_subinterface(rows: SectionRows, execution: SectionExecution) -> dict:
+    """Encode the ``subinterface`` container: dot1q L3 subinterfaces."""
+    return {"interface": build_subif_interfaces(rows["subinterface_intent"])}
+
+
+def encode_vlan(rows: SectionRows, execution: SectionExecution) -> dict:
+    """Encode the ``vlan`` container: the device's L2 VLAN database."""
+    vlans = []
+    for row in rows["vlan_intent"]:
+        entry: dict = {"vlan-id": row.vlan_id}
+        if row.name:
+            entry["name"] = row.name
+        vlans.append(entry)
+    return {"vlan": vlans}
+
+
+def encode_bfd(rows: SectionRows, execution: SectionExecution) -> dict:
+    """Encode the ``bfd`` container: per-interface BFD timers."""
+    interfaces = []
+    for row in rows["bfd_intent"]:
+        entry: dict = {"interface-name": row.interface_name, "micro-bfd": bool(row.micro_bfd)}
+        if row.min_tx is not None:
+            entry["min-tx"] = row.min_tx
+        if row.min_rx is not None:
+            entry["min-rx"] = row.min_rx
+        if row.multiplier is not None:
+            entry["multiplier"] = row.multiplier
+        interfaces.append(entry)
+    return {"interface": interfaces}
+
+
+def encode_interface_mtu(rows: SectionRows, execution: SectionExecution) -> dict:
+    """Encode the ``mtu`` container: per-interface L2 / IP / MPLS MTU."""
+    interfaces = []
+    for row in rows["interface_mtu_intent"]:
+        entry: dict = {"interface-name": row.interface_name}
+        if row.mtu is not None:
+            entry["mtu"] = row.mtu
+        if row.ip_mtu is not None:
+            entry["ip-mtu"] = row.ip_mtu
+        if row.mpls_mtu is not None:
+            entry["mpls-mtu"] = row.mpls_mtu
+        interfaces.append(entry)
+    return {"interface": interfaces}
+
+
+def encode_l2_sap(rows: SectionRows, execution: SectionExecution) -> dict:
+    """Encode the ``l2-sap`` container: SAPs under existing SR OS epipe/vpls services."""
+    saps = []
+    for row in rows["l2_sap_intent"]:
+        entry: dict = {
+            "service-name": row.service_name,
+            "sap-id": row.sap_id,
+            "service-type": row.service_type,
+        }
+        if row.port:
+            entry["port"] = row.port
+        if row.outer_tag is not None:
+            entry["outer-tag"] = row.outer_tag
+        if row.inner_tag is not None:
+            entry["inner-tag"] = row.inner_tag
+        saps.append(entry)
+    return {"sap": saps}
+
+
+def encode_isis(rows: SectionRows, execution: SectionExecution) -> dict:
+    """Encode the ``isis`` container: processes, per-level tuning, flex-algo and interfaces.
+
+    An empty list is OMITTED, not sent as ``[]``: a keyed-list merge reads an explicit
+    empty list as "replace with empty" and would over-delete the device's IS-IS state.
+    """
+    processes = build_isis_process_payload(
+        rows["isis_process_intent"],
+        rows["redistribution_intent"],
+        rows["isis_flex_algo_intent"],
+        rows["isis_level_intent"],
+    )
+    interfaces = build_isis_interface_payload(rows["isis_interface_intent"])
+    body: dict = {}
+    if interfaces:
+        body["interface-config"] = interfaces
+    if processes:
+        body["process-config"] = processes
+    return body
+
+
+def encode_bgp(rows: SectionRows, execution: SectionExecution) -> dict:
+    """Encode the ``bgp`` container: the router / scope / address-family / peer tree."""
+    redist_by_af: dict[str, list[dict]] = {}
+    for row in rows["redistribution_intent"]:
+        redist_by_af.setdefault(row.dest_ref, []).append(_bgp_redistribute_entry(row))
+
+    routers: list[dict] = []
+    router_by_asn: dict[str, dict] = {}
+    scope_by_key: dict[tuple[str, str], dict] = {}
+    af_seen: set[tuple[str, str, str]] = set()
+    for r in rows["bgp_router_intent"]:
+        asn_str = str(r.asn)
+        scopes_out = []
+        for scope in r.scopes:
+            afs_out = []
+            for af in scope.address_families:
+                af_entry: dict = {"afi": af.af}
+                af_redist = redist_by_af.get(f"{asn_str}:{scope.vrf}:{af.af}", [])
+                if af_redist:
+                    af_entry["redistribute"] = af_redist
+                afs_out.append(af_entry)
+                af_seen.add((asn_str, scope.vrf, af.af))
+            scope_dict = {
+                "vrf": scope.vrf,
+                "address-family": afs_out,
+                "peer": [_bgp_peer_entry(peer) for peer in scope.peers],
+            }
+            scopes_out.append(scope_dict)
+            scope_by_key[(asn_str, scope.vrf)] = scope_dict
+        router_dict: dict = {"asn": _parse_asn(r.asn), "scope": scopes_out}
+        if r.router_id:
+            router_dict["router-id"] = r.router_id  # bgp-reconciler leaf, sibling of asn
+        routers.append(router_dict)
+        router_by_asn[asn_str] = router_dict
+
+    _attach_orphan_bgp_redistribute(routers, redist_by_af, router_by_asn, scope_by_key, af_seen)
+    return {"router": routers}
+
+
+def unrenderable_route_policy_members(rows: SectionRows, dialect: CommunityDialect) -> list[tuple[str, str]]:
+    """``(community-list name, member)`` for every member this dialect cannot hold.
+
+    The encoder drops them so one unrepresentable member cannot abort a whole community;
+    the caller reports them, which is why the verdict is exposed rather than logged here.
+    """
+    skipped: list[tuple[str, str]] = []
+    for row in rows["route_policy_object_intent"]:
+        if row.family != "community_list":
+            continue
+        for entry in row.entries:
+            member = entry["community"]
+            if dialect.from_canonical(member) is UNREPRESENTABLE:
+                skipped.append((row.name, member))
+    return skipped
+
+
+def encode_route_policy(rows: SectionRows, execution: SectionExecution) -> dict:
+    """Encode the ``route-policy`` container: prefix-lists, community-lists, AS-paths, route-maps.
+
+    Community members are stored canonically and spelled per NED; the FROZEN dialect
+    translates them, never the device row, so an unrelated reissue after a NED change
+    sends the members the authorization froze.
+    """
+    by_family: dict[str, list] = {}
+    for row in rows["route_policy_object_intent"]:
+        entries = row.entries
+        if row.family == "route_map":
+            entries = [_normalize_route_map_entry(e) for e in entries if isinstance(e, dict)]
+        by_family.setdefault(row.family, []).append(
+            {"name": row.name, "entries": entries, "invert_match": getattr(row, "invert_match", False)}
+        )
+
+    def _community_list_entry(obj: dict) -> dict:
+        kept: list = []
+        for entry in obj["entries"]:
+            wire = execution.dialect.from_canonical(entry["community"])
+            if wire is UNREPRESENTABLE:
+                continue
+            kept.append({**entry, "community": wire} if wire != entry["community"] else entry)
+        return {"name": obj["name"], "invert-match": bool(obj.get("invert_match", False)), "entry": kept}
+
+    return {
+        "prefix-list": [{"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("prefix_list", [])],
+        "community-list": [_community_list_entry(obj) for obj in by_family.get("community_list", [])],
+        "as-path": [{"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("as_path", [])],
+        "route-map": [{"name": obj["name"], "entry": obj["entries"]} for obj in by_family.get("route_map", [])],
+    }
+
+
+def encode_ospf(rows: SectionRows, execution: SectionExecution) -> dict:
+    """Encode the ``ospf`` container: processes and interfaces.
+
+    A redistribute row whose process has no row of its own still lands, through a minimal
+    synthesized process entry — parity with IS-IS and BGP, so nothing is silently dropped.
+    """
+    redist_by_proc: dict[str, list[dict]] = {}
+    for row in rows["redistribution_intent"]:
+        redist_by_proc.setdefault(row.dest_ref, []).append(_redistribute_entry(row))
+
+    processes = [
+        _ospf_process_entry(row, redist_by_proc.get(str(row.process_id), [])) for row in rows["ospf_instance_intent"]
+    ]
+    emitted_pids = {p["process-id"] for p in processes}
+    for pid, redist_list in redist_by_proc.items():
+        if pid not in emitted_pids:
+            processes.append({"process-id": pid, "redistribute": redist_list})
+            emitted_pids.add(pid)
+
+    interfaces = [_ospf_interface_entry(row) for row in rows["ospf_interface_intent"]]
+    body: dict = {}
+    if interfaces:
+        body["interface-config"] = interfaces
+    if processes:
+        body["process-config"] = processes
+    return body
+
+
+def encode_switchport(rows: SectionRows, execution: SectionExecution) -> dict:
+    """Encode the ``switchport`` container: per-interface L2 mode and VLAN membership.
+
+    ``tagged-vlan`` is sorted so two stores holding the same membership in a different
+    insertion order encode the same bytes; a YANG leaf-list is order-insensitive.
+    """
+    interfaces = []
+    for row in rows["switchport_intent"]:
+        entry: dict = {"interface-name": row.interface_name}
+        if row.mode:
+            entry["mode"] = row.mode
+        if row.untagged_vlan is not None:
+            entry["untagged-vlan"] = row.untagged_vlan
+        tagged = sorted(tag.vlan_id for tag in row.tagged_vlans)
+        if tagged:
+            entry["tagged-vlan"] = tagged
+        interfaces.append(entry)
+    return {"interface": interfaces}
+
+
+#: LAG bundle scalar -> its YANG leaf. Every one is optional: an unset column is a leaf
+#: the operator has no opinion on, and an absent leaf is what says so on the wire.
+_LAG_BUNDLE_LEAVES = (
+    ("lag_id", "lag-id"),
+    ("min_links", "min-links"),
+    ("system_priority", "system-priority"),
+    ("system_id", "system-id"),
+    ("timer", "timer"),
+    ("admin_key", "admin-key"),
+)
+
+
+def encode_lag(rows: SectionRows, execution: SectionExecution) -> dict:
+    """Encode the ``lag`` container: LACP bundles and their member interfaces."""
+    bundles = []
+    for row in rows["lag_bundle_intent"]:
+        entry: dict = {"name": row.name}
+        for attribute, leaf in _LAG_BUNDLE_LEAVES:
+            value = getattr(row, attribute)
+            if value is not None:
+                entry[leaf] = value
+        members = []
+        for member in row.members:
+            member_entry: dict = {"interface-name": member.interface_name}
+            if member.mode:
+                member_entry["mode"] = member.mode
+            if member.port_priority is not None:
+                member_entry["port-priority"] = member.port_priority
+            members.append(member_entry)
+        if members:
+            entry["member"] = members
+        bundles.append(entry)
+    return {"bundle": bundles}
+
+
+def encode_interface_config(rows: SectionRows, execution: SectionExecution) -> dict:
+    """Encode the ``interface`` container: description, admin state and addresses, merged.
+
+    Attributes and addresses ride ONE keyed interface entry, so an interface named by both
+    halves must appear once. The section's proof supplies the writer context and the
+    per-attribute eligibility decisions; an ineligible attribute never reaches the wire.
+    """
+    interfaces = execution.proof.interfaces
+    eligible = execution.proof.eligible_attributes
+    by_name: dict[str, dict] = {}
+
+    def _entry(name: str) -> dict:
+        return by_name.setdefault(name, {"interface-name": name})
+
+    for row in rows["interface_intent"]:
+        if (row.interface_id, row.attribute) not in eligible:
+            continue
+        iface = interfaces[row.interface_id]
+        entry = _entry(iface.name)
+        if row.attribute == "description":
+            entry["description"] = row.intent_value if row.intent_value is not None else ""
+        elif row.attribute == "enabled":
+            # Strict coercion (raises on garbage), so a corrupt value never silently
+            # shuts an interface down.
+            entry["enabled"] = _coerce_enabled_intent(row.intent_value)
+
+    ip_by_iface: dict[int, list] = {}
+    for row in rows["interface_ip_intent"]:
+        ip_by_iface.setdefault(row.interface_id, []).append(row)
+    for interface_id, ip_rows in ip_by_iface.items():
+        iface = interfaces[interface_id]
+        routed_kind = nokia_routed_kind(iface)
+        ip_entry = build_interface_ip_body(
+            iface.name,
+            ip_rows,
+            kind=routed_kind,
+            service=iface.service if routed_kind in ("ies", "vprn") else None,
+            parent_binding=iface.parent_binding,
+            encap_tag=iface.encap_tag,
+        )
+        entry = _entry(iface.name)
+        for key, value in ip_entry.items():
+            if key != "interface-name":
+                entry[key] = value
+
+    return {"interface": list(by_name.values())}

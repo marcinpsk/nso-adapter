@@ -1,0 +1,195 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
+"""The write-side section registry and its per-section wire encoders (#1522 C9, memo A8).
+
+``device_intent_golden.json`` holds the body every section encodes for the shared row set.
+The fourteen sections that had a per-service builder were captured FROM those builders
+before the extraction, so an equal body is behaviour preservation and not a restatement of
+the new code. ``switchport`` and ``lag`` never had a writer: their goldens are read off
+``switchport-intent.yang`` and ``lag-intent.yang`` and are the pin from here on.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from nso_adapter.core.community_dialect import community_dialect_by_name, community_dialect_for
+from nso_adapter.core.projection import (
+    InterfaceExecution,
+    projection_sections,
+    section_registry,
+    section_rows_by_table,
+)
+from nso_adapter.nso.apply import NsoApplyError, SectionExecution, unrenderable_route_policy_members
+from tests.nso.device_intent_rows import ELIGIBLE_ATTRIBUTES, NOKIA_NED, interfaces, section_rows
+
+_GOLDEN = json.loads((Path(__file__).parent / "device_intent_golden.json").read_text())
+
+
+def _execution(section: str) -> SectionExecution:
+    """The frozen facts each section's golden body was captured under."""
+    if section == "route_policy":
+        return SectionExecution(NOKIA_NED, community_dialect_for(NOKIA_NED))
+    if section == "interface_config":
+        return SectionExecution(
+            None, community_dialect_for(None), InterfaceExecution(interfaces(), ELIGIBLE_ATTRIBUTES)
+        )
+    return SectionExecution(None, community_dialect_for(None))
+
+
+def _rows(section: str) -> dict[str, list]:
+    """The section's fixture rows, keyed by table name and complete for every declared table."""
+    by_model = section_rows()[section]
+    return {spec.model.__tablename__: by_model.get(spec.model, []) for spec in section_registry()[section].tables}
+
+
+@pytest.fixture(autouse=True)
+def _open_local_levels_gate(monkeypatch):
+    # The logging golden carries local-levels, so the deploy gate has to be open for it.
+    monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "1")
+
+
+@pytest.mark.parametrize("section", sorted(_GOLDEN))
+def test_each_section_encodes_its_golden_body(section):
+    entry = section_registry()[section]
+    assert entry.encode(_rows(section), _execution(section)) == _GOLDEN[section]
+
+
+def test_the_golden_covers_every_registered_section():
+    assert set(_GOLDEN) == projection_sections()
+
+
+def test_an_ineligible_attribute_never_reaches_the_wire():
+    rows = _rows("interface_config")
+    body = section_registry()["interface_config"].encode(rows, _execution("interface_config"))
+    nokia = next(entry for entry in body["interface"] if entry["interface-name"] == "1/1/1:100")
+    # Interface 2's `enabled` row is authorized but ineligible; its description is eligible.
+    assert "enabled" not in nokia
+    assert nokia["description"] == ""
+
+
+def test_route_policy_encodes_through_the_frozen_dialect_not_a_device_row():
+    rows = _rows("route_policy")
+    nokia = section_registry()["route_policy"].encode(
+        rows, SectionExecution(NOKIA_NED, community_dialect_for(NOKIA_NED))
+    )
+    identity = section_registry()["route_policy"].encode(
+        rows, SectionExecution(NOKIA_NED, community_dialect_by_name("identity"))
+    )
+    large = next(entry for entry in nokia["community-list"] if entry["name"] == "CL-LARGE")
+    assert large["entry"][0]["community"] == "64512:1:2"
+    identity_large = next(entry for entry in identity["community-list"] if entry["name"] == "CL-LARGE")
+    assert identity_large["entry"][0]["community"] == "large:64512:1:2"
+
+
+def test_unrenderable_members_are_reported_not_silently_dropped():
+    dialect = community_dialect_for(NOKIA_NED)
+    assert unrenderable_route_policy_members(_rows("route_policy"), dialect) == [
+        ("CL-BANDWIDTH", "bandwidth:64512:100")
+    ]
+    assert unrenderable_route_policy_members(_rows("route_policy"), community_dialect_by_name("identity")) == []
+
+
+def test_a_closed_local_levels_gate_refuses_rather_than_sending_a_weaker_body(monkeypatch):
+    monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "0")
+    with pytest.raises(NsoApplyError) as excinfo:
+        section_registry()["logging"].encode(_rows("logging"), _execution("logging"))
+    assert excinfo.value.code == "local_levels_gated"
+
+
+def test_an_encoder_refuses_a_row_set_missing_one_of_its_declared_tables():
+    rows = _rows("snmp")
+    del rows["snmp_host_intent"]
+    with pytest.raises(KeyError):
+        section_registry()["snmp"].encode(rows, _execution("snmp"))
+
+
+def test_section_rows_by_table_fills_every_declared_table():
+    document = {"vlan": {"vlan_intent": []}}
+    assert section_rows_by_table(document, "vlan") == {"vlan_intent": []}
+    document = {"snmp": {}}
+    assert sorted(section_rows_by_table(document, "snmp")) == [
+        "snmp_community_intent",
+        "snmp_host_intent",
+        "snmp_system_info_intent",
+        "snmp_v3_user_intent",
+    ]
+
+
+def test_the_registry_containers_are_the_aggregate_yang_containers():
+    # Committed snapshot of `tools/device_intent_containers.py` in nso-packages, never a
+    # read from a sibling checkout: the two repos move together, so a rename lands in both.
+    snapshot = json.loads((Path(__file__).parent / "device_intent_containers.json").read_text())
+    containers = [entry.container for entry in section_registry().values()]
+    assert len(containers) == len(set(containers))
+    assert set(containers) == set(snapshot["containers"])
+    assert len(snapshot["containers"]) == len(set(snapshot["containers"]))
+
+
+def test_every_section_declares_a_capability_scope_and_a_result_counter():
+    for section, entry in section_registry().items():
+        assert entry.capability_scopes, section
+        assert entry.result_keys, section
+    assert section_registry()["interface_config"].capability_scopes == ("interface_attribute", "interface_ip")
+    assert section_registry()["interface_config"].result_keys == ("attribute", "ip")
+
+
+def test_a_registry_whose_containers_collide_fails_at_startup(monkeypatch):
+    from nso_adapter.core import projection
+
+    broken = {section: entry for section, entry in projection.section_registry().items()}
+    broken["vlan"] = broken["vlan"]._replace(container="snmp")
+    monkeypatch.setattr(projection, "section_registry", lambda: broken)
+    with pytest.raises(RuntimeError, match="both claim container"):
+        projection._validate_section_registry(frozenset({"switchport", "lag"}))
+
+
+def test_a_registry_naming_an_unregistered_read_family_fails_at_startup(monkeypatch):
+    from nso_adapter.core import projection
+
+    broken = dict(projection.section_registry())
+    broken["vlan"] = broken["vlan"]._replace(read_family="not_a_family")
+    monkeypatch.setattr(projection, "section_registry", lambda: broken)
+    with pytest.raises(RuntimeError, match="unregistered family"):
+        projection._validate_section_registry(frozenset({"switchport", "lag"}))
+
+
+# ── Pins on the legacy per-family tables the aggregate sender deletes (#1522 C9 S3) ──
+#
+# Until the sender reads the registry, these tables and the registry hold the same facts
+# twice. Each pin dies with the table it guards.
+
+
+def test_the_registry_result_keys_are_the_batch_scope_result_order():
+    from nso_adapter.core.apply import _SCOPE_RESULT_ORDER
+
+    batch = [
+        key
+        for section, entry in section_registry().items()
+        if section not in ("interface_config", "switchport", "lag")
+        for key in entry.result_keys
+    ]
+    assert tuple(batch) == _SCOPE_RESULT_ORDER
+
+
+def test_the_registry_covers_every_atomically_staged_scope():
+    from nso_adapter.core.apply import _ATOMIC_SCOPE_ROOTS, _IFACE_CONFIG_ROOT, _capability_scopes_for
+
+    assert set(_ATOMIC_SCOPE_ROOTS.values()) <= set(section_registry())
+    for root, section in _ATOMIC_SCOPE_ROOTS.items():
+        assert tuple(_capability_scopes_for(root)) == section_registry()[section].capability_scopes
+    assert tuple(_capability_scopes_for(_IFACE_CONFIG_ROOT)) == section_registry()["interface_config"].capability_scopes
+
+
+def test_every_read_family_resolves_to_the_residue_wire_name():
+    from nso_adapter.core.importer import _projectable_spec
+    from nso_adapter.core.removal import _RESIDUE_WIRE_NAMES
+
+    for section, wire_name in _RESIDUE_WIRE_NAMES.items():
+        spec = _projectable_spec(section_registry()[section].read_family)
+        assert spec is not None and spec.wire_name == wire_name, section
+    for section in ("switchport", "lag"):
+        assert _projectable_spec(section_registry()[section].read_family) is not None

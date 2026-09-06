@@ -33,6 +33,7 @@ store holds when a worker gets round to it.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from copy import deepcopy
 from datetime import date, datetime
@@ -45,6 +46,24 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
+from nso_adapter.nso.apply import (
+    encode_bfd,
+    encode_bgp,
+    encode_interface_config,
+    encode_interface_mtu,
+    encode_isis,
+    encode_l2_sap,
+    encode_lag,
+    encode_logging,
+    encode_ospf,
+    encode_route_policy,
+    encode_snmp,
+    encode_static_route,
+    encode_subinterface,
+    encode_svi,
+    encode_switchport,
+    encode_vlan,
+)
 from nso_adapter.store.models import (
     BfdIntent,
     BgpAfIntent,
@@ -103,59 +122,248 @@ class _Spec(NamedTuple):
     lifecycle: bool = False
 
 
-_SECTION_TABLES: dict[str, tuple[_Spec, ...]] = {
-    "snmp": (
-        _Spec(SnmpCommunityIntent),
-        _Spec(SnmpV3UserIntent),
-        _Spec(SnmpHostIntent),
-        _Spec(SnmpSystemInfoIntent),
+class TableCompare(NamedTuple):
+    """Verify by comparing the section's keyed rows against the reader's own lists.
+
+    Each entry is ``(model, the reader list's label, row -> key tuple)``: the intended
+    objects a post-apply read must find, in the reader's own key grain.
+    """
+
+    entries: tuple[tuple[Any, str, Callable[[Any], tuple]], ...]
+
+
+class BespokeExpansion(NamedTuple):
+    """Verify through the section's own expected-key expansion (bgp, route_policy)."""
+
+
+class NoComparison(NamedTuple):
+    """Residue only. The section has no post-apply key comparison at C9."""
+
+
+#: The three verification dispositions, as singletons where they carry no data.
+BESPOKE_EXPANSION = BespokeExpansion()
+NO_COMPARISON = NoComparison()
+
+Verification = TableCompare | BespokeExpansion | NoComparison
+
+
+class _Section(NamedTuple):
+    """One document section: its intent tables plus everything the write side needs.
+
+    The ONE write-side family table (#1522 memo A8). Every derived consumer — the sender,
+    failure localisation, refusal attribution, capability recording, job results, reader
+    comparison and the device-wide residue check — reads this record instead of keeping a
+    hand-agreed copy of its own.
+
+    *container* is the YANG container under ``list device-intent``; it is stated rather
+    than derived because three sections do not spell it the way they spell themselves
+    (``interface_config`` is ``interface``, ``interface_mtu`` is ``mtu``, ``l2_sap`` is
+    ``l2-sap``). *read_family* is stated for the same reason: ``l2_sap`` reads
+    ``l2_service``, ``interface_config`` reads ``interface_ip``, ``lag`` reads
+    ``lag_config``. *capability_scopes* and *result_keys* default to the section's own
+    name; ``interface_config`` is the one section that records under two of each.
+    """
+
+    tables: tuple[_Spec, ...]
+    container: str
+    encode: Callable[[Mapping[str, list[Any]], Any], dict]
+    read_family: str
+    verify: Verification
+    capability_scopes: tuple[str, ...] = ()
+    result_keys: tuple[str, ...] = ()
+
+
+#: Iteration order is the order a device's document is built and its job results are
+#: named in. It is deliberately NOT coupled to the packages' plan order: a planner
+#: reorder must not need an adapter release.
+_SECTION_REGISTRY: dict[str, _Section] = {
+    "snmp": _Section(
+        tables=(
+            _Spec(SnmpCommunityIntent),
+            _Spec(SnmpV3UserIntent),
+            _Spec(SnmpHostIntent),
+            _Spec(SnmpSystemInfoIntent),
+        ),
+        container="snmp",
+        encode=encode_snmp,
+        read_family="snmp",
+        # A community's intent key is its label and the export keys it by a digest of the
+        # secret; _translate_expected re-keys what Vault can answer for.
+        verify=TableCompare(
+            (
+                (SnmpCommunityIntent, "community", lambda r: (r.label,)),
+                (SnmpV3UserIntent, "v3-user", lambda r: (r.username,)),
+                (SnmpHostIntent, "host", lambda r: (r.address,)),
+            )
+        ),
     ),
     # Tombstones ride the static-route section: an unconsumed one changes which entries the
     # document must retain verbatim, so a document built without them is a different document.
-    "static_route": (
-        _Spec(StaticRouteIntent),
-        _Spec(
-            StaticRouteTombstone,
-            identity=("route_id", "vrf", "prefix", "next_hop", "marking", "created_at"),
-            lifecycle=True,
+    "static_route": _Section(
+        tables=(
+            _Spec(StaticRouteIntent),
+            _Spec(
+                StaticRouteTombstone,
+                identity=("route_id", "vrf", "prefix", "next_hop", "marking", "created_at"),
+                lifecycle=True,
+            ),
+        ),
+        container="static-route",
+        encode=encode_static_route,
+        read_family="static_route",
+        verify=TableCompare(((StaticRouteIntent, "route", lambda r: (r.vrf, r.prefix, r.next_hop)),)),
+    ),
+    "logging": _Section(
+        tables=(_Spec(LoggingHostIntent), _Spec(LoggingLevelsIntent)),
+        container="logging",
+        encode=encode_logging,
+        read_family="logging",
+        verify=TableCompare(((LoggingHostIntent, "host", lambda r: (r.address,)),)),
+    ),
+    "svi": _Section(
+        tables=(_Spec(SviIntent),),
+        container="svi",
+        encode=encode_svi,
+        read_family="svi",
+        verify=TableCompare(((SviIntent, "interface", lambda r: (r.interface_name,)),)),
+    ),
+    "subinterface": _Section(
+        tables=(_Spec(SubinterfaceIntent),),
+        container="subinterface",
+        encode=encode_subinterface,
+        read_family="subinterface",
+        verify=TableCompare(((SubinterfaceIntent, "interface", lambda r: (r.interface_name,)),)),
+    ),
+    "vlan": _Section(
+        tables=(_Spec(VlanIntent),),
+        container="vlan",
+        encode=encode_vlan,
+        read_family="vlan",
+        verify=TableCompare(((VlanIntent, "vlan", lambda r: (r.vlan_id,)),)),
+    ),
+    "bfd": _Section(
+        tables=(_Spec(BfdIntent),),
+        container="bfd",
+        encode=encode_bfd,
+        read_family="bfd",
+        verify=TableCompare(((BfdIntent, "interface", lambda r: (r.interface_name,)),)),
+    ),
+    "interface_mtu": _Section(
+        tables=(_Spec(InterfaceMtuIntent),),
+        container="mtu",
+        encode=encode_interface_mtu,
+        read_family="interface_mtu",
+        verify=TableCompare(((InterfaceMtuIntent, "interface", lambda r: (r.interface_name,)),)),
+    ),
+    "l2_sap": _Section(
+        tables=(_Spec(L2SapIntent),),
+        container="l2-sap",
+        encode=encode_l2_sap,
+        read_family="l2_service",
+        verify=TableCompare(((L2SapIntent, "sap", lambda r: (r.service_name, r.sap_id)),)),
+    ),
+    "isis": _Section(
+        tables=(
+            _Spec(IsisProcessIntent),
+            _Spec(IsisInterfaceIntent),
+            _Spec(IsisLevelIntent),
+            _Spec(IsisFlexAlgoIntent),
+            _Spec(RedistributionIntent, discriminator=("dest_protocol", "isis")),
+        ),
+        container="isis",
+        encode=encode_isis,
+        read_family="isis",
+        verify=TableCompare(
+            (
+                (IsisInterfaceIntent, "interface-config", lambda r: (r.interface_name, r.af)),
+                (IsisProcessIntent, "process-config", lambda r: (r.process_tag,)),
+            )
         ),
     ),
-    "logging": (_Spec(LoggingHostIntent), _Spec(LoggingLevelsIntent)),
-    "svi": (_Spec(SviIntent),),
-    "subinterface": (_Spec(SubinterfaceIntent),),
-    "vlan": (_Spec(VlanIntent),),
-    "bfd": (_Spec(BfdIntent),),
-    "interface_mtu": (_Spec(InterfaceMtuIntent),),
-    "l2_sap": (_Spec(L2SapIntent),),
-    "isis": (
-        _Spec(IsisProcessIntent),
-        _Spec(IsisInterfaceIntent),
-        _Spec(IsisLevelIntent),
-        _Spec(IsisFlexAlgoIntent),
-        _Spec(RedistributionIntent, discriminator=("dest_protocol", "isis")),
+    "bgp": _Section(
+        tables=(
+            _Spec(BgpRouterIntent),
+            _Spec(BgpScopeIntent, parent=BgpRouterIntent),
+            _Spec(BgpAfIntent, parent=BgpScopeIntent),
+            _Spec(BgpPeerIntent, parent=BgpScopeIntent),
+            _Spec(BgpPeerAfIntent, parent=BgpPeerIntent),
+            _Spec(RedistributionIntent, discriminator=("dest_protocol", "bgp")),
+        ),
+        container="bgp",
+        encode=encode_bgp,
+        read_family="bgp",
+        verify=BESPOKE_EXPANSION,
     ),
-    "bgp": (
-        _Spec(BgpRouterIntent),
-        _Spec(BgpScopeIntent, parent=BgpRouterIntent),
-        _Spec(BgpAfIntent, parent=BgpScopeIntent),
-        _Spec(BgpPeerIntent, parent=BgpScopeIntent),
-        _Spec(BgpPeerAfIntent, parent=BgpPeerIntent),
-        _Spec(RedistributionIntent, discriminator=("dest_protocol", "bgp")),
+    "route_policy": _Section(
+        tables=(_Spec(RoutePolicyObjectIntent),),
+        container="route-policy",
+        encode=encode_route_policy,
+        read_family="route_policy",
+        verify=BESPOKE_EXPANSION,
     ),
-    "route_policy": (_Spec(RoutePolicyObjectIntent),),
-    "ospf": (
-        _Spec(OspfInstanceIntent),
-        _Spec(OspfInterfaceIntent),
-        _Spec(RedistributionIntent, discriminator=("dest_protocol", "ospf")),
+    "ospf": _Section(
+        tables=(
+            _Spec(OspfInstanceIntent),
+            _Spec(OspfInterfaceIntent),
+            _Spec(RedistributionIntent, discriminator=("dest_protocol", "ospf")),
+        ),
+        container="ospf",
+        encode=encode_ospf,
+        read_family="ospf",
+        verify=TableCompare(
+            (
+                (OspfInstanceIntent, "process-config", lambda r: (r.process_id,)),
+                (OspfInterfaceIntent, "interface-config", lambda r: (r.interface_name,)),
+            )
+        ),
     ),
-    # Switching snapshots have no receipt lane, discriminator, or lifecycle carrier.
-    "switchport": (_Spec(SwitchportIntent), _Spec(SwitchportTaggedVlanIntent, parent=SwitchportIntent)),
-    "lag": (_Spec(LagBundleIntent, identity=("name",)), _Spec(LagMemberIntent, parent=LagBundleIntent)),
-    "interface_config": (
-        _Spec(InterfaceIntent, parent=DbInterface),
-        _Spec(InterfaceIpIntent, parent=DbInterface),
+    # Prepared by an Apply POST rather than an intent PUT (#1612): no receipt lane, no
+    # discriminator and no lifecycle carrier, and every identity comes from the schema.
+    "switchport": _Section(
+        tables=(_Spec(SwitchportIntent), _Spec(SwitchportTaggedVlanIntent, parent=SwitchportIntent)),
+        container="switchport",
+        encode=encode_switchport,
+        read_family="switchport",
+        verify=NO_COMPARISON,
+    ),
+    "lag": _Section(
+        tables=(_Spec(LagBundleIntent, identity=("name",)), _Spec(LagMemberIntent, parent=LagBundleIntent)),
+        container="lag",
+        encode=encode_lag,
+        read_family="lag_config",
+        verify=NO_COMPARISON,
+    ),
+    # The residue check covers retracted addresses only; a dropped new address or
+    # description is not detected, and adding that comparison is a follow-up, not C9.
+    "interface_config": _Section(
+        tables=(
+            _Spec(InterfaceIntent, parent=DbInterface),
+            _Spec(InterfaceIpIntent, parent=DbInterface),
+        ),
+        container="interface",
+        encode=encode_interface_config,
+        read_family="interface_ip",
+        verify=NO_COMPARISON,
+        capability_scopes=("interface_attribute", "interface_ip"),
+        result_keys=("attribute", "ip"),
     ),
 }
+
+
+@cache
+def section_registry() -> dict[str, _Section]:
+    """Return the write-side section registry, with every default resolved.
+
+    ``capability_scopes`` and ``result_keys`` default to the section's own name, so only
+    the section that departs from that states it.
+    """
+    return {
+        section: entry._replace(
+            capability_scopes=entry.capability_scopes or (section,),
+            result_keys=entry.result_keys or (section,),
+        )
+        for section, entry in _SECTION_REGISTRY.items()
+    }
 
 
 #: The sections whose tables are owned by MORE THAN ONE endpoint stream, and which tables
@@ -182,7 +390,8 @@ _SPLIT_SECTION_STREAMS: dict[str, dict[str, tuple[type, ...]]] = {
 def _stream_tables() -> dict[str, tuple[_Spec, ...]]:
     """Stream name -> the intent tables it owns. Built once, validated on the way."""
     specs: dict[str, tuple[_Spec, ...]] = {}
-    for section, section_specs in _SECTION_TABLES.items():
+    for section, entry in _SECTION_REGISTRY.items():
+        section_specs = entry.tables
         split = _SPLIT_SECTION_STREAMS.get(section)
         if split is None:
             specs[section] = section_specs
@@ -214,7 +423,7 @@ def projection_sections() -> frozenset[str]:
     rather than as an empty document later:
 
     * the removal scopes ARE the write-path families, so a scope missing from
-      :data:`_SECTION_TABLES` is a family whose document could not be built;
+      :data:`_SECTION_REGISTRY` is a family whose document could not be built;
     * every in-protocol intent endpoint promotes one of these, so an endpoint naming a
       family with no tables would bump a revision nothing can ever deploy.
 
@@ -223,16 +432,16 @@ def projection_sections() -> frozenset[str]:
     from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS
     from nso_adapter.core.removal import VALID_REMOVAL_SCOPES
 
-    missing = VALID_REMOVAL_SCOPES - set(_SECTION_TABLES)
+    missing = VALID_REMOVAL_SCOPES - set(_SECTION_REGISTRY)
     if missing:
         raise RuntimeError(f"projection sections missing intent tables: {sorted(missing)}")
-    extra = set(_SECTION_TABLES) - VALID_REMOVAL_SCOPES
+    extra = set(_SECTION_REGISTRY) - VALID_REMOVAL_SCOPES
     if extra:
         raise RuntimeError(f"projection sections name no removal scope: {sorted(extra)}")
-    unpromotable = {e.promotes for e in INTENT_PUT_ENDPOINTS.values()} - set(_SECTION_TABLES)
+    unpromotable = {e.promotes for e in INTENT_PUT_ENDPOINTS.values()} - set(_SECTION_REGISTRY)
     if unpromotable:
         raise RuntimeError(f"intent endpoints promote sections with no intent tables: {sorted(unpromotable)}")
-    return frozenset(_SECTION_TABLES)
+    return frozenset(_SECTION_REGISTRY)
 
 
 @cache
@@ -265,7 +474,7 @@ def projection_streams() -> frozenset[str]:
         raise RuntimeError(f"streams that are both an intent PUT lane and an Apply POST: {sorted(overlap)}")
     split_streams = {stream for split in _SPLIT_SECTION_STREAMS.values() for stream in split}
     for stream in sorted(OUT_OF_PROTOCOL_STREAMS):
-        if stream not in _SECTION_TABLES:
+        if stream not in _SECTION_REGISTRY:
             raise RuntimeError(f"out-of-protocol stream {stream!r} names no section spelled the same")
         if stream in split_streams:
             raise RuntimeError(f"out-of-protocol stream {stream!r} may not share a split section")
@@ -277,7 +486,42 @@ def projection_streams() -> frozenset[str]:
     for stream_specs in _stream_tables().values():
         for spec in stream_specs:
             _identity_fields(spec)
+    _validate_section_registry(OUT_OF_PROTOCOL_STREAMS)
     return streams
+
+
+def _validate_section_registry(out_of_protocol: frozenset[str]) -> None:
+    """Refuse a registry a derived consumer could not read. Called from startup.
+
+    Every clause fails the process at boot rather than on the first request that reaches
+    the broken section: an unnamed container is a family the aggregate cannot carry, a
+    duplicate container is two families writing one place, and an unregistered read family
+    is a residue check with no reader list to look in.
+    """
+    from nso_adapter.core.families import ENGINE_FAMILY_KEYS
+
+    containers: dict[str, str] = {}
+    for section, entry in section_registry().items():
+        if not entry.container:
+            raise RuntimeError(f"section {section!r} names no device-intent container")
+        if not callable(entry.encode):
+            raise RuntimeError(f"section {section!r} has no wire encoder")
+        if not isinstance(entry.verify, TableCompare | BespokeExpansion | NoComparison):
+            raise RuntimeError(f"section {section!r} has no verification disposition")
+        if not entry.capability_scopes:
+            raise RuntimeError(f"section {section!r} records under no capability scope")
+        if not entry.result_keys:
+            raise RuntimeError(f"section {section!r} names no job-result counter")
+        if entry.read_family not in ENGINE_FAMILY_KEYS:
+            raise RuntimeError(f"section {section!r} reads through unregistered family {entry.read_family!r}")
+        owner = containers.setdefault(entry.container, section)
+        if owner != section:
+            raise RuntimeError(f"sections {owner!r} and {section!r} both claim container {entry.container!r}")
+    if out_of_protocol != CLAIM_LESS_SECTIONS:
+        raise RuntimeError(
+            f"the out-of-protocol streams {sorted(out_of_protocol)} are not the two claim-less "
+            f"sections {sorted(CLAIM_LESS_SECTIONS)}"
+        )
 
 
 def stream_tables(stream: str) -> tuple[str, ...]:
@@ -289,6 +533,13 @@ def stream_tables(stream: str) -> tuple[str, ...]:
     if stream not in projection_streams():
         raise ValueError(f"unknown projection stream {stream!r}")
     return tuple(spec.model.__tablename__ for spec in _stream_tables()[stream])
+
+
+def section_container(section: str) -> str:
+    """Return the YANG container *section* is carried under inside ``list device-intent``."""
+    if section not in projection_sections():
+        raise ValueError(f"unknown projection section {section!r}")
+    return section_registry()[section].container
 
 
 def stream_section(stream: str) -> str:
@@ -353,7 +604,7 @@ def _row_dict(row) -> dict:
     return {attr.key: _document_value(row, attr.key) for attr in sa_inspect(type(row)).column_attrs}
 
 
-_SPEC_BY_MODEL: dict[Any, _Spec] = {spec.model: spec for specs in _SECTION_TABLES.values() for spec in specs}
+_SPEC_BY_MODEL: dict[Any, _Spec] = {spec.model: spec for entry in _SECTION_REGISTRY.values() for spec in entry.tables}
 _SPEC_BY_TABLE: dict[str, _Spec] = {spec.model.__tablename__: spec for spec in _SPEC_BY_MODEL.values()}
 
 
@@ -530,11 +781,16 @@ ACTION_APPLY_EXECUTABLE_SECTIONS: frozenset[str] = DOCUMENT_EXECUTED_SECTIONS
 #: No section reads live intent to decide what a generation executes.
 LIVE_READ_SECTIONS: dict[str, str] = {}
 
+#: The two sections a claim-less Apply POST prepares instead of an intent PUT (#1612).
+#: Startup pins the out-of-protocol stream set against this, so a third such stream cannot
+#: appear without the registry changing with it.
+CLAIM_LESS_SECTIONS: frozenset[str] = frozenset({"switchport", "lag"})
+
 #: The sections that have no device writer yet, so manual Apply refuses to select them and
 #: force-removal refuses to address them (#1612). A COMPLETION PIN, not a capability flag:
 #: C9's aggregate sender moves both names into :data:`DOCUMENT_EXECUTED_SECTIONS`, empties
 #: this set and restores the two equalities the partition test carries.
-AWAITING_SENDER_SECTIONS: frozenset[str] = frozenset({"switchport", "lag"})
+AWAITING_SENDER_SECTIONS: frozenset[str] = CLAIM_LESS_SECTIONS
 
 #: Reserved section key for immutable interface and static-route execution metadata.
 EXECUTION_KEY = "_execution"
@@ -697,7 +953,7 @@ def section_models(sections) -> frozenset[type]:
     for section in sections:
         if section not in projection_sections():
             raise ValueError(f"unknown projection section {section!r}")
-        models.update(spec.model for spec in _SECTION_TABLES[section])
+        models.update(spec.model for spec in _SECTION_REGISTRY[section].tables)
     return frozenset(models)
 
 
@@ -739,7 +995,7 @@ def _attach_hydrated_relationships(
     fragment: dict[str, list[dict]], section: str, records: dict[Any, list[tuple[dict, object]]]
 ) -> None:
     """Rebuild in-document parent collections from durable logical identities."""
-    section_specs = _SECTION_TABLES[section]
+    section_specs = _SECTION_REGISTRY[section].tables
     relationship_models = {
         model for spec in section_specs if spec.parent in _SPEC_BY_MODEL for model in (spec.parent, spec.model)
     }
@@ -787,7 +1043,7 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
     if section not in document:
         raise ValueError(f"document does not carry section {section!r}")
     tables = document[section] or {}
-    allowed_models = {spec.model for spec in _SECTION_TABLES[section]}
+    allowed_models = {spec.model for spec in _SECTION_REGISTRY[section].tables}
     rows: dict[type, list] = {}
     row_records: dict[type, list[tuple[dict, object]]] = {}
     for table_name, serialized_rows in tables.items():
@@ -817,6 +1073,17 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
         row_records[model] = model_records
     _attach_hydrated_relationships(tables, section, row_records)
     return rows
+
+
+def section_rows_by_table(document: dict, section: str) -> dict[str, list]:
+    """Rebuild *section*'s rows the way its encoder reads them: table name -> rows.
+
+    Every table the section declares is present, empty when the document carries none, so
+    an encoder indexes its tables directly and a renamed table raises instead of silently
+    encoding an empty list.
+    """
+    hydrated = hydrate_section(document, section)
+    return {spec.model.__tablename__: hydrated.get(spec.model, []) for spec in section_registry()[section].tables}
 
 
 def fragment_tables(fragment: dict | None) -> dict[str, list[dict]]:
@@ -866,11 +1133,22 @@ __all__ = [
     "ACTION_APPLY_EXECUTABLE_SECTIONS",
     "APPLY_BOOKKEEPING_COLUMNS",
     "AWAITING_SENDER_SECTIONS",
+    "BESPOKE_EXPANSION",
+    "CLAIM_LESS_SECTIONS",
+    "NO_COMPARISON",
+    "BespokeExpansion",
     "DOCUMENT_EXECUTED_SECTIONS",
     "INTERFACE_ATTRIBUTE_ELIGIBLE_STATES",
     "EXECUTION_KEY",
     "InterfaceEligibilityUnresolved",
+    "InterfaceExecution",
     "LIVE_READ_SECTIONS",
+    "NoComparison",
+    "TableCompare",
+    "Verification",
+    "section_container",
+    "section_registry",
+    "section_rows_by_table",
     "fragment_context",
     "fragment_tables",
     "freeze_fragment",
