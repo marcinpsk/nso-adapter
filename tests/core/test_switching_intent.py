@@ -57,6 +57,31 @@ async def test_lag_replacement_rejects_duplicate_keys_without_mutating_snapshot(
 
 
 @pytest.mark.anyio
+async def test_lag_replacement_rejects_one_interface_in_two_bundles(adapter_client):
+    """An interface belongs to at most one aggregation, so the whole snapshot is the scope."""
+    device_id = await seed_device(nso_device_name="lag-core-shared-member", netbox_device_id=1613)
+    async with session() as db:
+        with pytest.raises(ValueError, match="duplicate LAG member interface_name across bundles"):
+            await replace_lag_snapshot(
+                db,
+                device_id,
+                (
+                    LagBundleSnapshot(
+                        name="Port-channel1", lag_id=1, members=(LagMemberSnapshot(interface_name="Gi0/1"),)
+                    ),
+                    LagBundleSnapshot(
+                        name="Port-channel2", lag_id=2, members=(LagMemberSnapshot(interface_name="Gi0/1"),)
+                    ),
+                ),
+            )
+        await db.rollback()
+
+    async with session() as db:
+        rows = (await db.execute(select(LagBundleIntent).where(LagBundleIntent.device_id == device_id))).scalars().all()
+    assert rows == []
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("bundle", "message"),
     [

@@ -85,6 +85,12 @@ def _validate_lag_snapshot(bundles: Sequence[LagBundleSnapshot]) -> None:
         _require_unique([member.interface_name for member in bundle.members], "LAG member interface_name")
         for member in bundle.members:
             _require_uint(member.port_priority, 65535, "port_priority", 16)
+    # An interface belongs to at most one bundle: two bundles claiming it would each render
+    # it as their member, and the device would carry the same port in two aggregations.
+    _require_unique(
+        [member.interface_name for bundle in bundles for member in bundle.members],
+        "LAG member interface_name across bundles",
+    )
 
 
 def _validate_switchport_snapshot(interfaces: Sequence[SwitchportSnapshot]) -> None:

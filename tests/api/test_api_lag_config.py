@@ -281,6 +281,11 @@ async def test_apply_lag_config_requires_explicit_snapshot_without_mutating_stor
                 ],
             }
         ],
+        # One interface cannot be a member of two bundles: the device would carry it twice.
+        [
+            {"name": "Port-channel1", "lag_id": 1, "members": [{"interface_name": "Gi0/1"}]},
+            {"name": "Port-channel2", "lag_id": 2, "members": [{"interface_name": "Gi0/1"}]},
+        ],
     ],
 )
 async def test_apply_lag_config_rejects_invalid_graph_without_mutating_store(adapter_client, bundles):

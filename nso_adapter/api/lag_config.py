@@ -68,6 +68,14 @@ class LagConfigApplyRequest(_StrictRequestModel):
             raise ValueError("bundle name values must be unique")
         return bundles
 
+    @field_validator("bundles")
+    @classmethod
+    def _member_names_are_unique_across_bundles(cls, bundles: list[LagBundleApply]) -> list[LagBundleApply]:
+        members = [member.interface_name for bundle in bundles for member in bundle.members]
+        if len(members) != len(set(members)):
+            raise ValueError("member interface_name values must be unique across bundles")
+        return bundles
+
 
 # ── Read-mirror response models (GET /lag-config) ─────────────────────────────
 # OMIT shape: bundle/member optionals are omitted when unset -> exclude_unset.
