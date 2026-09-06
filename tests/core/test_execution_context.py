@@ -594,3 +594,51 @@ def test_hydration_refuses_a_section_that_never_recorded_a_context():
         hydrate_static_route_apply_plan(route)
     with pytest.raises(ValueError, match="invalid execution context"):
         hydrate_static_route_removal_plan(route)
+
+
+def test_hydration_refuses_a_recorded_clear_the_documents_own_rows_do_not_describe():
+    """A clear is discharged against the row it names, so it must name a row this document has.
+
+    Checking the plane's outer keys only let a recorded clear name any row, any key and any
+    field: settlement would retire an obligation over a leaf the document never authorized
+    anyone to touch.
+    """
+    from nso_adapter.core.static_route_plan import hydrate_static_route_removal_plan
+
+    row = {
+        "id": 11,
+        "vrf": "",
+        "prefix": "198.18.0.0/24",
+        "next_hop": "198.18.1.1",
+        "metric": None,
+        "pending_clear": {"authorized": ["metric"]},
+    }
+
+    def _document(clear):
+        return {
+            "static_route": {
+                "static_route_intent": [row],
+                "_execution": {
+                    "context": {"ned_id": None, "dialect": "identity"},
+                    "operation": {
+                        "removal": {
+                            "authorized_removal_keys": [],
+                            "claimed_keys": [],
+                            "tombstone_ids": [],
+                            "candidate_clears": [clear],
+                            "reclaimed_keys": [],
+                        }
+                    },
+                },
+            }
+        }
+
+    good = {"row_id": 11, "key": ["", "198.18.0.0/24", "198.18.1.1"], "fields": ["metric"]}
+    assert hydrate_static_route_removal_plan(_document(good)).clears[0].row_id == 11
+
+    with pytest.raises(ValueError, match="does not carry"):
+        hydrate_static_route_removal_plan(_document({**good, "row_id": 12}))
+    with pytest.raises(ValueError, match="not the"):
+        hydrate_static_route_removal_plan(_document({**good, "key": ["", "198.18.9.0/24", "198.18.1.1"]}))
+    with pytest.raises(ValueError, match="wire-unset"):
+        hydrate_static_route_removal_plan(_document({**good, "fields": ["tag"]}))

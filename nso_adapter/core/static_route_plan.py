@@ -591,6 +591,38 @@ def hydrate_static_route_apply_plan(document: dict) -> SrPlan:
     )
 
 
+def _certify_clears(document: dict, clears: tuple[SrClear, ...]) -> None:
+    """Refuse a recorded clear the document's own rows do not describe.
+
+    Checking the outer keys only let a plan name any row id, any key and any field: the clear
+    is discharged against the row it names and its fields are what settlement proves gone, so
+    a mismatched entry retires an obligation the document never carried. Each clear must name
+    a row THIS document carries, at the triple that row renders, over fields that row's own
+    authorized carrier holds wire-unset.
+    """
+    if not clears:
+        return
+    rows = {row.get("id"): row for row in (document.get("static_route") or {}).get("static_route_intent", [])}
+    for clear in clears:
+        row = rows.get(clear.row_id)
+        if row is None:
+            raise ValueError(
+                f"recorded static-route clear names row {clear.row_id}, which this document does not carry"
+            )
+        if clear.key != _row_triple(row):
+            raise ValueError(
+                f"recorded static-route clear for row {clear.row_id} names key {list(clear.key)}, "
+                f"which is not the {list(_row_triple(row))} that row renders"
+            )
+        authorized = authorized_clear_fields(row.get("pending_clear"))
+        unset = {field for field in authorized if not wire_set(field, row.get(field))}
+        if not set(clear.fields) <= unset:
+            raise ValueError(
+                f"recorded static-route clear for row {clear.row_id} names fields "
+                f"{sorted(set(clear.fields) - unset)} its carrier does not hold wire-unset"
+            )
+
+
 def _sr_key(value) -> Triple:
     """Return the execution key *value* names, naming a malformed one.
 
@@ -615,6 +647,7 @@ def hydrate_static_route_removal_plan(document: dict) -> SrRemovalPlan:
     clears = tuple(
         SrClear(item["row_id"], _sr_key(item["key"]), tuple(item["fields"])) for item in record["candidate_clears"]
     )
+    _certify_clears(document, clears)
     return SrRemovalPlan(
         frozenset(_sr_key(key) for key in record["authorized_removal_keys"]),
         frozenset(_sr_key(key) for key in record["claimed_keys"]),
