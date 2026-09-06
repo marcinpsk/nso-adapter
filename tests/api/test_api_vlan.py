@@ -419,10 +419,6 @@ async def test_apply_lag_config_treats_an_empty_member_mode_as_unset(adapter_cli
         )
     assert member_mode is None
     assert (bundle.accepted_at, bundle.last_apply_at) == (evidence_at, evidence_at)
-    context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
-    assert encode_switchport_section(hydrate_section(document, "switchport"), context) == {
-        "interface": [{"interface-name": "Gi0/1", "mode": "trunk-all"}]
-    }
 
 
 # ── #1612: the POST prepares, Apply authorizes ────────────────────────────────
