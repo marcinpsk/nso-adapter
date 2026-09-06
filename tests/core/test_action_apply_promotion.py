@@ -2850,7 +2850,6 @@ _SHAPE = {
         "child_field": "interface_name",
         "child": lambda n: f"Gi0/{n}",
         "scalar": 7,
-        "text_leaf": "timer",
     },
     "switchport": {
         "path": "switchport/apply",
@@ -2861,9 +2860,26 @@ _SHAPE = {
         "child_field": "vlan_id",
         "child": lambda n: n,
         "scalar": "trunk",
-        "text_leaf": "mode",
     },
 }
+
+
+#: One retained-root scalar EDIT per stream, as (leaf, first value, second value).
+#:
+#: LAG ``timer`` moves between NULL and the empty string, which is the case neither delta
+#: predicate sees: ``is_cleared`` ignores an already-unset before, and an empty after is not
+#: positive. Switchport ``mode`` has no such pair, because the request normalises ``""`` to
+#: unset, so every edit of it is either positive or content-losing; it uses a plain value
+#: replacement instead. Both are retained-root edits that must reach the device.
+_SCALAR_EDITS: dict[str, tuple[str, object, object]] = {
+    "lag": ("timer", None, ""),
+    "switchport": ("mode", "access", "trunk"),
+}
+
+
+def _scalar_edit(stream: str, reverse: bool) -> tuple[str, object, object]:
+    leaf, first, second = _SCALAR_EDITS[stream]
+    return (leaf, second, first) if reverse else (leaf, first, second)
 
 
 async def _prepare(
@@ -3513,15 +3529,15 @@ async def test_force_removal_refuses_a_section_awaiting_its_aggregate_sender(ada
 
 
 @pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
-@pytest.mark.parametrize(("before", "after"), [(None, ""), ("", None)], ids=["null-to-empty", "empty-to-null"])
-async def test_a_null_to_empty_scalar_change_is_not_wire_equivalent(
-    adapter_client, sender_enabled_sections, stream, before, after
+@pytest.mark.parametrize("reverse", [False, True], ids=["forward", "reverse"])
+async def test_a_retained_root_scalar_edit_is_not_wire_equivalent(
+    adapter_client, sender_enabled_sections, stream, reverse
 ):
-    """Neither predicate sees it: a clear is not cleared and an empty value is not positive."""
+    """A retained-root edit reaches the device, whichever predicate does or does not see it."""
     from nso_adapter.store.models import GenerationStatus
 
-    leaf = _SHAPE[stream]["text_leaf"]
-    device_id = await seed_device(nso_device_name=f"null-empty-{stream}-{before!r}", netbox_device_id=None)
+    leaf, before, after = _scalar_edit(stream, reverse)
+    device_id = await seed_device(nso_device_name=f"scalar-edit-{stream}-{before!r}", netbox_device_id=None)
     first = (await _prepare(adapter_client, device_id, stream, {"A": [1]}, extra={leaf: before})).json()[
         "selection_revision"
     ]
@@ -3709,15 +3725,15 @@ async def test_an_unrelated_producer_composes_the_authorized_switching_fragment(
 
 
 @pytest.mark.parametrize("stream", _SWITCHING_STREAMS)
-@pytest.mark.parametrize(("before", "after"), [(None, ""), ("", None)], ids=["null-to-empty", "empty-to-null"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["forward", "reverse"])
 async def test_a_retained_root_edit_beside_a_detach_gets_a_networked_intermediate(
-    adapter_client, sender_enabled_sections, stream, before, after
+    adapter_client, sender_enabled_sections, stream, reverse
 ):
     """Control 2a: a detach commits no-networking, so the edit needs its own networked link."""
     from nso_adapter.store.models import GenerationMode
 
     shape = _SHAPE[stream]
-    leaf = shape["text_leaf"]
+    leaf, before, after = _scalar_edit(stream, reverse)
     device_id = await seed_device(nso_device_name=f"edit-detach-{stream}-{before!r}", netbox_device_id=None)
     await _authorize(adapter_client, device_id, stream, {"A": [1], "B": [2]}, extra={leaf: before})
     baseline = len(await _generations(device_id))
