@@ -932,12 +932,8 @@ async def _replace_static_route(
     terminal status — lands in :func:`_finalize_static_route_removal`'s single claim-guarded
     transaction, which is where §4.7's lock belongs.
     """
-    from nso_adapter.nso.apply import (
-        _STATIC_ROUTE_SERVICE_PATH,
-        NsoApplyError,
-        apply_static_routes,
-        static_route_entry_key,
-    )
+    from nso_adapter.core.static_route_reader import certified_static_route_section
+    from nso_adapter.nso.apply import NsoApplyError, apply_static_routes, static_route_entry_key
 
     context = context or {}
     if context.get("force"):
@@ -973,8 +969,8 @@ async def _replace_static_route(
     if not authorized and not candidate_clears:
         return _nothing_to_do()
 
-    state = await client.service_instance_state(_STATIC_ROUTE_SERVICE_PATH, device.nso_device_name)
-    if state.inconclusive:
+    section = await certified_static_route_section(client, device)
+    if section.inconclusive:
         # A body built from "looks empty" would drop every entry it was supposed to retain and
         # every orphan the guard was supposed to see, and then verify cleanly (G31).
         raise NsoApplyError(
@@ -983,7 +979,7 @@ async def _replace_static_route(
             "— refusing to build a removal PUT from an uncertified read",
             detail={"device": device.nso_device_name},
         )
-    current = state.entry
+    current = section.entry
     branch = "detach" if detach else "networked"
     if not current:
         # `absent` proves the SERVICE has no instance, never that the device is clean (G9):
@@ -1055,22 +1051,26 @@ def _sr_verify_ok(out: SrRemoval) -> bool:
     return not out.put_issued or out.verify == VERIFY_CONCLUSIVE
 
 
-async def _sr_detach_service_clean(client, device, out: SrRemoval) -> bool:
+async def _sr_service_clean(client, device, out: SrRemoval) -> bool:
     """Post-commit: whether every authorized key is gone from the SERVICE instance (§4.4).
 
-    Certified, never inferred: ``get_service_config`` answers ``None`` both for a keyed 404
+    Certified, never inferred: an uncertifiable read answers ``None`` both for a keyed 404
     and for any 2xx it could not parse (G31), and consuming a carrier on that reading throws
     the deletion record away while the service may still own the key.
-    """
-    from nso_adapter.nso.apply import _STATIC_ROUTE_SERVICE_PATH, static_route_entry_key
 
-    state = await client.service_instance_state(_STATIC_ROUTE_SERVICE_PATH, device.nso_device_name)
-    if state.inconclusive:
+    Taken by the NETWORKED settlement as well as by detach (#1683): authority to omit a key
+    must not outlive retention, so no path may consume a carrier while the live section still
+    holds a key that carrier claims. Without it, ordinary settlement opens exactly the
+    service-present gap the reclaimer is being fixed for.
+    """
+    from nso_adapter.core.static_route_reader import certified_static_route_section
+    from nso_adapter.nso.apply import static_route_entry_key
+
+    section = await certified_static_route_section(client, device)
+    if section.inconclusive:
         logger.warning("static_route.detach_proof_inconclusive", device_id=device.id)
         return False
-    if not state.entry:
-        return True
-    live = {static_route_entry_key(entry) for entry in (state.entry.get("route") or [])}
+    live = {static_route_entry_key(entry) for entry in section.routes}
     return not (live & set(out.authorized))
 
 
@@ -1142,7 +1142,14 @@ async def _sr_networked_proof(client, device, out: SrRemoval, result: dict):
     if out.clears:
         result["pending_clear_proven"] = {str(row_id): list(fields) for row_id, fields in sorted(per_field.items())}
     keys_ok = residue is None or residue == "clean"
-    return (keys_ok and clears_ok and _sr_verify_ok(out)), residue == "found", per_field
+    service_clean = not out.authorized or await _sr_service_clean(client, device, out)
+    if not service_clean:
+        result["service_clean"] = False
+    return (
+        (keys_ok and clears_ok and service_clean and _sr_verify_ok(out)),
+        residue == "found",
+        per_field,
+    )
 
 
 async def _sr_consume(db: AsyncSession, device, out: SrRemoval, per_field: dict, result: dict, *, reg) -> None:
@@ -1227,7 +1234,7 @@ async def _finalize_static_route_removal(db, job_id: int, device, client, out: S
     elif out.branch == "detach":
         result["detach"] = True
         result["residue_check"] = "skipped_detach"
-        service_clean = await _sr_detach_service_clean(client, device, out)
+        service_clean = await _sr_service_clean(client, device, out)
         sync_ok = await _sr_sync_from(client, device, result, job_id=job_id)
         # "PUT 2xx OR the instance is absent": demanding a literal 2xx makes a crash between a
         # committed detach PUT and its bookkeeping commit permanently unprovable — every retry

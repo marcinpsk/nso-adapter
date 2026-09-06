@@ -344,14 +344,21 @@ async def test_c4_5_detach_with_a_null_deployed_key_still_drops_the_triple(adapt
 
 @pytest.mark.parametrize("shape", ["triple", "deployed_key"])
 async def test_c4_6_a_reclaimed_key_is_not_dropped(adapter_client, shape):
-    """C4.6 — another route claims ``A``; deleting it would retract a live route's config."""
+    """C4.6 — a live row RENDERING ``A`` reclaims it; deleting it would retract live config.
+
+    Supersession is by a rendered key only (#1683). A row that merely names ``A`` as its
+    ``deployed_key`` has moved on to ``D`` and asserts ``A`` nowhere, so ``A`` is stale
+    service state this deletion still owes: the old conflation consumed the carrier with
+    ``A`` left on the service and nothing to own its cleanup.
+    """
     from structlog.testing import capture_logs
 
+    rendered = shape == "triple"
     device_id = await seed_device(nso_device_name=f"sr-c46-{shape}", netbox_device_id=7406 + len(shape))
-    spec = {"triple": A, "route_id": 2} if shape == "triple" else {"triple": D, "route_id": 2, "deployed_key": list(A)}
+    spec = {"triple": A, "route_id": 2} if rendered else {"triple": D, "route_id": 2, "deployed_key": list(A)}
     await seed_rows(device_id, [spec])
     fake = SrFake(f"sr-c46-{shape}", service=[wire(A), wire(B)])
-    # Two authorized keys, so the PUT still runs and the reclaimed one is visibly preserved.
+    # Two authorized keys, so the PUT still runs and a reclaimed one is visibly preserved.
     tomb_a = await seed_tomb(device_id, A, route_id=1)
     tomb_b = await seed_tomb(device_id, B, route_id=3)
     job_id = await seed_removal_job(device_id, {}, tombs=(tomb_a, tomb_b))
@@ -360,10 +367,11 @@ async def test_c4_6_a_reclaimed_key_is_not_dropped(adapter_client, shape):
         job = await run_removal_job(device_id, job_id, sr_client(fake))
 
     assert job.status == JobStatus.succeeded
-    assert fake.sent_keys() == {A}, "A is claimed by a live row — it is no longer this deletion's to drop"
-    assert fake.device_keys == {A}
+    expected = {A} if rendered else set()
+    assert fake.sent_keys() == expected
+    assert fake.device_keys == expected
     warnings = [log for log in logs if log["event"] == "static_route.removal_key_reclaimed"]
-    assert len(warnings) == 1
+    assert len(warnings) == int(rendered)
 
 
 async def test_c4_7_a_fully_superseded_removal_issues_no_http_at_all(adapter_client):

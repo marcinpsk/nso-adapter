@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import acquire_claim, claim_session, lock_claim, release_claim
 from nso_adapter.core.request_flags import DELETE_ORIGIN_MARKING, DETACH_MARKING
+from nso_adapter.core.static_route_reader import CertifiedSection
 from nso_adapter.store.models import Device, Job, JobStatus, StaticRouteTombstone
 
 logger = structlog.get_logger(__name__)
@@ -86,27 +87,46 @@ class _DeviceProof:
     def __init__(self) -> None:
         self.device_status: str = "error"
         self.device_entries: dict = {}
-        self.service_state = None
+        self.service_state: CertifiedSection | None = None
         self.sync_ok: bool | None = None
 
 
 async def _read_device(client, device, *, need_device_state: bool, need_service: bool) -> _DeviceProof:
     from nso_adapter.core.apply import _static_route_device_state
-    from nso_adapter.nso.apply import _STATIC_ROUTE_SERVICE_PATH
+    from nso_adapter.core.static_route_reader import certified_static_route_section
 
     proof = _DeviceProof()
     if need_device_state:
         proof.device_status, proof.device_entries = await _static_route_device_state(client, device)
     if need_service:
-        proof.service_state = await client.service_instance_state(_STATIC_ROUTE_SERVICE_PATH, device.nso_device_name)
+        proof.service_state = await certified_static_route_section(client, device)
     return proof
 
 
 def _delete_origin_proven(row: StaticRouteTombstone, proof: _DeviceProof) -> bool:
-    """Whether a delete-origin deletion is proven — none of its keys is on the DEVICE."""
+    """Whether a delete-origin deletion is proven: no key of its own is live anywhere.
+
+    DEVICE absence alone is not proof (#1683). A carrier consumed while the service still
+    holds a key it claims strands that key: no later document renders it, no later document
+    retains it, and no carrier is left to own its removal. So proven means the keys are gone
+    from the device export AND from a certified read of the service section.
+    """
     if proof.device_status != "ok":
         return False
-    return not (_authorized(row) & set(proof.device_entries))
+    if _authorized(row) & set(proof.device_entries):
+        return False
+    return _service_clean(row, proof)
+
+
+def _service_clean(row: StaticRouteTombstone, proof: _DeviceProof) -> bool:
+    """Whether a certified read shows the service holding no key this carrier claims."""
+    from nso_adapter.nso.apply import static_route_entry_key
+
+    state = proof.service_state
+    if state is None or state.inconclusive:
+        return False
+    live = {static_route_entry_key(entry) for entry in state.routes}
+    return not (live & _authorized(row))
 
 
 def _detach_proven(row: StaticRouteTombstone, proof: _DeviceProof) -> bool:
@@ -116,15 +136,14 @@ def _detach_proven(row: StaticRouteTombstone, proof: _DeviceProof) -> bool:
     ``no-networking`` — so it is never a failure here. Only a certified service read counts:
     an inconclusive one proves nothing and re-issues.
     """
-    from nso_adapter.nso.apply import static_route_entry_key
+    return proof.sync_ok is True and _service_clean(row, proof)
 
-    state = proof.service_state
-    if state is None or state.inconclusive or proof.sync_ok is not True:
+
+def _cleanup_pending(row: StaticRouteTombstone, proof: _DeviceProof) -> bool:
+    """Whether the device is certifiably clean of this carrier's keys while the service is not."""
+    if row.marking != DELETE_ORIGIN_MARKING or proof.device_status != "ok":
         return False
-    if not state.entry:
-        return True
-    live = {static_route_entry_key(entry) for entry in (state.entry.get("route") or [])}
-    return not (live & _authorized(row))
+    return not (_authorized(row) & set(proof.device_entries)) and not _service_clean(row, proof)
 
 
 async def reclaim_one_device(device_id: int, *, db: AsyncSession | None = None) -> tuple[int, int]:
@@ -168,11 +187,13 @@ async def reclaim_one_device(device_id: int, *, db: AsyncSession | None = None) 
 
             client = get_nso_client(device.nso_instance)
             markings = {row.marking for row in rows}
+            # One extra certified read per tick when a delete-origin carrier is in the batch:
+            # its proof is now service-clean AND device-clean.
             proof = await _read_device(
                 client,
                 device,
                 need_device_state=DELETE_ORIGIN_MARKING in markings,
-                need_service=DETACH_MARKING in markings,
+                need_service=bool(markings),
             )
             if DETACH_MARKING in markings:
                 from nso_adapter.core.removal import _sr_sync_from
@@ -190,6 +211,15 @@ async def reclaim_one_device(device_id: int, *, db: AsyncSession | None = None) 
                     if row.marking == DELETE_ORIGIN_MARKING
                     else _detach_proven(row, proof)
                 )
+                if not proven and _cleanup_pending(row, proof):
+                    # Device-absent plus service-present: the deletion is NOT proven and the
+                    # carrier is retained, with its ordinary removal reissue as its new owner.
+                    logger.warning(
+                        "static_route_reclaim.cleanup_pending",
+                        device_id=device_id,
+                        tombstone_id=row.id,
+                        marking=row.marking,
+                    )
                 (consumable.append(row.id) if proven else unproven.append(row))
             if consumable:
                 _, claim_token = reg.identity()

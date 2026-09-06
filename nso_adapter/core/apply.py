@@ -283,19 +283,20 @@ async def _static_route_snapshot(client, device, plan) -> tuple[dict | None, lis
     from the store triple would silently rewrite it.
     """
     from nso_adapter.core.static_route_plan import as_triple, triple_of
-    from nso_adapter.nso.apply import _STATIC_ROUTE_SERVICE_PATH, static_route_entry_key
+    from nso_adapter.core.static_route_reader import certified_static_route_section
+    from nso_adapter.nso.apply import static_route_entry_key
 
-    state = await client.service_instance_state(_STATIC_ROUTE_SERVICE_PATH, device.nso_device_name)
-    if state.inconclusive:
+    section = await certified_static_route_section(client, device)
+    if section.inconclusive:
         raise NsoApplyError(
             SNAPSHOT_INCONCLUSIVE,
             f"static_route: could not certify the live service instance on {device.nso_device_name!r} "
             "— refusing to build a PUT-replace from an uncertified read",
             detail={"device": device.nso_device_name},
         )
-    current = state.entry
-    if not current:
-        return current, []
+    current = section.entry
+    if current is None:
+        return None, []
 
     claimed: set[tuple[str, str, str]] = set()
     for tomb in plan.tombstones:
@@ -305,7 +306,7 @@ async def _static_route_snapshot(client, device, plan) -> tuple[dict | None, lis
             claimed.add(deployed)
     reasserted = {triple_of(row) for row in plan.rows}
     keep = claimed - reasserted  # a key a live row still renders needs no retention
-    retained = [entry for entry in (current.get("route") or []) if static_route_entry_key(entry) in keep]
+    retained = [entry for entry in section.routes if static_route_entry_key(entry) in keep]
     return current, retained
 
 

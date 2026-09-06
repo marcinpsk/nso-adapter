@@ -369,13 +369,17 @@ def classify_removal_plan(
         if (deployed := as_triple(tombstone.deployed_key)) is not None:
             authorized.add(deployed)
 
-    claimed: set[Triple] = set()
+    # Supersession is by a RENDERED key only, never by a deployed-only claim. A row whose
+    # identity moved from K to L still names K as its predecessor, and subtracting K would
+    # consume a carrier that owes K's cleanup as `superseded` while K is still on the
+    # service. `classify_apply_plan` already treats a predecessor key this way.
+    rendered: set[Triple] = {triple_of(row) for row in rows}
+    claimed: set[Triple] = set(rendered)
     for row in rows:
-        claimed.add(triple_of(row))
         if (deployed := as_triple(row.deployed_key)) is not None:
             claimed.add(deployed)
-    reclaimed = tuple(sorted(authorized & claimed))
-    authorized -= claimed
+    reclaimed = tuple(sorted(authorized & rendered))
+    authorized -= rendered
 
     clears: list[SrClear] = []
     if not clears_suppressed(context):
