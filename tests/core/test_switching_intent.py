@@ -408,7 +408,7 @@ def test_obsolete_direct_nso_switching_paths_are_absent():
     assert not (repository / "nso_adapter/core/lag_intent.py").exists()
     assert not (repository / "nso_adapter/core/switchport_intent.py").exists()
 
-    apply_source = (repository / "nso_adapter/nso/apply.py").read_text()
+    apply_source = (repository / "nso_adapter/nso/apply.py").read_text(encoding="utf-8")
     apply_tree = ast.parse(apply_source)
     function_names = {
         node.name for node in ast.walk(apply_tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -418,7 +418,7 @@ def test_obsolete_direct_nso_switching_paths_are_absent():
     assert "_LAG_SERVICE_PATH" not in apply_source
     assert "_SWITCHPORT_SERVICE_PATH" not in apply_source
 
-    lag_api = (repository / "nso_adapter/api/lag_config.py").read_text()
-    switchport_api = (repository / "nso_adapter/api/vlan.py").read_text()
+    lag_api = (repository / "nso_adapter/api/lag_config.py").read_text(encoding="utf-8")
+    switchport_api = (repository / "nso_adapter/api/vlan.py").read_text(encoding="utf-8")
     assert "get_nso_client" not in lag_api
     assert "get_nso_client" not in switchport_api
