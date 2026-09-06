@@ -8875,6 +8875,7 @@
                 "enum": [
                   "access",
                   "trunk",
+                  "trunk-all",
                   ""
                 ],
                 "type": "string"

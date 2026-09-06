@@ -2468,8 +2468,8 @@ use the standard error envelope.
 
 ### `GET /api/v1/devices/{id}/switchport` → `200 | 404`
 
-L2 switchport read-mirror. `mode` ∈ `access` · `trunk` · `""` (unset);
-`untagged_vlan` nullable int; `tagged_vlans` sorted list of ints.
+L2 switchport read-mirror. `mode` ∈ `access` · `trunk` · `trunk-all` · `""`
+(unset); `untagged_vlan` nullable int; `tagged_vlans` sorted list of ints.
 
 ```json
 { "device_id": 1,
@@ -2482,9 +2482,10 @@ L2 switchport read-mirror. `mode` ∈ `access` · `trunk` · `""` (unset);
 ### `POST /api/v1/devices/{id}/switchport/apply` → `200 | 404 | 422`
 
 Claim-less full-snapshot store write for desired switchport state. Body =
-`{ "interfaces": [...] }` with the GET row shape minus `source`. VLAN values
-are strict `uint16`; interface names and each interface's tagged VLAN values
-must be unique within the request.
+`{ "interfaces": [...] }` with the GET row shape minus `source`. `mode` is the
+closed vocabulary `access` · `trunk` · `trunk-all` · `""`, where `trunk-all` is
+NetBox's `tagged-all`. VLAN values are strict `uint16`; interface names and each
+interface's tagged VLAN values must be unique within the request.
 
 ```json
 { "status": "stored", "device_id": 1, "count": 2, "removed": 0 }

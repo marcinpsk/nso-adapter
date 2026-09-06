@@ -44,10 +44,11 @@ class _StrictSwitchportRequest(BaseModel):
 
 class SwitchportApply(_StrictSwitchportRequest):
     interface_name: str = Field(min_length=1, max_length=128)
-    #: The L2 mode vocabulary the read mirror serves and the contract states. Its own
-    #: vocabulary, unrelated to the LACP member mode a LAG bundle carries. The empty string
-    #: is the wire spelling of unset, and null means the same.
-    mode: Literal["access", "trunk", ""] | None = None
+    #: The L2 mode vocabulary, taken from switchport-intent.yang and from what the plugin
+    #: sends: `trunk-all` is NetBox's `tagged-all`. Its own vocabulary, unrelated to the LACP
+    #: member mode a LAG bundle carries. The empty string is the wire spelling of unset, and
+    #: null means the same.
+    mode: Literal["access", "trunk", "trunk-all", ""] | None = None
     untagged_vlan: Uint16 | None = None
     tagged_vlans: list[Uint16] = Field(default_factory=list)
 

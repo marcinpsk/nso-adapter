@@ -279,3 +279,31 @@ async def test_put_vlan_intent_stores_and_full_replaces(adapter_client):
 async def test_put_vlan_intent_unknown_device_404(adapter_client):
     resp = await adapter_client.put("/api/v1/devices/999999/vlan-intent", json={"vlans": []}, headers=AUTH | push_seq())
     assert resp.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_apply_switchport_accepts_the_trunk_all_mode(adapter_client):
+    """`trunk-all` is live: the plugin sends it for NetBox `tagged-all`, and YANG names it."""
+    from nso_adapter.core.generation import lock_device_document
+    from nso_adapter.core.switching_intent import render_switching_sections
+
+    device_id = await seed_device(nso_device_name="switchport-trunk-all", netbox_device_id=1212)
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/switchport/apply",
+        json={"interfaces": [{"interface_name": "Gi0/1", "mode": "trunk-all", "tagged_vlans": []}]},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 200, response.text
+    async with session() as db:
+        stored = await db.scalar(
+            text("SELECT mode FROM switchport_intent WHERE device_id = :device_id"),
+            {"device_id": device_id},
+        )
+    assert stored == "trunk-all"
+
+    async with session() as db:
+        await lock_device_document(db, device_id)
+        rendered = await render_switching_sections(db, device_id)
+        await db.rollback()
+    assert rendered["switchport"]["interface"] == [{"interface-name": "Gi0/1", "mode": "trunk-all"}]
