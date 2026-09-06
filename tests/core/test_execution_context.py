@@ -644,6 +644,39 @@ def test_hydration_refuses_a_recorded_clear_the_documents_own_rows_do_not_descri
         hydrate_static_route_removal_plan(_document({**good, "fields": ["tag"]}))
 
 
+def test_hydration_refuses_two_eligibility_decisions_that_decode_to_one_attribute():
+    """``"7/description"`` and ``"07/description"`` are two keys and one attribute.
+
+    Comparing the DECODED set let the second silently overwrite the first: the sets matched,
+    hydration passed, and the attribute went out ineligible with nothing to say so.
+    """
+    from nso_adapter.core.projection import hydrate_interface_execution
+
+    iface = {
+        "id": 7,
+        "name": "Gi0/0",
+        "kind": None,
+        "parent_binding": None,
+        "encap_tag": None,
+        "vrf": None,
+        "service": None,
+    }
+    document = {
+        "interface_config": {
+            "interface_intent": [{"id": 1, "interface_id": 7, "attribute": "description", "intent_value": "up"}],
+            "_execution": {
+                "context": {"ned_id": None, "dialect": "identity"},
+                "proof": {
+                    "interfaces": {"7": iface},
+                    "attribute_eligibility": {"7/description": True, "07/description": False},
+                },
+            },
+        }
+    }
+    with pytest.raises(ValueError, match="does not match its attribute rows"):
+        hydrate_interface_execution(document)
+
+
 def test_a_retained_interface_record_merges_with_the_desired_one():
     """The retained row keeps the binding its own authorization froze.
 

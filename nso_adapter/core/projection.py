@@ -990,14 +990,20 @@ def hydrate_interface_execution(document: dict) -> InterfaceExecution:
     if set(interfaces) != referenced_interfaces:
         raise ValueError("document section 'interface_config' execution context does not match its rows")
     attribute_keys = {(row["interface_id"], row["attribute"]) for row in section.get(InterfaceIntent.__tablename__, [])}
+    # Compared as WRITTEN, before decoding: "7/description" and "07/description" decode to one
+    # tuple, so a set of decoded keys can match the expected set while one decision silently
+    # overwrote the other and turned an eligible attribute ineligible.
+    expected_written = {
+        _attribute_eligibility_key(interface_id, attribute) for interface_id, attribute in attribute_keys
+    }
+    if set(serialized_eligibility) != expected_written:
+        raise ValueError("document section 'interface_config' eligibility does not match its attribute rows")
     decisions: dict[tuple[int, str], bool] = {}
     for key, value in serialized_eligibility.items():
         interface_id, _, attribute = str(key).partition("/")
         if not interface_id.isdigit() or not attribute or not isinstance(value, bool):
             raise ValueError(f"document section 'interface_config' has an invalid eligibility decision {key!r}")
         decisions[(int(interface_id), attribute)] = value
-    if set(decisions) != attribute_keys:
-        raise ValueError("document section 'interface_config' eligibility does not match its attribute rows")
     return InterfaceExecution(interfaces, frozenset(key for key, eligible in decisions.items() if eligible))
 
 
