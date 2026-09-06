@@ -2277,7 +2277,7 @@ async def test_enqueue_removal_force_refuses_a_composed_document(adapter_client)
     ("kwargs", "message"),
     [
         ({"allowed_removal_keys": {}}, "skips the collateral guard; got allowed removal keys"),
-        ({"static_route_tombstone_ids": (7,)}, r"records no execution plan; got tombstone ids \[7\]"),
+        ({"static_route_tombstone_ids": (7,)}, r"selects no lifecycle carrier; got tombstone ids \[7\]"),
         ({"settlement_cohort": 42}, "settles no promoted revisions; got settlement cohort 42"),
         ({"apply_attempt_id": uuid4()}, "carries no Apply attempt"),
     ],

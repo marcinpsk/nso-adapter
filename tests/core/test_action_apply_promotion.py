@@ -564,7 +564,7 @@ async def test_static_route_removal_generation_records_deployed_predecessor_auth
     )
     assert deleted.status_code == 200, deleted.text
     (generation,) = await _generations(device_id)
-    recorded = generation.document["static_route"]["_execution"]["removal"]
+    recorded = generation.document["static_route"]["_execution"]["operation"]["removal"]
     assert recorded["authorized_removal_keys"] == [list(_A), list(_B)]
     assert len(recorded["tombstone_ids"]) == 1
 
@@ -602,7 +602,7 @@ async def test_static_route_action_removal_records_store_only_deletion_authority
     job = {row.id: row for row in await _jobs(device_id)}[generation.job_id]
     assert job.context == {"scope": "static_route", "removed": {"route": [list(_B)]}}
     assert generation.allowed_removal_keys == {"route": [list(_A), list(_B)]}
-    recorded = generation.document["static_route"]["_execution"]["removal"]
+    recorded = generation.document["static_route"]["_execution"]["operation"]["removal"]
     assert recorded["authorized_removal_keys"] == [list(_A), list(_B)]
     assert recorded["tombstone_ids"] == []
 
@@ -758,7 +758,10 @@ async def test_interface_config_generation_records_creation_time_attribute_eligi
     assert response.status_code == 202, response.text
     (generation,) = await _generations(device_id)
     execution = generation.document["interface_config"]["_execution"]
-    assert execution["eligible_interface_attributes"] == [{"interface_id": iface_id, "attribute": "description"}]
+    assert execution["proof"]["attribute_eligibility"] == {
+        f"{iface_id}/description": True,
+        f"{iface_id}/enabled": False,
+    }
     async with session() as db:
         enabled_state = await db.scalar(
             sa.select(InterfaceAttrState).where(
@@ -1071,7 +1074,7 @@ async def test_recorded_static_route_put_is_refused_if_verification_is_disabled_
         await db.commit()
         generation_id = generation.id
         job_id = job.id
-        assert generation.document["static_route"]["_execution"]["apply"]["mode"] == "PUT"
+        assert generation.document["static_route"]["_execution"]["proof"]["apply"]["mode"] == "PUT"
 
     monkeypatch.setattr("nso_adapter.nso.apply.VERIFY_AFTER_APPLY", False)
     fake = SrFake("recorded-put-gate", service=[wire(_A)])
@@ -2195,6 +2198,7 @@ async def test_action_apply_accepts_bgp_once_its_graph_executes_from_the_documen
         "bgp_peer_intent",
         "bgp_peer_af_intent",
         "redistribution_intent",
+        "_execution",
     }
     assert len(await _jobs(device_id)) == 1
     assert (await _stream(device_id, "bgp")).authorized_revision == 1
@@ -2227,7 +2231,13 @@ async def test_promoted_static_route_detach_fails_when_proof_is_inconclusive(ada
                 DeviceProjectionStream.stream == "static_route",
             )
         )
-        desired = await snapshot_stream(db, device_id, "static_route")
+        from nso_adapter.core.projection import freeze_fragment
+        from nso_adapter.store.models import Device
+
+        device = await db.get(Device, device_id)
+        desired = await freeze_fragment(
+            db, device, "static_route", await snapshot_stream(db, device_id, "static_route")
+        )
         document = await _compose_authorized_document(db, device_id, {"static_route": desired})
         attempt_id = uuid4()
         assert await begin_apply_attempt(db, attempt_id, device_id, {"static_route": 5602}) is None
@@ -2701,10 +2711,17 @@ async def _rebind_authorized_ip_rows(device_id: int, interface_id) -> None:
                 DeviceProjectionStream.stream == "ip",
             )
         )
+        from nso_adapter.core.projection import EXECUTION_KEY, fragment_tables
+
         document = {
             table: [dict(entry, interface_id=interface_id) for entry in rows]
-            for table, rows in row.authorized_document.items()
+            for table, rows in fragment_tables(row.authorized_document).items()
         }
+        execution = deepcopy(row.authorized_document[EXECUTION_KEY])
+        execution["proof"]["interfaces"] = {
+            str(interface_id): dict(record, id=interface_id) for record in execution["proof"]["interfaces"].values()
+        }
+        document[EXECUTION_KEY] = execution
         assert document["interface_ip_intent"], "the promotion authorized no address to lose"
         await db.execute(
             sa.update(DeviceProjectionStream)

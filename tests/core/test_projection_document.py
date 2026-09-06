@@ -113,8 +113,20 @@ def test_hydrate_section_accepts_an_explicitly_empty_section():
 
 def test_composing_an_empty_promoted_stream_preserves_its_section():
     from nso_adapter.core.generation import _compose_document
+    from nso_adapter.core.projection import EXECUTION_KEY
 
-    assert _compose_document({"vlan": {}}) == {"vlan": {}}
+    context = {"ned_id": "cisco-ios-cli-3.8", "dialect": "identity"}
+    assert _compose_document({"vlan": {EXECUTION_KEY: {"context": context}}}) == {
+        "vlan": {EXECUTION_KEY: {"context": context}}
+    }
+
+
+def test_composing_an_unfrozen_fragment_is_refused():
+    """Every fragment a document composes was produced by a fragment producer."""
+    from nso_adapter.core.generation import _compose_document
+
+    with pytest.raises(ValueError, match="contributes an unfrozen fragment"):
+        _compose_document({"vlan": {"vlan_intent": []}})
 
 
 def test_increment_one_sections_are_document_executed():
@@ -633,18 +645,21 @@ def test_interface_execution_context_hydrates_beside_intent_tables():
             ],
             "interface_ip_intent": [],
             EXECUTION_KEY: {
-                "interfaces": [
-                    {
-                        "id": 7,
-                        "name": "GigabitEthernet0/1",
-                        "kind": None,
-                        "parent_binding": None,
-                        "encap_tag": None,
-                        "vrf": None,
-                        "service": None,
-                    }
-                ],
-                "eligible_interface_attributes": [{"interface_id": 7, "attribute": "description"}],
+                "context": {"ned_id": "cisco-ios-cli-3.8", "dialect": "identity"},
+                "proof": {
+                    "interfaces": {
+                        "7": {
+                            "id": 7,
+                            "name": "GigabitEthernet0/1",
+                            "kind": None,
+                            "parent_binding": None,
+                            "encap_tag": None,
+                            "vrf": None,
+                            "service": None,
+                        }
+                    },
+                    "attribute_eligibility": {"7/description": True},
+                },
             },
         }
     }
@@ -826,7 +841,10 @@ def test_a_split_that_leaves_a_table_unowned_is_refused(monkeypatch):
         monkeypatch.setitem(
             projection._SPLIT_SECTION_STREAMS,
             "isis",
-            {"isis": (IsisProcessIntent,), "isis_flex_algo": (IsisFlexAlgoIntent,)},
+            projection._SplitSection(
+                context_owner="isis",
+                streams={"isis": (IsisProcessIntent,), "isis_flex_algo": (IsisFlexAlgoIntent,)},
+            ),
         )
         with pytest.raises(RuntimeError, match="does not partition its tables"):
             projection._stream_tables()

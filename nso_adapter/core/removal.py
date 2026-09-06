@@ -840,121 +840,22 @@ def _sr_triple(key) -> tuple[str, str, str]:
     return tuple("" if p is None else str(p) for p in parts)  # type: ignore[return-value]
 
 
-async def _sr_authorization(db: AsyncSession, device, context: dict, *, job_id: int | None):
-    """Return ``(tombstones, authorized, claimed, rows, reclaimed)`` — §4.3's steps 1 and 2.
+async def _sr_execution_plan(db: AsyncSession, *, job_id: int | None):
+    """Return the removal plan the executing generation's document froze.
 
-    ``authorized`` is what this job may drop: the exact tombstones named by a reissue
-    generation, otherwise its OWN tombstones' ``{triple} ∪ {deployed_key}`` (X6; a NULL
-    ``deployed_key`` contributes nothing), or ``context["removed"]["route"]`` when it has no
-    tombstone carrier — minus every key a live intent row still claims. That subtraction is
-    ownership, not eligibility: another route reclaiming the key means the key is no longer
-    this deletion's to drop.
-    """
-    from nso_adapter.core.static_route_plan import as_triple, triple_of
-    from nso_adapter.store.models import StaticRouteIntent, StaticRouteTombstone
-
-    tombstones = []
-    context_has_tombstones = "tombstone_ids" in context
-    if context_has_tombstones:
-        tombstone_ids = context["tombstone_ids"]
-        if not isinstance(tombstone_ids, list) or not all(
-            isinstance(tombstone_id, int) and not isinstance(tombstone_id, bool) for tombstone_id in tombstone_ids
-        ):
-            raise ValueError("static_route removal context carries invalid tombstone_ids")
-        tombstones = list(
-            (
-                await db.execute(
-                    select(StaticRouteTombstone)
-                    .where(
-                        StaticRouteTombstone.device_id == device.id,
-                        StaticRouteTombstone.id.in_(sorted(set(tombstone_ids))),
-                    )
-                    .order_by(StaticRouteTombstone.id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-    elif job_id is not None:
-        tombstones = list(
-            (
-                await db.execute(
-                    select(StaticRouteTombstone)
-                    .where(StaticRouteTombstone.device_id == device.id, StaticRouteTombstone.job_id == job_id)
-                    .order_by(StaticRouteTombstone.id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-
-    authorized: set[tuple[str, str, str]] = set()
-    for tomb in tombstones:
-        authorized.add((tomb.vrf or "", tomb.prefix or "", tomb.next_hop or ""))
-        deployed = as_triple(tomb.deployed_key)
-        if deployed is not None:
-            authorized.add(deployed)
-    if not tombstones and not context_has_tombstones:
-        for key in (context.get("removed") or {}).get("route") or []:
-            authorized.add(_sr_triple(key))
-
-    rows = list(
-        (
-            await db.execute(
-                select(StaticRouteIntent).where(StaticRouteIntent.device_id == device.id).order_by(StaticRouteIntent.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    claimed: set[tuple[str, str, str]] = set()
-    for row in rows:
-        claimed.add(triple_of(row))
-        deployed = as_triple(row.deployed_key)
-        if deployed is not None:
-            claimed.add(deployed)
-    reclaimed = sorted(authorized & claimed)
-    return tombstones, authorized - claimed, claimed, rows, reclaimed
-
-
-async def _sr_execution_plan(db: AsyncSession, device, context: dict, *, job_id: int | None):
-    """Return a promoted removal plan, or classify a reissue (or an unqueued call) live.
-
-    A QUEUED job that carries no generation is refused, exactly as :func:`_replacement_section`
-    refuses it for every other scope: falling through here would classify against the live
-    store and retract whatever it holds now under a job authorized to assert something else.
+    There is no live classification any more. Every removal generation carries an operation
+    plane, and classifying against the live store instead would deploy a plan whose facts
+    the document it executes never asserted.
     """
     from nso_adapter.core.generation import executing_generation
-    from nso_adapter.core.static_route_plan import (
-        SrClear,
-        SrRemovalPlan,
-        candidate_clear_fields,
-        clears_suppressed,
-        hydrate_static_route_removal_plan,
-        triple_of,
-    )
+    from nso_adapter.core.static_route_plan import hydrate_static_route_removal_plan
 
-    if job_id is not None:
-        generation = await executing_generation(db, job_id)
-        if generation is None:
-            raise RuntimeError(f"removal job {job_id} for scope 'static_route' carries no generation to deploy")
-        if generation.stream_revisions:
-            return hydrate_static_route_removal_plan(generation.document)
-    tombstones, authorized, claimed, rows, reclaimed = await _sr_authorization(db, device, context, job_id=job_id)
-    # Clears re-evaluated at execution under the claim, never from a job-context snapshot: a
-    # clear queued minutes ago can have been re-set, deleted, moved or had its key reclaimed.
-    clears = (
-        ()
-        if clears_suppressed(context)
-        else tuple(SrClear(row.id, triple_of(row), fields) for row in rows if (fields := candidate_clear_fields(row)))
-    )
-    return SrRemovalPlan(
-        frozenset(authorized),
-        frozenset(claimed),
-        tuple(tombstone.id for tombstone in tombstones),
-        clears,
-        tuple(reclaimed),
-    )
+    if job_id is None:
+        raise RuntimeError("a static_route removal needs the generation of the job that carries it")
+    generation = await executing_generation(db, job_id)
+    if generation is None:
+        raise RuntimeError(f"removal job {job_id} for scope 'static_route' carries no generation to deploy")
+    return hydrate_static_route_removal_plan(generation.document)
 
 
 def _sr_body(current: dict, authorized: set, clears) -> tuple[list[dict], dict, dict]:
@@ -1015,20 +916,16 @@ async def _replace_static_route(
     store would forward-deploy every co-edited field on it (``metric 10→NULL`` **and**
     ``tag 100→200`` in one push would immediately deploy tag 200).
 
-    Promoted generation creation records the removal classification under the projection lock:
+    Generation creation records the removal classification under the projection lock, for a
+    promotion and a reissue alike, and execution reads it back:
 
-    1. every tombstone owned by THIS job contributes ``{triple} ∪ {deployed_key}`` (X6);
-       a job that owns none falls back to ``context["removed"]["route"]`` (including a
-       fence-shut removal);
-    2. supersession subtracts every key the selected plan claims as its ``triple`` or
-       its ``deployed_key``. A promotion uses the recorded document. A reissue uses current
-       accepted intent;
+    1. every carrier the operation SELECTED contributes ``{triple} ∪ {deployed_key}`` (X6);
+       an operation that selects none falls back to ``context["removed"]["route"]``
+       (including a fence-shut removal);
+    2. supersession subtracts every key the document's rows claim as their ``triple`` or
+       their ``deployed_key``;
     3. nothing left to drop and no clear to deliver ⇒ **no HTTP at all**: the tombstones are
        consumed by supersession, not by failure.
-
-    A reissue promotes nothing and records no execution plan. It re-derives this classification
-    at execution from its job and tombstone rows, including the durable clear carrier. Only the
-    ``authorized`` half is visible.
 
     *reg* is threaded but unused HERE on purpose: this function only reads and writes to the
     device. Every store write this job makes — the tombstone delete, the carrier update and the
@@ -1047,7 +944,7 @@ async def _replace_static_route(
         await _replace_simple(db, device, client, "static_route", context, job_id=job_id)
         return SrRemoval("force", frozenset(), (), frozenset(), True, False, None, {}, {}, ())
 
-    plan = await _sr_execution_plan(db, device, context, job_id=job_id)
+    plan = await _sr_execution_plan(db, job_id=job_id)
     authorized = set(plan.authorized)
     claimed = set(plan.claimed)
     reclaimed = plan.reclaimed
@@ -1751,7 +1648,7 @@ def _refuse_force_incompatible(
     apply_attempt_id,
     frozen_fragments,
 ) -> None:
-    """Refuse the arguments a reissue cannot honor: it skips the guard and records no plan."""
+    """Refuse the arguments a reissue cannot honor: it promotes nothing and skips the guard."""
     if promotes:
         raise ValueError(f"a force-removal of {scope!r} promotes nothing; got {promotes!r}")
     if marking is not None:
@@ -1770,7 +1667,7 @@ def _refuse_force_incompatible(
         raise ValueError(f"a force-removal of {scope!r} promotes nothing; got frozen fragments to promote")
     if static_route_tombstone_ids:
         raise ValueError(
-            f"a force-removal of {scope!r} records no execution plan; got tombstone ids "
+            f"a force-removal of {scope!r} selects no lifecycle carrier; got tombstone ids "
             f"{list(static_route_tombstone_ids)}"
         )
 
@@ -1863,6 +1760,40 @@ async def _promote_parked_clears(
         row.provenance = AUTHORIZED_PROVENANCE
         row.revision = max(row.revision, revision or 0)
     await db.flush()
+
+
+async def _pending_clears_discharged_by(
+    db: AsyncSession,
+    device_id: int,
+    scope: str,
+    promotes: tuple[str, ...],
+    *,
+    mode,
+    force: bool,
+) -> tuple[int, ...]:
+    """Return the ids :func:`_settle_pending_clears_at_admission` will delete, in id order.
+
+    Read BEFORE the generation is written so its operation plane can name the carriers it
+    discharges; the same transaction holds the projection lock, so nothing moves in between.
+    """
+    from nso_adapter.core.projection import section_streams
+    from nso_adapter.store.models import GenerationMode, StreamPendingClear
+
+    if force:
+        streams: tuple[str, ...] = section_streams(scope)
+    elif scope != "static_route" and mode is GenerationMode.networked:
+        streams = promotes
+    else:
+        return ()
+    ids = (
+        await db.execute(
+            select(StreamPendingClear.id).where(
+                StreamPendingClear.device_id == device_id,
+                StreamPendingClear.stream.in_(streams),
+            )
+        )
+    ).scalars()
+    return tuple(sorted(ids.all()))
 
 
 async def _settle_pending_clears_at_admission(
@@ -2092,12 +2023,14 @@ async def enqueue_removal(
     mode = GenerationMode.detach if context.get("detach") else GenerationMode.networked
     # The context rides the GENERATION either way, not only the job: a retry of a blocked
     # head has to rebuild a job that commits the same operation, down to the detach flag.
+    discharged_clear_ids = await _pending_clears_discharged_by(db, device_id, scope, promotes, mode=mode, force=force)
     if force:
         generation = await create_reissue_generation(
             db,
             device_id,
             mode=mode,
             removal_context=context,
+            discharged_clear_ids=discharged_clear_ids,
         )
     else:
         generation = await create_generation(
@@ -2112,6 +2045,7 @@ async def enqueue_removal(
             removal_context=context,
             settlement_cohort=settlement_cohort,
             static_route_tombstone_ids=static_route_tombstone_ids,
+            discharged_clear_ids=discharged_clear_ids,
             apply_attempt_id=apply_attempt_id,
             frozen_fragments=frozen_fragments,
         )
@@ -2175,7 +2109,7 @@ async def enqueue_static_route_removals(
 
     *removed* maps a marking to the route keys deleted with it, and *tombstones* are the
     carriers written for those keys. Each is stamped with the job that owns ITS marking, so
-    a job's authority is exactly its own rows (``_sr_authorization`` reads tombstones by job).
+    a job's authority is exactly its own rows (its generation selects its tombstones by id).
 
     One job cannot carry both markings. ``detach`` is a job-wide dispatch switch: it decides
     whether the whole PUT-replace commits ``no-networking``, so a mixed job would either

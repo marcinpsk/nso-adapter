@@ -179,21 +179,24 @@ async def reclaim_one_device(device_id: int, *, db: AsyncSession | None = None) 
 
                 proof.sync_ok = await _sr_sync_from(client, device, {}, job_id=0)
 
+            # PARTITION, then CONSUME, then COMPOSE. A reissue composed before the proven
+            # carriers are gone would inherit them into its document and re-assert a removal
+            # authority this very transaction is discharging.
             consumable: list[int] = []
+            unproven: list = []
             for row in rows:
                 proven = (
                     _delete_origin_proven(row, proof)
                     if row.marking == DELETE_ORIGIN_MARKING
                     else _detach_proven(row, proof)
                 )
-                if proven:
-                    consumable.append(row.id)
-                else:
-                    await reissue_removal_job(conn, device_id, row)
-                    reissued += 1
+                (consumable.append(row.id) if proven else unproven.append(row))
             if consumable:
                 _, claim_token = reg.identity()
                 consumed = await delete_tombstones(conn, consumable, device_id=device_id, claim_token=claim_token)
+            for row in unproven:
+                await reissue_removal_job(conn, device_id, row)
+                reissued += 1
             await conn.commit()
     finally:
         await release_claim(reg, db=db)

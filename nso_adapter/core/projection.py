@@ -366,6 +366,19 @@ def section_registry() -> dict[str, _Section]:
     }
 
 
+class _SplitSection(NamedTuple):
+    """A section written by more than one stream: who owns its context, and who owns what.
+
+    *context_owner* is the stream whose fragment supplies the composed section's encoding
+    context. Owner-wins is right for the context, which is a property of the SECTION, and
+    it is the one always-available way to move a section to a new NED: reauthorize the
+    owner. Row-grain proof does NOT follow it — see :func:`compose_section_execution`.
+    """
+
+    context_owner: str
+    streams: dict[str, tuple[type, ...]]
+
+
 #: The sections whose tables are owned by MORE THAN ONE endpoint stream, and which tables
 #: each stream owns. Every section absent from here has exactly one stream, spelled the same.
 #:
@@ -374,15 +387,21 @@ def section_registry() -> dict[str, _Section]:
 #: interface ATTRIBUTES a store-only repair left in the store (#103). The two halves are
 #: checked against the section's own table list below, so a table added to a split section
 #: fails loudly instead of falling into neither lane.
-_SPLIT_SECTION_STREAMS: dict[str, dict[str, tuple[type, ...]]] = {
-    "interface_config": {
-        "interface_config": (InterfaceIntent,),
-        "ip": (InterfaceIpIntent,),
-    },
-    "isis": {
-        "isis": (IsisProcessIntent, IsisInterfaceIntent, IsisLevelIntent, RedistributionIntent),
-        "isis_flex_algo": (IsisFlexAlgoIntent,),
-    },
+_SPLIT_SECTION_STREAMS: dict[str, _SplitSection] = {
+    "interface_config": _SplitSection(
+        context_owner="interface_config",
+        streams={
+            "interface_config": (InterfaceIntent,),
+            "ip": (InterfaceIpIntent,),
+        },
+    ),
+    "isis": _SplitSection(
+        context_owner="isis",
+        streams={
+            "isis": (IsisProcessIntent, IsisInterfaceIntent, IsisLevelIntent, RedistributionIntent),
+            "isis_flex_algo": (IsisFlexAlgoIntent,),
+        },
+    ),
 }
 
 
@@ -397,13 +416,18 @@ def _stream_tables() -> dict[str, tuple[_Spec, ...]]:
             specs[section] = section_specs
             continue
         by_model = {spec.model: spec for spec in section_specs}
-        claimed: list[type] = [model for models in split.values() for model in models]
+        claimed: list[type] = [model for models in split.streams.values() for model in models]
         if sorted(m.__name__ for m in claimed) != sorted(m.__name__ for m in by_model):
             raise RuntimeError(
                 f"section {section!r} stream ownership does not partition its tables: "
                 f"claimed {sorted(m.__name__ for m in claimed)} vs {sorted(m.__name__ for m in by_model)}"
             )
-        for stream, models in split.items():
+        if split.context_owner not in split.streams:
+            raise RuntimeError(
+                f"section {section!r} names context owner {split.context_owner!r}, which is not one of its "
+                f"streams {sorted(split.streams)}"
+            )
+        for stream, models in split.streams.items():
             specs[stream] = tuple(by_model[model] for model in models)
     return specs
 
@@ -411,7 +435,7 @@ def _stream_tables() -> dict[str, tuple[_Spec, ...]]:
 @cache
 def _stream_section() -> dict[str, str]:
     """Stream name -> the document section it contributes a fragment to."""
-    owner = {stream: section for section, split in _SPLIT_SECTION_STREAMS.items() for stream in split}
+    owner = {stream: section for section, split in _SPLIT_SECTION_STREAMS.items() for stream in split.streams}
     return {stream: owner.get(stream, stream) for stream in _stream_tables()}
 
 
@@ -472,7 +496,7 @@ def projection_streams() -> frozenset[str]:
     overlap = set(endpoints) & OUT_OF_PROTOCOL_STREAMS
     if overlap:
         raise RuntimeError(f"streams that are both an intent PUT lane and an Apply POST: {sorted(overlap)}")
-    split_streams = {stream for split in _SPLIT_SECTION_STREAMS.values() for stream in split}
+    split_streams = {stream for split in _SPLIT_SECTION_STREAMS.values() for stream in split.streams}
     for stream in sorted(OUT_OF_PROTOCOL_STREAMS):
         if stream not in _SECTION_REGISTRY:
             raise RuntimeError(f"out-of-protocol stream {stream!r} names no section spelled the same")
@@ -792,11 +816,10 @@ CLAIM_LESS_SECTIONS: frozenset[str] = frozenset({"switchport", "lag"})
 #: this set and restores the two equalities the partition test carries.
 AWAITING_SENDER_SECTIONS: frozenset[str] = CLAIM_LESS_SECTIONS
 
-#: Reserved section key for immutable interface and static-route execution metadata.
+#: Reserved section key for a section's execution metadata: its frozen encoding context,
+#: the proof its own rows were authorized with, and the operation plane one generation
+#: writes over them. Never a table, and never transmitted.
 EXECUTION_KEY = "_execution"
-#: The sections that record execution metadata under :data:`EXECUTION_KEY`. The two
-#: switching sections carry the frozen encoding context there (#1612).
-EXECUTION_METADATA_SECTIONS: frozenset[str] = frozenset({"interface_config", "static_route", "switchport", "lag"})
 INTERFACE_ATTRIBUTE_ELIGIBLE_STATES: frozenset[SyncState] = frozenset(
     {
         SyncState.accepted,
@@ -806,9 +829,12 @@ INTERFACE_ATTRIBUTE_ELIGIBLE_STATES: frozenset[SyncState] = frozenset(
     }
 )
 
+#: The seven interface fields the interface writer reads besides the intent rows.
+_INTERFACE_PROOF_FIELDS = ("id", "name", "kind", "parent_binding", "encap_tag", "vrf", "service")
+
 
 class InterfaceEligibilityUnresolved(RuntimeError):
-    """Interface intent whose non-intent eligibility state is missing at creation."""
+    """Interface intent whose non-intent eligibility state is missing at authorization."""
 
 
 class InterfaceExecution(NamedTuple):
@@ -818,14 +844,60 @@ class InterfaceExecution(NamedTuple):
     eligible_attributes: frozenset[tuple[int, str]]
 
 
-async def record_interface_execution(db: AsyncSession, device_id: int, document: dict) -> None:
-    """Resolve and record all non-intent facts needed to execute interface_config."""
-    section = document.get("interface_config")
-    if section is None:
-        return
-    attr_rows = section.get(InterfaceIntent.__tablename__, [])
-    ip_rows = section.get(InterfaceIpIntent.__tablename__, [])
+def _attribute_eligibility_key(interface_id: int, attribute: str) -> str:
+    return f"{interface_id}/{attribute}"
+
+
+def build_interface_proof(stream: str, tables: dict[str, list[dict]], interfaces, decisions: dict) -> dict:
+    """Build the interface section's proof from rows and already-resolved non-intent facts.
+
+    Pure, so the runtime freeze and the one-shot migration that stamps pre-contract fragments
+    produce the same bytes from the same inputs. *decisions* maps ``(interface_id, attribute)``
+    to the eligibility verdict; every attribute row of *tables* must have one.
+    """
+    attr_rows = tables.get(InterfaceIntent.__tablename__, [])
+    ip_rows = tables.get(InterfaceIpIntent.__tablename__, [])
     interface_ids = sorted({row["interface_id"] for row in [*attr_rows, *ip_rows]})
+    by_id = {iface.id: iface for iface in interfaces}
+    missing_interfaces = sorted(set(interface_ids) - set(by_id))
+    if missing_interfaces:
+        raise InterfaceEligibilityUnresolved(f"interface_config references missing interface ids {missing_interfaces}")
+    proof: dict = {
+        "interfaces": {
+            str(interface_id): {field: getattr(by_id[interface_id], field) for field in _INTERFACE_PROOF_FIELDS}
+            for interface_id in interface_ids
+        }
+    }
+    if not attr_rows and stream != "interface_config":
+        return proof
+    attr_keys = sorted({(row["interface_id"], row["attribute"]) for row in attr_rows})
+    unresolved = [key for key in attr_keys if key not in decisions]
+    if unresolved:
+        raise InterfaceEligibilityUnresolved(
+            "interface_config attribute eligibility is missing for "
+            + ", ".join(f"interface {interface_id} attribute {attribute!r}" for interface_id, attribute in unresolved)
+        )
+    # EVERY attribute row gets an explicit decision, ``false`` included: a decision that is
+    # merely absent cannot be told apart from one nobody made.
+    proof["attribute_eligibility"] = {
+        _attribute_eligibility_key(interface_id, attribute): decisions[(interface_id, attribute)]
+        for interface_id, attribute in attr_keys
+    }
+    return proof
+
+
+async def _freeze_interface_proof(db: AsyncSession, device_id: int, stream: str, tables: dict[str, list[dict]]) -> dict:
+    """Resolve the live non-intent facts the interface section's own rows need.
+
+    The ``ip`` stream contributes ``interfaces`` only: address rows carry no eligibility
+    decision, and resolving the SIBLING stream's decisions here would re-resolve rows this
+    authorization does not cover.
+    """
+    attr_rows = tables.get(InterfaceIntent.__tablename__, [])
+    ip_rows = tables.get(InterfaceIpIntent.__tablename__, [])
+    interface_ids = sorted({row["interface_id"] for row in [*attr_rows, *ip_rows]})
+    if not interface_ids:
+        return build_interface_proof(stream, tables, [], {})
     interfaces = (
         (
             await db.execute(
@@ -836,83 +908,90 @@ async def record_interface_execution(db: AsyncSession, device_id: int, document:
         )
         .scalars()
         .all()
-        if interface_ids
-        else []
     )
-    by_id = {iface.id: iface for iface in interfaces}
-    missing_interfaces = sorted(set(interface_ids) - set(by_id))
-    if missing_interfaces:
-        raise InterfaceEligibilityUnresolved(f"interface_config references missing interface ids {missing_interfaces}")
-
     states = (
         (await db.execute(select(InterfaceAttrState).where(InterfaceAttrState.interface_id.in_(interface_ids))))
         .scalars()
         .all()
-        if interface_ids
-        else []
     )
-    state_by_key = {(state.interface_id, state.attribute): state for state in states}
-    attr_keys = [(row["interface_id"], row["attribute"]) for row in attr_rows]
-    unresolved = sorted(key for key in attr_keys if key not in state_by_key)
-    if unresolved:
-        raise InterfaceEligibilityUnresolved(
-            "interface_config attribute eligibility is missing for "
-            + ", ".join(f"interface {interface_id} attribute {attribute!r}" for interface_id, attribute in unresolved)
-        )
-    eligible = [
-        {"interface_id": interface_id, "attribute": attribute}
-        for interface_id, attribute in sorted(attr_keys)
-        if state_by_key[(interface_id, attribute)].sync_state in INTERFACE_ATTRIBUTE_ELIGIBLE_STATES
-    ]
-    section[EXECUTION_KEY] = {
-        "interfaces": [
-            {
-                "id": iface.id,
-                "name": iface.name,
-                "kind": iface.kind,
-                "parent_binding": iface.parent_binding,
-                "encap_tag": iface.encap_tag,
-                "vrf": iface.vrf,
-                "service": iface.service,
-            }
-            for iface in interfaces
-        ],
-        "eligible_interface_attributes": eligible,
+    decisions = {
+        (state.interface_id, state.attribute): state.sync_state in INTERFACE_ATTRIBUTE_ELIGIBLE_STATES
+        for state in states
     }
+    return build_interface_proof(stream, tables, interfaces, decisions)
+
+
+def _section_execution(document: dict, section: str) -> dict:
+    execution = (document.get(section) or {}).get(EXECUTION_KEY)
+    if not isinstance(execution, dict):
+        raise ValueError(f"document section {section!r} has no execution metadata")
+    return execution
+
+
+def section_context(document: dict, section: str) -> dict:
+    """Return the frozen encoding context *section* must be encoded under.
+
+    Every encode, every residue expectation and every unrenderable-object exclusion takes
+    its NED id and dialect from here and from no device row, so a NED change reaches a
+    section only when an operation reauthorizes it.
+    """
+    from nso_adapter.core.community_dialect import community_dialect_by_name
+
+    context = _section_execution(document, section).get("context")
+    if not isinstance(context, dict) or set(context) != {"ned_id", "dialect"}:
+        raise ValueError(f"document section {section!r} has an invalid execution context")
+    ned_id = context["ned_id"]
+    if ned_id is not None and not isinstance(ned_id, str):
+        raise ValueError(f"document section {section!r} records a non-string ned_id")
+    try:
+        community_dialect_by_name(context["dialect"])
+    except ValueError as exc:
+        raise ValueError(f"document section {section!r} names an unregistered dialect: {exc}") from None
+    return context
+
+
+def section_proof(document: dict, section: str) -> dict | None:
+    """Return *section*'s recorded proof metadata, or ``None`` when it declares none."""
+    proof = _section_execution(document, section).get("proof")
+    if proof is not None and not isinstance(proof, dict):
+        raise ValueError(f"document section {section!r} has invalid proof metadata")
+    return proof
+
+
+def section_operation(document: dict, section: str) -> dict:
+    """Return the operation plane a generation wrote over *section*, or an empty mapping."""
+    operation = _section_execution(document, section).get("operation")
+    if operation is None:
+        return {}
+    if not isinstance(operation, dict):
+        raise ValueError(f"document section {section!r} has an invalid operation plane")
+    return operation
 
 
 def hydrate_interface_execution(document: dict) -> InterfaceExecution:
-    """Rebuild interface writer context and eligibility from the stored document."""
+    """Rebuild interface writer context and eligibility from the stored document.
+
+    Both halves are checked by EXACT equality against the section's own rows: a missing
+    decision, an extra one or an interface record the rows never reference is a document
+    that does not describe what it carries, and repairing it here would re-derive at
+    execution exactly what the freeze exists to fix.
+    """
     section = document.get("interface_config") or {}
-    execution = section.get(EXECUTION_KEY)
-    if execution is None:
-        raise ValueError("document section 'interface_config' has no recorded execution context")
-    if not isinstance(execution, dict) or set(execution) != {
-        "interfaces",
-        "eligible_interface_attributes",
-    }:
-        raise ValueError("document section 'interface_config' has invalid execution context")
-    serialized_interfaces = execution.get("interfaces")
-    serialized_eligible = execution.get("eligible_interface_attributes")
-    if not isinstance(serialized_interfaces, list) or not isinstance(serialized_eligible, list):
-        raise ValueError("document section 'interface_config' has invalid execution context")
+    proof = section_proof(document, "interface_config") or {}
+    if not set(proof) <= {"interfaces", "attribute_eligibility"} or "interfaces" not in proof:
+        raise ValueError("document section 'interface_config' has invalid execution proof")
+    serialized_interfaces = proof["interfaces"]
+    serialized_eligibility = proof.get("attribute_eligibility") or {}
+    if not isinstance(serialized_interfaces, dict) or not isinstance(serialized_eligibility, dict):
+        raise ValueError("document section 'interface_config' has invalid execution proof")
     interfaces: dict[int, DbInterface] = {}
-    allowed = {"id", "name", "kind", "parent_binding", "encap_tag", "vrf", "service"}
-    for record in serialized_interfaces:
-        if not isinstance(record, dict) or set(record) != allowed:
+    for key, record in serialized_interfaces.items():
+        if not isinstance(record, dict) or set(record) != set(_INTERFACE_PROOF_FIELDS):
             raise ValueError("document section 'interface_config' has invalid interface context")
         iface = DbInterface(**record)
-        if iface.id in interfaces:
-            raise ValueError(f"document section 'interface_config' repeats interface id {iface.id}")
+        if str(iface.id) != str(key):
+            raise ValueError(f"document section 'interface_config' files interface {iface.id} under key {key!r}")
         interfaces[iface.id] = iface
-    eligible: set[tuple[int, str]] = set()
-    for record in serialized_eligible:
-        if not isinstance(record, dict) or set(record) != {"interface_id", "attribute"}:
-            raise ValueError("document section 'interface_config' has invalid eligible attribute")
-        key = (record["interface_id"], record["attribute"])
-        if key in eligible:
-            raise ValueError(f"document section 'interface_config' repeats eligible attribute {key!r}")
-        eligible.add(key)
     referenced_interfaces = {
         row["interface_id"]
         for table in (InterfaceIntent.__tablename__, InterfaceIpIntent.__tablename__)
@@ -921,9 +1000,164 @@ def hydrate_interface_execution(document: dict) -> InterfaceExecution:
     if set(interfaces) != referenced_interfaces:
         raise ValueError("document section 'interface_config' execution context does not match its rows")
     attribute_keys = {(row["interface_id"], row["attribute"]) for row in section.get(InterfaceIntent.__tablename__, [])}
-    if not eligible <= attribute_keys:
+    decisions: dict[tuple[int, str], bool] = {}
+    for key, value in serialized_eligibility.items():
+        interface_id, _, attribute = str(key).partition("/")
+        if not interface_id.isdigit() or not attribute or not isinstance(value, bool):
+            raise ValueError(f"document section 'interface_config' has an invalid eligibility decision {key!r}")
+        decisions[(int(interface_id), attribute)] = value
+    if set(decisions) != attribute_keys:
         raise ValueError("document section 'interface_config' eligibility does not match its attribute rows")
-    return InterfaceExecution(interfaces, frozenset(eligible))
+    return InterfaceExecution(interfaces, frozenset(key for key, eligible in decisions.items() if eligible))
+
+
+def _merge_interface_records(section: str, into: dict, record: dict, key: str) -> None:
+    """Merge one interface record FIELD-WISE, refusing two different non-null values.
+
+    Owner-wins is wrong for rows: the IP endpoint backfills ``parent_binding`` and
+    ``encap_tag`` onto an interface an attribute fragment recorded while both were null, and
+    discarding the populated record would encode the address without its binding.
+    """
+    existing = into.get(key)
+    if existing is None:
+        into[key] = deepcopy(record)
+        return
+    merged = dict(existing)
+    for field, value in record.items():
+        previous = merged.get(field)
+        if previous is None:
+            merged[field] = value
+        elif value is not None and value != previous:
+            raise ValueError(
+                f"document section {section!r} interface {key} has conflicting {field!r} values "
+                f"{previous!r} and {value!r} across its fragments"
+            )
+    into[key] = merged
+
+
+def compose_section_execution(section: str, contributions: list[tuple[str, dict]]) -> dict:
+    """Compose one section's ``_execution`` from the fragments that build it.
+
+    Context is OWNER-WINS: it belongs to the section, and reauthorizing the owner is the one
+    way to move the section to a new NED. Proof is per ROW, so object-valued proof merges key
+    by key and interface records merge field-wise; a non-object proof value may come from one
+    fragment only.
+    """
+    owner = _SPLIT_SECTION_STREAMS[section].context_owner if section in _SPLIT_SECTION_STREAMS else section
+    contexts: dict[str, dict] = {}
+    proof: dict = {}
+    proof_source: dict[str, str] = {}
+    for stream, fragment in contributions:
+        frozen = fragment.get(EXECUTION_KEY)
+        if not isinstance(frozen, dict):
+            raise ValueError(f"section {section!r} stream {stream!r} contributes an unfrozen fragment")
+        if "operation" in frozen:
+            raise ValueError(
+                f"section {section!r} stream {stream!r} contributes a fragment carrying an operation plane"
+            )
+        contexts[stream] = section_context({section: fragment}, section)
+        for key, value in (frozen.get("proof") or {}).items():
+            if key == "interfaces":
+                merged = proof.setdefault("interfaces", {})
+                for interface_key, record in value.items():
+                    _merge_interface_records(section, merged, record, interface_key)
+                proof_source.setdefault(key, stream)
+            elif isinstance(value, dict):
+                proof.setdefault(key, {}).update(deepcopy(value))
+                proof_source.setdefault(key, stream)
+            elif key in proof:
+                raise ValueError(
+                    f"section {section!r} proof key {key!r} is contributed by both {proof_source[key]!r} and {stream!r}"
+                )
+            else:
+                proof[key] = deepcopy(value)
+                proof_source[key] = stream
+    if owner in contexts:
+        context = contexts[owner]
+    elif len(contexts) == 1:
+        context = next(iter(contexts.values()))
+    else:
+        raise ValueError(
+            f"section {section!r} is composed from {sorted(contexts)} with its context owner "
+            f"{owner!r} absent, so no fragment's context is authoritative"
+        )
+    execution: dict = {"context": deepcopy(context)}
+    if proof:
+        execution["proof"] = proof
+    return execution
+
+
+def retained_proof(
+    stream: str, desired: dict | None, source: dict | None, retained: dict[str, list[dict]]
+) -> dict | None:
+    """Extend *desired*'s proof with the entries the retained rows carried in *source*.
+
+    A retained row is a row an earlier authorization froze and this one keeps on the wire
+    until its detach link runs. Its decisions come from the fragment it was retained FROM,
+    never from live state: re-resolving them would let an interface that fell out of the
+    eligible set drop a description the intermediate document must still carry.
+    """
+    if not any(retained.values()):
+        return deepcopy(desired) if desired is not None else None
+    result: dict = deepcopy(desired) if desired is not None else {}
+    origin = source or {}
+    if stream in ("interface_config", "ip"):
+        interfaces = result.setdefault("interfaces", {})
+        for rows in retained.values():
+            for row in rows:
+                key = str(row["interface_id"])
+                if key in interfaces:
+                    continue
+                record = (origin.get("interfaces") or {}).get(key)
+                if record is None:
+                    raise ValueError(f"retained interface row references interface {key} with no recorded context")
+                interfaces[key] = deepcopy(record)
+        if stream == "interface_config":
+            eligibility = result.setdefault("attribute_eligibility", {})
+            for row in retained.get(InterfaceIntent.__tablename__, []):
+                key = _attribute_eligibility_key(row["interface_id"], row["attribute"])
+                if key in eligibility:
+                    continue
+                decision = (origin.get("attribute_eligibility") or {}).get(key)
+                if decision is None:
+                    raise ValueError(f"retained attribute row {key} has no recorded eligibility decision")
+                eligibility[key] = decision
+    elif stream == "static_route":
+        from nso_adapter.core.static_route_plan import extend_apply_plan
+
+        result["apply"] = extend_apply_plan(
+            result.get("apply"),
+            (origin.get("apply") or {}),
+            retained.get(StaticRouteIntent.__tablename__, []),
+        )
+    return result
+
+
+def prune_consumed_carriers(fragment: dict, existing_ids: frozenset[int]) -> dict:
+    """Drop the lifecycle carriers a settlement already consumed, and rebuild their proof.
+
+    The ONLY path that rewrites a fragment without an authorization, and admissible for one
+    reason: a carrier's disappearance is settlement by definition, so removing its reference
+    withdraws an authority the store has already discharged. It changes no intent value, no
+    context and no non-carrier proof, and it never reads live intent.
+    """
+    carriers = [table for table in fragment_tables(fragment) if _SPEC_BY_TABLE[table].lifecycle]
+    consumed = {table: [row for row in fragment[table] if row.get("id") not in existing_ids] for table in carriers}
+    if not any(consumed.values()):
+        return fragment
+    result = deepcopy(fragment)
+    for table in carriers:
+        result[table] = [row for row in result[table] if row.get("id") in existing_ids]
+    apply_plan = ((result.get(EXECUTION_KEY) or {}).get("proof") or {}).get("apply")
+    if apply_plan is not None:
+        from nso_adapter.core.static_route_plan import prune_apply_plan
+
+        result[EXECUTION_KEY]["proof"]["apply"] = prune_apply_plan(
+            apply_plan,
+            result.get(StaticRouteIntent.__tablename__, []),
+            result.get(StaticRouteTombstone.__tablename__, []),
+        )
+    return result
 
 
 _MODEL_BY_TABLE: dict[str, Any] = {spec.model.__tablename__: spec.model for spec in _SPEC_BY_MODEL.values()}
@@ -1047,7 +1281,7 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
     rows: dict[type, list] = {}
     row_records: dict[type, list[tuple[dict, object]]] = {}
     for table_name, serialized_rows in tables.items():
-        if table_name == EXECUTION_KEY and section in EXECUTION_METADATA_SECTIONS:
+        if table_name == EXECUTION_KEY:
             continue
         model = _MODEL_BY_TABLE.get(table_name)
         if model is None:
@@ -1096,22 +1330,38 @@ def fragment_context(fragment: dict | None) -> dict | None:
     return ((fragment or {}).get(EXECUTION_KEY) or {}).get("context")
 
 
-def freeze_fragment(tables: dict[str, list[dict]], device) -> dict:
+async def freeze_fragment(db: AsyncSession, device, stream: str, tables: dict[str, list[dict]]) -> dict:
     """Return the FRAGMENT for *tables*: the rows plus the state they must execute with.
 
-    The encoding context is read HERE, in the authorizing transaction, and preserved
-    verbatim: ``ned_id`` keeps an explicit null (a device with no NED id records ``null``
-    and dialect ``identity``), and ``dialect`` is the stable name of the dialect that NED id
-    resolves to, so an encode never re-reads the device row.
+    The one authorization-time fragment producer. Every fragment carries a context, and a
+    stream whose section declares proof carries the proof of ITS OWN rows as well; the
+    caller's transaction holds the projection lock, so the live non-intent rows read here
+    belong to the same state the tables were serialized from.
+
+    The encoding context is preserved verbatim: ``ned_id`` keeps an explicit null (a device
+    with no NED id records ``null`` and dialect ``identity``), and ``dialect`` is the stable
+    name of the dialect that NED id resolves to, so an encode never re-reads the device row.
     """
     from nso_adapter.core.community_dialect import community_dialect_for
 
-    return {
-        **deepcopy(tables),
-        EXECUTION_KEY: {
-            "context": {"ned_id": device.ned_id, "dialect": community_dialect_for(device.ned_id).name},
-        },
+    execution: dict = {
+        "context": {"ned_id": device.ned_id, "dialect": community_dialect_for(device.ned_id).name},
     }
+    proof = await _freeze_proof(db, device.id, stream, tables)
+    if proof is not None:
+        execution["proof"] = proof
+    return {**deepcopy(tables), EXECUTION_KEY: execution}
+
+
+async def _freeze_proof(db: AsyncSession, device_id: int, stream: str, tables: dict[str, list[dict]]) -> dict | None:
+    """Return the proof *stream*'s own rows must be executed with, or ``None``."""
+    if stream in ("interface_config", "ip"):
+        return await _freeze_interface_proof(db, device_id, stream, tables)
+    if stream == "static_route":
+        from nso_adapter.core.static_route_plan import freeze_static_route_proof
+
+        return freeze_static_route_proof(tables, device_id=device_id)
+    return None
 
 
 async def snapshot_stream(db: AsyncSession, device_id: int, stream: str) -> dict[str, list[dict]]:
@@ -1141,6 +1391,13 @@ __all__ = [
     "INTERFACE_ATTRIBUTE_ELIGIBLE_STATES",
     "EXECUTION_KEY",
     "InterfaceEligibilityUnresolved",
+    "build_interface_proof",
+    "compose_section_execution",
+    "prune_consumed_carriers",
+    "retained_proof",
+    "section_context",
+    "section_operation",
+    "section_proof",
     "InterfaceExecution",
     "LIVE_READ_SECTIONS",
     "NoComparison",
@@ -1151,7 +1408,6 @@ __all__ = [
     "section_rows_by_table",
     "fragment_context",
     "fragment_tables",
-    "freeze_fragment",
     "hydrate_section",
     "hydrate_interface_execution",
     "intent_state",
@@ -1162,7 +1418,7 @@ __all__ = [
     "rows_by_intent_identity",
     "section_models",
     "section_streams",
-    "record_interface_execution",
+    "freeze_fragment",
     "snapshot_stream",
     "stream_section",
     "stream_tables",

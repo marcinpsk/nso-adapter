@@ -28,7 +28,7 @@ from sqlalchemy import func, select
 from nso_adapter.core.claim import acquire_claim, release_claim
 from nso_adapter.store.models import Job, JobStatus, StaticRouteIntent, StaticRouteTombstone
 from tests.conftest import seed_device, session, start_job
-from tests.core.removal_helpers import seed_removal_job
+from tests.core.removal_helpers import seed_removal_job, seed_tomb
 from tests.core.test_static_route_put import A, B, C, D, seed_apply_job, seed_rows, wire
 
 pytestmark = pytest.mark.anyio
@@ -166,32 +166,6 @@ def sr_client(fake: SrFake):
 # ── seeding / running ────────────────────────────────────────────────────────
 
 
-async def seed_tomb(
-    device_id: int,
-    triple,
-    *,
-    job_id: int | None = None,
-    route_id: int = 99,
-    deployed_key=None,
-    marking: str = "delete_origin",
-) -> int:
-    vrf, prefix, next_hop = triple
-    async with session() as db:
-        tomb = StaticRouteTombstone(
-            device_id=device_id,
-            route_id=route_id,
-            vrf=vrf,
-            prefix=prefix,
-            next_hop=next_hop,
-            deployed_key=deployed_key,
-            marking=marking,
-            job_id=job_id,
-        )
-        db.add(tomb)
-        await db.commit()
-        return tomb.id
-
-
 async def run_removal_job(device_id: int, job_id: int, client, *, reg=None, sync_from=None) -> Job:
     from nso_adapter.core.removal import run_removal
 
@@ -290,8 +264,8 @@ async def test_c4_1_body_is_the_live_service_minus_the_authorized_key(adapter_cl
         "sr-c41",
         service=[wire(A), wire(B, **{"nso-only-leaf": "keep"}), wire(C, metric=7)],
     )
-    job_id = await seed_removal_job(device_id, {"removed": {"route": [list(A)]}})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {"removed": {"route": [list(A)]}}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -308,8 +282,8 @@ async def test_c4_2_a_never_applied_accepted_row_is_not_in_the_body(adapter_clie
     device_id = await seed_device(nso_device_name="sr-c42", netbox_device_id=7402)
     await seed_rows(device_id, [{"triple": D, "route_id": 2, "deployed_key": None}])
     fake = SrFake("sr-c42", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {"removed": {"route": [list(A)]}})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {"removed": {"route": [list(A)]}}, tombs=(tomb,))
 
     await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -323,8 +297,8 @@ async def test_c4_3_delete_origin_drops_both_the_triple_and_the_predecessor(adap
     """C4.3 — authorizing only the triple leaves the predecessor entry service-owned forever."""
     device_id = await seed_device(nso_device_name="sr-c43", netbox_device_id=7403)
     fake = SrFake("sr-c43", service=[wire(A), wire(B), wire(C)])
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, B, job_id=job_id, route_id=1, deployed_key=list(A))
+    tomb = await seed_tomb(device_id, B, route_id=1, deployed_key=list(A))
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -338,8 +312,8 @@ async def test_c4_4_detach_drops_and_proves_both_markings(adapter_client):
     """C4.4 — a detach un-owns the row's triple AND its ``deployed_key``, and proves both gone."""
     device_id = await seed_device(nso_device_name="sr-c44", netbox_device_id=7404)
     fake = SrFake("sr-c44", service=[wire(A), wire(B), wire(C)])
-    job_id = await seed_removal_job(device_id, {"detach": True})
-    await seed_tomb(device_id, B, job_id=job_id, route_id=1, deployed_key=list(A), marking="detach")
+    tomb = await seed_tomb(device_id, B, route_id=1, deployed_key=list(A), marking="detach")
+    job_id = await seed_removal_job(device_id, {"detach": True}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -355,8 +329,8 @@ async def test_c4_5_detach_with_a_null_deployed_key_still_drops_the_triple(adapt
     """C4.5 — authorizing only ``deployed_key`` would make a NULL one un-own nothing at all."""
     device_id = await seed_device(nso_device_name="sr-c45", netbox_device_id=7405)
     fake = SrFake("sr-c45", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {"detach": True})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1, deployed_key=None, marking="detach")
+    tomb = await seed_tomb(device_id, A, route_id=1, deployed_key=None, marking="detach")
+    job_id = await seed_removal_job(device_id, {"detach": True}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -377,10 +351,10 @@ async def test_c4_6_a_reclaimed_key_is_not_dropped(adapter_client, shape):
     spec = {"triple": A, "route_id": 2} if shape == "triple" else {"triple": D, "route_id": 2, "deployed_key": list(A)}
     await seed_rows(device_id, [spec])
     fake = SrFake(f"sr-c46-{shape}", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {})
     # Two authorized keys, so the PUT still runs and the reclaimed one is visibly preserved.
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
-    await seed_tomb(device_id, B, job_id=job_id, route_id=3)
+    tomb_a = await seed_tomb(device_id, A, route_id=1)
+    tomb_b = await seed_tomb(device_id, B, route_id=3)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb_a, tomb_b))
 
     with capture_logs() as logs:
         job = await run_removal_job(device_id, job_id, sr_client(fake))
@@ -398,8 +372,8 @@ async def test_c4_7_a_fully_superseded_removal_issues_no_http_at_all(adapter_cli
     await seed_rows(device_id, [{"triple": A, "route_id": 2}])
     fake = SrFake("sr-c47", service=[wire(A), wire(B)])
     client = sr_client(fake)
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, client)
 
@@ -417,8 +391,8 @@ async def test_c4_8_service_absent_still_runs_the_proof(adapter_client):
     """C4.8 — ``absent`` proves the SERVICE has no instance, never that the device is clean."""
     device_id = await seed_device(nso_device_name="sr-c48", netbox_device_id=7408)
     fake = SrFake("sr-c48", service=None, device=[wire(A)])
-    job_id = await seed_removal_job(device_id, {})
-    tomb = await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -434,8 +408,8 @@ async def test_c4_9_residue_found_fails_the_job_and_the_next_sweep_reissues(adap
 
     device_id = await seed_device(nso_device_name="sr-c49", netbox_device_id=7409)
     fake = SrFake("sr-c49", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {})
-    tomb = await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
     # The device keeps A after the commit — FASTMAP held an entry carrying a foreign leaf.
     client = sr_client(fake)
     original = fake.section
@@ -463,8 +437,8 @@ async def test_c4_10_detach_whose_service_still_holds_the_key_fails(adapter_clie
     """C4.10 — the un-own did not happen; succeeding would throw away the only record of it."""
     device_id = await seed_device(nso_device_name="sr-c410", netbox_device_id=7410)
     fake = SrFake("sr-c410", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {"detach": True})
-    tomb = await seed_tomb(device_id, A, job_id=job_id, route_id=1, marking="detach")
+    tomb = await seed_tomb(device_id, A, route_id=1, marking="detach")
+    job_id = await seed_removal_job(device_id, {"detach": True}, tombs=(tomb,))
     client = sr_client(fake)
     # The post-commit read still shows A: the service did not really drop it.
     fake.state = lambda: __import__("nso_adapter.nso.client", fromlist=["ServiceInstanceState"]).ServiceInstanceState(
@@ -482,8 +456,8 @@ async def test_c4_11_detach_whose_sync_from_never_lands_fails(adapter_client):
     """C4.11 — G11's unconditional success is gone: CDB keeps the reverse diff, so it is unproven."""
     device_id = await seed_device(nso_device_name="sr-c411", netbox_device_id=7411)
     fake = SrFake("sr-c411", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {"detach": True})
-    tomb = await seed_tomb(device_id, A, job_id=job_id, route_id=1, marking="detach")
+    tomb = await seed_tomb(device_id, A, route_id=1, marking="detach")
+    job_id = await seed_removal_job(device_id, {"detach": True}, tombs=(tomb,))
 
     job = await run_removal_job(
         device_id, job_id, sr_client(fake), sync_from=AsyncMock(side_effect=RuntimeError("read eof"))
@@ -507,8 +481,8 @@ async def test_c4_12_consumption_and_status_are_one_transaction(adapter_client):
 
     device_id = await seed_device(nso_device_name="sr-c412", netbox_device_id=7412)
     fake = SrFake("sr-c412", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {})
-    tomb = await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     async def _unknown(db):
         await db.rollback()
@@ -530,8 +504,8 @@ async def test_c4_13_a_tombstone_written_during_the_call_survives(adapter_client
     """C4.13 — only the SNAPSHOTTED ids die; nothing has proven anything about a newer one."""
     device_id = await seed_device(nso_device_name="sr-c413", netbox_device_id=7413)
     fake = SrFake("sr-c413", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {})
-    owned = await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    owned = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(owned,))
     client = sr_client(fake)
     late: dict[str, int] = {}
 
@@ -623,8 +597,8 @@ async def test_c4_16_a_mixed_delete_origin_and_clear_delivers_both(adapter_clien
         device_id, [{"triple": B, "route_id": 2, "pending_clear": {"authorized": ["metric"], "store_only": []}}]
     )
     fake = SrFake("sr-c416", service=[wire(A), wire(B, metric=10, tag=7)])
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -664,8 +638,8 @@ async def test_c4_18_a_clear_riding_a_detach_is_deferred_not_delivered(adapter_c
         device_id, [{"triple": B, "route_id": 2, "pending_clear": {"authorized": ["metric"], "store_only": []}}]
     )
     fake = SrFake("sr-c418", service=[wire(A), wire(B, metric=10)])
-    job_id = await seed_removal_job(device_id, {"detach": True})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1, marking="detach")
+    tomb = await seed_tomb(device_id, A, route_id=1, marking="detach")
+    job_id = await seed_removal_job(device_id, {"detach": True}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -695,8 +669,8 @@ async def test_c4_18b_a_sweeper_reissued_job_rederives_the_clear(adapter_client)
         device_id, [{"triple": B, "route_id": 2, "pending_clear": {"authorized": ["metric"], "store_only": []}}]
     )
     fake = SrFake("sr-c418b", service=[wire(A), wire(B, metric=10)])
-    failed = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, A, job_id=failed, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    failed = await seed_removal_job(device_id, {}, tombs=(tomb,))
     async with session() as db:
         job = await db.get(Job, failed)
         job.status = JobStatus.failed
@@ -746,8 +720,8 @@ async def test_c4_20_a_requeued_delete_origin_whose_put_already_landed(adapter_c
     """C4.20 — the key is already gone; the retry must be a no-op PUT, not a second failure."""
     device_id = await seed_device(nso_device_name="sr-c420", netbox_device_id=7421)
     fake = SrFake("sr-c420", service=[wire(B)], device=[wire(B)])
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -761,8 +735,8 @@ async def test_c4_21_a_requeued_detach_whose_put_removed_the_instance(adapter_cl
     """C4.21 — demanding a literal 2xx makes this retry permanently unprovable, forever re-swept."""
     device_id = await seed_device(nso_device_name="sr-c421", netbox_device_id=7422)
     fake = SrFake("sr-c421", service=None, device=[wire(A)])
-    job_id = await seed_removal_job(device_id, {"detach": True})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1, marking="detach")
+    tomb = await seed_tomb(device_id, A, route_id=1, marking="detach")
+    job_id = await seed_removal_job(device_id, {"detach": True}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -795,8 +769,8 @@ async def test_c4_24_apply_and_removal_interleaving_literal_vector(adapter_clien
         ],
     )
     fake = SrFake(f"sr-c424-{tag}", service=[wire(A, metric=10), wire(B), wire(C)])
-    removal_id = await seed_removal_job(device_id, {"detach": True} if marking == "detach" else {})
-    await seed_tomb(device_id, A, job_id=removal_id, route_id=1, marking=marking)
+    tomb = await seed_tomb(device_id, A, route_id=1, marking=marking)
+    removal_id = await seed_removal_job(device_id, {"detach": True} if marking == "detach" else {}, tombs=(tomb,))
 
     if order == "removal_first":
         removal = await run_removal_job(device_id, removal_id, sr_client(fake))
@@ -841,8 +815,8 @@ async def test_c4_25_a_queued_clear_is_revalidated_under_the_claim(adapter_clien
             await db.commit()
 
     fake = SrFake(f"sr-c425-{case}", service=[wire(A, metric=10), wire(B)])
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, B, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, B, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -872,10 +846,8 @@ async def test_c2_9b_an_inconclusive_read_issues_no_removal_put(adapter_client, 
         service=[wire(A), wire(B)],
         service_status="inconclusive",
     )
-    job_id = await seed_removal_job(device_id, {"detach": True} if branch == "detach" else {})
-    tomb = await seed_tomb(
-        device_id, A, job_id=job_id, route_id=1, marking="detach" if branch == "detach" else "delete_origin"
-    )
+    tomb = await seed_tomb(device_id, A, route_id=1, marking="detach" if branch == "detach" else "delete_origin")
+    job_id = await seed_removal_job(device_id, {"detach": True} if branch == "detach" else {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -912,11 +884,9 @@ async def test_c3_5_c4_28_a_carrier_owning_removal_fails_on_any_inconclusive_sig
         section_status=section_status,
         dry_run_status=500 if signal == "verify_inconclusive" else 200,
     )
-    job_id = await seed_removal_job(device_id, {})
-    tomb = None if clear_case else await seed_tomb(device_id, A, job_id=job_id, route_id=1)
-    if clear_case:
-        # A pure-clear job owns a carrier too — the pending_clear entry itself.
-        pass
+    # A pure-clear job owns a carrier too — the pending_clear entry itself.
+    tomb = None if clear_case else await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=() if clear_case else (tomb,))
 
     ctx = patch("nso_adapter.nso.apply.VERIFY_AFTER_APPLY", False) if signal == "verify_disabled" else None
     if ctx is None:
@@ -968,13 +938,18 @@ async def test_any_carried_static_route_generation_makes_unproven_removal_fail(a
                 document = {
                     "static_route": {
                         "_execution": {
-                            "removal": {
-                                "authorized_removal_keys": [list(A)],
-                                "claimed_keys": [],
+                            "context": {"ned_id": None, "dialect": "identity"},
+                            "operation": {
+                                "pending_clear_ids": [],
                                 "tombstone_ids": [],
-                                "candidate_clears": [],
-                                "reclaimed_keys": [],
-                            }
+                                "removal": {
+                                    "authorized_removal_keys": [list(A)],
+                                    "claimed_keys": [],
+                                    "tombstone_ids": [],
+                                    "candidate_clears": [],
+                                    "reclaimed_keys": [],
+                                },
+                            },
                         }
                     }
                 }
@@ -1017,13 +992,18 @@ async def test_non_static_generation_does_not_make_carrierless_removal_fail(adap
         document = {
             "static_route": {
                 "_execution": {
-                    "removal": {
-                        "authorized_removal_keys": [list(A)],
-                        "claimed_keys": [],
+                    "context": {"ned_id": None, "dialect": "identity"},
+                    "operation": {
+                        "pending_clear_ids": [],
                         "tombstone_ids": [],
-                        "candidate_clears": [],
-                        "reclaimed_keys": [],
-                    }
+                        "removal": {
+                            "authorized_removal_keys": [list(A)],
+                            "claimed_keys": [],
+                            "tombstone_ids": [],
+                            "candidate_clears": [],
+                            "reclaimed_keys": [],
+                        },
+                    },
                 }
             }
         }
@@ -1091,8 +1071,8 @@ async def test_c4_29b_consuming_a_tombstone_refuses_an_unregistered_claim(adapte
     """G19/§4.7 — carrier deletion is never made unguarded to keep a caller convenient."""
     device_id = await seed_device(nso_device_name="sr-c429b", netbox_device_id=7961)
     fake = SrFake("sr-c429b", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {})
-    tomb = await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     from nso_adapter.core.claim import ClaimRegistration
 
@@ -1112,8 +1092,8 @@ async def test_a_superseded_run_attempt_refuses_the_removal_terminal_write(adapt
     """
     device_id = await seed_device(nso_device_name="sr-attempt-fence", netbox_device_id=7962)
     fake = SrFake("sr-attempt-fence", service=[wire(A), wire(B)])
-    job_id = await seed_removal_job(device_id, {})
-    tomb = await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     section = fake.section
 
@@ -1144,8 +1124,8 @@ async def test_c4_31_retained_orphans_names_exactly_the_unclaimed_keys(adapter_c
     device_id = await seed_device(nso_device_name="sr-c431", netbox_device_id=7970)
     await seed_rows(device_id, [{"triple": B, "route_id": 2}, {"triple": D, "route_id": 3, "deployed_key": list(C)}])
     fake = SrFake("sr-c431", service=[wire(A), wire(B), wire(C), wire(D)])
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -1160,8 +1140,8 @@ async def test_c4_31b_an_unclaimed_retained_key_is_named(adapter_client):
     device_id = await seed_device(nso_device_name="sr-c431b", netbox_device_id=7971)
     await seed_rows(device_id, [{"triple": B, "route_id": 2}])
     fake = SrFake("sr-c431b", service=[wire(A), wire(B), wire(C), wire(D)])
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -1215,8 +1195,8 @@ async def test_c1_13_device_half_a_store_only_clear_is_invisible_to_a_removal(ad
         device_id, [{"triple": B, "route_id": 2, "pending_clear": {"authorized": [], "store_only": ["metric"]}}]
     )
     fake = SrFake("sr-c113", service=[wire(A), wire(B, metric=10)])
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
@@ -1229,11 +1209,13 @@ async def test_c1_13_device_half_a_store_only_clear_is_invisible_to_a_removal(ad
 # ── A2(iii) — one authorized clear can queue TWO removals ───────────────────
 
 
-async def test_a2_iii_the_duplicate_retract_is_a_no_op_via_supersession(adapter_client):
+async def test_a2_iii_the_duplicate_retract_re_asserts_the_delivered_clear(adapter_client):
     """A2(iii) — the endpoint queues one retract and a PATCH-mode apply queues another.
 
-    The second must find nothing left to deliver and no-op through supersession: no PUT, no
-    failure, and the ``removal_superseded`` record.
+    Both jobs freeze their clear at creation, so the second still names it (#1663: a removal
+    plan is a property of the document, never re-derived from the store at execution). Its
+    body is the certified snapshot with a leaf that is already gone, so the duplicate delivers
+    the same state again and neither fails nor strands the carrier.
     """
     device_id = await seed_device(nso_device_name="sr-a2iii", netbox_device_id=7995)
     await seed_rows(
@@ -1250,8 +1232,10 @@ async def test_a2_iii_the_duplicate_retract_is_a_no_op_via_supersession(adapter_
     assert job1.status == JobStatus.succeeded
     assert (await carriers(device_id))[B] is None
     assert job2.status == JobStatus.succeeded
-    assert job2.result["superseded"] is True
-    assert len(fake.writes) == writes_after_first, "the duplicate must issue no PUT"
+    assert "superseded" not in job2.result
+    assert fake.sent_routes() == [wire(B)], "the duplicate re-asserts the already-cleared entry"
+    assert len(fake.writes) == writes_after_first + 1
+    assert (await carriers(device_id))[B] is None
 
 
 # ── codex C4-F1 — a body with nothing left to deliver must not be PUT ────────

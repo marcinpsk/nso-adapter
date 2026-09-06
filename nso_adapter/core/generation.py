@@ -67,13 +67,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from nso_adapter.core.projection import (
     EXECUTION_KEY,
     InterfaceEligibilityUnresolved,
+    compose_section_execution,
     fragment_context,
     fragment_tables,
     freeze_fragment,
     is_intent_deletion,
     projection_row_state,
     projection_streams,
-    record_interface_execution,
+    prune_consumed_carriers,
+    retained_proof,
     rows_by_intent_identity,
     snapshot_stream,
     stream_section,
@@ -314,22 +316,26 @@ def _compose_document(fragments: dict[str, dict]) -> dict:
     """Compose ``{stream: fragment}`` into the ``{section: {table: rows}}`` outbound document.
 
     Streams own disjoint tables inside a section, so a section's tables are the union of its
-    streams' fragments and no fragment can overwrite a sibling's table.
+    streams' fragments and no fragment can overwrite a sibling's table. The section's
+    ``_execution`` is COMPOSED rather than overwritten: the context is the owner stream's and
+    the proof merges per row, so a lane that was not reauthorized keeps its own decisions.
     """
-    document: dict[str, dict] = {}
+    contributions: dict[str, list[tuple[str, dict]]] = {}
     for stream, fragment in sorted(fragments.items()):
-        document.setdefault(stream_section(stream), {}).update(fragment)
+        contributions.setdefault(stream_section(stream), []).append((stream, fragment))
+    document: dict[str, dict] = {}
+    for section, contributing in contributions.items():
+        body: dict = {}
+        for _stream, fragment in contributing:
+            body.update(fragment_tables(fragment))
+        body[EXECUTION_KEY] = compose_section_execution(section, contributing)
+        document[section] = body
     return document
 
 
 async def _authorized_fragments(db: AsyncSession, device_id: int) -> dict[str, dict]:
     """Every stream's last-authorized fragment for this device. Unpromoted lanes are absent."""
-    rows = (
-        (await db.execute(select(DeviceProjectionStream).where(DeviceProjectionStream.device_id == device_id)))
-        .scalars()
-        .all()
-    )
-    return {row.stream: row.authorized_document for row in rows if row.authorized_document}
+    return await refresh_consumed_carriers(db, device_id)
 
 
 async def _compose_authorized_document(db: AsyncSession, device_id: int, promoted: dict[str, dict]) -> dict:
@@ -398,9 +404,11 @@ def _fragment_deletions(
     default = DELETE_ORIGIN_MARKING if receipt.delete_origin else DETACH_MARKING
     networked: dict[str, list[dict]] = {}
     detached: dict[str, list[dict]] = {}
-    for table, previous in sorted((old or {}).items()):
-        desired_rows = rows_by_intent_identity(desired, table)
-        for identity, row in rows_by_intent_identity(old or {}, table).items():
+    old_tables = fragment_tables(old)
+    desired_tables = fragment_tables(desired)
+    for table in sorted(old_tables):
+        desired_rows = rows_by_intent_identity(desired_tables, table)
+        for identity, row in rows_by_intent_identity(old_tables, table).items():
             if not is_intent_deletion(table, identity, desired_rows):
                 continue
             row_id = row.get("id")
@@ -416,12 +424,26 @@ def _fragment_deletions(
     return networked, detached
 
 
-def _retain_rows(desired: dict, retained: dict[str, list[dict]]) -> dict:
-    """Overlay removed detach-only rows on the desired fragment deterministically."""
+def _retain_rows(desired: dict, retained: dict[str, list[dict]], stream: str, source: dict | None) -> dict:
+    """Overlay removed detach-only rows on the desired fragment deterministically.
+
+    A fragment producer: the retained rows keep the DECISIONS the fragment they were
+    retained FROM recorded for them, so an attribute that has since become ineligible still
+    reaches the intermediate document its detach link has not yet retired.
+    """
     result = deepcopy(desired)
     for table, rows in retained.items():
         result.setdefault(table, []).extend(deepcopy(rows))
         result[table].sort(key=lambda row: row["id"])
+    execution = result.setdefault(EXECUTION_KEY, {})
+    proof = retained_proof(
+        stream,
+        execution.get("proof"),
+        ((source or {}).get(EXECUTION_KEY) or {}).get("proof"),
+        retained,
+    )
+    if proof is not None:
+        execution["proof"] = proof
     return result
 
 
@@ -434,9 +456,11 @@ def _content_losing_rows(old: dict | None, desired: dict) -> dict[str, list[dict
     from nso_adapter.core.removal import lost_content
 
     replacement: dict[str, list[dict]] = {}
-    for table, previous in sorted((old or {}).items()):
-        desired_by_identity = rows_by_intent_identity(desired, table)
-        for identity, row in rows_by_intent_identity(old or {}, table).items():
+    old_tables = fragment_tables(old)
+    desired_tables = fragment_tables(desired)
+    for table in sorted(old_tables):
+        desired_by_identity = rows_by_intent_identity(desired_tables, table)
+        for identity, row in rows_by_intent_identity(old_tables, table).items():
             after = desired_by_identity.get(identity)
             if after is not None and lost_content(projection_row_state(table, row), projection_row_state(table, after)):
                 replacement.setdefault(table, []).append(row)
@@ -458,9 +482,11 @@ def _has_positive_content(before, after) -> bool:
 
 def _has_positive_delta(old: dict | None, desired: dict) -> bool:
     """Whether the desired fragment adds or changes any retained row."""
-    for table in sorted(set(old or {}) | set(desired)):
-        previous_by_identity = rows_by_intent_identity(old or {}, table)
-        for identity, row in rows_by_intent_identity(desired, table).items():
+    old_tables = fragment_tables(old)
+    desired_tables = fragment_tables(desired)
+    for table in sorted(set(old_tables) | set(desired_tables)):
+        previous_by_identity = rows_by_intent_identity(old_tables, table)
+        for identity, row in rows_by_intent_identity(desired_tables, table).items():
             before = previous_by_identity.get(identity)
             if before is None or _has_positive_content(
                 projection_row_state(table, before), projection_row_state(table, row)
@@ -483,6 +509,67 @@ async def _promote_static_route_clears(db: AsyncSession, device_id: int) -> None
         authorized = sorted({*(carrier.get(AUTHORIZED) or ()), *stored})
         row.pending_clear = {AUTHORIZED: authorized, STORE_ONLY: []}
     await db.flush()
+
+
+class CarrierGone(RuntimeError):
+    """An operation selected a lifecycle carrier the store has already discharged."""
+
+
+async def _freeze(db: AsyncSession, device, stream: str, tables: dict[str, list[dict]]) -> dict:
+    """Freeze one stream's fragment, naming the section an unresolved eligibility blocks."""
+    try:
+        return await freeze_fragment(db, device, stream, tables)
+    except InterfaceEligibilityUnresolved as exc:
+        logger.warning(
+            "generation.interface_eligibility_unresolved",
+            device_id=device.id,
+            detail=str(exc),
+            exc_info=True,
+        )
+        raise ApplyUnexecutable({"interface_config": "interface_attribute_eligibility_unresolved"}) from None
+
+
+async def refresh_consumed_carriers(
+    db: AsyncSession, device_id: int, *, selected: tuple[int, ...] = ()
+) -> dict[str, dict]:
+    """Prune settled carriers out of every stored fragment and return the fragments.
+
+    Runs before every composition, generation and reissue alike, with the projection lock
+    held, and REWRITES the stored fragment so document and fragment agree literally. An
+    INHERITED carrier that no longer exists was consumed by a settlement and is pruned; a
+    carrier the operation EXPLICITLY SELECTED that no longer exists refuses the creation,
+    because the operation asserts an authority it cannot prove.
+    """
+    from nso_adapter.store.models import StaticRouteTombstone
+
+    existing = frozenset(
+        (await db.execute(select(StaticRouteTombstone.id).where(StaticRouteTombstone.device_id == device_id)))
+        .scalars()
+        .all()
+    )
+    missing = sorted(set(selected) - existing)
+    if missing:
+        raise CarrierGone(f"device {device_id} selected static-route tombstones {missing} that no longer exist")
+    rows = (
+        (await db.execute(select(DeviceProjectionStream).where(DeviceProjectionStream.device_id == device_id)))
+        .scalars()
+        .all()
+    )
+    changed = False
+    fragments: dict[str, dict] = {}
+    for row in rows:
+        if not row.authorized_document:
+            continue
+        pruned = prune_consumed_carriers(row.authorized_document, existing)
+        if pruned is not row.authorized_document:
+            row.authorized_document = pruned
+            row.updated_at = _now()
+            changed = True
+            logger.info("generation.carriers_pruned", device_id=device_id, stream=row.stream)
+        fragments[row.stream] = pruned
+    if changed:
+        await db.flush()
+    return fragments
 
 
 class _Promotion(NamedTuple):
@@ -835,8 +922,20 @@ def _settle_wire_equivalent(promotion: _Promotion) -> None:
     revision = promotion.revision if promotion.revision is not None else promotion.row.desired_revision
     promotion.row.authorized_revision = revision
     promotion.row.applied_revision = revision
-    promotion.row.authorized_document = deepcopy(promotion.desired)
+    promotion.row.authorized_document = _authorized_assignment(promotion.row.stream, promotion.desired)
     promotion.row.updated_at = _now()
+
+
+def _authorized_assignment(stream: str, fragment: dict) -> dict:
+    """Refuse to store anything but a producer's fragment as a stream's authorized state.
+
+    Every assignment of ``authorized_document`` is an authorization, so the value must carry
+    the context it was authorized under; a hand-built dict would be an authorization nobody
+    made and no encode could read.
+    """
+    if fragment_context(fragment) is None:
+        raise ValueError(f"stream {stream!r} would store an authorized fragment with no execution context")
+    return deepcopy(fragment)
 
 
 async def _enqueue_action_removal_links(
@@ -992,24 +1091,25 @@ async def create_action_apply(
     removal_authority: dict[str, list] = {}
     for stream, selection in selected_rows.items():
         row, receipt, revision = selection
+        # ONE freeze per selected stream, here, and this fragment is what every link of the
+        # chain and the stored authorized document use. A second freeze performs the same
+        # live non-intent reads again and could disagree with the one that shaped the chain.
         if revision is None:
-            desired = await snapshot_stream(db, device_id, stream)
+            desired = await _freeze(db, device, stream, await snapshot_stream(db, device_id, stream))
             networked, detached = _fragment_deletions(row.authorized_document, desired, receipt)
             replacement = _content_losing_rows(row.authorized_document, desired)
             positive = _has_positive_delta(row.authorized_document, desired)
         else:
-            # The prepared snapshot is frozen ONCE here, and this fragment is what every
-            # link of the chain and the stored authorized document use.
             tables = row.prepared_tables or {}
-            desired = freeze_fragment(tables, device)
-            frozen_fragments[stream] = desired
+            desired = await _freeze(db, device, stream, tables)
             authorized_tables = fragment_tables(row.authorized_document)
             networked, detached = _prepared_deletions(row.prepared_deletions)
             replacement = _content_losing_rows(authorized_tables, tables)
             positive = _has_positive_delta(authorized_tables, tables)
             removal_authority.update(_switching_removal_keys(stream, authorized_tables, networked))
+        frozen_fragments[stream] = desired
         promotions[stream] = _Promotion(row, receipt, desired, networked, detached, replacement, positive, revision)
-        intermediate_fragments[stream] = _retain_rows(desired, detached)
+        intermediate_fragments[stream] = _retain_rows(desired, detached, stream, row.authorized_document)
 
     final_fragments = dict(authorized)
     final_fragments.update({stream: promotion.desired for stream, promotion in promotions.items()})
@@ -1085,6 +1185,7 @@ async def create_generation(
     removal_context: dict | None = None,
     settlement_cohort: int | None = None,
     static_route_tombstone_ids: tuple[int, ...] = (),
+    discharged_clear_ids: tuple[int, ...] = (),
     apply_attempt_id: UUID | None = None,
     frozen_fragments: dict[str, dict] | None = None,
 ) -> DeploymentGeneration:
@@ -1098,10 +1199,11 @@ async def create_generation(
     seam #1522's aggregate device-intent builder plugs into. *removal_context* is the job
     context a removal's generation must keep so a retry can rebuild the job that executes it.
 
-    *frozen_fragments* carries the already-frozen fragment of every out-of-protocol stream
-    named in *streams*. Those two streams promote their PREPARED slot, never a fresh
-    snapshot: the store-only isolation point is exactly that the live rows are not read here,
-    and the freeze happened once, in the Apply that resolved the selection.
+    *frozen_fragments* carries the already-frozen fragment of a stream the caller froze
+    itself. Manual Apply freezes every selected stream once and passes them all; a stream
+    with no entry is snapshotted and frozen here. The two out-of-protocol streams promote
+    their PREPARED slot, never a fresh snapshot, so their fragment is always the caller's:
+    the store-only isolation point is exactly that the live rows are not read for them.
     """
     from nso_adapter.core.intent_protocol import OUT_OF_PROTOCOL_STREAMS
     from nso_adapter.core.request_flags import STORE_ONLY
@@ -1111,6 +1213,14 @@ async def create_generation(
     if not streams:
         raise ValueError("a generation must name at least one projection stream")
     await lock_projection(db, device_id)
+    await refresh_consumed_carriers(db, device_id, selected=static_route_tombstone_ids)
+    device = None
+    if any(stream not in (frozen_fragments or {}) for stream in streams):
+        # populate_existing: a caller that loaded the device before taking the projection
+        # lock holds a copy whose NED id a concurrent transaction may already have replaced.
+        device = await db.get(Device, device_id, populate_existing=True)
+        if device is None:  # pragma: no cover - lock_projection proved the device exists
+            raise DeviceProjectionGone(f"device {device_id} no longer exists")
 
     stream_revisions: dict[str, int] = {}
     source_push_seq: dict[str, int | None] = {}
@@ -1157,7 +1267,12 @@ async def create_generation(
             raise RuntimeError(f"device {device_id} stream {stream!r} has no accepted write to promote")
         stream_revisions[stream] = row.desired_revision
         source_push_seq[stream] = row.source_push_seq
-        promoted[stream] = await snapshot_stream(db, device_id, stream)
+        fragment = (frozen_fragments or {}).get(stream)
+        promoted[stream] = (
+            fragment
+            if fragment is not None
+            else await _freeze(db, device, stream, await snapshot_stream(db, device_id, stream))
+        )
 
     # The promoted streams become the new last-authorized fragments, so the NEXT generation of
     # any other lane composes THIS state in rather than whatever the store drifts to.
@@ -1165,7 +1280,7 @@ async def create_generation(
         await db.execute(
             sa_update(DeviceProjectionStream)
             .where(DeviceProjectionStream.device_id == device_id, DeviceProjectionStream.stream == stream)
-            .values(authorized_document=fragment, updated_at=_now())
+            .values(authorized_document=_authorized_assignment(stream, fragment), updated_at=_now())
             .execution_options(synchronize_session=False)
         )
     body = document if document is not None else await _compose_authorized_document(db, device_id, promoted)
@@ -1180,6 +1295,7 @@ async def create_generation(
         removal_context=removal_context,
         settlement_cohort=settlement_cohort,
         static_route_tombstone_ids=static_route_tombstone_ids,
+        discharged_clear_ids=discharged_clear_ids,
         apply_attempt_id=apply_attempt_id,
     )
 
@@ -1196,54 +1312,41 @@ async def _store_generation(
     removal_context: dict | None,
     settlement_cohort: int | None,
     static_route_tombstone_ids: tuple[int, ...],
+    discharged_clear_ids: tuple[int, ...],
     apply_attempt_id: UUID | None,
 ) -> DeploymentGeneration:
-    """Allocate the sequence and write the immutable row. The projection lock is held."""
-    body = deepcopy(document)
-    # Only a promotion freezes execution-time store facts. A reissue carries no promoted
-    # revisions and keeps its established live-store, job-row and tombstone-row semantics.
-    if stream_revisions:
-        promoted_sections = {stream_section(stream) for stream in stream_revisions}
-        if "interface_config" in body and "interface_config" not in promoted_sections:
-            # A complete successor document carries the authorized interface section. Keep
-            # its last immutable execution plan instead of resolving changed live state.
-            previous_document = await db.scalar(
-                select(DeploymentGeneration.document)
-                .where(
-                    DeploymentGeneration.device_id == device_id,
-                    DeploymentGeneration.document["interface_config"][EXECUTION_KEY].is_not(None),
-                )
-                .order_by(DeploymentGeneration.seq.desc())
-                .limit(1)
-            )
-            previous_execution = ((previous_document or {}).get("interface_config") or {}).get(EXECUTION_KEY)
-            if previous_execution is not None:
-                body["interface_config"][EXECUTION_KEY] = deepcopy(previous_execution)
-        if "interface_config" in promoted_sections:
-            if (removal_context or {}).get("scope") == "interface_config":
-                section = body.setdefault("interface_config", {})
-                section.setdefault("interface_intent", [])
-                section.setdefault("interface_ip_intent", [])
-            try:
-                await record_interface_execution(db, device_id, body)
-            except InterfaceEligibilityUnresolved as exc:
-                logger.warning(
-                    "generation.interface_eligibility_unresolved",
-                    device_id=device_id,
-                    detail=str(exc),
-                    exc_info=True,
-                )
-                raise ApplyUnexecutable({"interface_config": "interface_attribute_eligibility_unresolved"}) from None
-        from nso_adapter.core.static_route_plan import record_static_route_execution
+    """Allocate the sequence and write the immutable row. The projection lock is held.
 
-        await record_static_route_execution(
-            db,
-            device_id,
-            body,
-            removal_context=removal_context,
-            allowed_removal_keys=allowed_removal_keys,
-            tombstone_ids=static_route_tombstone_ids,
-        )
+    It writes the OPERATION plane and nothing else. Context and proof belong to the
+    fragments the document composes, and are written by the producers that wrote those
+    fragments; deriving either here would describe an authorization nobody made.
+    """
+    body = deepcopy(document)
+    scope = (removal_context or {}).get("scope")
+    if scope is not None:
+        section = body.get(scope)
+        if section is None:
+            # The operation addresses a section this document does not carry: nothing has ever
+            # been authorized there, so there is no authority of ours to classify.
+            logger.warning("generation.operation_section_absent", device_id=device_id, scope=scope)
+        else:
+            # One deployment's facts, never a fragment's: which carriers this operation
+            # discharges, and — for static-route — how it classified the authority it was given.
+            operation: dict = {"pending_clear_ids": sorted(discharged_clear_ids)}
+            if scope == "static_route":
+                from nso_adapter.core.static_route_plan import build_static_route_operation
+
+                operation.update(
+                    await build_static_route_operation(
+                        db,
+                        device_id,
+                        body,
+                        removal_context=removal_context,
+                        allowed_removal_keys=allowed_removal_keys,
+                        tombstone_ids=static_route_tombstone_ids,
+                    )
+                )
+            section.setdefault(EXECUTION_KEY, {})["operation"] = operation
     generation = DeploymentGeneration(
         device_id=device_id,
         seq=await _next_seq(db, device_id),
@@ -1283,6 +1386,8 @@ async def create_reissue_generation(
     mode: GenerationMode,
     removal_context: dict | None = None,
     allowed_removal_keys: dict | None = None,
+    static_route_tombstone_ids: tuple[int, ...] = (),
+    discharged_clear_ids: tuple[int, ...] = (),
 ) -> DeploymentGeneration:
     """Order a NEW deployment of the state that is ALREADY authorized. Promotes nothing.
 
@@ -1298,30 +1403,31 @@ async def create_reissue_generation(
     (:func:`core.removal.enqueue_removal`) and the two scheduled producers carry no request.
 
     It therefore settles NOTHING: ``stream_revisions`` is empty. Its composed authorized
-    fragments carry no execution plan. The job behind it executes ONE removal context's
-    scope from live state, and settlement advances exactly what a generation lists. Listing
+    fragments carry the context and proof their own authorizations froze, and this creation
+    adds only the operation plane. Settlement advances exactly what a generation lists. Listing
     every authorized revision let a static-route reissue certify a VLAN revision whose own
     deployment had failed or been abandoned. The reissue never carried that lane.
     ``source_push_seq`` stays: it is provenance, not a settlement target.
     """
     await lock_projection(db, device_id)
+    fragments = await refresh_consumed_carriers(db, device_id, selected=static_route_tombstone_ids)
     rows = (
         (await db.execute(select(DeviceProjectionStream).where(DeviceProjectionStream.device_id == device_id)))
         .scalars()
         .all()
     )
-    fragments = {row.stream: row.authorized_document for row in rows if row.authorized_document}
     return await _store_generation(
         db,
         device_id,
         mode=mode,
         document=_compose_document(fragments),
         allowed_removal_keys=allowed_removal_keys or {},
-        source_push_seq={row.stream: row.source_push_seq for row in rows if row.authorized_document},
+        source_push_seq={row.stream: row.source_push_seq for row in rows if row.stream in fragments},
         stream_revisions={},
         removal_context=removal_context,
         settlement_cohort=None,
-        static_route_tombstone_ids=(),
+        static_route_tombstone_ids=static_route_tombstone_ids,
+        discharged_clear_ids=discharged_clear_ids,
         apply_attempt_id=None,
     )
 

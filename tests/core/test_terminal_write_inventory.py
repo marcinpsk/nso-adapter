@@ -156,8 +156,8 @@ async def _t7_removal_residue_found() -> tuple[int, int]:
     """``core/removal.py`` the residue-found failure of ``_finalize_static_route_removal``."""
     device_id = await seed_device(nso_device_name="inv-t7", netbox_device_id=8307)
     fake = SrFake("inv-t7", service=None, device=[wire(A)])
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
     job = await run_removal_job(device_id, job_id, sr_client(fake))
     assert job.result["residue_check"] == "found"
     return device_id, job_id
@@ -167,8 +167,8 @@ async def _t8_removal_proven() -> tuple[int, int]:
     """``core/removal.py`` the proven / no-carrier success of the same finalizer."""
     device_id = await seed_device(nso_device_name="inv-t8", netbox_device_id=8308)
     fake = SrFake("inv-t8", service=[wire(B)], device=[wire(B)])
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
     job = await run_removal_job(device_id, job_id, sr_client(fake))
     assert job.result["residue_check"] == "clean"
     return device_id, job_id
@@ -178,8 +178,8 @@ async def _t9_removal_unproven_with_carrier() -> tuple[int, int]:
     """``core/removal.py`` the unproven-with-carrier failure of the same finalizer."""
     device_id = await seed_device(nso_device_name="inv-t9", netbox_device_id=8309)
     fake = SrFake("inv-t9", service=[wire(A), wire(B)], section_status="unsupported")
-    job_id = await seed_removal_job(device_id, {})
-    await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
     job = await run_removal_job(device_id, job_id, sr_client(fake))
     assert job.error["code"] == "static_route_removal_unproven"
     return device_id, job_id

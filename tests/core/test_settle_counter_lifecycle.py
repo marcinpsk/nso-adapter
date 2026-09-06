@@ -390,8 +390,8 @@ async def test_a_failed_allocation_leaves_a_removals_carrier_alone(adapter_clien
 
     device_id = await seed_device(nso_device_name="lc-alloc-removal", netbox_device_id=8632)
     fake = SrFake("lc-alloc-removal", service=[wire(A)], device=[wire(A)])
-    job_id = await seed_removal_job(device_id, {})
-    tomb = await seed_tomb(device_id, A, job_id=job_id, route_id=1)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
     await _drop_counter(device_id)
 
     reg = await acquire_claim(device_id, "job", job_id=job_id)

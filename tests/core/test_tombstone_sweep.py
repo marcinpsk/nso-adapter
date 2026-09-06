@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from nso_adapter.core.claim import ClaimLostError, acquire_claim, release_claim
 from nso_adapter.core.tombstone_sweep import sweep_tombstones
 from tests.conftest import seed_device, session
+from tests.core.removal_helpers import authorize_static_route
 
 A = ("", "10.0.0.0/24", "192.0.2.1")
 B = ("", "10.0.1.0/24", "192.0.2.2")
@@ -53,7 +54,11 @@ async def _seed_tombstone(
             row.id = tombstone_id
         db.add(row)
         await db.commit()
-        return row.id
+        tomb_id = row.id
+    # The push that wrote this carrier also promoted the stream, so the device has an
+    # authorized static-route fragment for the sweeper's reissue to compose.
+    await authorize_static_route(device_id)
+    return tomb_id
 
 
 async def _seed_job(device_id: int, status, job_type=None) -> int:

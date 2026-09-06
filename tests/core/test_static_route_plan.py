@@ -636,7 +636,7 @@ async def test_generation_records_the_complete_static_route_apply_plan(adapter_c
         )
         await db.commit()
 
-    recorded = generation.document["static_route"]["_execution"]["apply"]
+    recorded = generation.document["static_route"]["_execution"]["proof"]["apply"]
     assert recorded == {
         "mode": "PUT",
         "row_ids": [ids[B]],
@@ -671,7 +671,7 @@ async def test_recorded_plan_rejects_a_malformed_sent_triple(adapter_client):
         )
         document = generation.document
 
-    document["static_route"]["_execution"]["apply"]["cas"][0]["sent_triple"] = list(B[:2])
+    document["static_route"]["_execution"]["proof"]["apply"]["cas"][0]["sent_triple"] = list(B[:2])
 
     # Pinned: the plan raises from four independent checks, and the CAS-coordinate one is a
     # plausible alternative source with no eligible rows.
@@ -767,16 +767,19 @@ def test_clears_suppressed_matches_the_two_removal_modes():
     assert clears_suppressed({"retract_deferred": True}) is True
 
 
-async def test_promoted_and_live_reissue_plans_carry_identical_clears(adapter_client):
-    """Drift guard: the creation-time classifier and the live reissue path share one rule."""
+async def test_a_frozen_removal_plan_round_trips_its_clears(adapter_client):
+    """Drift guard: what the creation-time classifier records is exactly what execution reads.
+
+    There is no second classifier to drift from any more: a reissue reads the operation plane
+    its own creation wrote, so the only rule left is that serialization round-trips.
+    """
     from nso_adapter.core.projection import EXECUTION_KEY
-    from nso_adapter.core.removal import _sr_execution_plan
     from nso_adapter.core.static_route_plan import (
         _serialize_removal_plan,
         classify_removal_plan,
         hydrate_static_route_removal_plan,
     )
-    from nso_adapter.store.models import Device, StaticRouteIntent
+    from nso_adapter.store.models import StaticRouteIntent
 
     device_id = await seed_device(nso_device_name="sr-clear-parity", netbox_device_id=9891)
     ids = await _seed_rows(
@@ -801,8 +804,6 @@ async def test_promoted_and_live_reissue_plans_carry_identical_clears(adapter_cl
         await db.commit()
 
     async with session() as db:
-        device = await db.get(Device, device_id)
-        live = await _sr_execution_plan(db, device, {}, job_id=None)
         rows = (
             (
                 await db.execute(
@@ -816,8 +817,14 @@ async def test_promoted_and_live_reissue_plans_carry_identical_clears(adapter_cl
         )
         promoted = classify_removal_plan(rows, [], allowed_removal_keys={}, context={})
 
-    document = {"static_route": {EXECUTION_KEY: {"removal": _serialize_removal_plan(promoted)}}}
+    document = {
+        "static_route": {
+            EXECUTION_KEY: {
+                "context": {"ned_id": None, "dialect": "identity"},
+                "operation": {"removal": _serialize_removal_plan(promoted)},
+            }
+        }
+    }
     hydrated = hydrate_static_route_removal_plan(document)
     assert hydrated.clears == promoted.clears
-    assert live.clears == promoted.clears
     assert [(clear.key, clear.fields) for clear in promoted.clears] == [(A, ("permanent",))]

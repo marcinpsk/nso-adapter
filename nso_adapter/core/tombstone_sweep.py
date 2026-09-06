@@ -92,6 +92,7 @@ async def reissue_removal_job(conn: AsyncSession, device_id: int, row: StaticRou
         mode=GenerationMode.detach if context["detach"] else GenerationMode.networked,
         removal_context=context,
         allowed_removal_keys=context["removed"],
+        static_route_tombstone_ids=(row.id,),
     )
     job = await create_dedicated_job(conn, device_id, JobType.removal, context=context)
     if not await attach_to_job(conn, generation, job):
