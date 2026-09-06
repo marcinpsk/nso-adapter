@@ -201,9 +201,11 @@ def test_the_migration_stamps_interface_proof_and_the_static_route_apply_plan(pg
     execution = hydrate_interface_execution({"interface_config": section})
     assert execution.eligible_attributes == frozenset({(interface_id, "description")})
 
-    plan = hydrate_static_route_apply_plan({"static_route": route_fragment}, eligible_rows=[])
+    plan = hydrate_static_route_apply_plan({"static_route": route_fragment})
     assert plan.tombstone_ids == []
-    assert route_fragment[EXECUTION_KEY]["proof"]["apply"]["mode"] in {"PATCH", "PUT"}
+    # ``mode`` no longer picks a transport: it records whether the stamped document delivers
+    # a replacement, and a pre-contract row with no deployed key delivers none.
+    assert route_fragment[EXECUTION_KEY]["proof"]["apply"]["mode"] == "PATCH"
 
 
 def test_the_downgrade_strips_execution_metadata_back_to_tables(pg_provisioner):

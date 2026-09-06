@@ -29,7 +29,7 @@ from nso_adapter.core.claim import ClaimRegistration, acquire_claim, release_cla
 from nso_adapter.store.models import DeviceSettleCounter, Job, JobStatus, JobType
 from tests.conftest import attach_apply_generation, seed_device, session
 from tests.core.test_jobs import _nso_client_for_connect
-from tests.core.test_static_route_put import A, B, wire
+from tests.core.test_static_route_put import A, B, seed_rows, wire
 from tests.core.test_static_route_removal import SrFake, run_removal_job, seed_removal_job, seed_tomb, sr_client
 
 pytestmark = pytest.mark.anyio
@@ -164,9 +164,14 @@ async def _t7_removal_residue_found() -> tuple[int, int]:
 
 
 async def _t8_removal_proven() -> tuple[int, int]:
-    """``core/removal.py`` the proven / no-carrier success of the same finalizer."""
+    """``core/removal.py`` the proven / no-carrier success of the same finalizer.
+
+    B is an accepted row so the document RENDERS it: the removal PUT carries the whole
+    document, and a live key no authorized row claims would be unauthorized collateral.
+    """
     device_id = await seed_device(nso_device_name="inv-t8", netbox_device_id=8308)
     fake = SrFake("inv-t8", service=[wire(B)], device=[wire(B)])
+    await seed_rows(device_id, [{"triple": B, "route_id": 2}])
     tomb = await seed_tomb(device_id, A, route_id=1)
     job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
     job = await run_removal_job(device_id, job_id, sr_client(fake))
@@ -178,8 +183,11 @@ async def _t9_removal_unproven_with_carrier() -> tuple[int, int]:
     """``core/removal.py`` the unproven-with-carrier failure of the same finalizer."""
     device_id = await seed_device(nso_device_name="inv-t9", netbox_device_id=8309)
     fake = SrFake("inv-t9", service=[wire(A), wire(B)], section_status="unsupported")
+    await seed_rows(device_id, [{"triple": B, "route_id": 2}])
     tomb = await seed_tomb(device_id, A, route_id=1)
-    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
+    # The carrier's own keys ride the context, exactly as ``_removal_context`` builds them:
+    # the device-wide guard reads them to tell the authorized drop from collateral.
+    job_id = await seed_removal_job(device_id, {"removed": {"route": [list(A)]}}, tombs=(tomb,))
     job = await run_removal_job(device_id, job_id, sr_client(fake))
     assert job.error["code"] == "static_route_removal_unproven"
     return device_id, job_id
@@ -238,6 +246,21 @@ async def _seed_accepted_static_route(device_id: int) -> None:
         await db.commit()
 
 
+def _apply_client() -> AsyncMock:
+    """An NSO boundary that answers the sender's ONE certified read conclusively.
+
+    The static-route section reads the live instance before every send (the ratified
+    retention exception). A bare AsyncMock answers it with a Mock whose ``inconclusive`` is
+    truthy, which refuses the send instead of exercising the terminal writer under test.
+    """
+    from nso_adapter.nso.client import NsoClient, ServiceInstanceState
+
+    client = AsyncMock(spec=NsoClient)
+    client.service_instance_state = AsyncMock(return_value=ServiceInstanceState("absent", None))
+    client.get_service_config = AsyncMock(return_value=None)
+    return client
+
+
 async def _t12_apply_all_ok() -> tuple[int, int]:
     """``core/apply.py`` ``_finalize_job``'s all-ok success — the writer carrying the route results."""
     from nso_adapter.core.apply import run_apply
@@ -249,9 +272,9 @@ async def _t12_apply_all_ok() -> tuple[int, int]:
     reg = await _claim_for(device_id, job_id)
     try:
         with (
-            patch("nso_adapter.core.importer.get_nso_client", return_value=AsyncMock()),
+            patch("nso_adapter.core.importer.get_nso_client", return_value=_apply_client()),
             patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
-            patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock),
+            patch("nso_adapter.nso.apply.apply_device_intent", new_callable=AsyncMock),
         ):
             await run_apply(job_id=job_id, device_id=device_id, force=True, reg=reg)
     finally:
@@ -274,9 +297,9 @@ async def _t13_apply_any_failed() -> tuple[int, int]:
     reg = await _claim_for(device_id, job_id)
     try:
         with (
-            patch("nso_adapter.core.importer.get_nso_client", return_value=AsyncMock()),
+            patch("nso_adapter.core.importer.get_nso_client", return_value=_apply_client()),
             patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=AsyncMock()),
-            patch("nso_adapter.nso.apply.apply_static_routes", new_callable=AsyncMock, side_effect=err),
+            patch("nso_adapter.nso.apply.apply_device_intent", new_callable=AsyncMock, side_effect=err),
         ):
             await run_apply(job_id=job_id, device_id=device_id, force=True, reg=reg)
     finally:

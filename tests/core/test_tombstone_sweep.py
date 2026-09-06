@@ -11,6 +11,7 @@ at acquisition rather than getting a subset of the work.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 
 import pytest
 import sqlalchemy as sa
@@ -24,6 +25,31 @@ from tests.core.removal_helpers import authorize_static_route
 A = ("", "10.0.0.0/24", "192.0.2.1")
 B = ("", "10.0.1.0/24", "192.0.2.2")
 C = ("", "10.0.2.0/24", "192.0.2.3")
+
+
+async def _seed_route(device_id: int, triple: tuple[str, str, str], *, route_id: int) -> None:
+    """Seed one ACCEPTED route so the device's authorized document renders it.
+
+    A key the live service holds and the document does not render is collateral now: one PUT
+    carries every family, so omitting it would retract it and the device-wide guard blocks
+    the write. A sibling route that must survive a removal is therefore an authorized row,
+    which is what it always was in production.
+    """
+    from nso_adapter.store.models import StaticRouteIntent
+
+    vrf, prefix, next_hop = triple
+    async with session() as db:
+        db.add(
+            StaticRouteIntent(
+                device_id=device_id,
+                vrf=vrf,
+                prefix=prefix,
+                next_hop=next_hop,
+                route_id=route_id,
+                accepted_at=datetime(2026, 6, 1, tzinfo=UTC),
+            )
+        )
+        await db.commit()
 
 
 async def _seed_tombstone(
@@ -218,6 +244,7 @@ async def test_the_reissued_job_runs_with_the_marking_the_tombstone_recorded(ada
     device_name = f"sw-m5-2-{marking}"
     device_id = await seed_device(nso_device_name=device_name, netbox_device_id=9630)
     failed_id = await _seed_job(device_id, JobStatus.failed)
+    await _seed_route(device_id, A, route_id=9)
     await _seed_tombstone(device_id, B, route_id=8, marking=marking, job_id=failed_id)
 
     assert await sweep_tombstones() == 1
@@ -253,6 +280,7 @@ async def test_a_failed_sweep_retry_removes_the_tombstone_and_deployed_keys(adap
 
     device_name = "sw-m5-retry-divergent"
     device_id = await seed_device(nso_device_name=device_name, netbox_device_id=9631)
+    await _seed_route(device_id, C, route_id=9)
     await _seed_tombstone(device_id, B, marking="delete_origin", deployed_key=A)
 
     assert await sweep_tombstones() == 1
@@ -271,7 +299,7 @@ async def test_a_failed_sweep_retry_removes_the_tombstone_and_deployed_keys(adap
     succeeded = await run_removal_job(device_id, retried_id, sr_client(fake))
 
     assert succeeded.status is JobStatus.succeeded
-    assert fake.sent_keys() == {C}, "the retry kept a key recorded only as deployed_key"
+    assert fake.sent_keys() == {C}, "the retry dropped a key its own document still renders"
     async with session() as db:
         remaining = (
             await db.scalars(sa.select(StaticRouteTombstone).where(StaticRouteTombstone.device_id == device_id))

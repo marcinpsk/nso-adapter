@@ -2,8 +2,8 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """One static-route replacement classifier, one plan — #1396 R2 §3.
 
-Generation creation classifies the store snapshot and records the result. Workers hydrate
-that result. Preview uses :func:`build_plan` over live rows.
+Generation creation classifies the store snapshot and records the result; workers and the
+preview hydrate that result, so nothing re-classifies live rows at execution.
 Two predicates decide the apply plan:
 
 * ``FENCE_OPEN(rows)``    — no row of the device carries ``route_id IS NULL``. Only the
@@ -28,7 +28,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = structlog.get_logger(__name__)
 
-#: A destructive replace whose proof is structurally unavailable must not run (§4.4).
+#: A destructive replace whose proof is structurally unavailable must not run (§4.4). Logged
+#: by the worker, which refuses the job rather than sending a document it cannot prove.
 PUT_REFUSED_EVENT = "static_route.put_refused_verify_disabled"
 
 #: Store fields whose clearing must reach the device, in ``_STATE_FIELDS`` order.
@@ -257,92 +258,59 @@ class SrRemovalPlan(NamedTuple):
     reclaimed: tuple[Triple, ...]
 
 
-def _verify_after_apply() -> bool:
-    """Read the flag live — it is a module constant tests flip, not a config object."""
-    from nso_adapter.nso import apply as nso_apply
-
-    return nso_apply.VERIFY_AFTER_APPLY
-
-
-def classify_apply_plan(all_rows: list, tombstones: list, *, eligible_rows: list, device_id: int) -> SrPlan:
+def classify_apply_plan(all_rows: list, tombstones: list, *, device_id: int) -> SrPlan:
     """Classify one immutable row snapshot into the static-route apply plan.
 
-    Callers derive scope execution, ``any_eligible``, atomic admission, row stamping and
-    the per-route results from ``plan.rows`` — never from the old eligible list. Deriving
-    ``any_eligible`` from the eligible list lets a ``force=False`` apply take the all-zero
-    early success AFTER a real PUT.
+    Every send is the device's whole document, so the body is ALWAYS the accepted rows and
+    the authority always names the predecessor keys the send drops. ``mode`` no longer picks
+    a transport — there is one — it records whether this document DELIVERS A REPLACEMENT, so
+    the worker can refuse to send one whose proof is structurally unavailable
+    (``_refuse_unverifiable_recorded_put``).
+
+    ``FENCE_OPEN`` no longer gates that record. It gated the PATCH-versus-PUT choice, and a
+    shut fence therefore used to leave a predecessor on the device; one document drops it
+    either way, so making the record fence-dependent would only drop the PROOF requirement on
+    exactly the devices least able to justify the write. The fence's real job is unchanged and
+    lives at the intent endpoint, where it decides whether a removed row earns a deletion
+    record at all.
+
+    Callers derive scope execution, ``any_eligible``, row stamping and the per-route results
+    from ``plan.rows``, never from an eligible list: an eligible-only body would retract
+    every accepted-and-clean route.
     """
     accepted = [r for r in all_rows if r.accepted_at is not None]
-    open_fence = fence_open(all_rows)
-    wants_put = open_fence and any(replacement_open(r) for r in accepted)
-
-    mode = "PATCH"
-    if wants_put:
-        if _verify_after_apply():
-            mode = "PUT"
-        else:
-            # A destructive replace whose proof is structurally unavailable must not run:
-            # the merge-PATCH that follows must also not CAS, or it closes the replacement
-            # while the predecessor is still on the device.
-            logger.warning(PUT_REFUSED_EVENT, device_id=device_id)
-
-    rows = accepted if mode == "PUT" else list(eligible_rows)
+    mode = "PUT" if any(replacement_open(r) for r in accepted) else "PATCH"
+    rows = accepted
 
     allowed: set[Triple] = set()
-    if mode == "PUT":
-        for row in rows:
-            deployed = as_triple(row.deployed_key)
-            if deployed is not None and deployed != triple_of(row):
-                allowed.add(deployed)
-        # X4 belt: rev 4.1's body retains every unconsumed tombstone's still-present keys
-        # verbatim, so those keys are re-asserted and cannot be orphans. Kept because the
-        # authority names it, not because it is reachable.
-        for tomb in tombstones:
-            allowed.add((tomb.vrf or "", tomb.prefix or "", tomb.next_hop or ""))
-            deployed = as_triple(tomb.deployed_key)
-            if deployed is not None:
-                allowed.add(deployed)
+    for row in rows:
+        deployed = as_triple(row.deployed_key)
+        if deployed is not None and deployed != triple_of(row):
+            allowed.add(deployed)
+    # X4 belt: the body retains every unconsumed tombstone's still-present keys verbatim, so
+    # those keys are re-asserted and cannot be orphans. Kept because the authority names it,
+    # not because it is reachable.
+    for tomb in tombstones:
+        allowed.add((tomb.vrf or "", tomb.prefix or "", tomb.next_hop or ""))
+        deployed = as_triple(tomb.deployed_key)
+        if deployed is not None:
+            allowed.add(deployed)
 
     cas = [SrCas(row.id, row.route_id, triple_of(row), row.deployed_key) for row in rows]
     watermark = max((t.id for t in tombstones), default=0)
     return SrPlan(mode, rows, allowed, tombstones, cas, watermark)
 
 
-async def build_plan(db: AsyncSession, device, *, eligible_rows: list) -> SrPlan:
-    """Build the live plan used by preview."""
-    from nso_adapter.store.models import StaticRouteIntent, StaticRouteTombstone
-
-    device_id = device.id
-    all_rows = list(
-        (
-            await db.execute(
-                select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id).order_by(StaticRouteIntent.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    tombstones = list(
-        (
-            await db.execute(
-                select(StaticRouteTombstone)
-                .where(StaticRouteTombstone.device_id == device_id)
-                .order_by(StaticRouteTombstone.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    return classify_apply_plan(all_rows, tombstones, eligible_rows=eligible_rows, device_id=device_id)
-
-
 def _removal_keys(value) -> set[Triple]:
     """Normalize the generation's guarded static-route key set.
 
-    Through :func:`_sr_key`: these entries come from the stored document too, so a malformed
-    one must name itself rather than raise ``as_triple``'s bare unpack error.
+    The authority is SCOPE-QUALIFIED (``{section: {list: keys}}``) because the collateral
+    guard is device-wide and two families both have a ``host`` list. Through :func:`_sr_key`:
+    these entries come from the stored document too, so a malformed one must name itself
+    rather than raise ``as_triple``'s bare unpack error.
     """
-    return {_sr_key(raw) for raw in (value or {}).get("route") or ()}
+    section = (value or {}).get("static_route") or {}
+    return {_sr_key(raw) for raw in section.get("route") or ()}
 
 
 def promotion_removal_keys(removed_rows: dict[str, list[dict]]) -> dict[str, list[list[str]]]:
@@ -353,6 +321,11 @@ def promotion_removal_keys(removed_rows: dict[str, list[dict]]) -> dict[str, lis
         if (deployed := as_triple(row.get("deployed_key"))) is not None:
             keys.add(deployed)
     return {"route": [list(key) for key in sorted(keys)]} if keys else {}
+
+
+def scope_qualified(scope: str, removed: dict | None) -> dict:
+    """Return one scope's guarded keys under the device-wide authority's own shape."""
+    return {scope: dict(removed)} if removed else {}
 
 
 def classify_removal_plan(
@@ -439,12 +412,7 @@ def freeze_static_route_proof(tables: dict[str, list[dict]], *, device_id: int) 
     hydrated = hydrate_section({"static_route": dict(tables)}, "static_route")
     rows = hydrated.get(StaticRouteIntent, [])
     tombstones = hydrated.get(StaticRouteTombstone, [])
-    accepted = [row for row in rows if row.accepted_at is not None]
-    return {
-        "apply": _serialize_apply_plan(
-            classify_apply_plan(rows, tombstones, eligible_rows=accepted, device_id=device_id)
-        )
-    }
+    return {"apply": _serialize_apply_plan(classify_apply_plan(rows, tombstones, device_id=device_id))}
 
 
 def prune_apply_plan(plan: dict, rows: list[dict], tombstones: list[dict]) -> dict:
@@ -455,19 +423,18 @@ def prune_apply_plan(plan: dict, rows: list[dict], tombstones: list[dict]) -> di
     not touch.
     """
     allowed: set[Triple] = set()
-    if plan["mode"] == "PUT":
-        selected = set(plan["row_ids"])
-        for row in rows:
-            if row.get("id") not in selected:
-                continue
-            deployed = as_triple(row.get("deployed_key"))
-            if deployed is not None and deployed != _row_triple(row):
-                allowed.add(deployed)
-        for tomb in tombstones:
-            allowed.add(_row_triple(tomb))
-            deployed = as_triple(tomb.get("deployed_key"))
-            if deployed is not None:
-                allowed.add(deployed)
+    selected = set(plan["row_ids"])
+    for row in rows:
+        if row.get("id") not in selected:
+            continue
+        deployed = as_triple(row.get("deployed_key"))
+        if deployed is not None and deployed != _row_triple(row):
+            allowed.add(deployed)
+    for tomb in tombstones:
+        allowed.add(_row_triple(tomb))
+        deployed = as_triple(tomb.get("deployed_key"))
+        if deployed is not None:
+            allowed.add(deployed)
     return {
         **plan,
         "allowed_removal_keys": [list(key) for key in sorted(allowed)],
@@ -500,7 +467,7 @@ def extend_apply_plan(desired: dict | None, source: dict, retained_rows: list[di
         by_id[row_id] = None
         cas[row_id] = deepcopy(item)
         deployed = as_triple(row.get("deployed_key"))
-        if desired["mode"] == "PUT" and deployed is not None and deployed != _row_triple(row):
+        if deployed is not None and deployed != _row_triple(row):
             allowed.add(deployed)
     ordered = sorted(by_id)
     return {
@@ -579,7 +546,7 @@ def recorded_static_route_apply_mode(document: dict) -> str | None:
     return mode
 
 
-def hydrate_static_route_apply_plan(document: dict, *, eligible_rows: list) -> SrPlan:
+def hydrate_static_route_apply_plan(document: dict) -> SrPlan:
     """Hydrate the immutable apply plan from a generation document."""
     from nso_adapter.core.projection import hydrate_section
     from nso_adapter.store.models import StaticRouteIntent, StaticRouteTombstone
@@ -597,8 +564,8 @@ def hydrate_static_route_apply_plan(document: dict, *, eligible_rows: list) -> S
         raise ValueError("document section 'static_route' apply plan does not match its rows")
     if not isinstance(tombstone_ids, list) or any(row_id not in tombstones_by_id for row_id in tombstone_ids):
         raise ValueError("document section 'static_route' apply plan does not match its tombstones")
-    selected_ids = set(row_ids) if record["mode"] == "PUT" else {row.id for row in eligible_rows}
-    rows = [rows_by_id[row_id] for row_id in row_ids if row_id in selected_ids]
+    selected_ids = set(row_ids)
+    rows = [rows_by_id[row_id] for row_id in row_ids]
     cas = [
         SrCas(
             item["row_id"],
@@ -664,7 +631,6 @@ __all__: list[str] = [
     "SrRemovalPlan",
     "as_triple",
     "authorized_clear_fields",
-    "build_plan",
     "build_static_route_operation",
     "candidate_clear_fields",
     "classify_apply_plan",

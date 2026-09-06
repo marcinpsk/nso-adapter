@@ -654,15 +654,25 @@ def _prepared_deletions(groups: dict | None) -> tuple[dict[str, list[dict]], dic
     return networked, deepcopy(resolved.get("detach") or {})
 
 
+def _merge_authority(base: dict[str, dict[str, list]], extra: dict[str, dict[str, list]]) -> dict[str, dict[str, list]]:
+    """Merge two scope-qualified removal authorities, section by section and list by list."""
+    merged = {section: {label: list(keys) for label, keys in labels.items()} for section, labels in base.items()}
+    for section, labels in extra.items():
+        target = merged.setdefault(section, {})
+        for label, keys in labels.items():
+            target.setdefault(label, []).extend(keys)
+    return merged
+
+
 def _switching_removal_keys(
     stream: str, authorized_tables: dict[str, list[dict]], networked: dict[str, list[dict]]
-) -> dict[str, list]:
+) -> dict[str, dict[str, list]]:
     """Return the scope-qualified removal authority for one stream's networked omissions.
 
     The identities come from the AUTHORIZED tables, because an owned-content child's root is
     retained and so is absent from the networked rows: indexing the group alone could not
-    resolve the parent prefix. The label carries the scope, so two switching scopes selected
-    by one Apply cannot collide in the union.
+    resolve the parent prefix. Qualified by SECTION, like every other family's authority, so
+    two scopes selected by one Apply cannot collide in the union.
     """
     section = stream_section(stream)
     keys: dict[str, list] = {}
@@ -674,8 +684,8 @@ def _switching_removal_keys(
             if row.get("id") in removed_ids
         )
         if identities:
-            keys[f"{section}/{table}"] = [list(identity) for identity in identities]
-    return keys
+            keys[table] = [list(identity) for identity in identities]
+    return {section: keys} if keys else {}
 
 
 async def _resolve_receipt_selection(
@@ -722,7 +732,6 @@ async def _selected_promotions(
 ) -> tuple[dict[str, _Selection], dict[str, str], dict[str, dict]]:
     """Resolve exact selected receipts and prepared snapshots, and report every stale selection."""
     from nso_adapter.core.intent_protocol import OUT_OF_PROTOCOL_STREAMS
-    from nso_adapter.core.projection import AWAITING_SENDER_SECTIONS
     from nso_adapter.core.receipt import latest_receipts
 
     rows = {
@@ -747,10 +756,6 @@ async def _selected_promotions(
     receipts = await latest_receipts(db, device_id, keyed)
     for stream, selector in sorted(selected.items()):
         row = rows.get(stream)
-        if stream_section(stream) in AWAITING_SENDER_SECTIONS:
-            # No device writer yet, so the section is unselectable and never reaches a job.
-            skipped[stream] = "awaiting_aggregate_sender"
-            continue
         if stream in OUT_OF_PROTOCOL_STREAMS:
             reason = _resolve_prepared_selection(row, selector)
             selection = None
@@ -947,13 +952,19 @@ async def _enqueue_action_removal_links(
     cohort: int | None,
     intermediate_document: dict,
     final_document: dict,
-    removal_authority: dict[str, list],
+    removal_authority: dict[str, dict[str, list]],
     frozen_fragments: dict[str, dict],
-) -> list[DeploymentGeneration]:
+) -> tuple[list[DeploymentGeneration], dict[str, dict[str, list]]]:
     from nso_adapter.core.removal import PromotionInterfaceUnresolved, enqueue_removal, promotion_removal_context
     from nso_adapter.core.request_flags import DELETE_ORIGIN_MARKING, DETACH_MARKING
+    from nso_adapter.core.static_route_plan import promotion_removal_keys, scope_qualified
 
-    generations = []
+    # TWO passes on purpose. Every networked generation carries the shared intermediate
+    # document and so omits the same rows; it must therefore carry the SAME authority, which
+    # is only known once every link's own keys are classified. Under the device-wide guard a
+    # link carrying less than the union would be blocked by a sibling's authorized omission.
+    contexts: dict[str, tuple] = {}
+    union = dict(removal_authority)
     for link in links:
         scope = stream_section(link.stream)
         try:
@@ -968,15 +979,17 @@ async def _enqueue_action_removal_links(
             raise ApplyUnexecutable({link.stream: "unresolved_interface_identity"}) from None
         if scope == "interface_config" and not context.interfaces:
             raise ApplyUnexecutable({link.stream: "no_executable_interface"})
-        allowed_removal_keys = context.removed
-        if scope == "static_route":
-            from nso_adapter.core.static_route_plan import promotion_removal_keys
-
-            allowed_removal_keys = promotion_removal_keys(link.removed)
+        own = promotion_removal_keys(link.removed) if scope == "static_route" else context.removed
+        contexts[link.stream] = (context, scope_qualified(scope, own))
         if link.mode is GenerationMode.networked:
-            # Every generation carrying the shared intermediate document omits the same rows,
-            # so it must carry the same authority; a detach link carries the final and none.
-            allowed_removal_keys = {**(allowed_removal_keys or {}), **removal_authority}
+            union = _merge_authority(union, scope_qualified(scope, own))
+
+    generations = []
+    for link in links:
+        scope = stream_section(link.stream)
+        context, own_keys = contexts[link.stream]
+        # A detach link carries the final document and no authority: nothing reaches the device.
+        allowed_removal_keys = union if link.mode is GenerationMode.networked else own_keys
         marking = DELETE_ORIGIN_MARKING if link.mode is GenerationMode.networked and link.removed else None
         if link.mode is GenerationMode.detach:
             marking = DETACH_MARKING
@@ -1006,7 +1019,7 @@ async def _enqueue_action_removal_links(
         if generation is None:  # pragma: no cover - enqueue_removal attaches before returning
             raise RuntimeError(f"removal job {job.id} has no deployment generation")
         generations.append(generation)
-    return generations
+    return generations, union
 
 
 async def _enqueue_action_apply_job(
@@ -1017,7 +1030,7 @@ async def _enqueue_action_apply_job(
     apply_attempt_id: UUID,
     document: dict,
     cohort: int | None,
-    removal_authority: dict[str, list],
+    removal_authority: dict[str, dict[str, list]],
     frozen_fragments: dict[str, dict],
 ) -> DeploymentGeneration:
     """Create the companion Apply generation and give it a carrier.
@@ -1088,7 +1101,7 @@ async def create_action_apply(
     promotions: dict[str, _Promotion] = {}
     intermediate_fragments: dict[str, dict] = {}
     frozen_fragments: dict[str, dict] = {}
-    removal_authority: dict[str, list] = {}
+    removal_authority: dict[str, dict[str, list]] = {}
     for stream, selection in selected_rows.items():
         row, receipt, revision = selection
         # ONE freeze per selected stream, here, and this fragment is what every link of the
@@ -1106,7 +1119,9 @@ async def create_action_apply(
             networked, detached = _prepared_deletions(row.prepared_deletions)
             replacement = _content_losing_rows(authorized_tables, tables)
             positive = _has_positive_delta(authorized_tables, tables)
-            removal_authority.update(_switching_removal_keys(stream, authorized_tables, networked))
+            removal_authority = _merge_authority(
+                removal_authority, _switching_removal_keys(stream, authorized_tables, networked)
+            )
         frozen_fragments[stream] = desired
         promotions[stream] = _Promotion(row, receipt, desired, networked, detached, replacement, positive, revision)
         intermediate_fragments[stream] = _retain_rows(desired, detached, stream, row.authorized_document)
@@ -1128,7 +1143,7 @@ async def create_action_apply(
 
     link_count = len(networked_links) + len(detach_links) + bool(apply_streams)
     cohort = await allocate_settlement_cohort(db) if link_count > 1 else None
-    generations = await _enqueue_action_removal_links(
+    generations, removal_authority = await _enqueue_action_removal_links(
         db,
         device_id,
         networked_links,
@@ -1153,19 +1168,18 @@ async def create_action_apply(
         )
         generations.append(generation)
 
-    generations.extend(
-        await _enqueue_action_removal_links(
-            db,
-            device_id,
-            detach_links,
-            apply_attempt_id=apply_attempt_id,
-            cohort=cohort,
-            intermediate_document=intermediate_document,
-            final_document=final_document,
-            removal_authority={},
-            frozen_fragments=frozen_fragments,
-        )
+    detach_generations, _ = await _enqueue_action_removal_links(
+        db,
+        device_id,
+        detach_links,
+        apply_attempt_id=apply_attempt_id,
+        cohort=cohort,
+        intermediate_document=intermediate_document,
+        final_document=final_document,
+        removal_authority={},
+        frozen_fragments=frozen_fragments,
     )
+    generations.extend(detach_generations)
 
     for promotion in promotions.values():
         if promotion.receipt is not None:

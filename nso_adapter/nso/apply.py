@@ -1,20 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""NSO reconcile-commit apply operations (Phase 2, /).
+"""The aggregate ``device-intent`` write path: one document, one PUT, one commit (#1522).
 
-Uses NSO RESTCONF transactions with the ``reconcile`` commit option so that
-the interface-reconciler service adopts pre-existing brownfield config instead
-of creating conflicts.
+Every family of a device is one container of ONE ``device-intent`` service instance, so a
+deployment is a full-document PUT of that instance and removal is by omission. There is one
+sender (:func:`apply_device_intent`) and one wire vocabulary (the ``encode_*`` functions at
+the bottom of the module, bound to their containers by the section registry in
+``core/projection.py``). The sixteen per-service senders, their ``*_SERVICE_PATH`` constants
+and the multi-module ``/restconf/data`` staging path are gone with the reconcilers they wrote.
 
-Protocol summary:
-1. PATCH a reconciler-service path (e.g. ``interface-reconciler:interface-config``)
-   with the desired intent body, carrying the ``reconcile`` commit query param so NSO
-   adopts pre-existing brownfield config (see ``_commit_url``). Each such PATCH is its
-   own NSO transaction → its own device commit.
-2. The atomic path (``NSO_ADAPTER_ATOMIC_APPLY`` → :func:`apply_combined`) instead PATCHes
-   several module bodies to ``/restconf/data`` in one request → one transaction → one
-   device commit. NSO RESTCONF is stateless (no cross-request transaction handle), so a
-   single multi-module edit is the atomic unit.
+Every write carries the ``reconcile`` commit option (see :func:`_commit_url`) so the service
+adopts pre-existing brownfield device config instead of conflicting with it.
 """
 
 from __future__ import annotations
@@ -22,14 +18,13 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
-from contextvars import ContextVar
 from typing import Any, NamedTuple, cast
 
 import structlog
 
 from nso_adapter.core.community_dialect import UNREPRESENTABLE, CommunityDialect, community_dialect_for
 from nso_adapter.core.isis_canon import isis_level
-from nso_adapter.nso.client import NsoClient, _url_key
+from nso_adapter.nso.client import DEVICE_INTENT_PATH, DEVICE_INTENT_ROOT, NsoClient, _url_key
 from nso_adapter.nso.nso_json import boundary_safe_dumps
 from nso_adapter.secrets.refs import VaultRefError, parse_vault_ref
 
@@ -67,36 +62,6 @@ VERIFY_DISABLED = "disabled"  # NSO_ADAPTER_VERIFY_APPLY is off; no proof was ev
 # commit (no reconcile param — same observed result as keep on this NSO).
 _RAW_RECONCILE = os.environ.get("NSO_ADAPTER_RECONCILE_COMMIT", "keep-non-service-config").strip()
 RECONCILE_COMMIT = "" if _RAW_RECONCILE.lower() in ("", "0", "off", "false", "no", "none") else _RAW_RECONCILE
-
-# RESTCONF path to the interface-reconciler service list
-_SERVICE_PATH = "/restconf/data/interface-reconciler:interface-config"
-
-# RESTCONF datastore root. The atomic apply path (NSO_ADAPTER_ATOMIC_APPLY) PATCHes
-# several reconciler-service module bodies here in ONE request → ONE NSO transaction →
-# ONE device commit. NSO RESTCONF has no cross-request transaction handle
-# (``tailf-netconf-transactions`` is NETCONF-session-only and is not exposed under
-# ``/restconf/operations``), so a single multi-module edit *is* the atomic unit. Verified
-# live on sw01: a combined subif+IP PATCH renders one ``<edit-config>`` to the device.
-_DATA_PATH = "/restconf/data"
-
-# Set by core/removal.run_removal around a DETACH removal's scope dispatch (#106): every
-# PUT-replace in that dispatch commits with ``no-networking`` so dropping service
-# governance never plays FASTMAP's reverse diff against the live device (an adopted
-# entry's retract stripped an IOS route-map filter). A contextvar — not a parameter —
-# because the dispatch fans out through per-scope apply_* signatures that should not all
-# have to thread a transport concern.
-DETACH_REPLACE: ContextVar[bool] = ContextVar("detach_replace", default=False)
-
-
-def atomic_apply_enabled() -> bool:
-    """Whether to stage an apply's scopes into ONE transaction (NSO_ADAPTER_ATOMIC_APPLY).
-
-    Off by default — the per-scope PATCH+commit path stays the fallback until the
-    whole-apply atomic path (I3b) is proven. When on, ``run_apply`` stages the
-    subinterface + interface-IP pair into a single :func:`apply_combined` commit so the
-    subif unit and its IP land together (dissolving the greenfield ordering dependency).
-    """
-    return os.environ.get("NSO_ADAPTER_ATOMIC_APPLY", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _commit_url(url: str, *, dry_run: bool | str = False, no_networking: bool = False) -> str:
@@ -296,58 +261,60 @@ async def _verify_native_or_raise(
     return VERIFY_CONCLUSIVE
 
 
-async def _send_service_config(
-    client: NsoClient,
-    service_path: str,
-    root_key: str,
-    device_name: str,
-    body: dict,
-    *,
-    scope: str,
-    replace: bool = False,
-    dry_run: bool | str = False,
-    stage: dict[str, list] | None = None,
-    instance_key: str | None = None,
-) -> str | None:
-    """Send a reconciler service instance body to NSO — the shared apply/removal tail.
+def device_intent_instance(device_name: str, containers: Mapping[str, dict]) -> dict:
+    """Return the ``list device-intent`` entry for *device_name* carrying *containers*.
 
-    ``replace=False`` (apply/add/update): merge-PATCH the service list path, then run
-    the native dry-run verify guard. ``replace=True`` (removal): PUT-replace the keyed
-    instance (``<service_path>=<device>``) so omitted list entries are dropped and
-    FASTMAP reverts them — merge-PATCH never drops, and a node-level DELETE 404s on
-    empty-string list keys. On replace, *body* must be the FULL desired state.
-
-    ``stage`` (atomic apply, I3b): when given, capture this scope's instance body into
-    ``stage[root_key]`` and return WITHOUT any HTTP — the caller commits every staged
-    scope in one :func:`apply_combined` transaction. Mutually exclusive with the commit
-    here; ignores ``replace``/``dry_run`` (atomic apply is merge-PATCH only).
-
-    Return value follows the mode: the native delta under ``dry_run``, ``None`` under
-    ``stage`` (nothing was sent), and otherwise the R2 §4.4 proof verdict of the commit.
+    The entry is the whole desired state of the device: a family the mapping omits owns
+    nothing, which is what makes removal an omission rather than a delete.
     """
-    if stage is not None:
-        stage[root_key] = [body]
-        return None
-    payload = boundary_safe_dumps({root_key: [body]})
-    if replace:
-        # instance_key overrides the single-key default for a compound-key list (e.g.
-        # interface-config is keyed by "device interface-name" → "<device>,<iface>").
-        url = f"{client._base}{service_path}={instance_key or _url_key(device_name)}"
-        method = "put"
-    else:
-        url = f"{client._base}{service_path}"
-        method = "patch"
+    return {"device": device_name, **{container: body for container, body in containers.items()}}
+
+
+async def apply_device_intent(
+    client: NsoClient,
+    device_name: str,
+    containers: Mapping[str, dict],
+    *,
+    dry_run: bool | str = False,
+    no_networking: bool = False,
+    strict: bool = False,
+) -> str | None:
+    """PUT one device's whole ``device-intent`` instance — the ONE sender.
+
+    *containers* maps a YANG container name under ``list device-intent`` to its encoded
+    body. A PUT replaces the keyed instance, so the mapping is complete desired state and an
+    absent family is a retraction; merge-PATCH could never express that (it never drops) and
+    per-family PUTs would put N transactions and the ordering problem back.
+
+    One request is one NSO transaction is one device commit, so FASTMAP resolves every
+    cross-family dependency inside it (a subinterface unit and its address land together).
+
+    ``dry_run=True`` returns the native device delta the commit would push and commits
+    nothing; ``dry_run="cli"`` returns the NED-uniform tree diff instead. ``no_networking``
+    commits to CDB only — the detach path (#106), which drops service governance without
+    touching the device. ``strict`` (dry-run only) makes a conclusive 4xx rejection raise, so
+    failure localisation can tell a real rejection from a transient blip.
+
+    Returns the delta under ``dry_run``, else the R2 §4.4 proof verdict of the commit — ONE
+    verdict, shared by every family in the document. Raises :class:`NsoApplyError` on a
+    non-2xx commit.
+    """
+    payload = boundary_safe_dumps({DEVICE_INTENT_ROOT: [device_intent_instance(device_name, containers)]})
+    url = f"{client._base}{DEVICE_INTENT_PATH}={_url_key(device_name)}"
+
     if dry_run:
-        # Preview: compute the delta without committing anything (dry_run="cli" asks
-        # for the NED-uniform tree diff; any other truthy value = device-native).
         return await native_dry_run(
-            client, url, payload, device_name, method=method, outformat="cli" if dry_run == "cli" else "native"
+            client,
+            url,
+            payload,
+            device_name,
+            method="put",
+            strict=strict,
+            outformat="cli" if dry_run == "cli" else "native",
         )
-    # Detach removal (#106): the replace drops service governance in CDB only; the
-    # caller sync-froms right after so CDB returns to device truth.
-    no_networking = replace and DETACH_REPLACE.get()
+
     async with client._client(timeout=client._action_timeout) as c:
-        resp = await getattr(c, method)(
+        resp = await c.put(
             _commit_url(url, no_networking=no_networking),
             content=payload,
             headers={"Content-Type": "application/yang-data+json"},
@@ -358,84 +325,19 @@ async def _send_service_config(
             except Exception:
                 err = {"raw": resp.text}
             logger.error(
-                "nso.apply.service_send_failed",
-                scope=scope,
+                "nso.apply.device_intent_failed",
                 device=device_name,
-                method=method,
+                families=sorted(containers),
                 status=resp.status_code,
                 body=err,
             )
             raise NsoApplyError(
-                "nso_put_failed" if replace else "nso_patch_failed",
-                f"NSO {method.upper()} for {scope} failed with status {resp.status_code}",
+                "nso_put_failed",
+                f"NSO device-intent PUT failed with status {resp.status_code}",
                 detail={"nso_error": err},
             )
-    logger.info("nso.apply.service_sent", scope=scope, device=device_name, method=method, replace=replace)
-    return await _verify_native_or_raise(client, url, payload, device_name, scope=scope, method=method)
-
-
-async def apply_combined(
-    client: NsoClient,
-    device_name: str,
-    modules: dict[str, list[dict]],
-    *,
-    dry_run: bool | str = False,
-    strict: bool = False,
-) -> str | None:
-    """Stage several reconciler-service bodies into ONE ``/restconf/data`` PATCH.
-
-    *modules* maps a module-qualified service root key (e.g.
-    ``"subinterface-reconciler:subif-config"``) to its list of service-instance bodies.
-    Empty lists are dropped. The single PATCH commits as ONE NSO transaction → ONE device
-    commit, so FASTMAP resolves intra-transaction dependencies (a subif unit and its IP
-    land together). Carries the ``reconcile`` commit param like every other write.
-
-    ``dry_run=True`` returns the native device delta the combined commit would push (no
-    commit). Otherwise commits, runs the post-apply verify guard, and returns that guard's
-    R2 §4.4 verdict — the commit is ONE transaction, so every scope staged into it shares
-    one verdict. Discarding it (as this used to) leaves the atomic path with no proof
-    channel at all: an inconclusive verify behind a 2xx would either CAS a never-proven
-    row or never bootstrap ``deployed_key`` in atomic mode (G39).
-    Raises NsoApplyError on a non-2xx commit. ``strict`` (dry-run only) makes a conclusive
-    4xx dry-run rejection raise instead of returning None — used by atomic-failure
-    localisation to tell a real NED rejection apart from a transient/inconclusive blip.
-    """
-    body = {root: bodies for root, bodies in modules.items() if bodies}
-    payload = boundary_safe_dumps(body)
-    url = f"{client._base}{_DATA_PATH}"
-
-    if dry_run:
-        return await native_dry_run(
-            client,
-            url,
-            payload,
-            device_name,
-            method="patch",
-            strict=strict,
-            outformat="cli" if dry_run == "cli" else "native",
-        )
-
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.patch(_commit_url(url), content=payload, headers={"Content-Type": "application/yang-data+json"})
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.combined_failed",
-                device=device_name,
-                modules=list(body),
-                status=resp.status_code,
-                body=err,
-            )
-            raise NsoApplyError(
-                "nso_patch_failed",
-                f"NSO combined PATCH failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-    logger.info("nso.apply.combined_sent", device=device_name, modules=list(body))
-    return await _verify_native_or_raise(client, url, payload, device_name, scope="combined", method="patch")
+    logger.info("nso.apply.device_intent_sent", device=device_name, families=sorted(containers))
+    return await _verify_native_or_raise(client, url, payload, device_name, scope="device-intent", method="put")
 
 
 # Recognised boolean spellings for the `enabled` interface attribute. The intent value
@@ -475,9 +377,8 @@ def _add_nokia_routed_context(
 ) -> None:
     """Stamp the Nokia routed-interface context onto *entry* in place (no-op when kind is None).
 
-    Shared by the IP path (:func:`build_interface_ip_entry`) and the per-scope attribute path
-    (:func:`apply_interface_attribute`) so both route a Nokia logical/loopback interface's config
-    to the ``router``/``service`` interface instead of the physical port. Ignored by IOS/Junos.
+    Routes a Nokia logical/loopback interface's config to the ``router``/``service`` interface
+    instead of the physical port. Ignored by IOS/Junos.
     """
     if not kind:
         return
@@ -490,110 +391,15 @@ def _add_nokia_routed_context(
         entry["encap-tag"] = encap_tag
 
 
-async def apply_interface_attribute(
-    client: NsoClient,
-    device_name: str,
-    interface_name: str,
-    attribute: str,
-    value: str | None,
-    *,
-    kind: str | None = None,
-    service: str | None = None,
-    parent_binding: str | None = None,
-    encap_tag: str | None = None,
-    dry_run: bool | str = False,
-) -> str | None:
-    """Write a single (device, interface, attribute) intent slice to NSO.
+def nokia_attr_kind(iface) -> str | None:
+    """Return the Nokia writer context an interface's ATTRIBUTES need: the routed kinds plus ``lag``.
 
-    Creates or updates the service instance keyed by (device_name, interface_name)
-    using NSO RESTCONF PATCH with the reconcile commit option.
-
-    ``kind``/``service``/``parent_binding``/``encap_tag`` carry the Nokia routed-interface
-    context (base|ies|vprn) so a logical/loopback interface's description/enabled lands on the
-    ``router``/``service`` interface, not a phantom ``configure port <logical-name>`` — the
-    per-scope twin of what :func:`apply_interface_ips` already threads. Ignored by IOS/Junos.
-
-    Raises NsoApplyError on failure.
+    A LAG's description and admin state belong on ``configure lag``, which no routed kind
+    names: :func:`nokia_routed_kind` answers ``None`` for a lag because a lag carries no IP.
+    Without this, an attribute-only entry reaches the wire with no context at all and the
+    description targets a phantom ``configure port <logical-name>``.
     """
-    # Build the service instance body — only include the attribute being applied
-    service_body: dict = {
-        "interface-reconciler:interface-config": [
-            {
-                "device": device_name,
-                "interface-name": interface_name,
-            }
-        ]
-    }
-
-    entry = service_body["interface-reconciler:interface-config"][0]
-    _add_nokia_routed_context(entry, kind=kind, service=service, parent_binding=parent_binding, encap_tag=encap_tag)
-
-    if attribute == "description":
-        entry["description"] = value if value is not None else ""
-    elif attribute == "enabled":
-        entry["enabled"] = _coerce_enabled_intent(value)
-    else:
-        raise NsoApplyError(
-            "unsupported_attribute",
-            f"Attribute '{attribute}' is not supported by interface-reconciler",
-        )
-
-    url = f"{client._base}{_SERVICE_PATH}"
-    payload = boundary_safe_dumps(
-        {"interface-reconciler:interface-config": service_body["interface-reconciler:interface-config"]}
-    )
-
-    if dry_run:
-        # Same convention as _send_service_config: dry_run == "cli" asks for NSO's
-        # NED-uniform tree diff, any other truthy value for the device-native delta.
-        # Dropping it here made ?outformat=cli silently return a NATIVE delta for this
-        # scope, so the preview's diff2html renderer was handed device CLI lines it
-        # cannot parse into hunks — the interface rows of a cli-mode preview came out
-        # blank or mangled while every other scope rendered.
-        return await native_dry_run(
-            client,
-            url,
-            payload,
-            device_name,
-            method="patch",
-            outformat="cli" if dry_run == "cli" else "native",
-        )
-
-    async with client._client(timeout=client._action_timeout) as c:
-        # Use PATCH to create-or-update the service instance (reconcile commit).
-        resp = await c.patch(
-            _commit_url(url),
-            content=payload,
-            headers={"Content-Type": "application/yang-data+json"},
-        )
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.patch_failed",
-                device=device_name,
-                interface=interface_name,
-                attribute=attribute,
-                status=resp.status_code,
-                body=err,
-            )
-            raise NsoApplyError(
-                "nso_patch_failed",
-                f"NSO PATCH failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-
-    logger.info(
-        "nso.apply.ok",
-        device=device_name,
-        interface=interface_name,
-        attribute=attribute,
-    )
-
-    await _verify_native_or_raise(client, url, payload, device_name, scope="interface_attribute")
-    return None
+    return "lag" if getattr(iface, "kind", None) == "lag" else nokia_routed_kind(iface)
 
 
 def nokia_routed_kind(iface) -> str | None:
@@ -708,181 +514,6 @@ def build_interface_ip_body(
     return entry
 
 
-def build_interface_config_entry(
-    device_name: str,
-    interface_name: str,
-    attr_intent_rows,
-    ip_intent_rows,
-    *,
-    kind: str | None = None,
-    service: str | None = None,
-    parent_binding: str | None = None,
-    encap_tag: str | None = None,
-) -> dict:
-    """Build ONE interface-reconciler entry merging attribute + IP intent for an interface.
-
-    Used by the removal path to PUT-replace a single ``(device, interface-name)`` instance
-    with its full remaining desired state.
-    """
-    entry = build_interface_ip_entry(
-        device_name,
-        interface_name,
-        list(ip_intent_rows),
-        kind=kind,
-        service=service,
-        parent_binding=parent_binding,
-        encap_tag=encap_tag,
-    )
-    for row in attr_intent_rows:
-        if row.attribute == "description":
-            entry["description"] = row.intent_value if row.intent_value is not None else ""
-        elif row.attribute == "enabled":
-            entry["enabled"] = _coerce_enabled_intent(row.intent_value)
-    return entry
-
-
-async def replace_interface_config(
-    client: NsoClient, device_name: str, interface_name: str, entry: dict, *, dry_run: bool | str = False
-) -> str | None:
-    """PUT-replace the ``(device, interface-name)`` interface-reconciler instance with *entry*.
-
-    FASTMAP reverts any address/attribute the previous deploy created that is no longer in
-    the full desired state — how a removed IP is propagated to the device (merge-PATCH can
-    never drop a list entry). Raises NsoApplyError on failure.
-    """
-    instance_key = f"{_url_key(device_name)},{_url_key(interface_name)}"
-    return await _send_service_config(
-        client,
-        _SERVICE_PATH,
-        "interface-reconciler:interface-config",
-        device_name,
-        entry,
-        scope="interface_config",
-        replace=True,
-        dry_run=dry_run,
-        instance_key=instance_key,
-    )
-
-
-async def delete_interface_config(client: NsoClient, device_name: str, interface_name: str) -> None:
-    """DELETE the ``(device, interface-name)`` instance → FASTMAP reverts all config it created.
-
-    Used when an interface has NO remaining accepted attr/IP intent (the operator wants
-    nothing managed there). A 404 is treated as success (already gone — idempotent).
-    """
-    instance_key = f"{_url_key(device_name)},{_url_key(interface_name)}"
-    url = f"{client._base}{_SERVICE_PATH}={instance_key}"
-    async with client._client(timeout=client._action_timeout) as c:
-        # Detach (#106): dropping governance of the whole instance must not let
-        # FASTMAP revert the config on the device — commit to CDB only.
-        resp = await c.delete(_commit_url(url, no_networking=DETACH_REPLACE.get()))
-        if resp.status_code not in (200, 204, 404):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.interface_config_delete_failed",
-                device=device_name,
-                interface=interface_name,
-                status=resp.status_code,
-                body=err,
-            )
-            raise NsoApplyError(
-                "nso_delete_failed",
-                f"NSO DELETE for interface_config {device_name}/{interface_name} failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-    logger.info("nso.apply.interface_config_deleted", device=device_name, interface=interface_name)
-
-
-async def apply_interface_ips(
-    client: NsoClient,
-    device_name: str,
-    interface_name: str,
-    ip_intent_rows: list,
-    *,
-    kind: str | None = None,
-    service: str | None = None,
-    parent_binding: str | None = None,
-    encap_tag: str | None = None,
-    dry_run: bool | str = False,
-) -> str | None:
-    """Write IP addresses and VRF for a single interface to NSO.
-
-    Builds a full interface-reconciler PATCH body from the supplied rows,
-    one PATCH call per interface covering all IPv4, IPv6, and VRF intent.
-
-    ``kind``/``service``/``parent_binding``/``encap_tag`` carry the Nokia
-    routed-interface context so the reconciler writes the IP to the SR OS
-    ``configure router Base`` / ``configure service {ies,vprn} <service>``
-    interface (bound to its port) instead of to the port.  They are ignored by
-    the IOS/Junos handlers.
-
-    Raises NsoApplyError on failure.
-    """
-    entry = build_interface_ip_entry(
-        device_name,
-        interface_name,
-        ip_intent_rows,
-        kind=kind,
-        service=service,
-        parent_binding=parent_binding,
-        encap_tag=encap_tag,
-    )
-
-    url = f"{client._base}{_SERVICE_PATH}"
-    payload = boundary_safe_dumps({"interface-reconciler:interface-config": [entry]})
-
-    if dry_run:
-        # dry_run == "cli" → NSO's NED-uniform tree diff (see apply_interface_attribute).
-        return await native_dry_run(
-            client,
-            url,
-            payload,
-            device_name,
-            method="patch",
-            outformat="cli" if dry_run == "cli" else "native",
-        )
-
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.patch(
-            _commit_url(url),
-            content=payload,
-            headers={"Content-Type": "application/yang-data+json"},
-        )
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.ip_patch_failed",
-                device=device_name,
-                interface=interface_name,
-                status=resp.status_code,
-                body=err,
-            )
-            raise NsoApplyError(
-                "nso_patch_failed",
-                f"NSO PATCH for IP intent failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-
-    logger.info(
-        "nso.apply.ip_ok",
-        device=device_name,
-        interface=interface_name,
-        ipv4_count=len(entry.get("ipv4-address", [])),
-        ipv6_count=len(entry.get("ipv6-address", [])),
-    )
-
-    await _verify_native_or_raise(client, url, payload, device_name, scope="interface_ip")
-    return None
-
-
-_SNMP_SERVICE_PATH = "/restconf/data/snmp-reconciler:snmp-config"
-
 # Plugin/adapter spellings → snmp-reconciler YANG enum values. The API constrains these
 # fields to exactly these keys (api/snmp.py), so the store can never hold a spelling the
 # writer cannot render — a raise here aborts the whole SNMP body, taking unrelated
@@ -922,86 +553,6 @@ def _snmp_vault_triple(vault_ref: str, prefix: str, owner: str) -> dict[str, str
         f"{prefix}vault-path": ref.path,
         f"{prefix}vault-key": cast(str, ref.key),
     }
-
-
-# RESTCONF path to the static-route-reconciler service list
-_STATIC_ROUTE_SERVICE_PATH = "/restconf/data/static-route-reconciler:static-route-config"
-
-# RESTCONF path to the logging-reconciler service list (remote syslog write path)
-_LOGGING_SERVICE_PATH = "/restconf/data/logging-reconciler:logging-config"
-
-# RESTCONF path to the svi-reconciler service list (SVI/IRB write path)
-_SVI_SERVICE_PATH = "/restconf/data/svi-reconciler:svi-config"
-
-# RESTCONF path to the subinterface-reconciler service list (dot1q write path)
-_SUBIF_SERVICE_PATH = "/restconf/data/subinterface-reconciler:subif-config"
-
-# RESTCONF path to the vlan-reconciler service list (VLAN-database write path)
-_VLAN_SERVICE_PATH = "/restconf/data/vlan-reconciler:vlan-config"
-
-# RESTCONF path to the bfd-reconciler service list (per-interface BFD write path)
-_BFD_SERVICE_PATH = "/restconf/data/bfd-reconciler:bfd-config"
-
-# RESTCONF path to the mtu-reconciler service list (per-interface MTU write path, Phase 2b)
-_MTU_SERVICE_PATH = "/restconf/data/mtu-reconciler:mtu-config"
-
-# RESTCONF path to the l2-sap-reconciler service list
-_L2_SAP_SERVICE_PATH = "/restconf/data/l2-sap-reconciler:l2-sap-config"
-
-# RESTCONF path to the isis-reconciler service list
-_ISIS_SERVICE_PATH = "/restconf/data/isis-reconciler:isis-config"
-
-# RESTCONF path to the bgp-reconciler service list
-_BGP_SERVICE_PATH = "/restconf/data/bgp-reconciler:bgp-config"
-
-# RESTCONF path to the route-policy-reconciler service list
-_ROUTE_POLICY_SERVICE_PATH = "/restconf/data/route-policy-reconciler:route-policy-config"
-
-
-async def apply_snmp_config(
-    client: NsoClient,
-    device_name: str,
-    community_intents: list,
-    v3_user_intents: list,
-    host_intents: list,
-    system_info_intent,
-    *,
-    replace: bool = False,
-    dry_run: bool | str = False,
-    stage: dict[str, list] | None = None,
-) -> str | None:
-    """Write the full SNMP intent snapshot for a device to the snmp-reconciler service.
-
-    Builds a single body covering all communities, v3 users, hosts, and system info,
-    in the exact snmp-reconciler YANG shape: refs split into vault-mount/path/key
-    triples (the service resolves them from Vault at commit time), enums normalized
-    from the plugin spellings (RO/RW, trap/inform, 2c) to the YANG values.
-    ``replace=True`` PUT-replaces the keyed instance so removed elements are
-    reverted.  Raises NsoApplyError on failure — including any intent row whose
-    vault_ref cannot yield the mandatory triples (a silent drop would delete that
-    element from the device on a replace apply).
-    """
-    body = encode_snmp(
-        {
-            "snmp_community_intent": community_intents,
-            "snmp_v3_user_intent": v3_user_intents,
-            "snmp_host_intent": host_intents,
-            "snmp_system_info_intent": [system_info_intent] if system_info_intent else [],
-        },
-        _CONTEXT_FREE_EXECUTION,
-    )
-    entry = {"device": device_name, **body}
-    return await _send_service_config(
-        client,
-        _SNMP_SERVICE_PATH,
-        "snmp-reconciler:snmp-config",
-        device_name,
-        entry,
-        scope="snmp",
-        replace=replace,
-        dry_run=dry_run,
-        stage=stage,
-    )
 
 
 def _static_route_required(row: object, field: str) -> Any:
@@ -1048,51 +599,6 @@ def static_route_entry_key(entry: dict) -> tuple[str, str, str]:
     return (entry.get("vrf") or "", entry.get("prefix") or "", entry.get("next-hop") or "")
 
 
-async def apply_static_routes(
-    client: NsoClient,
-    device_name: str,
-    route_intent_rows: list,
-    *,
-    extra_entries: list[dict] | None = None,
-    replace: bool = False,
-    dry_run: bool | str = False,
-    stage: dict[str, list] | None = None,
-) -> str | None:
-    """Write static route intent for a single device to NSO.
-
-    Builds a full static-route-reconciler body from the supplied rows and commits in
-    reconcile mode so pre-existing routes are adopted. ``replace=True`` PUT-replaces
-    the keyed instance (full desired state) so removed routes are reverted on the
-    device. Raises NsoApplyError on failure.
-
-    *extra_entries* are raw wire entries appended verbatim after the rendered ones — R2's
-    tombstone retention, where the live copy carries metric/tag and NED-specific leaves the
-    store has no column for. A rendered row always WINS on a key collision: the store is
-    the authority for a route it still owns.
-    """
-    routes = encode_static_route({"static_route_intent": route_intent_rows}, _CONTEXT_FREE_EXECUTION)["route"]
-    if extra_entries:
-        seen = {static_route_entry_key(entry) for entry in routes}
-        for entry in extra_entries:
-            key = static_route_entry_key(entry)
-            if key in seen:
-                continue
-            seen.add(key)
-            routes.append(entry)
-
-    return await _send_service_config(
-        client,
-        _STATIC_ROUTE_SERVICE_PATH,
-        "static-route-reconciler:static-route-config",
-        device_name,
-        {"device": device_name, "route": routes},
-        scope="static_route",
-        replace=replace,
-        dry_run=dry_run,
-        stage=stage,
-    )
-
-
 def local_levels_write_enabled() -> bool:
     """Whether to emit the logging ``local-levels`` container (NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE).
 
@@ -1124,81 +630,6 @@ def _local_levels(row) -> dict:
     return {leaf: value for leaf, attr in _LOCAL_LEVEL_LEAVES if (value := getattr(row, attr))}
 
 
-async def apply_logging_config(
-    client: NsoClient,
-    device_name: str,
-    host_intent_rows: list,
-    *,
-    levels_intent_row=None,
-    replace: bool = False,
-    dry_run: bool | str = False,
-    stage: dict[str, list] | None = None,
-) -> str | None:
-    """Write the full remote-syslog + local-levels intent snapshot for a device to NSO.
-
-    Builds a logging-reconciler body from the supplied rows; the service adopts
-    pre-existing brownfield logging config (reconcile). ``replace=True`` PUT-replaces
-    the keyed instance so removed hosts / cleared severities are reverted. No secrets.
-
-    ``levels_intent_row`` is the device's accepted local-levels singleton (NX-P4a);
-    only SET severities are emitted (an absent leaf = unmanaged; removal is FASTMAP
-    retraction via replace, never an explicit clear). Emission is gated by
-    :func:`local_levels_write_enabled` — and a CLOSED gate with an accepted levels
-    intent REFUSES (NsoApplyError) rather than sending a weaker host-only body:
-    proceeding would stamp the levels row in_sync without any severity landing, and
-    a replace-mode body missing local-levels would FASTMAP-retract previously-owned
-    severities (on NX that DISABLES the destination). The scope fails visibly
-    (apply_failed / stage_errors / removal_failed) until the gate opens or the
-    operator un-manages the levels.
-    """
-    rows: SectionRows = {
-        "logging_host_intent": host_intent_rows,
-        "logging_levels_intent": [levels_intent_row] if levels_intent_row is not None else [],
-    }
-    refuse_gated_local_levels(rows)
-    body: dict = {"device": device_name, **encode_logging(rows, _CONTEXT_FREE_EXECUTION)}
-    return await _send_service_config(
-        client,
-        _LOGGING_SERVICE_PATH,
-        "logging-reconciler:logging-config",
-        device_name,
-        body,
-        scope="logging",
-        replace=replace,
-        dry_run=dry_run,
-        stage=stage,
-    )
-
-
-async def apply_svi_config(
-    client: NsoClient,
-    device_name: str,
-    svi_intent_rows: list,
-    *,
-    replace: bool = False,
-    dry_run: bool | str = False,
-    stage: dict[str, list] | None = None,
-) -> str | None:
-    """Write the SVI/IRB intent snapshot for a device to NSO.
-
-    Materialises interface VlanN / interfaces irb unit N via the svi-reconciler;
-    IPs ride the interface-reconciler. Reconcile mode (brownfield adoption).
-    ``replace=True`` PUT-replaces the keyed instance so removed SVIs are reverted.
-    """
-    body = encode_svi({"svi_intent": svi_intent_rows}, _CONTEXT_FREE_EXECUTION)
-    return await _send_service_config(
-        client,
-        _SVI_SERVICE_PATH,
-        "svi-reconciler:svi-config",
-        device_name,
-        {"device": device_name, **body},
-        scope="svi",
-        replace=replace,
-        dry_run=dry_run,
-        stage=stage,
-    )
-
-
 def build_subif_interfaces(subif_intent_rows: list) -> list[dict]:
     """Shape the subinterface-reconciler ``interface`` list from a device's subif rows.
 
@@ -1217,159 +648,6 @@ def build_subif_interfaces(subif_intent_rows: list) -> list[dict]:
             entry["vrf"] = row.vrf
         interfaces.append(entry)
     return interfaces
-
-
-async def apply_subinterface_config(
-    client: NsoClient,
-    device_name: str,
-    subif_intent_rows: list,
-    *,
-    replace: bool = False,
-    dry_run: bool | str = False,
-    stage: dict[str, list] | None = None,
-) -> str | None:
-    """Write the dot1q subinterface intent snapshot for a device to NSO.
-
-    Materialises <parent>.<unit> (encapsulation dot1Q + vrf forwarding) / Junos
-    unit vlan-id via the subinterface-reconciler; IPs ride the interface-reconciler.
-    Reconcile mode (brownfield adoption). ``replace=True`` PUT-replaces the keyed
-    instance so removed subinterfaces are reverted.
-    """
-    return await _send_service_config(
-        client,
-        _SUBIF_SERVICE_PATH,
-        "subinterface-reconciler:subif-config",
-        device_name,
-        {
-            "device": device_name,
-            **encode_subinterface({"subinterface_intent": subif_intent_rows}, _CONTEXT_FREE_EXECUTION),
-        },
-        scope="subinterface",
-        replace=replace,
-        dry_run=dry_run,
-        stage=stage,
-    )
-
-
-async def apply_vlan_config(
-    client: NsoClient,
-    device_name: str,
-    vlan_intent_rows: list,
-    *,
-    replace: bool = False,
-    dry_run: bool | str = False,
-    stage: dict[str, list] | None = None,
-) -> str | None:
-    """Write the VLAN-database intent snapshot for a device to NSO (write path).
-
-    Materialises 'vlan <id> / name <name>' (IOS) / 'vlans <name> vlan-id <id>'
-    (Junos) via the vlan-reconciler. Reconcile mode (brownfield adoption).
-    ``replace=True`` PUT-replaces the keyed instance (full desired list) so removed
-    VLANs are reverted on the device. Raises NsoApplyError on failure.
-    """
-    body = encode_vlan({"vlan_intent": vlan_intent_rows}, _CONTEXT_FREE_EXECUTION)
-    return await _send_service_config(
-        client,
-        _VLAN_SERVICE_PATH,
-        "vlan-reconciler:vlan-config",
-        device_name,
-        {"device": device_name, **body},
-        scope="vlan",
-        replace=replace,
-        dry_run=dry_run,
-        stage=stage,
-    )
-
-
-async def apply_bfd_config(
-    client: NsoClient,
-    device_name: str,
-    bfd_intent_rows: list,
-    *,
-    replace: bool = False,
-    dry_run: bool | str = False,
-    stage: dict[str, list] | None = None,
-) -> str | None:
-    """Write the per-interface BFD intent snapshot for a device to NSO.
-
-    Materialises BFD timers via the bfd-reconciler (IOS interface bfd interval;
-    IOS-XR bfd address-family; Junos ae bfd-liveness-detection; Nokia router
-    interface ipv4 bfd). Reconcile mode. ``replace=True`` PUT-replaces the keyed
-    instance so removed BFD interfaces are reverted.
-    """
-    body = encode_bfd({"bfd_intent": bfd_intent_rows}, _CONTEXT_FREE_EXECUTION)
-    return await _send_service_config(
-        client,
-        _BFD_SERVICE_PATH,
-        "bfd-reconciler:bfd-config",
-        device_name,
-        {"device": device_name, **body},
-        scope="bfd",
-        replace=replace,
-        dry_run=dry_run,
-        stage=stage,
-    )
-
-
-async def apply_mtu_config(
-    client: NsoClient,
-    device_name: str,
-    mtu_intent_rows: list,
-    *,
-    replace: bool = False,
-    dry_run: bool | str = False,
-    stage: dict[str, list] | None = None,
-) -> str | None:
-    """Write the per-interface MTU intent snapshot for a device to NSO (Phase 2b).
-
-    Materialises native L2 mtu / ip-mtu / mpls-mtu via the mtu-reconciler (IOS
-    interface mtu + subif ip mtu; IOS-XR interface mtu + ipv4 mtu; Junos physical
-    mtu + unit family mtu; Nokia port ethernet mtu + router interface ip-mtu).
-    Reconcile mode. ``replace=True`` PUT-replaces the keyed instance so removed
-    MTU interfaces are reverted.
-    """
-    body = encode_interface_mtu({"interface_mtu_intent": mtu_intent_rows}, _CONTEXT_FREE_EXECUTION)
-    return await _send_service_config(
-        client,
-        _MTU_SERVICE_PATH,
-        "mtu-reconciler:mtu-config",
-        device_name,
-        {"device": device_name, **body},
-        scope="interface_mtu",
-        replace=replace,
-        dry_run=dry_run,
-        stage=stage,
-    )
-
-
-async def apply_l2_saps(
-    client: NsoClient,
-    device_name: str,
-    sap_intent_rows: list,
-    *,
-    replace: bool = False,
-    dry_run: bool | str = False,
-    stage: dict[str, list] | None = None,
-) -> str | None:
-    """Write Nokia L2 SAP intent for a single device to NSO.
-
-    Builds a full l2-sap-reconciler body from the supplied rows and commits in
-    reconcile mode so pre-existing SAPs are adopted. The NSO service adds each SAP
-    under an EXISTING epipe/vpls service (SAP-only). ``replace=True`` PUT-replaces
-    the keyed instance so removed SAPs are reverted.
-    """
-    body = encode_l2_sap({"l2_sap_intent": sap_intent_rows}, _CONTEXT_FREE_EXECUTION)
-    return await _send_service_config(
-        client,
-        _L2_SAP_SERVICE_PATH,
-        "l2-sap-reconciler:l2-sap-config",
-        device_name,
-        {"device": device_name, **body},
-        scope="l2_sap",
-        replace=replace,
-        dry_run=dry_run,
-        stage=stage,
-    )
 
 
 def _redistribute_entry(row) -> dict:
@@ -1510,64 +788,6 @@ def build_isis_process_payload(
     return processes
 
 
-async def apply_isis_interfaces(
-    client: NsoClient,
-    device_name: str,
-    isis_intent_rows: list,
-    isis_process_rows: list | None = None,
-    redistribution_rows: list | None = None,
-    flex_algo_rows: list | None = None,
-    level_rows: list | None = None,
-    *,
-    replace: bool = False,
-    dry_run: bool | str = False,
-    stage: dict[str, list] | None = None,
-) -> str | None:
-    """Write IS-IS interface-enablement and process intent for a single device to NSO.
-
-    Builds a full isis-reconciler body from the supplied rows and commits with the
-    reconcile option so pre-existing IS-IS config is adopted (brownfield).
-
-    When *isis_process_rows* is provided, a ``process-config`` list is included
-    so the reconciler writes process-level config (net, is-type, metric-style,
-    overload-bit, area/domain auth) before enabling interfaces.
-
-    *redistribution_rows* rows must have: dest_ref (process_tag), source_protocol,
-    source_ref, route_map (optional), metric (optional), metric_type (optional).
-
-    ``replace=False`` (apply/add/update): merge-PATCH — a merge never drops an omitted
-    leaf, so a cleared scalar (e.g. metric back to blank) is NOT retracted this way.
-    ``replace=True`` (removal): PUT-replace the keyed instance with the FULL owned
-    desired state so any omitted interface/leaf is dropped and FASTMAP reverts it on
-    the device (un-owned brownfield stays, protected by the reconcile option). Used by
-    the ``isis`` removal job to propagate a cleared/deleted owned intent.
-
-    Raises NsoApplyError on failure.
-    """
-    body = encode_isis(
-        {
-            "isis_process_intent": isis_process_rows or [],
-            "isis_interface_intent": isis_intent_rows or [],
-            "isis_level_intent": level_rows or [],
-            "isis_flex_algo_intent": flex_algo_rows or [],
-            "redistribution_intent": redistribution_rows or [],
-        },
-        _CONTEXT_FREE_EXECUTION,
-    )
-    service_body: dict = {"device": device_name, **body}
-    return await _send_service_config(
-        client,
-        _ISIS_SERVICE_PATH,
-        "isis-reconciler:isis-config",
-        device_name,
-        service_body,
-        scope="isis",
-        replace=replace,
-        dry_run=dry_run,
-        stage=stage,
-    )
-
-
 def build_isis_interface_payload(isis_intent_rows: list | None) -> list[dict]:
     """Build the isis-reconciler ``interface-config`` payload from store rows."""
     interfaces: list[dict] = []
@@ -1598,50 +818,6 @@ def build_isis_interface_payload(isis_intent_rows: list | None) -> list[dict]:
             entry["frr-protection"] = row.frr_protection
         interfaces.append(entry)
     return interfaces
-
-
-async def replace_service_instance(
-    client: NsoClient,
-    service_path: str,
-    root_key: str,
-    device_name: str,
-    body: dict,
-) -> None:
-    """RESTCONF PUT-replace a keyed reconciler service instance with the full desired body.
-
-    Generalised removal primitive. Removal must be explicit: a merge-PATCH that omits
-    an entry leaves it in the FASTMAP service intent (and on the device), and a
-    node-level DELETE 404s on empty-string list keys. PUT on the keyed instance
-    (``<service_path>=<device>``) replaces its entire content with *body*, so omitted
-    list entries are dropped and FASTMAP reverts the device config.
-
-    *body* is the full desired instance dict (must include the ``device`` key). A body
-    with only the device key clears all of this service's managed config for the device.
-    The PUT carries the ``reconcile`` commit option (see ``_commit_url``) so the replace
-    still adopts brownfield config rather than conflicting with it.
-    """
-    url = f"{client._base}{service_path}={_url_key(device_name)}"
-    payload = boundary_safe_dumps({root_key: [body]})
-    async with client._client(timeout=client._action_timeout) as c:
-        resp = await c.put(_commit_url(url), content=payload, headers={"Content-Type": "application/yang-data+json"})
-        if resp.status_code not in (200, 201, 204):
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
-            logger.error(
-                "nso.apply.service_replace_failed",
-                service=root_key,
-                device=device_name,
-                status=resp.status_code,
-                body=err,
-            )
-            raise NsoApplyError(
-                "nso_put_failed",
-                f"NSO PUT-replace for {root_key} failed with status {resp.status_code}",
-                detail={"nso_error": err},
-            )
-    logger.info("nso.apply.service_replaced", service=root_key, device=device_name)
 
 
 def _parse_asn(asn) -> int:
@@ -1728,46 +904,6 @@ def _attach_orphan_bgp_redistribute(routers, redist_by_af, router_by_asn, scope_
         af_seen.add((asn_str, vrf, af))
 
 
-async def apply_bgp_config(
-    client: NsoClient,
-    device_name: str,
-    router_intent_rows: list,
-    redistribution_rows: list | None = None,
-    *,
-    replace: bool = False,
-    dry_run: bool | str = False,
-    stage: dict[str, list] | None = None,
-) -> str | None:
-    """Write BGP intent for a single device to NSO via the bgp-reconciler.
-
-    Builds the full router/scope/AF/peer/peer-AF tree from the supplied
-    BgpRouterIntent rows (with relationships eagerly loaded by the caller)
-    and commits in reconcile mode so pre-existing BGP config is adopted.
-    ``replace=True`` PUT-replaces the keyed instance so removed routers/peers are
-    reverted.
-
-    *redistribution_rows* rows must have: dest_ref (f"{asn}:{vrf}:{af}"),
-    source_protocol, source_ref, route_map (optional), metric (optional).
-
-    Raises NsoApplyError on failure.
-    """
-    body = encode_bgp(
-        {"bgp_router_intent": router_intent_rows, "redistribution_intent": redistribution_rows or []},
-        _CONTEXT_FREE_EXECUTION,
-    )
-    return await _send_service_config(
-        client,
-        _BGP_SERVICE_PATH,
-        "bgp-reconciler:bgp-config",
-        device_name,
-        {"device": device_name, **body},
-        scope="bgp",
-        replace=replace,
-        dry_run=dry_run,
-        stage=stage,
-    )
-
-
 # Route-map intent entry keys → route-policy-reconciler YANG leaf names. The plugin
 # pushes YANG-shaped keys; legacy intents carried snake_case / "match"+"set" dict
 # blobs — normalise both so a stale row can't 400 the RESTCONF call.
@@ -1826,60 +962,6 @@ def _normalize_route_map_entry(entry: dict) -> dict:
     return out
 
 
-async def apply_route_policy_config(
-    client: NsoClient,
-    device_name: str,
-    intent_rows: list,
-    *,
-    ned_id: str | None = None,
-    replace: bool = False,
-    dry_run: bool | str = False,
-    stage: dict[str, list] | None = None,
-) -> str | None:
-    """Write route-policy intent for a single device to NSO via the route-policy-reconciler.
-
-    Groups RoutePolicyObjectIntent rows by family and builds the canonical NSO service
-    payload per docs/m17-route-policy-contract.md §2 (reconcile semantics).
-    ``replace=True`` PUT-replaces the keyed instance so removed policy objects are
-    reverted. Raises NsoApplyError on failure.
-
-    Community members are stored canonically (Cisco/Junos form) in NetBox but each NED
-    spells them differently; ``ned_id`` selects the dialect that translates them to the
-    device's wire form. Members the NED cannot represent (e.g. ``color:`` on Nokia) are
-    dropped from this device's push — so one bad member can't abort the whole community —
-    and logged per-device on a real apply (``dry_run=False``) for the operator/auto-apply
-    journal.
-    """
-    dialect = community_dialect_for(ned_id)
-    rows = {"route_policy_object_intent": intent_rows}
-    if not dry_run:
-        for name, member in unrenderable_route_policy_members(rows, dialect):
-            logger.warning(
-                "apply.route_policy.member_skipped",
-                device=device_name,
-                ned_id=ned_id,
-                community=name,
-                member=member,
-                reason="unrepresentable_on_ned",
-            )
-    body = {"device": device_name, **encode_route_policy(rows, SectionExecution(ned_id, dialect))}
-    return await _send_service_config(
-        client,
-        _ROUTE_POLICY_SERVICE_PATH,
-        "route-policy-reconciler:route-policy-config",
-        device_name,
-        body,
-        scope="route_policy",
-        replace=replace,
-        dry_run=dry_run,
-        stage=stage,
-    )
-
-
-# RESTCONF path to the ospf-reconciler service list
-_OSPF_SERVICE_PATH = "/restconf/data/ospf-reconciler:ospf-config"
-
-
 def _ospf_process_entry(row, proc_redist: list[dict]) -> dict:
     """One OSPF ``process-config`` entry from a process row plus its nested redistribute list."""
     # process-id is sent as a STRING: the ospf-reconciler YANG leaf is a string so named
@@ -1920,54 +1002,6 @@ def _ospf_interface_entry(row) -> dict:
         if row.auth_key:
             entry["auth-key"] = row.auth_key
     return entry
-
-
-async def apply_ospf_config(
-    client: NsoClient,
-    device_name: str,
-    process_intent_rows: list,
-    interface_intent_rows: list,
-    redistribution_rows: list | None = None,
-    *,
-    replace: bool = False,
-    dry_run: bool | str = False,
-    stage: dict[str, list] | None = None,
-) -> str | None:
-    """Write OSPF process and interface intent for a single device to NSO.
-
-    Builds a full ospf-reconciler body from the supplied rows and commits in
-    reconcile mode so pre-existing OSPF config is adopted. ``replace=True``
-    PUT-replaces the keyed instance so removed processes/interfaces are reverted.
-
-    *process_intent_rows* rows must have: process_id, router_id (optional), vrf (optional).
-    *interface_intent_rows* rows must have: interface_name, process_id, area_id,
-    passive (bool), priority (optional), cost (optional), network_type (optional),
-    auth_type (optional), auth_key (optional).
-    *redistribution_rows* rows must have: dest_ref (str(process_id)), source_protocol,
-    source_ref, route_map (optional), metric (optional), metric_type (optional).
-
-    Raises NsoApplyError on failure.
-    """
-    body = encode_ospf(
-        {
-            "ospf_instance_intent": process_intent_rows,
-            "ospf_interface_intent": interface_intent_rows,
-            "redistribution_intent": redistribution_rows or [],
-        },
-        _CONTEXT_FREE_EXECUTION,
-    )
-    service_body: dict = {"device": device_name, **body}
-    return await _send_service_config(
-        client,
-        _OSPF_SERVICE_PATH,
-        "ospf-reconciler:ospf-config",
-        device_name,
-        service_body,
-        scope="ospf",
-        replace=replace,
-        dry_run=dry_run,
-        stage=stage,
-    )
 
 
 # ── The aggregate device-intent wire encoders (#1522 C9, memo A8) ─────────────────────
@@ -2386,6 +1420,11 @@ def encode_lag(rows: SectionRows, execution: SectionExecution) -> dict:
     return {"bundle": bundles}
 
 
+#: The interface attributes this writer has a wire leaf for. Anything else is refused rather
+#: than dropped: the managed scope is operator data, not a closed enum.
+_INTERFACE_ATTRIBUTE_LEAVES = frozenset({"description", "enabled"})
+
+
 def encode_interface_config(rows: SectionRows, execution: SectionExecution) -> dict:
     """Encode the ``interface`` container: description, admin state and addresses, merged.
 
@@ -2400,14 +1439,25 @@ def encode_interface_config(rows: SectionRows, execution: SectionExecution) -> d
     def _entry(name: str) -> dict:
         return by_name.setdefault(name, {"interface-name": name})
 
+    attributed: set[str] = set()
     for row in rows["interface_intent"]:
         if (row.interface_id, row.attribute) not in eligible:
             continue
         iface = interfaces[row.interface_id]
+        attributed.add(iface.name)
+        if row.attribute not in _INTERFACE_ATTRIBUTE_LEAVES:
+            # The managed scope is data, so the store CAN hold an attribute this writer has
+            # no leaf for. Refusing is the only honest answer: emitting the entry without it
+            # would stamp the row in_sync for a leaf that never reached the device (#26).
+            raise NsoApplyError(
+                "unsupported_attribute",
+                f"interface_config: attribute {row.attribute!r} on {iface.name!r} has no wire leaf",
+                detail={"interface": iface.name, "attribute": row.attribute},
+            )
         entry = _entry(iface.name)
         if row.attribute == "description":
             entry["description"] = row.intent_value if row.intent_value is not None else ""
-        elif row.attribute == "enabled":
+        else:
             # Strict coercion (raises on garbage), so a corrupt value never silently
             # shuts an interface down.
             entry["enabled"] = _coerce_enabled_intent(row.intent_value)
@@ -2430,5 +1480,20 @@ def encode_interface_config(rows: SectionRows, execution: SectionExecution) -> d
         for key, value in ip_entry.items():
             if key != "interface-name":
                 entry[key] = value
+
+    # The attribute half's context, last so a lag keeps the kind only IT can name. The two
+    # halves rode separate service instances before and each stamped its own; one entry
+    # carries one context, and an attribute-only entry with none writes to the wrong node.
+    for interface_id, iface in interfaces.items():
+        if iface.name not in attributed:
+            continue
+        attr_kind = nokia_attr_kind(iface)
+        _add_nokia_routed_context(
+            by_name[iface.name],
+            kind=attr_kind,
+            service=iface.service if attr_kind in ("ies", "vprn") else None,
+            parent_binding=iface.parent_binding,
+            encap_tag=iface.encap_tag,
+        )
 
     return {"interface": list(by_name.values())}

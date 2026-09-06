@@ -10,6 +10,7 @@ fake, and the guard cases use the same spec'd fake the shipped guard tests use.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -19,12 +20,12 @@ from nso_adapter.core import removal as removal_mod
 from nso_adapter.core.claim import ClaimLostError, ClaimRegistration, acquire_claim, lock_claim
 from nso_adapter.core.static_route_plan import (
     SR_CLEAR_FIELDS,
-    build_plan,
+    _serialize_apply_plan,
     fence_open,
     hydrate_static_route_apply_plan,
     replacement_open,
 )
-from nso_adapter.nso.apply import apply_static_routes, static_route_entry
+from nso_adapter.nso.apply import static_route_entry
 from tests.conftest import seed_device, session
 
 pytestmark = pytest.mark.anyio
@@ -85,14 +86,41 @@ async def _seed_tombstone(
 
 
 async def _plan(device_id: int, *, force: bool = True):
-    """Build the plan the way a real apply does — eligible rows from the real collector."""
+    """Classify the device's live rows the way authorization freezes them.
+
+    The eligible list is returned beside the plan because several cases pin that the BODY is
+    no longer a function of it: one document carries every accepted row, so an eligible-only
+    body would retract the accepted-and-clean siblings.
+    """
     from nso_adapter.core.apply import _collect_eligible
-    from nso_adapter.store.models import Device, StaticRouteIntent
+    from nso_adapter.core.static_route_plan import classify_apply_plan
+    from nso_adapter.store.models import StaticRouteIntent, StaticRouteTombstone
 
     async with session() as db:
-        device = await db.get(Device, device_id)
+        rows = list(
+            (
+                await db.execute(
+                    sa.select(StaticRouteIntent)
+                    .where(StaticRouteIntent.device_id == device_id)
+                    .order_by(StaticRouteIntent.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        tombstones = list(
+            (
+                await db.execute(
+                    sa.select(StaticRouteTombstone)
+                    .where(StaticRouteTombstone.device_id == device_id)
+                    .order_by(StaticRouteTombstone.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
         eligible = await _collect_eligible(db, StaticRouteIntent, device_id, force)
-        return await build_plan(db, device, eligible_rows=eligible), [r.id for r in eligible]
+        return classify_apply_plan(rows, tombstones, device_id=device_id), [r.id for r in eligible]
 
 
 def _triples(rows) -> set[tuple]:
@@ -102,12 +130,14 @@ def _triples(rows) -> set[tuple]:
 # ── C1.1 / C1.2 — the mode predicate ─────────────────────────────────────────
 
 
-async def test_c1_1_a_route_id_less_sibling_shuts_the_fence(adapter_client):
-    """C1.1 — one NULL ``route_id`` anywhere on the device forbids PUT mode.
+async def test_c1_1_the_fence_no_longer_decides_whether_a_replacement_needs_proof(adapter_client):
+    """C1.1 — the fence gated a transport choice that no longer exists.
 
-    The fence is per DEVICE, not per row: the replacement-open row here is fully
-    identified, and a per-row reading would happily PUT-replace while a sibling triple
-    was never correlated with any NetBox route pk.
+    It forbade PUT mode so a device whose triples were never correlated with a NetBox route
+    pk could not claim deletion authority. One document drops the predecessor either way, so
+    a fence-dependent record would only drop the PROOF requirement on the devices least able
+    to justify the write. The fence still decides whether a removed row earns a deletion
+    record, at the intent endpoint, and that is untouched.
     """
     device_id = await seed_device(nso_device_name="sr-plan-fence", netbox_device_id=7001)
     await _seed_rows(
@@ -117,10 +147,12 @@ async def test_c1_1_a_route_id_less_sibling_shuts_the_fence(adapter_client):
             {"triple": B, "route_id": 2, "deployed_key": list(C)},
         ],
     )
+    assert fence_open([]) is True, "the predicate itself is unchanged"
     plan, _ = await _plan(device_id)
-    assert plan.mode == "PATCH"
+    assert plan.mode == "PUT", "a shut fence cannot make an undelivered identity edit unprovable"
+    assert C in plan.allowed, "the body drops the predecessor, so the authority must name it"
 
-    # Discriminating variant: backfill the NULL and the very same store flips to PUT.
+    # Discriminating variant: backfilling the NULL changes nothing about this record.
     from nso_adapter.store.models import StaticRouteIntent
 
     async with session() as db:
@@ -162,20 +194,45 @@ async def test_c1_2_no_open_replacement_stays_patch(adapter_client):
     assert C in plan.allowed
 
 
-async def test_c1_2b_put_is_refused_when_verification_is_disabled(adapter_client, monkeypatch):
-    """§4.4 — a destructive replace whose proof is structurally unavailable must not run."""
+async def test_c1_2b_classification_is_pure_and_the_worker_refuses_an_unprovable_replacement(
+    adapter_client, monkeypatch
+):
+    """§4.4 — a destructive replace whose proof is unavailable must not run, and the REFUSAL
+    is the worker's, not the classifier's.
+
+    There is one transport now, so there is no weaker mode to fall back to: classification
+    stays a pure function of the rows (the same plan with verification on or off), and
+    ``_refuse_unverifiable_recorded_put`` fails the job before anything is sent.
+    """
+    from nso_adapter.core.apply import _refuse_unverifiable_recorded_put
+    from nso_adapter.core.claim import JobError
     from nso_adapter.nso import apply as nso_apply
 
     device_id = await seed_device(nso_device_name="sr-plan-noverify", netbox_device_id=7003)
     await _seed_rows(device_id, [{"triple": B, "route_id": 2, "deployed_key": list(A)}])
     monkeypatch.setattr(nso_apply, "VERIFY_AFTER_APPLY", False)
     plan, _ = await _plan(device_id)
-    assert plan.mode == "PATCH"
-    assert plan.allowed == set()
+    assert plan.mode == "PUT", "the plan records that this document delivers a replacement"
+    assert A in plan.allowed
+
+    generation = SimpleNamespace(
+        device_id=device_id,
+        document={
+            "static_route": {
+                "static_route_intent": [],
+                "_execution": {
+                    "context": {"ned_id": None, "dialect": "identity"},
+                    "proof": {"apply": _serialize_apply_plan(plan)},
+                },
+            }
+        },
+    )
+    with pytest.raises(JobError) as excinfo:
+        _refuse_unverifiable_recorded_put(generation, frozenset({"static_route"}))
+    assert excinfo.value.error["code"] == "static_route_put_verify_disabled"
 
     monkeypatch.setattr(nso_apply, "VERIFY_AFTER_APPLY", True)
-    plan, _ = await _plan(device_id)
-    assert plan.mode == "PUT"
+    _refuse_unverifiable_recorded_put(generation, frozenset({"static_route"}))
 
 
 # ── C1.3 / C1.4 — plan.rows is the single source of truth ────────────────────
@@ -220,8 +277,13 @@ async def test_c1_4_any_eligible_derived_from_plan_rows_is_true(adapter_client):
     assert plan.cas[0].sent_triple == B
 
 
-async def test_c1_4b_patch_rows_are_the_eligible_list_verbatim(adapter_client):
-    """PATCH mode must not silently widen the body to every accepted row."""
+async def test_c1_4b_the_body_is_every_accepted_row_even_with_no_replacement_open(adapter_client):
+    """One document is complete desired state, so an eligible-only body is never built.
+
+    Under the per-family merge this device took the eligible list verbatim. The aggregate
+    replaces the whole family, so a body holding only the pending row would RETRACT the
+    accepted-and-clean sibling the operator never touched.
+    """
     device_id = await seed_device(nso_device_name="sr-plan-patchrows", netbox_device_id=7006)
     ids = await _seed_rows(
         device_id,
@@ -231,9 +293,9 @@ async def test_c1_4b_patch_rows_are_the_eligible_list_verbatim(adapter_client):
         ],
     )
     plan, eligible = await _plan(device_id, force=False)
-    assert plan.mode == "PATCH"
+    assert plan.mode == "PATCH", "no row carries an undelivered identity edit"
     assert eligible == [ids[B]]
-    assert [r.id for r in plan.rows] == [ids[B]]
+    assert [r.id for r in plan.rows] == [ids[A], ids[B]]
 
 
 # ── C1.5 — REPLACEMENT_OPEN is element-wise ──────────────────────────────────
@@ -369,16 +431,17 @@ def test_static_route_projection_state_uses_the_wire_renderer_for_serialized_row
 # ── C1.7 — extra_entries ─────────────────────────────────────────────────────
 
 
-async def _staged_body(rows, extra_entries=None) -> dict:
-    from nso_adapter.nso.client import NsoClient
+def _retained_body(rows, extra_entries=None) -> dict:
+    """The static-route container the sender builds: the document's rows plus retention."""
+    from nso_adapter.core.apply import overlay_retained_routes
+    from nso_adapter.nso.apply import _CONTEXT_FREE_EXECUTION, encode_static_route
 
-    client = AsyncMock(spec=NsoClient)
-    stage: dict[str, list] = {}
-    await apply_static_routes(client, "sr-extra", rows, extra_entries=extra_entries, replace=True, stage=stage)
-    return stage[_SR_ROOT][0]
+    body = encode_static_route({"static_route_intent": rows}, _CONTEXT_FREE_EXECUTION)
+    overlay_retained_routes(body, extra_entries or [])
+    return body
 
 
-async def test_c1_7_extra_entries_ride_verbatim_and_never_override_a_rendered_row():
+def test_c1_7_retained_entries_ride_verbatim_and_never_override_a_rendered_row():
     """C1.7 — retention appends what the store cannot express, and loses key collisions.
 
     ``A'`` is a live copy of a route the store still owns; letting it win would deploy
@@ -388,7 +451,7 @@ async def test_c1_7_extra_entries_ride_verbatim_and_never_override_a_rendered_ro
     stale_a = {"vrf": "", "prefix": A[1], "next-hop": A[2], "metric": 999}
     verbatim_c = {"vrf": "", "prefix": C[1], "next-hop": C[2], "tag": 7, "bfd-fast-detect": {"minimum": 50}}
 
-    body = await _staged_body([rendered_a], extra_entries=[stale_a, verbatim_c])
+    body = _retained_body([rendered_a], extra_entries=[stale_a, verbatim_c])
     assert body["route"] == [
         {"vrf": "", "prefix": A[1], "next-hop": A[2], "metric": 10},
         verbatim_c,
@@ -397,9 +460,9 @@ async def test_c1_7_extra_entries_ride_verbatim_and_never_override_a_rendered_ro
     assert body["route"][1]["bfd-fast-detect"] == {"minimum": 50}
 
 
-async def test_c1_7b_no_extra_entries_is_todays_body():
-    body = await _staged_body([_RenderRow()])
-    assert body == {"device": "sr-extra", "route": [{"vrf": "", "prefix": "10.0.0.0/24", "next-hop": "192.0.2.1"}]}
+def test_c1_7b_no_retained_entries_is_the_documents_own_body():
+    body = _retained_body([_RenderRow()])
+    assert body == {"route": [{"vrf": "", "prefix": "10.0.0.0/24", "next-hop": "192.0.2.1"}]}
 
 
 # ── C1.8 — the guard snapshot parameter ──────────────────────────────────────
@@ -419,12 +482,20 @@ class _Device:
     ned_id = "cisco-ios-cli-6.95"
 
 
+def _instance(*keys) -> dict:
+    return {
+        "device": "sr-guard",
+        "static-route": {"route": [{"vrf": k[0], "prefix": k[1], "next-hop": k[2]} for k in keys]},
+    }
+
+
+def _containers(*keys) -> dict:
+    return {"static-route": {"route": [{"vrf": k[0], "prefix": k[1], "next-hop": k[2]} for k in keys]}}
+
+
 @pytest.mark.parametrize(
     ("supplied", "label"),
-    [
-        ({"device": "sr-guard", "route": [{"vrf": "", "prefix": A[1], "next-hop": A[2]}]}, "a real snapshot"),
-        (None, "the absent-service snapshot"),
-    ],
+    [(_instance(A), "a real snapshot"), (None, "the absent-service snapshot")],
 )
 async def test_c1_8_supplied_snapshot_suppresses_the_internal_get(supplied, label):
     """C1.8 — ``current=`` is a sentinel default, so even ``None`` suppresses the GET.
@@ -433,53 +504,31 @@ async def test_c1_8_supplied_snapshot_suppresses_the_internal_get(supplied, labe
     is a valid snapshot meaning "no service instance", and re-reading it defeats the
     one-snapshot contract exactly where a second read is most likely to disagree.
     """
-    client = _guard_client(
-        {"device": "sr-guard", "route": [{"vrf": "", "prefix": "10.9.9.0/24", "next-hop": "1.2.3.4"}]}
-    )
+    client = _guard_client(_instance(("", "10.9.9.0/24", "1.2.3.4")))
 
-    async def _apply(**kwargs):
-        if kwargs.get("stage") is not None:
-            kwargs["stage"][_SR_ROOT] = [
-                {"device": "sr-guard", "route": [{"vrf": "", "prefix": A[1], "next-hop": A[2]}]}
-            ]
-        return
-
-    await removal_mod._guarded_apply(
-        client, _Device(), "static_route", {}, AsyncMock(side_effect=_apply), current=supplied
-    )
+    with patch("nso_adapter.nso.apply.apply_device_intent", new_callable=AsyncMock):
+        await removal_mod.guarded_device_write(client, _Device(), _containers(A), allowed={}, current=supplied)
     client.get_service_config.assert_not_awaited(), label
 
 
-async def test_c1_8b_other_scopes_still_read_the_service_themselves():
-    """The twelve scopes that pass nothing keep today's internal GET."""
+async def test_c1_8b_a_send_with_no_snapshot_reads_the_instance_itself():
+    """A document with no static-route section takes no certified read, so the guard reads."""
     client = _guard_client(None)
-    await removal_mod._guarded_apply(client, _Device(), "vlan", {}, AsyncMock())
+    with patch("nso_adapter.nso.apply.apply_device_intent", new_callable=AsyncMock):
+        await removal_mod.guarded_device_write(client, _Device(), {"vlan": {"vlan": []}}, allowed={})
     client.get_service_config.assert_awaited_once()
 
 
 async def test_c1_8c_a_supplied_snapshot_still_drives_the_guard():
     """Handing the snapshot in must not disable the collateral check."""
     client = _guard_client(None)  # would look clean if the helper re-read
-    supplied = {
-        "device": "sr-guard",
-        "route": [
-            {"vrf": "", "prefix": A[1], "next-hop": A[2]},
-            {"vrf": "", "prefix": C[1], "next-hop": C[2]},  # orphan
-        ],
-    }
-
-    async def _apply(**kwargs):
-        if kwargs.get("stage") is not None:
-            kwargs["stage"][_SR_ROOT] = [
-                {"device": "sr-guard", "route": [{"vrf": "", "prefix": A[1], "next-hop": A[2]}]}
-            ]
-        return "preview"
-
-    with pytest.raises(removal_mod.RemovalBlockedError) as excinfo:
-        await removal_mod._guarded_apply(
-            client, _Device(), "static_route", {}, AsyncMock(side_effect=_apply), current=supplied
-        )
-    assert excinfo.value.orphans == {"route": [["", C[1], C[2]]]}
+    with (
+        patch("nso_adapter.nso.apply.apply_device_intent", new_callable=AsyncMock, return_value="preview"),
+        pytest.raises(removal_mod.RemovalBlockedError) as excinfo,
+    ):
+        await removal_mod.guarded_device_write(client, _Device(), _containers(A), allowed={}, current=_instance(A, C))
+    # Scope-qualified: the guard is device-wide, and two families both have a `host` list.
+    assert excinfo.value.orphans == {"static_route/route": [["", C[1], C[2]]]}
     client.get_service_config.assert_not_awaited()
 
 
@@ -676,12 +725,13 @@ async def test_recorded_plan_rejects_a_malformed_sent_triple(adapter_client):
     # Pinned: the plan raises from four independent checks, and the CAS-coordinate one is a
     # plausible alternative source with no eligible rows.
     with pytest.raises(ValueError, match="must contain three values"):
-        hydrate_static_route_apply_plan(document, eligible_rows=[])
+        hydrate_static_route_apply_plan(document)
 
 
 async def test_plan_writes_nothing(adapter_client):
-    """``build_plan`` is read-only — no stamping, no consumption, no HTTP."""
-    from nso_adapter.store.models import Device, StaticRouteIntent
+    """Classification is read-only — no stamping, no consumption, no HTTP."""
+    from nso_adapter.core.static_route_plan import classify_apply_plan
+    from nso_adapter.store.models import StaticRouteIntent
 
     device_id = await seed_device(nso_device_name="sr-plan-readonly", netbox_device_id=7013)
     await _seed_rows(device_id, [{"triple": B, "route_id": 2, "deployed_key": list(A)}])
@@ -696,8 +746,12 @@ async def test_plan_writes_nothing(adapter_client):
             .scalars()
             .all()
         )
-        device = await db.get(Device, device_id)
-        await build_plan(db, device, eligible_rows=[])
+        rows = list(
+            (await db.execute(sa.select(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id)))
+            .scalars()
+            .all()
+        )
+        classify_apply_plan(rows, [], device_id=device_id)
         await db.rollback()
 
     async with session() as db:

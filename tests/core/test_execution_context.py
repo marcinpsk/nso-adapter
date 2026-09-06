@@ -208,7 +208,7 @@ async def test_scenario_1_a_reissue_carries_the_context_and_proof_its_authorizat
     eligibility = _execution(reissue, "interface_config")["proof"]["attribute_eligibility"]
     assert set(eligibility.values()) == {True}, "eligibility was re-resolved from now-ineligible live state"
     assert hydrate_interface_execution(reissue.document).eligible_attributes
-    assert hydrate_static_route_apply_plan(reissue.document, eligible_rows=[]).mode in {"PATCH", "PUT"}
+    assert hydrate_static_route_apply_plan(reissue.document).mode in {"PATCH", "PUT"}
     for stream, revision in (("interface_config", 1), ("static_route", 1)):
         row = await _stream(device_id, stream)
         assert (row.authorized_revision, row.applied_revision) == (revision, revision)
@@ -255,7 +255,7 @@ async def test_scenario_2_a_settled_carrier_is_pruned_from_the_fragment_and_ever
     assert pruned["_execution"]["proof"]["apply"]["tombstone_ids"] == []
     assert pruned["static_route_tombstone"] == []
     later = (await _generations(device_id))[-1]
-    assert hydrate_static_route_apply_plan(later.document, eligible_rows=[]).tombstone_ids == []
+    assert hydrate_static_route_apply_plan(later.document).tombstone_ids == []
 
     stored = (await _generations(device_id))[0]
     assert (stored.document, stored.digest) == (frozen_document, frozen_digest), "an immutable document was rewritten"

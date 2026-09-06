@@ -12,8 +12,9 @@ key, so retention would omit it and a consumption proof would wrongly permit con
 
 Changing the URL alone does not fix it, because the nesting is wrong too. So the path and the
 projection live HERE and nowhere else, and every consumer keeps the shape it already reads:
-``{"route": [...]}``. When the cutover installs the aggregate, this module changes and no
-consumer does.
+``{"route": [...]}``. The aggregate sender made that real: the path is now the one
+``device-intent`` instance (``NsoClient.service_instance_state``) and the projection reads the
+section out of its ``static-route`` container.
 """
 
 from __future__ import annotations
@@ -24,9 +25,6 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-#: The legacy per-family instance, until C9's cutover replaces it with the aggregate.
-STATIC_ROUTE_SERVICE_PATH = "/restconf/data/static-route-reconciler:static-route-config"
-
 
 class CertifiedSection(NamedTuple):
     """A certified verdict about the device's static-route section.
@@ -35,10 +33,15 @@ class CertifiedSection(NamedTuple):
     CONCLUSIVE and means the certified instance carries no static-route entry, from a
     conclusive 404 and from an empty container alike. Anything uncertifiable is
     ``inconclusive`` and every consumer refuses on it.
+
+    *instance* is the whole certified instance the same read saw, so the sender's collateral
+    guard and the retained entries come from ONE read (#1396 R2 §4.1) instead of two that can
+    disagree. It is ``None`` for a certified absence and for an uncertifiable read alike.
     """
 
     status: str
     entry: dict | None
+    instance: dict | None = None
 
     @property
     def inconclusive(self) -> bool:
@@ -56,7 +59,7 @@ async def certified_static_route_section(client, device) -> CertifiedSection:
     The read may refuse a write and may supply the bytes of a key the caller's frozen plan
     already names; it may never add a key, authorize an omission or select a carrier.
     """
-    state = await client.service_instance_state(STATIC_ROUTE_SERVICE_PATH, device.nso_device_name)
+    state = await client.service_instance_state(device.nso_device_name)
     if state.inconclusive:
         return CertifiedSection("inconclusive", None)
     try:
@@ -67,8 +70,8 @@ async def certified_static_route_section(client, device) -> CertifiedSection:
     if not routes:
         # An instance with no entry and no instance at all say the same thing, and the
         # consumers all treat "certified nothing here" alike.
-        return CertifiedSection("absent", None)
-    return CertifiedSection("present", {"route": routes})
+        return CertifiedSection("absent", None, state.entry)
+    return CertifiedSection("present", {"route": routes}, state.entry)
 
 
 class _Uncertifiable(Exception):
@@ -115,4 +118,4 @@ def _certify_entry(route: object) -> None:
             raise _Uncertifiable(f"a route entry carries a non-string {leaf}: {value!r}")
 
 
-__all__ = ["STATIC_ROUTE_SERVICE_PATH", "CertifiedSection", "certified_static_route_section"]
+__all__ = ["CertifiedSection", "certified_static_route_section"]

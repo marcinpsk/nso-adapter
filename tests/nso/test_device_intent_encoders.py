@@ -180,42 +180,38 @@ def test_a_registry_naming_an_unregistered_read_family_fails_at_startup(monkeypa
         projection._validate_section_registry(frozenset({"switchport", "lag"}))
 
 
-# ── Pins on the legacy per-family tables the aggregate sender deletes (#1522 C9 S3) ──
+# ── the derived consumers: every one of them READS the registry (#1522 memo A8) ──
 #
-# Until the sender reads the registry, these tables and the registry hold the same facts
-# twice. Each pin dies with the table it guards.
+# Each pin used to guard a hand-kept table beside the registry. The tables are gone with the
+# per-family senders, so the pins now hold the consumers to the registry instead.
 
 
-def test_the_registry_result_keys_are_the_batch_scope_result_order():
-    from nso_adapter.core.apply import _SCOPE_RESULT_ORDER
+def test_the_job_result_counters_are_the_registry_result_keys_in_registry_order():
+    from nso_adapter.core.apply import _result_keys
 
-    batch = [
-        key
-        for section, entry in section_registry().items()
-        if section not in ("interface_config", "switchport", "lag")
-        for key in entry.result_keys
-    ]
-    assert tuple(batch) == _SCOPE_RESULT_ORDER
+    expected = tuple(key for entry in section_registry().values() for key in entry.result_keys)
+    assert _result_keys() == expected
+    # The counter names themselves are a plugin contract and did not change with the sender.
+    assert set(_result_keys()) >= {"attribute", "ip", "snmp", "static_route", "logging", "switchport", "lag"}
+    assert _result_keys()[-2:] == ("attribute", "ip"), "the two interface counters follow the batch counters"
 
 
-def test_the_registry_covers_every_atomically_staged_scope():
-    from nso_adapter.core.apply import _ATOMIC_SCOPE_ROOTS, _IFACE_CONFIG_ROOT, _capability_scopes_for
+def test_capability_scopes_resolve_through_the_registry_container_map():
+    from nso_adapter.core.apply import _capability_scopes_for
 
-    assert set(_ATOMIC_SCOPE_ROOTS.values()) <= set(section_registry())
-    for root, section in _ATOMIC_SCOPE_ROOTS.items():
-        assert tuple(_capability_scopes_for(root)) == section_registry()[section].capability_scopes
-    assert tuple(_capability_scopes_for(_IFACE_CONFIG_ROOT)) == section_registry()["interface_config"].capability_scopes
+    for section, entry in section_registry().items():
+        assert tuple(_capability_scopes_for(entry.container)) == entry.capability_scopes, section
+    assert _capability_scopes_for("no-such-family") == []
 
 
 def test_every_read_family_resolves_to_the_residue_wire_name():
-    from nso_adapter.core.importer import _projectable_spec
-    from nso_adapter.core.removal import _RESIDUE_WIRE_NAMES
+    from nso_adapter.core.importer import projectable_spec
+    from nso_adapter.core.removal import residue_wire_name
 
-    for section, wire_name in _RESIDUE_WIRE_NAMES.items():
-        spec = _projectable_spec(section_registry()[section].read_family)
-        assert spec is not None and spec.wire_name == wire_name, section
-    for section in ("switchport", "lag"):
-        assert _projectable_spec(section_registry()[section].read_family) is not None
+    for section, entry in section_registry().items():
+        spec = projectable_spec(entry.read_family)
+        assert spec is not None, section
+        assert residue_wire_name(section) == spec.wire_name, section
 
 
 # ── the purity rule the amendment states: encode(rows, frozen context) ───────────────

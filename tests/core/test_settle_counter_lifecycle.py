@@ -323,6 +323,7 @@ async def test_a_failed_allocation_never_takes_a_second_terminal_write(adapter_c
     from nso_adapter.core.apply import run_apply
     from nso_adapter.core.claim import BookkeepingOutcomeUnknown, acquire_claim, release_claim
     from nso_adapter.store.models import StaticRouteIntent
+    from tests.core.test_static_route_removal import SrFake, sr_client
 
     device_id = await seed_device(nso_device_name=f"lc-alloc-{failure}", netbox_device_id=8631)
     async with session() as db:
@@ -354,20 +355,22 @@ async def test_a_failed_allocation_never_takes_a_second_terminal_write(adapter_c
 
     reg = await acquire_claim(device_id, "job", job_id=job_id)
     reg.run_attempt = 1
-    applied = AsyncMock()
+    # The real RESTCONF boundary, so "the device work happened" is an observed PUT rather
+    # than an awaited mock: the aggregate sends ONE document for the whole device.
+    fake = SrFake(f"lc-alloc-{failure}", service=[])
     refresh = AsyncMock()
     try:
         with (
-            patch("nso_adapter.core.importer.get_nso_client", return_value=AsyncMock()),
+            patch("nso_adapter.core.importer.get_nso_client", return_value=sr_client(fake)),
             patch("nso_adapter.core.apply._post_apply_refresh_and_notify", new=refresh),
-            patch("nso_adapter.nso.apply.apply_static_routes", new=applied),
         ):
             with pytest.raises(BookkeepingOutcomeUnknown):
                 await run_apply(job_id=job_id, device_id=device_id, force=True, reg=reg)
     finally:
         await release_claim(reg)
 
-    assert applied.await_count > 0, "the pin no longer models a failure AFTER the device work"
+    assert fake.writes, "the pin no longer models a failure AFTER the device work"
+    assert fake.sent_keys() == {("", "10.6.0.0/24", "10.6.0.1")}
     refresh.assert_not_awaited()
 
     async with session() as db:

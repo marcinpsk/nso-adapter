@@ -31,26 +31,29 @@ _INCREMENT_FOUR_SECTIONS = frozenset({"interface_config"})
 _INCREMENT_FIVE_SECTIONS = frozenset({"static_route"})
 
 
-def test_every_section_is_either_document_executed_awaiting_a_sender_or_names_its_blocker():
-    """Three states, no fourth. Manual selection and execution stay equal but distinct."""
+def test_every_section_executes_from_its_document_or_names_its_blocker():
+    """Two states, no third. Manual selection and execution stay equal but distinct.
+
+    The aggregate sender closed the completion pin: switchport and lag joined the executed
+    set, ``AWAITING_SENDER_SECTIONS`` is gone, and every section of the registry now has a
+    device writer.
+    """
     from nso_adapter.core.projection import (
         ACTION_APPLY_EXECUTABLE_SECTIONS,
-        AWAITING_SENDER_SECTIONS,
+        CLAIM_LESS_SECTIONS,
         DOCUMENT_EXECUTED_SECTIONS,
         LIVE_READ_SECTIONS,
         projection_sections,
     )
 
-    partition = DOCUMENT_EXECUTED_SECTIONS | set(LIVE_READ_SECTIONS) | AWAITING_SENDER_SECTIONS
+    partition = DOCUMENT_EXECUTED_SECTIONS | set(LIVE_READ_SECTIONS)
     assert partition == projection_sections(), (
         f"sections with no disposition: {sorted(projection_sections() - partition)}; "
         f"unknown sections named: {sorted(partition - projection_sections())}"
     )
     assert not (DOCUMENT_EXECUTED_SECTIONS & set(LIVE_READ_SECTIONS)), "a section cannot be both"
-    assert not (DOCUMENT_EXECUTED_SECTIONS & AWAITING_SENDER_SECTIONS), "a section cannot be both"
-    assert not (set(LIVE_READ_SECTIONS) & AWAITING_SENDER_SECTIONS), "a section cannot be both"
-    assert AWAITING_SENDER_SECTIONS == {"switchport", "lag"}, (
-        "the completion pin C9 deletes names exactly the two sections with no device writer"
+    assert CLAIM_LESS_SECTIONS <= DOCUMENT_EXECUTED_SECTIONS, (
+        "the two out-of-protocol sections execute from their documents like every other one"
     )
     assert all(reason for reason in LIVE_READ_SECTIONS.values()), "every live-read section must state why"
     assert ACTION_APPLY_EXECUTABLE_SECTIONS == DOCUMENT_EXECUTED_SECTIONS, (
@@ -66,8 +69,9 @@ def test_every_section_is_either_document_executed_awaiting_a_sender_or_names_it
         | _INCREMENT_FOUR_SECTIONS
         | _INCREMENT_FIVE_SECTIONS
     )
-    assert incremented | {"vlan"} == DOCUMENT_EXECUTED_SECTIONS, (
-        "vlan is intentionally document-executed without an incremental rollout step"
+    assert incremented | {"vlan"} | CLAIM_LESS_SECTIONS == DOCUMENT_EXECUTED_SECTIONS, (
+        "vlan is intentionally document-executed without an incremental rollout step, and the "
+        "two claim-less sections arrived with the aggregate sender"
     )
 
 
@@ -160,7 +164,6 @@ def test_increment_four_sections_are_document_executed():
 def test_increment_five_completes_document_execution():
     from nso_adapter.core.projection import (
         ACTION_APPLY_EXECUTABLE_SECTIONS,
-        AWAITING_SENDER_SECTIONS,
         DOCUMENT_EXECUTED_SECTIONS,
         LIVE_READ_SECTIONS,
         projection_sections,
@@ -171,12 +174,12 @@ def test_increment_five_completes_document_execution():
     assert _INCREMENT_FIVE_SECTIONS <= DOCUMENT_EXECUTED_SECTIONS
     assert LIVE_READ_SECTIONS == {}
     assert ACTION_APPLY_EXECUTABLE_SECTIONS is DOCUMENT_EXECUTED_SECTIONS
-    assert DOCUMENT_EXECUTED_SECTIONS | AWAITING_SENDER_SECTIONS == projection_sections()
+    assert DOCUMENT_EXECUTED_SECTIONS == projection_sections()
     assert len(projection_sections()) == 16
     assert len(projection_streams()) == 18
     assert {
         stream for stream in projection_streams() if stream_section(stream) not in ACTION_APPLY_EXECUTABLE_SECTIONS
-    } == {"switchport", "lag"}
+    } == set(), "every stream's section is selectable now that the aggregate sender writes them all"
 
 
 @pytest.mark.parametrize(
@@ -383,7 +386,7 @@ async def test_a_snapshot_hydrates_back_into_the_rows_it_was_taken_from(adapter_
 async def test_bgp_snapshot_hydrates_the_relationship_graph_for_the_writer(adapter_client):
     """Durable parent identities rebuild the complete BGP writer graph."""
     from nso_adapter.core.projection import hydrate_section, rows_by_intent_identity, snapshot_stream
-    from nso_adapter.nso.apply import apply_bgp_config
+    from nso_adapter.nso.apply import _CONTEXT_FREE_EXECUTION, encode_bgp
     from nso_adapter.store.models import (
         BgpAfIntent,
         BgpPeerAfIntent,
@@ -423,10 +426,11 @@ async def test_bgp_snapshot_hydrates_the_relationship_graph_for_the_writer(adapt
 
     assert set(rows_by_intent_identity(fragment, "bgp_peer_af_intent")) == {("64512", "", "192.0.2.1", "ipv4-unicast")}
     rows = hydrate_section({"bgp": fragment}, "bgp")
-    stage: dict[str, list] = {}
-    await apply_bgp_config(None, "projection-bgp-graph", rows[BgpRouterIntent], stage=stage)
+    body = encode_bgp(
+        {"bgp_router_intent": rows[BgpRouterIntent], "redistribution_intent": []}, _CONTEXT_FREE_EXECUTION
+    )
 
-    router = stage["bgp-reconciler:bgp-config"][0]["router"][0]
+    router = body["router"][0]
     assert router == {
         "asn": 64512,
         "router-id": "192.0.2.254",

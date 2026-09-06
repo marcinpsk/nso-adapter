@@ -117,7 +117,6 @@ class ActionApplyOut(BaseModel):
             "revision_mismatch",
             # The two out-of-protocol switching streams: no receipt, no push sequence.
             "no_prepared_revision",
-            "awaiting_aggregate_sender",
         ],
     ]
     skipped_detail: dict[str, ActionApplySkippedDetailOut] | None
@@ -173,12 +172,10 @@ async def action_force_removal(
     reviewing the blocked job's orphan list + dry-run preview, this deliberately
     flushes the orphaned service rows (PUT-replace with only the remaining intent).
 
-    ``interface_config`` is per-instance (interface-reconciler is keyed by
-    ``(device, interface-name)``), so its removal job flushes exactly the interfaces named
-    in *interfaces* — with none, ``_replace_interface_config`` iterates an empty list and
-    the job succeeds having pushed NOTHING, telling the operator their orphaned addresses
-    were flushed while the config is still live on the device. Reject that rather than
-    succeed at nothing.
+    The flush is the device's whole document with the guard off: every family keeps its
+    authorized rows and the orphans the guard was blocking on are simply not in it. The
+    static-route section additionally suppresses retention, so a carrier-claimed key the
+    operator is flushing is not preserved by the very write that flushes it (#1683).
 
     It PROMOTES NOTHING (#1522 §G2). The flush re-deploys state an earlier push already
     authorized, with the guard off, so ``enqueue_removal`` gives it a reissue generation.
@@ -186,30 +183,13 @@ async def action_force_removal(
     settlement then certified them applied — the sibling lane's un-promoted store-only state
     included, on interfaces this job never sends.
     """
-    from nso_adapter.core.projection import AWAITING_SENDER_SECTIONS
-    from nso_adapter.core.removal import VALID_REMOVAL_SCOPES, enqueue_removal
+    from nso_adapter.core.removal import enqueue_removal, valid_removal_scopes
 
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
-    if body.scope not in VALID_REMOVAL_SCOPES:
+    if body.scope not in valid_removal_scopes():
         raise api_error(400, "bad_request", f"Unknown removal scope {body.scope!r}")
-    # Refused at ADMISSION, before any generation or job: a section with no device writer has
-    # no dispatch handler, and a failed head would block every later device write.
-    if body.scope in AWAITING_SENDER_SECTIONS:
-        raise api_error(
-            400,
-            "bad_request",
-            f"Removal scope {body.scope!r} has no device writer yet",
-            {"scope": body.scope, "reason": "awaiting_aggregate_sender"},
-        )
-    if body.scope == "interface_config" and not body.interfaces:
-        raise api_error(
-            400,
-            "bad_request",
-            "force-removal of interface_config requires 'interfaces': the interface-reconciler "
-            "is keyed per interface, so with none named the job would flush nothing.",
-        )
     job = await enqueue_removal(
         db,
         device_id,

@@ -5,10 +5,9 @@
 Two vocabularies, deliberately different sizes.
 
 A *section* is one family of the device's outbound DOCUMENT — the same vocabulary the
-removal scopes already use, so there is one name for ``isis`` and not two. The section set
-is DERIVED from :data:`core.removal.VALID_REMOVAL_SCOPES`; it is never restated here,
-because a section the removal path can address and the generation path cannot would be a
-family whose shrink has no promotion record.
+removal scopes already use, so there is one name for ``isis`` and not two. The registry here
+IS that vocabulary: a removal scope is one of these families emptied, so there is no second
+list for the removal path to drift from.
 
 A *stream* is one endpoint's delivery lane: sixteen of them, one per in-protocol intent PUT
 (:mod:`core.intent_protocol`). It is the AUTHORIZATION unit — what a receipt keys on and
@@ -443,25 +442,16 @@ def _stream_section() -> dict[str, str]:
 def projection_sections() -> frozenset[str]:
     """Every section name a stored DOCUMENT can carry — the outbound device families.
 
-    Derived, not restated, from two directions and checked at the first caller's import
-    rather than as an empty document later:
-
-    * the removal scopes ARE the write-path families, so a scope missing from
-      :data:`_SECTION_REGISTRY` is a family whose document could not be built;
-    * every in-protocol intent endpoint promotes one of these, so an endpoint naming a
-      family with no tables would bump a revision nothing can ever deploy.
+    The registry IS the vocabulary: a section is a family the aggregate document can carry,
+    and a removal scope is such a family emptied — there is no second list to agree with.
+    One direction is still checked here, at the first caller's import rather than as an empty
+    document later: every in-protocol intent endpoint promotes one of these, so an endpoint
+    naming a family with no tables would bump a revision nothing can ever deploy.
 
     This is NOT the promotion vocabulary — see :func:`projection_streams`.
     """
     from nso_adapter.core.intent_protocol import INTENT_PUT_ENDPOINTS
-    from nso_adapter.core.removal import VALID_REMOVAL_SCOPES
 
-    missing = VALID_REMOVAL_SCOPES - set(_SECTION_REGISTRY)
-    if missing:
-        raise RuntimeError(f"projection sections missing intent tables: {sorted(missing)}")
-    extra = set(_SECTION_REGISTRY) - VALID_REMOVAL_SCOPES
-    if extra:
-        raise RuntimeError(f"projection sections name no removal scope: {sorted(extra)}")
     unpromotable = {e.promotes for e in INTENT_PUT_ENDPOINTS.values()} - set(_SECTION_REGISTRY)
     if unpromotable:
         raise RuntimeError(f"intent endpoints promote sections with no intent tables: {sorted(unpromotable)}")
@@ -792,9 +782,11 @@ DOCUMENT_EXECUTED_SECTIONS: frozenset[str] = frozenset(
         "interface_mtu",
         "l2_sap",
         "isis",
+        "lag",
         "route_policy",
         "ospf",
         "static_route",
+        "switchport",
     }
 )
 
@@ -809,12 +801,6 @@ LIVE_READ_SECTIONS: dict[str, str] = {}
 #: Startup pins the out-of-protocol stream set against this, so a third such stream cannot
 #: appear without the registry changing with it.
 CLAIM_LESS_SECTIONS: frozenset[str] = frozenset({"switchport", "lag"})
-
-#: The sections that have no device writer yet, so manual Apply refuses to select them and
-#: force-removal refuses to address them (#1612). A COMPLETION PIN, not a capability flag:
-#: C9's aggregate sender moves both names into :data:`DOCUMENT_EXECUTED_SECTIONS`, empties
-#: this set and restores the two equalities the partition test carries.
-AWAITING_SENDER_SECTIONS: frozenset[str] = CLAIM_LESS_SECTIONS
 
 #: Reserved section key for a section's execution metadata: its frozen encoding context,
 #: the proof its own rows were authorized with, and the operation plane one generation
@@ -1382,7 +1368,6 @@ async def snapshot_stream(db: AsyncSession, device_id: int, stream: str) -> dict
 __all__ = [
     "ACTION_APPLY_EXECUTABLE_SECTIONS",
     "APPLY_BOOKKEEPING_COLUMNS",
-    "AWAITING_SENDER_SECTIONS",
     "BESPOKE_EXPANSION",
     "CLAIM_LESS_SECTIONS",
     "NO_COMPARISON",

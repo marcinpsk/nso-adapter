@@ -64,8 +64,14 @@ class ServiceInstanceState(NamedTuple):
         return self.status == "inconclusive"
 
 
-def _inconclusive(service_path: str, device_name: str, reason: str) -> ServiceInstanceState:
-    logger.warning("nso.service_instance_inconclusive", service=service_path, device=device_name, reason=reason)
+#: The ONE service the adapter writes and reads back: one aggregate instance per device
+#: (#1522). The write side spells its containers; both sides spell the path here.
+DEVICE_INTENT_ROOT = "device-intent:device-intent"
+DEVICE_INTENT_PATH = f"/restconf/data/{DEVICE_INTENT_ROOT}"
+
+
+def _inconclusive(device_name: str, reason: str) -> ServiceInstanceState:
+    logger.warning("nso.service_instance_inconclusive", service=DEVICE_INTENT_PATH, device=device_name, reason=reason)
     return ServiceInstanceState("inconclusive", None)
 
 
@@ -261,27 +267,24 @@ class NsoClient:
                     return device_type[key].get("ned-id")
             return None
 
-    async def get_service_config(self, service_path: str, device_name: str) -> dict | None:
-        """Return the device's current reconciler service instance, or None when absent.
+    async def get_service_config(self, device_name: str) -> dict | None:
+        """Return the device's current ``device-intent`` instance, or None when absent.
 
-        *service_path* is the service's RESTCONF data path (the apply module's
-        ``*_SERVICE_PATH`` constants, e.g. ``/restconf/data/isis-reconciler:isis-config``).
-        The removal collateral guard compares these rows — what a PUT-replace will
-        RETRACT from the device — against the would-be replacement body before
-        committing (the ra1 lo0 incident: orphaned service rows silently flushed).
+        The removal collateral guard compares these rows — what the full-document PUT will
+        RETRACT from the device — against the would-be body before committing (the ra1 lo0
+        incident: orphaned service rows silently flushed).
         """
-        url = f"{self._base}{service_path}={_url_key(device_name)}"
+        url = f"{self._base}{DEVICE_INTENT_PATH}={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
                 return None
             resp.raise_for_status()
             data = resp.json()
-            root = service_path.rsplit("/", 1)[-1]
-            entries = data.get(root) or data.get(root.split(":", 1)[-1], [])
+            entries = data.get(DEVICE_INTENT_ROOT) or data.get(DEVICE_INTENT_ROOT.split(":", 1)[-1], [])
             return entries[0] if entries else None
 
-    async def service_instance_state(self, service_path: str, device_name: str) -> ServiceInstanceState:
+    async def service_instance_state(self, device_name: str) -> ServiceInstanceState:
         """Read the service instance and CERTIFY the verdict — ``present``/``absent``/``inconclusive``.
 
         :meth:`get_service_config` cannot certify an absence (#1396 R2 §4.4): it returns ``None``
@@ -295,7 +298,7 @@ class NsoClient:
         ``absent`` is ONLY a conclusive keyed 404. A transport error or a non-404 error status
         raises, as it does for every other read here.
         """
-        url = f"{self._base}{service_path}={_url_key(device_name)}"
+        url = f"{self._base}{DEVICE_INTENT_PATH}={_url_key(device_name)}"
         async with self._client() as c:
             resp = await c.get(url)
             if resp.status_code == 404:
@@ -306,23 +309,22 @@ class NsoClient:
             except Exception:
                 data = None
             if not isinstance(data, dict):
-                return _inconclusive(service_path, device_name, "unparseable body")
-            root = service_path.rsplit("/", 1)[-1]
-            entries = data.get(root)
+                return _inconclusive(device_name, "unparseable body")
+            entries = data.get(DEVICE_INTENT_ROOT)
             if entries is None:
-                entries = data.get(root.split(":", 1)[-1])
+                entries = data.get(DEVICE_INTENT_ROOT.split(":", 1)[-1])
             if not isinstance(entries, list) or len(entries) != 1:
                 # A keyed GET answers with exactly its one instance. Zero is the empty-root
                 # case; more than one means we are not reading what we asked for, and
                 # picking [0] would compute retention and collateral from another device's
                 # instance — a PUT that omits this device's real rows.
                 got = len(entries) if isinstance(entries, list) else "no recognized root"
-                return _inconclusive(service_path, device_name, f"expected one instance, got {got}")
+                return _inconclusive(device_name, f"expected one instance, got {got}")
             entry = entries[0]
             if not isinstance(entry, dict) or not entry:
-                return _inconclusive(service_path, device_name, "empty instance entry")
+                return _inconclusive(device_name, "empty instance entry")
             if entry.get("device") != device_name:
-                return _inconclusive(service_path, device_name, f"instance echoes device {entry.get('device')!r}")
+                return _inconclusive(device_name, f"instance echoes device {entry.get('device')!r}")
             return ServiceInstanceState("present", entry)
 
     # ── device-state envelope (READSEM S3) — status-declared per-family reads ─────────

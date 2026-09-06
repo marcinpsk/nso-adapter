@@ -201,10 +201,11 @@ async def test_a_networked_removal_whose_service_still_holds_the_key_keeps_its_c
         # The commit really does clean the device; the SERVICE keeps A, which is the state
         # the conjunct exists to notice.
         state = original()
-        if state.entry is not None and A not in {
-            (e.get("vrf") or "", e.get("prefix") or "", e.get("next-hop") or "") for e in state.entry["route"]
+        section = (state.entry or {}).get("static-route")
+        if section is not None and A not in {
+            (e.get("vrf") or "", e.get("prefix") or "", e.get("next-hop") or "") for e in section["route"]
         }:
-            state.entry["route"] = [*state.entry["route"], wire(A)]
+            section["route"] = [*section["route"], wire(A)]
         return state
 
     fake.state = _sticky_service

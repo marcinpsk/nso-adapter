@@ -89,7 +89,8 @@ async def seed_removal_job(device_id: int, context: dict, *, tombs: tuple[int, .
             device_id,
             mode=GenerationMode.detach if full_context.get("detach") else GenerationMode.networked,
             removal_context=full_context,
-            allowed_removal_keys=full_context.get("removed") or {},
+            # Scope-qualified, like every real producer: the guard is device-wide now.
+            allowed_removal_keys={"static_route": full_context["removed"]} if full_context.get("removed") else {},
             static_route_tombstone_ids=tuple(tombs),
         )
         # Started, at attempt 1: see seed_apply_job in test_static_route_put.

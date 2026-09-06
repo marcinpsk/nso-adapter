@@ -28,8 +28,12 @@ pytestmark = pytest.mark.anyio
 
 AUTH = {"Authorization": f"Bearer {VALID_TOKEN}"}
 
-_VLAN_ROOT = "vlan-reconciler:vlan-config"
-_SNMP_ROOT = "snmp-reconciler:snmp-config"
+#: The ONE service every family writes: ``list device-intent[device]``. A body carries one
+#: entry whose keys are the YANG containers the document asserts.
+_DI_ROOT = "device-intent:device-intent"
+#: The containers the cases below reach for by name.
+_VLAN_CONTAINER = "vlan"
+_SNMP_CONTAINER = "snmp"
 
 
 # ── the recorded RESTCONF boundary ───────────────────────────────────────────
@@ -54,7 +58,7 @@ class _Recorder:
                 request=request,
                 json={"dry-run-result": {"native": {"device": [{"name": self.device_name, "data": ""}]}}},
             )
-        if self.fail_vlan and _VLAN_ROOT in (body or {}):
+        if self.fail_vlan and _VLAN_CONTAINER in (self._instance(body) or {}):
             return httpx.Response(
                 400,
                 request=request,
@@ -62,16 +66,32 @@ class _Recorder:
             )
         return httpx.Response(204, request=request, text="")
 
+    @staticmethod
+    def _instance(body) -> dict | None:
+        """The device-intent list entry a request carried, or ``None`` for anything else."""
+        entries = (body or {}).get(_DI_ROOT)
+        return entries[0] if isinstance(entries, list) and entries else None
+
     @property
     def commits(self) -> list[dict]:
         return [c for c in self.calls if not c["dry_run"]]
 
-    def bodies(self, root: str) -> list[dict]:
-        return [c["body"] for c in self.commits if root in (c["body"] or {})]
+    @property
+    def documents(self) -> list[dict]:
+        """Every device-intent instance this device really committed, in order."""
+        return [instance for call in self.commits if (instance := self._instance(call["body"])) is not None]
+
+    def bodies(self, container: str) -> list[dict]:
+        """Every committed document that CARRIED *container* — omission is retraction now."""
+        return [instance for instance in self.documents if container in instance]
+
+    def container(self, container: str, index: int = -1) -> dict:
+        """One committed document's body for *container*."""
+        return self.bodies(container)[index][container]
 
     def vlan_ids(self) -> list[list[int]]:
-        """Per real vlan-config commit, the vlan ids the body carried."""
-        return [[entry["vlan-id"] for entry in body[_VLAN_ROOT][0]["vlan"]] for body in self.bodies(_VLAN_ROOT)]
+        """Per committed document carrying the vlan family, the vlan ids the body carried."""
+        return [[entry["vlan-id"] for entry in doc[_VLAN_CONTAINER]["vlan"]] for doc in self.bodies(_VLAN_CONTAINER)]
 
 
 def recorded_client(device_name: str, *, on_sync_from=None, fail_vlan: bool = False, device_state: dict | None = None):
@@ -526,11 +546,11 @@ async def test_f8_e_a_force_removal_authorizes_nothing_outside_the_interfaces_it
     job_id = await run_head(device_id, client)
     assert job_id is not None
     assert (await job_row(job_id)).status.value == "succeeded"
-    # The interface-reconciler is keyed per interface, so the instance key is in the URL.
-    assert [c["url"] for c in rec.commits if "Gi0%2F2" in c["url"]] == [], (
-        "the flush sent the interface it was never given"
-    )
-    assert [c["url"] for c in rec.commits if "Gi0%2F1" in c["url"]] != [], "the flush sent nothing at all"
+    # One document, so the interface the flush must not carry is read out of the body it
+    # transmitted, not out of a per-interface instance URL.
+    (document,) = rec.documents
+    sent = [entry["interface-name"] for entry in document.get("interface", {}).get("interface", [])]
+    assert "Gi0/2" not in sent, "the flush sent the store-only repair it never authorized"
 
     sibling = await stream_row(device_id, "ip")
     assert sibling.authorized_revision == 0
@@ -881,7 +901,7 @@ async def _block_the_head(client, device_id: int, device_name: str):
     assert (await put_vlans(client, device_id, [10])).status_code == 200
     failing, rec = recorded_client(device_name, fail_vlan=True)
     await run_head(device_id, failing)
-    assert rec.bodies(_VLAN_ROOT), "the injected vlan rejection never fired"
+    assert rec.bodies(_VLAN_CONTAINER), "the injected vlan rejection never fired"
     (head,) = await generations(device_id)
     return head
 

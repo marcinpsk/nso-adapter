@@ -39,10 +39,12 @@ _ROOT = pathlib.Path(__file__).resolve().parents[2] / "nso_adapter"
 # (module, enclosing function, the log event that identifies the broad handler).
 # Named rather than derived: the point is that THESE sites are covered, and a rename
 # should fail the test rather than silently shrink the inventory.
+# The per-scope and per-item handlers (``_run_scope``, the attribute and IP loops) went with
+# the per-scope send path: one document is one commit, so their sites no longer exist and
+# their stamping now runs unwrapped, where an exception reaches ``run_apply`` and is re-raised
+# there instead of being swallowed.
 INVENTORY = [
-    ("core/apply.py", "_run_scope", "{log_label}_unexpected_error"),
-    ("core/apply.py", None, "apply.attribute_unexpected_error"),
-    ("core/apply.py", None, "apply.ip_unexpected_error"),
+    ("core/apply.py", "_static_route_device_state", "static_route.device_state_read_failed"),
     ("core/apply.py", "_post_apply_refresh_and_notify", "apply.post_refresh_failed"),
     ("core/apply.py", "run_apply", "apply.unexpected_error"),
     ("core/apply.py", "_record_rp_capability", "apply.capability_record_skipped"),

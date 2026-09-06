@@ -1626,21 +1626,21 @@ state, or by a PUT-mode apply that omits the leaf as part of its own authorized 
 Clearing `name` is a documented no-op: it has no wire leaf, so there is nothing to deliver.
 No job is queued and the route's outcome is unaffected.
 
-#### Static-route removals are live-service-relative
+#### Static-route removals are document-relative, with one live read
 
-Removal propagation for `static_route` diverges from the shared pattern in
-[Removal propagation](#removal-propagation), which rebuilds the PUT body from the remaining
-accepted store rows:
+Removal propagation for `static_route` follows the shared pattern in
+[Removal propagation](#removal-propagation) — the body is the device's authorized document with
+the removed rows omitted — plus one narrowly scoped live read:
 
-- the body is the **live service minus exactly the keys this job is authorized to drop** — the
-  removed route's own triple and whatever it was last proved deployed as. Everything else on
-  the service rides through verbatim, so a removal can neither forward-deploy an unrelated
-  store edit nor flush config no store row describes.
-- because such a body cannot flush collateral, a static-route removal **no longer blocks** on
-  unrelated service-owned entries. It retains them and logs
-  `static_route.removal_retained_orphans`, naming exactly the retained keys no route in the
-  generation document claims. That log is the operator's signal. The apply-side guard above still refuses, which
-  is where a store-assertive body really can flush something.
+- the static-route container additionally carries, **verbatim**, the live service entry for
+  every key the frozen plan RETAINS: `claimed - reasserted - operation_selected`, where
+  `claimed` unions each unconsumed deletion record's own triple and its last proved deployed
+  key. Those entries hold metric, tag and NED-specific leaves the store has no column for, so
+  rebuilding them from a store triple would silently rewrite them. An operation-selected key is
+  never retained, and a **force-removal retains nothing** — the override is a flush.
+- the read is certified. An uncertifiable answer refuses the send
+  (`static_route_snapshot_inconclusive`) rather than building a body from "looks empty";
+  certified absence retains nothing.
 - if the generation-creation snapshot shows that every authorized key is claimed and there is
   no cleared leaf to deliver, the job issues no device write at all and succeeds. A later push
   cannot change that recorded decision.
@@ -1649,15 +1649,12 @@ accepted store rows:
   is retried. Removals get no "succeed while unproven" treatment: a succeeded removal is what
   retires the record, so one that consumed nothing must not report success.
 
-#### Interaction with the atomic apply
+#### One transaction, one commit
 
-With `NSO_ADAPTER_ATOMIC_APPLY` on, every scope normally stages into one combined transaction.
-Staging is merge-PATCH only, so a pass that owes a **PUT-replace** cannot ride it: the
-static-route scope is excluded from the combined body and delivered by its own PUT immediately
-after that transaction commits. The replacement is therefore **not** atomic with the other
-scopes — a rejected follow-on fails the job and stamps only the static-route rows while the rest
-of the apply stays applied. A combined commit that fails issues no follow-on at all, leaving the
-static rows pending and retried, exactly like any other non-offending scope.
+Every family of a device rides ONE `device-intent` instance, so a deployment is a single PUT of
+that instance and a family the body omits is a family the write retracts. A rejected commit
+therefore fails **every** family in the push — nothing landed — and those rows record
+`last_apply_error` naming the family the localisation attributed it to.
 
 ### `GET /api/v1/devices/{id}/interface-ips` → `200 | 404`
 

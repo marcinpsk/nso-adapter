@@ -43,12 +43,8 @@ async def test_put_ospf_intent_string_process_id(adapter_client):
 
 
 async def test_put_ospf_intent_admin_state(adapter_client):
-    """OSPF process admin-state (enabled) round-trips through put/get + into the apply body."""
-    import json
-    from types import SimpleNamespace
-    from unittest.mock import AsyncMock, patch
-
-    from nso_adapter.nso.apply import apply_ospf_config
+    """OSPF process admin-state (enabled) round-trips through put/get + into the wire body."""
+    from nso_adapter.nso.apply import _CONTEXT_FREE_EXECUTION, encode_ospf
     from nso_adapter.store.models import OspfInstanceIntent
 
     device_id = await seed_device(nso_device_name="ospf-admin-dev", netbox_device_id=921)
@@ -64,18 +60,13 @@ async def test_put_ospf_intent_admin_state(adapter_client):
             await db.execute(select(OspfInstanceIntent).where(OspfInstanceIntent.device_id == device_id))
         ).scalar_one()
         assert inst.enabled is True
-        # The dry-run apply body must carry the admin-state for the reconciler to write it.
-        with patch("nso_adapter.nso.apply.native_dry_run", new_callable=AsyncMock, return_value="OK") as mock_dry:
-            await apply_ospf_config(
-                client=SimpleNamespace(_base="http://nso/restconf/data"),
-                device_name="ospf-admin-dev",
-                process_intent_rows=[inst],
-                interface_intent_rows=[],
-                dry_run=True,
-            )
-        sent = json.loads(mock_dry.call_args.args[2])  # native_dry_run(client, url, payload, ...)
-        proc = sent["ospf-reconciler:ospf-config"][0]["process-config"][0]
-        assert proc["enabled"] is True
+        # The ospf container the document carries must carry the admin-state for the
+        # aggregate to write it.
+        body = encode_ospf(
+            {"ospf_instance_intent": [inst], "ospf_interface_intent": [], "redistribution_intent": []},
+            _CONTEXT_FREE_EXECUTION,
+        )
+        assert body["process-config"][0]["enabled"] is True
 
 
 async def test_put_ospf_intent_removal_enqueues_job_not_inline(adapter_client):

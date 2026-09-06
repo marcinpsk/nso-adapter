@@ -359,13 +359,13 @@ async def test_put_removal_enqueues_async_removal_job(adapter_client, monkeypatc
         client.get_service_config.return_value = None
         return client
 
-    async def _fake_apply(client, device_name, comms, users, hosts, sysinfo, replace):
+    async def _fake_send(client, device_name, containers, **kwargs):
         captured["device_name"] = device_name
-        captured["replace"] = replace
-        captured["labels"] = [c.label for c in comms]
+        captured["no_networking"] = kwargs.get("no_networking", False)
+        captured["labels"] = [entry["name"] for entry in (containers.get("snmp") or {}).get("community", [])]
 
     monkeypatch.setattr("nso_adapter.core.importer.get_nso_client", _fake_get_client)
-    monkeypatch.setattr("nso_adapter.nso.apply.apply_snmp_config", _fake_apply)
+    monkeypatch.setattr("nso_adapter.nso.apply.apply_device_intent", _fake_send)
 
     await adapter_client.put(f"/api/v1/devices/{device_id}/snmp-intent", json=_full_body(), headers=AUTH | push_seq())
     # No device call during a pure-add PUT.
@@ -399,11 +399,11 @@ async def test_put_removal_enqueues_async_removal_job(adapter_client, monkeypatc
         }
         job_id = jobs[0].id
 
-    # The worker runs the removal → PUT-replaces with the remaining intent.
+    # The worker runs the removal → PUTs the document with the dropped community omitted.
     await run_removal(job_id, device_id)
-    assert captured["replace"] is True
     assert captured["device_name"] == "snmp-prop-dev"
-    assert captured["labels"] == ["ro1"]  # rw1 gone from the re-applied set
+    assert captured["no_networking"] is True, "an unmarked drop detaches rather than retracting"
+    assert captured["labels"] == ["ro1"]  # rw1 gone from the transmitted document
 
 
 @pytest.mark.anyio
