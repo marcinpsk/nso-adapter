@@ -11,6 +11,8 @@ the new code. ``switchport`` and ``lag`` never had a writer: their goldens are r
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 from pathlib import Path
 
@@ -23,7 +25,13 @@ from nso_adapter.core.projection import (
     section_registry,
     section_rows_by_table,
 )
-from nso_adapter.nso.apply import NsoApplyError, SectionExecution, unrenderable_route_policy_members
+from nso_adapter.nso import apply as nso_apply
+from nso_adapter.nso.apply import (
+    NsoApplyError,
+    SectionExecution,
+    refuse_gated_local_levels,
+    unrenderable_route_policy_members,
+)
 from tests.nso.device_intent_rows import ELIGIBLE_ATTRIBUTES, NOKIA_NED, interfaces, section_rows
 
 _GOLDEN = json.loads((Path(__file__).parent / "device_intent_golden.json").read_text())
@@ -44,12 +52,6 @@ def _rows(section: str) -> dict[str, list]:
     """The section's fixture rows, keyed by table name and complete for every declared table."""
     by_model = section_rows()[section]
     return {spec.model.__tablename__: by_model.get(spec.model, []) for spec in section_registry()[section].tables}
-
-
-@pytest.fixture(autouse=True)
-def _open_local_levels_gate(monkeypatch):
-    # The logging golden carries local-levels, so the deploy gate has to be open for it.
-    monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "1")
 
 
 @pytest.mark.parametrize("section", sorted(_GOLDEN))
@@ -93,11 +95,32 @@ def test_unrenderable_members_are_reported_not_silently_dropped():
     assert unrenderable_route_policy_members(_rows("route_policy"), community_dialect_by_name("identity")) == []
 
 
-def test_a_closed_local_levels_gate_refuses_rather_than_sending_a_weaker_body(monkeypatch):
+@pytest.mark.parametrize("gate", ["0", "1"])
+def test_flipping_the_local_levels_gate_cannot_change_an_encoded_body(monkeypatch, gate):
+    """An encoder is a pure function of its rows and its context, never of the environment.
+
+    A body that depended on a process's environment would let two adapters encode one
+    document differently, and a retry of a frozen generation send different bytes.
+    """
+    monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", gate)
+    body = section_registry()["logging"].encode(_rows("logging"), _execution("logging"))
+    assert body == _GOLDEN["logging"]
+    assert body["local-levels"] == {"console-severity": "warnings", "module-severity": "errors"}
+
+
+def test_the_send_boundary_refuses_gated_local_levels(monkeypatch):
+    """The refusal moved out of the encoder; it did not go away."""
+    rows = _rows("logging")
     monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "0")
     with pytest.raises(NsoApplyError) as excinfo:
-        section_registry()["logging"].encode(_rows("logging"), _execution("logging"))
+        refuse_gated_local_levels(rows)
     assert excinfo.value.code == "local_levels_gated"
+    assert excinfo.value.detail == {"levels": {"console-severity": "warnings", "module-severity": "errors"}}
+    monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "1")
+    assert refuse_gated_local_levels(rows) is None
+    # A hosts-only device has no severities to gate, so a closed gate never refuses it.
+    monkeypatch.setenv("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "0")
+    assert refuse_gated_local_levels({**rows, "logging_levels_intent": []}) is None
 
 
 def test_an_encoder_refuses_a_row_set_missing_one_of_its_declared_tables():
@@ -193,3 +216,63 @@ def test_every_read_family_resolves_to_the_residue_wire_name():
         assert spec is not None and spec.wire_name == wire_name, section
     for section in ("switchport", "lag"):
         assert _projectable_spec(section_registry()[section].read_family) is not None
+
+
+# ── the purity rule the amendment states: encode(rows, frozen context) ───────────────
+
+
+def _encoder_call_graph() -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    """Every module-level function in ``nso/apply.py`` an encoder can reach."""
+    module = ast.parse(Path(inspect.getfile(nso_apply)).read_text())
+    defined = {node.name: node for node in module.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    reached: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    pending = [entry.encode.__name__ for entry in section_registry().values()]
+    while pending:
+        name = pending.pop()
+        node = defined.get(name)
+        if node is None or name in reached:
+            continue
+        reached[name] = node
+        pending.extend(
+            call.func.id
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id in defined
+        )
+    return reached
+
+
+#: Reading any of these makes a body a function of the process rather than of the document.
+_IMPURE_READS = {
+    ("os", "environ"),
+    ("os", "getenv"),
+    ("datetime", "now"),
+    ("datetime", "utcnow"),
+    ("date", "today"),
+    ("time", "time"),
+    ("time", "monotonic"),
+}
+
+
+def test_no_encoder_reads_the_environment_the_clock_or_the_network():
+    """An encoder is a pure function of its rows and its frozen context (#1522 memo A8).
+
+    A body that depended on a process's environment, on the clock, or on a device read
+    would let two adapters encode one document differently, and a retry of a frozen
+    generation send different bytes than the attempt it retries.
+    """
+    graph = _encoder_call_graph()
+    assert {entry.encode.__name__ for entry in section_registry().values()} <= set(graph)
+    impure: list[str] = []
+    for name, node in sorted(graph.items()):
+        if isinstance(node, ast.AsyncFunctionDef):
+            impure.append(f"{name}: an encoder path may not be a coroutine")
+        for child in ast.walk(node):
+            if isinstance(child, ast.Await):
+                impure.append(f"{name}: awaits, so it can reach the network")
+            if (
+                isinstance(child, ast.Attribute)
+                and isinstance(child.value, ast.Name)
+                and (child.value.id, child.attr) in _IMPURE_READS
+            ):
+                impure.append(f"{name}: reads {child.value.id}.{child.attr}")
+    assert not impure, impure

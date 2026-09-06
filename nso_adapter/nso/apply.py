@@ -1112,6 +1112,17 @@ _LOCAL_LEVEL_LEAVES = (
     ("module-severity", "module_severity"),
 )
 
+_LOCAL_LEVELS_GATED = (
+    "accepted local-levels intent cannot be applied: the "
+    "NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE gate is off (open it once the "
+    "reloaded logging-reconciler is live, or un-manage the levels)"
+)
+
+
+def _local_levels(row) -> dict:
+    """Return one local-levels row's SET severities; an absent leaf is unmanaged."""
+    return {leaf: value for leaf, attr in _LOCAL_LEVEL_LEAVES if (value := getattr(row, attr))}
+
 
 async def apply_logging_config(
     client: NsoClient,
@@ -1140,14 +1151,12 @@ async def apply_logging_config(
     (apply_failed / stage_errors / removal_failed) until the gate opens or the
     operator un-manages the levels.
     """
-    encoded = encode_logging(
-        {
-            "logging_host_intent": host_intent_rows,
-            "logging_levels_intent": [levels_intent_row] if levels_intent_row is not None else [],
-        },
-        _CONTEXT_FREE_EXECUTION,
-    )
-    body: dict = {"device": device_name, **encoded}
+    rows: SectionRows = {
+        "logging_host_intent": host_intent_rows,
+        "logging_levels_intent": [levels_intent_row] if levels_intent_row is not None else [],
+    }
+    refuse_gated_local_levels(rows)
+    body: dict = {"device": device_name, **encode_logging(rows, _CONTEXT_FREE_EXECUTION)}
     return await _send_service_config(
         client,
         _LOGGING_SERVICE_PATH,
@@ -2062,11 +2071,27 @@ def encode_static_route(rows: SectionRows, execution: SectionExecution) -> dict:
     return {"route": [static_route_entry(row) for row in rows["static_route_intent"]]}
 
 
+def refuse_gated_local_levels(rows: SectionRows) -> None:
+    """Refuse a SEND whose logging rows carry local-levels while the deploy gate is closed.
+
+    The refusal belongs to the send boundary, never to :func:`encode_logging`: an encoder is
+    a pure function of its rows and its frozen context, so one document must encode the same
+    bytes in every process. Sending a weaker host-only body instead would stamp the levels
+    row in_sync with no severity landing, and a replace-mode body missing local-levels would
+    FASTMAP-retract severities the device already holds (on NX that disables the destination).
+    """
+    if local_levels_write_enabled():
+        return
+    for levels_row in rows["logging_levels_intent"]:
+        if levels := _local_levels(levels_row):
+            raise NsoApplyError("local_levels_gated", _LOCAL_LEVELS_GATED, {"levels": levels})
+
+
 def encode_logging(rows: SectionRows, execution: SectionExecution) -> dict:
     """Encode the ``logging`` container: remote syslog hosts plus the local-levels singleton.
 
-    A closed ``local-levels`` gate with accepted severities REFUSES rather than sending a
-    weaker host-only body, which would FASTMAP-retract severities the device already holds.
+    The severities are emitted whenever the row sets them; whether they may be SENT is
+    :func:`refuse_gated_local_levels`'s question, at the send boundary.
     """
     hosts = []
     for row in rows["logging_host_intent"]:
@@ -2087,16 +2112,7 @@ def encode_logging(rows: SectionRows, execution: SectionExecution) -> dict:
 
     body: dict = {"host": hosts}
     for levels_row in rows["logging_levels_intent"]:
-        levels = {leaf: value for leaf, attr in _LOCAL_LEVEL_LEAVES if (value := getattr(levels_row, attr))}
-        if levels and not local_levels_write_enabled():
-            raise NsoApplyError(
-                "local_levels_gated",
-                "accepted local-levels intent cannot be applied: the "
-                "NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE gate is off (open it once the "
-                "reloaded logging-reconciler is live, or un-manage the levels)",
-                {"levels": levels},
-            )
-        if levels:
+        if levels := _local_levels(levels_row):
             body["local-levels"] = levels
     return body
 
