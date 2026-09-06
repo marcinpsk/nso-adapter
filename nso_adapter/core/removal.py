@@ -1543,6 +1543,7 @@ async def enqueue_removal(
     from nso_adapter.core.generation import (
         create_generation,
         create_reissue_generation,
+        lock_projection,
         require_attach_to_job,
     )
     from nso_adapter.core.jobs import create_dedicated_job
@@ -1622,6 +1623,13 @@ async def enqueue_removal(
     mode = GenerationMode.detach if context.get("detach") else GenerationMode.networked
     # The context rides the GENERATION either way, not only the job: a retry of a blocked
     # head has to rebuild a job that commits the same operation, down to the detach flag.
+    #
+    # The projection lock FIRST, and held to commit. The carriers this admission discharges
+    # are selected here and named in the immutable operation plane, while the discharge below
+    # deletes them by STREAM: a store-only clear committing between an unlocked selection and
+    # the creation would be deleted by an operation that never named it, and its obligation
+    # would be gone with no record that anything discharged it.
+    await lock_projection(db, device_id)
     discharged_clear_ids = await _pending_clears_discharged_by(db, device_id, scope, promotes, mode=mode, force=force)
     if force:
         generation = await create_reissue_generation(
