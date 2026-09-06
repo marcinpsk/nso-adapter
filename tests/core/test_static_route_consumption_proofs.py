@@ -73,17 +73,23 @@ async def _generation_statuses(device_id: int) -> list:
         return [row.status for row in rows]
 
 
-async def test_the_reader_normalizes_the_legacy_and_the_aggregate_shapes_alike():
-    """The aggregate nests the same routes under ``static-route``; consumers see one shape."""
-    legacy = await certified_static_route_section(
-        _reader(_State("present", {"device": "reader-dev", "route": [wire(A)]})), _DEVICE
-    )
+async def test_the_reader_projects_the_aggregate_container_and_refuses_a_legacy_shaped_answer():
+    """One service, one nesting. A legacy-shaped answer at that path is not this family.
+
+    The aggregate nests the routes under ``static-route`` and consumers still see
+    ``{"route": [...]}``. An instance answering with a TOP-LEVEL route list is the reconciler
+    the adapter no longer writes: certifying the family from it would read a service nothing
+    keeps up to date, so it refuses instead.
+    """
     aggregate = await certified_static_route_section(
         _reader(_State("present", {"device": "reader-dev", "static-route": {"route": [wire(A)]}})), _DEVICE
     )
-    assert legacy.status == aggregate.status == "present"
-    assert legacy.entry == aggregate.entry == {"route": [wire(A)]}
-    assert legacy.routes == aggregate.routes == [wire(A)]
+    assert (aggregate.status, aggregate.entry, aggregate.routes) == ("present", {"route": [wire(A)]}, [wire(A)])
+
+    legacy = await certified_static_route_section(
+        _reader(_State("present", {"device": "reader-dev", "route": [wire(A)]})), _DEVICE
+    )
+    assert legacy.inconclusive and legacy.entry is None
 
 
 async def test_an_empty_container_certifies_absence_and_an_uncertifiable_read_does_not():
@@ -91,6 +97,8 @@ async def test_an_empty_container_certifies_absence_and_an_uncertifiable_read_do
     empty_instance = await certified_static_route_section(
         _reader(_State("present", {"device": "reader-dev", "static-route": {}})), _DEVICE
     )
+    no_family = await certified_static_route_section(_reader(_State("present", {"device": "reader-dev"})), _DEVICE)
+    assert (no_family.status, no_family.routes) == ("absent", [])
     no_instance = await certified_static_route_section(_reader(_State("absent", None)), _DEVICE)
     unreadable = await certified_static_route_section(_reader(_State("inconclusive", None)), _DEVICE)
 
@@ -102,12 +110,15 @@ async def test_an_empty_container_certifies_absence_and_an_uncertifiable_read_do
 @pytest.mark.parametrize(
     ("label", "entry"),
     [
-        ("route is an object", {"device": "reader-dev", "route": wire(A)}),
-        ("route is a string", {"device": "reader-dev", "route": "198.18.0.0/24"}),
-        ("an entry is a string", {"device": "reader-dev", "route": ["198.18.0.0/24"]}),
-        ("an entry carries no prefix", {"device": "reader-dev", "route": [{"vrf": "", "next-hop": "192.0.2.1"}]}),
+        ("route is an object", {"device": "reader-dev", "static-route": {"route": wire(A)}}),
+        ("route is a string", {"device": "reader-dev", "static-route": {"route": "198.18.0.0/24"}}),
+        ("an entry is a string", {"device": "reader-dev", "static-route": {"route": ["198.18.0.0/24"]}}),
+        (
+            "an entry carries no prefix",
+            {"device": "reader-dev", "static-route": {"route": [{"vrf": "", "next-hop": "192.0.2.1"}]}},
+        ),
         ("the container is a list", {"device": "reader-dev", "static-route": [wire(A)]}),
-        ("a nested entry is a string", {"device": "reader-dev", "static-route": {"route": ["x"]}}),
+        ("a legacy top-level route list", {"device": "reader-dev", "route": [wire(A)]}),
     ],
 )
 async def test_a_malformed_section_is_inconclusive_and_never_a_certified_absence(label, entry):
@@ -125,7 +136,7 @@ async def test_a_malformed_section_is_inconclusive_and_never_a_certified_absence
 
 async def test_a_well_formed_empty_route_list_still_certifies_absence():
     """The negative control: an empty list is a shape the reader understands, so it certifies."""
-    for entry in ({"device": "reader-dev", "route": []}, {"device": "reader-dev", "static-route": {"route": []}}):
+    for entry in ({"device": "reader-dev"}, {"device": "reader-dev", "static-route": {"route": []}}):
         section = await certified_static_route_section(_reader(_State("present", entry)), _DEVICE)
         assert (section.status, section.routes) == ("absent", [])
 

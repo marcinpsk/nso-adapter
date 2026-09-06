@@ -14,7 +14,9 @@ Changing the URL alone does not fix it, because the nesting is wrong too. So the
 projection live HERE and nowhere else, and every consumer keeps the shape it already reads:
 ``{"route": [...]}``. The aggregate sender made that real: the path is now the one
 ``device-intent`` instance (``NsoClient.service_instance_state``) and the projection reads the
-section out of its ``static-route`` container.
+section out of its ``static-route`` container. A legacy-shaped answer at that path is refused
+rather than read: certifying the family from a service the adapter no longer writes is exactly
+the mistake this module exists to prevent.
 """
 
 from __future__ import annotations
@@ -91,11 +93,14 @@ def _project(entry: dict | None) -> list[dict]:
         raise _Uncertifiable(f"the instance is a {type(entry).__name__}, not an object")
     section = entry.get("static-route")
     if section is None:
-        routes = entry.get("route")
-    elif isinstance(section, dict):
-        routes = section.get("route")
-    else:
+        if "route" in entry:
+            # A LEGACY-shaped instance answering for the aggregate's path. Reading it would
+            # certify the family from a service the adapter no longer writes, so refuse.
+            raise _Uncertifiable("the instance carries a top-level route list, not a static-route container")
+        return []
+    if not isinstance(section, dict):
         raise _Uncertifiable(f"the static-route container is a {type(section).__name__}, not an object")
+    routes = section.get("route")
     if routes is None:
         return []
     if not isinstance(routes, list):

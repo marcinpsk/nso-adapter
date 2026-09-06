@@ -535,7 +535,7 @@ async def test_c4_10_detach_whose_service_still_holds_the_key_fails(adapter_clie
     client = sr_client(fake)
     # The post-commit read still shows A: the service did not really drop it.
     fake.state = lambda: __import__("nso_adapter.nso.client", fromlist=["ServiceInstanceState"]).ServiceInstanceState(
-        "present", {"device": "sr-c410", "route": [wire(A), wire(B)]}
+        "present", {"device": "sr-c410", _SR_CONTAINER: {"route": [wire(A), wire(B)]}}
     )
 
     job = await run_removal_job(device_id, job_id, client)
