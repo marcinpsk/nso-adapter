@@ -2866,13 +2866,11 @@ _SHAPE = {
 
 #: One retained-root scalar EDIT per stream, as (leaf, first value, second value).
 #:
-#: LAG ``timer`` moves between NULL and the empty string, which is the case neither delta
-#: predicate sees: ``is_cleared`` ignores an already-unset before, and an empty after is not
-#: positive. Switchport ``mode`` has no such pair, because the request normalises ``""`` to
-#: unset, so every edit of it is either positive or content-losing; it uses a plain value
-#: replacement instead. Both are retained-root edits that must reach the device.
+#: Both are plain value replacements. Neither family can express a change that no delta
+#: predicate sees any more: every optional string leaf normalises ``""`` to unset, so an
+#: edit of one is either positive (a new value) or content-losing (a value going away).
 _SCALAR_EDITS: dict[str, tuple[str, object, object]] = {
-    "lag": ("timer", None, ""),
+    "lag": ("timer", "fast", "slow"),
     "switchport": ("mode", "access", "trunk"),
 }
 
