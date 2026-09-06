@@ -76,6 +76,7 @@ async def test_lag_replacement_rejects_one_interface_in_two_bundles(adapter_clie
                         name="Port-channel2", lag_id=2, members=(LagMemberSnapshot(interface_name="Gi0/1"),)
                     ),
                 ),
+                deleted_roots=[],
             )
         await db.rollback()
 
