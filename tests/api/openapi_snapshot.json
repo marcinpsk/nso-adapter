@@ -15615,11 +15615,17 @@
             "description": "Successful Response"
           }
         },
+        "security": [],
         "summary": "Healthz",
         "tags": [
           "health"
         ]
       }
     }
-  }
+  },
+  "security": [
+    {
+      "_OptionalBearer": []
+    }
+  ]
 }

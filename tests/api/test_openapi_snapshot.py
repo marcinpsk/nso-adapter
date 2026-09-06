@@ -34,6 +34,10 @@ def openapi_schema() -> dict:
     return create_app().openapi()
 
 
+#: The path-item keys that are operations; the rest are shared parameters and metadata.
+_HTTP_METHODS = frozenset({"get", "put", "post", "patch", "delete", "head", "options", "trace"})
+
+
 def _iter_refs(node):
     """Yield every ``$ref`` string reachable in an OpenAPI (sub)document."""
     if isinstance(node, dict):
@@ -275,3 +279,34 @@ def test_normalize_masks_the_release_version(openapi_schema):
     # must not fail on that bump (it did once: v0.2.0 broke main's CI).
     bumped = {**openapi_schema, "info": {**openapi_schema["info"], "version": "99.99.99"}}
     assert normalize(bumped) == normalize(openapi_schema)
+
+
+def test_the_document_declares_the_bearer_requirement_globally(openapi_schema):
+    """The runtime enforces the token on every endpoint but one; the document must say so.
+
+    Without a global requirement a generated client sends no ``Authorization`` header and
+    gets a 401 it cannot explain from the schema.
+    """
+    scheme = next(iter(openapi_schema["components"]["securitySchemes"]))
+    assert openapi_schema["components"]["securitySchemes"][scheme]["scheme"] == "bearer"
+    assert openapi_schema["security"] == [{scheme: []}]
+
+    exempt = {
+        f"{method.upper()} {path}"
+        for path, item in openapi_schema["paths"].items()
+        for method, operation in item.items()
+        if method in _HTTP_METHODS and operation.get("security") == []
+    }
+    assert exempt == {"GET /healthz"}, "only the unauthenticated health probe opts out"
+
+    for path, item in openapi_schema["paths"].items():
+        for method, operation in item.items():
+            if method in _HTTP_METHODS and path != "/healthz":
+                assert operation.get("security"), f"{method.upper()} {path} declares no requirement"
+
+
+def test_the_exempt_operations_are_the_ones_with_no_token_dependency():
+    """Derived from the routes, so an endpoint that forgets the dependency changes this set."""
+    from nso_adapter.main import _unauthenticated_paths, create_app
+
+    assert _unauthenticated_paths(create_app()) == frozenset({"/healthz"})

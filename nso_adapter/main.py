@@ -77,6 +77,60 @@ from nso_adapter.store.db import get_engine, init_db, session
 logger = structlog.get_logger(__name__)
 
 
+def _unauthenticated_paths(app: FastAPI) -> frozenset[str]:
+    """Return the route paths that reach their handler without the bearer dependency.
+
+    Derived from the routes rather than listed, so an endpoint that forgets
+    :func:`api.deps.verify_token` changes this set instead of quietly inheriting a
+    requirement the runtime does not enforce.
+    """
+    from fastapi.routing import iter_route_contexts
+
+    from nso_adapter.api.deps import verify_token
+
+    def dependencies(dependant):
+        for dependency in dependant.dependencies:
+            yield dependency.call
+            yield from dependencies(dependency)
+
+    # iter_route_contexts flattens the included routers; app.routes holds their wrappers.
+    exempt: set[str] = set()
+    for route in iter_route_contexts(app.routes):
+        dependant = getattr(route, "dependant", None)
+        if dependant is None or route.path is None:
+            continue
+        if verify_token not in set(dependencies(dependant)):
+            exempt.add(route.path)
+    return frozenset(exempt)
+
+
+def _declare_bearer_requirement(app: FastAPI) -> None:
+    """State in the DOCUMENT what the app enforces at runtime.
+
+    FastAPI declares the scheme per operation, but a generated client reading only the
+    document root sends no ``Authorization`` header and gets a 401 the schema never
+    explained. The global requirement says it once; the endpoints that genuinely take no
+    token opt out with an empty one.
+    """
+    generated_openapi = app.openapi
+
+    def openapi():
+        schema = generated_openapi()
+        if "security" in schema:
+            return schema
+        schemes = schema.get("components", {}).get("securitySchemes", {})
+        if not schemes:  # pragma: no cover - the bearer dependency always registers one
+            return schema
+        schema["security"] = [{name: [] for name in schemes}]
+        for path in _unauthenticated_paths(app):
+            for operation in schema["paths"].get(path, {}).values():
+                if isinstance(operation, dict):
+                    operation["security"] = []
+        return schema
+
+    app.openapi = openapi  # type: ignore[method-assign]
+
+
 def _preserve_exact_openapi_integer_bounds(app: FastAPI) -> None:
     """Restore integer bounds that FastAPI coerces to imprecise JSON floats."""
     generated_openapi = app.openapi
@@ -485,6 +539,7 @@ def create_app() -> FastAPI:
     app.include_router(jobs_router)
     app.include_router(config_router)
     _preserve_exact_openapi_integer_bounds(app)
+    _declare_bearer_requirement(app)
     return app
 
 
