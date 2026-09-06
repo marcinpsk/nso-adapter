@@ -3,13 +3,13 @@
 """The execution-context contract's five scenarios (#1663, #1522 memo A9).
 
 One invariant, driven end to end: **a generation document's execution metadata matches
-exactly the authorized fragments it composes.** Every case runs against the real API app
-and the real store, executes through the REAL worker at the recorded RESTCONF boundary,
-and asserts both what the document says and that it hydrates completely.
+exactly the authorized fragments it composes.** Every scenario runs against the real API app
+and the real store, EXECUTES through the REAL worker, and asserts the device-intent document
+the sender transmitted as well as what the stored document says and that it hydrates.
 
-The assertions here are about the DOCUMENT and its hydration. The bodies the aggregate
-sender derives from that document are C9's second slice; the per-section context reaches
-the encoders with it.
+Executing is the point. A case that only reads the stored document stays green when the
+sender ignores the frozen metadata and re-derives everything from live state, which is the
+class of bug this contract exists to prevent.
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ from tests.core.test_action_apply_promotion import (
     _generations,
     _put_routes,
     _put_vlans,
-    _settle,
     _stream,
 )
 from tests.core.test_generation_protocol import recorded_client, run_head, seed_settings
@@ -135,6 +134,62 @@ def _execution(generation, section: str) -> dict:
     return generation.document[section]["_execution"]
 
 
+async def _execute(device_id: int, name: str, **kwargs):
+    """Run this device's queued head through the real worker → its recorder.
+
+    Every assertion about what reached NSO reads this recorder, so a scenario cannot pass by
+    agreeing with the stored document while the sender transmitted something else.
+    """
+    from nso_adapter.store.models import Job, JobStatus
+
+    client, recorder = recorded_client(name, **kwargs)
+    job_id = await run_head(device_id, client)
+    assert job_id is not None, "no job was queued for the generation under test"
+    async with session() as db:
+        job = await db.get(Job, job_id)
+    assert job.status is JobStatus.succeeded, f"the worker failed the job under test: {job.error}"
+    return recorder
+
+
+async def _next_queued_type(device_id: int):
+    """The job type at the head of this device's queue, or ``None`` when it is empty."""
+    from nso_adapter.store.models import Job, JobStatus
+
+    async with session() as db:
+        return await db.scalar(
+            sa.select(Job.job_type)
+            .where(Job.device_id == device_id, Job.status == JobStatus.queued)
+            .order_by(Job.id)
+            .limit(1)
+        )
+
+
+async def _drain_writes(device_id: int, name: str, *, limit: int = 6) -> list[dict]:
+    """Execute every queued job in order → the device-intent writes they transmitted.
+
+    Each entry is ``{"instance": …, "no_networking": bool}``. A chain's links are asserted by
+    what each one SENT, never by their queue order, which the planner owns.
+    """
+    from nso_adapter.store.models import Job, JobStatus, JobType
+
+    writes: list[dict] = []
+    for _ in range(limit):
+        if await _next_queued_type(device_id) not in (JobType.apply, JobType.removal):
+            break  # the follow-up sync a detach queues is not part of the chain under test
+        client, recorder = recorded_client(name)
+        job_id = await run_head(device_id, client)
+        if job_id is None:
+            break
+        async with session() as db:
+            job = await db.get(Job, job_id)
+        assert job.status is JobStatus.succeeded, f"the worker failed job {job_id}: {job.error}"
+        for call in recorder.commits:
+            instance = recorder._instance(call["body"])
+            if instance is not None:
+                writes.append({"instance": instance, "no_networking": "no-networking" in call["url"]})
+    return writes
+
+
 # ── Scenario 1 — a reissue re-asserts what it froze ──────────────────────────
 
 
@@ -146,7 +201,7 @@ async def test_scenario_1_a_reissue_carries_the_context_and_proof_its_authorizat
     """
     from nso_adapter.core.projection import hydrate_interface_execution
     from nso_adapter.core.static_route_plan import hydrate_static_route_apply_plan
-    from nso_adapter.store.models import GenerationStatus, SyncState
+    from nso_adapter.store.models import SyncState
 
     device_id = await seed_device(nso_device_name="ec-reissue", netbox_device_id=17001)
     await seed_settings(device_id, auto_apply=False)
@@ -166,13 +221,11 @@ async def test_scenario_1_a_reissue_carries_the_context_and_proof_its_authorizat
     assert (
         await _apply(adapter_client, device_id, {"interface_config": 1701, "static_route": 1702, "vlan": 1703})
     ).status_code == 202
-    client, _ = recorded_client("ec-reissue")
-    first_job = await run_head(device_id, client)
-    assert first_job is not None
-    await _settle(first_job, GenerationStatus.settled)
+    first = await _execute(device_id, "ec-reissue")
     baseline = (await _generations(device_id))[-1]
     frozen_interface = baseline.document["interface_config"]
     frozen_routes = baseline.document["static_route"]
+    sent_first = first.documents[-1]
 
     # Everything the old code re-derived at execution moves under the reissue's feet.
     await _set_attribute_state(device_id, "description", SyncState.error)
@@ -213,7 +266,13 @@ async def test_scenario_1_a_reissue_carries_the_context_and_proof_its_authorizat
         row = await _stream(device_id, stream)
         assert (row.authorized_revision, row.applied_revision) == (revision, revision)
 
-    assert await run_head(device_id, recorded_client("ec-reissue")[0]) is not None
+    # The point of the scenario: what the reissue TRANSMITS for the untouched families is the
+    # bytes the first deployment sent, not what the live store and the live NED now say.
+    second = await _execute(device_id, "ec-reissue")
+    sent_second = second.documents[-1]
+    assert sent_second["interface"] == sent_first["interface"]
+    assert sent_second["static-route"] == sent_first["static-route"]
+    assert sent_second["interface"]["interface"][0]["description"] == "core link"
 
 
 # ── Scenario 2 — a consumed carrier leaves no authority behind ───────────────
@@ -260,6 +319,18 @@ async def test_scenario_2_a_settled_carrier_is_pruned_from_the_fragment_and_ever
     stored = (await _generations(device_id))[0]
     assert (stored.document, stored.digest) == (frozen_document, frozen_digest), "an immutable document was rewritten"
 
+    # EXECUTE the later document: a pruned carrier claims nothing, so the key it used to
+    # claim is neither rendered nor retained, and a further reissue transmits the same.
+    apply_recorder = await _execute(device_id, "ec-carrier")
+    routes = apply_recorder.container("static-route")["route"]
+    assert {(r.get("vrf") or "", r["prefix"], r["next-hop"]) for r in routes} == {B}
+    assert apply_recorder.container("vlan")["vlan"] == [{"vlan-id": 202, "name": "vlan-202"}]
+
+    assert (await _force_removal(adapter_client, device_id, "static_route")).status_code == 202
+    reissue_recorder = await _execute(device_id, "ec-carrier")
+    reissued_routes = reissue_recorder.container("static-route")["route"]
+    assert {(r.get("vrf") or "", r["prefix"], r["next-hop"]) for r in reissued_routes} == {B}
+
 
 async def test_scenario_2_an_operation_selecting_a_consumed_carrier_refuses_creation(adapter_client):
     """An INHERITED carrier that is gone was settled; an explicitly SELECTED one is a lie."""
@@ -282,16 +353,16 @@ async def test_scenario_2_an_operation_selecting_a_consumed_carrier_refuses_crea
 async def test_scenario_3_a_reissue_encodes_route_policy_under_the_context_it_was_authorized_with(adapter_client):
     """A device NED change reaches a section only when an operation reauthorizes it."""
     from nso_adapter.core.projection import section_context
-    from nso_adapter.store.models import GenerationStatus
 
     device_id = await seed_device(nso_device_name="ec-dialect", netbox_device_id=17004)
     await seed_settings(device_id, auto_apply=False)
     await _set_ned(device_id, _NOKIA)
     assert (await _put_route_policy(adapter_client, device_id, ["large:64512:1:2"], seq=1720)).status_code == 200
     assert (await _apply(adapter_client, device_id, {"route_policy": 1720})).status_code == 202
-    first_job = await run_head(device_id, recorded_client("ec-dialect")[0])
-    assert first_job is not None
-    await _settle(first_job, GenerationStatus.settled)
+    first = await _execute(device_id, "ec-dialect")
+    # The frozen dialect is what spells the member: SR OS keeps an exact large community as
+    # three keyword-less colon parts, and the canonical `large:` prefix would be rejected.
+    assert first.container("route-policy")["community-list"][0]["entry"][0]["community"] == "64512:1:2"
 
     # A LATER section is authorized under a different context, so the document legally
     # carries two.
@@ -301,15 +372,18 @@ async def test_scenario_3_a_reissue_encodes_route_policy_under_the_context_it_wa
     mixed = (await _generations(device_id))[-1]
     assert section_context(mixed.document, "route_policy") == {"ned_id": _NOKIA, "dialect": "nokia_timos"}
     assert section_context(mixed.document, "vlan") == {"ned_id": _CISCO, "dialect": "identity"}
-
-    second_job = await run_head(device_id, recorded_client("ec-dialect")[0])
-    assert second_job is not None
-    await _settle(second_job, GenerationStatus.settled)
+    second = await _execute(device_id, "ec-dialect")
+    assert second.container("route-policy")["community-list"][0]["entry"][0]["community"] == "64512:1:2"
 
     assert (await _force_removal(adapter_client, device_id, "vlan")).status_code == 202
     reissue = (await _generations(device_id))[-1]
     assert section_context(reissue.document, "route_policy") == {"ned_id": _NOKIA, "dialect": "nokia_timos"}
     assert reissue.document["route_policy"] == mixed.document["route_policy"]
+
+    # EXECUTED with the device row now cisco: the members are still the Nokia spelling, so
+    # the encode read the section's frozen dialect and not the live device.
+    flush = await _execute(device_id, "ec-dialect")
+    assert flush.container("route-policy")["community-list"][0]["entry"][0]["community"] == "64512:1:2"
 
 
 # ── Scenario 4 — H1: one push that adds, deletes and detaches ────────────────
@@ -322,7 +396,7 @@ async def test_scenario_4_the_networked_intermediate_keeps_the_retained_rows_own
     still has to carry, and only the detach final may retire it.
     """
     from nso_adapter.core.projection import hydrate_interface_execution
-    from nso_adapter.store.models import GenerationMode, GenerationStatus, SyncState
+    from nso_adapter.store.models import GenerationMode, SyncState
 
     device_id = await seed_device(
         nso_device_name="ec-h1", netbox_device_id=17005, attributes=["description", "enabled"]
@@ -338,9 +412,7 @@ async def test_scenario_4_the_networked_intermediate_keeps_the_retained_rows_own
         )
     ).status_code == 200
     assert (await _apply(adapter_client, device_id, {"interface_config": 1730})).status_code == 202
-    first_job = await run_head(device_id, recorded_client("ec-h1")[0])
-    assert first_job is not None
-    await _settle(first_job, GenerationStatus.settled)
+    await _execute(device_id, "ec-h1")
 
     # One push drops the description and adds an enabled row; the description's live state
     # then falls out of the eligible set.
@@ -374,6 +446,22 @@ async def test_scenario_4_the_networked_intermediate_keeps_the_retained_rows_own
         assert hydrate_interface_execution(generation.document) is not None
     assert intermediate.digest != final.digest
 
+    # EXECUTED, every link of the chain. The networked writes still carry the description
+    # they retained; only the no-networking write drops it, because nothing authorized
+    # retracting it from the device.
+    writes = await _drain_writes(device_id, "ec-h1")
+    networked = [w for w in writes if not w["no_networking"]]
+    detached = [w for w in writes if w["no_networking"]]
+    assert networked and detached, f"expected a networked link and a detach link, got {writes}"
+    for write in networked:
+        entry = write["instance"]["interface"]["interface"][0]
+        assert entry["description"] == "core link", "a networked link dropped the row it retained"
+        assert entry["enabled"] is True
+    for write in detached:
+        entry = write["instance"]["interface"]["interface"][0]
+        assert "description" not in entry, "the detach still asserted the description"
+        assert entry["enabled"] is True
+
 
 # ── Scenario 5 — the sibling streams of a split section ──────────────────────
 
@@ -381,7 +469,7 @@ async def test_scenario_4_the_networked_intermediate_keeps_the_retained_rows_own
 async def test_scenario_5a_an_ip_only_apply_keeps_the_owner_streams_context_and_decisions(adapter_client):
     """Case A. Only ``ip`` is reauthorized, so nothing about the attribute lane moves."""
     from nso_adapter.core.projection import hydrate_interface_execution, section_context
-    from nso_adapter.store.models import GenerationStatus, SyncState
+    from nso_adapter.store.models import SyncState
 
     device_id = await seed_device(nso_device_name="ec-split", netbox_device_id=17006)
     await seed_settings(device_id, auto_apply=False)
@@ -397,9 +485,7 @@ async def test_scenario_5a_an_ip_only_apply_keeps_the_owner_streams_context_and_
         )
     ).status_code == 200
     assert (await _apply(adapter_client, device_id, {"interface_config": 1740})).status_code == 202
-    first_job = await run_head(device_id, recorded_client("ec-split")[0])
-    assert first_job is not None
-    await _settle(first_job, GenerationStatus.settled)
+    await _execute(device_id, "ec-split")
 
     await _set_attribute_state(device_id, "description", SyncState.error)
     assert (
@@ -433,6 +519,17 @@ async def test_scenario_5a_an_ip_only_apply_keeps_the_owner_streams_context_and_
     assert hydrate_interface_execution(generation.document).eligible_attributes == frozenset({(eth0, "description")})
     assert (await _stream(device_id, "interface_config")).authorized_revision == 1
 
+    # EXECUTED: the transmitted interface container carries the attribute half's AUTHORIZED
+    # contribution beside the address the ip lane just authorized, and not the store-only
+    # value the live row now holds.
+    ip_only = await _execute(device_id, "ec-split")
+    sent = {entry["interface-name"]: entry for entry in ip_only.container("interface")["interface"]}
+    assert sent["GigabitEthernet0/1"]["description"] == "authorized"
+    assert sent["GigabitEthernet0/2"]["ipv4-address"][0]["address"] == "192.0.2.1"
+    # The section kept the cisco context through a NED change, so no Nokia routed leaf rides
+    # either entry: the encode read the frozen record, never the live device row.
+    assert not any("kind" in entry for entry in sent.values())
+
     # A following interface_config authorization moves the section's context.
     assert (
         await _put_attrs(
@@ -442,7 +539,6 @@ async def test_scenario_5a_an_ip_only_apply_keeps_the_owner_streams_context_and_
             seq=1743,
         )
     ).status_code == 200
-    await _settle((await _generations(device_id))[-1].job_id, GenerationStatus.settled)
     assert (await _apply(adapter_client, device_id, {"interface_config": 1743})).status_code == 202
     moved = (await _generations(device_id))[-1]
     assert section_context(moved.document, "interface_config") == {"ned_id": _NOKIA, "dialect": "nokia_timos"}
@@ -487,12 +583,75 @@ def test_scenario_5d_composition_refuses_a_fragment_whose_context_is_not_a_conte
         _compose_document({"vlan": {"_execution": {**good, "operation": {}}}})
 
 
-def test_scenario_5e_interface_records_merge_field_wise_and_refuse_a_conflict():
+async def test_scenario_5e_a_backfilled_binding_survives_composition_and_reaches_the_wire(adapter_client):
     """Case E. Owner-wins is right for the context and wrong for a row.
 
-    The IP endpoint backfills ``parent_binding`` and ``encap_tag`` onto an interface an
-    attribute fragment recorded while both were null; owner-wins would restore the nulls and
-    the encoded address would lose its binding.
+    Driven by real rows, because that is where the loss happens: the ip endpoint backfills
+    ``parent_binding`` and ``encap_tag`` onto an interface the attribute fragment recorded
+    while both were null. Owner-wins would restore the nulls, and SR OS would be told to
+    configure the address on an interface with no port binding.
+    """
+    from nso_adapter.store.models import DbInterface
+
+    device_id = await seed_device(nso_device_name="ec-split-merge", netbox_device_id=17008)
+    await seed_settings(device_id, auto_apply=False)
+    await _set_ned(device_id, _NOKIA)
+    async with session() as db:
+        iface = DbInterface(device_id=device_id, name="1/1/1:100", kind="logical")
+        db.add(iface)
+        await db.commit()
+
+    assert (
+        await _put_attrs(
+            adapter_client,
+            device_id,
+            [{"interface": "1/1/1:100", "attribute": "description", "intent_value": "uplink"}],
+            seq=1760,
+        )
+    ).status_code == 200
+    assert (await _apply(adapter_client, device_id, {"interface_config": 1760})).status_code == 202
+    await _execute(device_id, "ec-split-merge")
+    frozen = (await _stream(device_id, "interface_config")).authorized_document
+    (recorded,) = frozen["_execution"]["proof"]["interfaces"].values()
+    assert recorded["parent_binding"] is None, "setup broken: the attribute lane must freeze the bare record"
+
+    # The ip push backfills the binding, so the ip fragment records what the attribute
+    # fragment could not have known.
+    assert (
+        await _put_addresses(
+            adapter_client,
+            device_id,
+            [
+                {
+                    "interface": "1/1/1:100",
+                    "address": "192.0.2.9/24",
+                    "family": "ipv4",
+                    "routed": True,
+                    "parent_binding": "lag-99",
+                    "encap_tag": "99",
+                }
+            ],
+            seq=1761,
+        )
+    ).status_code == 200
+    assert (await _apply(adapter_client, device_id, {"ip": 1761})).status_code == 202
+
+    generation = (await _generations(device_id))[-1]
+    (merged,) = generation.document["interface_config"]["_execution"]["proof"]["interfaces"].values()
+    assert (merged["parent_binding"], merged["encap_tag"]) == ("lag-99", "99")
+
+    recorder = await _execute(device_id, "ec-split-merge")
+    (entry,) = recorder.container("interface")["interface"]
+    assert entry["description"] == "uplink"
+    assert entry["parent-binding"] == "lag-99"
+    assert entry["encap-tag"] == "99"
+
+
+def test_scenario_5e_composition_refuses_two_different_non_null_interface_values():
+    """The refusal half, which no single store can produce: two fragments, two bindings.
+
+    The ip endpoint never clobbers a populated binding, so a conflict can only come from a
+    document assembled out of fragments that disagree, and that must refuse rather than pick.
     """
     from nso_adapter.core.generation import _compose_document
 
@@ -507,20 +666,6 @@ def test_scenario_5e_interface_records_merge_field_wise_and_refuse_a_conflict():
         "service": None,
     }
     bound = {**bare, "parent_binding": "lag-99", "encap_tag": "99"}
-    document = _compose_document(
-        {
-            "interface_config": {
-                "interface_intent": [],
-                "_execution": {"context": context, "proof": {"interfaces": {"7": bare}, "attribute_eligibility": {}}},
-            },
-            "ip": {
-                "interface_ip_intent": [],
-                "_execution": {"context": context, "proof": {"interfaces": {"7": bound}}},
-            },
-        }
-    )
-    assert document["interface_config"]["_execution"]["proof"]["interfaces"]["7"] == bound
-
     with pytest.raises(ValueError, match="conflicting 'parent_binding' values"):
         _compose_document(
             {
@@ -535,6 +680,93 @@ def test_scenario_5e_interface_records_merge_field_wise_and_refuse_a_conflict():
                 },
             }
         )
+
+
+# ── the other split section: IS-IS ownership, and the one consumption choke point ──
+
+
+async def test_the_isis_section_takes_its_owner_streams_context_and_keeps_both_lanes_rows(adapter_client):
+    """The second split section, whose owner is ``isis`` and whose sibling is the flex-algo lane.
+
+    Owner-wins is a property of the SECTION, so reauthorizing the owner is the one way to
+    move it to a new NED. The sibling's ROWS are not owner-wins: they are the other lane's
+    authorization and must still reach the wire.
+    """
+    from nso_adapter.core.projection import section_context
+
+    device_id = await seed_device(nso_device_name="ec-isis-owner", netbox_device_id=17009)
+    await seed_settings(device_id, auto_apply=False)
+    await _set_ned(device_id, _NOKIA)
+    assert (
+        await adapter_client.put(
+            f"/api/v1/devices/{device_id}/isis-flex-algo-intent",
+            json={"flex_algos": [{"process_tag": "1", "algo_id": 128}]},
+            headers=AUTH | {"X-Push-Seq": "1770"},
+        )
+    ).status_code == 200
+    assert (await _apply(adapter_client, device_id, {"isis_flex_algo": 1770})).status_code == 202
+    sibling_only = (await _generations(device_id))[-1]
+    assert section_context(sibling_only.document, "isis") == {"ned_id": _NOKIA, "dialect": "nokia_timos"}
+    await _execute(device_id, "ec-isis-owner")
+
+    # The OWNER lane is authorized next, under a different device NED.
+    await _set_ned(device_id, _CISCO)
+    assert (
+        await adapter_client.put(
+            f"/api/v1/devices/{device_id}/isis-interface-intent",
+            json={"interfaces": [{"interface_name": "GigabitEthernet0/1", "af": "ipv4", "process_tag": "1"}]},
+            headers=AUTH | {"X-Push-Seq": "1771"},
+        )
+    ).status_code == 200
+    assert (await _apply(adapter_client, device_id, {"isis": 1771})).status_code == 202
+
+    composed = (await _generations(device_id))[-1]
+    assert section_context(composed.document, "isis") == {"ned_id": _CISCO, "dialect": "identity"}, (
+        "the composed section took the sibling lane's context instead of its owner's"
+    )
+    assert composed.document["isis"]["isis_flex_algo_intent"], "the sibling lane's rows left the document"
+
+    recorder = await _execute(device_id, "ec-isis-owner")
+    isis = recorder.container("isis")
+    assert [entry["interface-name"] for entry in isis["interface-config"]] == ["GigabitEthernet0/1"]
+    (process,) = isis["process-config"]
+    assert [algo["algo-id"] for algo in process["flex-algo"]] == [128], "the sibling lane's rows left the wire"
+
+
+def test_every_consumption_path_deletes_a_carrier_through_the_one_locking_choke_point():
+    """One choke point, so the projection lock cannot be forgotten on a new consumption path.
+
+    ``delete_tombstones`` takes the claim, then the projection lock, then the carrier rows.
+    A second site issuing its own DELETE would consume a carrier a document creation holding
+    that lock is in the middle of composing, which is the interleaving the order forbids.
+    """
+    import ast
+    import pathlib as _pathlib
+
+    root = _pathlib.Path(__file__).resolve().parents[2] / "nso_adapter"
+    offenders: set[str] = set()
+    for path in root.rglob("*.py"):
+        if path.name == "tombstone_store.py":
+            continue
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "delete":
+                if any(isinstance(arg, ast.Name) and arg.id == "StaticRouteTombstone" for arg in node.args):
+                    offenders.add(str(path.relative_to(root)))
+    assert offenders == set(), f"carrier deletions outside the choke point: {sorted(offenders)}"
+
+    source = ast.parse((root / "store" / "tombstone_store.py").read_text())
+    body = next(
+        node for node in ast.walk(source) if isinstance(node, ast.AsyncFunctionDef) and node.name == "delete_tombstones"
+    )
+    awaited = [
+        node.func.id
+        for node in ast.walk(body)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"lock_claim", "lock_projection"}
+    ]
+    assert awaited[:2] == ["lock_claim", "lock_projection"], f"the lock order is not claim then projection: {awaited}"
 
 
 # ── the hydration half: every stored fact is checked BEFORE any device I/O ────
