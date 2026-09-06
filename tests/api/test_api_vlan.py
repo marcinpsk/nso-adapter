@@ -172,6 +172,9 @@ async def test_apply_switchport_requires_explicit_snapshot_without_mutating_stor
             {"interface_name": "Gi0/1"},
         ],
         [{"interface_name": "Gi0/1", "tagged_vlans": [10, 10]}],
+        # mode is a closed vocabulary: access, trunk, or the empty string for unset.
+        [{"interface_name": "Gi0/1", "mode": "foo"}],
+        [{"interface_name": "Gi0/1", "mode": "ACCESS"}],
     ],
 )
 async def test_apply_switchport_rejects_invalid_graph_without_mutating_store(adapter_client, interfaces):

@@ -8872,7 +8872,11 @@
           "mode": {
             "anyOf": [
               {
-                "maxLength": 16,
+                "enum": [
+                  "access",
+                  "trunk",
+                  ""
+                ],
                 "type": "string"
               },
               {

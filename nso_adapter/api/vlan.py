@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -44,7 +44,10 @@ class _StrictSwitchportRequest(BaseModel):
 
 class SwitchportApply(_StrictSwitchportRequest):
     interface_name: str = Field(min_length=1, max_length=128)
-    mode: str | None = Field(default=None, max_length=16)
+    #: The L2 mode vocabulary the read mirror serves and the contract states. Its own
+    #: vocabulary, unrelated to the LACP member mode a LAG bundle carries. The empty string
+    #: is the wire spelling of unset, and null means the same.
+    mode: Literal["access", "trunk", ""] | None = None
     untagged_vlan: Uint16 | None = None
     tagged_vlans: list[Uint16] = Field(default_factory=list)
 
