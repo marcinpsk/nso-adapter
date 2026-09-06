@@ -47,6 +47,32 @@ class _State:
 _DEVICE = SimpleNamespace(id=1, nso_device_name="reader-dev")
 
 
+async def _jobs(device_id: int) -> dict:
+    from sqlalchemy import select
+
+    from nso_adapter.store.models import Job
+
+    async with session() as db:
+        rows = (await db.execute(select(Job).where(Job.device_id == device_id))).scalars().all()
+        return {row.id: row for row in rows}
+
+
+async def _generation_statuses(device_id: int) -> list:
+    from sqlalchemy import select
+
+    from nso_adapter.store.models import DeploymentGeneration
+
+    async with session() as db:
+        rows = (
+            await db.execute(
+                select(DeploymentGeneration)
+                .where(DeploymentGeneration.device_id == device_id)
+                .order_by(DeploymentGeneration.seq)
+            )
+        ).scalars()
+        return [row.status for row in rows]
+
+
 async def test_the_reader_normalizes_the_legacy_and_the_aggregate_shapes_alike():
     """The aggregate nests the same routes under ``static-route``; consumers see one shape."""
     legacy = await certified_static_route_section(
@@ -227,10 +253,13 @@ async def test_the_reclaimer_reissues_rather_than_consuming_when_the_service_sti
     device_id = await seed_device(nso_device_name="sr-cleanup-pending", netbox_device_id=17203)
     owner = await seed_succeeded_owner(device_id)
     tomb = await seed_tomb(device_id, A, job_id=owner, route_id=1)
+    # A separately authorized sibling, so the cleanup's body proves it drops A and keeps B
+    # rather than proving nothing by carrying nothing.
+    await seed_rows(device_id, [{"triple": B, "route_id": 2}])
     await authorize_static_route(device_id)
 
     # The device is certifiably clean of A; the service still owns it.
-    fake = SrFake("sr-cleanup-pending", service=[wire(A)], device=[wire(B)])
+    fake = SrFake("sr-cleanup-pending", service=[wire(A), wire(B)], device=[wire(B)])
     with capture_logs() as logs:
         assert await run_reclaim(sr_client(fake)) == (0, 1)
 
@@ -238,6 +267,68 @@ async def test_the_reclaimer_reissues_rather_than_consuming_when_the_service_sti
     (reissued,) = await queued_removals(device_id)
     assert (await owners(device_id))[tomb] == reissued.id, "the reissue did not become the carrier's owner"
     assert [log for log in logs if log["event"] == "static_route_reclaim.cleanup_pending"]
+
+    # The reissue is only half the promise. Run it through the REAL worker: it must transmit
+    # the omission, certify the service clean and only then consume the carrier and settle.
+    from nso_adapter.store.models import GenerationStatus, JobStatus
+    from tests.core.test_generation_protocol import run_head
+
+    assert await run_head(device_id, sr_client(fake)) == reissued.id
+    assert fake.sent_keys() == {B}, "the cleanup must omit the key it is authorized to remove"
+    assert A not in fake.service_keys, "the service still owns the key the cleanup claims to have removed"
+
+    job = (await _jobs(device_id))[reissued.id]
+    assert job.status is JobStatus.succeeded
+    assert job.result["removal_branch"] == "networked"
+    assert job.result.get("service_clean") is not False, "consumption requires a CERTIFIED clean service"
+    assert await tombstone_ids(device_id) == [], "the carrier survived a proven cleanup"
+    assert await _generation_statuses(device_id) == [GenerationStatus.settled]
+
+
+async def test_a_failed_cleanup_retains_the_carrier_and_keeps_the_cutover_blocked(adapter_client):
+    """The negative control: nothing consumes on a cleanup that did not land.
+
+    An unproven cleanup that consumed anyway would clear the cutover preflight while the key
+    is still on the service, which is exactly the parked state the preflight exists to catch.
+    """
+    from nso_adapter.core.cutover import CutoverBlocked, refuse_cutover_while_carriers_are_parked
+    from nso_adapter.store.models import JobStatus
+    from tests.core.removal_helpers import authorize_static_route
+    from tests.core.test_generation_protocol import run_head
+    from tests.core.test_static_route_reclaim import owners, queued_removals, run_reclaim, seed_succeeded_owner
+
+    device_id = await seed_device(nso_device_name="sr-cleanup-failed", netbox_device_id=17206)
+    owner = await seed_succeeded_owner(device_id)
+    tomb = await seed_tomb(device_id, A, job_id=owner, route_id=1)
+    await seed_rows(device_id, [{"triple": B, "route_id": 2}])
+    await authorize_static_route(device_id)
+
+    fake = SrFake("sr-cleanup-failed", service=[wire(A)], device=[wire(B)])
+    assert await run_reclaim(sr_client(fake)) == (0, 1)
+    (reissued,) = await queued_removals(device_id)
+
+    # The device rejects the cleanup PUT, so nothing was retracted and nothing is proven.
+    fake.dry_run_status = 200
+    original = fake.handle
+
+    async def _reject(method, url, content=None, headers=None):
+        import httpx
+
+        if "dry-run=" not in url:
+            fake.calls.append({"method": method, "url": url, "body": None, "dry_run": False, "no_networking": False})
+            return httpx.Response(400, request=httpx.Request(method.upper(), url), json={"errors": "nope"})
+        return await original(method, url, content, headers)
+
+    fake.handle = _reject
+    assert await run_head(device_id, sr_client(fake)) == reissued.id
+
+    job = (await _jobs(device_id))[reissued.id]
+    assert job.status is JobStatus.failed
+    assert await tombstone_ids(device_id) == [tomb], "a failed cleanup consumed the carrier"
+    assert (await owners(device_id))[tomb] == reissued.id, "the failed owner keeps the carrier sweepable"
+    async with session() as db:
+        with pytest.raises(CutoverBlocked, match="must drain first"):
+            await refuse_cutover_while_carriers_are_parked(db)
 
 
 async def test_a_reclaim_consumes_only_when_the_device_and_the_service_are_both_clean(adapter_client):
