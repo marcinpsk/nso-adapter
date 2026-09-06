@@ -304,3 +304,53 @@ async def test_apply_lag_config_rejects_invalid_graph_without_mutating_store(ada
             {"device_id": device_id},
         )
     assert count == 0
+
+
+@pytest.mark.anyio
+async def test_apply_lag_config_treats_empty_timer_and_system_id_as_unset(adapter_client):
+    """`""` and null both mean unset for every optional string leaf, not just the mode."""
+    from datetime import UTC, datetime
+
+    from sqlalchemy import update
+
+    from nso_adapter.core.generation import lock_device_document
+    from nso_adapter.core.switching_intent import render_switching_sections
+    from nso_adapter.store.models import LagBundleIntent
+
+    device_id = await seed_device(nso_device_name="lag-empty-strings", netbox_device_id=1215)
+    body = {"bundles": [{"name": "Port-channel1", "lag_id": 1}]}
+    assert (
+        await adapter_client.post(f"/api/v1/devices/{device_id}/lag-config/apply", json=body, headers=AUTH)
+    ).status_code == 200
+
+    evidence_at = datetime(2026, 9, 1, tzinfo=UTC)
+    async with session() as db:
+        await db.execute(
+            update(LagBundleIntent)
+            .where(LagBundleIntent.device_id == device_id)
+            .values(accepted_at=evidence_at, last_apply_at=evidence_at)
+        )
+        await db.commit()
+
+    body["bundles"][0].update({"timer": "", "system_id": ""})
+    response = await adapter_client.post(f"/api/v1/devices/{device_id}/lag-config/apply", json=body, headers=AUTH)
+
+    assert response.status_code == 200, response.text
+    async with session() as db:
+        row = (
+            await db.execute(
+                text(
+                    "SELECT timer, system_id, accepted_at, last_apply_at FROM lag_bundle_intent "
+                    "WHERE device_id = :device_id"
+                ),
+                {"device_id": device_id},
+            )
+        ).one()
+    assert (row.timer, row.system_id) == (None, None), "an empty optional string is stored as unset"
+    assert (row.accepted_at, row.last_apply_at) == (evidence_at, evidence_at), "an unchanged row keeps its evidence"
+
+    async with session() as db:
+        await lock_device_document(db, device_id)
+        rendered = await render_switching_sections(db, device_id)
+        await db.rollback()
+    assert rendered["lag"]["bundle"] == [{"name": "Port-channel1", "lag-id": 1}], "the unset leaves are omitted"

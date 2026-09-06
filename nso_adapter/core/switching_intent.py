@@ -22,14 +22,15 @@ from nso_adapter.store.models import (
 
 
 def _unset(value: str | None) -> str | None:
-    """Return the ONE spelling of an unset mode leaf.
+    """Return the ONE spelling of an unset optional string leaf.
 
     The wire and the store carry two spellings of the same thing: the plugin sends ``""``
-    for an interface with no mode, and an omitted key arrives as ``None``. They must reach
+    for a leaf it has no value for, and an omitted key arrives as ``None``. They must reach
     the store as one value, or re-sending either for the other reads as an edit and clears
     the row's apply evidence. ``None`` is the canonical one, because that is what makes the
-    renderer OMIT the leaf: an empty string would be emitted, and the YANG leaf holds
-    ``access``, ``trunk`` or ``trunk-all`` and nothing else.
+    renderer OMIT the leaf; an empty string would be emitted instead, and no leaf here can
+    hold one — a switchport mode is ``access``, ``trunk`` or ``trunk-all``, and a LAG timer
+    and system id are equally closed.
     """
     return value or None
 
@@ -54,6 +55,10 @@ class LagBundleSnapshot:
     timer: str | None = None
     admin_key: int | None = None
     members: tuple[LagMemberSnapshot, ...] = ()
+
+    def __post_init__(self) -> None:
+        for leaf in ("system_id", "timer"):
+            object.__setattr__(self, leaf, _unset(getattr(self, leaf)))
 
 
 @dataclass(frozen=True, slots=True)
