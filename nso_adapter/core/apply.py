@@ -56,7 +56,6 @@ from nso_adapter.store.models import (
     InterfaceIpIntent,
     Job,
     JobStatus,
-    JobType,
     RedistributionIntent,
     StaticRouteIntent,
     SyncState,
@@ -77,7 +76,7 @@ async def enqueue_apply(
     stream: str,
     settlement_cohort: int | None = None,
 ) -> Job | None:
-    """Create or join a queued coalescible Apply carrier for a new generation.
+    """Admit a new generation, with a dedicated carrier for a settlement cohort.
 
     *stream* names the endpoint lane this write touched — the promotion protocol's unit
     (#1522 §G2). It is a required keyword, not an optional one: a call site that cannot say
@@ -101,8 +100,7 @@ async def enqueue_apply(
     such a device; #1522 §H4's manual-Apply protocol is what needs the bump at the mutation
     site, and moving it there belongs with that change.
     """
-    from nso_adapter.core.generation import attach_to_job, create_generation
-    from nso_adapter.core.jobs import admit_coalescible_job
+    from nso_adapter.core.generation import admit_apply_generation, create_generation
     from nso_adapter.core.request_flags import STORE_ONLY
     from nso_adapter.store.models import GenerationMode
 
@@ -121,27 +119,7 @@ async def enqueue_apply(
         settlement_cohort=settlement_cohort,
     )
 
-    # Atomic same-type QUEUED dedupe, inside a savepoint. Two properties matter to the
-    # fifteen callers, all of which reach here with intent rows already mutated and
-    # uncommitted: a conflict must not poison their transaction, and on a conflict the
-    # queued winner is row-locked until they commit, so the worker cannot start it against a
-    # snapshot older than the request that admitted it.
-    #
-    # A removal is enqueued BEFORE its apply by design, so rejecting on any active job
-    # dropped the apply outright; and a running apply must not refuse its successor, because
-    # the successor is what carries the newer intent.
-    created, winner = await admit_coalescible_job(db, device_id, JobType.apply)
-    job = created or winner
-    if job is not None:
-        # A refused attachment is not an error: the generation is not contiguous with what
-        # that job already carries, so it waits for a job of its own (advance_device_generations).
-        await attach_to_job(db, generation, job)
-    else:
-        logger.error("apply.generation_unattached", device_id=device_id, seq=generation.seq)
-    if created is None:
-        return None
-    await db.flush()
-    return created
+    return await admit_apply_generation(db, generation)
 
 
 # ── #1396 R2 §4.1/§4.2/§4.8 — the guarded static-route PUT-replace ───────────

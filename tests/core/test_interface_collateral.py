@@ -12,7 +12,14 @@ import pytest
 from tests.conftest import seed_device, session
 from tests.core.test_action_apply_promotion import _apply, _put_vlans
 from tests.core.test_execution_context import _execute, _put_addresses, _put_attrs, _seed_interface
-from tests.core.test_generation_protocol import job_row, recorded_client, run_head, seed_settings, stream_row
+from tests.core.test_generation_protocol import (
+    generations,
+    job_row,
+    recorded_client,
+    run_head,
+    seed_settings,
+    stream_row,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -211,8 +218,9 @@ async def test_automatic_attribute_removal_keeps_enabled(adapter_client):
     assert "description" not in entry
 
 
+@pytest.mark.parametrize("queued", [False, True], ids=["idle", "queued"])
 @pytest.mark.parametrize("reject", [False, True], ids=["success", "rejected"])
-async def test_automatic_attribute_edit_with_detach(adapter_client, reject):
+async def test_automatic_attribute_edit_with_detach(adapter_client, reject, queued):
     """A positive edit lands before detach, and both links must succeed to settle."""
     name = "attribute-auto-mixed"
     device_id = await seed_device(nso_device_name=name, netbox_device_id=17339, attributes=["description", "enabled"])
@@ -222,6 +230,10 @@ async def test_automatic_attribute_edit_with_detach(adapter_client, reject):
     live = (await _execute(device_id, name)).documents[-1]
     before = await stream_row(device_id, "interface_config")
     assert before.applied_revision == before.desired_revision
+
+    if queued:
+        assert (await _put_vlans(adapter_client, device_id, [100], seq=1)).status_code == 200
+        predecessor = (await generations(device_id))[-1]
 
     response = await _put_attrs(
         adapter_client, device_id, [{**enabled, "intent_value": False}], seq=1821, query="?delete_origin=false"
@@ -236,13 +248,29 @@ async def test_automatic_attribute_edit_with_detach(adapter_client, reject):
 
     client, rec = recorded_client(name, on_sync_from=check_unsettled)
     client.get_service_config.return_value = live
+    if queued:
+        companion, detach = (await generations(device_id))[-2:]
+        assert companion.settlement_cohort is not None
+        assert companion.settlement_cohort == detach.settlement_cohort
+        assert companion.job_id != predecessor.job_id
+        assert not (await job_row(companion.job_id)).coalescible
+        first = await job_row(await run_head(device_id, client))
+        assert first.id == predecessor.job_id
+        assert first.status.value == "succeeded", (first.error, first.result)
+        assert len(rec.documents) == 1
+        assert rec.vlan_ids() == [[100]]
+        assert rec.documents[0]["interface"] == live["interface"]
+        assert not rec.fake.writes[0]["no_networking"]
+        await check_unsettled()
+        client.get_service_config.return_value = rec.documents[-1]
+    offset = int(queued)
     if reject:
         rec.fake.reject_containers.add("interface")
     job = await job_row(await run_head(device_id, client))
-    assert rec.fake.writes and not rec.fake.writes[0]["no_networking"], (
+    assert rec.fake.writes and not rec.fake.writes[offset]["no_networking"], (
         "the positive edit needs a networked transmission"
     )
-    (entry,) = rec.documents[0]["interface"]["interface"]
+    (entry,) = rec.documents[offset]["interface"]["interface"]
     assert entry["enabled"] is False
     assert entry["description"] == "core link"
     await check_unsettled()
@@ -251,7 +279,7 @@ async def test_automatic_attribute_edit_with_detach(adapter_client, reject):
         assert job.status.value == "failed", (job.error, job.result)
         assert job.error["code"] == "nso_commit_failed"
         assert await run_head(device_id, client) is None
-        assert len(rec.documents) == 1
+        assert len(rec.documents) == offset + 1
         await check_unsettled()
         return
 
@@ -259,10 +287,71 @@ async def test_automatic_attribute_edit_with_detach(adapter_client, reject):
     client.get_service_config.return_value = rec.documents[-1]
     detach = await job_row(await run_head(device_id, client))
     assert detach.status.value == "succeeded", (detach.error, detach.result)
-    assert len(rec.documents) == 2
+    assert len(rec.documents) == offset + 2
     assert rec.fake.writes[-1]["no_networking"]
     (final,) = rec.documents[-1]["interface"]["interface"]
     assert final["enabled"] is False
     assert "description" not in final
     settled = await stream_row(device_id, "interface_config")
     assert settled.applied_revision == pending.desired_revision
+
+
+@pytest.mark.parametrize(
+    "auto_apply",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="store-only attribute omission under auto-apply reaches create_generation and returns HTTP 500",
+            ),
+        ),
+    ],
+    ids=["manual", "store-only-auto"],
+)
+async def test_manual_attribute_edit_with_detach_refuses_queued_apply(adapter_client, auto_apply):
+    """Manual promotion refuses the incumbent without authorizing the prepared edit."""
+    name = "attribute-manual-queued"
+    device_id = await seed_device(nso_device_name=name, netbox_device_id=17340, attributes=["description", "enabled"])
+    await seed_settings(device_id, auto_apply=True)
+    enabled = {"interface": _IFACE, "attribute": "enabled", "intent_value": True}
+    assert (await _put_attrs(adapter_client, device_id, [*_ATTR, enabled], seq=1830)).status_code == 200
+    live = (await _execute(device_id, name)).documents[-1]
+    before = await stream_row(device_id, "interface_config")
+    assert (await _put_vlans(adapter_client, device_id, [100], seq=1)).status_code == 200
+    incumbent = (await generations(device_id))[-1]
+    if not auto_apply:
+        from sqlalchemy import select
+
+        from nso_adapter.store.models import DeviceSettings
+
+        async with session() as db:
+            settings = await db.scalar(select(DeviceSettings).where(DeviceSettings.device_id == device_id))
+            settings.auto_apply = False
+            await db.commit()
+    response = await _put_attrs(
+        adapter_client,
+        device_id,
+        [{**enabled, "intent_value": False}],
+        seq=1831,
+        query="?store_only=true&delete_origin=false",
+    )
+    assert response.status_code == 200, response.text
+    response = await _apply(adapter_client, device_id, {"interface_config": 1831})
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "conflict"
+    assert response.json()["error"]["detail"]["job_id"] == incumbent.job_id
+    assert len(await generations(device_id)) == 2
+    current = await stream_row(device_id, "interface_config")
+    assert current.authorized_revision == before.authorized_revision < current.desired_revision
+    assert current.applied_revision == before.applied_revision
+    client, rec = recorded_client(name)
+    client.get_service_config.return_value = live
+    job = await job_row(await run_head(device_id, client))
+    assert job.id == incumbent.job_id
+    assert job.status.value == "succeeded", (job.error, job.result)
+    assert len(rec.documents) == 1
+    assert rec.documents[0]["interface"] == live["interface"]
+    assert rec.vlan_ids() == [[100]]
+    assert await run_head(device_id, client) is None

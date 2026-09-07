@@ -1062,15 +1062,7 @@ async def _enqueue_action_apply_job(
     removal_authority: dict[str, dict[str, list]],
     frozen_fragments: dict[str, dict],
 ) -> DeploymentGeneration:
-    """Create the companion Apply generation and give it a carrier.
-
-    It shares the intermediate document with the removal links, so it omits the same rows and
-    carries the same authority. A companion that carries authority takes a DEDICATED carrier:
-    an unrelated auto-Apply may otherwise join the coalescible one and execute the shared
-    document with an empty authority, which is exactly what the device-wide guard blocks.
-    """
-    from nso_adapter.core.jobs import admit_coalescible_job, create_dedicated_job
-
+    """Create the companion Apply generation and admit its carrier."""
     generation = await create_generation(
         db,
         device_id,
@@ -1082,17 +1074,33 @@ async def _enqueue_action_apply_job(
         apply_attempt_id=apply_attempt_id,
         frozen_fragments=frozen_fragments,
     )
-    if removal_authority:
-        carrier = await create_dedicated_job(db, device_id, JobType.apply)
-    else:
-        admitted, winner = await admit_coalescible_job(db, device_id, JobType.apply)
-        if winner is not None:
-            raise ApplyJobConflict(winner.id)
-        if admitted is None:  # pragma: no cover - bounded admission retries exhausted
-            raise RuntimeError(f"could not admit an apply job for device {device_id}")
-        carrier = admitted
-    await require_attach_to_job(db, generation, carrier)
+    await admit_apply_generation(db, generation)
     return generation
+
+
+async def admit_apply_generation(db: AsyncSession, generation: DeploymentGeneration) -> Job | None:
+    """Admit an Apply carrier without letting coalescing absorb a chain companion.
+
+    Cohort members and generations with removal authority need dedicated carriers.
+    Ordinary automatic generations can join a queued winner if they are contiguous.
+    Return the new carrier, or None when admission found an existing queued job.
+    """
+    from nso_adapter.core.jobs import admit_coalescible_job, create_dedicated_job
+
+    if generation.settlement_cohort is not None or generation.allowed_removal_keys:
+        dedicated = await create_dedicated_job(db, generation.device_id, JobType.apply)
+        await require_attach_to_job(db, generation, dedicated)
+        return dedicated
+
+    created, winner = await admit_coalescible_job(db, generation.device_id, JobType.apply)
+    if winner is not None and generation.apply_attempt_id is not None:
+        raise ApplyJobConflict(winner.id)
+    carrier = created or winner
+    if carrier is None:  # pragma: no cover - bounded admission retries exhausted
+        raise RuntimeError(f"could not admit an apply job for device {generation.device_id}")
+    # A noncontiguous successor waits for advancement to assign its own carrier.
+    await attach_to_job(db, generation, carrier)
+    return created
 
 
 async def create_action_apply(
@@ -2199,6 +2207,7 @@ __all__ = [
     "GenerationNotBlocked",
     "GenerationTampered",
     "LIVE_JOB_STATUSES",
+    "admit_apply_generation",
     "advance_device_generations",
     "advance_generations_locked",
     "allocate_settlement_cohort",
