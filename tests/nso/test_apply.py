@@ -387,7 +387,7 @@ async def test_verify_raises_on_nonempty_delta():
     with pytest.raises(NsoApplyError) as exc_info:
         await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="static_route")
     assert exc_info.value.code == "verify_mismatch"
-    assert "ip route" in exc_info.value.detail["device_delta"]
+    assert exc_info.value.detail["device_delta"] == "[redacted]"
 
 
 @pytest.mark.asyncio
@@ -415,7 +415,7 @@ async def test_verify_raises_on_conclusive_4xx_rejection():
     _mock_http_ctx(client, _httpx_response(400, json_data=err_body))
     with pytest.raises(NsoApplyError) as exc_info:
         await _verify_native_or_raise(client, "http://nso/x", "{}", "sw03", scope="route_policy")
-    assert exc_info.value.detail.get("nso_error") == err_body
+    assert exc_info.value.detail["nso_error"] == {"ietf-restconf:errors": {"error": [{"error-message": "[redacted]"}]}}
 
 
 @pytest.mark.asyncio

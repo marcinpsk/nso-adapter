@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping
 from typing import Any, NamedTuple, cast
 
@@ -205,7 +206,7 @@ async def native_dry_run(
             err = resp.json()
         except ValueError:
             err = {"raw": "[redacted]"}
-        err = _sanitized_nso_error(err, _submitted_secrets(json.loads(payload)))
+        err = _sanitized_nso_error(err)
         logger.warning("nso.apply.dry_run_non_2xx", device=device_name, status=resp.status_code, body=err)
         if strict and 400 <= resp.status_code < 500:
             raise NsoApplyError(
@@ -253,6 +254,7 @@ async def _verify_native_or_raise(
         logger.warning("nso.apply.verify_inconclusive_or_unexpected", scope=scope, device=device_name)
         return VERIFY_INCONCLUSIVE
     if delta.strip():
+        delta = "[redacted]"
         logger.error("nso.apply.verify_mismatch", scope=scope, device=device_name, delta=delta)
         raise NsoApplyError(
             "verify_mismatch",
@@ -272,41 +274,32 @@ def device_intent_instance(device_name: str, containers: Mapping[str, dict]) -> 
     return {"device": device_name, **{container: body for container, body in containers.items()}}
 
 
-def _secret_leaf(key: str) -> bool:
-    key = key.lower().replace("_", "-").split(":")[-1]
-    return "password" in key or "secret" in key or ("auth" in key and key.endswith("key"))
+def _diagnostic_message(value: object) -> str:
+    """Keep only a recognized refusal family from opaque server text."""
+    from nso_adapter.core.projection import section_registry
+
+    if isinstance(value, str):
+        match = re.search(r"device-intent:\s*refused\s*\[\s*family=([A-Za-z0-9._-]+)(?=\s|\])", value)
+        if match and match.group(1) in {entry.container for entry in section_registry().values()}:
+            return f"device-intent: refused [family={match.group(1)}]: [redacted]"
+    return "[redacted]"
 
 
-def _submitted_secrets(value: object) -> set[str]:
-    if isinstance(value, dict):
-        secrets = set()
-        for key, child in value.items():
-            if _secret_leaf(key) and isinstance(child, str) and child:
-                secrets.add(child)
-            else:
-                secrets.update(_submitted_secrets(child))
-        return secrets
-    if isinstance(value, list):
-        return {secret for child in value for secret in _submitted_secrets(child)}
-    return set()
-
-
-def _sanitized_nso_error(value: object, secrets: set[str]) -> object:
-    """Remove submitted secrets and opaque error data before logging or persistence."""
+def _sanitized_nso_error(value: object) -> object:
+    """Retain validated diagnostics without server text or Vault fields."""
     if isinstance(value, dict):
         return {
-            key: "[redacted]"
-            if _secret_leaf(key) or key in {"error-info", "raw"}
-            else _sanitized_nso_error(child, secrets)
+            key: _sanitized_nso_error(child)
+            if key in {"ietf-restconf:errors", "errors", "error"}
+            else _diagnostic_message(child)
+            if key == "error-message"
+            else "[redacted]"
             for key, child in value.items()
+            if key in {"ietf-restconf:errors", "errors", "error", "error-message", "error-info", "raw"}
         }
     if isinstance(value, list):
-        return [_sanitized_nso_error(child, secrets) for child in value]
-    if isinstance(value, str):
-        for secret in sorted(secrets, key=len, reverse=True):
-            value = value.replace(secret, "[redacted]")
-            value = value.replace(boundary_safe_dumps(secret)[1:-1], "[redacted]")
-    return value
+        return [_sanitized_nso_error(child) for child in value]
+    return _diagnostic_message(value)
 
 
 async def apply_device_intent(
@@ -364,7 +357,7 @@ async def apply_device_intent(
                 err = resp.json()
             except ValueError:
                 err = {"raw": "[redacted]"}
-            err = _sanitized_nso_error(err, _submitted_secrets(containers))
+            err = _sanitized_nso_error(err)
             logger.error(
                 "nso.apply.device_intent_failed",
                 device=device_name,
@@ -583,11 +576,11 @@ def _snmp_vault_triple(vault_ref: str, prefix: str, owner: str) -> dict[str, str
     """
     try:
         ref = parse_vault_ref(vault_ref, require_key=True)
-    except VaultRefError as exc:
+    except VaultRefError:
         raise NsoApplyError(
             "invalid_vault_ref",
-            f"SNMP intent {owner!r}: bad vault_ref: {exc}",
-        ) from exc
+            f"SNMP intent {owner!r}: vault_ref must be a valid mount/path#key reference",
+        ) from None
     return {
         f"{prefix}vault-mount": ref.mount,
         f"{prefix}vault-path": ref.path,

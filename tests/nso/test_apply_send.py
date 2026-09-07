@@ -487,7 +487,7 @@ def test_snmp_rejects_a_malformed_vault_ref(bad_ref):
     community would be deleted from the device)."""
     communities = [SimpleNamespace(label="ro", vault_ref=bad_ref, access="RO", acl=None)]
 
-    with pytest.raises(NsoApplyError, match="vault_ref"):
+    with pytest.raises(NsoApplyError, match="vault_ref") as caught:
         encode_snmp(
             {
                 "snmp_community_intent": communities,
@@ -497,6 +497,14 @@ def test_snmp_rejects_a_malformed_vault_ref(bad_ref):
             },
             _PLAIN,
         )
+
+    import traceback
+
+    if bad_ref:
+        assert bad_ref not in str(caught.value)
+        assert bad_ref not in "".join(traceback.format_exception(caught.value))
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__
 
 
 async def test_logging_container_carries_the_host_list():
