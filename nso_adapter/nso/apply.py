@@ -203,8 +203,9 @@ async def native_dry_run(
         # Surface the device error rather than silently discarding it as "inconclusive".
         try:
             err = resp.json()
-        except Exception:
-            err = {"raw": resp.text}
+        except ValueError:
+            err = {"raw": "[redacted]"}
+        err = _sanitized_nso_error(err, _submitted_secrets(json.loads(payload)))
         logger.warning("nso.apply.dry_run_non_2xx", device=device_name, status=resp.status_code, body=err)
         if strict and 400 <= resp.status_code < 500:
             raise NsoApplyError(
@@ -271,6 +272,43 @@ def device_intent_instance(device_name: str, containers: Mapping[str, dict]) -> 
     return {"device": device_name, **{container: body for container, body in containers.items()}}
 
 
+def _secret_leaf(key: str) -> bool:
+    key = key.lower().replace("_", "-").split(":")[-1]
+    return "password" in key or "secret" in key or ("auth" in key and key.endswith("key"))
+
+
+def _submitted_secrets(value: object) -> set[str]:
+    if isinstance(value, dict):
+        secrets = set()
+        for key, child in value.items():
+            if _secret_leaf(key) and isinstance(child, str) and child:
+                secrets.add(child)
+            else:
+                secrets.update(_submitted_secrets(child))
+        return secrets
+    if isinstance(value, list):
+        return {secret for child in value for secret in _submitted_secrets(child)}
+    return set()
+
+
+def _sanitized_nso_error(value: object, secrets: set[str]) -> object:
+    """Remove submitted secrets and opaque error data before logging or persistence."""
+    if isinstance(value, dict):
+        return {
+            key: "[redacted]"
+            if _secret_leaf(key) or key in {"error-info", "raw"}
+            else _sanitized_nso_error(child, secrets)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitized_nso_error(child, secrets) for child in value]
+    if isinstance(value, str):
+        for secret in sorted(secrets, key=len, reverse=True):
+            value = value.replace(secret, "[redacted]")
+            value = value.replace(json.dumps(secret)[1:-1], "[redacted]")
+    return value
+
+
 async def apply_device_intent(
     client: NsoClient,
     device_name: str,
@@ -324,8 +362,9 @@ async def apply_device_intent(
         if resp.status_code not in (200, 201, 204):
             try:
                 err = resp.json()
-            except Exception:
-                err = {"raw": resp.text}
+            except ValueError:
+                err = {"raw": "[redacted]"}
+            err = _sanitized_nso_error(err, _submitted_secrets(containers))
             logger.error(
                 "nso.apply.device_intent_failed",
                 device=device_name,

@@ -456,3 +456,67 @@ async def test_a_clean_commit_clears_the_stale_capability_for_every_family_it_ca
 
     assert job.status == (JobStatus.failed if put_fails else JobStatus.succeeded), job.error
     assert await capability_scopes(device_id) == (["static_route"] if put_fails else [])
+
+
+@pytest.mark.parametrize("phase", ["commit", "verify"])
+@pytest.mark.parametrize("shape", ["object", "text", "string"])
+async def test_rejected_commit_redacts_secrets_in_logs_and_stored_errors(adapter_client, shape, phase):
+    from structlog.testing import capture_logs
+
+    from nso_adapter.store.models import OspfInterfaceIntent
+
+    secret = "placeholder-authentication-secret"
+    device_id = await seed_device(nso_device_name="sr-atomic")
+    await seed_vlan(device_id)
+    async with session() as db:
+        db.add(
+            OspfInterfaceIntent(
+                device_id=device_id,
+                interface_name="GigabitEthernet0/1",
+                process_id="1",
+                area_id="0",
+                auth_type="md5",
+                auth_key=secret,
+                accepted_at=_NOW,
+            )
+        )
+        await db.commit()
+    client, rec = atomic_client("sr-atomic", state=present(device_name="sr-atomic"), section=dev_state())
+    original = rec._handle
+
+    async def reject(method, url, content=None, headers=None):
+        if method == "put" and ("dry-run=" in url) == (phase == "verify") and secret in content:
+            message = f"device-intent: refused [family=ospf field=auth-key]: rejected {secret}"
+            if shape == "text":
+                return httpx.Response(400, text=message)
+            if shape == "string":
+                return httpx.Response(400, json=message)
+            return httpx.Response(
+                400,
+                json={
+                    "ietf-restconf:errors": {
+                        "error": [
+                            {
+                                "error-message": message,
+                                "error-info": {"auth-key": secret, "submitted": f"value={secret}"},
+                            }
+                        ]
+                    }
+                },
+            )
+        return await original(method, url, content, headers)
+
+    rec._handle = reject
+    with capture_logs() as logs:
+        job = await run_the_apply(device_id, client)
+    assert job.status == JobStatus.failed
+    async with session() as db:
+        row = await db.scalar(select(OspfInterfaceIntent).where(OspfInterfaceIntent.device_id == device_id))
+        error = row.last_apply_error
+    assert error is not None, json.dumps({"error": job.error, "logs": logs})
+    assert error["code"] == ("nso_put_failed" if phase == "commit" else "dry_run_rejected"), error
+    assert secret not in json.dumps(error)
+    event = "nso.apply.device_intent_failed" if phase == "commit" else "nso.apply.dry_run_non_2xx"
+    failures = [record for record in logs if record["event"] == event]
+    assert failures
+    assert secret not in json.dumps(logs)
