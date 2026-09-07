@@ -194,7 +194,10 @@ async def _escalate_not_ready(device: Device, nso_client: NsoClient, wire_name: 
         async with _action_semaphore():
             output = await nso_client.run_device_state_read(device.nso_device_name, [wire_name])
     except Exception as exc:  # noqa: BLE001 — action error (bracket exhaustion, unknown device) → keep rows
-        return Unavailable(UnavailableReason.read_error, detail=repr(exc))
+        # The type says transport blip or contract violation; the message can repeat what NSO said.
+        return Unavailable(
+            UnavailableReason.read_error, detail=f"the device-state-read action raised {type(exc).__name__}"
+        )
     section = output.get(wire_name)
     if section is None:
         return Unavailable(UnavailableReason.read_error, detail="action output missing the requested section")
@@ -221,9 +224,11 @@ async def classify_envelope_family_read(
     try:
         section = await nso_client.get_device_state_section(device.nso_device_name, wire_name)
     except NsoExportUnavailableError as exc:
-        return Unavailable(UnavailableReason.export_down, detail=repr(exc))
+        return Unavailable(
+            UnavailableReason.export_down, detail=f"the envelope section GET raised {type(exc).__name__}"
+        )
     except Exception as exc:  # noqa: BLE001 — any read failure is Unavailable; the mirror is kept
-        return Unavailable(UnavailableReason.read_error, detail=repr(exc))
+        return Unavailable(UnavailableReason.read_error, detail=f"the envelope section GET raised {type(exc).__name__}")
     outcome = classify_envelope_section(section)
     if isinstance(outcome, Unavailable) and outcome.reason is UnavailableReason.not_ready:
         logger.info(
