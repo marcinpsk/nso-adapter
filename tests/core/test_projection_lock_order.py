@@ -331,7 +331,7 @@ async def test_switching_writer_commits_before_real_offboard(adapter_client, riv
 
 async def test_document_snapshot_waits_for_a_switching_replacement(adapter_client, rival_engine):
     from nso_adapter.core.generation import lock_device_document
-    from nso_adapter.core.projection import hydrate_section, snapshot_stream
+    from nso_adapter.core.projection import hydrate_section
     from nso_adapter.core.switching_intent import (
         LagBundleSnapshot,
         LagMemberSnapshot,
@@ -339,6 +339,7 @@ async def test_document_snapshot_waits_for_a_switching_replacement(adapter_clien
         replace_lag_snapshot,
     )
     from nso_adapter.store.db import get_engine
+    from tests.core.test_projection_document import _freeze_snapshot
 
     device_id = await seed_device(nso_device_name="lock-switching-snapshot", netbox_device_id=9913)
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
@@ -361,7 +362,7 @@ async def test_document_snapshot_waits_for_a_switching_replacement(adapter_clien
 
         async def read_document():
             await lock_device_document(reader, device_id)
-            fragment = await snapshot_stream(reader, device_id, "lag")
+            fragment = await _freeze_snapshot(reader, device_id, "lag")
             await reader.rollback()
             return encode_lag_section(
                 hydrate_section({"lag": fragment}, "lag"), {"ned_id": None, "dialect": "identity"}

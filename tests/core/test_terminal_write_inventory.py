@@ -195,15 +195,18 @@ async def _t9_removal_unproven_with_carrier() -> tuple[int, int]:
 
 async def _t10_removal_generic_success() -> tuple[int, int]:
     """``core/removal.py`` ``run_removal``'s generic-scope success."""
-    from nso_adapter.core.removal import run_removal
+    from nso_adapter.core.removal import enqueue_removal
+    from tests.core.removal_helpers import authorize_stream
+    from tests.core.test_generation_protocol import recorded_client, run_head
 
     device_id = await seed_device(nso_device_name="inv-t10", netbox_device_id=8310)
-    job_id = await _running_job(device_id, JobType.removal, context={"scope": "vlan"})
-    with (
-        patch("nso_adapter.core.importer.get_nso_client", return_value=AsyncMock()),
-        patch("nso_adapter.core.removal._dispatch_scope", new=AsyncMock()),
-    ):
-        await run_removal(job_id=job_id, device_id=device_id, reg=ClaimRegistration(run_attempt=1))
+    await authorize_stream(device_id, "vlan")
+    async with session() as db:
+        job = await enqueue_removal(db, device_id, "vlan", marking=None, defer_retract=False, promotes=(), force=True)
+        await db.commit()
+        job_id = job.id
+    client, _ = recorded_client("inv-t10")
+    assert await run_head(device_id, client) == job_id
     return device_id, job_id
 
 

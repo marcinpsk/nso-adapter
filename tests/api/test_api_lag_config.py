@@ -327,9 +327,10 @@ async def test_apply_lag_config_treats_empty_timer_and_system_id_as_unset(adapte
 
     from sqlalchemy import update
 
-    from nso_adapter.core.projection import hydrate_section, snapshot_stream
+    from nso_adapter.core.projection import hydrate_section
     from nso_adapter.core.switching_intent import encode_lag_section
     from nso_adapter.store.models import LagBundleIntent
+    from tests.core.test_projection_document import _freeze_snapshot
 
     device_id = await seed_device(nso_device_name="lag-empty-strings", netbox_device_id=1215)
     body = {"bundles": [{"name": "Port-channel1", "lag_id": 1}], "deleted_roots": []}
@@ -364,7 +365,7 @@ async def test_apply_lag_config_treats_empty_timer_and_system_id_as_unset(adapte
     assert (row.accepted_at, row.last_apply_at) == (evidence_at, evidence_at), "an unchanged row keeps its evidence"
 
     async with session() as db:
-        document = {"lag": await snapshot_stream(db, device_id, "lag")}
+        document = {"lag": await _freeze_snapshot(db, device_id, "lag")}
         await db.rollback()
     context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
     assert encode_lag_section(hydrate_section(document, "lag"), context) == {

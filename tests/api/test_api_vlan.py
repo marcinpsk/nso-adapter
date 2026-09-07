@@ -299,8 +299,9 @@ async def test_put_vlan_intent_unknown_device_404(adapter_client):
 @pytest.mark.anyio
 async def test_apply_switchport_accepts_the_trunk_all_mode(adapter_client):
     """`trunk-all` is live: the plugin sends it for NetBox `tagged-all`, and YANG names it."""
-    from nso_adapter.core.projection import hydrate_section, snapshot_stream
+    from nso_adapter.core.projection import hydrate_section
     from nso_adapter.core.switching_intent import encode_switchport_section
+    from tests.core.test_projection_document import _freeze_snapshot
 
     device_id = await seed_device(nso_device_name="switchport-trunk-all", netbox_device_id=1212)
     response = await adapter_client.post(
@@ -321,7 +322,7 @@ async def test_apply_switchport_accepts_the_trunk_all_mode(adapter_client):
     assert stored == "trunk-all"
 
     async with session() as db:
-        document = {"switchport": await snapshot_stream(db, device_id, "switchport")}
+        document = {"switchport": await _freeze_snapshot(db, device_id, "switchport")}
         await db.rollback()
     context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
     assert encode_switchport_section(hydrate_section(document, "switchport"), context) == {
