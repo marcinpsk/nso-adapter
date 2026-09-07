@@ -872,7 +872,12 @@ def test_every_consumption_path_deletes_a_carrier_through_the_one_locking_choke_
             continue
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "delete":
+            if isinstance(node, ast.Call) and (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "delete"
+                or isinstance(node.func, ast.Attribute)
+                and node.func.attr == "delete"
+            ):
                 if any(isinstance(arg, ast.Name) and arg.id == "StaticRouteTombstone" for arg in node.args):
                     offenders.add(str(path.relative_to(root)))
     assert offenders == set(), f"carrier deletions outside the choke point: {sorted(offenders)}"
