@@ -88,10 +88,19 @@ def _vault_provider(request: Request):
 
 
 def _parse_ref(reference: str) -> VaultRef:
+    """Parse a caller-supplied ref, answering 400 with the broken rule and not the input.
+
+    The caller learns which part of the grammar it broke. It is never sent its own text
+    back: a caller that put a secret in the ``vault_ref`` field would otherwise read it
+    out of the error body and out of every log that recorded the response.
+    """
     try:
         return parse_vault_ref(reference)
     except VaultRefError as exc:
-        raise api_error(400, "invalid_vault_ref", str(exc)) from exc
+        reason = exc.reason
+    # Raised outside the handler: `from exc` (and `from None`) both keep the parser
+    # exception on the chain, and its text repeats the reference.
+    raise api_error(400, "invalid_vault_ref", reason)
 
 
 async def _vault_op(operation):
@@ -211,10 +220,15 @@ async def harvest_community(
             "hash2-obfuscated — live-confirmed; v3 secrets are never harvestable)",
         )
 
+    unavailable = None
     try:
         client = get_nso_client(device.nso_instance)
-    except RuntimeError as exc:
-        raise api_error(502, "nso_unavailable", str(exc)) from exc
+    except RuntimeError:
+        # Adapter-authored, like the same refusal in api/capability.py. The caught text is
+        # not repeated and not chained: a raise inside the handler attaches it either way.
+        unavailable = api_error(502, "nso_unavailable", f"No NSO client for instance {device.nso_instance!r}")
+    if unavailable is not None:
+        raise unavailable
     payload = await client.get_device_config_subtree(device.nso_device_name, subpath)
 
     found = snmp_harvest.find_community(ned_id, payload or {}, body.community_hash)
