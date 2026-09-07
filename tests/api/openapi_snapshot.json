@@ -5473,7 +5473,11 @@
           "timer": {
             "anyOf": [
               {
-                "maxLength": 8,
+                "enum": [
+                  "fast",
+                  "slow",
+                  ""
+                ],
                 "type": "string"
               },
               {
@@ -5646,7 +5650,12 @@
           "mode": {
             "anyOf": [
               {
-                "maxLength": 16,
+                "enum": [
+                  "active",
+                  "passive",
+                  "on",
+                  ""
+                ],
                 "type": "string"
               },
               {
