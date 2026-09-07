@@ -968,6 +968,12 @@ async def test_worker_validates_vlan_context_before_any_nso_io(adapter_client, c
         await db.execute(sa.text("ALTER TABLE deployment_generation ENABLE TRIGGER deployment_generation_immutable"))
         await db.commit()
     client, rec = recorded_client("invalid-vlan-context")
+    from unittest.mock import patch
+
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
+        response = await adapter_client.get(f"/api/v1/devices/{device_id}/actions/apply-diff", headers=AUTH)
+    assert response.status_code == 200
+    assert "preview unavailable" in response.json()["diffs"]["device_intent"]
     job = await job_row(await run_head(device_id, client))
     assert job.status.value == "failed"
     assert client.mock_calls == [], "context validation must precede every NSO call"

@@ -555,18 +555,14 @@ async def test_c1_9_runners_forward_the_worker_registration(adapter_client):
 
 async def test_c1_9b_dispatch_scope_receives_the_job_id_and_the_registration(adapter_client):
     """``_dispatch_scope`` had neither (G13), so no R2 write could be job-correlated."""
-    from nso_adapter.store.models import Job, JobStatus, JobType
+    from tests.core.removal_helpers import authorize_stream
 
     device_id = await seed_device(nso_device_name="sr-thread", netbox_device_id=7010)
+    await authorize_stream(device_id, "vlan")
     async with session() as db:
-        job = Job(
-            job_type=JobType.removal,
-            device_id=device_id,
-            status=JobStatus.queued,
-            coalescible=False,
-            context={"scope": "vlan"},
+        job = await removal_mod.enqueue_removal(
+            db, device_id, "vlan", marking=None, defer_retract=False, promotes=(), force=True
         )
-        db.add(job)
         await db.commit()
         job_id = job.id
 
@@ -594,18 +590,15 @@ async def test_c1_9c_a_revoked_claim_propagates_instead_of_failing_the_job(adapt
     Driven through the real ``lock_claim`` with the real registration the runner was
     handed; recovery already owns the disposition.
     """
-    from nso_adapter.store.models import DeviceClaim, Job, JobStatus, JobType
+    from nso_adapter.store.models import DeviceClaim, Job, JobStatus
+    from tests.core.removal_helpers import authorize_stream
 
     device_id = await seed_device(nso_device_name="sr-revoked", netbox_device_id=7011)
+    await authorize_stream(device_id, "vlan")
     async with session() as db:
-        job = Job(
-            job_type=JobType.removal,
-            device_id=device_id,
-            status=JobStatus.queued,
-            coalescible=False,
-            context={"scope": "vlan"},
+        job = await removal_mod.enqueue_removal(
+            db, device_id, "vlan", marking=None, defer_retract=False, promotes=(), force=True
         )
-        db.add(job)
         await db.commit()
         job_id = job.id
 

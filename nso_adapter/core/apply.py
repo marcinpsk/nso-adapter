@@ -764,14 +764,14 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
     generation = await executable_head(db, device_id)
     if generation is None:
         return {PREVIEW_KEY: "!! preview unavailable: this device has no generation to deploy"}
-    if generation.job_id is not None:
-        generation = await executing_generation(db, generation.job_id)
-        if generation is None:
-            return {PREVIEW_KEY: "!! preview unavailable: job carries no generation"}
-    client = get_nso_client(device.nso_instance)
-    # dry_run is bool|str down the sender: True = native, "cli" = tree diff.
-    fmt: bool | str = "cli" if outformat == "cli" else True
     try:
+        if generation.job_id is not None:
+            generation = await executing_generation(db, generation.job_id)
+            if generation is None:
+                return {PREVIEW_KEY: "!! preview unavailable: job carries no generation"}
+        client = get_nso_client(device.nso_instance)
+        # dry_run is bool|str down the sender: True = native, "cli" = tree diff.
+        fmt: bool | str = "cli" if outformat == "cli" else True
         policy = execution_policy(generation)
         body = await build_device_containers(
             client, device, generation.document, retain_static_routes=policy.retain_static_routes

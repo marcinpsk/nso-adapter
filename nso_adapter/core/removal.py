@@ -1651,9 +1651,10 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
         try:
             from nso_adapter.core.generation import executing_generation, execution_policy
 
+            scope = _removal_scope(context)
             generation = await executing_generation(db, job_id)
             if generation is None:
-                raise RuntimeError(f"removal job {job_id} carries no generation")
+                raise RuntimeError(f"removal job {job_id} carries no generation to deploy")
             policy = execution_policy(generation)
             context = policy.context
             scope = _removal_scope(context)
