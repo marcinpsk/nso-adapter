@@ -22,8 +22,8 @@ from nso_adapter.core.static_route_reader import certified_static_route_section
 from tests.conftest import seed_device, session
 from tests.core.removal_helpers import seed_removal_job, seed_tomb
 from tests.core.static_route_harness import K as K_KEY
-from tests.core.test_static_route_put import A, B, C, seed_rows, wire
-from tests.core.test_static_route_removal import SrFake, run_removal_job, sr_client, tombstone_ids
+from tests.core.test_static_route_put import A, B, C, D, seed_rows, wire
+from tests.core.test_static_route_removal import SrFake, key_of, run_removal_job, sr_client, tombstone_ids
 
 pytestmark = pytest.mark.anyio
 
@@ -262,46 +262,115 @@ async def test_a_networked_removal_whose_service_still_holds_the_key_keeps_its_c
     assert await tombstone_ids(device_id) == [tomb], "the carrier was consumed while the service held its key"
 
 
-async def test_the_reclaimer_reissues_rather_than_consuming_when_the_service_still_holds_the_key(adapter_client):
-    """Device-absent plus service-present is ``cleanup_pending``: retained, reissued, logged."""
-    from structlog.testing import capture_logs
+async def _cleanup_pending(api):
+    """Fixture S with a second, separately RETAINED sibling: the state test 4 starts from.
 
+    A is claimed by an abandoned carrier with a succeeded owner, gone from the device and
+    still owned by the service. B is RENDERED by an intent row. C is claimed by an ordinary
+    carrier the reclaim never looks at, so it exists only in the live service and its bytes
+    are ones no store row could rebuild.
+    """
     from tests.core.removal_helpers import authorize_static_route
-    from tests.core.test_static_route_reclaim import owners, queued_removals, run_reclaim, seed_succeeded_owner
+    from tests.core.static_route_harness import RetentionHarness
+    from tests.core.test_generation_protocol import seed_settings
+    from tests.core.test_static_route_reclaim import seed_succeeded_owner
 
     device_id = await seed_device(nso_device_name="sr-cleanup-pending", netbox_device_id=17203)
+    await seed_settings(device_id, auto_apply=False)
     owner = await seed_succeeded_owner(device_id)
     tomb = await seed_tomb(device_id, A, job_id=owner, route_id=1)
-    # A separately authorized sibling, so the cleanup's body proves it drops A and keeps B
-    # rather than proving nothing by carrying nothing.
+    sibling = await seed_tomb(device_id, C, route_id=3)  # no succeeded owner: the reclaim skips it
+    rich_c = wire(C, metric=77, tag=707)
+    rich_c["interface-next-hop"] = "GigabitEthernet0/9"
     await seed_rows(device_id, [{"triple": B, "route_id": 2}])
     await authorize_static_route(device_id)
 
-    # The device is certifiably clean of A; the service still owns it.
-    fake = SrFake("sr-cleanup-pending", service=[wire(A), wire(B)], device=[wire(B)])
-    with capture_logs() as logs:
-        assert await run_reclaim(sr_client(fake)) == (0, 1)
+    fake = SrFake("sr-cleanup-pending", service=[wire(A), wire(B), rich_c], device=[wire(B), rich_c])
+    client = sr_client(fake)
+    return RetentionHarness(api, device_id, fake, client), tomb, sibling, rich_c
 
-    assert await tombstone_ids(device_id) == [tomb]
+
+async def test_the_reclaimer_reissues_rather_than_consuming_when_the_service_still_holds_the_key(adapter_client):
+    """Device-absent plus service-present is ``cleanup_pending``: retained, reissued, logged.
+
+    Then the whole promise, through the real worker: the cleanup omits the key its frozen
+    authority names, transmits the separately RETAINED sibling at its current service bytes,
+    certifies the service clean and only then consumes the carrier — and a fresh successor
+    carries no trace of the key.
+    """
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.projection import section_operation
+    from nso_adapter.store.models import GenerationStatus, JobStatus
+    from tests.core.test_execution_context import _drain
+    from tests.core.test_generation_protocol import generations, run_head
+    from tests.core.test_static_route_reclaim import owners, queued_removals, run_reclaim
+
+    harness, tomb, sibling, rich_c = await _cleanup_pending(adapter_client)
+    device_id, fake, client = harness.device_id, harness.fake, harness.client
+    with capture_logs() as logs:
+        assert await run_reclaim(client) == (0, 1)
+
+    assert sorted(await tombstone_ids(device_id)) == sorted([tomb, sibling])
     (reissued,) = await queued_removals(device_id)
     assert (await owners(device_id))[tomb] == reissued.id, "the reissue did not become the carrier's owner"
     assert [log for log in logs if log["event"] == "static_route_reclaim.cleanup_pending"]
+    (frozen,) = [g for g in await generations(device_id) if g.job_id == reissued.id]
+    removal = section_operation(frozen.document, "static_route")["removal"]
+    assert [tuple(key) for key in removal["authorized_removal_keys"]] == [A], "the cleanup froze no authority for A"
 
     # The reissue is only half the promise. Run it through the REAL worker: it must transmit
     # the omission, certify the service clean and only then consume the carrier and settle.
-    from nso_adapter.store.models import GenerationStatus, JobStatus
-    from tests.core.test_generation_protocol import run_head
-
-    assert await run_head(device_id, sr_client(fake)) == reissued.id
-    assert fake.sent_keys() == {B}, "the cleanup must omit the key it is authorized to remove"
+    assert await run_head(device_id, client) == reissued.id
+    assert fake.sent_keys() == {B, C}, "the cleanup must omit the key it is authorized to remove"
+    assert next(e for e in fake.sent_routes() if key_of(e) == C) == rich_c, "the retained sibling was rebuilt"
     assert A not in fake.service_keys, "the service still owns the key the cleanup claims to have removed"
 
     job = (await _jobs(device_id))[reissued.id]
     assert job.status is JobStatus.succeeded
     assert job.result["removal_branch"] == "networked"
     assert job.result.get("service_clean") is not False, "consumption requires a CERTIFIED clean service"
-    assert await tombstone_ids(device_id) == [], "the carrier survived a proven cleanup"
+    assert await tombstone_ids(device_id) == [sibling], "the carrier survived a proven cleanup"
     assert await _generation_statuses(device_id) == [GenerationStatus.settled]
+
+    # A fresh successor: no key, no claim, no refusal — the retained sibling still rides.
+    await _drain(device_id)  # the settlement's own follow-up is not the job under test
+    await harness.unrelated()
+    await harness.run()
+    assert fake.sent_keys() == {B, C}
+    assert A not in fake.sent_keys()
+
+
+@pytest.mark.parametrize("recreated", [False, True])
+async def test_a_successor_refuses_an_omission_the_cleanup_never_authorized(adapter_client, recreated):
+    """The cleanup's authority covers its own key, once. Anything else is collateral.
+
+    Two live keys the successor's document neither renders nor retains: an unrelated one, and
+    the cleaned key put back on the service after the consumption. Both must block the whole
+    document, with no committing PUT, on an ordinary networked successor — force and detach
+    have their own deliberate bypasses and are not used.
+    """
+    from tests.core.test_execution_context import _drain
+    from tests.core.test_generation_protocol import job_row, run_head
+    from tests.core.test_static_route_reclaim import queued_removals, run_reclaim
+
+    harness, _, _, _ = await _cleanup_pending(adapter_client)
+    device_id, fake, client = harness.device_id, harness.fake, harness.client
+    assert await run_reclaim(client) == (0, 1)
+    (reissued,) = await queued_removals(device_id)
+    assert await run_head(device_id, client) == reissued.id
+    assert fake.sent_keys() == {B, C}
+    await _drain(device_id)
+
+    extra = wire(A) if recreated else wire(D)
+    fake.service = [*fake.service, extra]
+    await harness.unrelated()
+    writes = len(fake.writes)
+    job = await job_row(await run_head(device_id, client))
+    assert job.status.value == "failed", job.result
+    (blocked,) = {item["error"] for item in job.error["detail"]["items"]}
+    assert "static_route/route" in blocked and extra["prefix"] in blocked, blocked
+    assert len(fake.writes) == writes, "a refused document must not commit"
 
 
 async def test_a_failed_cleanup_retains_the_carrier_and_keeps_the_cutover_blocked(adapter_client):
