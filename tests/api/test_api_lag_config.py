@@ -601,34 +601,90 @@ async def test_apply_lag_config_requires_an_explicit_deletion_authority(adapter_
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("leaf", ["mode", "timer"])
-async def test_apply_lag_rejects_invalid_lacp_leaf(adapter_client, leaf):
-    device_id = await seed_device(nso_device_name="lag-invalid-leaf", netbox_device_id=None)
-    bundle = {"name": "Port-channel1", "lag_id": 1}
-    if leaf == "mode":
-        bundle["members"] = [{"interface_name": "Gi0/1", "mode": "invalid"}]
-    else:
-        bundle["timer"] = "invalid"
-    response = await adapter_client.post(
-        f"/api/v1/devices/{device_id}/lag-config/apply", json={"bundles": [bundle], "deleted_roots": []}, headers=AUTH
-    )
-    assert response.status_code == 422
-    assert await _stream_row(device_id) is None
-    async with session() as db:
-        assert await db.scalar(text("SELECT count(*) FROM lag_bundle_intent")) == 0
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("mode", ["active", "passive", "on", "", None])
-@pytest.mark.parametrize("timer", ["fast", "slow", "", None])
-async def test_apply_lag_renders_supported_lacp_leaves(adapter_client, mode, timer):
+async def test_apply_lag_accepts_the_lacp_vocabulary_the_export_emits(adapter_client):
+    """A GET body must replay into apply: the export serves the raw NED string, not a fixed set."""
     from nso_adapter.core.projection import hydrate_section
     from nso_adapter.core.switching_intent import encode_lag_section
 
-    device_id = await seed_device(nso_device_name="lag-valid-leaves", netbox_device_id=None)
-    response = await adapter_client.post(
-        f"/api/v1/devices/{device_id}/lag-config/apply",
-        json={
+    device_id = await seed_device(nso_device_name="lag-export-vocabulary", netbox_device_id=None)
+    body = {
+        "bundles": [
+            {
+                "name": "Bundle-Ether2",
+                "lag_id": 2,
+                "timer": "slow",
+                "members": [{"interface_name": "TenGigE0/0/0/0", "mode": "inherit"}],
+            },
+            {
+                "name": "Port-channel1",
+                "lag_id": 1,
+                "timer": "fast",
+                "members": [
+                    {"interface_name": "GigabitEthernet0/1", "mode": "auto"},
+                    {"interface_name": "GigabitEthernet0/2", "mode": "desirable"},
+                ],
+            },
+        ],
+        "deleted_roots": [],
+    }
+
+    response = await _post_lag(adapter_client, device_id, body)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "prepared"
+    async with session() as db:
+        stored = (
+            await db.execute(
+                text(
+                    "SELECT b.timer, m.interface_name, m.mode FROM lag_bundle_intent b "
+                    "JOIN lag_member_intent m ON m.lag_bundle_id = b.id "
+                    "WHERE b.device_id = :device_id ORDER BY m.interface_name"
+                ),
+                {"device_id": device_id},
+            )
+        ).all()
+    assert [tuple(row) for row in stored] == [
+        ("fast", "GigabitEthernet0/1", "auto"),
+        ("fast", "GigabitEthernet0/2", "desirable"),
+        ("slow", "TenGigE0/0/0/0", "inherit"),
+    ]
+
+    context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
+    document = {"lag": (await _stream_row(device_id)).prepared_tables}
+    assert encode_lag_section(hydrate_section(document, "lag"), context) == {
+        "bundle": [
+            {
+                "name": "Bundle-Ether2",
+                "lag-id": 2,
+                "timer": "slow",
+                "member": [{"interface-name": "TenGigE0/0/0/0", "mode": "inherit"}],
+            },
+            {
+                "name": "Port-channel1",
+                "lag-id": 1,
+                "timer": "fast",
+                "member": [
+                    {"interface-name": "GigabitEthernet0/1", "mode": "auto"},
+                    {"interface-name": "GigabitEthernet0/2", "mode": "desirable"},
+                ],
+            },
+        ]
+    }
+
+
+@pytest.mark.anyio
+async def test_apply_lag_accepts_an_lacp_leaf_at_the_column_width(adapter_client):
+    """The request bound equals the store column width, so the longest accepted value fits."""
+    from nso_adapter.core.projection import hydrate_section
+    from nso_adapter.core.switching_intent import encode_lag_section
+
+    device_id = await seed_device(nso_device_name="lag-leaf-width", netbox_device_id=None)
+    mode, timer = "m" * 16, "t" * 8
+
+    response = await _post_lag(
+        adapter_client,
+        device_id,
+        {
             "bundles": [
                 {
                     "name": "Port-channel1",
@@ -639,19 +695,93 @@ async def test_apply_lag_renders_supported_lacp_leaves(adapter_client, mode, tim
             ],
             "deleted_roots": [],
         },
-        headers=AUTH,
     )
-    assert response.status_code == 200
-    assert response.json()["status"] == "prepared"
-    row = await _stream_row(device_id)
-    document = {"lag": row.prepared_tables}
+
+    assert response.status_code == 200, response.text
+    async with session() as db:
+        stored = (
+            await db.execute(
+                text(
+                    "SELECT b.timer, m.mode FROM lag_bundle_intent b "
+                    "JOIN lag_member_intent m ON m.lag_bundle_id = b.id "
+                    "WHERE b.device_id = :device_id"
+                ),
+                {"device_id": device_id},
+            )
+        ).one()
+    assert tuple(stored) == (timer, mode)
+
     context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
-    rendered = encode_lag_section(hydrate_section(document, "lag"), context)["bundle"][0]
-    assert rendered == {
-        "name": "Port-channel1",
-        "lag-id": 1,
-        **({"timer": timer} if timer else {}),
-        "member": [{"interface-name": "Gi0/1", **({"mode": mode} if mode else {})}],
+    document = {"lag": (await _stream_row(device_id)).prepared_tables}
+    assert encode_lag_section(hydrate_section(document, "lag"), context) == {
+        "bundle": [
+            {
+                "name": "Port-channel1",
+                "lag-id": 1,
+                "timer": timer,
+                "member": [{"interface-name": "Gi0/1", "mode": mode}],
+            }
+        ]
+    }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("leaf", "value"), [("mode", "m" * 17), ("timer", "t" * 9)])
+async def test_apply_lag_rejects_an_lacp_leaf_past_the_column_width(adapter_client, leaf, value):
+    device_id = await seed_device(nso_device_name=f"lag-leaf-overflow-{leaf}", netbox_device_id=None)
+    bundle = {"name": "Port-channel1", "lag_id": 1}
+    if leaf == "mode":
+        bundle["members"] = [{"interface_name": "Gi0/1", "mode": value}]
+    else:
+        bundle["timer"] = value
+
+    response = await _post_lag(adapter_client, device_id, {"bundles": [bundle], "deleted_roots": []})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert await _stream_row(device_id) is None
+    async with session() as db:
+        assert await db.scalar(text("SELECT count(*) FROM lag_bundle_intent")) == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["", None])
+async def test_apply_lag_treats_an_empty_member_mode_as_unset(adapter_client, mode):
+    from nso_adapter.core.projection import hydrate_section
+    from nso_adapter.core.switching_intent import encode_lag_section
+
+    device_id = await seed_device(nso_device_name="lag-unset-mode", netbox_device_id=None)
+    response = await _post_lag(
+        adapter_client,
+        device_id,
+        {
+            "bundles": [
+                {
+                    "name": "Port-channel1",
+                    "lag_id": 1,
+                    "members": [{"interface_name": "Gi0/1", "mode": mode}],
+                }
+            ],
+            "deleted_roots": [],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "prepared"
+    async with session() as db:
+        assert (
+            await db.scalar(
+                text(
+                    "SELECT m.mode FROM lag_bundle_intent b JOIN lag_member_intent m ON m.lag_bundle_id = b.id "
+                    "WHERE b.device_id = :device_id"
+                ),
+                {"device_id": device_id},
+            )
+        ) is None
+    context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
+    document = {"lag": (await _stream_row(device_id)).prepared_tables}
+    assert encode_lag_section(hydrate_section(document, "lag"), context) == {
+        "bundle": [{"name": "Port-channel1", "lag-id": 1, "member": [{"interface-name": "Gi0/1"}]}]
     }
 
 
