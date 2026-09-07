@@ -101,7 +101,9 @@ def upgrade() -> None:
             decisions = {key: SyncState(value).value in eligible for key, value in states.items()}
             execution["proof"] = build_interface_proof(row["stream"], tables, interfaces, decisions)
         elif row["stream"] == "static_route":
-            execution["proof"] = freeze_static_route_proof(tables, device_id=row["device_id"])
+            execution["proof"] = freeze_static_route_proof(
+                tables, device_id=row["device_id"], context=execution["context"]
+            )
         connection.execute(_STAMP, {"id": row["id"], "document": {**tables, EXECUTION_KEY: execution}})
 
 

@@ -1537,6 +1537,10 @@ async def executing_generation(db: AsyncSession, job_id: int) -> DeploymentGener
             f"generation {generation.id} (device {generation.device_id} seq {generation.seq}) digest "
             f"{generation.digest[:12]} does not match its document"
         )
+    from nso_adapter.core.projection import section_context
+
+    for section in generation.document:
+        section_context(generation.document, section)
     return generation
 
 

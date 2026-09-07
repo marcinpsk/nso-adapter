@@ -938,3 +938,45 @@ def test_a_retained_interface_record_merges_with_the_desired_one():
     conflicting = {"interfaces": {"7": {**bare, "parent_binding": "lag-1"}}, "attribute_eligibility": {}}
     with pytest.raises(ValueError, match="conflicting 'parent_binding' values"):
         retained_proof("interface_config", conflicting, source, retained)
+
+
+@pytest.mark.parametrize("context", [None, {"ned_id": None, "dialect": "missing-dialect"}])
+async def test_worker_validates_vlan_context_before_any_nso_io(adapter_client, context):
+    import json
+    from copy import deepcopy
+
+    from nso_adapter.core.generation import digest_document
+    from nso_adapter.store.models import DeploymentGeneration
+    from tests.core.test_generation_protocol import job_row
+
+    device_id = await seed_device(nso_device_name="invalid-vlan-context", netbox_device_id=17318)
+    await seed_settings(device_id, auto_apply=True)
+    assert (await _put_vlans(adapter_client, device_id, [100], seq=1)).status_code == 200
+    async with session() as db:
+        generation = await db.scalar(sa.select(DeploymentGeneration).where(DeploymentGeneration.device_id == device_id))
+        document = deepcopy(generation.document)
+        if context is None:
+            document["vlan"]["_execution"].pop("context")
+        else:
+            document["vlan"]["_execution"]["context"] = context
+        digest = digest_document(generation.mode, document, generation.allowed_removal_keys or {})
+        await db.execute(sa.text("ALTER TABLE deployment_generation DISABLE TRIGGER deployment_generation_immutable"))
+        await db.execute(
+            sa.text("UPDATE deployment_generation SET document = CAST(:doc AS json), digest = :digest WHERE id = :gid"),
+            {"doc": json.dumps(document), "digest": digest, "gid": generation.id},
+        )
+        await db.execute(sa.text("ALTER TABLE deployment_generation ENABLE TRIGGER deployment_generation_immutable"))
+        await db.commit()
+    client, rec = recorded_client("invalid-vlan-context")
+    job = await job_row(await run_head(device_id, client))
+    assert job.status.value == "failed"
+    assert client.mock_calls == [], "context validation must precede every NSO call"
+    assert rec.calls == []
+
+
+def test_every_section_hydrator_refuses_missing_context():
+    from nso_adapter.core.projection import hydrate_section, section_registry
+
+    for section in section_registry():
+        with pytest.raises(ValueError, match=section):
+            hydrate_section({section: {}}, section)

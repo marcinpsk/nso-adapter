@@ -1327,6 +1327,7 @@ def hydrate_section(document: dict, section: str) -> dict[type, list]:
     """
     if section not in document:
         raise ValueError(f"document does not carry section {section!r}")
+    section_context(document, section)
     tables = document[section] or {}
     allowed_models = {spec.model for spec in _SECTION_REGISTRY[section].tables}
     rows: dict[type, list] = {}
@@ -1398,20 +1399,22 @@ async def freeze_fragment(db: AsyncSession, device, stream: str, tables: dict[st
     execution: dict = {
         "context": {"ned_id": device.ned_id, "dialect": community_dialect_for(device.ned_id).name},
     }
-    proof = await _freeze_proof(db, device.id, stream, tables)
+    proof = await _freeze_proof(db, device.id, stream, tables, execution["context"])
     if proof is not None:
         execution["proof"] = proof
     return {**deepcopy(tables), EXECUTION_KEY: execution}
 
 
-async def _freeze_proof(db: AsyncSession, device_id: int, stream: str, tables: dict[str, list[dict]]) -> dict | None:
+async def _freeze_proof(
+    db: AsyncSession, device_id: int, stream: str, tables: dict[str, list[dict]], context: dict
+) -> dict | None:
     """Return the proof *stream*'s own rows must be executed with, or ``None``."""
     if stream in ("interface_config", "ip"):
         return await _freeze_interface_proof(db, device_id, stream, tables)
     if stream == "static_route":
         from nso_adapter.core.static_route_plan import freeze_static_route_proof
 
-        return freeze_static_route_proof(tables, device_id=device_id)
+        return freeze_static_route_proof(tables, device_id=device_id, context=context)
     return None
 
 

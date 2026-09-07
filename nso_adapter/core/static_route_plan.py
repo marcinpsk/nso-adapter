@@ -399,7 +399,7 @@ def _serialize_removal_plan(plan: SrRemovalPlan) -> dict:
     }
 
 
-def freeze_static_route_proof(tables: dict[str, list[dict]], *, device_id: int) -> dict:
+def freeze_static_route_proof(tables: dict[str, list[dict]], *, device_id: int, context: dict) -> dict:
     """Freeze the APPLY PLAN of a static-route fragment's own rows and carriers.
 
     Pure: the plan is classified from the tables the authorization serialized, so the mode,
@@ -409,7 +409,7 @@ def freeze_static_route_proof(tables: dict[str, list[dict]], *, device_id: int) 
     from nso_adapter.core.projection import hydrate_section
     from nso_adapter.store.models import StaticRouteIntent, StaticRouteTombstone
 
-    hydrated = hydrate_section({"static_route": dict(tables)}, "static_route")
+    hydrated = hydrate_section({"static_route": {**tables, "_execution": {"context": context}}}, "static_route")
     rows = hydrated.get(StaticRouteIntent, [])
     tombstones = hydrated.get(StaticRouteTombstone, [])
     return {"apply": _serialize_apply_plan(classify_apply_plan(rows, tombstones, device_id=device_id))}

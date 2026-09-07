@@ -31,6 +31,15 @@ _INCREMENT_FOUR_SECTIONS = frozenset({"interface_config"})
 _INCREMENT_FIVE_SECTIONS = frozenset({"static_route"})
 
 
+async def _freeze_snapshot(db, device_id, stream):
+    from nso_adapter.core.projection import freeze_fragment, snapshot_stream
+    from nso_adapter.store.models import Device
+
+    return await freeze_fragment(
+        db, await db.get(Device, device_id), stream, await snapshot_stream(db, device_id, stream)
+    )
+
+
 def test_every_section_executes_from_its_document_or_names_its_blocker():
     """Two states, no third. Manual selection and execution stay equal but distinct.
 
@@ -112,7 +121,7 @@ def test_hydrate_section_refuses_an_absent_section():
 def test_hydrate_section_accepts_an_explicitly_empty_section():
     from nso_adapter.core.projection import hydrate_section
 
-    assert hydrate_section({"vlan": {}}, "vlan") == {}
+    assert hydrate_section({"vlan": {"_execution": {"context": {"ned_id": None, "dialect": "identity"}}}}, "vlan") == {}
 
 
 def test_composing_an_empty_promoted_stream_preserves_its_section():
@@ -273,7 +282,6 @@ async def test_increment_one_apply_rows_come_from_the_generation_document(
     from sqlalchemy import inspect as sa_inspect
 
     from nso_adapter.core.apply import _Projection
-    from nso_adapter.core.projection import snapshot_stream
     from nso_adapter.store import models
 
     device_id = await seed_device(nso_device_name=f"document-{section}")
@@ -284,7 +292,7 @@ async def test_increment_one_apply_rows_come_from_the_generation_document(
         db.add(row)
         await db.flush()
         original_value = getattr(row, changed_field)
-        document = {section: await snapshot_stream(db, device_id, section)}
+        document = {section: await _freeze_snapshot(db, device_id, section)}
         setattr(row, changed_field, successor_value)
         await db.commit()
 
@@ -302,7 +310,6 @@ async def test_snmp_apply_rows_and_vault_refs_come_from_the_generation_document(
     from sqlalchemy import inspect as sa_inspect
 
     from nso_adapter.core.apply import _Projection
-    from nso_adapter.core.projection import snapshot_stream
     from nso_adapter.store.models import SnmpCommunityIntent
 
     device_id = await seed_device(nso_device_name="document-snmp", netbox_device_id=9824)
@@ -317,7 +324,7 @@ async def test_snmp_apply_rows_and_vault_refs_come_from_the_generation_document(
         )
         db.add(row)
         await db.flush()
-        document = {"snmp": await snapshot_stream(db, device_id, "snmp")}
+        document = {"snmp": await _freeze_snapshot(db, device_id, "snmp")}
         row.vault_ref = "network/snmp/communities/successor#community"
         await db.commit()
 
@@ -335,7 +342,6 @@ async def test_logging_apply_rows_come_from_the_generation_document(adapter_clie
     from sqlalchemy import inspect as sa_inspect
 
     from nso_adapter.core.apply import _Projection
-    from nso_adapter.core.projection import snapshot_stream
     from nso_adapter.store.models import LoggingHostIntent
 
     device_id = await seed_device(nso_device_name="document-logging", netbox_device_id=9825)
@@ -349,7 +355,7 @@ async def test_logging_apply_rows_come_from_the_generation_document(adapter_clie
         )
         db.add(row)
         await db.flush()
-        document = {"logging": await snapshot_stream(db, device_id, "logging")}
+        document = {"logging": await _freeze_snapshot(db, device_id, "logging")}
         row.severity = "WARNING"
         await db.commit()
 
@@ -364,7 +370,7 @@ async def test_logging_apply_rows_come_from_the_generation_document(adapter_clie
 
 async def test_a_snapshot_hydrates_back_into_the_rows_it_was_taken_from(adapter_client):
     """Round-trip fidelity, including the types JSON cannot hold natively."""
-    from nso_adapter.core.projection import hydrate_section, snapshot_stream
+    from nso_adapter.core.projection import hydrate_section
     from nso_adapter.store.models import VlanIntent
 
     device_id = await seed_device(nso_device_name="projection-roundtrip", netbox_device_id=9820)
@@ -375,7 +381,7 @@ async def test_a_snapshot_hydrates_back_into_the_rows_it_was_taken_from(adapter_
         await db.commit()
 
     async with session() as db:
-        document = {"vlan": await snapshot_stream(db, device_id, "vlan")}
+        document = {"vlan": await _freeze_snapshot(db, device_id, "vlan")}
 
     rows = hydrate_section(document, "vlan")[VlanIntent]
     assert [(r.vlan_id, r.name) for r in rows] == [(10, "MGMT"), (20, None)]
@@ -385,7 +391,7 @@ async def test_a_snapshot_hydrates_back_into_the_rows_it_was_taken_from(adapter_
 
 async def test_bgp_snapshot_hydrates_the_relationship_graph_for_the_writer(adapter_client):
     """Durable parent identities rebuild the complete BGP writer graph."""
-    from nso_adapter.core.projection import hydrate_section, rows_by_intent_identity, snapshot_stream
+    from nso_adapter.core.projection import hydrate_section, rows_by_intent_identity
     from nso_adapter.nso.apply import _CONTEXT_FREE_EXECUTION, encode_bgp
     from nso_adapter.store.models import (
         BgpAfIntent,
@@ -422,7 +428,7 @@ async def test_bgp_snapshot_hydrates_the_relationship_graph_for_the_writer(adapt
         await db.commit()
 
     async with session() as db:
-        fragment = await snapshot_stream(db, device_id, "bgp")
+        fragment = await _freeze_snapshot(db, device_id, "bgp")
 
     assert set(rows_by_intent_identity(fragment, "bgp_peer_af_intent")) == {("64512", "", "192.0.2.1", "ipv4-unicast")}
     rows = hydrate_section({"bgp": fragment}, "bgp")
@@ -478,6 +484,7 @@ def test_bgp_hydration_resolves_parents_in_linear_work():
         ]
     )
     fragment = {
+        "_execution": {"context": {"ned_id": None, "dialect": "identity"}},
         "bgp_router_intent": [{"id": 1, "device_id": 1, "asn": "64512"}],
         "bgp_scope_intent": [{"id": 2, "router_id": 1, "vrf": ""}],
         "bgp_af_intent": [],
@@ -609,9 +616,19 @@ def test_hydrating_an_unknown_table_or_column_is_refused():
     from nso_adapter.core.projection import hydrate_section
 
     with pytest.raises(ValueError, match="unknown table"):
-        hydrate_section({"vlan": {"not_a_table": []}}, "vlan")
+        hydrate_section(
+            {"vlan": {"_execution": {"context": {"ned_id": None, "dialect": "identity"}}, "not_a_table": []}}, "vlan"
+        )
     with pytest.raises(ValueError, match="unknown column"):
-        hydrate_section({"vlan": {"vlan_intent": [{"nope": 1}]}}, "vlan")
+        hydrate_section(
+            {
+                "vlan": {
+                    "_execution": {"context": {"ned_id": None, "dialect": "identity"}},
+                    "vlan_intent": [{"nope": 1}],
+                }
+            },
+            "vlan",
+        )
 
 
 def test_hydrating_a_row_without_its_primary_key_is_refused():
@@ -619,9 +636,25 @@ def test_hydrating_a_row_without_its_primary_key_is_refused():
     from nso_adapter.core.projection import hydrate_section
 
     with pytest.raises(ValueError, match="primary key"):
-        hydrate_section({"vlan": {"vlan_intent": [{"device_id": 1, "vlan_id": 10}]}}, "vlan")
+        hydrate_section(
+            {
+                "vlan": {
+                    "_execution": {"context": {"ned_id": None, "dialect": "identity"}},
+                    "vlan_intent": [{"device_id": 1, "vlan_id": 10}],
+                }
+            },
+            "vlan",
+        )
     with pytest.raises(ValueError, match="primary key"):
-        hydrate_section({"vlan": {"vlan_intent": [{"id": None, "device_id": 1, "vlan_id": 10}]}}, "vlan")
+        hydrate_section(
+            {
+                "vlan": {
+                    "_execution": {"context": {"ned_id": None, "dialect": "identity"}},
+                    "vlan_intent": [{"id": None, "device_id": 1, "vlan_id": 10}],
+                }
+            },
+            "vlan",
+        )
 
 
 def test_hydrating_a_known_table_under_the_wrong_section_is_refused():
@@ -629,7 +662,9 @@ def test_hydrating_a_known_table_under_the_wrong_section_is_refused():
     from nso_adapter.core.projection import hydrate_section
 
     with pytest.raises(ValueError, match="does not belong"):
-        hydrate_section({"svi": {"vlan_intent": []}}, "svi")
+        hydrate_section(
+            {"svi": {"_execution": {"context": {"ned_id": None, "dialect": "identity"}}, "vlan_intent": []}}, "svi"
+        )
 
 
 def test_interface_execution_context_hydrates_beside_intent_tables():
