@@ -15,6 +15,7 @@ promotes it, so the encoding context is the one read then and not the one read h
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -237,7 +238,7 @@ async def _prepare_snapshot(
 
     _refuse_unsupported_request_modes()
     marked = list(deleted_roots)
-    duplicates = sorted({root for root in marked if marked.count(root) > 1})
+    duplicates = sorted(root for root, count in Counter(marked).items() if count > 1)
     if duplicates:
         raise SwitchingRequestRefused(f"deleted_roots repeats a root: {duplicates}")
     store_only = STORE_ONLY.get()

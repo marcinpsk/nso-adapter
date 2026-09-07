@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from time import perf_counter
 
 import pytest
 from sqlalchemy import text
@@ -669,3 +670,32 @@ async def test_apply_lag_rejects_duplicate_ids_without_mutation(adapter_client):
     assert await _stream_row(device_id) is None
     async with session() as db:
         assert await db.scalar(text("SELECT count(*) FROM lag_bundle_intent")) == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("route", "field"), [("lag-config", "bundles"), ("switchport", "interfaces")])
+async def test_switching_apply_refuses_many_duplicate_roots_promptly(adapter_client, route, field):
+    device_id = await seed_device(nso_device_name="switching-large-deletion-list", netbox_device_id=None)
+    body = {field: [], "deleted_roots": ["root-z", "root-a"] * 39_999 + ["root-z", "root-once"]}
+
+    started = perf_counter()
+    response = await adapter_client.post(f"/api/v1/devices/{device_id}/{route}/apply", json=body, headers=AUTH)
+    elapsed = perf_counter() - started
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["message"] == "deleted_roots repeats a root: ['root-a', 'root-z']"
+    assert elapsed < 5.0, f"80,000 deletion entries took {elapsed:.3f}s; expected less than 5s"
+    async with session() as db:
+        counts = (
+            await db.execute(
+                text(
+                    "SELECT "
+                    "(SELECT count(*) FROM lag_bundle_intent) AS bundles, "
+                    "(SELECT count(*) FROM switchport_intent) AS interfaces, "
+                    "(SELECT count(*) FROM device_projection_stream) AS streams, "
+                    "(SELECT count(*) FROM device_generation_counter) AS counters, "
+                    "(SELECT count(*) FROM jobs) AS jobs"
+                )
+            )
+        ).one()
+    assert tuple(counts) == (0, 0, 0, 0, 0)
