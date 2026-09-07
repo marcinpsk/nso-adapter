@@ -1871,11 +1871,8 @@ async def test_attributes_and_addresses_merge_into_one_interface_entry(adapter_c
     assert gi[0]["ipv4-address"][0]["address"] == "10.0.0.1"
 
 
-async def test_a_rejected_commit_fails_the_localised_family_and_leaves_the_rest_pending(adapter_client):
-    """The rolled-back transaction failed only the family localisation names; the rest retry.
-
-    Nothing landed either way, so a non-offender is PENDING (untouched), not failed.
-    """
+async def test_a_rejected_commit_fails_all_families_with_localized_attribution(adapter_client):
+    """A localized refusal fails every row in the rolled-back transaction."""
     from nso_adapter.nso.apply import NsoApplyError
     from nso_adapter.store.models import SnmpCommunityIntent, StaticRouteIntent
 
@@ -1899,7 +1896,7 @@ async def test_a_rejected_commit_fails_the_localised_family_and_leaves_the_rest_
         sr = (await db.execute(select(StaticRouteIntent))).scalars().all()
         sc = (await db.execute(select(SnmpCommunityIntent))).scalars().all()
         assert sr and all(r.last_apply_error is not None for r in sr)  # offender → failed
-        assert sc and all(r.last_apply_error is None and r.last_apply_at is None for r in sc)  # pending
+        assert sc and all(r.last_apply_error is not None and r.last_apply_at is None for r in sc)
         assert (await db.get(Job, job_id)).status == JobStatus.failed
 
 
@@ -1943,11 +1940,11 @@ async def test_localisation_empties_one_family_at_a_time_and_records_its_capabil
         by_scope = {c.scope: c for c in caps}
         assert "static_route" in by_scope and by_scope["static_route"].status == "unsupported"
         assert "snmp" not in by_scope  # compiled fine → not an offender → no capability row
-        # offender failed, snmp pending, job failed
+        # Every transmitted family failed.
         sr = (await db.execute(select(StaticRouteIntent))).scalars().all()
         sc = (await db.execute(select(SnmpCommunityIntent))).scalars().all()
         assert all(r.last_apply_error is not None for r in sr)
-        assert all(r.last_apply_error is None and r.last_apply_at is None for r in sc)
+        assert all(r.last_apply_error is not None and r.last_apply_at is None for r in sc)
         assert (await db.get(Job, job_id)).status == JobStatus.failed
 
 

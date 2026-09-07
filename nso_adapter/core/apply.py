@@ -1606,15 +1606,18 @@ async def _commit_document(
             logger.debug("apply.atomic.capability_record_skipped", job_id=job_id)
     if not offenders:  # could not localise → the whole rolled-back commit is the failure
         offenders = dict.fromkeys(containers, "")
-    err = {"code": commit_error.code, "message": commit_error.message, "detail": commit_error.detail}
-    return commit_error, verify, offenders, err, commit_error.message
+    message = commit_error.message
+    if offenders:
+        message = f"{message}; blocked by {', '.join(sorted(offenders))} refusal: {device_err or message}"
+    err = {"code": commit_error.code, "message": message, "detail": commit_error.detail}
+    return commit_error, verify, offenders, err, message
 
 
 def _stamp_batch_sections(sections, offenders, commit_error, err, msg, now) -> tuple[dict, dict]:
     """Stamp every batch family from the single commit outcome → (outcomes, failures).
 
-    Keyed by RESULT KEY, in registry order. Offending families fail; the rest are pending
-    (rows untouched, retried next apply) because the whole transaction rolled back.
+    Keyed by result key, in registry order. Every transmitted family fails when the
+    transaction rolls back. Localization identifies the culprit only.
     """
     registry = section_registry()
     outcomes: dict[str, tuple[int, int]] = {}
@@ -1632,7 +1635,7 @@ def _stamp_batch_sections(sections, offenders, commit_error, err, msg, now) -> t
                 row.last_apply_at = now
                 row.last_apply_error = None
             outcomes[key] = (len(apply_rows.sent), 0)
-        elif registry[section].container in offenders:
+        else:
             for row in apply_rows.sent:
                 row.last_apply_error = err
             for row in apply_rows.stamp:
@@ -1646,8 +1649,8 @@ async def _run_document_apply(db, device, client, device_name, job, job_id, now,
     """Deploy one device's document: encode every family, PUT once, stamp the one outcome.
 
     On success every row the body carried is stamped in_sync; on failure the whole
-    transaction rolled back — localise the offending families, fail their rows (+ record
-    capability), and leave the rest pending (untouched → retried next apply).
+    transaction rolled back. Fail every transmitted row and localize only for attribution
+    and capability recording.
 
     §4.4: the commit's verify verdict is threaded out of the sender rather than discarded and
     is shared by every family. §4.9's PATCH-versus-PUT split is gone with the per-family
@@ -1700,7 +1703,7 @@ async def _run_document_apply(db, device, client, device_name, job, job_id, now,
     )
 
     iface_container = section_registry()["interface_config"].container
-    iface_failed = (iface_container in offenders) if iface_container in body.containers else False
+    iface_failed = commit_error is not None and iface_container in body.containers
     attr_outcome = _stamp_attr_atomic(attr_eligible, commit_error, iface_failed, err, msg, now, snapshot)
     ip_outcome = _stamp_ip_atomic(
         ip_rows_flat, commit_error, iface_failed, err, msg, now, stamp_of=plan.interface.ip_stamp_of

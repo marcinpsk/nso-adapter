@@ -103,7 +103,7 @@ def _reject_restconf_commits(client, message: str) -> None:
         return httpx.Response(
             400,
             request=httpx.Request("PUT", url),
-            json={"errors": {"error": [{"error-message": message}]}},
+            json={"ietf-restconf:errors": {"error": [{"error-message": message}]}},
         )
 
     client._client.return_value.__aenter__.return_value.put.side_effect = reject
@@ -3780,3 +3780,25 @@ async def test_a_retained_root_edit_beside_a_detach_gets_a_networked_intermediat
         assert edited[leaf] == after, "the edit rides both documents"
     assert intermediate.settlement_cohort is not None
     assert intermediate.settlement_cohort == final.settlement_cohort
+
+
+async def test_localized_refusal_fails_every_transmitted_scope(adapter_client):
+    from nso_adapter.store.models import StaticRouteIntent, VlanIntent
+    from tests.core.test_generation_protocol import job_row, recorded_client, run_head
+
+    device_id = await seed_device(nso_device_name="localized-refusal", netbox_device_id=17316)
+    await seed_settings(device_id, auto_apply=True)
+    assert (await _put_routes(adapter_client, device_id, [route_entry(_A, route_id=1)], seq=1)).status_code == 200
+    assert (await _put_vlans(adapter_client, device_id, [100], seq=1)).status_code == 200
+    client, _ = recorded_client("localized-refusal")
+    _reject_restconf_commits(client, "device-intent: refused [family=vlan field=vlan-id]: unsupported")
+    job = await job_row(await run_head(device_id, client))
+    assert job.status.value == "failed", job.result
+    for scope in ("vlan", "static_route"):
+        assert job.result[f"{scope}_count_by_outcome"]["apply_failed"] == 1
+    async with session() as db:
+        for model in (StaticRouteIntent, VlanIntent):
+            row = await db.scalar(sa.select(model).where(model.device_id == device_id))
+            assert row.last_apply_error is not None
+            assert "vlan" in row.last_apply_error["message"]
+            assert row.last_apply_at is None

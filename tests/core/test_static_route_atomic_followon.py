@@ -226,16 +226,8 @@ async def test_c5_2_a_failed_combined_commit_issues_no_follow_on_put(adapter_cli
     assert outcomes(job) == {B: "apply_failed"}
 
 
-async def test_p0_2_an_untouched_row_does_not_pair_a_previous_error_with_this_result(adapter_client):
-    """#1396 R3 P0 — C5.2's row, but carrying an error an EARLIER apply left on it.
-
-    This is the one path where a row keeps a persisted ``last_apply_error`` while this pass
-    neither delivered nor failed it: the commit rolls back, no family is localised as the
-    offender, the rows are left untouched, and the outcome is ``unproven``. Reading the
-    column straight into the record would hand a generation-correlated consumer a failure
-    from a superseded generation as though it described this one. The row keeps its error —
-    it is still the store's last known failure — but the record must not claim it.
-    """
+async def test_localized_refusal_replaces_previous_errors_on_other_families(adapter_client):
+    """A refused transaction replaces stale errors on every affected row."""
     device_id = await seed_device(nso_device_name="sr-atomic", netbox_device_id=7504)
     stale = {"code": "internal", "message": "a previous apply failed", "detail": {}}
     await seed_replacement(device_id, last_apply_error=stale)
@@ -244,16 +236,15 @@ async def test_p0_2_an_untouched_row_does_not_pair_a_previous_error_with_this_re
         "sr-atomic", state=present(wire(A), device_name="sr-atomic"), section=dev_state(wire(B))
     )
     rec.fail_commit = True
-    # The refusal names its own family, so localisation attributes vlan and leaves every
-    # other family pending: untouched rows, and an outcome that claims nothing.
     rec.reject_message = "device-intent: refused [family=vlan field=vlan-id]: unsupported"
 
     job = await run_the_apply(device_id, client)
 
     entry = job.result["static_route_results"][0]
-    assert entry["outcome"] == "unproven"
-    assert entry["error"] is None, "this pass produced no verdict for this route"
-    assert await static_rows(device_id) == [(None, stale)], "the row still holds it — only the record is scoped"
+    assert entry["outcome"] == "apply_failed"
+    assert entry["error"] is not None
+    assert "vlan" in entry["error"]["message"]
+    assert await static_rows(device_id) == [(None, entry["error"])]
 
 
 # ── C5.3 — a rejected commit fails EVERY family, not just the static rows ────
