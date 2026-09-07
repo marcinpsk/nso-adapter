@@ -305,7 +305,7 @@ def _sanitized_nso_error(value: object, secrets: set[str]) -> object:
     if isinstance(value, str):
         for secret in sorted(secrets, key=len, reverse=True):
             value = value.replace(secret, "[redacted]")
-            value = value.replace(json.dumps(secret)[1:-1], "[redacted]")
+            value = value.replace(boundary_safe_dumps(secret)[1:-1], "[redacted]")
     return value
 
 

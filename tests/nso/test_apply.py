@@ -266,7 +266,7 @@ async def test_a_rejected_commit_raises_with_the_put_code():
 
 @pytest.mark.asyncio
 async def test_a_rejected_commit_with_a_non_json_body_still_raises():
-    """NSO can answer a 4xx with plain text; the error must carry it rather than blow up."""
+    """A plain-text rejection raises a structured error without exposing its body."""
     client = _make_nso_client()
     mock_http = AsyncMock()
     mock_http.put.return_value = _httpx_response(400)
@@ -275,7 +275,7 @@ async def test_a_rejected_commit_with_a_non_json_body_still_raises():
     with pytest.raises(NsoApplyError) as exc_info:
         await apply_device_intent(client, "ra1", {"l2-sap": {"sap": []}})
     assert exc_info.value.code == "nso_put_failed"
-    assert exc_info.value.detail["nso_error"] == {"raw": "error body"}
+    assert exc_info.value.detail["nso_error"] == {"raw": "[redacted]"}
 
 
 def test_nso_apply_error_str():
