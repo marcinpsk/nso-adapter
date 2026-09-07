@@ -2827,12 +2827,23 @@ async def test_backfill_only_never_answers_for_a_sequence_the_receipt_does_not_h
 _SWITCHING_STREAMS = ["lag", "switchport"]
 
 
+#: One stable, distinct LAG id per root name. The store enforces ``(device_id, lag_id)``, so
+#: two roots of one request may not share an id, and a re-prepared root must keep its own or
+#: it reads as an edit. Derived rather than tabulated: a fixture root the table did not list
+#: used to fail with a KeyError instead of getting an id.
+_LAG_IDS: dict[str, int] = {}
+
+
+def _lag_id(name: str) -> int:
+    return _LAG_IDS.setdefault(name, len(_LAG_IDS) + 1)
+
+
 def _lag_body(roots: dict[str, list[int]], *, deleted_roots=(), scalar=None, extra=None) -> dict:
     return {
         "bundles": [
             {
                 "name": name,
-                "lag_id": {"A": 1, "B": 2, "C": 3, "X": 4, "L1": 5, "L2": 6}[name],
+                "lag_id": _lag_id(name),
                 **({"admin_key": scalar} if scalar is not None else {}),
                 "members": [{"interface_name": f"Gi0/{child}"} for child in children],
                 **(extra or {}),
