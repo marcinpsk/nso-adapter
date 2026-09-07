@@ -344,7 +344,7 @@ async def test_fetch_host_keys_failed_result_raises(patch_client):
     client = _make_client()
     payload = {"tailf-ncs:output": {"result": "failed", "info": "connection refused"}}
     with patch_client(client, 200, payload):  # noqa: SIM117
-        with pytest.raises(RuntimeError, match="did not store a key"):
+        with pytest.raises(RuntimeError, match="did not report a stored key"):
             await client.fetch_host_keys("core-rtr-01")
 
 
@@ -353,7 +353,7 @@ async def test_fetch_host_keys_no_fingerprint_raises(patch_client):
     client = _make_client()
     payload = {"tailf-ncs:output": {"result": "updated"}}
     with patch_client(client, 200, payload):  # noqa: SIM117
-        with pytest.raises(RuntimeError, match="did not store a key"):
+        with pytest.raises(RuntimeError, match="reported a stored key with no fingerprint"):
             await client.fetch_host_keys("core-rtr-01")
 
 

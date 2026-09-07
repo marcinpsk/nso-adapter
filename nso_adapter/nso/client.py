@@ -514,11 +514,13 @@ class NsoClient:
         body = out.get("tailf-ncs:output", {}) if isinstance(out, dict) else {}
         result = body.get("result")
         if result not in ("updated", "unchanged") or not body.get("fingerprint"):
-            info = body.get("info") or body.get("error") or ""
-            raise RuntimeError(
-                f"fetch-host-keys for {device_name!r} did not store a key "
-                f"(result={result!r}){f': {info}' if info else ''}"
+            # The action's info/error/result are the server's own text; name the failure kind.
+            kind = (
+                "did not report a stored key"
+                if result not in ("updated", "unchanged")
+                else "reported a stored key with no fingerprint"
             )
+            raise RuntimeError(f"fetch-host-keys for {device_name!r} {kind}")
         return out
 
     async def sync_from(self, device_name: str) -> bool:

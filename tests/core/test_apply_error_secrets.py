@@ -686,3 +686,60 @@ async def test_a_refused_device_state_read_keeps_the_echoed_value_out_of_every_s
     with pytest.raises(NsoReadContractError) as caught:
         await client.run_device_state_read(name, ["static-route"])
     assert_chain_free_of(caught.value, _SECRETS)
+
+
+# ── a failed host-key fetch: the action's own info text reaches no sink ──
+
+#: What NSO answers when the SSH negotiation fails: free text it chose.
+_KEY_INFO = f"ssh connect failed for {_REF} while reading community {_SECRET}"
+
+
+async def test_a_failed_host_key_fetch_keeps_the_action_info_out_of_the_provisioning_steps(adapter_client_with_nso):
+    """The raise names the action, the device and the failure kind, never the server's info.
+
+    The provisioning result persists the step detail and the API returns it, so whatever
+    `fetch-host-keys` put in its message became part of the job record.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.onboarding import provision_nso_device
+    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
+
+    name = "host-key-secret"
+
+    def respond(request):
+        if "ssh/fetch-host-keys" in str(request.url):
+            return httpx.Response(200, json={"tailf-ncs:output": {"result": "failed", "info": _KEY_INFO}})
+        if request.method == "GET":
+            return httpx.Response(200, json={"tailf-ncs:device": [{"name": name}]})
+        return httpx.Response(200, json={})
+
+    client = _client_with(httpx.MockTransport(respond))
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=client),
+        patch("nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()),
+        capture_logs() as logs,
+    ):
+        async with session() as db:
+            result = await provision_nso_device(
+                db,
+                nso_instance="nso-dev",
+                device_name=name,
+                address="10.0.0.9",
+                ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+                authgroup="network",
+            )
+
+    assert result["ok"] is False
+    step = next(entry for entry in result["steps"] if entry["step"] == "fetch_host_keys")
+    assert step["status"] == "failed"
+    assert "fetch-host-keys" in step["detail"], "the step must still say what failed"
+    for secret in _SECRETS:
+        assert secret not in json.dumps(result), "the persisted step detail repeats server text"
+    assert_records_free_of(logs, _SECRETS)
+
+    with pytest.raises(RuntimeError) as caught:
+        await client.fetch_host_keys(name)
+    assert_chain_free_of(caught.value, _SECRETS)
