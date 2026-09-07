@@ -314,7 +314,7 @@ def test_attrs_to_interface_list_singleton_bare_object():
         "device-name": "sw01",
         "interface": {"interface-name": "GigabitEthernet0/1", "description": "uplink", "enabled": True},
     }
-    result = _attrs_to_interface_list(entry)
+    result = _attrs_to_interface_list(entry, device_name="sw01")
     assert len(result) == 1
     assert result[0].name == "GigabitEthernet0/1"
     assert result[0].nso.description == "uplink"
