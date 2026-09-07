@@ -200,13 +200,7 @@ async def test_c5_1_a_replacement_rides_the_one_document_with_its_siblings(adapt
 
 
 async def test_c5_2_a_failed_combined_commit_issues_no_follow_on_put(adapter_client):
-    """C5.2 — the commit is rejected ⇒ one write, nothing landed, rows pending.
-
-    The static rows rode that very transaction, so its rollback says everything about them:
-    they are untouched, retried next apply, and never stamped failed. There is no second
-    write that could deliver a replacement on top of a device the commit just failed to
-    change.
-    """
+    """A rejected commit leaves last_apply_at unset and records failure on each affected row."""
     device_id = await seed_device(nso_device_name="sr-atomic", netbox_device_id=7502)
     await seed_replacement(device_id)
     await seed_vlan(device_id)
