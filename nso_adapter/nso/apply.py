@@ -577,10 +577,14 @@ def _snmp_vault_triple(vault_ref: str, prefix: str, owner: str) -> dict[str, str
     try:
         ref = parse_vault_ref(vault_ref, require_key=True)
     except VaultRefError:
+        ref = None
+    # Raised OUTSIDE the except block. `from None` only sets __suppress_context__, and the
+    # parser exception stays reachable as __context__ with the whole reference in its repr.
+    if ref is None:
         raise NsoApplyError(
             "invalid_vault_ref",
             f"SNMP intent {owner!r}: vault_ref must be a valid mount/path#key reference",
-        ) from None
+        )
     return {
         f"{prefix}vault-mount": ref.mount,
         f"{prefix}vault-path": ref.path,

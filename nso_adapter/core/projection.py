@@ -675,9 +675,13 @@ def _document_value(row, key: str) -> Any:
         try:
             parse_vault_ref(value, require_key=True)
         except VaultRefError:
-            raise ValueError(
-                f"{type(row).__tablename__}.{key}: refusing to serialize non-reference secret material"
-            ) from None
+            malformed = True
+        else:
+            malformed = False
+        # Raised OUTSIDE the except block: a raise inside it attaches the parser exception as
+        # __context__, whose repr echoes the very material this refusal exists to withhold.
+        if malformed:
+            raise ValueError(f"{type(row).__tablename__}.{key}: refusing to serialize non-reference secret material")
     return _jsonable(value)
 
 

@@ -43,6 +43,24 @@ async def _run(device_id, client, monkeypatch, job_id=None):
         return await db.get(Job, job_id)
 
 
+def _exception_chain(exc):
+    """Every exception reachable from *exc* through ``__cause__`` AND ``__context__``.
+
+    ``raise ... from None`` only sets ``__suppress_context__``, which hides the parser
+    exception from a formatted traceback while ``__context__`` still holds it.
+    """
+    seen: set[int] = set()
+    pending, chain = [exc], []
+    while pending:
+        node = pending.pop()
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        chain.append(node)
+        pending += [node.__cause__, node.__context__]
+    return chain
+
+
 def _assert_safe(exc, job, row_error, logs, secrets):
     assert job.status == JobStatus.failed
     assert row_error is not None
@@ -55,11 +73,10 @@ def _assert_safe(exc, job, row_error, logs, secrets):
         json.dumps(row_error),
         repr([record.__dict__ for record in logs.records]),
     ]
+    surfaces += [f"{node!r} {node}" for node in _exception_chain(exc)]
     for surface in surfaces:
         for secret in secrets:
             assert secret not in surface
-    assert exc.__cause__ is None
-    assert exc.__context__ is None or exc.__suppress_context__
 
 
 async def _community():
@@ -162,6 +179,24 @@ async def test_verification_delta_keeps_no_secret_in_logs_or_errors(adapter_clie
     assert any("nso.apply.verify_mismatch" in record.getMessage() for record in recorded_logs.records)
 
 
+async def test_a_non_reference_secret_never_reaches_the_projection_refusal_chain(adapter_client):
+    """The serialization guard refuses raw secret material; its chain must not repeat it."""
+    from sqlalchemy import update
+
+    from nso_adapter.core.projection import snapshot_stream
+
+    device_id, row = await _community()
+    raw = "placeholder-raw-secret-not-a-reference"
+    async with session() as db:
+        await db.execute(update(SnmpCommunityIntent).where(SnmpCommunityIntent.id == row.id).values(vault_ref=raw))
+        await db.commit()
+    async with session() as db:
+        with pytest.raises(ValueError) as caught:
+            await snapshot_stream(db, device_id, "snmp")
+    for node in _exception_chain(caught.value):
+        assert raw not in f"{node!r} {node}"
+
+
 async def test_malformed_snmp_reference_keeps_no_reference_in_exception_or_row(adapter_client, recorded_logs):
     from nso_adapter.core.apply import (
         _NO_INTERFACE,
@@ -196,7 +231,13 @@ async def test_malformed_snmp_reference_keeps_no_reference_in_exception_or_row(a
     async with session() as db:
         job = await db.get(Job, job_id)
         stored = await db.get(SnmpCommunityIntent, row.id)
-        _assert_safe(exc, job, stored.last_apply_error, recorded_logs, [bad_ref])
+        _assert_safe(
+            exc,
+            job,
+            stored.last_apply_error,
+            recorded_logs,
+            [bad_ref, "placeholder-mount", "placeholder path", "placeholder-key"],
+        )
     assert not requests
 
 
