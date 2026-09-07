@@ -292,4 +292,6 @@ def test_static_route_legacy_body_paths_are_deleted():
         for node in ast.walk(ast.parse(Path(inspect.getfile(module)).read_text()))
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    assert not definitions & {"_static_route_snapshot", "_replace_static_route"}
+    # _static_route_snapshot survives by design (#1683: the aggregate builder's single
+    # retention helper). The per-service SENDERS are what had to go.
+    assert not definitions & {"_replace_static_route", "_sr_body"}

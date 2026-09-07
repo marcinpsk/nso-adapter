@@ -661,6 +661,37 @@ def _operation_selected_routes(document: dict) -> frozenset:
     return frozenset(key for raw in (removal.get("authorized_removal_keys") or []) if (key := as_triple(raw)))
 
 
+async def _static_route_snapshot(client, device, document: dict, plan) -> tuple[Any, list[dict]]:
+    """Read the live static-route section ONCE and derive the entries the PUT must retain.
+
+    Returns ``(certified, retained)``. Certified ABSENCE retains nothing and sends; an
+    INCONCLUSIVE read raises :class:`NsoApplyError`, because a full-document PUT built on a
+    read that may be hiding entries retracts whatever it could not see (#1683 §4.4).
+
+    *retained* are the live entries a tombstone still claims (by its own triple or by its
+    ``deployed_key``), that no body-rendered row re-asserts and that this operation's own
+    plane does not authorize removing. They are kept VERBATIM: metric, tag and NED-specific
+    leaves live only in the live copy, so rebuilding such an entry from the store triple
+    would silently rewrite it.
+    """
+    from nso_adapter.core.static_route_plan import as_triple, triple_of
+    from nso_adapter.core.static_route_reader import certified_static_route_section
+    from nso_adapter.nso.apply import static_route_entry_key
+
+    certified = await certified_static_route_section(client, device)
+    if certified.inconclusive:
+        raise NsoApplyError(
+            SNAPSHOT_INCONCLUSIVE,
+            f"static_route: could not certify the live service instance on {device.nso_device_name!r}; "
+            "refusing to build a device-intent PUT from an uncertified read",
+            detail={"device": device.nso_device_name},
+        )
+    claimed = {triple_of(tomb) for tomb in plan.tombstones}
+    claimed.update(key for tomb in plan.tombstones if (key := as_triple(tomb.deployed_key)) is not None)
+    keep = claimed - {triple_of(row) for row in plan.rows} - _operation_selected_routes(document)
+    return certified, [entry for entry in certified.routes if static_route_entry_key(entry) in keep]
+
+
 async def build_device_containers(
     client,
     device,
@@ -691,10 +722,6 @@ async def build_device_containers(
     decides. It is never silently omitted: under a full-document PUT an omitted family is a
     RETRACTED family, so a body with a build error is not sendable at all.
     """
-    from nso_adapter.core.static_route_plan import as_triple, triple_of
-    from nso_adapter.core.static_route_reader import certified_static_route_section
-    from nso_adapter.nso.apply import static_route_entry_key
-
     registry = section_registry()
     containers: dict[str, dict] = {}
     errors: dict[str, NsoApplyError] = {}
@@ -714,18 +741,7 @@ async def build_device_containers(
                 retained: list[dict] = []
                 if retain_static_routes:
                     plan = static_route_plan or hydrate_static_route_apply_plan(document)
-                    certified = await certified_static_route_section(client, device)
-                    if certified.inconclusive:
-                        raise NsoApplyError(
-                            SNAPSHOT_INCONCLUSIVE,
-                            f"static_route: could not certify the live service instance on {device.nso_device_name!r}; "
-                            "refusing to build a device-intent PUT from an uncertified read",
-                            detail={"device": device.nso_device_name},
-                        )
-                    claimed = {triple_of(tomb) for tomb in plan.tombstones}
-                    claimed.update(key for tomb in plan.tombstones if (key := as_triple(tomb.deployed_key)) is not None)
-                    keep = claimed - {triple_of(row) for row in plan.rows} - _operation_selected_routes(document)
-                    retained = [entry for entry in certified.routes if static_route_entry_key(entry) in keep]
+                    certified, retained = await _static_route_snapshot(client, device, document, plan)
                 sent_route_keys = overlay_retained_routes(body, retained)
         except NsoApplyError as exc:
             logger.error(
