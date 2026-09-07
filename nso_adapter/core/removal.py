@@ -30,6 +30,7 @@ from sqlalchemy import delete, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from nso_adapter.core.claim import BookkeepingOutcomeUnknown, ClaimLostError, JobError, error_envelope
+from nso_adapter.core.projection import GuardList as _GuardList
 from nso_adapter.core.request_flags import (
     AUTHORIZED_PROVENANCE,
     DELETE_ORIGIN_MARKING,
@@ -119,65 +120,6 @@ class RemovalBlockedError(Exception):
 # ── collateral guard (#90) — every device-keyed PUT-replace scope ─────────────
 
 
-class _GuardList(NamedTuple):
-    """One keyed YANG list the guard compares.
-
-    ``label`` names the list in ``context["removed"]`` and in the orphan report;
-    ``path`` walks nested lists from the service entry root to the keyed list
-    (bgp peers live at router→scope→peer); ``keys`` are the key leaf names.
-    """
-
-    label: str
-    path: tuple[str, ...]
-    keys: tuple[str, ...]
-
-
-@cache
-def _guard_lists() -> dict[str, tuple[_GuardList, ...]]:
-    """Section → the keyed YANG lists a full-document PUT can retract from that family.
-
-    Nested non-keyed content (route-map entries, redistribute rows, bgp address-families,
-    snmp system-info scalars) is intentionally NOT guarded: the collateral unit is the keyed
-    config object a stale document would silently flush off the device. ``interface_config``
-    is excluded — its addresses are a VALUE grain, checked by the residue path instead.
-    """
-    return {
-        "isis": (
-            _GuardList("interface-config", ("interface-config",), ("interface-name", "af")),
-            _GuardList("process-config", ("process-config",), ("process-tag",)),
-        ),
-        "ospf": (
-            _GuardList("interface-config", ("interface-config",), ("interface-name",)),
-            _GuardList("process-config", ("process-config",), ("process-id",)),
-        ),
-        "bgp": (
-            _GuardList("router", ("router",), ("asn",)),
-            # device-wide flatten: the trigger can only produce peer addresses across all
-            # routers/scopes, so the guard compares at the same grain
-            _GuardList("peer", ("router", "scope", "peer"), ("peer-address",)),
-        ),
-        "snmp": (
-            _GuardList("community", ("community",), ("name",)),
-            _GuardList("v3-user", ("v3-user",), ("username",)),
-            _GuardList("host", ("host",), ("address",)),
-        ),
-        "route_policy": (
-            _GuardList("prefix-list", ("prefix-list",), ("name",)),
-            _GuardList("community-list", ("community-list",), ("name",)),
-            _GuardList("as-path", ("as-path",), ("name",)),
-            _GuardList("route-map", ("route-map",), ("name",)),
-        ),
-        "bfd": (_GuardList("interface", ("interface",), ("interface-name",)),),
-        "svi": (_GuardList("interface", ("interface",), ("interface-name",)),),
-        "subinterface": (_GuardList("interface", ("interface",), ("interface-name",)),),
-        "static_route": (_GuardList("route", ("route",), ("vrf", "prefix", "next-hop")),),
-        "interface_mtu": (_GuardList("interface", ("interface",), ("interface-name",)),),
-        "vlan": (_GuardList("vlan", ("vlan",), ("vlan-id",)),),
-        "logging": (_GuardList("host", ("host",), ("address",)),),
-        "l2_sap": (_GuardList("sap", ("sap",), ("service-name", "sap-id")),),
-    }
-
-
 @cache
 def _section_by_model() -> dict[str, str]:
     """Intent model name → the document section it belongs to, off the registry.
@@ -197,7 +139,9 @@ def _section_by_model() -> dict[str, str]:
 
 def section_guard_lists(section: str) -> tuple[_GuardList, ...]:
     """Return the guarded YANG lists of one section, empty when it has none."""
-    return _guard_lists().get(section, ())
+    from nso_adapter.core.projection import section_registry
+
+    return section_registry()[section].guard_lists if section in section_registry() else ()
 
 
 @cache
@@ -325,6 +269,15 @@ def _norm_key(key) -> tuple[str, ...]:
 
 def _leaf_keys(entry: dict, guard_list: _GuardList) -> set[tuple[str, ...]]:
     """Collect the key tuples of *guard_list*'s leaf entries under *entry*."""
+    if guard_list.parent_key is not None:
+        return {
+            (
+                str(parent[guard_list.parent_key]),
+                *((str(child),) if guard_list.scalar else tuple(str(child[k]) for k in guard_list.keys)),
+            )
+            for parent in entry.get(guard_list.path[0]) or []
+            for child in parent.get(guard_list.path[1]) or []
+        }
     level = [entry]
     for name in guard_list.path:
         level = [child for node in level for child in (node.get(name) or [])]
@@ -615,7 +568,8 @@ def _document_orphans(current: dict, containers: dict[str, dict], allowed: dict[
 
     registry = section_registry()
     orphans: dict[str, list] = {}
-    for section, guard_lists in _guard_lists().items():
+    for section, entry in registry.items():
+        guard_lists = entry.guard_lists
         container = registry[section].container
         live = current.get(container) or {}
         body = containers.get(container) or {}

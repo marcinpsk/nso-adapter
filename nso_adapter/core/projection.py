@@ -146,6 +146,16 @@ NO_COMPARISON = NoComparison()
 Verification = TableCompare | BespokeExpansion | NoComparison
 
 
+class GuardList(NamedTuple):
+    """A guarded list, its authority label, and its parent-qualified wire identity."""
+
+    label: str
+    path: tuple[str, ...]
+    keys: tuple[str, ...]
+    parent_key: str | None = None
+    scalar: bool = False
+
+
 class _Section(NamedTuple):
     """One document section: its intent tables plus everything the write side needs.
 
@@ -168,6 +178,7 @@ class _Section(NamedTuple):
     encode: Callable[[Mapping[str, list[Any]], Any], dict]
     read_family: str
     verify: Verification
+    guard_lists: tuple[GuardList, ...] = ()
     capability_scopes: tuple[str, ...] = ()
     result_keys: tuple[str, ...] = ()
 
@@ -182,6 +193,11 @@ _SECTION_REGISTRY: dict[str, _Section] = {
             _Spec(SnmpV3UserIntent),
             _Spec(SnmpHostIntent),
             _Spec(SnmpSystemInfoIntent),
+        ),
+        guard_lists=(
+            GuardList("community", ("community",), ("name",)),
+            GuardList("v3-user", ("v3-user",), ("username",)),
+            GuardList("host", ("host",), ("address",)),
         ),
         container="snmp",
         encode=encode_snmp,
@@ -207,6 +223,7 @@ _SECTION_REGISTRY: dict[str, _Section] = {
                 lifecycle=True,
             ),
         ),
+        guard_lists=(GuardList("route", ("route",), ("vrf", "prefix", "next-hop")),),
         container="static-route",
         encode=encode_static_route,
         read_family="static_route",
@@ -214,6 +231,7 @@ _SECTION_REGISTRY: dict[str, _Section] = {
     ),
     "logging": _Section(
         tables=(_Spec(LoggingHostIntent), _Spec(LoggingLevelsIntent)),
+        guard_lists=(GuardList("host", ("host",), ("address",)),),
         container="logging",
         encode=encode_logging,
         read_family="logging",
@@ -221,6 +239,7 @@ _SECTION_REGISTRY: dict[str, _Section] = {
     ),
     "svi": _Section(
         tables=(_Spec(SviIntent),),
+        guard_lists=(GuardList("interface", ("interface",), ("interface-name",)),),
         container="svi",
         encode=encode_svi,
         read_family="svi",
@@ -228,6 +247,7 @@ _SECTION_REGISTRY: dict[str, _Section] = {
     ),
     "subinterface": _Section(
         tables=(_Spec(SubinterfaceIntent),),
+        guard_lists=(GuardList("interface", ("interface",), ("interface-name",)),),
         container="subinterface",
         encode=encode_subinterface,
         read_family="subinterface",
@@ -235,6 +255,7 @@ _SECTION_REGISTRY: dict[str, _Section] = {
     ),
     "vlan": _Section(
         tables=(_Spec(VlanIntent),),
+        guard_lists=(GuardList("vlan", ("vlan",), ("vlan-id",)),),
         container="vlan",
         encode=encode_vlan,
         read_family="vlan",
@@ -242,6 +263,7 @@ _SECTION_REGISTRY: dict[str, _Section] = {
     ),
     "bfd": _Section(
         tables=(_Spec(BfdIntent),),
+        guard_lists=(GuardList("interface", ("interface",), ("interface-name",)),),
         container="bfd",
         encode=encode_bfd,
         read_family="bfd",
@@ -249,6 +271,7 @@ _SECTION_REGISTRY: dict[str, _Section] = {
     ),
     "interface_mtu": _Section(
         tables=(_Spec(InterfaceMtuIntent),),
+        guard_lists=(GuardList("interface", ("interface",), ("interface-name",)),),
         container="mtu",
         encode=encode_interface_mtu,
         read_family="interface_mtu",
@@ -256,6 +279,7 @@ _SECTION_REGISTRY: dict[str, _Section] = {
     ),
     "l2_sap": _Section(
         tables=(_Spec(L2SapIntent),),
+        guard_lists=(GuardList("sap", ("sap",), ("service-name", "sap-id")),),
         container="l2-sap",
         encode=encode_l2_sap,
         read_family="l2_service",
@@ -268,6 +292,10 @@ _SECTION_REGISTRY: dict[str, _Section] = {
             _Spec(IsisLevelIntent),
             _Spec(IsisFlexAlgoIntent),
             _Spec(RedistributionIntent, discriminator=("dest_protocol", "isis")),
+        ),
+        guard_lists=(
+            GuardList("interface-config", ("interface-config",), ("interface-name", "af")),
+            GuardList("process-config", ("process-config",), ("process-tag",)),
         ),
         container="isis",
         encode=encode_isis,
@@ -288,6 +316,12 @@ _SECTION_REGISTRY: dict[str, _Section] = {
             _Spec(BgpPeerAfIntent, parent=BgpPeerIntent),
             _Spec(RedistributionIntent, discriminator=("dest_protocol", "bgp")),
         ),
+        guard_lists=(
+            GuardList("router", ("router",), ("asn",)),
+            # device-wide flatten: the trigger can only produce peer addresses across all
+            # routers/scopes, so the guard compares at the same grain
+            GuardList("peer", ("router", "scope", "peer"), ("peer-address",)),
+        ),
         container="bgp",
         encode=encode_bgp,
         read_family="bgp",
@@ -295,6 +329,12 @@ _SECTION_REGISTRY: dict[str, _Section] = {
     ),
     "route_policy": _Section(
         tables=(_Spec(RoutePolicyObjectIntent),),
+        guard_lists=(
+            GuardList("prefix-list", ("prefix-list",), ("name",)),
+            GuardList("community-list", ("community-list",), ("name",)),
+            GuardList("as-path", ("as-path",), ("name",)),
+            GuardList("route-map", ("route-map",), ("name",)),
+        ),
         container="route-policy",
         encode=encode_route_policy,
         read_family="route_policy",
@@ -305,6 +345,10 @@ _SECTION_REGISTRY: dict[str, _Section] = {
             _Spec(OspfInstanceIntent),
             _Spec(OspfInterfaceIntent),
             _Spec(RedistributionIntent, discriminator=("dest_protocol", "ospf")),
+        ),
+        guard_lists=(
+            GuardList("interface-config", ("interface-config",), ("interface-name",)),
+            GuardList("process-config", ("process-config",), ("process-id",)),
         ),
         container="ospf",
         encode=encode_ospf,
@@ -320,6 +364,12 @@ _SECTION_REGISTRY: dict[str, _Section] = {
     # discriminator and no lifecycle carrier, and every identity comes from the schema.
     "switchport": _Section(
         tables=(_Spec(SwitchportIntent), _Spec(SwitchportTaggedVlanIntent, parent=SwitchportIntent)),
+        guard_lists=(
+            GuardList(SwitchportIntent.__tablename__, ("interface",), ("interface-name",)),
+            GuardList(
+                SwitchportTaggedVlanIntent.__tablename__, ("interface", "tagged-vlan"), (), "interface-name", True
+            ),
+        ),
         container="switchport",
         encode=encode_switchport,
         read_family="switchport",
@@ -327,6 +377,10 @@ _SECTION_REGISTRY: dict[str, _Section] = {
     ),
     "lag": _Section(
         tables=(_Spec(LagBundleIntent, identity=("name",)), _Spec(LagMemberIntent, parent=LagBundleIntent)),
+        guard_lists=(
+            GuardList(LagBundleIntent.__tablename__, ("bundle",), ("name",)),
+            GuardList(LagMemberIntent.__tablename__, ("bundle", "member"), ("interface-name",), "name"),
+        ),
         container="lag",
         encode=encode_lag,
         read_family="lag_config",
