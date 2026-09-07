@@ -38,3 +38,21 @@ async def test_verify_token_rejects_wrong_token_sharing_a_prefix():
 async def test_verify_token_rejects_missing_credentials():
     with pytest.raises(ApiError):
         await verify_token(_req("s3cr3t-token"), None)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("path", ["/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"])
+@pytest.mark.parametrize("authorization", [None, "Bearer wrong-token"])
+async def test_documentation_requires_bearer(adapter_client, path, authorization):
+    headers = {"Authorization": authorization} if authorization else {}
+    response = await adapter_client.get(path, headers=headers)
+    assert response.status_code == 401
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("path", ["/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"])
+async def test_documentation_accepts_bearer(adapter_client, path):
+    from tests.conftest import VALID_TOKEN
+
+    response = await adapter_client.get(path, headers={"Authorization": f"Bearer {VALID_TOKEN}"})
+    assert response.status_code == 200
