@@ -539,3 +539,96 @@ async def test_a_failed_residue_read_keeps_the_server_reason_out_of_the_log_and_
     with pytest.raises(RuntimeError) as caught:
         await removal_mod._residue_after_removal(client, device, "snmp", {"scope": "snmp", **removed})
     assert_chain_free_of(caught.value, secrets)
+
+
+# ── an envelope section that reports status=error: the wire reason reaches no sink ──
+
+#: What a real `snmp-config` extract failure can answer in the envelope's own error-reason.
+_SECTION_REASON = f"extract of /snmp:snmp/community[name='{_SECRET}'] failed for {_REF}"
+_SECRETS = [_SECRET, _REF, "placeholder-mount", "placeholder-path", "placeholder-key"]
+
+
+def _envelope_client(wire: str, section: dict, action_output: dict | None = None):
+    """A real NsoClient whose device-state envelope answers *section* for *wire*."""
+
+    def respond(request):
+        if "device-state-read/run" in str(request.url):
+            return httpx.Response(200, json={"network-state-export:output": action_output or {}})
+        if request.url.path.endswith(f"/{wire}"):
+            return httpx.Response(200, json={f"network-state-export:{wire}": section})
+        return httpx.Response(404)
+
+    return _client_with(httpx.MockTransport(respond))
+
+
+async def _refresh_static_route(device_id: int, client):
+    """One real engine refresh for the static_route family, on the real DB."""
+    from nso_adapter.core.refresh_engine import run_family_refresh
+    from nso_adapter.core.static_route import STATIC_ROUTE_SPEC
+    from nso_adapter.store.models import Device
+
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        await run_family_refresh(db, device, client, STATIC_ROUTE_SPEC)
+
+
+async def _outcome_rows(device_id: int) -> list[dict]:
+    from sqlalchemy import select
+
+    from nso_adapter.store.models import RefreshOutcome
+
+    async with session() as db:
+        rows = (await db.execute(select(RefreshOutcome).where(RefreshOutcome.device_id == device_id))).scalars().all()
+        return [{c.name: getattr(row, c.name) for c in row.__table__.columns} for row in rows]
+
+
+async def test_an_error_section_keeps_the_wire_reason_out_of_the_refresh_log(adapter_client):
+    """`static_route.refresh.unavailable` classifies the failure; it never repeats the wire text.
+
+    The envelope's `error-reason` is the server's own text. A `snmp-config` extract failure
+    can answer a community-keyed path there, and the classifier carried it verbatim into the
+    log record the poller writes on every failed read.
+    """
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    device_id = await seed_device(nso_device_name="refresh-error-section", netbox_device_id=9421)
+    client = _envelope_client("static-route", {"status": "error", "error-reason": _SECTION_REASON})
+    with capture_logs() as logs:
+        await _refresh_static_route(device_id, client)
+
+    reported = [record for record in logs if record["event"] == "static_route.refresh.unavailable"]
+    assert reported, "the unavailable read was not reported at all"
+    assert reported[0]["reason"] == "read_error", "the reason is the half the operator needs"
+    assert reported[0]["detail"] == "the section reported status=error"
+    assert_records_free_of(logs, _SECRETS)
+    assert_records_free_of(await _outcome_rows(device_id), _SECRETS)
+
+
+async def test_a_refused_escalation_keeps_the_certification_text_out_of_the_refresh_log(adapter_client):
+    """The escalation's own exception is a sink too: only its TYPE may reach the record.
+
+    A `not-ready` section escalates to the device-state-read action. The action's response is
+    certified, and the refusal names what the server echoed — so carrying the exception repr
+    into `detail` re-published it.
+    """
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    device_id = await seed_device(nso_device_name="refresh-escalation", netbox_device_id=9422)
+    client = _envelope_client(
+        "static-route",
+        {"status": "not-ready"},
+        action_output={"atomic": True, "device-name": f"other-device-{_SECRET}"},
+    )
+    with capture_logs() as logs:
+        await _refresh_static_route(device_id, client)
+
+    reported = [record for record in logs if record["event"] == "static_route.refresh.unavailable"]
+    assert reported, "the unavailable read was not reported at all"
+    assert reported[0]["reason"] == "read_error"
+    assert reported[0]["detail"] == "the device-state-read action raised NsoReadContractError"
+    assert_records_free_of(logs, _SECRETS)
+    assert_records_free_of(await _outcome_rows(device_id), _SECRETS)

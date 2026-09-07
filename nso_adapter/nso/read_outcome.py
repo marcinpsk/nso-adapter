@@ -65,7 +65,8 @@ class Unavailable:
     """No authoritative answer → keep the last-known mirror rows."""
 
     reason: UnavailableReason
-    # Diagnostic only (exception repr); excluded from equality so tests can assert on reason alone.
+    # An AUTHORED classification, never server or exception text: it reaches the operator log.
+    # Excluded from equality so tests can assert on reason alone.
     detail: str = field(default="", compare=False)
 
 
@@ -88,7 +89,8 @@ def classify_envelope_section(section: dict | None) -> ReadOutcome:
     * ``not-ready`` → :class:`Unavailable`(``not_ready``): no record under the current
       mount (post-reload, NED remount). The engine escalates to ``device-state-read run``
       exactly once — the envelope itself never extracts.
-    * ``error`` → :class:`Unavailable`(``read_error``) with the wire's ``error-reason``.
+    * ``error`` → :class:`Unavailable`(``read_error``). The wire's ``error-reason`` is the
+      server's own text, so it is classified, never carried.
 
     ``section is None`` is DEVICE-level absence (the client already confirmed the
     ``device-state`` container is alive): the device is genuinely unknown to NSO. READSEM S5
@@ -112,5 +114,6 @@ def classify_envelope_section(section: dict | None) -> ReadOutcome:
     if status == "not-ready":
         return Unavailable(UnavailableReason.not_ready)
     if status == "error":
-        return Unavailable(UnavailableReason.read_error, detail=str(section.get("error-reason") or ""))
-    return Unavailable(UnavailableReason.read_error, detail=f"unrecognized envelope status {status!r}")
+        # The error-reason is the server's own text and can name a community-keyed path.
+        return Unavailable(UnavailableReason.read_error, detail="the section reported status=error")
+    return Unavailable(UnavailableReason.read_error, detail="the section reported an unrecognized status")

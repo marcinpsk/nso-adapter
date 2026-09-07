@@ -253,7 +253,9 @@ async def _fetch_projection(nso_client, device, wire_names: list[str], *, atomic
             async with _action_semaphore():
                 output = await nso_client.run_device_state_read(device.nso_device_name, wire_names, timeout=360.0)
         except Exception as exc:  # noqa: BLE001 — action error keeps every family
-            return {}, Unavailable(UnavailableReason.read_error, detail=repr(exc))
+            return {}, Unavailable(
+                UnavailableReason.read_error, detail=f"the device-state-read action raised {type(exc).__name__}"
+            )
         # Codex S3-R3 F5: a non-mapping output or atomic!=True must NEVER be materialized
         # as an atomic read — fan out read_error (keep) instead.
         if not isinstance(output, dict) or output.get("atomic") is not True:
@@ -262,9 +264,13 @@ async def _fetch_projection(nso_client, device, wire_names: list[str], *, atomic
     try:
         doc = await nso_client.get_device_state_doc(device.nso_device_name)
     except NsoExportUnavailableError as exc:
-        return {}, Unavailable(UnavailableReason.export_down, detail=repr(exc))
+        return {}, Unavailable(
+            UnavailableReason.export_down, detail=f"the device-state doc GET raised {type(exc).__name__}"
+        )
     except Exception as exc:  # noqa: BLE001 — any supplier failure keeps every family
-        return {}, Unavailable(UnavailableReason.read_error, detail=repr(exc))
+        return {}, Unavailable(
+            UnavailableReason.read_error, detail=f"the device-state doc GET raised {type(exc).__name__}"
+        )
     if doc is None:
         return {w: None for w in wire_names}, None
     # Codex S3-R3 F5: only the confirmed whole-doc 404 above may mean device absence. A
@@ -282,7 +288,7 @@ async def _fetch_projection(nso_client, device, wire_names: list[str], *, atomic
                 sections[w] = _section_or_error(output.get(w))
         except Exception as exc:  # noqa: BLE001 — heal failure degrades only the not-ready set
             for w in not_ready:
-                sections[w] = {"status": "error", "error-reason": f"heal action failed: {exc!r}"}
+                sections[w] = {"status": "error", "error-reason": f"heal action failed ({type(exc).__name__})"}
     return sections, None
 
 
