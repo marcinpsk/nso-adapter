@@ -1000,7 +1000,7 @@ async def _enqueue_action_removal_links(
             context = context._replace(removed=removal_authority.get(scope) or None)
         own = promotion_removal_keys(link.removed) if scope == "static_route" else context.removed
         contexts[link.stream] = (context, scope_qualified(scope, own))
-        if link.mode is GenerationMode.networked:
+        if link.mode is GenerationMode.networked and scope not in CLAIM_LESS_SECTIONS:
             union = _merge_authority(union, scope_qualified(scope, own))
 
     generations = []
