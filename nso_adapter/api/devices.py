@@ -432,12 +432,16 @@ class DeviceCreate(BaseModel):
 async def onboard_device(body: DeviceCreate, db: AsyncSession = Depends(get_db)):
     from nso_adapter.core.onboarding import onboard_device as _onboard
 
+    refused = None
     try:
         device = await _onboard(db, body.nso_instance, body.nso_device_name, body.netbox_device_id)
     except LookupError as exc:
-        raise api_error(409, "conflict", str(exc))
+        # Built in the handler, raised after it: a raise inside attaches the caught exception.
+        refused = api_error(409, "conflict", str(exc))
     except ValueError as exc:
-        raise api_error(422, "validation_error", str(exc))
+        refused = api_error(422, "validation_error", str(exc))
+    if refused is not None:
+        raise refused
     return _device_out(device)
 
 
@@ -754,12 +758,15 @@ async def rekey_device(device_id: int, body: DevicePatch, db: AsyncSession = Dep
         raise api_error(404, "not_found", "Device not found")
     if body.nso_instance is None and body.nso_device_name is None:
         return _device_out(device)
+    refused = None
     try:
         device = await _rekey(db, device, body.nso_instance, body.nso_device_name)
     except LookupError as exc:
-        raise api_error(409, "conflict", str(exc))
+        refused = api_error(409, "conflict", str(exc))
     except ValueError as exc:
-        raise api_error(422, "validation_error", str(exc))
+        refused = api_error(422, "validation_error", str(exc))
+    if refused is not None:
+        raise refused
     return _device_out(device)
 
 
