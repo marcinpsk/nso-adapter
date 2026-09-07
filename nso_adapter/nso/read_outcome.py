@@ -77,7 +77,7 @@ class ReadOperation(str, enum.Enum):
 
 
 class ReadFailureCode(str, enum.Enum):
-    """The authored contract reason, for a failure the server ANSWERED instead of raising.
+    """The authored reason a read could not be served, beyond what raised.
 
     Closed set. Each member names one way the read contract broke, so an operator can tell a
     device-reported extract error from a malformed body from a failed heal.
@@ -108,7 +108,7 @@ class ReadFailure:
     family: str
     error_type: str | None = None  # the raised type, when the read raised
     http_status: int | None = None  # the numeric status, when the server answered one
-    code: ReadFailureCode | None = None  # the contract reason, when the server answered a refused 200
+    code: ReadFailureCode | None = None  # the contract reason, when the read broke a rule
 
     def for_family(self, family: str) -> ReadFailure:
         """Narrow a whole-device read failure to the family it is being reported for."""
