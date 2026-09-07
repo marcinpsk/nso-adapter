@@ -497,12 +497,13 @@ async def put_static_route_intent(
             return await _apply_static_route_intent(device_id, body, db, delivery)
     except ClaimUnavailableError:
         logger.warning("static_route.intent_claim_timeout", device_id=device_id)
-        raise api_error(
+        busy = api_error(
             409,
             "conflict",
             "The device is busy with another operation; retry",
             {"reason": "device_claimed"},
-        ) from None
+        )
+    raise busy
 
 
 def _write_tombstones(

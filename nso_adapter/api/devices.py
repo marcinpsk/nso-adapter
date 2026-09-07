@@ -776,14 +776,17 @@ async def offboard_device(device_id: int, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+    busy = None
     try:
         await _offboard(db, device)
     except ClaimUnavailableError:
         # Something is working on this device. Tearing it down from under a runner is the
         # one thing the claim exists to prevent; the operator retries.
-        raise api_error(
+        busy = api_error(
             409,
             "conflict",
             "The device is busy with another operation; retry",
             {"reason": "device_claimed"},
-        ) from None
+        )
+    if busy is not None:
+        raise busy
