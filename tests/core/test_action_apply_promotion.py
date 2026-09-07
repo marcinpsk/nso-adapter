@@ -2619,6 +2619,18 @@ def test_every_apply_unexecutable_reason_is_documented_and_live():
     assert documented == raised, f"documented {sorted(documented)} != raised {sorted(raised)}"
 
 
+def test_every_apply_skip_reason_is_documented():
+    from pathlib import Path
+
+    from nso_adapter.api.actions import ActionApplyOut
+
+    contract = (Path(__file__).resolve().parents[2] / "docs" / "api-contract.md").read_text()
+    section = contract.split("### `POST /api/v1/devices/{id}/actions/apply` (A3)", 1)[1].split("\n### ", 1)[0]
+    reasons = set(ActionApplyOut.model_json_schema()["properties"]["skipped"]["additionalProperties"]["enum"])
+    documented = set(re.findall(r"`([a-z_]+)`", section))
+    assert reasons <= documented, f"Apply skip reasons missing from the contract: {sorted(reasons - documented)}"
+
+
 def _widen_apply_boundary(monkeypatch, *sections: str) -> None:
     """Admit *sections* past the live-read gate for one test.
 
@@ -2812,7 +2824,7 @@ def _lag_body(roots: dict[str, list[int]], *, deleted_roots=(), scalar=None, ext
         "bundles": [
             {
                 "name": name,
-                "lag_id": 1,
+                "lag_id": {"A": 1, "B": 2, "C": 3, "X": 4, "L1": 5, "L2": 6}[name],
                 **({"admin_key": scalar} if scalar is not None else {}),
                 "members": [{"interface_name": f"Gi0/{child}"} for child in children],
                 **(extra or {}),

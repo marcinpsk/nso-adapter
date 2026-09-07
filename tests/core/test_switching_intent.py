@@ -652,6 +652,7 @@ async def test_lag_replacement_rejects_duplicate_ids(adapter_client):
                     LagBundleSnapshot(name="Port-channel1", lag_id=7),
                     LagBundleSnapshot(name="Port-channel2", lag_id=7),
                 ),
+                deleted_roots=[],
             )
         assert await db.scalar(select(LagBundleIntent.id).where(LagBundleIntent.device_id == device_id)) is None
 
@@ -672,6 +673,7 @@ async def test_lag_id_constraint_allows_nulls_and_other_devices(adapter_client):
                     LagBundleSnapshot(name="Port-channel2"),
                     LagBundleSnapshot(name="Port-channel3"),
                 ),
+                deleted_roots=[],
             )
         await db.commit()
     async with session() as db:
@@ -690,7 +692,7 @@ async def test_lag_replacement_can_swap_and_reassign_ids(adapter_client):
         (LagBundleSnapshot(name="Port-channel3", lag_id=1),),
     ):
         async with session() as db:
-            await replace_lag_snapshot(db, device_id, bundles)
+            await replace_lag_snapshot(db, device_id, bundles, deleted_roots=[])
             await db.commit()
         async with session() as db:
             rows = (await db.execute(select(LagBundleIntent).where(LagBundleIntent.device_id == device_id))).scalars()

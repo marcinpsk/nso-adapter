@@ -822,9 +822,9 @@ do not otherwise refuse these barrier actions.
 
 ### `POST /api/v1/devices/{id}/actions/apply` (A3)
 
-Atomically promote the exact intent pushes selected by the caller and enqueue their
-immutable deployment-generation chain. The selector maps the adapter's receipt stream name
-to the `X-Push-Seq` that the plugin drained:
+Atomically promote the exact intent selected by the caller and enqueue its immutable
+deployment-generation chain. For the sixteen receipt lanes, the selector maps the stream
+name to the `X-Push-Seq` that the plugin drained:
 
 ```json
 {
@@ -851,12 +851,13 @@ creates no generation or job. Reusing the UUID with a different device or select
 `409 conflict`; `error.detail.mismatch` is `device_id` or `selected`. The conflict changes
 nothing.
 
-The selector uses push sequences, not current revisions, because the plugin already owns
-these values in its drain bookkeeping and the adapter receipts use the same identity. A
-selected sequence is a strict integer in the receipt domain `1..2^63-1`. A value outside
-that domain returns `422 validation_error`.
+The receipt lanes use push sequences because the plugin owns these values in its drain
+bookkeeping. The out-of-protocol `lag` and `switchport` streams use the `selection_revision`
+returned by their preparation POST. A store-only POST returns no selection revision.
+Each selected value is a strict integer in `1..2^63-1`. A value outside that domain
+returns `422 validation_error`.
 
-A stream is promotable only when its latest durable receipt and projection row both match the
+A receipt lane is promotable only when its latest durable receipt and projection row both match the
 selected sequence. A later push never rides an earlier selection. Every stale selection is
 reported under `skipped`: `superseded` for an older sequence, `already_applied` when its
 revision settled, `already_authorized` when its generation is still unsettled or was
@@ -865,6 +866,21 @@ matching receipt was admitted in backfill-only mode, and `revision_mismatch` whe
 receipt matches but the projection row does not. `backfill_only` is terminal for that
 sequence: the receipt exists and holds it, but a backfill repairs correlation only, so no
 retry of the same selection can promote it.
+
+For a prepared stream, `no_prepared_revision` means the selected revision has no matching
+prepared slot. It is terminal for the selected revision. Prepare a new snapshot and select
+its returned revision. `awaiting_aggregate_sender` means the section has no device sender.
+It is retryable after the aggregate sender becomes available. On this branch, `lag` and
+`switchport` always return this reason before the adapter checks their prepared revisions.
+The adapter preserves their prepared slots and creates no generation or job for them.
+
+`superseded` and `backfill_only` require a new selection. `already_applied` needs no further
+work. `already_authorized` leaves recovery to the owning generation's retry or abandon action.
+`no_receipt` can be retried after the matching receipt arrives. `revision_mismatch` requires
+the receipt and projection state to match before a retry can promote it.
+Use a new `apply_attempt_id` to re-evaluate a retryable skip. The same UUID replays the stored
+response, even after the sender or stored state changes.
+
 `skipped_detail` is keyed by stream; only its CONTENT is conditional — the key itself is
 always present. It identifies the generation for
 each `already_authorized` skip whose owning generation can be identified. Each member has
@@ -946,9 +962,12 @@ and an identical retry replays it. Reasons are stable machine codes:
 - `unresolved_interface_identity`
 <!-- apply-unexecutable-reasons:end -->
 
-The manual-Apply boundary is exactly `DOCUMENT_EXECUTED_SECTIONS`. It contains every section,
-so all sixteen streams are executable through `ACTION_APPLY_EXECUTABLE_SECTIONS`. SNMP
-documents store Vault references verbatim. The SNMP writer reads those references from the
+The registry contains eighteen streams: sixteen endpoint receipt lanes and the out-of-protocol
+`lag` and `switchport` streams. They compose sixteen document sections. The manual-Apply
+execution boundary is `ACTION_APPLY_EXECUTABLE_SECTIONS`, which equals
+`DOCUMENT_EXECUTED_SECTIONS`. Its fourteen sections cover the sixteen receipt lanes.
+The two switching sections remain in `AWAITING_SENDER_SECTIONS` and are not executable.
+SNMP documents store Vault references verbatim. The SNMP writer reads those references from the
 hydrated rows when it builds the send body. BGP documents store the router, scope,
 address-family, peer, and peer address-family tables. The hydrator rebuilds their relationship
 graph from durable parent identities before the writer walks it. Static-route documents also
@@ -2342,10 +2361,11 @@ Every `PUT /api/v1/devices/{id}/*-intent` endpoint below (and `vlan-intent`,
 - Storing intent **never touches the device synchronously**. If `auto_apply` is enabled in
   the device settings, an ordinary non-store-only PUT enqueues the scope's apply job.
   Otherwise the intent remains stored in the mirror.
-- Explicit `actions/apply` promotes every section through `DOCUMENT_EXECUTED_SECTIONS`, so
-  all sixteen streams are executable from their stored generation documents. Use a new
-  `X-Push-Seq` when resending a stored payload because receipt replay returns the recorded
-  response without new work.
+- Explicit `actions/apply` can execute the sixteen receipt lanes through the fourteen
+  sections in `DOCUMENT_EXECUTED_SECTIONS`. The registry also contains `lag` and `switchport`.
+  These two streams remain in `AWAITING_SENDER_SECTIONS` and return
+  `awaiting_aggregate_sender`. Use a new `X-Push-Seq` when resending a stored receipt-lane
+  payload because receipt replay returns the recorded response without new work.
 - Where dropping a row from a keyed NSO service list requires it, the adapter
   queues an async removal job (see [Removal propagation](#removal-propagation)).
 - → `200` `{ "device_id": 1, "count": <rows stored>, "removed": <rows dropped> }`.
