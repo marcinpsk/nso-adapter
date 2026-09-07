@@ -1576,11 +1576,11 @@ async def _commit_document(
             await _record_atomic_capability(db, client, device, device_name, offenders, commit_error, rp, device_err)
         except Exception:  # noqa: BLE001 — capability recording is best-effort
             logger.debug("apply.atomic.capability_record_skipped", job_id=job_id)
-    if not offenders:  # could not localise → the whole rolled-back commit is the failure
-        offenders = dict.fromkeys(containers, "")
     message = commit_error.message
     if offenders:
         message = f"{message}; blocked by {', '.join(sorted(offenders))} refusal: {device_err or message}"
+    else:
+        offenders = dict.fromkeys(containers, "")
     err = {"code": commit_error.code, "message": message, "detail": commit_error.detail}
     return commit_error, verify, offenders, err, message
 
