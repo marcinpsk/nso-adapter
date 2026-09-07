@@ -2654,30 +2654,10 @@ def test_every_apply_skip_reason_is_documented():
     assert reasons <= documented, f"Apply skip reasons missing from the contract: {sorted(reasons - documented)}"
 
 
-def _widen_apply_boundary(monkeypatch, *sections: str) -> None:
-    """Admit *sections* past the live-read gate for one test.
-
-    The gate is a rollout boundary, not the behavior under test: it currently holds every
-    section but ``vlan``, so the paths below are unreachable over HTTP until the aggregate
-    document builder lands. The widening only unions sections in and never replaces the
-    set, so it degrades to a no-op and these tests run unpatched once the real boundary
-    holds the section.
-    """
-    from nso_adapter.core import generation as generation_module
-    from nso_adapter.core import projection as projection_module
-
-    widened = projection_module.ACTION_APPLY_EXECUTABLE_SECTIONS | set(sections)
-    monkeypatch.setattr(projection_module, "ACTION_APPLY_EXECUTABLE_SECTIONS", widened)
-    # `from … import` binds a copy; rebind it only where the consuming module still has one.
-    if hasattr(generation_module, "ACTION_APPLY_EXECUTABLE_SECTIONS"):
-        monkeypatch.setattr(generation_module, "ACTION_APPLY_EXECUTABLE_SECTIONS", widened)
-
-
-async def test_action_apply_names_a_backfill_only_receipt_by_its_own_skip_code(adapter_client, monkeypatch):
+async def test_action_apply_names_a_backfill_only_receipt_by_its_own_skip_code(adapter_client):
     """A backfill receipt holds the selected sequence, so 'no_receipt' misdescribes it."""
     from tests.api.test_static_route_identity import seed_intent
 
-    _widen_apply_boundary(monkeypatch, "static_route")
     device_id = await seed_device(nso_device_name="apply-backfill-skip", netbox_device_id=9984)
     await seed_settings(device_id, auto_apply=False)
     await seed_intent(device_id, [{"triple": _A, "route_id": 1}])
@@ -2747,11 +2727,10 @@ async def _rebind_authorized_ip_rows(device_id: int, interface_id) -> None:
         await db.commit()
 
 
-async def _authorized_ip_address(client, device_id: int, monkeypatch, *, seq: int) -> None:
+async def _authorized_ip_address(client, device_id: int, *, seq: int) -> None:
     """Promote and settle one stored address, so the next push decomposes into a removal."""
     from nso_adapter.store.models import GenerationStatus
 
-    _widen_apply_boundary(monkeypatch, "interface_config")
     await seed_settings(device_id, auto_apply=False)
     stored = await _put_ip(
         client,
@@ -2764,10 +2743,10 @@ async def _authorized_ip_address(client, device_id: int, monkeypatch, *, seq: in
     await _settle((await _generations(device_id))[0].job_id, GenerationStatus.settled)
 
 
-async def test_action_apply_refuses_a_removal_whose_interface_identity_is_gone(adapter_client, monkeypatch):
+async def test_action_apply_refuses_a_removal_whose_interface_identity_is_gone(adapter_client):
     """The removal names an interface row that no longer exists, so nothing may execute."""
     device_id = await seed_device(nso_device_name="apply-interface-gone", netbox_device_id=9985)
-    await _authorized_ip_address(adapter_client, device_id, monkeypatch, seq=6501)
+    await _authorized_ip_address(adapter_client, device_id, seq=6501)
     await _rebind_authorized_ip_rows(device_id, 999999)
     assert (await _put_ip(adapter_client, device_id, [], seq=6502)).status_code == 200
 
@@ -2786,10 +2765,10 @@ async def test_action_apply_refuses_a_removal_whose_interface_identity_is_gone(a
     assert (await _stream(device_id, "ip")).authorized_revision == 1
 
 
-async def test_action_apply_refuses_an_interface_removal_with_no_executable_instance(adapter_client, monkeypatch):
+async def test_action_apply_refuses_an_interface_removal_with_no_executable_instance(adapter_client):
     """interface-reconciler is keyed per interface, so a nameless removal would send nothing."""
     device_id = await seed_device(nso_device_name="apply-interface-nameless", netbox_device_id=9986)
-    await _authorized_ip_address(adapter_client, device_id, monkeypatch, seq=6601)
+    await _authorized_ip_address(adapter_client, device_id, seq=6601)
     await _rebind_authorized_ip_rows(device_id, None)
     assert (await _put_ip(adapter_client, device_id, [], seq=6602)).status_code == 200
 
@@ -2813,12 +2792,11 @@ async def test_action_apply_refuses_an_interface_removal_with_no_executable_inst
     [(6410, "superseded", 9987), (6412, "no_receipt", 9988)],
 )
 async def test_backfill_only_never_answers_for_a_sequence_the_receipt_does_not_hold(
-    adapter_client, monkeypatch, selected_seq, expected, netbox_device_id
+    adapter_client, selected_seq, expected, netbox_device_id
 ):
     """A neighboring sequence keeps its own answer: the older one is superseded, the newer retryable."""
     from tests.api.test_static_route_identity import seed_intent
 
-    _widen_apply_boundary(monkeypatch, "static_route")
     device_id = await seed_device(
         nso_device_name=f"apply-backfill-seq-{selected_seq}", netbox_device_id=netbox_device_id
     )
