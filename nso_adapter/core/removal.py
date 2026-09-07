@@ -107,14 +107,14 @@ def valid_removal_scopes() -> frozenset[str]:
 class RemovalBlockedError(Exception):
     """A PUT-replace would retract service rows nobody just removed (collateral).
 
-    Raised by the scope guard BEFORE anything is committed; carries the orphan keys
-    per YANG list and a native dry-run preview so the failed job's detail gives the
-    operator the full would-be device delta to review (the ra1 lo0 incident guard).
+    Raised by the scope guard BEFORE anything is committed; carries the orphan keys per
+    YANG list, which name the rows the operator must re-accept or flush (the ra1 lo0
+    incident guard). It carries no device delta: native config is opaque text that holds
+    resolved communities and auth keys, and this payload is persisted on the job and rows.
     """
 
-    def __init__(self, orphans: dict[str, list], preview: str | None):
+    def __init__(self, orphans: dict[str, list]):
         self.orphans = orphans
-        self.preview = preview
         super().__init__(f"PUT-replace would retract rows not in intent: {orphans}")
 
 
@@ -639,7 +639,7 @@ async def guarded_device_write(
 
     Guard flow: GET the current aggregate instance; compare it against the body about to be
     sent; any live key that the body neither re-asserts nor is authorized to drop is an
-    ORPHAN — block with a native dry-run preview instead of committing.
+    ORPHAN — block, naming the orphan keys, instead of committing.
 
     ``context["force"]`` (the actions/force-removal override) skips the guard, and so does a
     ``no-networking`` write: nothing can be flushed from a device the commit never reaches.
@@ -665,8 +665,7 @@ async def guarded_device_write(
         if current:
             orphans = _document_orphans(current, containers, allowed)
             if orphans:
-                preview = await apply_device_intent(client, device_name, containers, dry_run=True)
-                raise RemovalBlockedError(orphans, preview)
+                raise RemovalBlockedError(orphans)
     return await apply_device_intent(client, device_name, containers, no_networking=no_networking)
 
 
@@ -1760,7 +1759,6 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
                     "detail": {
                         "scope": scope,
                         "orphans": blocked.orphans,
-                        "preview": blocked.preview,
                         "hint": (
                             "These service rows are not in the remaining intent and were not part of "
                             "this retraction. Re-accept them into intent to keep them, or re-run via "

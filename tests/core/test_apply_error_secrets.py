@@ -14,6 +14,7 @@ import structlog
 from nso_adapter.core.apply import run_apply
 from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.nso.apply import NsoApplyError, SectionExecution, apply_device_intent, encode_snmp
+from nso_adapter.nso.client import DEVICE_INTENT_ROOT
 from nso_adapter.store.models import Job, JobStatus, OspfInterfaceIntent, SnmpCommunityIntent
 from tests.conftest import seed_device, session
 from tests.core.test_static_route_put import seed_apply_job
@@ -197,3 +198,58 @@ async def test_malformed_snmp_reference_keeps_no_reference_in_exception_or_row(a
         stored = await db.get(SnmpCommunityIntent, row.id)
         _assert_safe(exc, job, stored.last_apply_error, recorded_logs, [bad_ref])
     assert not requests
+
+
+# ── the collateral guard: a refusal names the orphans, never the device delta ──
+
+_ORPHAN_INSTANCE = {
+    DEVICE_INTENT_ROOT: [{"device": _DEVICE, "snmp": {"community": [{"name": "ro"}, {"name": "legacy"}]}}]
+}
+
+
+def _blocked_client(delta: str):
+    """A live instance carrying an orphan community; every dry-run answers *delta*."""
+
+    def respond(request):
+        if request.method == "GET":
+            return httpx.Response(200, json=_ORPHAN_INSTANCE)
+        return httpx.Response(200, json={"dry-run-result": {"native": {"device": [{"name": _DEVICE, "data": delta}]}}})
+
+    return _client_with(httpx.MockTransport(respond))
+
+
+async def test_a_blocked_apply_keeps_the_device_delta_out_of_the_job_and_row_errors(
+    adapter_client, monkeypatch, recorded_logs
+):
+    """The apply worker persists the orphan identifiers on the row, and no native delta."""
+    device_id, row = await _community()
+    client = _blocked_client(f"snmp-server community {_SECRET} RO\n")
+    job = await _run(device_id, client, monkeypatch)
+    async with session() as db:
+        stored = await db.get(SnmpCommunityIntent, row.id)
+    assert job.status == JobStatus.failed
+    assert stored.last_apply_error["code"] == "removal_blocked_collateral"
+    assert stored.last_apply_error["detail"]["orphans"] == {"snmp/community": [["legacy"]]}
+    for surface in (json.dumps(job.error), json.dumps(stored.last_apply_error), repr(recorded_logs.records)):
+        assert _SECRET not in surface
+
+
+async def test_a_blocked_removal_keeps_the_device_delta_out_of_the_job_error(adapter_client, recorded_logs):
+    """The removal worker persists the same orphan identifiers, and no native delta."""
+    from unittest.mock import patch
+
+    from nso_adapter.core import removal as removal_mod
+    from tests.core.test_removal import _seed_removal_job
+
+    device_id, _row = await _community()
+    job_id = await _seed_removal_job(device_id, scope="snmp")
+    client = _blocked_client(f"snmp-server community {_SECRET} RO\n")
+    with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
+        await removal_mod.run_removal(job_id, device_id)
+    async with session() as db:
+        job = await db.get(Job, job_id)
+    assert job.status == JobStatus.failed
+    assert job.error["code"] == "removal_blocked_collateral"
+    assert job.error["detail"]["orphans"] == {"snmp/community": [["legacy"]]}
+    assert _SECRET not in json.dumps(job.error)
+    assert _SECRET not in repr(recorded_logs.records)

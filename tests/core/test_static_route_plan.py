@@ -522,10 +522,7 @@ async def test_c1_8b_a_send_with_no_snapshot_reads_the_instance_itself():
 async def test_c1_8c_a_supplied_snapshot_still_drives_the_guard():
     """Handing the snapshot in must not disable the collateral check."""
     client = _guard_client(None)  # would look clean if the helper re-read
-    with (
-        patch("nso_adapter.nso.apply.apply_device_intent", new_callable=AsyncMock, return_value="preview"),
-        pytest.raises(removal_mod.RemovalBlockedError) as excinfo,
-    ):
+    with pytest.raises(removal_mod.RemovalBlockedError) as excinfo:
         await removal_mod.guarded_device_write(client, _Device(), _containers(A), allowed={}, current=_instance(A, C))
     # Scope-qualified: the guard is device-wide, and two families both have a `host` list.
     assert excinfo.value.orphans == {"static_route/route": [["", C[1], C[2]]]}

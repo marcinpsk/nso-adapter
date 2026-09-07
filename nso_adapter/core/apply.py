@@ -1529,9 +1529,7 @@ async def _commit_document(
         verify = await guarded_device_write(client, device, containers, allowed=allowed, current=body.snapshot)
     except RemovalBlockedError as exc:
         logger.error("apply.blocked_collateral", job_id=job_id, device=device_name, orphans=exc.orphans)
-        commit_error = NsoApplyError(
-            "removal_blocked_collateral", str(exc), detail={"orphans": exc.orphans, "preview": exc.preview}
-        )
+        commit_error = NsoApplyError("removal_blocked_collateral", str(exc), detail={"orphans": exc.orphans})
         blocked = True
     except NsoApplyError as exc:
         commit_error = exc

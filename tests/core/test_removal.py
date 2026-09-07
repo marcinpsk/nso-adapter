@@ -744,7 +744,7 @@ async def test_run_removal_marks_failed_even_when_session_poisoned(adapter_clien
 # debris whose intent deletions never reached NSO) off the live router — lo0 left
 # ra1's IGP for ~42h. The guard compares NSO's current service rows against the
 # remaining snapshot + the trigger's just-removed keys BEFORE committing; anything
-# beyond that is collateral → block with a dry-run preview in the failure detail.
+# beyond that is collateral → block, naming the orphan rows in the failure detail.
 
 
 def _isis_instance(device_name: str, **containers) -> dict:
@@ -766,7 +766,7 @@ async def _seed_isis_intent(device_id: int, *ifaces: tuple[str, str]):
 
 async def test_isis_removal_blocked_on_orphaned_service_rows(adapter_client):
     """A live interface row the document does not re-assert and nobody just removed is an
-    orphan; the job must BLOCK, attach the dry-run preview, and commit NOTHING."""
+    orphan; the job must BLOCK, name the orphan rows, and commit NOTHING."""
     device_id = await _seed_device(nso_device_name="ra1-guard")
     await _seed_isis_intent(device_id, ("system", "ipv4"))
     client = _guard_client(
@@ -781,7 +781,7 @@ async def test_isis_removal_blocked_on_orphaned_service_rows(adapter_client):
         )
     )
     job_id = await _seed_removal_job(device_id, scope="isis")
-    sender = _sender(preview="- interface lo0 (native preview)")
+    sender = _sender()
     await _run_removal_with(device_id, job_id, client, sender)
     async with session() as db:
         job = await db.get(Job, job_id)
@@ -790,8 +790,8 @@ async def test_isis_removal_blocked_on_orphaned_service_rows(adapter_client):
         # Scope-qualified: the guard walks every family, and two of them have an
         # ``interface-config`` list.
         assert job.error["detail"]["orphans"] == {"isis/interface-config": [["lo0", "ipv4"]]}
-        assert job.error["detail"]["preview"] == "- interface lo0 (native preview)"
-    assert _commits(sender) == [], "the preview is a dry-run; nothing may be committed"
+        assert "preview" not in job.error["detail"], "a native delta may not be persisted"
+    assert _commits(sender) == [], "a blocked write commits nothing"
 
 
 async def test_isis_removal_orphaned_process_blocks(adapter_client):
@@ -914,11 +914,11 @@ def _guard_client(instance=None):
     return client
 
 
-def _sender(preview: str = "native preview"):
-    """Record every ``apply_device_intent`` call and answer a dry-run with *preview*."""
+def _sender():
+    """Record every ``apply_device_intent`` call and answer a dry-run with a native delta."""
 
     async def _impl(_client, _device_name, _containers, *, dry_run=False, no_networking=False, strict=False):
-        return preview if dry_run else "conclusive"
+        return "native delta" if dry_run else "conclusive"
 
     return AsyncMock(side_effect=_impl)
 
@@ -977,8 +977,8 @@ async def test_snmp_removal_blocked_on_orphaned_community(adapter_client):
         assert job.error["code"] == "removal_blocked_collateral"
         # The host is an orphan on the same document: one PUT retracts every family at once.
         assert job.error["detail"]["orphans"] == {"snmp/community": [["legacy"]], "snmp/host": [["10.0.0.9"]]}
-        assert job.error["detail"]["preview"] == "native preview"
-    assert _commits(sender) == [], "the preview is a dry-run; nothing may be committed"
+        assert "preview" not in job.error["detail"], "a native delta may not be persisted"
+    assert _commits(sender) == [], "a blocked write commits nothing"
 
 
 async def test_snmp_removal_passes_when_removed_threaded(adapter_client):
