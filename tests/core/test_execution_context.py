@@ -14,6 +14,8 @@ class of bug this contract exists to prevent.
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import pytest
 import sqlalchemy as sa
 
@@ -281,55 +283,51 @@ async def test_scenario_1_a_reissue_carries_the_context_and_proof_its_authorizat
 async def test_scenario_2_a_settled_carrier_is_pruned_from_the_fragment_and_every_later_document(adapter_client):
     """Real removal settlement consumes T; the next creation prunes it under the lock.
 
-    The stored fragment is rewritten, so fragment and document agree literally rather than
-    by exemption, and the already-immutable generation that named T keeps its bytes.
+    Driven through the intent API and the REAL worker, like every other scenario: a directly
+    invoked runner proves the bookkeeping without proving that the admission which wrote the
+    carrier and the worker which discharges it agree about it.
+
+    The stored fragment is rewritten, so fragment and document agree literally rather than by
+    exemption, and the already-immutable generation that named T keeps its bytes.
     """
     from nso_adapter.core.static_route_plan import hydrate_static_route_apply_plan, hydrate_static_route_removal_plan
-    from tests.core.removal_helpers import seed_removal_job, seed_tomb
-    from tests.core.test_static_route_put import A, B, seed_rows, wire
-    from tests.core.test_static_route_removal import SrFake, run_removal_job, sr_client, tombstone_ids
+    from tests.core.static_route_harness import K, S, retention_harness, route
+    from tests.core.test_static_route_removal import tombstone_ids
 
-    device_id = await seed_device(nso_device_name="ec-carrier", netbox_device_id=17002)
-    await seed_settings(device_id, auto_apply=False)
-    await seed_rows(device_id, [{"triple": B, "route_id": 2}])
-    tomb = await seed_tomb(device_id, A, route_id=1)
-    job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
+    harness = await retention_harness(adapter_client)
+    device_id = harness.device_id
+    await harness.push([route(K, route_id=1), route(S, route_id=2)])
+    await harness.run()
+    assert harness.fake.sent_keys() == {K, S}
+    await harness.drain()
 
+    await harness.push([route(S, route_id=2)], removed=((1, K),))
+    (tomb,) = await tombstone_ids(device_id)
     fragment = (await _stream(device_id, "static_route")).authorized_document
     assert fragment["_execution"]["proof"]["apply"]["tombstone_ids"] == [tomb]
     removal = (await _generations(device_id))[-1]
     frozen_document, frozen_digest = removal.document, removal.digest
     assert hydrate_static_route_removal_plan(frozen_document).tombstone_ids == (tomb,)
 
-    job = await run_removal_job(device_id, job_id, sr_client(SrFake("ec-carrier", service=[wire(A), wire(B)])))
-    assert job.status.value == "succeeded"
+    await harness.run()
     assert await tombstone_ids(device_id) == [], "real settlement did not consume the carrier"
-    await _drain(device_id)
+    assert harness.fake.sent_keys() == {S}, "the removal transmitted the key it was retracting"
+    await harness.drain()
 
     # An unrelated authorization is the next document creation, so it prunes.
-    assert (await _put_vlans(adapter_client, device_id, [202], seq=1710)).status_code == 200
-    assert (await _apply(adapter_client, device_id, {"vlan": 1710})).status_code == 202
-
+    later = await harness.unrelated()
     pruned = (await _stream(device_id, "static_route")).authorized_document
     assert pruned["_execution"]["proof"]["apply"]["tombstone_ids"] == []
     assert pruned["static_route_tombstone"] == []
-    later = (await _generations(device_id))[-1]
     assert hydrate_static_route_apply_plan(later.document).tombstone_ids == []
 
-    stored = (await _generations(device_id))[0]
+    stored = next(g for g in await _generations(device_id) if g.id == removal.id)
     assert (stored.document, stored.digest) == (frozen_document, frozen_digest), "an immutable document was rewritten"
 
     # EXECUTE the later document: a pruned carrier claims nothing, so the key it used to
-    # claim is neither rendered nor retained, and a further reissue transmits the same.
-    apply_recorder = await _execute(device_id, "ec-carrier")
-    routes = apply_recorder.container("static-route")["route"]
-    assert {(r.get("vrf") or "", r["prefix"], r["next-hop"]) for r in routes} == {B}
-    assert apply_recorder.container("vlan")["vlan"] == [{"vlan-id": 202, "name": "vlan-202"}]
-
-    assert (await _force_removal(adapter_client, device_id, "static_route")).status_code == 202
-    reissue_recorder = await _execute(device_id, "ec-carrier")
-    reissued_routes = reissue_recorder.container("static-route")["route"]
-    assert {(r.get("vrf") or "", r["prefix"], r["next-hop"]) for r in reissued_routes} == {B}
+    # claim is neither rendered nor retained.
+    await harness.run()
+    assert harness.fake.sent_keys() == {S}
 
 
 async def test_scenario_2_an_operation_selecting_a_consumed_carrier_refuses_creation(adapter_client):
@@ -565,6 +563,73 @@ async def test_scenario_5c_a_section_with_no_owner_fragment_takes_its_only_contr
     generation = (await _generations(device_id))[-1]
     assert section_context(generation.document, "interface_config") == {"ned_id": _NOKIA, "dialect": "nokia_timos"}
     assert "attribute_eligibility" not in generation.document["interface_config"]["_execution"]["proof"]
+
+    # EXECUTED: a section whose owner stream never contributed still encodes and reaches the
+    # wire, under the only context it has.
+    recorder = await _execute(device_id, "ec-split-owner-absent")
+    (entry,) = recorder.container("interface")["interface"]
+    assert entry["interface-name"] == "GigabitEthernet0/1"
+    assert entry["ipv4-address"] == [{"address": "192.0.2.5", "prefix-length": 24, "secondary": False}]
+    assert "description" not in entry, "the absent owner contributed no attribute"
+
+
+async def _revisions(device_id: int) -> set:
+    """Every projection stream's authorized/applied revision, as one comparable snapshot."""
+    from nso_adapter.store.models import DeviceProjectionStream
+
+    async with session() as db:
+        rows = (
+            await db.execute(
+                sa.select(
+                    DeviceProjectionStream.stream,
+                    DeviceProjectionStream.authorized_revision,
+                    DeviceProjectionStream.applied_revision,
+                ).where(DeviceProjectionStream.device_id == device_id)
+            )
+        ).all()
+    return set(rows)
+
+
+async def test_scenario_5d_a_refused_composition_rolls_the_whole_transaction_back(adapter_client):
+    """Case D, in the store: a refusal creates no generation and moves no revision.
+
+    The refusal is raised in the middle of an Apply that has already promoted streams in its
+    own transaction. Anything less than a full rollback leaves a stream marked authorized for
+    a document that was never created, and the next Apply would skip it as already applied.
+    """
+    from nso_adapter.store.models import DeviceProjectionStream
+    from tests.core.test_action_apply_promotion import _put_snmp
+
+    device_id = await seed_device(nso_device_name="ec-refusal-rollback", netbox_device_id=17009)
+    await seed_settings(device_id, auto_apply=False)
+    assert (await _put_snmp(adapter_client, device_id, ["ops"], seq=1779)).status_code == 200
+    assert (await _apply(adapter_client, device_id, {"snmp": 1779})).status_code == 202
+    await _execute(device_id, "ec-refusal-rollback")
+    assert (await _put_vlans(adapter_client, device_id, [401], seq=1780)).status_code == 200
+    assert (await _apply(adapter_client, device_id, {"vlan": 1780})).status_code == 202
+    await _execute(device_id, "ec-refusal-rollback")
+
+    # An UNSELECTED stored fragment whose dialect names nothing registered: the composition
+    # takes every authorized fragment, so the next Apply of another stream has to refuse.
+    async with session() as db:
+        row = await db.scalar(
+            sa.select(DeviceProjectionStream).where(
+                DeviceProjectionStream.device_id == device_id, DeviceProjectionStream.stream == "snmp"
+            )
+        )
+        document = deepcopy(row.authorized_document)
+        document["_execution"]["context"]["dialect"] = "no-such-dialect"
+        row.authorized_document = document
+        await db.commit()
+
+    before = await _generations(device_id)
+    revisions = await _revisions(device_id)
+    assert (await _put_vlans(adapter_client, device_id, [401, 402], seq=1781)).status_code == 200
+    response = await _apply(adapter_client, device_id, {"vlan": 1781})
+    assert response.status_code >= 500, response.text
+
+    assert [g.id for g in await _generations(device_id)] == [g.id for g in before], "a refused Apply left a generation"
+    assert await _revisions(device_id) == revisions, "a refused Apply promoted a stream"
 
 
 def test_scenario_5d_composition_refuses_a_fragment_whose_context_is_not_a_context():
