@@ -2122,7 +2122,7 @@ async def _finalize_job(
     )
 
 
-def _refuse_unverifiable_recorded_put(generation, execution_sections) -> None:
+def _refuse_unverifiable_recorded_put(generation) -> None:
     """Refuse a recorded destructive replacement when verification is disabled at execution.
 
     ``mode`` no longer picks a transport — every send is the whole document — so what it
@@ -2133,8 +2133,6 @@ def _refuse_unverifiable_recorded_put(generation, execution_sections) -> None:
     from nso_adapter.core.static_route_plan import PUT_REFUSED_EVENT
     from nso_adapter.nso import apply as nso_apply
 
-    if "static_route" not in execution_sections:
-        return
     if recorded_static_route_apply_mode(generation.document) == "PUT" and not nso_apply.VERIFY_AFTER_APPLY:
         logger.warning(PUT_REFUSED_EVENT, device_id=generation.device_id)
         raise JobError(
@@ -2178,7 +2176,7 @@ async def _execute_apply(db: AsyncSession, job: Job, job_id: int, device_id: int
     # successor push can commit; without the stored document it would be deployed here, under
     # this generation's identity and settled as this generation's revision.
     generation, execution_sections = await _required_apply_generation(db, job_id)
-    _refuse_unverifiable_recorded_put(generation, execution_sections)
+    _refuse_unverifiable_recorded_put(generation)
 
     client = get_nso_client(device.nso_instance)
     device_name = device.nso_device_name

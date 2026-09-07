@@ -228,11 +228,11 @@ async def test_c1_2b_classification_is_pure_and_the_worker_refuses_an_unprovable
         },
     )
     with pytest.raises(JobError) as excinfo:
-        _refuse_unverifiable_recorded_put(generation, frozenset({"static_route"}))
+        _refuse_unverifiable_recorded_put(generation)
     assert excinfo.value.error["code"] == "static_route_put_verify_disabled"
 
     monkeypatch.setattr(nso_apply, "VERIFY_AFTER_APPLY", True)
-    _refuse_unverifiable_recorded_put(generation, frozenset({"static_route"}))
+    _refuse_unverifiable_recorded_put(generation)
 
 
 # ── C1.3 / C1.4 — plan.rows is the single source of truth ────────────────────

@@ -760,7 +760,7 @@ def _classify_static_route_removal(generation, context: dict) -> SrRemoval:
 
 async def _put_removal_document(db: AsyncSession, device, client, scope: str, context: dict | None, *, job_id):
     """Build and send the aggregate once, with the frozen operation's settlement proof."""
-    from nso_adapter.core.apply import build_device_containers
+    from nso_adapter.core.apply import _refuse_unverifiable_recorded_put, build_device_containers
     from nso_adapter.core.generation import execution_policy
 
     generation = await _executing_document(db, job_id, scope)
@@ -769,6 +769,8 @@ async def _put_removal_document(db: AsyncSession, device, client, scope: str, co
     out = _classify_static_route_removal(generation, context) if scope == "static_route" else None
     if out is not None and out.branch == "superseded":
         return out
+    if not policy.no_networking:
+        _refuse_unverifiable_recorded_put(generation)
     body = await build_device_containers(
         client, device, generation.document, retain_static_routes=policy.retain_static_routes
     )
