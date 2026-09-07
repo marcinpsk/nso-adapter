@@ -1285,6 +1285,16 @@ def encode_bgp(rows: SectionRows, execution: SectionExecution) -> dict:
     return {"router": routers}
 
 
+def _community_member(entry: object, name: str) -> str:
+    """Validate one stored community member for both encoding and reporting."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("community"), str):
+        raise NsoApplyError(
+            "invalid_route_policy_intent",
+            f"Community list {name!r} has an entry without a string community key",
+        )
+    return entry["community"]
+
+
 def unrenderable_route_policy_members(rows: SectionRows, dialect: CommunityDialect) -> list[tuple[str, str]]:
     """``(community-list name, member)`` for every member this dialect cannot hold.
 
@@ -1296,7 +1306,7 @@ def unrenderable_route_policy_members(rows: SectionRows, dialect: CommunityDiale
         if row.family != "community_list":
             continue
         for entry in row.entries:
-            member = entry["community"]
+            member = _community_member(entry, row.name)
             if dialect.from_canonical(member) is UNREPRESENTABLE:
                 skipped.append((row.name, member))
     return skipped
@@ -1321,10 +1331,11 @@ def encode_route_policy(rows: SectionRows, execution: SectionExecution) -> dict:
     def _community_list_entry(obj: dict) -> dict:
         kept: list = []
         for entry in obj["entries"]:
-            wire = execution.dialect.from_canonical(entry["community"])
+            member = _community_member(entry, obj["name"])
+            wire = execution.dialect.from_canonical(member)
             if wire is UNREPRESENTABLE:
                 continue
-            kept.append({**entry, "community": wire} if wire != entry["community"] else entry)
+            kept.append({**entry, "community": wire} if wire != member else entry)
         return {"name": obj["name"], "invert-match": bool(obj.get("invert_match", False)), "entry": kept}
 
     return {
