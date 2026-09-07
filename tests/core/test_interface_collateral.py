@@ -51,7 +51,10 @@ async def test_unasserted_interface_root_blocks_an_unrelated_vlan_put(adapter_cl
     client.get_service_config.return_value = _live(description="core link")
     job = await job_row(await run_head(device_id, client))
     assert job.status.value == "failed", job.result
-    assert await _blocked_orphans(device_id) == {"interface_config/interface": [[_IFACE]]}
+    assert await _blocked_orphans(device_id) == {
+        "interface_config/interface": [[_IFACE]],
+        "interface_config/description": [[_IFACE]],
+    }
     assert not rec.documents
 
 
@@ -109,3 +112,76 @@ async def test_an_authorized_address_removal_drops_the_address(adapter_client):
     job = await job_row(await run_head(device_id, client))
     assert job.status.value == "succeeded", job.error
     assert rec.documents[-1]["interface"] == {"interface": []}
+
+
+@pytest.mark.parametrize("attribute,value", [("description", "keep"), ("enabled", False)])
+async def test_unasserted_interface_attribute_blocks_an_ip_only_put(adapter_client, attribute, value):
+    """Keeping the root and address does not authorize retracting an attribute."""
+    from sqlalchemy import select
+
+    from nso_adapter.store.models import InterfaceIpIntent
+
+    device_id = await seed_device(nso_device_name="attribute-collateral", netbox_device_id=17335)
+    await seed_settings(device_id, auto_apply=False)
+    await _seed_interface(device_id, _IFACE)
+    addresses = [{"interface": _IFACE, "address": "192.0.2.5/24", "family": "ipv4"}]
+    assert (await _put_addresses(adapter_client, device_id, addresses, seq=1780)).status_code == 200
+    assert (await _apply(adapter_client, device_id, {"ip": 1780})).status_code == 202
+    client, rec = recorded_client("attribute-collateral")
+    live = _live(addresses=[{"address": "192.0.2.5", "prefix-length": 24}])
+    live["interface"]["interface"][0][attribute] = value
+    client.get_service_config.return_value = live
+    job = await job_row(await run_head(device_id, client))
+    assert job.status.value == "failed", job.result
+    async with session() as db:
+        row = (await db.execute(select(InterfaceIpIntent))).scalar_one()
+        assert row.last_apply_error["code"] == "removal_blocked_collateral"
+        assert row.last_apply_error["detail"]["orphans"] == {f"interface_config/{attribute}": [[_IFACE]]}
+    assert not rec.documents
+
+
+@pytest.mark.parametrize("attribute,value", [("description", "keep"), ("enabled", False)])
+async def test_authorized_attribute_removal_keeps_the_address(adapter_client, attribute, value):
+    """An attribute deletion authorizes its leaf while the IP stream keeps the root."""
+    device_id = await seed_device(nso_device_name="attribute-removal", netbox_device_id=17336, attributes=[attribute])
+    await seed_settings(device_id, auto_apply=False)
+    attrs = [{"interface": _IFACE, "attribute": attribute, "intent_value": value}]
+    assert (await _put_attrs(adapter_client, device_id, attrs, seq=1790)).status_code == 200
+    assert (await _apply(adapter_client, device_id, {"interface_config": 1790})).status_code == 202
+    await _execute(device_id, "attribute-removal")
+    addresses = [{"interface": _IFACE, "address": "192.0.2.5/24", "family": "ipv4"}]
+    assert (await _put_addresses(adapter_client, device_id, addresses, seq=1791)).status_code == 200
+    assert (await _apply(adapter_client, device_id, {"ip": 1791})).status_code == 202
+    live = (await _execute(device_id, "attribute-removal")).documents[-1]
+    assert live["interface"]["interface"][0][attribute] == value
+
+    assert (await _put_attrs(adapter_client, device_id, [], seq=1792, query="?delete_origin=true")).status_code == 200
+    assert (await _apply(adapter_client, device_id, {"interface_config": 1792})).status_code == 202
+    client, rec = recorded_client("attribute-removal")
+    client.get_service_config.return_value = live
+    job = await job_row(await run_head(device_id, client))
+    assert job.status.value == "succeeded", job.error
+    entry = rec.documents[-1]["interface"]["interface"][0]
+    assert attribute not in entry
+    assert entry["ipv4-address"] == live["interface"]["interface"][0]["ipv4-address"]
+
+
+async def test_ip_only_put_without_attribute_changes_succeeds(adapter_client):
+    """An unchanged address-only section carries no attribute omission."""
+    device_id = await seed_device(nso_device_name="ip-collateral-clean", netbox_device_id=17337)
+    await seed_settings(device_id, auto_apply=False)
+    await _seed_interface(device_id, _IFACE)
+    addresses = [{"interface": _IFACE, "address": "192.0.2.5/24", "family": "ipv4"}]
+    assert (await _put_addresses(adapter_client, device_id, addresses, seq=1800)).status_code == 200
+    assert (await _apply(adapter_client, device_id, {"ip": 1800})).status_code == 202
+    client, rec = recorded_client("ip-collateral-clean")
+    live = _live(addresses=[{"address": "192.0.2.5", "prefix-length": 24}])
+    client.get_service_config.return_value = live
+    job = await job_row(await run_head(device_id, client))
+    assert job.status.value == "succeeded", job.error
+    entry = rec.documents[-1]["interface"]["interface"][0]
+    assert entry["interface-name"] == _IFACE
+    assert entry["ipv4-address"][0]["address"] == "192.0.2.5"
+    assert entry["ipv4-address"][0]["prefix-length"] == 24
+    assert "description" not in entry
+    assert "enabled" not in entry

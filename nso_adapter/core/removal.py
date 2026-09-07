@@ -270,6 +270,13 @@ def _norm_key(key) -> tuple[str, ...]:
 
 def _leaf_keys(entry: dict, guard_list: _GuardList) -> set[tuple[str, ...]]:
     """Collect the key tuples of *guard_list*'s leaf entries under *entry*."""
+    if guard_list.presence:
+        assert guard_list.parent_key is not None
+        return {
+            (str(parent[guard_list.parent_key]),)
+            for parent in entry.get(guard_list.path[0]) or []
+            if guard_list.path[1] in parent
+        }
     if guard_list.parent_key is not None:
         return {
             (
@@ -1850,7 +1857,11 @@ _PROMOTION_GUARD_FIELDS: dict[str, tuple[tuple[str, str, tuple[str, ...]], ...]]
 }
 
 
-def interface_removal_keys(interfaces: Sequence[str], addresses: Sequence[Sequence[str]]) -> dict[str, list]:
+def interface_removal_keys(
+    interfaces: Sequence[str],
+    addresses: Sequence[Sequence[str]],
+    attributes: Sequence[Sequence[str]] = (),
+) -> dict[str, list]:
     """Return the keys an interface_config removal authorizes, in every grain that reads them.
 
     ``address`` is the VALUE grain :func:`_interface_config_residue` intersects with the
@@ -1858,7 +1869,12 @@ def interface_removal_keys(interfaces: Sequence[str], addresses: Sequence[Sequen
     name and an address by its host part alone, so the collateral guard's grains are DERIVED
     from the same triples here rather than captured a second time somewhere else.
     """
+    from nso_adapter.nso.apply import INTERFACE_ATTRIBUTE_LEAVES
+
     keys: dict[str, list] = {}
+    for interface, attribute in attributes:
+        if attribute in INTERFACE_ATTRIBUTE_LEAVES:
+            keys.setdefault(attribute, []).append([str(interface)])
     if addresses:
         keys["address"] = [list(triple) for triple in addresses]
     for interface, address, _vrf in addresses:
@@ -1919,7 +1935,12 @@ async def _promotion_interface_context(
             if row.get("interface_id") in names_by_id
         }
     )
-    return interfaces, interface_removal_keys(emptied, sorted(set(address_keys)))
+    attribute_keys = [
+        (names_by_id[row["interface_id"]], row["attribute"])
+        for row in removed_rows.get("interface_intent", [])
+        if row.get("interface_id") in names_by_id
+    ]
+    return interfaces, interface_removal_keys(emptied, sorted(set(address_keys)), sorted(set(attribute_keys)))
 
 
 async def promotion_removal_context(

@@ -46,6 +46,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
 from nso_adapter.nso.apply import (
+    INTERFACE_ATTRIBUTE_LEAVES,
     encode_bfd,
     encode_bgp,
     encode_interface_config,
@@ -154,6 +155,7 @@ class GuardList(NamedTuple):
     keys: tuple[str, ...]
     parent_key: str | None = None
     scalar: bool = False
+    presence: bool = False
 
 
 class _Section(NamedTuple):
@@ -399,6 +401,10 @@ _SECTION_REGISTRY: dict[str, _Section] = {
             GuardList("interface", ("interface",), ("interface-name",)),
             GuardList("ipv4-address", ("interface", "ipv4-address"), ("address",), "interface-name"),
             GuardList("ipv6-address", ("interface", "ipv6-address"), ("address",), "interface-name"),
+            *(
+                GuardList(attribute, ("interface", attribute), (), "interface-name", presence=True)
+                for attribute in sorted(INTERFACE_ATTRIBUTE_LEAVES)
+            ),
         ),
         container="interface",
         encode=encode_interface_config,

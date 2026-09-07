@@ -1424,7 +1424,7 @@ def encode_lag(rows: SectionRows, execution: SectionExecution) -> dict:
 
 #: The interface attributes this writer has a wire leaf for. Anything else is refused rather
 #: than dropped: the managed scope is operator data, not a closed enum.
-_INTERFACE_ATTRIBUTE_LEAVES = frozenset({"description", "enabled"})
+INTERFACE_ATTRIBUTE_LEAVES = frozenset({"description", "enabled"})
 
 
 def encode_interface_config(rows: SectionRows, execution: SectionExecution) -> dict:
@@ -1447,7 +1447,7 @@ def encode_interface_config(rows: SectionRows, execution: SectionExecution) -> d
             continue
         iface = interfaces[row.interface_id]
         attributed.add(iface.name)
-        if row.attribute not in _INTERFACE_ATTRIBUTE_LEAVES:
+        if row.attribute not in INTERFACE_ATTRIBUTE_LEAVES:
             # The managed scope is data, so the store CAN hold an attribute this writer has
             # no leaf for. Refusing is the only honest answer: emitting the entry without it
             # would stamp the row in_sync for a leaf that never reached the device (#26).
