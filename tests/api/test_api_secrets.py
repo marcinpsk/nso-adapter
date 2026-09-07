@@ -505,3 +505,73 @@ async def test_a_vault_failure_puts_no_reference_or_provider_text_in_the_502(vau
     with pytest.raises(ApiError) as caught:
         await _vault_op(boom)
     assert_chain_free_of(caught.value, leaked)
+
+
+# ── the reference is not a log field ─────────────────────────────────────────
+
+_REF_PATH = "placeholder-path/placeholder-leaf"
+_REF = f"network/{_REF_PATH}#placeholder-key"
+# The mount and the key stay loggable: the mount is the scope, and the key is the field
+# name the write reports. Only the locating path and the plaintext must never appear.
+_REF_LOCATORS = [_REF, _REF_PATH, "placeholder-path", "placeholder-leaf", "placeholder-secret"]
+
+
+@pytest.mark.anyio
+async def test_a_SUCCESSFUL_set_puts_no_part_of_the_REFERENCE_PATH_in_the_logs(vault_client):
+    """The success path logged the complete ref, which the failure path already refuses to.
+
+    A ref names a Vault mount, a path and a key. Whoever reads the adapter log then knows
+    exactly where every secret the adapter writes lives. The mount is the scope the operator
+    needs, and the field names already say what was written.
+    """
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    client, store, _ = vault_client
+    with capture_logs() as logs:
+        resp = await client.post(
+            "/api/v1/secrets",
+            json={"vault_ref": _REF, "values": {"placeholder-key": "placeholder-secret"}},
+            headers=AUTH,
+        )
+
+    assert resp.status_code == 200
+    assert store[_REF_PATH] == {"placeholder-key": "placeholder-secret"}, "the write must still land"
+    written = [record for record in logs if record["event"] == "secrets.set"]
+    assert written, "the write was not reported at all"
+    assert_records_free_of(logs, _REF_LOCATORS)
+    assert written[0]["vault_mount"] == "network", "the scope is the half the operator needs"
+    assert written[0]["fields"] == ["placeholder-key"]
+    assert written[0]["version"] == 1
+
+
+@pytest.mark.anyio
+async def test_a_SUCCESSFUL_harvest_puts_no_part_of_the_REFERENCE_PATH_in_the_logs(vault_client):
+    """Same sink on the harvest side, where the ref points at an adopted community."""
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    client, store, _ = vault_client
+    device_id = await _seed_harvest_device("cisco-ios-cli-6.77")
+    _wire_nso_transport(
+        _NsoTransport({"tailf-ned-cisco-ios:community": [{"name": "placeholder-secret", "RO": [None]}]})
+    )
+
+    target_hash = _h("placeholder-secret")
+    with capture_logs() as logs:
+        resp = await client.post(
+            f"/api/v1/devices/{device_id}/secrets/harvest-community",
+            json={"community_hash": target_hash, "vault_ref": _REF},
+            headers=AUTH,
+        )
+
+    assert resp.status_code == 200
+    assert store[_REF_PATH] == {"placeholder-key": "placeholder-secret"}, "the harvest must still land"
+    harvested = [record for record in logs if record["event"] == "secrets.harvest_community"]
+    assert harvested, "the harvest was not reported at all"
+    assert_records_free_of(logs, _REF_LOCATORS)
+    assert harvested[0]["device"] == "harvest-dev", "the device is the half the operator needs"
+    assert harvested[0]["community_hash"] == target_hash
+    assert harvested[0]["vault_mount"] == "network"

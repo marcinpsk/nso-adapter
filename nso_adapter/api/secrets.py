@@ -136,7 +136,9 @@ async def set_secret(body: SecretWriteRequest, request: Request) -> SecretWriteO
     plain = {field: value.get_secret_value() for field, value in body.values.items()}
     version = await _vault_op(lambda: provider.write_path(ref.mount, ref.path, plain))
     hashes = {field: secret_fingerprint(value) for field, value in plain.items()}
-    logger.info("secrets.set", vault_ref=body.vault_ref, fields=sorted(plain), version=version)
+    # The ref names a mount, a path and a key. The mount is the scope the operator filters on;
+    # the path locates the secret, so it is not logged.
+    logger.info("secrets.set", vault_mount=ref.mount, fields=sorted(plain), version=version)
     return SecretWriteOut(vault_ref=body.vault_ref, version=version, hashes=hashes)
 
 
@@ -225,11 +227,12 @@ async def harvest_community(
         )
 
     version = await _vault_op(lambda: provider.write_path(ref.mount, ref.path, {ref.key: found.secret}))
+    # device + community_hash identify the harvest; the mount is the scope. The path is not logged.
     logger.info(
         "secrets.harvest_community",
         device=device.nso_device_name,
         community_hash=body.community_hash,
-        vault_ref=body.vault_ref,
+        vault_mount=ref.mount,
         version=version,
     )
     return HarvestCommunityOut(
