@@ -591,13 +591,10 @@ async def _revisions(device_id: int) -> set:
 
 
 async def test_scenario_5d_a_refused_composition_rolls_the_whole_transaction_back(adapter_client):
-    """Case D, in the store: a refusal creates no generation and moves no revision.
+    """A composition refusal rolls back the Apply reservation inserted before composition."""
+    from uuid import uuid4
 
-    The refusal is raised in the middle of an Apply that has already promoted streams in its
-    own transaction. Anything less than a full rollback leaves a stream marked authorized for
-    a document that was never created, and the next Apply would skip it as already applied.
-    """
-    from nso_adapter.store.models import DeviceProjectionStream
+    from nso_adapter.store.models import DeploymentApplyAttempt, DeviceProjectionStream
     from tests.core.test_action_apply_promotion import _put_snmp
 
     device_id = await seed_device(nso_device_name="ec-refusal-rollback", netbox_device_id=17009)
@@ -625,9 +622,12 @@ async def test_scenario_5d_a_refused_composition_rolls_the_whole_transaction_bac
     before = await _generations(device_id)
     revisions = await _revisions(device_id)
     assert (await _put_vlans(adapter_client, device_id, [401, 402], seq=1781)).status_code == 200
-    response = await _apply(adapter_client, device_id, {"vlan": 1781})
-    assert response.status_code >= 500, response.text
+    attempt_id = uuid4()
+    response = await _apply(adapter_client, device_id, {"vlan": 1781}, attempt_id=attempt_id)
+    assert response.status_code == 500, response.text
 
+    async with session() as db:
+        assert await db.get(DeploymentApplyAttempt, attempt_id) is None, "a refused Apply committed its reservation"
     assert [g.id for g in await _generations(device_id)] == [g.id for g in before], "a refused Apply left a generation"
     assert await _revisions(device_id) == revisions, "a refused Apply promoted a stream"
 
