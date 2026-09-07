@@ -34,10 +34,10 @@ from tests.core.test_static_route_put import (
 
 pytestmark = pytest.mark.anyio
 
-#: A live entry carrying leaves the store has no column for. Retention is verbatim or it is
+#: A live entry carrying leaves no tombstone triple names. Retention is verbatim or it is
 #: nothing: rebuilding this from a store triple would silently rewrite the router's own state.
 _RICH_A = wire(A, metric=10, tag=101)
-_RICH_A["bfd-fast-detect"] = {"minimum": 50}
+_RICH_A["interface-next-hop"] = "GigabitEthernet0/3"
 
 
 async def _carrier_for(device_id: int, triple, **kwargs) -> int:
