@@ -86,10 +86,10 @@ def _certify_device_state_output(output: object, device_name: str, wire_families
     """
     if not isinstance(output, dict) or output.get("atomic") is not True:
         raise NsoReadContractError(f"device-state-read for {device_name!r} did not certify an atomic snapshot")
-    echoed = output.get("device-name")
-    if echoed != device_name:
+    if output.get("device-name") != device_name:
+        # The echo is the server's own value: name the device we asked for, never the one it sent.
         raise NsoReadContractError(
-            f"device-state-read echoed device {echoed!r}, expected {device_name!r} — refusing a "
+            f"device-state-read echoed a different device than {device_name!r} — refusing a "
             "version-skewed / wrong-device snapshot"
         )
     for wire in wire_families:
@@ -98,10 +98,10 @@ def _certify_device_state_output(output: object, device_name: str, wire_families
             continue
         if not isinstance(section, dict):
             raise NsoReadContractError(f"device-state-read section {wire!r} is not a dict")
-        status = section.get("status")
-        if status not in _TERMINAL_SECTION_STATUSES:
+        if section.get("status") not in _TERMINAL_SECTION_STATUSES:
+            # The status is the server's own value; the section name is ours and says enough.
             raise NsoReadContractError(
-                f"device-state-read section {wire!r} has non-terminal status {status!r} "
+                f"device-state-read section {wire!r} has a non-terminal status "
                 f"(expected one of {sorted(_TERMINAL_SECTION_STATUSES)})"
             )
 
