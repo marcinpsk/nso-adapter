@@ -78,7 +78,7 @@ def test_attrs_to_interface_list_description_and_enabled():
             {"interface-name": "GigabitEthernet0/2", "enabled": False},
         ],
     }
-    result = _attrs_to_interface_list(entry)
+    result = _attrs_to_interface_list(entry, device_name="sw01")
     assert len(result) == 2
     ge01 = next(i for i in result if i.name == "GigabitEthernet0/1")
     assert ge01.nso.description == "uplink"
@@ -105,7 +105,7 @@ def test_attrs_to_interface_list_m27r_logical_fields():
             {"interface-name": "1/1/c1", "enabled": True, "kind": "physical"},
         ],
     }
-    result = _attrs_to_interface_list(entry)
+    result = _attrs_to_interface_list(entry, device_name="sw01")
     logical = next(i for i in result if i.name == "LAG99:10")
     assert logical.kind == "logical"
     assert logical.parent_binding == "lag-99"
@@ -118,11 +118,11 @@ def test_attrs_to_interface_list_m27r_logical_fields():
 
 
 def test_attrs_to_interface_list_returns_empty_on_none():
-    assert _attrs_to_interface_list(None) == []
+    assert _attrs_to_interface_list(None, device_name="sw01") == []
 
 
 def test_attrs_to_interface_list_returns_empty_when_no_interface_key():
-    assert _attrs_to_interface_list({"device-name": "sw01"}) == []
+    assert _attrs_to_interface_list({"device-name": "sw01"}, device_name="sw01") == []
 
 
 def test_attrs_to_interface_list_skips_malformed_entry():
@@ -134,16 +134,65 @@ def test_attrs_to_interface_list_skips_malformed_entry():
             {"interface-name": "GigabitEthernet0/2", "enabled": False},
         ]
     }
-    result = _attrs_to_interface_list(entry)
+    result = _attrs_to_interface_list(entry, device_name="sw01")
     assert len(result) == 2
     assert result[0].name == "GigabitEthernet0/1"
     assert result[1].name == "GigabitEthernet0/2"
 
 
+async def test_a_MALFORMED_attrs_entry_puts_no_payload_in_the_record(db_session: AsyncSession, adapter_client):
+    """The skip logged the whole entry, which is the device's own data.
+
+    An entry missing ``interface-name`` still carries whatever leaves the NED emitted, so
+    ``entry=<the entry>`` published all of them. The missing field, the family and the device
+    we asked for say everything an operator can act on.
+    """
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    device = Device(
+        nso_instance="nso-dev",
+        nso_device_name="sw-attrs-sink",
+        ned_id="cisco-ios-cli-6.95",
+        netbox_device_id=41,
+    )
+    db_session.add(device)
+    await db_session.commit()
+
+    nso_client = _make_nso_client(
+        {
+            "device-name": "sw-attrs-sink",
+            "interface": [
+                {"interface-name": "GigabitEthernet0/1", "enabled": True},
+                {"description": "placeholder-server-text", "enabled": True},  # no interface-name
+            ],
+        }
+    )
+
+    from nso_adapter.core import importer as imp
+
+    imp._nso_clients["nso-dev"] = nso_client
+    imp._netbox_client = None
+
+    with (
+        patch("nso_adapter.core.importer.nso_actions.sync_from", new=AsyncMock(return_value={"result": True})),
+        capture_logs() as logs,
+    ):
+        await sync_device(device.id, db_session)
+
+    skipped = [record for record in logs if record["event"] == "interface_attributes.entry_skipped"]
+    assert skipped, "the skipped entry was not reported at all"
+    assert skipped[0]["missing_field"] == "interface-name"
+    assert skipped[0]["family"] == "interface-attributes"
+    assert skipped[0]["device_name"] == "sw-attrs-sink", "the device we asked for is what an operator needs"
+    assert_records_free_of(logs, ["placeholder-server-text"])
+
+
 def test_attrs_to_interface_list_enabled_absent_yields_none():
     """When NSO package omits 'enabled', the domain object carries None — not True/False."""
     entry = {"interface": [{"interface-name": "GigabitEthernet0/1", "description": "uplink"}]}
-    result = _attrs_to_interface_list(entry)
+    result = _attrs_to_interface_list(entry, device_name="sw01")
     assert len(result) == 1
     assert result[0].nso.enabled is None
 
