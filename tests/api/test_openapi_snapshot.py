@@ -310,3 +310,17 @@ def test_the_exempt_operations_are_the_ones_with_no_token_dependency():
     from nso_adapter.main import _unauthenticated_paths, create_app
 
     assert _unauthenticated_paths(create_app()) == frozenset({"/healthz"})
+
+
+def test_lag_apply_contract_excludes_read_only_fields():
+    import json
+    import re
+
+    from nso_adapter.api.lag_config import LagConfigApplyRequest
+
+    contract = (SNAPSHOT_PATH.parents[2] / "docs" / "api-contract.md").read_text()
+    section = contract.split("### `POST /api/v1/devices/{id}/lag-config/apply`", 1)[1].split("\n---", 1)[0]
+    assert "excluding read-only `vpc_sensitive`" in section
+    examples = [json.loads(body) for body in re.findall(r"```json\n(.*?)\n```", section, re.DOTALL)]
+    request = next(body for body in examples if "bundles" in body)
+    assert LagConfigApplyRequest.model_validate(request).bundles

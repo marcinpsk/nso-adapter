@@ -2441,9 +2441,20 @@ member `mode`/`port_priority`.
 ### `POST /api/v1/devices/{id}/lag-config/apply` → `200 | 404 | 422`
 
 Claim-less full-snapshot store write for desired LAG state. Body = the GET
-`bundles` shape. `lag_id` stays required and is a strict `uint32`; optional
-LAG integer leaves are strict `uint16`. Bundle names and member interface names
-must be unique within the request.
+`bundles` shape, excluding read-only `vpc_sensitive`. `lag_id` stays required
+and is a strict `uint32`; optional LAG integer leaves are strict `uint16`.
+Bundle names, LAG IDs, and member interface names must be unique within the request.
+
+Request example:
+
+```json
+{ "bundles": [
+    { "name": "lag-2", "lag_id": 2, "min_links": 1, "system_priority": 32768,
+      "members": [ { "interface_name": "1/1/c2/1", "mode": "active", "port_priority": 100 } ] }
+  ] }
+```
+
+Response:
 
 ```json
 { "status": "stored", "device_id": 1, "count": 1, "removed": 0 }
