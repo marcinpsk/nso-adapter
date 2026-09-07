@@ -66,6 +66,9 @@ class LagConfigApplyRequest(_StrictRequestModel):
         names = [bundle.name for bundle in bundles]
         if len(names) != len(set(names)):
             raise ValueError("bundle name values must be unique")
+        ids = [bundle.lag_id for bundle in bundles]
+        if len(ids) != len(set(ids)):
+            raise ValueError("bundle lag_id values must be unique")
         return bundles
 
     @field_validator("bundles")

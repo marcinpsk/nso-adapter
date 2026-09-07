@@ -130,3 +130,22 @@ def test_switching_intent_migration_creates_empty_write_owned_tables(pg_provisio
             with engine.connect() as connection:
                 assert connection.scalar(sa.text("SELECT count(*) FROM lag_bundle_config")) == 1
                 assert connection.scalar(sa.text("SELECT count(*) FROM device_switchport")) == 1
+
+
+def test_lag_identity_migration_upgrade_and_downgrade(pg_provisioner):
+    module = load_migration("b7d9f1a3c5e8_lag_intent_device_identity.py")
+    assert module.down_revision == _module().revision
+    assert_single_head_containing(module.revision)
+    with private_database(pg_provisioner, "lag_identity") as sync_url:
+        alembic(sync_url, "upgrade", module.revision)
+        with engine_on(sync_url) as engine:
+            uniques = {
+                item["name"]: item["column_names"]
+                for item in sa.inspect(engine).get_unique_constraints("lag_bundle_intent")
+            }
+            assert uniques["uq_lag_bundle_intent_device_lag"] == ["device_id", "lag_id"]
+        alembic(sync_url, "downgrade", module.down_revision)
+        with engine_on(sync_url) as engine:
+            assert {item["name"] for item in sa.inspect(engine).get_unique_constraints("lag_bundle_intent")} == {
+                "uq_lag_bundle_intent_identity"
+            }

@@ -977,6 +977,9 @@ class LagBundleIntent(Base):
     __tablename__ = "lag_bundle_intent"
     __table_args__ = (
         UniqueConstraint("device_id", "name", name="uq_lag_bundle_intent_identity"),
+        UniqueConstraint(
+            "device_id", "lag_id", name="uq_lag_bundle_intent_device_lag", deferrable=True, initially="DEFERRED"
+        ),
         CheckConstraint(
             "lag_id IS NULL OR lag_id BETWEEN 0 AND 4294967295",
             name="ck_lag_bundle_intent_lag_id_uint32",

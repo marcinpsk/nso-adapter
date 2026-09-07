@@ -492,3 +492,60 @@ def test_obsolete_direct_nso_switching_paths_are_absent():
     switchport_api = (repository / "nso_adapter/api/vlan.py").read_text(encoding="utf-8")
     assert "get_nso_client" not in lag_api
     assert "get_nso_client" not in switchport_api
+
+
+@pytest.mark.anyio
+async def test_lag_replacement_rejects_duplicate_ids(adapter_client):
+    device_id = await seed_device(nso_device_name="lag-duplicate-id", netbox_device_id=None)
+    async with session() as db:
+        with pytest.raises(ValueError, match="duplicate LAG lag_id"):
+            await replace_lag_snapshot(
+                db,
+                device_id,
+                (
+                    LagBundleSnapshot(name="Port-channel1", lag_id=7),
+                    LagBundleSnapshot(name="Port-channel2", lag_id=7),
+                ),
+            )
+        assert await db.scalar(select(LagBundleIntent.id).where(LagBundleIntent.device_id == device_id)) is None
+
+
+@pytest.mark.anyio
+async def test_lag_id_constraint_allows_nulls_and_other_devices(adapter_client):
+    from sqlalchemy.exc import IntegrityError
+
+    first = await seed_device(nso_device_name="lag-identity-first", netbox_device_id=None)
+    second = await seed_device(nso_device_name="lag-identity-second", netbox_device_id=None)
+    async with session() as db:
+        for device_id in (first, second):
+            await replace_lag_snapshot(
+                db,
+                device_id,
+                (
+                    LagBundleSnapshot(name="Port-channel1", lag_id=7),
+                    LagBundleSnapshot(name="Port-channel2"),
+                    LagBundleSnapshot(name="Port-channel3"),
+                ),
+            )
+        await db.commit()
+    async with session() as db:
+        db.add(LagBundleIntent(device_id=first, name="Port-channel4", lag_id=7, accepted_at=datetime.now(UTC)))
+        with pytest.raises(IntegrityError, match="uq_lag_bundle_intent_device_lag"):
+            await db.commit()
+        await db.rollback()
+
+
+@pytest.mark.anyio
+async def test_lag_replacement_can_swap_and_reassign_ids(adapter_client):
+    device_id = await seed_device(nso_device_name="lag-reassign", netbox_device_id=None)
+    for bundles in (
+        (LagBundleSnapshot(name="Port-channel1", lag_id=1), LagBundleSnapshot(name="Port-channel2", lag_id=2)),
+        (LagBundleSnapshot(name="Port-channel1", lag_id=2), LagBundleSnapshot(name="Port-channel2", lag_id=1)),
+        (LagBundleSnapshot(name="Port-channel3", lag_id=1),),
+    ):
+        async with session() as db:
+            await replace_lag_snapshot(db, device_id, bundles)
+            await db.commit()
+        async with session() as db:
+            rows = (await db.execute(select(LagBundleIntent).where(LagBundleIntent.device_id == device_id))).scalars()
+            assert {(row.name, row.lag_id) for row in rows} == {(bundle.name, bundle.lag_id) for bundle in bundles}

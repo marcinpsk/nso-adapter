@@ -182,7 +182,7 @@ async def test_apply_lag_config_full_replace_reports_removed_roots(adapter_clien
     device_id = await seed_device(nso_device_name="lag-full-replace", netbox_device_id=1112)
     first = {
         "bundles": [
-            {"name": "Port-channel1", "lag_id": 7},
+            {"name": "Port-channel1", "lag_id": 6},
             {"name": "Port-channel2", "lag_id": 7},
         ]
     }
@@ -405,3 +405,16 @@ async def test_apply_lag_renders_supported_lacp_leaves(adapter_client, mode, tim
         **({"timer": timer} if timer else {}),
         "member": [{"interface-name": "Gi0/1", **({"mode": mode} if mode else {})}],
     }
+
+
+@pytest.mark.anyio
+async def test_apply_lag_rejects_duplicate_ids_without_mutation(adapter_client):
+    device_id = await seed_device(nso_device_name="lag-api-duplicate-id", netbox_device_id=None)
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/lag-config/apply",
+        json={"bundles": [{"name": "Port-channel1", "lag_id": 7}, {"name": "Port-channel2", "lag_id": 7}]},
+        headers=AUTH,
+    )
+    assert response.status_code == 422
+    async with session() as db:
+        assert await db.scalar(text("SELECT count(*) FROM lag_bundle_intent")) == 0

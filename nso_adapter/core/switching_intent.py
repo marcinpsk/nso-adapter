@@ -101,6 +101,7 @@ def _require_uint(value: object, maximum: int, label: str, bits: int) -> None:
 
 def _validate_lag_snapshot(bundles: Sequence[LagBundleSnapshot]) -> None:
     _require_unique([bundle.name for bundle in bundles], "LAG bundle name")
+    _require_unique([bundle.lag_id for bundle in bundles if bundle.lag_id is not None], "LAG lag_id")
     for bundle in bundles:
         _require_uint(bundle.lag_id, 4294967295, "lag_id", 32)
         _require_uint(bundle.min_links, 65535, "min_links", 16)
