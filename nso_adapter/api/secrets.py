@@ -94,7 +94,7 @@ def _parse_ref(reference: str) -> VaultRef:
         raise api_error(400, "invalid_vault_ref", str(exc)) from exc
 
 
-async def _vault_op(operation, vault_ref: str):
+async def _vault_op(operation):
     """Run a provider read/write OFF the event loop, mapping Vault failures to a 502.
 
     hvac is blocking (``requests`` — real sockets), so calling it straight from an
@@ -104,13 +104,17 @@ async def _vault_op(operation, vault_ref: str):
     failover probes and job dispatch stalls. ``write_path`` is a read-merge-write (two
     round-trips) plus a possible AppRole re-login on 403, so the freeze multiplies.
 
-    hvac error text names the path and reason (e.g. 'permission denied' when the
-    AppRole policy doesn't cover the ref) — never secret values.
+    The provider's own text can repeat the request URL and the payload, and the ref names a
+    mount, a path and a key, so the 502 carries the failure TYPE alone. The caller already
+    knows which ref it sent.
     """
     try:
         return await anyio.to_thread.run_sync(operation)
-    except Exception as exc:
-        raise api_error(502, "vault_error", f"Vault operation failed for {vault_ref!r}: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 — every provider failure is the same 502
+        failure = type(exc).__name__
+    # Raised outside the handler: `from None` would still leave the provider's exception
+    # reachable on __context__, and a formatted traceback prints it.
+    raise api_error(502, "vault_error", f"The Vault operation failed ({failure})")
 
 
 @router.post(
@@ -130,7 +134,7 @@ async def set_secret(body: SecretWriteRequest, request: Request) -> SecretWriteO
         )
 
     plain = {field: value.get_secret_value() for field, value in body.values.items()}
-    version = await _vault_op(lambda: provider.write_path(ref.mount, ref.path, plain), body.vault_ref)
+    version = await _vault_op(lambda: provider.write_path(ref.mount, ref.path, plain))
     hashes = {field: secret_fingerprint(value) for field, value in plain.items()}
     logger.info("secrets.set", vault_ref=body.vault_ref, fields=sorted(plain), version=version)
     return SecretWriteOut(vault_ref=body.vault_ref, version=version, hashes=hashes)
@@ -146,7 +150,7 @@ async def verify_secret(body: SecretVerifyRequest, request: Request) -> SecretVe
     provider = _vault_provider(request)
     ref = _parse_ref(body.vault_ref)
 
-    data, version = await _vault_op(lambda: provider.read_path_meta(ref.mount, ref.path), body.vault_ref)
+    data, version = await _vault_op(lambda: provider.read_path_meta(ref.mount, ref.path))
     if ref.key is not None:
         data = {ref.key: data[ref.key]} if ref.key in data else {}
     if not data:
@@ -220,7 +224,7 @@ async def harvest_community(
             f"{device.nso_device_name!r} — if the device changed out-of-band, run sync-from and refresh first",
         )
 
-    version = await _vault_op(lambda: provider.write_path(ref.mount, ref.path, {ref.key: found.secret}), body.vault_ref)
+    version = await _vault_op(lambda: provider.write_path(ref.mount, ref.path, {ref.key: found.secret}))
     logger.info(
         "secrets.harvest_community",
         device=device.nso_device_name,
