@@ -2389,7 +2389,8 @@ async def test_consumed_static_route_tombstone_is_not_planned_as_an_intent_delet
     assert apply_streams == set()
 
 
-async def test_action_apply_job_executes_only_the_selected_generation_document(adapter_client):
+@pytest.mark.parametrize("select_snmp", [False, True])
+async def test_action_apply_job_executes_only_the_selected_generation_document(adapter_client, select_snmp):
     """An unselected live row must not ride a document-executed Apply."""
     from nso_adapter.store.models import SnmpCommunityIntent
     from tests.core.test_generation_protocol import recorded_client, run_head
@@ -2401,17 +2402,24 @@ async def test_action_apply_job_executes_only_the_selected_generation_document(a
     ).status_code == 200
     assert (await _put_vlans(adapter_client, device_id, [10], seq=6202, query="?store_only=true")).status_code == 200
 
-    response = await _apply(adapter_client, device_id, {"vlan": 6202})
+    selected = {"vlan": 6202, **({"snmp": 6201} if select_snmp else {})}
+    response = await _apply(adapter_client, device_id, selected)
     assert response.status_code == 202, response.text
 
     client, recorder = recorded_client("apply-document-only")
     assert await run_head(device_id, client) is not None
 
     assert recorder.vlan_ids() == [[10]]
-    assert recorder.bodies("snmp-reconciler:snmp-config") == []
+    assert bool(recorder.bodies("snmp")) is select_snmp
+    if select_snmp:
+        assert recorder.container("snmp")["community"][0]["name"] == "stored"
     snmp = await _stream(device_id, "snmp")
     vlan = await _stream(device_id, "vlan")
-    assert (snmp.desired_revision, snmp.authorized_revision, snmp.applied_revision) == (1, 0, 0)
+    assert (snmp.desired_revision, snmp.authorized_revision, snmp.applied_revision) == (
+        1,
+        int(select_snmp),
+        int(select_snmp),
+    )
     assert (vlan.desired_revision, vlan.authorized_revision, vlan.applied_revision) == (1, 1, 1)
     async with session() as db:
         stored = await db.scalar(
@@ -2420,7 +2428,7 @@ async def test_action_apply_job_executes_only_the_selected_generation_document(a
                 SnmpCommunityIntent.label == "stored",
             )
         )
-        assert stored.last_apply_at is None
+        assert (stored.last_apply_at is not None) is select_snmp
 
 
 async def test_action_apply_settlement_between_projection_and_generation_reads_is_skipped(
