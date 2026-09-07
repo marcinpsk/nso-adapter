@@ -207,31 +207,32 @@ async def put_intent(
     await db.flush()
 
     from nso_adapter.core.generation import auto_apply_requested
-    from nso_adapter.core.projection import rows_by_intent_identity, snapshot_stream
+    from nso_adapter.core.projection import fragment_tables, rows_by_intent_identity, snapshot_stream
 
-    projection = await db.scalar(
-        select(DeviceProjectionStream).where(
-            DeviceProjectionStream.device_id == device_id,
-            DeviceProjectionStream.stream == delivery.stream,
+    if await auto_apply_requested(db, device_id, 1):
+        projection = await db.scalar(
+            select(DeviceProjectionStream).where(
+                DeviceProjectionStream.device_id == device_id,
+                DeviceProjectionStream.stream == delivery.stream,
+            )
         )
-    )
-    authorized = projection.authorized_document if projection is not None else None
-    desired = await snapshot_stream(db, device_id, delivery.stream)
-    desired_rows = rows_by_intent_identity(desired, "interface_intent")
-    removed_rows = [
-        row
-        for identity, row in rows_by_intent_identity(authorized or {}, "interface_intent").items()
-        if identity not in desired_rows
-    ]
-    if await auto_apply_requested(db, device_id, count + len(removed_rows)):
-        if removed_rows:
-            from nso_adapter.core.generation import create_automatic_apply
+        authorized = projection.authorized_document if projection is not None else None
+        desired = await snapshot_stream(db, device_id, delivery.stream)
+        desired_rows = rows_by_intent_identity(desired, "interface_intent")
+        removed_rows = [
+            row
+            for identity, row in rows_by_intent_identity(fragment_tables(authorized), "interface_intent").items()
+            if identity not in desired_rows
+        ]
+        if count or removed_rows:
+            if removed_rows:
+                from nso_adapter.core.generation import create_automatic_apply
 
-            await create_automatic_apply(db, device_id, delivery.stream, delivery.push_seq)
-        else:
-            from nso_adapter.core.apply import enqueue_apply
+                await create_automatic_apply(db, device_id, delivery.stream, delivery.push_seq)
+            else:
+                from nso_adapter.core.apply import enqueue_apply
 
-            await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
+                await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
 
     result = {
         "device_id": device_id,
