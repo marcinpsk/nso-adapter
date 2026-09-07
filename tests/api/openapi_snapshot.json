@@ -3869,6 +3869,10 @@
             "title": "Encap Tag"
           },
           "family": {
+            "enum": [
+              "ipv4",
+              "ipv6"
+            ],
             "title": "Family",
             "type": "string"
           },
