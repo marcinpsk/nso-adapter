@@ -227,7 +227,6 @@ async def refresh_redistribution_from_outcomes(
     assert _REDIST_COMPONENTS, "empty _REDIST_COMPONENTS is a programming error"
     replaced = [p for p, o in outcomes.items() if not isinstance(o, Unavailable)]
     errors = [p for p, o in outcomes.items() if isinstance(o, Unavailable) and o.reason not in _NONFAILING_KEEP]
-    kept_nonfailing = [p for p, o in outcomes.items() if isinstance(o, Unavailable) and o.reason in _NONFAILING_KEEP]
     # Worst freshness among the REPLACED authoritative components: fresh < stale
     # (READSEM S5 retired the `aged` approximation — the envelope carries `stale` directly).
     _FRESHNESS_RANK = {Freshness.fresh: 0, Freshness.stale: 1}
@@ -246,10 +245,7 @@ async def refresh_redistribution_from_outcomes(
         composite_ok = not errors
     elif errors:
         # Nothing replaced, at least one real failure → unavailable with the WORST reason.
-        merged = Unavailable(
-            _worst_reason([o for o in outcomes.values() if isinstance(o, Unavailable)]),
-            detail=f"components kept: {sorted(errors + kept_nonfailing)}",
-        )
+        merged = Unavailable(_worst_reason([o for o in outcomes.values() if isinstance(o, Unavailable)]))
         terminal_result, terminal_succeeded, composite_ok = "kept", False, False
     else:
         # All components are non-failing keeps (unsupported and/or device-absent

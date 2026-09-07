@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable
 from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
@@ -35,11 +35,16 @@ from nso_adapter.domain.models import Interface, InterfaceAttr
 from nso_adapter.nso import actions as nso_actions
 from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import (  # noqa: F401 — Present used below
+    WHOLE_DEVICE,
     Present,
+    ReadFailure,
+    ReadFailureCode,
+    ReadOperation,
     ReadOutcome,
     Unavailable,
     UnavailableReason,
     classify_envelope_section,
+    read_failure_from_exception,
 )
 from nso_adapter.nso.shape import as_list
 from nso_adapter.store.db import execute_dml
@@ -238,12 +243,16 @@ def projectable_spec(name: str) -> FamilySpec[Any] | None:
 async def _fetch_projection(nso_client, device, wire_names: list[str], *, atomic: bool = False):
     """Grain-b supplier: ONE record-served doc GET + ONE heal action for the not-ready set.
 
-    Returns ``(sections, supplier_outcome)``: on supplier failure sections is empty and
-    the outcome (export_down / read_error) fans out to every family via
+    Returns ``(sections, supplier_outcome, section_failures)``: on supplier failure sections is
+    empty and the outcome (export_down / read_error) fans out to every family via
     ``run_family_refresh_from_outcome`` — NEVER a fabricated section (codex S3-R1 F8).
+    ``section_failures`` classifies the families the supplier answered but could not serve (a
+    malformed section, a failed heal), one authored :class:`ReadFailure` each.
     A confirmed device absence yields ``{wire: None}`` → ``Unavailable(not_authoritative)``,
     keeping the last-known rows for every family (READSEM S5 retired the pop/present policy).
     """
+    name = device.nso_device_name
+    failures: dict[str, ReadFailure] = {}
     if atomic:
         # READSEM grain c: ONE txid-bracketed build for every requested family. Output
         # sections are terminal (ok|unsupported|error); an action error (bracket
@@ -251,52 +260,86 @@ async def _fetch_projection(nso_client, device, wire_names: list[str], *, atomic
         # everything up to 3x under commit churn (3 x rc1 75.6s outruns the 180s default).
         try:
             async with _action_semaphore():
-                output = await nso_client.run_device_state_read(device.nso_device_name, wire_names, timeout=360.0)
+                output = await nso_client.run_device_state_read(name, wire_names, timeout=360.0)
         except Exception as exc:  # noqa: BLE001 — action error keeps every family
-            return {}, Unavailable(
-                UnavailableReason.read_error, detail=f"the device-state-read action raised {type(exc).__name__}"
+            failure = read_failure_from_exception(
+                exc, operation=ReadOperation.device_state_read, device=name, family=WHOLE_DEVICE
             )
+            return {}, Unavailable(UnavailableReason.read_error, failure=failure), failures
         # Codex S3-R3 F5: a non-mapping output or atomic!=True must NEVER be materialized
         # as an atomic read — fan out read_error (keep) instead.
         if not isinstance(output, dict) or output.get("atomic") is not True:
-            return {}, Unavailable(UnavailableReason.read_error, detail="action output malformed or not atomic")
-        return {w: _section_or_error(output.get(w)) for w in wire_names}, None
+            failure = ReadFailure(
+                operation=ReadOperation.device_state_read,
+                device=name,
+                family=WHOLE_DEVICE,
+                code=ReadFailureCode.action_output_not_atomic,
+            )
+            return {}, Unavailable(UnavailableReason.read_error, failure=failure), failures
+        sections = _split_sections(output, wire_names, name, ReadOperation.device_state_read, failures)
+        return sections, None, failures
     try:
-        doc = await nso_client.get_device_state_doc(device.nso_device_name)
+        doc = await nso_client.get_device_state_doc(name)
     except NsoExportUnavailableError as exc:
-        return {}, Unavailable(
-            UnavailableReason.export_down, detail=f"the device-state doc GET raised {type(exc).__name__}"
-        )
+        failure = read_failure_from_exception(exc, operation=ReadOperation.doc_get, device=name, family=WHOLE_DEVICE)
+        return {}, Unavailable(UnavailableReason.export_down, failure=failure), failures
     except Exception as exc:  # noqa: BLE001 — any supplier failure keeps every family
-        return {}, Unavailable(
-            UnavailableReason.read_error, detail=f"the device-state doc GET raised {type(exc).__name__}"
-        )
+        # An HTTP 401 and an HTTP 503 are different operator problems; the status separates them.
+        failure = read_failure_from_exception(exc, operation=ReadOperation.doc_get, device=name, family=WHOLE_DEVICE)
+        return {}, Unavailable(UnavailableReason.read_error, failure=failure), failures
     if doc is None:
-        return {w: None for w in wire_names}, None
+        return {w: None for w in wire_names}, None, failures
     # Codex S3-R3 F5: only the confirmed whole-doc 404 above may mean device absence. A
-    # present-but-null/scalar section inside a 200 doc is MALFORMED - an error section
+    # present-but-null/scalar section inside a 200 doc is MALFORMED - a classified failure
     # (keep), never None (which would authoritatively clear pop families).
-    sections = {w: _section_or_error(doc.get(w)) for w in wire_names}
-    not_ready = [w for w, sec in sections.items() if sec.get("status") == "not-ready"]
+    sections = _split_sections(doc, wire_names, name, ReadOperation.doc_get, failures)
+    not_ready = [w for w, sec in sections.items() if sec is not None and sec.get("status") == "not-ready"]
     if not_ready:
+        healed: dict | None = None
+        heal_failure: ReadFailure | None = None
         try:
             async with _action_semaphore():
-                output = await nso_client.run_device_state_read(device.nso_device_name, not_ready)
+                output = await nso_client.run_device_state_read(name, not_ready)
             if not isinstance(output, dict):
-                raise TypeError(f"action output is {type(output).__name__}, not a mapping")
-            for w in not_ready:
-                sections[w] = _section_or_error(output.get(w))
+                raise TypeError("the heal action output is not a mapping")
+            healed = output
         except Exception as exc:  # noqa: BLE001 — heal failure degrades only the not-ready set
+            heal_failure = read_failure_from_exception(
+                exc, operation=ReadOperation.device_state_read, device=name, family=WHOLE_DEVICE
+            )
+        if heal_failure is not None:
             for w in not_ready:
-                sections[w] = {"status": "error", "error-reason": f"heal action failed ({type(exc).__name__})"}
-    return sections, None
+                sections[w] = None
+                failures[w] = replace(heal_failure, family=w, code=ReadFailureCode.heal_action_failed)
+        else:
+            assert healed is not None
+            sections.update(_split_sections(healed, not_ready, name, ReadOperation.device_state_read, failures))
+    return sections, None, failures
 
 
-def _section_or_error(section) -> dict:
-    """Coerce a projected section to a dict; anything else becomes an error section."""
-    if isinstance(section, dict):
-        return section
-    return {"status": "error", "error-reason": f"malformed section ({type(section).__name__})"}
+def _split_sections(
+    served: dict,
+    wire_names: list[str],
+    device_name: str,
+    operation: ReadOperation,
+    failures: dict[str, ReadFailure],
+) -> dict[str, dict | None]:
+    """Keep the dict sections; classify anything else as a malformed section (rows kept)."""
+    sections: dict[str, dict | None] = {}
+    for wire in wire_names:
+        section = served.get(wire)
+        if isinstance(section, dict):
+            sections[wire] = section
+            failures.pop(wire, None)
+            continue
+        sections[wire] = None
+        failures[wire] = ReadFailure(
+            operation=operation,
+            device=device_name,
+            family=wire,
+            code=ReadFailureCode.section_malformed,
+        )
+    return sections
 
 
 @dataclass(frozen=True)
@@ -312,13 +355,27 @@ class _ProjectionLayout:
 class _ProjectedRead:
     """One supplier result shared by every consumer in a projected batch."""
 
+    device: str
     sections: dict[str, dict | None]
     supplier_outcome: ReadOutcome | None
+    section_failures: dict[str, ReadFailure]
 
     def outcome_for(self, wire_name: str) -> ReadOutcome:
         if self.supplier_outcome is not None:
-            return self.supplier_outcome
-        return classify_envelope_section(self.sections[wire_name])
+            return _narrowed(self.supplier_outcome, wire_name)
+        # Checked BEFORE `sections`: a family the supplier could not serve holds None there,
+        # and None alone means a CONFIRMED device absence (which would clear the mirror).
+        failure = self.section_failures.get(wire_name)
+        if failure is not None:
+            return Unavailable(UnavailableReason.read_error, failure=failure)
+        return classify_envelope_section(self.sections[wire_name], device=self.device, family=wire_name)
+
+
+def _narrowed(outcome: ReadOutcome, wire_name: str) -> ReadOutcome:
+    """Report a whole-device supplier failure against the family it is being served for."""
+    if isinstance(outcome, Unavailable) and outcome.failure is not None:
+        return Unavailable(outcome.reason, failure=outcome.failure.for_family(wire_name))
+    return outcome
 
 
 def _projection_layout(
@@ -368,13 +425,13 @@ async def _projected_batch(
     async with AsyncExitStack() as lock_stack:
         for lock_name in layout.lock_names:
             await lock_stack.enter_async_context(_engine._family_lock(device.id, lock_name))
-        sections, supplier_outcome = await _fetch_projection(
+        sections, supplier_outcome, section_failures = await _fetch_projection(
             nso_client,
             device,
             list(layout.wire_names),
             atomic=atomic,
         )
-        yield layout, _ProjectedRead(sections, supplier_outcome)
+        yield layout, _ProjectedRead(device.nso_device_name, sections, supplier_outcome, section_failures)
 
 
 async def _apply_projected(

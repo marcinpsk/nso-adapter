@@ -17,7 +17,7 @@ from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.nso.apply import NsoApplyError, SectionExecution, apply_device_intent, encode_snmp
 from nso_adapter.nso.client import DEVICE_INTENT_ROOT
 from nso_adapter.store.models import BgpRouterIntent, Job, JobStatus, OspfInterfaceIntent, SnmpCommunityIntent
-from tests._secret_discipline import assert_chain_free_of
+from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
 from tests.conftest import VALID_TOKEN, push_seq, seed_device, session
 from tests.core.test_static_route_put import seed_apply_job
 from tests.nso.test_apply_send import _client_with
@@ -601,7 +601,7 @@ async def test_an_error_section_keeps_the_wire_reason_out_of_the_refresh_log(ada
     reported = [record for record in logs if record["event"] == "static_route.refresh.unavailable"]
     assert reported, "the unavailable read was not reported at all"
     assert reported[0]["reason"] == "read_error", "the reason is the half the operator needs"
-    assert reported[0]["detail"] == "the section reported status=error"
+    assert reported[0]["failure_code"] == "section_status_error"
     assert_records_free_of(logs, _SECRETS)
     assert_records_free_of(await _outcome_rows(device_id), _SECRETS)
 
@@ -629,7 +629,9 @@ async def test_a_refused_escalation_keeps_the_certification_text_out_of_the_refr
     reported = [record for record in logs if record["event"] == "static_route.refresh.unavailable"]
     assert reported, "the unavailable read was not reported at all"
     assert reported[0]["reason"] == "read_error"
-    assert reported[0]["detail"] == "the device-state-read action raised NsoReadContractError"
+    assert reported[0]["read_operation"] == "device_state_read"
+    assert reported[0]["error_type"] == "NsoReadContractError"
+    assert reported[0]["http_status"] is None
     assert_records_free_of(logs, _SECRETS)
     assert_records_free_of(await _outcome_rows(device_id), _SECRETS)
 
@@ -743,3 +745,81 @@ async def test_a_failed_host_key_fetch_keeps_the_action_info_out_of_the_provisio
     with pytest.raises(RuntimeError) as caught:
         await client.fetch_host_keys(name)
     assert_chain_free_of(caught.value, _SECRETS)
+
+
+# ── two different HTTP failures must classify differently ────────────────────
+
+#: What a real NSO answers on a refused read: a reason phrase and a body it chose.
+_HTTP_REASON = f"Denied for {_REF}"
+_HTTP_BODY = {"ietf-restconf:errors": {"error": [{"error-message": f"community {_SECRET} rejected"}]}}
+_HTTP_SECRETS = [*_SECRETS, _HTTP_REASON, "Denied for", "rejected"]
+
+
+def _status_client(status: int):
+    """A real NsoClient whose device-state envelope answers *status* with server text."""
+
+    def respond(request):
+        return httpx.Response(
+            status,
+            json=_HTTP_BODY,
+            extensions={"reason_phrase": _HTTP_REASON.encode()},
+        )
+
+    return _client_with(httpx.MockTransport(respond))
+
+
+async def _unavailable_record(device_id: int, client) -> dict:
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        await _refresh_static_route(device_id, client)
+    reported = [record for record in logs if record["event"] == "static_route.refresh.unavailable"]
+    assert reported, "the unavailable read was not reported at all"
+    assert_records_free_of(logs, _HTTP_SECRETS)
+    return reported[0]
+
+
+async def test_an_auth_refusal_and_an_outage_do_not_classify_the_same(adapter_client):
+    """Round 1 collapsed both to "the section GET raised HTTPStatusError".
+
+    A 401 is a credential problem an operator fixes in config; a 503 is an outage they wait
+    out. The record has to separate them, and neither may repeat the reason phrase, the URL
+    or the body NSO answered.
+    """
+    denied_id = await seed_device(nso_device_name="refresh-401", netbox_device_id=9431)
+    outage_id = await seed_device(nso_device_name="refresh-503", netbox_device_id=9432)
+
+    denied = await _unavailable_record(denied_id, _status_client(401))
+    outage = await _unavailable_record(outage_id, _status_client(503))
+
+    assert denied["http_status"] == 401
+    assert outage["http_status"] == 503
+    assert denied["http_status"] != outage["http_status"], "the two failures classify the same"
+    for record in (denied, outage):
+        assert record["reason"] == "read_error"
+        assert record["read_operation"] == "section_get"
+        assert record["error_type"] == "HTTPStatusError"
+        assert record["family"] == "static-route"
+        assert record["failure_code"] is None, "an HTTP answer is not a contract refusal"
+    assert denied["device_name"] == "refresh-401"
+    assert outage["device_name"] == "refresh-503"
+    assert_records_free_of(await _outcome_rows(denied_id), _HTTP_SECRETS)
+
+
+async def test_an_authored_contract_refusal_classifies_apart_from_an_http_failure(adapter_client):
+    """The third operator case: NSO answered 200 and the read contract refused it.
+
+    An authored code says WHICH rule broke, and it carries no status because the server
+    answered a clean one. Round 1 had only the exception type here, and a served
+    ``status=error`` section raises nothing at all, so it had nothing to say.
+    """
+    device_id = await seed_device(nso_device_name="refresh-contract", netbox_device_id=9433)
+    client = _envelope_client("static-route", {"status": "error", "error-reason": _SECTION_REASON})
+
+    record = await _unavailable_record(device_id, client)
+
+    assert record["failure_code"] == "section_status_error"
+    assert record["read_operation"] == "section_classify"
+    assert record["http_status"] is None, "nothing was refused over HTTP"
+    assert record["error_type"] is None, "nothing raised"
+    assert record["family"] == "static-route"

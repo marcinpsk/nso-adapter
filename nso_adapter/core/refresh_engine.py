@@ -35,10 +35,14 @@ from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
 from nso_adapter.nso.read_outcome import (
     AbsentAuthoritative,
     Present,
+    ReadFailure,
+    ReadFailureCode,
+    ReadOperation,
     ReadOutcome,
     Unavailable,
     UnavailableReason,
     classify_envelope_section,
+    read_failure_from_exception,
 )
 from nso_adapter.store import outcome_store
 from nso_adapter.store.models import Device
@@ -190,20 +194,38 @@ async def _escalate_not_ready(device: Device, nso_client: NsoClient, wire_name: 
     terminal (``ok|unsupported|error``) — a ``not-ready`` here is a contract violation and
     is refused rather than looped on.
     """
+    name = device.nso_device_name
     try:
         async with _action_semaphore():
-            output = await nso_client.run_device_state_read(device.nso_device_name, [wire_name])
+            output = await nso_client.run_device_state_read(name, [wire_name])
     except Exception as exc:  # noqa: BLE001 — action error (bracket exhaustion, unknown device) → keep rows
-        # The type says transport blip or contract violation; the message can repeat what NSO said.
-        return Unavailable(
-            UnavailableReason.read_error, detail=f"the device-state-read action raised {type(exc).__name__}"
+        # The status separates an auth refusal from an outage; the server's own words never travel.
+        failure = read_failure_from_exception(
+            exc, operation=ReadOperation.device_state_read, device=name, family=wire_name
         )
+        return Unavailable(UnavailableReason.read_error, failure=failure)
     section = output.get(wire_name)
     if section is None:
-        return Unavailable(UnavailableReason.read_error, detail="action output missing the requested section")
-    outcome = classify_envelope_section(section)
+        return Unavailable(
+            UnavailableReason.read_error,
+            failure=ReadFailure(
+                operation=ReadOperation.device_state_read,
+                device=name,
+                family=wire_name,
+                code=ReadFailureCode.action_section_missing,
+            ),
+        )
+    outcome = classify_envelope_section(section, device=name, family=wire_name)
     if isinstance(outcome, Unavailable) and outcome.reason is UnavailableReason.not_ready:
-        return Unavailable(UnavailableReason.read_error, detail="action returned not-ready (contract violation)")
+        return Unavailable(
+            UnavailableReason.read_error,
+            failure=ReadFailure(
+                operation=ReadOperation.device_state_read,
+                device=name,
+                family=wire_name,
+                code=ReadFailureCode.action_returned_not_ready,
+            ),
+        )
     return outcome
 
 
@@ -221,15 +243,26 @@ async def classify_envelope_family_read(
     three components, the importer's interface_attributes read). Escalation runs under
     the shared action semaphore.
     """
+    name = device.nso_device_name
     try:
-        section = await nso_client.get_device_state_section(device.nso_device_name, wire_name)
+        section = await nso_client.get_device_state_section(name, wire_name)
     except NsoExportUnavailableError as exc:
         return Unavailable(
-            UnavailableReason.export_down, detail=f"the envelope section GET raised {type(exc).__name__}"
+            UnavailableReason.export_down,
+            failure=read_failure_from_exception(
+                exc, operation=ReadOperation.section_get, device=name, family=wire_name
+            ),
         )
     except Exception as exc:  # noqa: BLE001 — any read failure is Unavailable; the mirror is kept
-        return Unavailable(UnavailableReason.read_error, detail=f"the envelope section GET raised {type(exc).__name__}")
-    outcome = classify_envelope_section(section)
+        # An HTTP 401 and an HTTP 503 are different operator problems, so the numeric status
+        # travels with the type. Neither the reason phrase nor the URL does.
+        return Unavailable(
+            UnavailableReason.read_error,
+            failure=read_failure_from_exception(
+                exc, operation=ReadOperation.section_get, device=name, family=wire_name
+            ),
+        )
+    outcome = classify_envelope_section(section, device=name, family=wire_name)
     if isinstance(outcome, Unavailable) and outcome.reason is UnavailableReason.not_ready:
         logger.info(
             f"{family_name}.refresh.not_ready_escalating",
@@ -301,7 +334,7 @@ async def run_family_refresh_from_section(
         db,
         device,
         spec,
-        classify_envelope_section(section),
+        classify_envelope_section(section, device=device.nso_device_name, family=spec.wire_name),
         refresh_source=refresh_source,
         own_lock=own_lock,
     )
@@ -335,6 +368,18 @@ async def run_family_refresh_from_outcome(
         return await _apply_outcome(db, device, spec, outcome, refresh_source)
     async with _family_lock(device.id, spec.name):
         return await _apply_outcome(db, device, spec, outcome, refresh_source)
+
+
+def _failure_fields(device: Device, spec: FamilySpec, failure: ReadFailure | None) -> dict[str, object]:
+    """Build the record fields for a kept read: the authored classification, or the bare ask.
+
+    ``failure`` is None only for a DECLARED state the engine still keeps rows on (a
+    ``not-ready`` section nobody escalated, a merged composite outcome) — nothing failed,
+    so there is nothing to classify beyond what was asked for.
+    """
+    if failure is None:
+        return {"device_name": device.nso_device_name, "family": spec.wire_name}
+    return failure.log_fields()
 
 
 async def _materialize_guarded(
@@ -499,9 +544,8 @@ async def _apply_outcome(
     logger.warning(
         f"{spec.name}.refresh.unavailable",
         device_id=device.id,
-        device_name=device.nso_device_name,
         reason=outcome.reason.value,
-        detail=outcome.detail,
+        **_failure_fields(device, spec, outcome.failure),
     )
     selected = await _record_result(db, device, spec, attempt_id, result="kept", succeeded=False, row_count=None)
     return selected is False
