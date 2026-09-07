@@ -813,7 +813,9 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
         logger.warning("apply_diff.failed", device=device.nso_device_name, error=repr(exc))
         reason = getattr(exc, "message", None) or repr(exc)
         return {PREVIEW_KEY: f"!! preview unavailable: {reason}"}
-    return {PREVIEW_KEY: delta} if delta and delta.strip() else {}
+    if delta is None:
+        return {PREVIEW_KEY: "!! preview unavailable: NSO dry-run was inconclusive"}
+    return {PREVIEW_KEY: delta} if delta.strip() else {}
 
 
 # ── run_apply: shared eligibility + per-scope batch-commit helpers ────────────

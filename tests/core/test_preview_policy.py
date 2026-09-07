@@ -48,3 +48,20 @@ async def test_preview_and_commit_share_frozen_removal_policy(adapter_client, op
     assert preview["body"] == commit["body"]
     assert preview["no_networking"] == commit["no_networking"] == (operation == "detach")
     assert fake.sent_routes() == ([] if operation == "force" else [_RICH_A])
+
+
+@pytest.mark.parametrize("dry_run_status", [200, 400, 503])
+async def test_preview_distinguishes_empty_delta_from_unavailable(adapter_client, dry_run_status):
+    from nso_adapter.core.apply import PREVIEW_KEY
+
+    device_id = await seed_device(nso_device_name="preview-availability", netbox_device_id=17315)
+    await seed_settings(device_id, auto_apply=True)
+    assert (await _put_vlans(adapter_client, device_id, [100], seq=1)).status_code == 200
+    fake = SrFake("preview-availability", service=[], dry_run_status=dry_run_status)
+    async with session() as db:
+        with patch("nso_adapter.core.importer.get_nso_client", return_value=sr_client(fake)):
+            preview = await collect_apply_diff(db, device_id)
+    if dry_run_status == 200:
+        assert preview == {}
+    else:
+        assert "preview unavailable" in preview[PREVIEW_KEY]
