@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+from collections.abc import Sequence
 from functools import cache
 from typing import NamedTuple
 from uuid import UUID
@@ -1837,6 +1838,25 @@ _PROMOTION_GUARD_FIELDS: dict[str, tuple[tuple[str, str, tuple[str, ...]], ...]]
 }
 
 
+def interface_removal_keys(interfaces: Sequence[str], addresses: Sequence[Sequence[str]]) -> dict[str, list]:
+    """Return the keys an interface_config removal authorizes, in every grain that reads them.
+
+    ``address`` is the VALUE grain :func:`_interface_config_residue` intersects with the
+    export's ``ip/prefix-length`` strings. The document's own lists key an interface by its
+    name and an address by its host part alone, so the collateral guard's grains are DERIVED
+    from the same triples here rather than captured a second time somewhere else.
+    """
+    keys: dict[str, list] = {}
+    if addresses:
+        keys["address"] = [list(triple) for triple in addresses]
+    for interface, address, _vrf in addresses:
+        version = ipaddress.ip_interface(str(address)).version
+        keys.setdefault(f"ipv{version}-address", []).append([str(interface), str(address).rsplit("/", 1)[0]])
+    if interfaces:
+        keys["interface"] = [[str(name)] for name in interfaces]
+    return keys
+
+
 async def _promotion_interface_context(
     db: AsyncSession,
     device_id: int,
@@ -1878,8 +1898,16 @@ async def _promotion_interface_context(
         for row in removed_rows.get("interface_ip_intent", [])
         if row.get("interface_id") in names_by_id
     ]
-    removed = {"address": sorted(set(address_keys))} if address_keys else {}
-    return interfaces, removed
+    # A REPLACEMENT interface keeps rows and so keeps its entry; only a removal may empty one.
+    emptied = sorted(
+        {
+            names_by_id[row["interface_id"]]
+            for rows in removed_rows.values()
+            for row in rows
+            if row.get("interface_id") in names_by_id
+        }
+    )
+    return interfaces, interface_removal_keys(emptied, sorted(set(address_keys)))
 
 
 async def promotion_removal_context(

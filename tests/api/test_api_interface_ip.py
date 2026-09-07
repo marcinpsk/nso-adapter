@@ -274,8 +274,13 @@ async def test_put_ip_intent_removal_enqueues_interface_config_job(adapter_clien
             "scope": "interface_config",
             "interfaces": ["Gi0/3"],
             # #104 phase-3: the removed VALUES ride along so run_removal can do the
-            # value-grain residue check after the per-instance replace/delete.
-            "removed": {"address": [["Gi0/3", "10.0.0.2/24", ""]]},
+            # value-grain residue check after the per-instance replace/delete; the wire
+            # grains beside them are what the device-wide collateral guard compares.
+            "removed": {
+                "address": [["Gi0/3", "10.0.0.2/24", ""]],
+                "ipv4-address": [["Gi0/3", "10.0.0.2"]],
+                "interface": [["Gi0/3"]],
+            },
             "detach": True,
         }
 
@@ -343,7 +348,9 @@ async def test_put_ip_intent_removal_captures_values_per_interface(adapter_clien
         assert len(removals) == 1
         assert removals[0].context["interfaces"] == ["Gi0/5"]
         assert removals[0].context["removed"] == {
-            "address": [["Gi0/5", "10.0.1.1/30", "CUST"], ["Gi0/5", "10.0.2.1/30", ""]]
+            "address": [["Gi0/5", "10.0.1.1/30", "CUST"], ["Gi0/5", "10.0.2.1/30", ""]],
+            "ipv4-address": [["Gi0/5", "10.0.1.1"], ["Gi0/5", "10.0.2.1"]],
+            "interface": [["Gi0/5"]],
         }
 
 

@@ -315,7 +315,7 @@ async def put_ip_intent(
     # every other service's replace_on_removal, and always runs (removal is not auto_apply-gated).
     replaced = False
     if removed_interfaces:
-        from nso_adapter.core.removal import enqueue_removal, query_flag_marking
+        from nso_adapter.core.removal import enqueue_removal, interface_removal_keys, query_flag_marking
 
         marks = query_flag_marking(deletes=True)
         replaced = (
@@ -330,7 +330,7 @@ async def put_ip_intent(
                 promotes=(delivery.stream,),
                 settlement_cohort=settlement_cohort,
                 interfaces=sorted(removed_interfaces),
-                removed={"address": removed_addresses},
+                removed=interface_removal_keys(sorted(removed_interfaces), removed_addresses),
             )
             is not None
         )

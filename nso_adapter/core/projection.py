@@ -393,6 +393,13 @@ _SECTION_REGISTRY: dict[str, _Section] = {
             _Spec(InterfaceIntent, parent=DbInterface),
             _Spec(InterfaceIpIntent, parent=DbInterface),
         ),
+        # Exempt from the post-apply key comparison, never from the device-wide collateral
+        # guard: an omitted root or address is a retraction like any other section's.
+        guard_lists=(
+            GuardList("interface", ("interface",), ("interface-name",)),
+            GuardList("ipv4-address", ("interface", "ipv4-address"), ("address",), "interface-name"),
+            GuardList("ipv6-address", ("interface", "ipv6-address"), ("address",), "interface-name"),
+        ),
         container="interface",
         encode=encode_interface_config,
         read_family="interface_ip",
