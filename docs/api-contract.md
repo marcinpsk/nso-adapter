@@ -1686,28 +1686,30 @@ Field notes:
 - `address`: IP address without prefix length.
 - `prefix_length`: integer subnet mask length.
 
-### `PUT /api/v1/devices/{id}/ip-intent` → `200 | 404`
+### `PUT /api/v1/devices/{id}/ip-intent` → `200 | 404 | 422`
 
-Push (full-replace) the interface IP intent mirror for this device.
+Push the full interface IP intent snapshot for this device. Send `X-Push-Seq` with the request.
 
 ```json
 {
-  "interfaces": [
+  "addresses": [
     {
-      "interface_name": "GigabitEthernet0/1",
-      "vrf": "",
-      "address": "192.0.2.1",
-      "prefix_length": 30,
-      "af": "ipv4"
+      "interface": "GigabitEthernet0/1",
+      "address": "192.0.2.1/30",
+      "family": "ipv4",
+      "secondary": false,
+      "vrf": ""
     }
   ]
 }
 ```
 
-Response: `{ "device_id": 1, "count": 1 }`
+`address` must contain a valid IP address and a numeric prefix length.
+`family` must be `ipv4` or `ipv6` and must agree with the address.
+Invalid input returns 422 before the adapter stores intent or queues removal work.
 
-Full-replace semantics: any `(interface_name, af, address)` triple not present in
-the request body is deleted from the intent mirror.
+The response includes `device_id`, `address_count`, `removed_interfaces`, `replaced`, and `updated_at`.
+The adapter deletes each `(interface, address, vrf)` entry absent from the full snapshot.
 
 ### `GET /api/v1/devices/{id}/isis-interfaces` → `200 | 404`
 
