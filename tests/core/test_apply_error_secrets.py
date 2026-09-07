@@ -16,6 +16,7 @@ from nso_adapter.core.community_dialect import community_dialect_for
 from nso_adapter.nso.apply import NsoApplyError, SectionExecution, apply_device_intent, encode_snmp
 from nso_adapter.nso.client import DEVICE_INTENT_ROOT
 from nso_adapter.store.models import Job, JobStatus, OspfInterfaceIntent, SnmpCommunityIntent
+from tests._secret_discipline import assert_chain_free_of
 from tests.conftest import seed_device, session
 from tests.core.test_static_route_put import seed_apply_job
 from tests.nso.test_apply_send import _client_with
@@ -43,24 +44,6 @@ async def _run(device_id, client, monkeypatch, job_id=None):
         return await db.get(Job, job_id)
 
 
-def _exception_chain(exc):
-    """Every exception reachable from *exc* through ``__cause__`` AND ``__context__``.
-
-    ``raise ... from None`` only sets ``__suppress_context__``, which hides the parser
-    exception from a formatted traceback while ``__context__`` still holds it.
-    """
-    seen: set[int] = set()
-    pending, chain = [exc], []
-    while pending:
-        node = pending.pop()
-        if node is None or id(node) in seen:
-            continue
-        seen.add(id(node))
-        chain.append(node)
-        pending += [node.__cause__, node.__context__]
-    return chain
-
-
 def _assert_safe(exc, job, row_error, logs, secrets):
     assert job.status == JobStatus.failed
     assert row_error is not None
@@ -73,10 +56,10 @@ def _assert_safe(exc, job, row_error, logs, secrets):
         json.dumps(row_error),
         repr([record.__dict__ for record in logs.records]),
     ]
-    surfaces += [f"{node!r} {node}" for node in _exception_chain(exc)]
     for surface in surfaces:
         for secret in secrets:
             assert secret not in surface
+    assert_chain_free_of(exc, secrets)
 
 
 async def _community():
@@ -193,8 +176,7 @@ async def test_a_non_reference_secret_never_reaches_the_projection_refusal_chain
     async with session() as db:
         with pytest.raises(ValueError) as caught:
             await snapshot_stream(db, device_id, "snmp")
-    for node in _exception_chain(caught.value):
-        assert raw not in f"{node!r} {node}"
+    assert_chain_free_of(caught.value, [raw])
 
 
 async def test_malformed_snmp_reference_keeps_no_reference_in_exception_or_row(adapter_client, recorded_logs):
@@ -294,3 +276,62 @@ async def test_a_blocked_removal_keeps_the_device_delta_out_of_the_job_error(ada
     assert job.error["detail"]["orphans"] == {"snmp/community": [["legacy"]]}
     assert _SECRET not in json.dumps(job.error)
     assert _SECRET not in repr(recorded_logs.records)
+
+
+# ── a device rejection: the construct is attributed, the device text is not kept ──
+
+_NED = "cisco-ios-cli-6.95"
+_SW = "15.5"
+_REJECTION = (
+    f"external error (device {_DEVICE}) Aborted: syntax error\n"
+    "command: set extcommunity color 12\n"
+    f"config: snmp-server community {_SECRET} RO\n"
+)
+
+
+async def test_a_device_rejection_attributes_its_construct_and_keeps_no_device_text(
+    adapter_client, monkeypatch, recorded_logs
+):
+    """Redaction must not cost the capability verdict the rejection is the only source of.
+
+    A dry-run renders an unsupported route-policy construct cleanly, so the commit error is
+    the one place the device names it. The construct identifier survives; the rest does not.
+    """
+    from nso_adapter.core.capability import get_device_capability
+    from nso_adapter.store.models import Device, RoutePolicyObjectIntent
+
+    device_id, row = await _community()
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        device.ned_id, device.sw_version = _NED, _SW
+        db.add(
+            RoutePolicyObjectIntent(
+                device_id=device_id, family="ipv4", name="RM-IN", entries=[], accepted_at=datetime.now(UTC)
+            )
+        )
+        await db.commit()
+    body = {"ietf-restconf:errors": {"error": [{"error-message": _REJECTION}]}}
+
+    def respond(request):
+        if request.method == "GET":
+            return httpx.Response(404)
+        if request.method == "PUT" and "dry-run=" not in str(request.url):
+            return httpx.Response(400, json=body)
+        return httpx.Response(200, json={"dry-run-result": {"native": {}}})
+
+    client = _client_with(httpx.MockTransport(respond))
+    job = await _run(device_id, client, monkeypatch)
+    async with session() as db:
+        recorded = {(r.scope, r.name): r for r in await get_device_capability(db, _NED, _SW) if r.source == "apply"}
+        stored = await db.get(SnmpCommunityIntent, row.id)
+    assert job.status == JobStatus.failed
+    assert ("rm-set", "set extcommunity color") in recorded, f"the construct was not attributed: {sorted(recorded)}"
+    surfaces = [
+        json.dumps(job.error),
+        json.dumps(stored.last_apply_error),
+        repr([record.__dict__ for record in recorded_logs.records]),
+        *(f"{r.detail} {r.name}" for r in recorded.values()),
+    ]
+    for surface in surfaces:
+        assert _SECRET not in surface
+        assert "snmp-server" not in surface, "opaque device text left the redaction boundary"

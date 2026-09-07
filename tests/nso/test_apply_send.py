@@ -500,11 +500,12 @@ def test_snmp_rejects_a_malformed_vault_ref(bad_ref):
 
     import traceback
 
+    from tests._secret_discipline import assert_chain_free_of
+
     if bad_ref:
         assert bad_ref not in str(caught.value)
         assert bad_ref not in "".join(traceback.format_exception(caught.value))
-    assert caught.value.__cause__ is None
-    assert caught.value.__suppress_context__
+        assert_chain_free_of(caught.value, [bad_ref])
 
 
 async def test_logging_container_carries_the_host_list():
