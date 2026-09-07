@@ -21,6 +21,7 @@ import pytest
 from nso_adapter.core.static_route_reader import certified_static_route_section
 from tests.conftest import seed_device, session
 from tests.core.removal_helpers import seed_removal_job, seed_tomb
+from tests.core.static_route_harness import K as K_KEY
 from tests.core.test_static_route_put import A, B, C, seed_rows, wire
 from tests.core.test_static_route_removal import SrFake, run_removal_job, sr_client, tombstone_ids
 
@@ -388,3 +389,58 @@ async def test_worker_retains_carrier_when_service_members_are_null(adapter_clie
     assert job.status.value == "failed", job.result
     assert await tombstone_ids(device_id) == [tomb]
     assert fake.writes == []
+
+
+# ── the sender half: a consumed carrier retains nothing, and prunes ──────────
+
+
+async def _fixture_s(api):
+    """A live sibling S on the device, plus an abandoned carrier T claiming K."""
+    from tests.core.removal_helpers import authorize_static_route
+    from tests.core.static_route_harness import S, retention_harness, route
+    from tests.core.test_static_route_reclaim import seed_succeeded_owner
+
+    harness = await retention_harness(api)
+    await harness.push([route(S, route_id=2)])
+    await harness.run()
+    owner = await seed_succeeded_owner(harness.device_id)
+    tomb = await seed_tomb(harness.device_id, K_KEY, job_id=owner, route_id=1)
+    await authorize_static_route(harness.device_id)
+    return harness, tomb
+
+
+async def test_a_reclaim_consumption_protects_a_frozen_successor_and_prunes_the_next(adapter_client):
+    """The reclaim's counterpart at the SENDER: what a consumed carrier no longer retains.
+
+    A successor frozen while T existed still names T, so executing it after the consumption
+    must transmit neither K nor a claim on it, and the next creation must prune T out of the
+    fragment and every document built from it — without rewriting the frozen one.
+    """
+    from nso_adapter.core.static_route_plan import hydrate_static_route_apply_plan
+    from tests.core.static_route_harness import S
+    from tests.core.test_generation_protocol import generations, stream_row
+    from tests.core.test_static_route_reclaim import run_reclaim
+
+    harness, tomb = await _fixture_s(adapter_client)
+    frozen = await harness.unrelated()
+    assert hydrate_static_route_apply_plan(frozen.document).tombstone_ids == [tomb]
+    original = (frozen.document, frozen.digest)
+
+    assert await run_reclaim(harness.client) == (1, 0)
+    assert await tombstone_ids(harness.device_id) == []
+
+    await harness.run()
+    assert harness.fake.sent_keys() == {S}
+    assert all(entry["prefix"] != K_KEY[1] for entry in harness.fake.sent_routes())
+
+    fresh = await harness.unrelated()
+    fragment = (await stream_row(harness.device_id, "static_route")).authorized_document
+    assert fragment["static_route_tombstone"] == []
+    assert fragment["_execution"]["proof"]["apply"]["tombstone_ids"] == []
+    assert hydrate_static_route_apply_plan(fresh.document).tombstone_ids == []
+    assert fresh.document["static_route"]["static_route_tombstone"] == []
+    await harness.run()
+    assert harness.fake.sent_keys() == {S}
+
+    stored = next(g for g in await generations(harness.device_id) if g.id == frozen.id)
+    assert (stored.document, stored.digest) == original, "an immutable document was rewritten"
