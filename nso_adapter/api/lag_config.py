@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -34,7 +34,7 @@ class _StrictRequestModel(BaseModel):
 
 class LagMemberApply(_StrictRequestModel):
     interface_name: str = Field(min_length=1, max_length=128)
-    mode: Literal["active", "passive", "on", ""] | None = None
+    mode: str | None = Field(default=None, max_length=16)
     port_priority: Uint16 | None = None
 
 
@@ -44,7 +44,7 @@ class LagBundleApply(_StrictRequestModel):
     min_links: Uint16 | None = None
     system_priority: Uint16 | None = None
     system_id: str | None = Field(default=None, max_length=17)
-    timer: Literal["fast", "slow", ""] | None = None
+    timer: str | None = Field(default=None, max_length=8)
     admin_key: Uint16 | None = None
     members: list[LagMemberApply] = Field(default_factory=list)
 

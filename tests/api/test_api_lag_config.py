@@ -357,57 +357,6 @@ async def test_apply_lag_config_treats_empty_timer_and_system_id_as_unset(adapte
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("leaf", ["mode", "timer"])
-async def test_apply_lag_rejects_invalid_lacp_leaf(adapter_client, leaf):
-    device_id = await seed_device(nso_device_name="lag-invalid-leaf", netbox_device_id=None)
-    bundle = {"name": "Port-channel1", "lag_id": 1}
-    if leaf == "mode":
-        bundle["members"] = [{"interface_name": "Gi0/1", "mode": "invalid"}]
-    else:
-        bundle["timer"] = "invalid"
-    response = await adapter_client.post(
-        f"/api/v1/devices/{device_id}/lag-config/apply", json={"bundles": [bundle]}, headers=AUTH
-    )
-    assert response.status_code == 422
-    async with session() as db:
-        assert await db.scalar(text("SELECT count(*) FROM lag_bundle_intent")) == 0
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("mode", ["active", "passive", "on", "", None])
-@pytest.mark.parametrize("timer", ["fast", "slow", "", None])
-async def test_apply_lag_renders_supported_lacp_leaves(adapter_client, mode, timer):
-    from nso_adapter.core.generation import lock_device_document
-    from nso_adapter.core.switching_intent import render_switching_sections
-
-    device_id = await seed_device(nso_device_name="lag-valid-leaves", netbox_device_id=None)
-    response = await adapter_client.post(
-        f"/api/v1/devices/{device_id}/lag-config/apply",
-        json={
-            "bundles": [
-                {
-                    "name": "Port-channel1",
-                    "lag_id": 1,
-                    "timer": timer,
-                    "members": [{"interface_name": "Gi0/1", "mode": mode}],
-                }
-            ]
-        },
-        headers=AUTH,
-    )
-    assert response.status_code == 200
-    async with session() as db:
-        await lock_device_document(db, device_id)
-        rendered = (await render_switching_sections(db, device_id))["lag"]["bundle"][0]
-    assert rendered == {
-        "name": "Port-channel1",
-        "lag-id": 1,
-        **({"timer": timer} if timer else {}),
-        "member": [{"interface-name": "Gi0/1", **({"mode": mode} if mode else {})}],
-    }
-
-
-@pytest.mark.anyio
 async def test_apply_lag_rejects_duplicate_ids_without_mutation(adapter_client):
     device_id = await seed_device(nso_device_name="lag-api-duplicate-id", netbox_device_id=None)
     response = await adapter_client.post(
@@ -418,3 +367,72 @@ async def test_apply_lag_rejects_duplicate_ids_without_mutation(adapter_client):
     assert response.status_code == 422
     async with session() as db:
         assert await db.scalar(text("SELECT count(*) FROM lag_bundle_intent")) == 0
+
+
+@pytest.mark.anyio
+async def test_apply_lag_accepts_the_lacp_vocabulary_the_export_emits(adapter_client):
+    """A GET body must replay into apply: the export serves the raw NED string, not a fixed set."""
+    from nso_adapter.core.generation import lock_device_document
+    from nso_adapter.core.switching_intent import render_switching_sections
+
+    device_id = await seed_device(nso_device_name="lag-export-vocabulary", netbox_device_id=None)
+    body = {
+        "bundles": [
+            {
+                "name": "Bundle-Ether2",
+                "lag_id": 2,
+                "timer": "slow",
+                "members": [{"interface_name": "TenGigE0/0/0/0", "mode": "inherit"}],
+            },
+            {
+                "name": "Port-channel1",
+                "lag_id": 1,
+                "timer": "fast",
+                "members": [
+                    {"interface_name": "GigabitEthernet0/1", "mode": "auto"},
+                    {"interface_name": "GigabitEthernet0/2", "mode": "desirable"},
+                ],
+            },
+        ]
+    }
+    response = await adapter_client.post(f"/api/v1/devices/{device_id}/lag-config/apply", json=body, headers=AUTH)
+    assert response.status_code == 200, response.text
+
+    async with session() as db:
+        stored = (
+            await db.execute(
+                text(
+                    "SELECT b.timer, m.interface_name, m.mode FROM lag_bundle_intent b "
+                    "JOIN lag_member_intent m ON m.lag_bundle_id = b.id "
+                    "WHERE b.device_id = :device_id ORDER BY m.interface_name"
+                ),
+                {"device_id": device_id},
+            )
+        ).all()
+    assert [tuple(row) for row in stored] == [
+        ("fast", "GigabitEthernet0/1", "auto"),
+        ("fast", "GigabitEthernet0/2", "desirable"),
+        ("slow", "TenGigE0/0/0/0", "inherit"),
+    ]
+
+    async with session() as db:
+        await lock_device_document(db, device_id)
+        rendered = await render_switching_sections(db, device_id)
+        await db.rollback()
+    assert rendered["lag"]["bundle"] == [
+        {
+            "name": "Bundle-Ether2",
+            "lag-id": 2,
+            "timer": "slow",
+            "member": [{"interface-name": "TenGigE0/0/0/0", "mode": "inherit"}],
+        },
+        {
+            "name": "Port-channel1",
+            "lag-id": 1,
+            "timer": "fast",
+            "member": [
+                {"interface-name": "GigabitEthernet0/1", "mode": "auto"},
+                {"interface-name": "GigabitEthernet0/2", "mode": "desirable"},
+            ],
+        },
+    ]
