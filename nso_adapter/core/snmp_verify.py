@@ -72,8 +72,9 @@ def _fingerprints_blocking(provider, refs: Mapping[str, str]) -> dict[str, str]:
         try:
             secret = _resolve_one(provider, ref)
         except Exception as exc:  # noqa: BLE001 — one bad ref must not sink the rest
-            # The ref is not a secret (it is a path), so it is safe to name. The VALUE never is.
-            logger.warning("snmp_verify.vault_read_failed", label=label, vault_ref=ref, error=repr(exc))
+            # The label identifies the grain. The ref names a mount, a path and a key, and the
+            # provider's own message can repeat the request and the payload, so neither is logged.
+            logger.warning("snmp_verify.vault_read_failed", label=label, exception_type=type(exc).__name__)
             continue
         if secret:
             out[label] = secret_fingerprint(secret)

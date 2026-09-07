@@ -32,3 +32,28 @@ def assert_chain_free_of(exc: BaseException, secrets) -> None:
         rendered = f"{node!r} {node}"
         for secret in secrets:
             assert secret not in rendered, f"{type(node).__name__} in the chain repeats secret material"
+
+
+class EchoingVault:
+    """A Vault provider whose failure repeats the reference and the plaintext.
+
+    A real client fails with the request URL in the message, and a decode failure can repeat the
+    payload, so a sink that logs the exception repeats whatever the provider said. A real object,
+    never a Mock: a Mock answers ``read_path`` with another Mock and the sink never sees a failure.
+    """
+
+    def __init__(self, ref: str, secret: str):
+        self.ref = ref
+        self.secret = secret
+        self.reads = 0
+
+    def read_path(self, mount: str, path: str) -> dict[str, str]:
+        self.reads += 1
+        raise RuntimeError(f"vault: read of {mount}/{path} failed for {self.ref} holding {self.secret}")
+
+
+def assert_records_free_of(records, secrets) -> None:
+    """Fail when any captured structlog record repeats one of *secrets*."""
+    rendered = repr([dict(record) for record in records])
+    for secret in secrets:
+        assert secret not in rendered, f"a log record repeats {secret!r}"

@@ -2280,6 +2280,43 @@ async def test_VAULT_DOWN_reports_unverifiable_and_NEVER_clean(adapter_client, v
     assert job.result["residue_unverifiable"] == ["community"]
 
 
+_LEAKY_REF = "placeholder-mount/placeholder-path#placeholder-key"
+_LEAKY_COMPONENTS = [_LEAKY_REF, "placeholder-mount", "placeholder-path", "placeholder-key", "placeholder-secret"]
+
+
+async def test_a_VAULT_OUTAGE_puts_no_part_of_the_REFERENCE_in_the_removal_logs(adapter_client):
+    """The verification sink names the community LABEL and the failure TYPE, and nothing else.
+
+    The ref names a Vault mount, path and key, and the provider's own exception can repeat the
+    request and the payload, so logging either put the whole reference (and whatever the client
+    said) in the operator's log for every removal whose Vault read failed.
+    """
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core import snmp_verify
+    from tests._secret_discipline import EchoingVault, assert_records_free_of
+
+    provider = EchoingVault(_LEAKY_REF, "placeholder-secret")
+    snmp_verify.register_secrets_provider(provider)
+    try:
+        device_id, job_id = await _seed_snmp_removal("sw3", refs={"prod-ro": _LEAKY_REF})
+        client = _ReaderClient(snmp={"community": [{"name": _community_export_name(_COMMUNITY), "access": "ro"}]})
+        with capture_logs() as logs:
+            await _run(job_id, device_id, client)
+    finally:
+        snmp_verify.register_secrets_provider(None)
+
+    assert provider.reads == 1, "the outage was never reached"
+    job = await _job_after(job_id)
+    assert job.result["residue_check"] != "clean"  # still fails open
+    assert job.result["residue_unverifiable"] == ["community"]
+    failed = [record for record in logs if record["event"] == "snmp_verify.vault_read_failed"]
+    assert failed, "the failed read was not reported at all"
+    assert failed[0]["label"] == "prod-ro", "the label is the half the operator needs"
+    assert_records_free_of(logs, _LEAKY_COMPONENTS)
+    assert failed[0]["exception_type"] == "RuntimeError"
+
+
 async def test_NO_vault_provider_is_unverifiable_too(adapter_client):
     """The local/env secrets provider has no mount-explicit read. Same verdict as an outage."""
     device_id, job_id = await _seed_snmp_removal("sw3", refs={"prod-ro": _REF})

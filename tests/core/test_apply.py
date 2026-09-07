@@ -3070,6 +3070,45 @@ async def test_VAULT_DOWN_must_not_stamp_a_landed_community_apply_failed(adapter
         assert row.last_apply_error is None, "a Vault outage must never accuse the WRITER of dropping"
 
 
+_LEAKY_REF = "placeholder-mount/placeholder-path#placeholder-key"
+_LEAKY_COMPONENTS = [_LEAKY_REF, "placeholder-mount", "placeholder-path", "placeholder-key", "placeholder-secret"]
+
+
+async def test_a_VAULT_OUTAGE_puts_no_part_of_the_REFERENCE_in_the_apply_logs(adapter_client):
+    """The same sink on the apply side, where every verified apply reads Vault.
+
+    The reference names a Vault mount, path and key, and the provider's exception can repeat the
+    request and the payload. Only the community LABEL and the failure TYPE may be logged.
+    """
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core import snmp_verify
+    from tests._secret_discipline import EchoingVault, assert_records_free_of
+
+    provider = EchoingVault(_LEAKY_REF, "placeholder-secret")
+    snmp_verify.register_secrets_provider(provider)
+    try:
+        device_id = await _seed_device("rtr-a17-vaultleak", 437)
+        job_id = await _seed_apply_job(device_id)
+        await _seed_community(device_id, vault_ref=_LEAKY_REF)
+        with capture_logs() as logs:
+            job = await _apply_snmp(
+                device_id,
+                job_id,
+                {"community": [{"name": community_export_name(SNMP_COMMUNITY)}], "v3-user": [], "host": []},
+            )
+    finally:
+        snmp_verify.register_secrets_provider(None)
+
+    assert provider.reads == 1, "the outage was never reached"
+    assert job.status == JobStatus.succeeded  # still fails open
+    failed = [record for record in logs if record["event"] == "snmp_verify.vault_read_failed"]
+    assert failed, "the failed read was not reported at all"
+    assert failed[0]["label"] == "prod-ro", "the label is the half the operator needs"
+    assert_records_free_of(logs, _LEAKY_COMPONENTS)
+    assert failed[0]["exception_type"] == "RuntimeError"
+
+
 async def test_a_dropped_HOST_is_still_caught_when_the_community_grain_goes_dark(adapter_client, vault):
     """One grain being unverifiable must not blunt the others — the address-keyed host still fails."""
     from nso_adapter.store.models import SnmpHostIntent
