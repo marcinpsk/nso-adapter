@@ -93,6 +93,48 @@ async def test_the_reader_projects_the_aggregate_container_and_refuses_a_legacy_
     assert legacy.inconclusive and legacy.entry is None
 
 
+async def test_the_aggregate_read_serves_both_consumers_and_no_legacy_path(adapter_client):
+    """The path boundary, through the SENDER and through a consumption proof.
+
+    The fake answers the aggregate instance path and 404s every other URL, so a consumer that
+    fell back to the retired per-service one would read a conclusive absence: the sender would
+    retain nothing and the reclaim would consume a carrier whose key the service still holds.
+    """
+    from tests.core.removal_helpers import authorize_static_route
+    from tests.core.static_route_harness import RetentionHarness
+    from tests.core.test_generation_protocol import seed_settings
+    from tests.core.test_static_route_reclaim import run_reclaim, seed_succeeded_owner
+
+    device_id = await seed_device(nso_device_name="sr-path-boundary", netbox_device_id=17318)
+    await seed_settings(device_id, auto_apply=False)
+    owner = await seed_succeeded_owner(device_id)
+    tomb = await seed_tomb(device_id, A, job_id=owner, route_id=1)
+    await seed_rows(device_id, [{"triple": B, "route_id": 2}])
+    await authorize_static_route(device_id)
+
+    rich_a = wire(A, metric=42, tag=404)
+    rich_a["interface-next-hop"] = "GigabitEthernet0/7"
+    fake = SrFake("sr-path-boundary", service=[rich_a, wire(B)], device=[wire(B)])
+    client = sr_client(fake)
+    harness = RetentionHarness(adapter_client, device_id, fake, client)
+
+    # Consumer 1, the sender: K is found on the aggregate instance and transmitted verbatim.
+    await harness.unrelated()
+    await harness.run()
+    assert fake.sent_keys() == {A, B}
+    assert next(e for e in fake.sent_routes() if key_of(e) == A) == rich_a
+
+    # Consumer 2, the consumption proof: the service still holds K, so nothing is consumed.
+    consumed, _ = await run_reclaim(client)
+    assert consumed == 0
+    assert await tombstone_ids(device_id) == [tomb]
+
+    assert fake.reads, "neither consumer read the service"
+    assert all("device-intent:device-intent=sr-path-boundary" in read["url"] for read in fake.reads), (
+        "a consumer addressed a service path the adapter no longer writes"
+    )
+
+
 async def test_an_empty_container_certifies_absence_and_an_uncertifiable_read_does_not():
     """``absent`` is conclusive; anything uncertifiable refuses every consumer."""
     empty_instance = await certified_static_route_section(
