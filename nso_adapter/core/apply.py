@@ -1084,7 +1084,7 @@ def _device_error_message(exc) -> str | None:
 
 #: The container the route-policy family writes under. Its rejections are the one class the
 #: device names in the COMMIT error while every dry-run renders clean.
-_RP_CONTAINER = "route-policy"
+_RP_CONTAINER = section_registry()["route_policy"].container
 
 #: The family a refusal from the aggregate names for itself, from the ratified refusal shape
 #: ``device-intent: refused [family=<container> field=<field_id>]: <reason>``.
