@@ -971,6 +971,7 @@ async def _enqueue_action_removal_links(
     removal_authority: dict[str, dict[str, list]],
     frozen_fragments: dict[str, dict],
 ) -> tuple[list[DeploymentGeneration], dict[str, dict[str, list]]]:
+    from nso_adapter.core.projection import CLAIM_LESS_SECTIONS
     from nso_adapter.core.removal import PromotionInterfaceUnresolved, enqueue_removal, promotion_removal_context
     from nso_adapter.core.request_flags import DELETE_ORIGIN_MARKING, DETACH_MARKING
     from nso_adapter.core.static_route_plan import promotion_removal_keys, scope_qualified
@@ -995,6 +996,8 @@ async def _enqueue_action_removal_links(
             raise ApplyUnexecutable({link.stream: "unresolved_interface_identity"}) from None
         if scope == "interface_config" and not context.interfaces:
             raise ApplyUnexecutable({link.stream: "no_executable_interface"})
+        if scope in CLAIM_LESS_SECTIONS and link.mode is GenerationMode.networked:
+            context = context._replace(removed=removal_authority.get(scope) or None)
         own = promotion_removal_keys(link.removed) if scope == "static_route" else context.removed
         contexts[link.stream] = (context, scope_qualified(scope, own))
         if link.mode is GenerationMode.networked:

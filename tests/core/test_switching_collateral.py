@@ -66,3 +66,35 @@ async def test_switching_child_guard_and_residue_use_authorized_identity(scope, 
     }
     assert _document_orphans({scope: body}, retained_root, {}) == {f"{scope}/{label}": [[str(p) for p in key]]}
     assert _document_orphans({scope: body}, retained_root, {scope: {label: [key]}}) == {}
+
+
+@pytest.mark.parametrize("scope", ["lag", "switchport"])
+@pytest.mark.parametrize("remove_root", [False, True])
+@pytest.mark.parametrize("survives", [False, True])
+async def test_prepared_removal_worker_checks_root_and_child_residue(adapter_client, scope, remove_root, survives):
+    from tests.core.test_action_apply_promotion import _apply, _prepare
+
+    device_id = await seed_device(nso_device_name="prepared-residue", netbox_device_id=17319)
+    await seed_settings(device_id, auto_apply=False)
+    root = "Port-channel10" if scope == "lag" else "Ethernet1"
+    wire = "lag-config" if scope == "lag" else "switchport"
+    revision = (await _prepare(adapter_client, device_id, scope, {root: [100]})).json()["selection_revision"]
+    assert (await _apply(adapter_client, device_id, {scope: revision})).status_code == 202
+    device_state = {}
+    client, rec = recorded_client("prepared-residue", device_state=device_state)
+    assert (await job_row(await run_head(device_id, client))).status.value == "succeeded"
+    previous = rec.documents[-1]
+    client.get_service_config.return_value = previous
+    device_state[wire] = {"status": "ok", **(previous[scope] if survives else {})}
+    response = await _prepare(
+        adapter_client,
+        device_id,
+        scope,
+        {} if remove_root else {root: []},
+        deleted_roots=[root] if remove_root else [],
+    )
+    assert response.status_code == 200, response.text
+    assert (await _apply(adapter_client, device_id, {scope: response.json()["selection_revision"]})).status_code == 202
+    job = await job_row(await run_head(device_id, client))
+    assert job.status.value == "succeeded", job.error
+    assert job.result["residue_check"] == ("found" if survives else "clean")
