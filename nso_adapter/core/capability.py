@@ -424,6 +424,7 @@ _REJECTION_CONSTRUCTS = (
     ("rm-match", "match length", "match length"),
     ("rm-match", "match as-path", "match as-path"),
     ("community", "ip large-community-list", "ip large-community-list"),
+    ("community", "ip community-list", "ip community-list"),
 )
 
 
@@ -502,8 +503,6 @@ def parse_rejected_construct(message: str):
         return "rm-set", " ".join(cmd.split()[:3])
     if low.startswith("match "):
         return "rm-match", " ".join(cmd.split()[:3])
-    if "community-list" in low:
-        return "community", " ".join(cmd.split()[:3])
     return None, None
 
 

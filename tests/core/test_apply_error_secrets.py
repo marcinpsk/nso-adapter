@@ -282,22 +282,34 @@ async def test_a_blocked_removal_keeps_the_device_delta_out_of_the_job_error(ada
 
 _NED = "cisco-ios-cli-6.95"
 _SW = "15.5"
-_REJECTION = (
-    f"external error (device {_DEVICE}) Aborted: syntax error\n"
-    "command: set extcommunity color 12\n"
-    f"config: snmp-server community {_SECRET} RO\n"
+
+
+def _rejection(command: str) -> str:
+    return (
+        f"external error (device {_DEVICE}) Aborted: syntax error\n"
+        f"command: {command}\n"
+        f"config: snmp-server community {_SECRET} RO\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "construct", "member"),
+    [
+        ("set extcommunity color 12", ("rm-set", "set extcommunity color"), None),
+        ("ip community-list standard CL permit 65000:1", ("community", "ip community-list"), "65000:1"),
+    ],
 )
-
-
 async def test_a_device_rejection_attributes_its_construct_and_keeps_no_device_text(
-    adapter_client, monkeypatch, recorded_logs
+    adapter_client, monkeypatch, recorded_logs, command, construct, member
 ):
     """Redaction must not cost the capability verdict the rejection is the only source of.
 
     A dry-run renders an unsupported route-policy construct cleanly, so the commit error is
     the one place the device names it. The construct identifier survives; the rest does not.
+    A community construct must also reach the KIND index preflight reads, or the next attach
+    of a community the device just rejected reports full support.
     """
-    from nso_adapter.core.capability import get_device_capability
+    from nso_adapter.core.capability import get_device_capability, preflight
     from nso_adapter.store.models import Device, RoutePolicyObjectIntent
 
     device_id, row = await _community()
@@ -310,7 +322,7 @@ async def test_a_device_rejection_attributes_its_construct_and_keeps_no_device_t
             )
         )
         await db.commit()
-    body = {"ietf-restconf:errors": {"error": [{"error-message": _REJECTION}]}}
+    body = {"ietf-restconf:errors": {"error": [{"error-message": _rejection(command)}]}}
 
     def respond(request):
         if request.method == "GET":
@@ -325,7 +337,10 @@ async def test_a_device_rejection_attributes_its_construct_and_keeps_no_device_t
         recorded = {(r.scope, r.name): r for r in await get_device_capability(db, _NED, _SW) if r.source == "apply"}
         stored = await db.get(SnmpCommunityIntent, row.id)
     assert job.status == JobStatus.failed
-    assert ("rm-set", "set extcommunity color") in recorded, f"the construct was not attributed: {sorted(recorded)}"
+    assert construct in recorded, f"the construct was not attributed: {sorted(recorded)}"
+    if member is not None:
+        verdict = preflight(list(recorded.values()), community_members=[member])
+        assert verdict["fully_supported"] is False, f"preflight claims support for the rejected {member!r}"
     surfaces = [
         json.dumps(job.error),
         json.dumps(stored.last_apply_error),

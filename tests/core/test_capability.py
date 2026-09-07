@@ -271,6 +271,16 @@ def test_parse_rejected_construct():
     assert parse_rejected_construct("no command here") == (None, None)
     # A rejection whose command is the LAST line (no trailing newline) must still parse (#20).
     assert parse_rejected_construct("aborted: command: set tag 5") == ("rm-set", "set tag")
+    # Community lists resolve to a FIXED identifier: the redaction allowlist is built from the
+    # same table, so a name derived from the device's own text could never survive it.
+    assert parse_rejected_construct("command: ip community-list standard CL permit 65000:1") == (
+        "community",
+        "ip community-list",
+    )
+    assert parse_rejected_construct("command: ip large-community-list expanded CL permit .*") == (
+        "community",
+        "ip large-community-list",
+    )
 
 
 @pytest.mark.asyncio
