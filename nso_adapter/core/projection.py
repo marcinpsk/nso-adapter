@@ -148,10 +148,9 @@ _SECTION_TABLES: dict[str, tuple[_Spec, ...]] = {
         _Spec(OspfInterfaceIntent),
         _Spec(RedistributionIntent, discriminator=("dest_protocol", "ospf")),
     ),
-    # Prepared by an Apply POST rather than an intent PUT (#1612): no receipt lane, no
-    # discriminator and no lifecycle carrier, and every identity comes from the schema.
+    # Switching snapshots have no receipt lane, discriminator, or lifecycle carrier.
     "switchport": (_Spec(SwitchportIntent), _Spec(SwitchportTaggedVlanIntent, parent=SwitchportIntent)),
-    "lag": (_Spec(LagBundleIntent), _Spec(LagMemberIntent, parent=LagBundleIntent)),
+    "lag": (_Spec(LagBundleIntent, identity=("name",)), _Spec(LagMemberIntent, parent=LagBundleIntent)),
     "interface_config": (
         _Spec(InterfaceIntent, parent=DbInterface),
         _Spec(InterfaceIpIntent, parent=DbInterface),

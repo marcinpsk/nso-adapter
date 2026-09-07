@@ -726,8 +726,8 @@ def test_the_two_out_of_protocol_streams_are_the_only_streams_without_an_endpoin
         assert section_streams(stream) == (stream,), "an out-of-protocol section is never split"
 
 
-def test_the_switching_identities_come_from_the_schema():
-    """No `identity=`: each switching table has one unique constraint holding its scope."""
+def test_the_switching_identities_use_the_durable_root_and_child_keys():
+    """The LAG name stays the document key when its numeric ID is also unique."""
     from nso_adapter.core.projection import _SECTION_TABLES, _identity_fields
 
     identities = {
@@ -742,7 +742,7 @@ def test_the_switching_identities_come_from_the_schema():
         "lag_member_intent": ("interface_name",),
     }
     assert all(
-        spec.identity is None and spec.discriminator is None and not spec.lifecycle
+        spec.discriminator is None and not spec.lifecycle
         for section in ("switchport", "lag")
         for spec in _SECTION_TABLES[section]
     )

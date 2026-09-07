@@ -47,7 +47,7 @@ def _seed_stream(connection, *, desired_revision: int) -> int:
 
 def test_prepared_slot_migration_adds_three_nullable_columns_and_two_checks(pg_provisioner):
     module = _module()
-    assert module.down_revision == "a5c7e9b1d3f6"
+    assert module.down_revision == "b7d9f1a3c5e8"
     assert_single_head_containing(module.revision)
 
     with private_database(pg_provisioner, "prepared_slot") as sync_url:

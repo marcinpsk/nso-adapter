@@ -3,7 +3,7 @@
 """Add the prepared projection slot for the out-of-protocol switching streams.
 
 Revision ID: b3d9f2a6c410
-Revises: a5c7e9b1d3f6
+Revises: b7d9f1a3c5e8
 Create Date: 2026-09-05
 """
 
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "b3d9f2a6c410"
-down_revision: str | None = "a5c7e9b1d3f6"
+down_revision: str | None = "b7d9f1a3c5e8"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

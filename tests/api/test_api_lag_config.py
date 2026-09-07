@@ -192,7 +192,7 @@ async def test_apply_lag_config_full_replace_reports_removed_roots(adapter_clien
     device_id = await seed_device(nso_device_name="lag-full-replace", netbox_device_id=1112)
     first = {
         "bundles": [
-            {"name": "Port-channel1", "lag_id": 7},
+            {"name": "Port-channel1", "lag_id": 6},
             {"name": "Port-channel2", "lag_id": 7},
         ],
         "deleted_roots": [],
@@ -597,3 +597,75 @@ async def test_apply_lag_config_requires_an_explicit_deletion_authority(adapter_
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "validation_error"
     assert await _stream_row(device_id) is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("leaf", ["mode", "timer"])
+async def test_apply_lag_rejects_invalid_lacp_leaf(adapter_client, leaf):
+    device_id = await seed_device(nso_device_name="lag-invalid-leaf", netbox_device_id=None)
+    bundle = {"name": "Port-channel1", "lag_id": 1}
+    if leaf == "mode":
+        bundle["members"] = [{"interface_name": "Gi0/1", "mode": "invalid"}]
+    else:
+        bundle["timer"] = "invalid"
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/lag-config/apply", json={"bundles": [bundle], "deleted_roots": []}, headers=AUTH
+    )
+    assert response.status_code == 422
+    assert await _stream_row(device_id) is None
+    async with session() as db:
+        assert await db.scalar(text("SELECT count(*) FROM lag_bundle_intent")) == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["active", "passive", "on", "", None])
+@pytest.mark.parametrize("timer", ["fast", "slow", "", None])
+async def test_apply_lag_renders_supported_lacp_leaves(adapter_client, mode, timer):
+    from nso_adapter.core.projection import hydrate_section
+    from nso_adapter.core.switching_intent import encode_lag_section
+
+    device_id = await seed_device(nso_device_name="lag-valid-leaves", netbox_device_id=None)
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/lag-config/apply",
+        json={
+            "bundles": [
+                {
+                    "name": "Port-channel1",
+                    "lag_id": 1,
+                    "timer": timer,
+                    "members": [{"interface_name": "Gi0/1", "mode": mode}],
+                }
+            ],
+            "deleted_roots": [],
+        },
+        headers=AUTH,
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "prepared"
+    row = await _stream_row(device_id)
+    document = {"lag": row.prepared_tables}
+    context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
+    rendered = encode_lag_section(hydrate_section(document, "lag"), context)["bundle"][0]
+    assert rendered == {
+        "name": "Port-channel1",
+        "lag-id": 1,
+        **({"timer": timer} if timer else {}),
+        "member": [{"interface-name": "Gi0/1", **({"mode": mode} if mode else {})}],
+    }
+
+
+@pytest.mark.anyio
+async def test_apply_lag_rejects_duplicate_ids_without_mutation(adapter_client):
+    device_id = await seed_device(nso_device_name="lag-api-duplicate-id", netbox_device_id=None)
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/lag-config/apply",
+        json={
+            "bundles": [{"name": "Port-channel1", "lag_id": 7}, {"name": "Port-channel2", "lag_id": 7}],
+            "deleted_roots": [],
+        },
+        headers=AUTH,
+    )
+    assert response.status_code == 422
+    assert await _stream_row(device_id) is None
+    async with session() as db:
+        assert await db.scalar(text("SELECT count(*) FROM lag_bundle_intent")) == 0
