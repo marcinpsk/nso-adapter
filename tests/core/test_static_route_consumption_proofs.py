@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from nso_adapter.core.static_route_reader import certified_static_route_section
+from nso_adapter.nso.client import ServiceInstanceState
 from tests.conftest import seed_device, session
 from tests.core.removal_helpers import seed_removal_job, seed_tomb
 from tests.core.static_route_harness import K as K_KEY
@@ -34,15 +35,6 @@ def _reader(state) -> object:
     client = SimpleNamespace()
     client.service_instance_state = AsyncMock(return_value=state)
     return client
-
-
-class _State:
-    def __init__(self, status: str, entry):
-        self.status, self.entry = status, entry
-
-    @property
-    def inconclusive(self) -> bool:
-        return self.status == "inconclusive"
 
 
 _DEVICE = SimpleNamespace(id=1, nso_device_name="reader-dev")
@@ -83,12 +75,13 @@ async def test_the_reader_projects_the_aggregate_container_and_refuses_a_legacy_
     keeps up to date, so it refuses instead.
     """
     aggregate = await certified_static_route_section(
-        _reader(_State("present", {"device": "reader-dev", "static-route": {"route": [wire(A)]}})), _DEVICE
+        _reader(ServiceInstanceState("present", {"device": "reader-dev", "static-route": {"route": [wire(A)]}})),
+        _DEVICE,
     )
     assert (aggregate.status, aggregate.entry, aggregate.routes) == ("present", {"route": [wire(A)]}, [wire(A)])
 
     legacy = await certified_static_route_section(
-        _reader(_State("present", {"device": "reader-dev", "route": [wire(A)]})), _DEVICE
+        _reader(ServiceInstanceState("present", {"device": "reader-dev", "route": [wire(A)]})), _DEVICE
     )
     assert legacy.inconclusive and legacy.entry is None
 
@@ -161,12 +154,14 @@ async def test_the_aggregate_read_serves_both_consumers_and_no_legacy_path(adapt
 async def test_an_empty_container_certifies_absence_and_an_uncertifiable_read_does_not():
     """``absent`` is conclusive; anything uncertifiable refuses every consumer."""
     empty_instance = await certified_static_route_section(
-        _reader(_State("present", {"device": "reader-dev", "static-route": {}})), _DEVICE
+        _reader(ServiceInstanceState("present", {"device": "reader-dev", "static-route": {}})), _DEVICE
     )
-    no_family = await certified_static_route_section(_reader(_State("present", {"device": "reader-dev"})), _DEVICE)
+    no_family = await certified_static_route_section(
+        _reader(ServiceInstanceState("present", {"device": "reader-dev"})), _DEVICE
+    )
     assert (no_family.status, no_family.routes) == ("absent", [])
-    no_instance = await certified_static_route_section(_reader(_State("absent", None)), _DEVICE)
-    unreadable = await certified_static_route_section(_reader(_State("inconclusive", None)), _DEVICE)
+    no_instance = await certified_static_route_section(_reader(ServiceInstanceState("absent", None)), _DEVICE)
+    unreadable = await certified_static_route_section(_reader(ServiceInstanceState("inconclusive", None)), _DEVICE)
 
     assert (empty_instance.status, empty_instance.routes) == ("absent", [])
     assert (no_instance.status, no_instance.routes) == ("absent", [])
@@ -194,7 +189,7 @@ async def test_a_malformed_section_is_inconclusive_and_never_a_certified_absence
     projection that iterated it would walk the object's KEYS, drop them all and certify that
     the service holds nothing.
     """
-    section = await certified_static_route_section(_reader(_State("present", entry)), _DEVICE)
+    section = await certified_static_route_section(_reader(ServiceInstanceState("present", entry)), _DEVICE)
 
     assert section.inconclusive, label
     assert section.entry is None
@@ -203,7 +198,7 @@ async def test_a_malformed_section_is_inconclusive_and_never_a_certified_absence
 async def test_a_well_formed_empty_route_list_still_certifies_absence():
     """The negative control: an empty list is a shape the reader understands, so it certifies."""
     for entry in ({"device": "reader-dev"}, {"device": "reader-dev", "static-route": {"route": []}}):
-        section = await certified_static_route_section(_reader(_State("present", entry)), _DEVICE)
+        section = await certified_static_route_section(_reader(ServiceInstanceState("present", entry)), _DEVICE)
         assert (section.status, section.routes) == ("absent", [])
 
 
@@ -249,7 +244,10 @@ def test_the_shared_reader_is_the_only_certified_static_route_reader():
     """
     callers = set()
     for path in (_REPO_ROOT / "nso_adapter").rglob("*.py"):
-        if path.name in {"client.py", "static_route_reader.py"}:
+        if path.relative_to(_REPO_ROOT).as_posix() in {
+            "nso_adapter/nso/client.py",
+            "nso_adapter/core/static_route_reader.py",
+        }:
             continue
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
