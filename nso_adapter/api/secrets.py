@@ -5,12 +5,20 @@
 The adapter is the only component that WRITES Vault; the NSO snmp-reconciler
 reads refs at commit time and the plugin stores refs only. Plaintext transits
 these endpoints transiently (``SecretStr`` bodies, no body logging) and is
-never persisted, returned, or interpolated into errors — responses carry only
-refs, field names, KV v2 versions and ``sha256[:16]`` fingerprints (the same
-digest the read mirror publishes as the community identity).
+never persisted, returned, or interpolated into errors.
+
+Neither is the REFERENCE, nor any component of it. ``vault_ref`` and the
+``values`` keys are free-form caller strings that name a mount, a path and a
+field, so a caller that pastes a secret into one would read it back out of the
+answer and out of every log that recorded the answer. Every response and every
+record carries an adapter-minted ``operation_id`` instead: it joins the record
+to the answer, and it is ours. What Vault itself reports back (field names,
+fingerprints, KV v2 versions) is not a caller echo and still travels.
 """
 
 from __future__ import annotations
+
+from uuid import uuid4
 
 import anyio.to_thread
 import structlog
@@ -45,9 +53,8 @@ class SecretWriteRequest(BaseModel):
 
 
 class SecretWriteOut(BaseModel):
-    vault_ref: str
+    operation_id: str  # the adapter-minted handle joining this answer to its log record
     version: int
-    hashes: dict[str, str]  # field → sha256[:16] fingerprint
 
 
 class SecretVerifyRequest(BaseModel):
@@ -55,7 +62,7 @@ class SecretVerifyRequest(BaseModel):
 
 
 class SecretVerifyOut(BaseModel):
-    vault_ref: str
+    operation_id: str
     exists: bool
     fields: list[str]
     hashes: dict[str, str]
@@ -68,11 +75,21 @@ class HarvestCommunityRequest(BaseModel):
 
 
 class HarvestCommunityOut(BaseModel):
-    vault_ref: str
+    operation_id: str
     secret_hash: str
     version: int
     access: str
     acl: str | None
+
+
+def _operation_id() -> str:
+    """Mint the correlation handle for one secrets operation.
+
+    A reference names a mount, a path and a key, and the caller chooses all three, so no
+    part of it may reach a log record or a response body. An operator still has to join a
+    record to the answer the caller got, and this id is that join.
+    """
+    return uuid4().hex[:12]
 
 
 def _vault_provider(request: Request):
@@ -136,19 +153,19 @@ async def set_secret(body: SecretWriteRequest, request: Request) -> SecretWriteO
     provider = _vault_provider(request)
     ref = _parse_ref(body.vault_ref)
     if ref.key is not None and set(body.values) != {ref.key}:
+        # Both halves of the mismatch are the caller's own strings, so the refusal states the
+        # rule. The caller holds the ref and the field names it sent and needs neither back.
         raise api_error(
             400,
             "invalid_vault_ref",
-            f"ref names key {ref.key!r} but values carry fields {sorted(body.values)!r}",
+            "a vault_ref ending in '#<key>' requires values to carry exactly that one field",
         )
 
     plain = {field: value.get_secret_value() for field, value in body.values.items()}
     version = await _vault_op(lambda: provider.write_path(ref.mount, ref.path, plain))
-    hashes = {field: secret_fingerprint(value) for field, value in plain.items()}
-    # The ref names a mount, a path and a key. The mount is the scope the operator filters on;
-    # the path locates the secret, so it is not logged.
-    logger.info("secrets.set", vault_mount=ref.mount, fields=sorted(plain), version=version)
-    return SecretWriteOut(vault_ref=body.vault_ref, version=version, hashes=hashes)
+    operation_id = _operation_id()
+    logger.info("secrets.set", operation_id=operation_id, version=version)
+    return SecretWriteOut(operation_id=operation_id, version=version)
 
 
 @router.post(
@@ -166,8 +183,12 @@ async def verify_secret(body: SecretVerifyRequest, request: Request) -> SecretVe
         data = {ref.key: data[ref.key]} if ref.key in data else {}
     if not data:
         version = None
+    operation_id = _operation_id()
+    # The field names and fingerprints are what VAULT holds, not what the caller sent, and the
+    # verify exists to report them. Nothing of the submitted ref is echoed.
+    logger.info("secrets.verify", operation_id=operation_id, exists=bool(data), version=version)
     return SecretVerifyOut(
-        vault_ref=body.vault_ref,
+        operation_id=operation_id,
         exists=bool(data),
         fields=sorted(data),
         hashes={field: secret_fingerprint(value) for field, value in data.items()},
@@ -241,16 +262,17 @@ async def harvest_community(
         )
 
     version = await _vault_op(lambda: provider.write_path(ref.mount, ref.path, {ref.key: found.secret}))
-    # device + community_hash identify the harvest; the mount is the scope. The path is not logged.
+    operation_id = _operation_id()
+    # The device is the adapter's own row and the hash is a fingerprint; no part of the ref.
     logger.info(
         "secrets.harvest_community",
+        operation_id=operation_id,
         device=device.nso_device_name,
         community_hash=body.community_hash,
-        vault_mount=ref.mount,
         version=version,
     )
     return HarvestCommunityOut(
-        vault_ref=body.vault_ref,
+        operation_id=operation_id,
         secret_hash=secret_fingerprint(found.secret),
         version=version,
         access=found.access,

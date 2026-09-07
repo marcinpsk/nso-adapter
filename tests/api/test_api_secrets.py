@@ -190,7 +190,7 @@ async def test_a_slow_vault_write_does_not_stall_the_event_loop(vault_client):
 
 
 @pytest.mark.anyio
-async def test_set_secret_writes_vault_and_returns_hashes(vault_client):
+async def test_set_secret_writes_vault_and_reports_the_version(vault_client):
     client, store, _ = vault_client
     resp = await client.post(
         "/api/v1/secrets",
@@ -200,12 +200,12 @@ async def test_set_secret_writes_vault_and_returns_hashes(vault_client):
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["vault_ref"] == "network/netbox/snmp/v3/monitor"
     assert body["version"] == 1
-    assert body["hashes"] == {"auth": _h("hunter2"), "priv": _h("hunter3")}
+    assert body["operation_id"], "the answer must still be joinable to its log record"
     assert store["netbox/snmp/v3/monitor"] == {"auth": "hunter2", "priv": "hunter3"}
-    # the response never carries the values
-    assert "hunter2" not in resp.text and "hunter3" not in resp.text
+    # the response never carries the values, the ref, or the field names the caller chose
+    for echoed in ("hunter2", "hunter3", "network/netbox/snmp/v3/monitor", "auth", "priv"):
+        assert echoed not in resp.text
 
 
 @pytest.mark.anyio
@@ -217,8 +217,10 @@ async def test_set_secret_keyed_ref_writes_that_field(vault_client):
     )
 
     assert resp.status_code == 200
-    assert resp.json()["hashes"] == {"community": _h("s3cr3t-comm")}
+    assert resp.json()["version"] == 1
     assert store["netbox/snmp/community/abc123"] == {"community": "s3cr3t-comm"}
+    for echoed in ("s3cr3t-comm", ref, "abc123", "community"):
+        assert echoed not in resp.text
 
 
 @pytest.mark.anyio
@@ -231,8 +233,10 @@ async def test_set_secret_keyed_ref_rejects_other_fields(vault_client):
     )
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "invalid_vault_ref"
-    assert "v" == "v" and "other" in resp.text  # field NAME may appear...
-    assert "s3cr3t" not in resp.text  # ...values never
+    # Both halves of the mismatch are the caller's own strings: the refusal states the rule.
+    for echoed in ("other", "network/p#community", "s3cr3t"):
+        assert echoed not in resp.text
+    assert "exactly that one field" in resp.json()["error"]["message"]
 
 
 @pytest.mark.anyio
@@ -413,13 +417,14 @@ async def test_harvest_community_ios_happy_path(vault_client):
 
     assert resp.status_code == 200
     body = resp.json()
+    assert body.pop("operation_id"), "the answer must still be joinable to its log record"
     assert body == {
-        "vault_ref": ref,
         "secret_hash": target_hash,
         "version": 1,
         "access": "RO",
         "acl": "20",
     }
+    assert ref not in resp.text, "the harvest answered with the caller's own reference"
     assert store[f"netbox/snmp/community/{target_hash}"] == {"community": "s3cr3t-comm"}
     assert "s3cr3t-comm" not in resp.text
     # the GET was the targeted per-NED community subtree, not the full device config
@@ -507,22 +512,25 @@ async def test_a_vault_failure_puts_no_reference_or_provider_text_in_the_502(vau
     assert_chain_free_of(caught.value, leaked)
 
 
-# ── the reference is not a log field ─────────────────────────────────────────
+# ── no reference component is a log field or a response field ────────────────
 
+_REF_MOUNT = "network"
+_REF_KEY = "placeholder-key"
 _REF_PATH = "placeholder-path/placeholder-leaf"
-_REF = f"network/{_REF_PATH}#placeholder-key"
-# The mount and the key stay loggable: the mount is the scope, and the key is the field
-# name the write reports. Only the locating path and the plaintext must never appear.
-_REF_LOCATORS = [_REF, _REF_PATH, "placeholder-path", "placeholder-leaf", "placeholder-secret"]
+_REF = f"{_REF_MOUNT}/{_REF_PATH}#{_REF_KEY}"
+#: Every component of the reference, plus the plaintext. The caller chose all of them, so a
+#: caller that pastes a secret into any of them would read it back out of the answer or out
+#: of whatever recorded the answer. Round 2 allowed the mount and the key; both leak.
+_REF_LOCATORS = [_REF, _REF_PATH, _REF_MOUNT, _REF_KEY, "placeholder-path", "placeholder-leaf", "placeholder-secret"]
 
 
 @pytest.mark.anyio
-async def test_a_SUCCESSFUL_set_puts_no_part_of_the_REFERENCE_PATH_in_the_logs(vault_client):
-    """The success path logged the complete ref, which the failure path already refuses to.
+async def test_a_SUCCESSFUL_set_echoes_no_REFERENCE_COMPONENT_anywhere(vault_client):
+    """The success path still logged the mount and the field names and returned the whole ref.
 
-    A ref names a Vault mount, a path and a key. Whoever reads the adapter log then knows
-    exactly where every secret the adapter writes lives. The mount is the scope the operator
-    needs, and the field names already say what was written.
+    A ref names a Vault mount, a path and a key, and the caller chose all three. Whoever reads
+    the adapter log, or the answer, then knows exactly where every secret the adapter writes
+    lives — and a caller that pastes a secret into the ref reads it straight back.
     """
     from structlog.testing import capture_logs
 
@@ -532,23 +540,24 @@ async def test_a_SUCCESSFUL_set_puts_no_part_of_the_REFERENCE_PATH_in_the_logs(v
     with capture_logs() as logs:
         resp = await client.post(
             "/api/v1/secrets",
-            json={"vault_ref": _REF, "values": {"placeholder-key": "placeholder-secret"}},
+            json={"vault_ref": _REF, "values": {_REF_KEY: "placeholder-secret"}},
             headers=AUTH,
         )
 
     assert resp.status_code == 200
-    assert store[_REF_PATH] == {"placeholder-key": "placeholder-secret"}, "the write must still land"
+    assert store[_REF_PATH] == {_REF_KEY: "placeholder-secret"}, "the write must still land"
     written = [record for record in logs if record["event"] == "secrets.set"]
     assert written, "the write was not reported at all"
     assert_records_free_of(logs, _REF_LOCATORS)
-    assert written[0]["vault_mount"] == "network", "the scope is the half the operator needs"
-    assert written[0]["fields"] == ["placeholder-key"]
+    for echoed in _REF_LOCATORS:
+        assert echoed not in resp.text, "the answer repeats a component of the caller's reference"
     assert written[0]["version"] == 1
+    assert written[0]["operation_id"] == resp.json()["operation_id"], "the record must join to the answer"
 
 
 @pytest.mark.anyio
-async def test_a_SUCCESSFUL_harvest_puts_no_part_of_the_REFERENCE_PATH_in_the_logs(vault_client):
-    """Same sink on the harvest side, where the ref points at an adopted community."""
+async def test_a_SUCCESSFUL_harvest_echoes_no_REFERENCE_COMPONENT_anywhere(vault_client):
+    """Same sinks on the harvest side, where the ref points at an adopted community."""
     from structlog.testing import capture_logs
 
     from tests._secret_discipline import assert_records_free_of
@@ -568,13 +577,62 @@ async def test_a_SUCCESSFUL_harvest_puts_no_part_of_the_REFERENCE_PATH_in_the_lo
         )
 
     assert resp.status_code == 200
-    assert store[_REF_PATH] == {"placeholder-key": "placeholder-secret"}, "the harvest must still land"
+    assert store[_REF_PATH] == {_REF_KEY: "placeholder-secret"}, "the harvest must still land"
     harvested = [record for record in logs if record["event"] == "secrets.harvest_community"]
     assert harvested, "the harvest was not reported at all"
     assert_records_free_of(logs, _REF_LOCATORS)
-    assert harvested[0]["device"] == "harvest-dev", "the device is the half the operator needs"
+    for echoed in _REF_LOCATORS:
+        assert echoed not in resp.text, "the answer repeats a component of the caller's reference"
+    assert harvested[0]["device"] == "harvest-dev", "the device is the adapter's own row"
     assert harvested[0]["community_hash"] == target_hash
-    assert harvested[0]["vault_mount"] == "network"
+    assert harvested[0]["operation_id"] == resp.json()["operation_id"], "the record must join to the answer"
+
+
+@pytest.mark.anyio
+async def test_a_SUCCESSFUL_verify_echoes_no_REFERENCE_COMPONENT_anywhere(vault_client):
+    """The verify echoed the submitted ref too; what VAULT holds is not a caller echo."""
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    client, store, _ = vault_client
+    store[_REF_PATH] = {_REF_KEY: "placeholder-secret"}
+
+    with capture_logs() as logs:
+        resp = await client.post("/api/v1/secrets/verify", json={"vault_ref": _REF}, headers=AUTH)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["exists"] is True
+    assert body["hashes"] == {_REF_KEY: _h("placeholder-secret")}, "what Vault holds is the point of the verify"
+    assert_records_free_of(logs, _REF_LOCATORS)
+    for echoed in (_REF, _REF_PATH, _REF_MOUNT, "placeholder-path", "placeholder-leaf", "placeholder-secret"):
+        assert echoed not in resp.text, "the answer repeats a component of the caller's reference"
+    verified = [record for record in logs if record["event"] == "secrets.verify"]
+    assert verified, "the verify was not reported at all"
+    assert verified[0]["operation_id"] == body["operation_id"], "the record must join to the answer"
+
+
+@pytest.mark.anyio
+async def test_an_INVALID_values_ENTRY_keeps_the_callers_key_out_of_the_422(vault_client):
+    """Pydantic reports a bad map entry at ``("body", "values", <key>)``.
+
+    The key is the caller's own string. A caller that named the entry after the secret read
+    it straight back out of the validation location.
+    """
+    client, _store, _ = vault_client
+
+    resp = await client.post(
+        "/api/v1/secrets",
+        json={"vault_ref": _REF, "values": {"placeholder-secret": {"nested": 1}}},
+        headers=AUTH,
+    )
+
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
+    assert "placeholder-secret" not in resp.text, "the 422 location repeats the caller's map key"
+    locations = [error["loc"] for error in resp.json()["error"]["detail"]["errors"]]
+    assert ["body", "values", "[redacted]"] in locations, "the operator must still learn WHERE it broke"
 
 
 # ── a malformed reference is never echoed back ───────────────────────────────
