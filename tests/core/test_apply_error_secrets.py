@@ -293,21 +293,34 @@ def _rejection(command: str) -> str:
 
 
 @pytest.mark.parametrize(
-    ("command", "construct", "member"),
+    ("command", "construct", "condemned", "cleared"),
     [
-        ("set extcommunity color 12", ("rm-set", "set extcommunity color"), None),
-        ("ip community-list standard CL permit 65000:1", ("community", "ip community-list"), "65000:1"),
+        ("set extcommunity color 12", ("rm-set", "set extcommunity color"), None, None),
+        (
+            "ip community-list standard CL permit 65000:1",
+            ("community", "ip community-list standard"),
+            "65000:1",
+            "^65000:",
+        ),
+        (
+            "ip community-list expanded CL permit ^65000:",
+            ("community", "ip community-list expanded"),
+            "^65000:",
+            "65000:1",
+        ),
     ],
 )
 async def test_a_device_rejection_attributes_its_construct_and_keeps_no_device_text(
-    adapter_client, monkeypatch, recorded_logs, command, construct, member
+    adapter_client, monkeypatch, recorded_logs, command, construct, condemned, cleared
 ):
     """Redaction must not cost the capability verdict the rejection is the only source of.
 
     A dry-run renders an unsupported route-policy construct cleanly, so the commit error is
     the one place the device names it. The construct identifier survives; the rest does not.
-    A community construct must also reach the KIND index preflight reads, or the next attach
-    of a community the device just rejected reports full support.
+    A community construct must also reach the KIND index preflight reads with the kind the
+    rejected LIST carries. One identifier for both community-list forms condemned the wrong
+    members either way: a rejected regex kept passing, and standard members the device never
+    refused were reported unsupported.
     """
     from nso_adapter.core.capability import get_device_capability, preflight
     from nso_adapter.store.models import Device, RoutePolicyObjectIntent
@@ -337,10 +350,13 @@ async def test_a_device_rejection_attributes_its_construct_and_keeps_no_device_t
         recorded = {(r.scope, r.name): r for r in await get_device_capability(db, _NED, _SW) if r.source == "apply"}
         stored = await db.get(SnmpCommunityIntent, row.id)
     assert job.status == JobStatus.failed
+    if condemned is not None:
+        verdict = preflight(list(recorded.values()), community_members=[condemned])
+        assert verdict["fully_supported"] is False, f"preflight claims support for the rejected {condemned!r}"
+    if cleared is not None:
+        verdict = preflight(list(recorded.values()), community_members=[cleared])
+        assert verdict["fully_supported"] is True, f"preflight condemns {cleared!r}, which the device never refused"
     assert construct in recorded, f"the construct was not attributed: {sorted(recorded)}"
-    if member is not None:
-        verdict = preflight(list(recorded.values()), community_members=[member])
-        assert verdict["fully_supported"] is False, f"preflight claims support for the rejected {member!r}"
     surfaces = [
         json.dumps(job.error),
         json.dumps(stored.last_apply_error),

@@ -272,15 +272,37 @@ def test_parse_rejected_construct():
     # A rejection whose command is the LAST line (no trailing newline) must still parse (#20).
     assert parse_rejected_construct("aborted: command: set tag 5") == ("rm-set", "set tag")
     # Community lists resolve to a FIXED identifier: the redaction allowlist is built from the
-    # same table, so a name derived from the device's own text could never survive it.
+    # same table, so a name derived from the device's own text could never survive it. Each
+    # form keeps its own identifier, because the identifier is what states the member kind.
     assert parse_rejected_construct("command: ip community-list standard CL permit 65000:1") == (
         "community",
-        "ip community-list",
+        "ip community-list standard",
+    )
+    assert parse_rejected_construct("command: ip community-list expanded CL permit ^65000:") == (
+        "community",
+        "ip community-list expanded",
     )
     assert parse_rejected_construct("command: ip large-community-list expanded CL permit .*") == (
         "community",
         "ip large-community-list",
     )
+    # A numbered list names its kind by a NUMBER, which is device text the redaction may not
+    # keep, so it is not attributed at all rather than attributed to a guessed kind.
+    assert parse_rejected_construct("command: ip community-list 100 permit ^65000:") == (None, None)
+
+
+def test_a_community_list_row_indexes_under_the_kind_its_list_carries():
+    """A rejection names a LIST. Kinding it as a member reads every identifier as 'standard'."""
+    from nso_adapter.core.capability import preflight
+
+    for name, condemned, cleared in (
+        ("ip community-list standard", "65000:1", "^65000:"),
+        ("ip community-list expanded", "^65000:", "65000:1"),
+        ("ip large-community-list", "large:65000:1:2", "65000:1"),
+    ):
+        rows = [_row("community", name, "unsupported")]
+        assert preflight(rows, community_members=[condemned])["fully_supported"] is False, name
+        assert preflight(rows, community_members=[cleared])["fully_supported"] is True, name
 
 
 @pytest.mark.asyncio

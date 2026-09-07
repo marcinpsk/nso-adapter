@@ -299,6 +299,21 @@ def _community_kind(member: str) -> str:
     return "regex" if any(c in _REGEX_META for c in member_str) else "standard"
 
 
+#: Community-list COMMAND identifier → the member kind that list carries. A rejection names a
+#: list, not a member, and no identifier here holds a regex metacharacter, so _community_kind
+#: reads them all as "standard". One identifier per form: the identifier is what states the kind.
+_COMMAND_COMMUNITY_KINDS = {
+    "ip community-list standard": "standard",
+    "ip community-list expanded": "regex",
+    "ip large-community-list": "large",
+}
+
+
+def _row_community_kind(name: str) -> str:
+    """Kind of a ``community`` capability row, whether it names a member or a list command."""
+    return _COMMAND_COMMUNITY_KINDS.get(str(name).strip()) or _community_kind(name)
+
+
 def _index_rows(rows: Any) -> tuple[dict[str, tuple[str, str]], dict[tuple[str, str], tuple[str, str]]]:
     """Build (community kind→(status,detail), construct (scope,name)→(status,detail)) maps.
 
@@ -308,7 +323,7 @@ def _index_rows(rows: Any) -> tuple[dict[str, tuple[str, str]], dict[tuple[str, 
     construct: dict[tuple[str, str], tuple[str, str]] = {}
     for r in rows:
         if r.scope == "community":
-            k = _community_kind(r.name)
+            k = _row_community_kind(r.name)
             cur = kind.get(k)
             if cur is None or _RANK.get(r.status, 0) > _RANK.get(cur[0], 0):
                 kind[k] = (r.status, r.detail)
@@ -423,8 +438,8 @@ _REJECTION_CONSTRUCTS = (
     ("rm-match", "match local-preference", "match local-preference"),
     ("rm-match", "match length", "match length"),
     ("rm-match", "match as-path", "match as-path"),
-    ("community", "ip large-community-list", "ip large-community-list"),
-    ("community", "ip community-list", "ip community-list"),
+    # Longest first: "ip community-list standard" must win over any shorter community prefix.
+    *(("community", name, name) for name in sorted(_COMMAND_COMMUNITY_KINDS, key=len, reverse=True)),
 )
 
 
