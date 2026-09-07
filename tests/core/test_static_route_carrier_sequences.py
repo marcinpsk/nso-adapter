@@ -95,7 +95,8 @@ async def _enable_auto_apply(device_id: int) -> None:
         await db.commit()
 
 
-async def test_a_deployed_only_claim_is_cleaned_up_rather_than_superseded(adapter_client):
+@pytest.mark.parametrize("auto_apply", [False, True], ids=["manual", "automatic"])
+async def test_a_deployed_only_claim_is_cleaned_up_rather_than_superseded(adapter_client, auto_apply):
     """The F2 sequence: a carrier whose key only ever gets DEPLOYED is not superseded.
 
     Supersession needs a rendered key. After a K-to-L replacement the row renders L and only
@@ -116,24 +117,31 @@ async def test_a_deployed_only_claim_is_cleaned_up_rather_than_superseded(adapte
     assert harness.fake.sent_keys() == {K, S}
     await harness.drain()
 
-    # Manual Apply must render the successor and authorize removal of its predecessor.
-    await harness.push([route(L, route_id=1), route(S, route_id=2)])
+    retained_entry = next(entry for entry in harness.fake.sent_routes() if key_of(entry) == K)
+    # The key move renders L while the abandoned carrier retains K.
+    if auto_apply:
+        await _enable_auto_apply(harness.device_id)
+    await harness.push([route(L, route_id=1), route(S, route_id=2)], delete_origin=auto_apply)
     replacement = (await generations(harness.device_id))[-1]
     await harness.run()
-    assert harness.fake.sent_keys() == {L, S}, "manual replacement transmitted the predecessor instead of L"
+    assert harness.fake.sent_keys() == {K, L, S}, "L is rendered and K is still retained by its carrier"
+    transmitted = {key_of(entry): entry for entry in harness.fake.sent_routes()}
+    assert transmitted[K] == retained_entry
+    assert (transmitted[L]["metric"], transmitted[L]["tag"]) == (10, 101)
+    assert "removal" not in replacement.document["static_route"]["_execution"].get("operation", {})
     await harness.drain()
-    assert harness.fake.sent_keys() == {L, S}
+    replacement = next(g for g in await generations(harness.device_id) if g.id == replacement.id)
+    assert replacement.status.value == "settled"
+    assert harness.fake.sent_keys() == {K, L, S}
     assert await tombstone_ids(harness.device_id) == [tomb]
     rows = replacement.document["static_route"]["static_route_intent"]
     assert len({row["id"] for row in rows}) == len(rows)
     assert {row["prefix"] for row in rows} == {L[1], S[1]}
 
-    # The sweeper first, so the cleanup takes the lower sequence, and the successor is frozen
-    # while the carrier is still live.
+    # Admit cleanup before freezing the successor while its carrier is still live.
     assert await sweep_one_device(harness.device_id) == 1
     cleanup = (await generations(harness.device_id))[-1]
-    # An operator Apply is refused while a job is queued, so the successor is frozen the one
-    # way that stays open: an auto-applied push, admitted behind the cleanup.
+    # Automatic admission can freeze a successor behind the queued cleanup.
     await _enable_auto_apply(harness.device_id)
     harness.seq += 1
     assert (await _put_vlans(harness.api, harness.device_id, [777], seq=harness.seq)).status_code == 200
@@ -156,7 +164,9 @@ async def test_a_deployed_only_claim_is_cleaned_up_rather_than_superseded(adapte
     assert K not in harness.fake.service_keys
     assert await tombstone_ids(harness.device_id) == []
 
-    await harness.drain()  # the successor, and whatever the settlement queued behind it
+    await harness.drain()
     assert harness.fake.sent_keys() == {L, S}
     assert all(key_of(entry) != K for entry in harness.fake.sent_routes())
-    assert (await generations(harness.device_id))[-1].id == successor.id
+    settled = (await generations(harness.device_id))[-1]
+    assert settled.id == successor.id
+    assert settled.status.value == "settled"

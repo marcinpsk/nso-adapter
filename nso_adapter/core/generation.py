@@ -440,9 +440,9 @@ def _fragment_deletions(
                 marking = explicit.get((table, "route_id", row["route_id"]), marking)
             key = (row.get("vrf") or "", row.get("prefix") or "", row.get("next_hop") or "")
             marking = explicit.get((table, "key", key), marking)
-            # A correlated successor replaces its predecessor through a networked write.
+            # A correlated key move is positive intent, not a removal operation.
             if row.get("route_id") in successor_route_ids:
-                marking = DELETE_ORIGIN_MARKING
+                continue
             target = networked if marking == DELETE_ORIGIN_MARKING else detached
             target.setdefault(table, []).append(row)
     return networked, detached
