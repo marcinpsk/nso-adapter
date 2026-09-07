@@ -555,6 +555,30 @@ async def test_service_instance_state_accepts_the_short_root_spelling(patch_clie
     assert state.status == "present"
 
 
+async def test_a_MISMATCHED_device_echo_never_reaches_the_refusal_record(patch_client):
+    """The echo is the server's own value, and the reader logged it verbatim.
+
+    A device-intent instance answering ``{"device": "<secret>"}`` put that value into
+    ``nso.service_instance_inconclusive``. The operator needs to know the identity did not
+    match; they do not need the string NSO sent, and the reader already knows what it asked.
+    """
+    from structlog.testing import capture_logs
+
+    from tests._secret_discipline import assert_records_free_of
+
+    echoed = "placeholder-secret-echo"
+    client = _make_client()
+    with patch_client(client, 200, {_SR_ROOT: [{**_ENTRY, "device": echoed}]}), capture_logs() as logs:
+        state = await client.service_instance_state("rtr")
+
+    assert (state.status, state.entry) == ("inconclusive", None), "a wrong-device echo is never a read"
+    refused = [record for record in logs if record["event"] == "nso.service_instance_inconclusive"]
+    assert refused, "the refusal was not reported at all"
+    assert refused[0]["device"] == "rtr", "the device we ASKED for is the half the operator needs"
+    assert refused[0]["reason"] == "the instance echoes a different device"
+    assert_records_free_of(logs, [echoed])
+
+
 async def test_service_instance_state_raises_on_a_server_error(patch_client):
     """A 500 is neither an absence nor a certified read — it must not be swallowed."""
     client = _make_client()
