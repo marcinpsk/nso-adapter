@@ -220,6 +220,7 @@ async def onboard_device(
         mapping_status=MappingStatus.mapped,
     )
     db.add(device)
+    claimed = None
     try:
         # The settle counter is created WITH the device, in this same transaction: a terminal
         # write may never create it (Appendix S §3.3), so every insert site owes one.
@@ -243,9 +244,12 @@ async def onboard_device(
         ).scalar_one_or_none()
         if winner is None or winner.netbox_device_id not in (None, netbox_device_id):
             # The conflict was on netbox_device_id instead: another NSO node claimed it.
-            raise LookupError(f"NetBox device {netbox_device_id} is already onboarded") from None
-        logger.info("device.onboard_race_resolved", device_id=winner.id, nso_device=nso_device_name)
-        return winner
+            claimed = LookupError(f"NetBox device {netbox_device_id} is already onboarded")
+        else:
+            logger.info("device.onboard_race_resolved", device_id=winner.id, nso_device=nso_device_name)
+            return winner
+    if claimed is not None:
+        raise claimed
     await db.refresh(device)
     logger.info("device.onboarded", device_id=device.id, nso_device=nso_device_name)
     return device

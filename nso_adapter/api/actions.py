@@ -193,18 +193,21 @@ async def action_force_removal(
         raise api_error(404, "not_found", "Device not found")
     if body.scope not in valid_removal_scopes():
         raise api_error(400, "bad_request", f"Unknown removal scope {body.scope!r}")
+    refusal = None
     try:
         job = await _force_removal_job(db, device_id, body)
     except OperationSectionAbsent as absent:
         # Nothing was ever authorized for this family, so there is no document section for the
         # flush to act on and no carrier of ours to discharge. Refuse rather than create a
         # generation whose operation plane could not be recorded.
-        raise api_error(
+        refusal = api_error(
             400,
             "bad_request",
             f"Nothing is authorized for {body.scope!r} on this device, so there is nothing to flush",
             {"scope": body.scope, "reason": absent.reason},
-        ) from None
+        )
+    if refusal is not None:
+        raise refusal
     return await _force_removal_response(db, job)
 
 
@@ -343,16 +346,19 @@ async def action_apply(
 
     # The UUID identity outranks the device lookup: an existing attempt POSTed at any
     # other device (even a nonexistent one) is an identity conflict, not a 404.
+    mismatched = None
     try:
         stored = await replay_apply_attempt(db, body.apply_attempt_id, device_id, body.selected)
     except ApplyAttemptIdentityMismatch as exc:
         await db.rollback()
-        raise api_error(
+        mismatched = api_error(
             409,
             "conflict",
             "Apply attempt UUID belongs to a different request identity",
             {"mismatch": exc.mismatch},
-        ) from None
+        )
+    if mismatched is not None:
+        raise mismatched
     if stored is not None:
         await db.rollback()
         return _apply_http_response(stored.http_status, stored.response)
@@ -360,16 +366,19 @@ async def action_apply(
     if not device:
         raise api_error(404, "not_found", "Device not found")
     await lock_projection(db, device_id)
+    mismatched = None
     try:
         stored = await begin_apply_attempt(db, body.apply_attempt_id, device_id, body.selected)
     except ApplyAttemptIdentityMismatch as exc:
         await db.rollback()
-        raise api_error(
+        mismatched = api_error(
             409,
             "conflict",
             "Apply attempt UUID belongs to a different request identity",
             {"mismatch": exc.mismatch},
-        ) from None
+        )
+    if mismatched is not None:
+        raise mismatched
     if stored is not None:
         await db.rollback()
         return _apply_http_response(stored.http_status, stored.response)
@@ -535,9 +544,11 @@ async def action_retry_generation(
         # The compare-and-set behind the lock: unreachable while this request holds it, and
         # kept as the guarantee's second half for any caller that does not.
         await db.rollback()
-        raise api_error(409, "conflict", _HEAD_ALREADY_ACTED_ON) from None
-    await db.commit()
-    return {"generation_id": head.id, "seq": head.seq, "job_id": job.id if job else None}
+        acted_on = api_error(409, "conflict", _HEAD_ALREADY_ACTED_ON)
+    else:
+        await db.commit()
+        return {"generation_id": head.id, "seq": head.seq, "job_id": job.id if job else None}
+    raise acted_on
 
 
 @router.post(
@@ -572,13 +583,15 @@ async def action_abandon_generation(
         successor = await reconcile_generation(db, head.id)
     except GenerationNotBlocked:
         await db.rollback()
-        raise api_error(409, "conflict", _HEAD_ALREADY_ACTED_ON) from None
-    await db.commit()
-    return {
-        "generation_id": head.id,
-        "seq": head.seq,
-        "job_id": successor.id if successor else None,
-    }
+        acted_on = api_error(409, "conflict", _HEAD_ALREADY_ACTED_ON)
+    else:
+        await db.commit()
+        return {
+            "generation_id": head.id,
+            "seq": head.seq,
+            "job_id": successor.id if successor else None,
+        }
+    raise acted_on
 
 
 @router.get(
