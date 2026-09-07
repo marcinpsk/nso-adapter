@@ -89,7 +89,10 @@ async def _upsert_vlans(
             # A skipped item would vanish from `seen` and the prune below would delete its
             # existing row — reject the whole refresh instead (the engine's savepoint keeps
             # the last-known rows and records the failure).
-            unusable = ValueError(f"vlan-database item without a usable vlan id for device {device.id}: {item!r}")
+            unusable = ValueError(
+                f"a vlan-database item for device {device.id} carries a vlan-id of type "
+                f"{type(raw_vlan_id).__name__}, not an integer"
+            )
         if unusable is not None:
             raise unusable
         seen.add(vid)
