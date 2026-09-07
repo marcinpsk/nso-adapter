@@ -118,10 +118,14 @@ async def _device_and_client(device_id: int, db: AsyncSession):
     device = await db.get(Device, device_id)
     if not device:
         raise api_error(404, "not_found", "Device not found")
+    unavailable = None
     try:
         client = get_nso_client(device.nso_instance)
     except RuntimeError:
-        raise api_error(409, "no_nso_client", f"No NSO client for instance {device.nso_instance!r}")
+        # Built in the handler, raised after it: a raise inside attaches the caught exception.
+        unavailable = api_error(409, "no_nso_client", f"No NSO client for instance {device.nso_instance!r}")
+    if unavailable is not None:
+        raise unavailable
     return device, client
 
 
