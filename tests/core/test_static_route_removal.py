@@ -846,7 +846,8 @@ async def test_c4_21_a_requeued_detach_whose_put_removed_the_instance(adapter_cl
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
-    assert fake.writes == [], "no instance to PUT"
+    assert len(fake.writes) == 1
+    assert fake.writes[0]["no_networking"]
     assert job.status == JobStatus.succeeded
     assert await tombstone_ids(device_id) == []
     assert fake.device_keys == {A}, "the device keeps it — that is what a detach means"

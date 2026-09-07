@@ -131,9 +131,9 @@ def test_an_encoder_refuses_a_row_set_missing_one_of_its_declared_tables():
 
 
 def test_section_rows_by_table_fills_every_declared_table():
-    document = {"vlan": {"vlan_intent": []}}
+    document = {"vlan": {"vlan_intent": [], "_execution": {"context": {"ned_id": None, "dialect": "identity"}}}}
     assert section_rows_by_table(document, "vlan") == {"vlan_intent": []}
-    document = {"snmp": {}}
+    document = {"snmp": {"_execution": {"context": {"ned_id": None, "dialect": "identity"}}}}
     assert sorted(section_rows_by_table(document, "snmp")) == [
         "snmp_community_intent",
         "snmp_host_intent",
@@ -272,3 +272,15 @@ def test_no_encoder_reads_the_environment_the_clock_or_the_network():
             ):
                 impure.append(f"{name}: reads {child.value.id}.{child.attr}")
     assert not impure, impure
+
+
+def test_static_route_legacy_body_paths_are_deleted():
+    from nso_adapter.core import apply, removal
+
+    definitions = {
+        node.name
+        for module in (apply, removal)
+        for node in ast.walk(ast.parse(Path(inspect.getfile(module)).read_text()))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert not definitions & {"_static_route_snapshot", "_replace_static_route"}

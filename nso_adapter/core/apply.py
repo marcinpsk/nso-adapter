@@ -156,47 +156,6 @@ async def enqueue_apply(
 SNAPSHOT_INCONCLUSIVE = "static_route_snapshot_inconclusive"
 
 
-async def _static_route_snapshot(client, device, plan, *, operation_selected: frozenset = frozenset()) -> tuple:
-    """Read the live static-route section ONCE → ``(certified section, retained entries)``.
-
-    The ratified exception to encoding from the document alone (#1683). The retained KEY SET
-    is a pure function of the document — ``claimed - reasserted - operation_selected`` — and
-    only the BYTES come from the live section: metric, tag and NED-specific leaves live only
-    in the live copy, so rebuilding such an entry from a store triple would silently rewrite
-    it. An operation-selected key is NEVER retained, whatever any carrier claims: precedence
-    is per key, not per carrier, or a removal would re-assert the very key it is deleting.
-
-    ``claimed`` unions each unconsumed carrier's own triple and its ``deployed_key``;
-    ``reasserted`` is what the document's own rows render. The certified verdict comes back
-    whole so the device-wide collateral guard sees the SAME read (R2 §4.1). Raises
-    :class:`NsoApplyError` on an uncertifiable read: a body built from "looks empty" would
-    drop every entry it had to retain and then verify cleanly.
-    """
-    from nso_adapter.core.static_route_plan import as_triple, triple_of
-    from nso_adapter.core.static_route_reader import certified_static_route_section
-    from nso_adapter.nso.apply import static_route_entry_key
-
-    section = await certified_static_route_section(client, device)
-    if section.inconclusive:
-        raise NsoApplyError(
-            SNAPSHOT_INCONCLUSIVE,
-            f"static_route: could not certify the live service instance on {device.nso_device_name!r} "
-            "— refusing to build a device-intent PUT from an uncertified read",
-            detail={"device": device.nso_device_name},
-        )
-
-    claimed: set[tuple[str, str, str]] = set()
-    for tomb in plan.tombstones:
-        claimed.add((tomb.vrf or "", tomb.prefix or "", tomb.next_hop or ""))
-        deployed = as_triple(tomb.deployed_key)
-        if deployed is not None:
-            claimed.add(deployed)
-    reasserted = {triple_of(row) for row in plan.rows}
-    keep = claimed - reasserted - set(operation_selected)
-    retained = [entry for entry in section.routes if static_route_entry_key(entry) in keep]
-    return section, retained
-
-
 RESIDUE_FOUND_CODE = "static_route_residue_found"
 
 #: Per-route outcomes (§4.5). ``unproven`` is the honest third state R2 adds — the write was
@@ -732,6 +691,10 @@ async def build_device_containers(
     decides. It is never silently omitted: under a full-document PUT an omitted family is a
     RETRACTED family, so a body with a build error is not sendable at all.
     """
+    from nso_adapter.core.static_route_plan import as_triple, triple_of
+    from nso_adapter.core.static_route_reader import certified_static_route_section
+    from nso_adapter.nso.apply import static_route_entry_key
+
     registry = section_registry()
     containers: dict[str, dict] = {}
     errors: dict[str, NsoApplyError] = {}
@@ -751,9 +714,18 @@ async def build_device_containers(
                 retained: list[dict] = []
                 if retain_static_routes:
                     plan = static_route_plan or hydrate_static_route_apply_plan(document)
-                    certified, retained = await _static_route_snapshot(
-                        client, device, plan, operation_selected=_operation_selected_routes(document)
-                    )
+                    certified = await certified_static_route_section(client, device)
+                    if certified.inconclusive:
+                        raise NsoApplyError(
+                            SNAPSHOT_INCONCLUSIVE,
+                            f"static_route: could not certify the live service instance on {device.nso_device_name!r}; "
+                            "refusing to build a device-intent PUT from an uncertified read",
+                            detail={"device": device.nso_device_name},
+                        )
+                    claimed = {triple_of(tomb) for tomb in plan.tombstones}
+                    claimed.update(key for tomb in plan.tombstones if (key := as_triple(tomb.deployed_key)) is not None)
+                    keep = claimed - {triple_of(row) for row in plan.rows} - _operation_selected_routes(document)
+                    retained = [entry for entry in certified.routes if static_route_entry_key(entry) in keep]
                 sent_route_keys = overlay_retained_routes(body, retained)
         except NsoApplyError as exc:
             logger.error(

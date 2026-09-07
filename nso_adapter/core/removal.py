@@ -649,20 +649,14 @@ async def guarded_device_write(
     return await apply_device_intent(client, device_name, containers, no_networking=no_networking)
 
 
-# ── #1396 R2 §4.3/§4.4 — the three static-route removal branches ─────────────
-#
-# Static routes are the one scope whose removal is LIVE-SERVICE-RELATIVE: the body is what
-# the service currently holds minus exactly what this job is authorized to drop, never the
-# store's remaining rows. A store-assertive body forward-deploys every co-edited field of
-# every surviving row, which the ratified policy forbids — and it is also what made a removal
-# block on unrelated service orphans, since a body it never asserted looks like collateral.
+# Static-route carriers retain their settlement classification across the aggregate send.
 
 #: Consumption by supersession: the selected plan claims every key the job could drop.
 SR_SUPERSEDED_EVENT = "static_route.removal_superseded"
 
 
 class SrRemoval(NamedTuple):
-    """What :func:`_replace_static_route` did, for the proof and bookkeeping that follow.
+    """The aggregate removal result, for the proof and bookkeeping that follow.
 
     Returned rather than acted on in place: §4.6 requires the consumption, the carrier
     updates and the terminal job status to land in ONE transaction, and that transaction
@@ -680,8 +674,6 @@ class SrRemoval(NamedTuple):
     sent_keys: frozenset
     #: Whether a PUT was actually issued (a 2xx, since a non-2xx raises).
     put_issued: bool
-    #: Whether the pre-PUT read CERTIFIED the service instance absent (a keyed 404).
-    service_absent: bool
     #: The commit's native-verify verdict, or ``None`` when no PUT was sent.
     verify: str | None
     #: ``{intent row id: [store field names]}`` whose wire leaves this body deleted.
@@ -697,24 +689,6 @@ def _sr_triple(key) -> tuple[str, str, str]:
     return tuple("" if p is None else str(p) for p in parts)  # type: ignore[return-value]
 
 
-async def _sr_execution_plan(db: AsyncSession, *, job_id: int | None):
-    """Return the removal plan the executing generation's document froze.
-
-    There is no live classification any more. Every removal generation carries an operation
-    plane, and classifying against the live store instead would deploy a plan whose facts
-    the document it executes never asserted.
-    """
-    from nso_adapter.core.generation import executing_generation
-    from nso_adapter.core.static_route_plan import hydrate_static_route_removal_plan
-
-    if job_id is None:
-        raise RuntimeError("a static_route removal needs the generation of the job that carries it")
-    generation = await executing_generation(db, job_id)
-    if generation is None:
-        raise RuntimeError(f"removal job {job_id} for scope 'static_route' carries no generation to deploy")
-    return hydrate_static_route_removal_plan(generation.document)
-
-
 async def _executing_document(db: AsyncSession, job_id: int | None, scope: str):
     """Return the generation this removal deploys, or refuse. Every producer attaches one."""
     from nso_adapter.core.generation import executing_generation
@@ -727,149 +701,79 @@ async def _executing_document(db: AsyncSession, job_id: int | None, scope: str):
     return generation
 
 
-async def _put_removal_document(db: AsyncSession, device, client, scope: str, context: dict | None, *, job_id):
-    """Deploy the removal as what it is: the device's document with the removed rows gone.
+def _classify_static_route_removal(generation, context: dict) -> SrRemoval:
+    """Read the frozen operation's settlement classification without constructing a body."""
+    from nso_adapter.core.static_route_plan import hydrate_static_route_removal_plan
 
-    Removal is by OMISSION now — there is no per-family replace body and no live-relative
-    composition. The document the generation froze is the authorized state, so a row it does
-    not carry is a row the PUT retracts, and the operation plane (not the live service) is
-    what says the retraction was authorized. A reissue deploys ITS OWN document too: falling
-    back to live intent would transmit a store-only replacement nothing authorized.
-    """
+    if context.get("force"):
+        return SrRemoval("force", frozenset(), (), frozenset(), False, None, {}, {})
+    plan = hydrate_static_route_removal_plan(generation.document)
+    if plan.reclaimed:
+        logger.warning(
+            "static_route.removal_key_reclaimed",
+            device_id=generation.device_id,
+            job_id=generation.job_id,
+            keys=[list(key) for key in plan.reclaimed],
+        )
+    branch = "detach" if context.get("detach") else "networked"
+    if not plan.authorized and not plan.clears:
+        branch = "superseded"
+        logger.info(
+            SR_SUPERSEDED_EVENT,
+            device_id=generation.device_id,
+            job_id=generation.job_id,
+            tombstones=list(plan.tombstone_ids),
+            reclaimed=[list(key) for key in plan.reclaimed],
+        )
+    return SrRemoval(
+        branch,
+        frozenset(plan.authorized),
+        plan.tombstone_ids,
+        frozenset(),
+        False,
+        None,
+        {clear.row_id: clear.fields for clear in plan.clears},
+        {clear.row_id: clear.key for clear in plan.clears},
+    )
+
+
+async def _put_removal_document(db: AsyncSession, device, client, scope: str, context: dict | None, *, job_id):
+    """Build and send the aggregate once, with the frozen operation's settlement proof."""
     from nso_adapter.core.apply import build_device_containers
     from nso_adapter.core.generation import execution_policy
 
     generation = await _executing_document(db, job_id, scope)
     policy = execution_policy(generation)
     context = policy.context
+    out = _classify_static_route_removal(generation, context) if scope == "static_route" else None
+    if out is not None and out.branch == "superseded":
+        return out
     body = await build_device_containers(
         client, device, generation.document, retain_static_routes=policy.retain_static_routes
     )
     if body.errors:
         raise next(iter(body.errors.values()))
-    return await guarded_device_write(
-        client,
-        device,
-        body.containers,
-        allowed=guard_allowed(generation, scope=scope, context=context),
-        context=context,
-        current=body.snapshot,
-        no_networking=policy.no_networking,
-    )
-
-
-async def _replace_static_route(
-    db: AsyncSession,
-    device,
-    client,
-    context: dict | None = None,
-    *,
-    job_id: int | None = None,
-    reg=None,
-) -> SrRemoval:
-    """Retract static routes with the DOCUMENT's body (§4.3). Three branches.
-
-    **(a) force** — the operator's deliberate flush: the document's own rows, no retained
-    entries and no guard. Retention is suppressed because a force reissue carries no removal
-    authority, so keeping every carrier-claimed key would be the opposite of the flush the
-    endpoint promises (#1683).
-
-    **(b) detach** — the ``no-networking`` un-own. A no-networking PUT can never reach the
-    device, so a detach never delivers a clear; the ``pending_clear`` carrier holds it for a
-    later networked retract instead.
-
-    **(c) everything else** — networked. ONE branch, not two: a single push can delete rows
-    AND clear leaves on surviving rows, and neither ``retract`` nor ``delete_origin`` survives
-    into the job context (G26). A cleared leaf needs no overlay any more: the document's row
-    no longer carries the field, so the body the encoder renders omits the leaf and the PUT
-    retracts it.
-
-    Generation creation records the removal classification under the projection lock, for a
-    promotion and a reissue alike, and execution reads it back:
-
-    1. every carrier the operation SELECTED contributes ``{triple} ∪ {deployed_key}`` (X6);
-    2. supersession subtracts every key the document's rows RENDER;
-    3. nothing left to drop and no clear to deliver ⇒ **no HTTP at all**: the tombstones are
-       consumed by supersession, not by failure.
-
-    *reg* is threaded but unused HERE on purpose: this function only reads and writes to the
-    device. Every store write this job makes — the tombstone delete, the carrier update and
-    the terminal status — lands in :func:`_finalize_static_route_removal`'s single
-    claim-guarded transaction, which is where §4.7's lock belongs.
-    """
-    from nso_adapter.core.apply import build_device_containers
-    from nso_adapter.core.projection import section_registry
-    from nso_adapter.nso.apply import static_route_entry_key
-
-    context = context or {}
-    if context.get("force"):
-        await _put_removal_document(db, device, client, "static_route", context, job_id=job_id)
-        return SrRemoval("force", frozenset(), (), frozenset(), True, False, None, {}, {})
-
-    plan = await _sr_execution_plan(db, job_id=job_id)
-    authorized = set(plan.authorized)
-    reclaimed = plan.reclaimed
-    detach = bool(context.get("detach"))
-    candidate_clears = plan.clears
-    tombstone_ids = plan.tombstone_ids
-
-    if reclaimed:
-        logger.warning(
-            "static_route.removal_key_reclaimed",
-            device_id=device.id,
-            job_id=job_id,
-            keys=[list(key) for key in reclaimed],
+    if out is not None:
+        delivered = {
+            row_id: fields for row_id, fields in out.clears.items() if out.clear_keys[row_id] in body.sent_route_keys
+        }
+        out = out._replace(
+            sent_keys=body.sent_route_keys,
+            clears=delivered,
+            clear_keys={row_id: out.clear_keys[row_id] for row_id in delivered},
         )
-
-    def _nothing_to_do() -> SrRemoval:
-        logger.info(
-            SR_SUPERSEDED_EVENT,
-            device_id=device.id,
-            job_id=job_id,
-            tombstones=list(tombstone_ids),
-            reclaimed=[list(k) for k in reclaimed],
-        )
-        return SrRemoval("superseded", frozenset(), tombstone_ids, frozenset(), False, False, None, {}, {})
-
-    if not authorized and not candidate_clears:
-        return _nothing_to_do()
-
-    generation = await _executing_document(db, job_id, "static_route")
-    body = await build_device_containers(client, device, generation.document)
-    if body.errors:
-        raise next(iter(body.errors.values()))
-    branch = "detach" if detach else "networked"
-    container = section_registry()["static_route"].container
-    sent_keys = {static_route_entry_key(entry) for entry in (body.containers.get(container) or {}).get("route") or []}
-    delivered = {clear.row_id: clear.fields for clear in candidate_clears if clear.key in sent_keys}
-    delivered_keys = {clear.row_id: clear.key for clear in candidate_clears if clear.key in sent_keys}
-    if not authorized and not delivered:
-        # The store-side clear check got us past the pre-read branch, but the key it named is
-        # not in the body (the row's identity moved, or it was never on the service). Sending
-        # anyway would be a device commit with no authority behind it.
-        return _nothing_to_do()
-
+        if out.branch != "force" and not out.authorized and not delivered:
+            return out._replace(branch="superseded", sent_keys=frozenset())
     verdict = await guarded_device_write(
         client,
         device,
         body.containers,
-        # The operation plane, not the job context, is what authorizes a removal's omissions.
-        allowed=guard_allowed(generation, scope="static_route", context=context, route_keys=authorized),
+        allowed=guard_allowed(generation, scope=scope, context=context, route_keys=out.authorized if out else None),
         context=context,
         current=body.snapshot,
-        no_networking=detach,
+        no_networking=policy.no_networking,
     )
-    return SrRemoval(
-        branch,
-        frozenset(authorized),
-        tombstone_ids,
-        frozenset(sent_keys),
-        True,
-        False,
-        verdict,
-        delivered,
-        delivered_keys,
-    )
+    return out._replace(put_issued=True, verify=verdict) if out is not None else None
 
 
 # ── #1396 R2 §4.4/§4.6 — the removal's proof and its ONE terminal transaction ─
@@ -1074,7 +978,7 @@ async def _finalize_static_route_removal(db, job_id: int, device, client, out: S
         # "PUT 2xx OR the instance is absent": demanding a literal 2xx makes a crash between a
         # committed detach PUT and its bookkeeping commit permanently unprovable — every retry
         # sees no instance and could never satisfy the predicate.
-        proven = service_clean and sync_ok and (out.put_issued or out.service_absent) and _sr_verify_ok(out)
+        proven = service_clean and sync_ok and out.put_issued and _sr_verify_ok(out)
     else:
         proven, residue_found, per_field = await _sr_networked_proof(client, device, out, result)
 
@@ -1181,10 +1085,7 @@ async def _dispatch_scope(
     """
     if scope not in valid_removal_scopes():
         raise ValueError(f"Unknown removal scope {scope!r}")
-    if scope == "static_route":
-        return await _replace_static_route(db, device, client, context, job_id=job_id, reg=reg)
-    await _put_removal_document(db, device, client, scope, context, job_id=job_id)
-    return None
+    return await _put_removal_document(db, device, client, scope, context, job_id=job_id)
 
 
 def _refuse_force_incompatible(
@@ -1539,8 +1440,7 @@ async def enqueue_removal(
     # both. Networking it would strip the un-owned row's config off the device (the #106
     # damage); not networking it leaves the cleared leaf. Safety wins — but the deferred
     # retract is recorded, never silently dropped (intent-integrity). The next push that
-    # carries no un-own retracts it. `_replace_static_route` reads the flag back and builds
-    # a body without the clear, so a NETWORKED job of a mixed request defers it too.
+    # carries no un-own retracts it. The frozen operation records the deferred clear.
     deletes = shrank or bool(context.get("removed"))
     _refuse_unmarked_deletion(scope, marking, deletes=deletes, force=force)
     _refuse_deferred_delete_origin(scope, marking, retract=retract, defer_retract=defer_retract)
