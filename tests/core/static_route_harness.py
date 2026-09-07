@@ -28,8 +28,14 @@ class RetentionHarness:
     client: object
     seq: int = 0
 
-    async def push(self, routes, *, removed=(), store_only=False):
+    async def push(self, routes, *, removed=(), store_only=False, delete_origin=False):
+        """One intent push. *delete_origin* marks a push whose SHRINK is a NetBox deletion.
+
+        A replacement (a route_id whose triple moves) shrinks no row, so it needs the mark
+        stated: unmarked, the predecessor identity is un-owned and stays on the device.
+        """
         self.seq += 1
+        marked = bool(removed) or delete_origin
         before = len(await generations(self.device_id))
         response = await _put_routes(
             self.api,
@@ -37,7 +43,7 @@ class RetentionHarness:
             routes,
             seq=self.seq,
             query=("?store_only=true" if store_only else "")
-            + (("&" if store_only else "?") + "delete_origin=true" if removed else ""),
+            + (("&" if store_only else "?") + "delete_origin=true" if marked else ""),
             deleted=[deleted(route_id, [key]) for route_id, key in removed],
         )
         assert response.status_code == 200, response.text
