@@ -488,7 +488,7 @@ async def test_c4_8_service_absent_still_runs_the_proof(adapter_client):
 
     job = await run_removal_job(device_id, job_id, sr_client(fake))
 
-    assert fake.writes == [], "no service instance, nothing to PUT"
+    assert len(fake.writes) == 1, "certified absence does not suppress the document"
     assert job.result["residue_check"] == "found"
     assert job.status == JobStatus.failed
     assert await tombstone_ids(device_id) == [tomb], "consuming here strands the route permanently"
@@ -678,13 +678,14 @@ async def test_c4_15_a_pure_clear_deletes_only_the_named_leaf(adapter_client):
     assert (await carriers(device_id))[A] is None, "X's carrier is consumed by per-field evidence"
 
 
-async def test_c4_16_a_mixed_delete_origin_and_clear_delivers_both(adapter_client):
+@pytest.mark.parametrize("service_absent", [False, True])
+async def test_c4_16_a_mixed_delete_origin_and_clear_delivers_both(adapter_client, service_absent):
     """C4.16 — one PUT: ``A`` gone AND ``B``'s cleared leaf gone, every other ``B`` leaf live."""
     device_id = await seed_device(nso_device_name="sr-c416", netbox_device_id=7416)
     await seed_rows(
         device_id, [{"triple": B, "route_id": 2, "pending_clear": {"authorized": ["metric"], "store_only": []}}]
     )
-    fake = SrFake("sr-c416", service=[wire(A), wire(B, metric=10, tag=7)])
+    fake = SrFake("sr-c416", service=None if service_absent else [wire(A), wire(B, metric=10, tag=7)])
     tomb = await seed_tomb(device_id, A, route_id=1)
     job_id = await seed_removal_job(device_id, {}, tombs=(tomb,))
 

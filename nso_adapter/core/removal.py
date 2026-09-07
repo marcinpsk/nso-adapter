@@ -838,12 +838,6 @@ async def _replace_static_route(
     if body.errors:
         raise next(iter(body.errors.values()))
     branch = "detach" if detach else "networked"
-    if body.static_route is not None and body.static_route.status == "absent":
-        # `absent` proves the SERVICE holds no route, never that the device is clean (G9): a
-        # previously detached route can sit unowned on the device. So no PUT — and the proof
-        # still runs, which is also what keeps a retried detach provable at all.
-        return SrRemoval(branch, frozenset(authorized), tombstone_ids, frozenset(), False, True, None, {}, {})
-
     container = section_registry()["static_route"].container
     sent_keys = {static_route_entry_key(entry) for entry in (body.containers.get(container) or {}).get("route") or []}
     delivered = {clear.row_id: clear.fields for clear in candidate_clears if clear.key in sent_keys}
