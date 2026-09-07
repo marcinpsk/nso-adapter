@@ -692,11 +692,13 @@ async def test_c2_10c_a_clean_device_queues_nothing(adapter_client):
     assert await removal_contexts(device_id) == []
 
 
-async def test_a_blocked_replace_reports_the_preview_on_the_job(adapter_client):
-    """The native delta is what the operator reviews before forcing the replacement.
+async def test_a_blocked_replace_reports_the_orphan_it_refused_over(adapter_client):
+    """The orphan keys are what the operator acts on: re-accept those rows, or force.
 
-    Reporting the orphan keys alone tells them WHICH rows would go, not WHAT would be
-    pushed — and GET /jobs/{id} is where they read it.
+    The refusal carries no native delta. Device config is opaque text that holds resolved
+    communities and auth keys, and this payload is persisted on the job and on every sent
+    row. An operator who wants the delta reads GET /devices/{id}/apply-preview, which
+    previews the same document without storing it.
     """
     device_id = await seed_device(nso_device_name="sr-put", netbox_device_id=7223)
     await seed_rows(device_id, [{"triple": B, "route_id": 7, "deployed_key": list(A)}])
@@ -708,8 +710,7 @@ async def test_a_blocked_replace_reports_the_preview_on_the_job(adapter_client):
     assert job.status == JobStatus.failed
     item = next(i for i in job.error["detail"]["items"] if i["type"] == "static_route")
     assert "static_route/route" in item["error"], "the job names the orphan it refused over"
-    # The structured report — the would-be device delta, not just the orphan keys — is
-    # stamped on the row the operator reads beside the job.
     row_error = await _first_row_error(device_id)
     assert row_error["code"] == "removal_blocked_collateral"
-    assert row_error["detail"]["preview"] == delta
+    assert row_error["detail"]["orphans"] == {"static_route/route": [list(C)]}
+    assert delta not in json.dumps(row_error), "the would-be device delta may not be persisted"
