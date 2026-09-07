@@ -575,3 +575,79 @@ async def test_a_SUCCESSFUL_harvest_puts_no_part_of_the_REFERENCE_PATH_in_the_lo
     assert harvested[0]["device"] == "harvest-dev", "the device is the half the operator needs"
     assert harvested[0]["community_hash"] == target_hash
     assert harvested[0]["vault_mount"] == "network"
+
+
+# ── a malformed reference is never echoed back ───────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_a_MALFORMED_ref_is_answered_with_the_broken_RULE_not_the_input(vault_client):
+    """The 400 named the rule AND repeated the caller's own text, secret included.
+
+    ``vault_ref`` is a free-form string on the wire. A caller that pastes a community or a
+    password into it had that value written straight back into the error body, and the
+    parser exception stayed on ``__cause__`` where a formatted traceback still prints it.
+    """
+    from nso_adapter.api.errors import ApiError
+    from nso_adapter.api.secrets import _parse_ref
+    from tests._secret_discipline import assert_chain_free_of, exception_chain
+
+    client, _store, _ = vault_client
+    malformed = "network/placeholder-path placeholder-secret#placeholder-key"
+
+    resp = await client.post("/api/v1/secrets", json={"vault_ref": malformed, "values": {"a": "b"}}, headers=AUTH)
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_vault_ref"
+    for echoed in (malformed, "placeholder-path", "placeholder-secret"):
+        assert echoed not in resp.text, "the 400 body repeats the caller's own reference"
+    assert "whitespace" in resp.json()["error"]["message"], "the caller must still learn WHAT is malformed"
+
+    # The same input through the real helper: `from exc` kept the parser exception, whose
+    # own text repeats the reference verbatim.
+    with pytest.raises(ApiError) as caught:
+        _parse_ref(malformed)
+    assert_chain_free_of(caught.value, [malformed, "placeholder-path", "placeholder-secret"])
+    assert exception_chain(caught.value) == [caught.value], "the parser exception is still attached"
+
+
+@pytest.mark.anyio
+async def test_an_UNREGISTERED_instance_answers_502_with_nothing_attached(vault_client, monkeypatch):
+    """The 502 repeated the registry's own text and chained its exception.
+
+    The refusal is adapter-authored, exactly as ``api/capability.py`` writes it for the same
+    registry miss, and it is raised after the handler so nothing rides on the chain.
+    """
+    from nso_adapter.api import secrets as secrets_api
+    from nso_adapter.api.errors import ApiError, api_error
+    from nso_adapter.store.models import Device
+    from tests._secret_discipline import exception_chain
+
+    client, _store, _ = vault_client
+    device_id = await _seed_harvest_device("cisco-ios-cli-6.77")
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        device.nso_instance = "nso-not-registered"
+        await db.commit()
+
+    built: list[ApiError] = []
+
+    def _spy(*args, **kwargs):
+        error = api_error(*args, **kwargs)
+        built.append(error)
+        return error
+
+    monkeypatch.setattr(secrets_api, "api_error", _spy)
+
+    resp = await client.post(
+        f"/api/v1/devices/{device_id}/secrets/harvest-community",
+        json={"community_hash": _h("x"), "vault_ref": "network/p#community"},
+        headers=AUTH,
+    )
+
+    assert resp.status_code == 502
+    assert resp.json()["error"]["code"] == "nso_unavailable"
+    assert "nso-not-registered" in resp.json()["error"]["message"], "the operator must still learn which instance"
+    assert built, "the refusal never went through api_error"
+    refusal = built[-1]
+    assert exception_chain(refusal) == [refusal], "the registry exception is still attached to the 502"

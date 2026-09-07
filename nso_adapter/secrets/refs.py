@@ -36,7 +36,16 @@ def secret_fingerprint(value: str) -> str:
 
 
 class VaultRefError(ValueError):
-    """Raised for a reference that cannot yield a (mount, path[, key]) triple."""
+    """Raised for a reference that cannot yield a (mount, path[, key]) triple.
+
+    ``reason`` names WHICH part of the grammar the input broke and repeats no part of
+    the input. An API boundary answers with it, so a caller that put a secret in the
+    ``vault_ref`` field is told what to fix without being sent its own material back.
+    """
+
+    def __init__(self, reason: str, reference: object) -> None:
+        super().__init__(f"{reason}: {reference!r}")
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -55,28 +64,28 @@ def parse_vault_ref(reference: str, *, require_key: bool | None = None) -> Vault
 
     ``require_key=True`` rejects refs without ``#key`` (SNMP intent fields).
     ``require_key=False`` rejects refs with a key (generic secrets path operations).
-    ``None`` accepts both. Raises :class:`VaultRefError` on malformed input. The
-    message contains only the reference text (references are not secrets).
+    ``None`` accepts both. Raises :class:`VaultRefError` on malformed input, whose
+    ``reason`` names the broken rule without repeating the input.
     """
     if not isinstance(reference, str) or not reference:
-        raise VaultRefError(f"empty vault_ref {reference!r}")
+        raise VaultRefError("vault_ref is empty or not a string", reference)
     if any(ch.isspace() for ch in reference):
-        raise VaultRefError(f"vault_ref contains whitespace: {reference!r}")
+        raise VaultRefError("vault_ref contains whitespace", reference)
     if reference.count("#") > 1:
-        raise VaultRefError(f"vault_ref has more than one '#': {reference!r}")
+        raise VaultRefError("vault_ref has more than one '#'", reference)
 
     locator, sep, key = reference.partition("#")
     if sep and not key:
-        raise VaultRefError(f"vault_ref has an empty key after '#': {reference!r}")
+        raise VaultRefError("vault_ref has an empty key after '#'", reference)
     if require_key is True and not sep:
-        raise VaultRefError(f"vault_ref must end in '#<key>': {reference!r}")
+        raise VaultRefError("vault_ref must end in '#<key>'", reference)
     if require_key is False and sep:
-        raise VaultRefError(f"vault_ref must not carry a '#<key>' here: {reference!r}")
+        raise VaultRefError("vault_ref must not carry a '#<key>' here", reference)
 
     mount, slash, path = locator.partition("/")
     if not slash or not mount or not path:
-        raise VaultRefError(f"vault_ref must be '<mount>/<path...>': {reference!r}")
+        raise VaultRefError("vault_ref must be '<mount>/<path...>'", reference)
     if "" in path.split("/"):
-        raise VaultRefError(f"vault_ref has an empty path segment: {reference!r}")
+        raise VaultRefError("vault_ref has an empty path segment", reference)
 
     return VaultRef(mount=mount, path=path, key=key if sep else None)
