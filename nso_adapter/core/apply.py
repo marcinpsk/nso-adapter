@@ -782,7 +782,7 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
     to deploy reports the preview UNAVAILABLE rather than an empty one, which would read as
     "nothing to do".
     """
-    from nso_adapter.core.generation import executable_head
+    from nso_adapter.core.generation import executable_head, executing_generation
     from nso_adapter.core.importer import get_nso_client
     from nso_adapter.nso.apply import apply_device_intent
 
@@ -792,6 +792,10 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
     generation = await executable_head(db, device_id)
     if generation is None:
         return {PREVIEW_KEY: "!! preview unavailable: this device has no generation to deploy"}
+    if generation.job_id is not None:
+        generation = await executing_generation(db, generation.job_id)
+        if generation is None:
+            return {PREVIEW_KEY: "!! preview unavailable: job carries no generation"}
     client = get_nso_client(device.nso_instance)
     # dry_run is bool|str down the sender: True = native, "cli" = tree diff.
     fmt: bool | str = "cli" if outformat == "cli" else True

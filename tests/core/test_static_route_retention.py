@@ -365,3 +365,24 @@ async def test_carrier_only_build_refusal_fails_the_document(adapter_client):
     assert job.status.value == "failed", job.result
     assert all(g.status.value != "settled" for g in await _generations(device_id))
     assert not any(call["method"] == "put" for call in fake.calls)
+
+
+async def test_preview_uses_the_highest_generation_of_the_coalesced_job(adapter_client):
+    from nso_adapter.core.apply import collect_apply_diff
+    from tests.core.test_action_apply_promotion import _generations, _put_vlans
+    from tests.core.test_generation_protocol import recorded_client, run_head, seed_settings
+
+    device_id = await seed_device(nso_device_name="preview-coalesced", netbox_device_id=17313)
+    await seed_settings(device_id, auto_apply=True)
+    assert (await _put_vlans(adapter_client, device_id, [100], seq=1)).status_code == 200
+    assert (await _put_vlans(adapter_client, device_id, [100, 200], seq=2)).status_code == 200
+    generations = await _generations(device_id)
+    assert len(generations) == 2
+    assert generations[0].job_id == generations[1].job_id
+    client, rec = recorded_client("preview-coalesced")
+    async with session() as db:
+        with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
+            await collect_apply_diff(db, device_id)
+    preview = next(call["body"] for call in rec.calls if call["dry_run"])
+    await run_head(device_id, client)
+    assert preview == rec.commits[0]["body"]
