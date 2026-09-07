@@ -956,6 +956,7 @@ and an identical retry replays it. Reasons are stable machine codes:
 
 <!-- apply-unexecutable-reasons:start -->
 - `interface_attribute_eligibility_unresolved`
+- `invalid_stored_address`
 - `mixed_detach_replacement`
 - `no_executable_interface`
 - `outstanding_deletion_provenance`
