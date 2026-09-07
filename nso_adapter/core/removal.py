@@ -302,6 +302,8 @@ _READER_LIST_PATHS: dict[tuple[str, str], tuple[str, ...]] = {
     ("isis", "process-config"): ("process",),
     ("ospf", "interface-config"): ("interface",),
     ("ospf", "process-config"): ("instance",),
+    ("lag", "lag_bundle_intent"): ("lag",),
+    ("lag", "lag_member_intent"): ("lag", "member"),
 }
 
 
@@ -310,15 +312,25 @@ def _reader_keys(scope: str, entry: dict, guard_list: _GuardList) -> set[tuple[s
 
     The reader lists mirror the reconciler-service shapes (bgp's router→scope→peer
     nesting included), so the guard's own ``_leaf_keys`` walk applies as-is — except
-    the isis/ospf list renames in ``_READER_LIST_PATHS`` and l2, where the reader
-    nests ``sap`` under ``service`` while the service list is flat (service-name,
-    sap-id) — a parent-level key leaf the generic walk cannot express.
+    the list renames in ``_READER_LIST_PATHS`` and the two grains the export renders
+    in a different SHAPE: l2 nests ``sap`` under ``service`` while the service list is
+    flat (service-name, sap-id), and switchport emits its tagged VLANs as one comma/range
+    string where the service carries a leaf-list. Both would intersect empty, which reads
+    as a clean bill for config the removal never took off the device.
     """
+    from nso_adapter.core.vlan import parse_vlan_string
+
     if scope == "l2_sap":
         return {
             (str(svc.get("service-name", "")), str(sap.get("sap-id", "")))
             for svc in entry.get("service") or []
             for sap in svc.get("sap") or []
+        }
+    if scope == "switchport" and guard_list.scalar:
+        return {
+            (str(iface.get("interface-name", "")), str(vlan_id))
+            for iface in entry.get(guard_list.path[0]) or []
+            for vlan_id in parse_vlan_string(iface.get("tagged-vlans"))
         }
     path = _READER_LIST_PATHS.get((scope, guard_list.label))
     if path is not None:
