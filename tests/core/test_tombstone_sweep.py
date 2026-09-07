@@ -179,7 +179,7 @@ async def test_a_sweep_rejects_a_carrier_that_cannot_take_its_generation(adapter
             device_id,
             mode=GenerationMode.detach,
             removal_context=context,
-            allowed_removal_keys=context["removed"],
+            allowed_removal_keys={"static_route": context["removed"]},
         )
         carrier = await create_dedicated_job(db, device_id, JobType.removal, context=context)
         assert await attach_to_job(db, first, carrier)
