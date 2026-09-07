@@ -16,15 +16,17 @@ import pathlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from nso_adapter.core.static_route_reader import certified_static_route_section
-from nso_adapter.nso.client import ServiceInstanceState
+from nso_adapter.nso.client import DEVICE_INTENT_ROOT, ServiceInstanceState
 from tests.conftest import seed_device, session
 from tests.core.removal_helpers import seed_removal_job, seed_tomb
 from tests.core.static_route_harness import K as K_KEY
 from tests.core.test_static_route_put import A, B, C, D, seed_rows, wire
 from tests.core.test_static_route_removal import SrFake, key_of, run_removal_job, sr_client, tombstone_ids
+from tests.nso.test_apply_send import _client_with
 
 pytestmark = pytest.mark.anyio
 
@@ -582,3 +584,73 @@ async def test_a_reclaim_consumption_protects_a_frozen_successor_and_prunes_the_
 
     stored = next(g for g in await generations(harness.device_id) if g.id == frozen.id)
     assert (stored.document, stored.digest) == original, "an immutable document was rewritten"
+
+
+# ── a malformed answer: what the server sent reaches no sink ──
+
+#: A malformed leaf carries whatever JSON the server chose, and a real one can hold secret
+#: material (a keyed path, a community). The sentinel stands for that material.
+_MALFORMED_SECRET = "placeholder-malformed-leaf-secret"
+_MALFORMED_DEVICE = SimpleNamespace(id=2, nso_device_name="sr-malformed")
+
+
+def _instance_client(entry: dict):
+    """A real NsoClient over a fake RESTCONF transport that answers ONE instance."""
+
+    def respond(request):
+        assert "device-intent:device-intent=sr-malformed" in str(request.url)
+        return httpx.Response(200, json={DEVICE_INTENT_ROOT: [entry]})
+
+    return _client_with(httpx.MockTransport(respond))
+
+
+@pytest.mark.parametrize(
+    ("leaf", "malformed", "arrived"),
+    [
+        ("prefix", {"community": _MALFORMED_SECRET}, "dict"),
+        ("vrf", [_MALFORMED_SECRET], "list"),
+        ("next-hop", {"community": _MALFORMED_SECRET}, "dict"),
+    ],
+)
+async def test_a_malformed_route_leaf_reaches_no_sink_and_still_names_the_field(leaf, malformed, arrived):
+    """A refused entry names the leaf and the type that arrived, and nothing the server sent.
+
+    The certification runs on a body the adapter did not write, so a malformed leaf can hold
+    any material the server chose. Reproducing the VALUE put it in the operator's log and in
+    the refusal message; the leaf name and its received type diagnose the same shape fault.
+    """
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.static_route_reader import _project, _Uncertifiable
+    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
+
+    route = {"prefix": "10.0.0.0/24", "vrf": "", "next-hop": "10.0.0.1"} | {leaf: malformed}
+    entry = {"device": "sr-malformed", "static-route": {"route": [route]}}
+
+    with capture_logs() as logs:
+        section = await certified_static_route_section(_instance_client(entry), _MALFORMED_DEVICE)
+
+    assert (section.status, section.entry, section.instance) == ("inconclusive", None, None)
+    reported = [record for record in logs if record["event"] == "static_route.section_uncertifiable"]
+    assert reported, "the malformed answer was not reported at all"
+    assert leaf in reported[0]["reason"], "the operator cannot tell WHICH leaf was malformed"
+    assert arrived in reported[0]["reason"], "the operator cannot tell WHAT type arrived"
+    assert_records_free_of(logs, [_MALFORMED_SECRET])
+
+    # The raise itself, on the real projector: no node of the chain repeats the value either.
+    with pytest.raises(_Uncertifiable) as caught:
+        _project(entry)
+    assert_chain_free_of(caught.value, [_MALFORMED_SECRET])
+
+
+async def test_a_missing_prefix_key_is_still_diagnosable_without_a_value():
+    """A route entry with no prefix key is refused, and the refusal says which leaf is absent."""
+    from nso_adapter.core.static_route_reader import _project, _Uncertifiable
+
+    with pytest.raises(_Uncertifiable) as missing:
+        _project({"static-route": {"route": [{"next-hop": "10.0.0.1"}]}})
+    assert "prefix" in str(missing.value) and "NoneType" in str(missing.value)
+
+    with pytest.raises(_Uncertifiable) as empty:
+        _project({"static-route": {"route": [{"prefix": ""}]}})
+    assert "prefix" in str(empty.value)

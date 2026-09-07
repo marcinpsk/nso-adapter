@@ -115,12 +115,16 @@ def _certify_entry(route: object) -> None:
     if not isinstance(route, dict):
         raise _Uncertifiable(f"a route entry is a {type(route).__name__}, not an object")
     prefix = route.get("prefix")
-    if not isinstance(prefix, str) or not prefix:
-        raise _Uncertifiable(f"a route entry carries no prefix key: {prefix!r}")
+    # The instance is a body the adapter did not write, so a malformed leaf can hold any
+    # material the server chose. Name the leaf and the type it arrived as, never the value.
+    if not isinstance(prefix, str):
+        raise _Uncertifiable(f"a route entry carries a prefix of type {type(prefix).__name__}, not a string")
+    if not prefix:
+        raise _Uncertifiable("a route entry carries an empty prefix")
     for leaf in ("vrf", "next-hop"):
         value = route.get(leaf)
         if value is not None and not isinstance(value, str):
-            raise _Uncertifiable(f"a route entry carries a non-string {leaf}: {value!r}")
+            raise _Uncertifiable(f"a route entry carries a {leaf} of type {type(value).__name__}, not a string")
 
 
 __all__ = ["CertifiedSection", "certified_static_route_section"]
