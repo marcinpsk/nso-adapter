@@ -1393,6 +1393,9 @@ async def _store_generation(
     fragments the document composes, and are written by the producers that wrote those
     fragments; deriving either here would describe an authorization nobody made.
     """
+    from nso_adapter.core.static_route_plan import validate_removal_authority
+
+    validate_removal_authority(allowed_removal_keys)
     body = deepcopy(document)
     scope = (removal_context or {}).get("scope")
     if scope is not None:
@@ -1573,6 +1576,9 @@ async def executing_generation(db: AsyncSession, job_id: int) -> DeploymentGener
     if not carried:
         return None
     generation = carried[-1]
+    from nso_adapter.core.static_route_plan import validate_removal_authority
+
+    validate_removal_authority(generation.allowed_removal_keys)
     expected = digest_document(generation.mode, generation.document, generation.allowed_removal_keys or {})
     if expected != generation.digest:
         raise GenerationTampered(

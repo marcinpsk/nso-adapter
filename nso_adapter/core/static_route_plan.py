@@ -301,6 +301,12 @@ def classify_apply_plan(all_rows: list, tombstones: list, *, device_id: int) -> 
     return SrPlan(mode, rows, allowed, tombstones, cas, watermark)
 
 
+def validate_removal_authority(value: object) -> None:
+    """Refuse removal authority that does not name its section and guarded list."""
+    if not isinstance(value, dict) or any(not isinstance(labels, dict) for labels in value.values()):
+        raise ValueError("allowed_removal_keys must be scope-qualified")
+
+
 def _removal_keys(value) -> set[Triple]:
     """Normalize the generation's guarded static-route key set.
 
@@ -309,7 +315,8 @@ def _removal_keys(value) -> set[Triple]:
     these entries come from the stored document too, so a malformed one must name itself
     rather than raise ``as_triple``'s bare unpack error.
     """
-    section = (value or {}).get("static_route") or {}
+    validate_removal_authority(value)
+    section = value.get("static_route") or {}
     return {_sr_key(raw) for raw in section.get("route") or ()}
 
 

@@ -611,10 +611,15 @@ def guard_allowed(generation, *, scope: str | None = None, context: dict | None 
     triples a removal's operation plane owns. Scope-qualified because the guard is device-wide
     and two families both have a ``host`` list.
     """
-    allowed: dict[str, dict[str, list]] = {}
-    for section, labels in (getattr(generation, "allowed_removal_keys", None) or {}).items():
-        if isinstance(labels, dict):
-            allowed[section] = {label: list(keys) for label, keys in labels.items()}
+    from nso_adapter.core.static_route_plan import validate_removal_authority
+
+    authority = getattr(generation, "allowed_removal_keys", None)
+    if authority is None:
+        authority = {}
+    validate_removal_authority(authority)
+    allowed: dict[str, dict[str, list]] = {
+        section: {label: list(keys) for label, keys in labels.items()} for section, labels in authority.items()
+    }
     if scope is not None:
         for label, keys in _removed_context(scope, context or {}).items():
             allowed.setdefault(scope, {}).setdefault(label, []).extend(keys)
@@ -1502,6 +1507,8 @@ async def enqueue_removal(
     # the creation would be deleted by an operation that never named it, and its obligation
     # would be gone with no record that anything discharged it.
     await lock_projection(db, device_id)
+    from nso_adapter.core.static_route_plan import scope_qualified
+
     discharged_clear_ids = await _pending_clears_discharged_by(db, device_id, scope, promotes, mode=mode, force=force)
     if force:
         generation = await create_reissue_generation(
@@ -1519,7 +1526,7 @@ async def enqueue_removal(
             mode=mode,
             allowed_removal_keys=allowed_removal_keys
             if allowed_removal_keys is not None
-            else context.get("removed") or {},
+            else scope_qualified(scope, context.get("removed")),
             document=document,
             removal_context=context,
             settlement_cohort=settlement_cohort,
