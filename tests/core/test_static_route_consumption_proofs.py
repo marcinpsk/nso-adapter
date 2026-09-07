@@ -224,7 +224,13 @@ async def test_a_reclaim_never_consumes_a_carrier_on_a_malformed_service_read(ad
     # section projection can tell it is not a list of entries.
     fake.state = lambda: ServiceInstanceState("present", {"device": "sr-malformed-read", **entry})
 
-    assert await run_reclaim(sr_client(fake)) == (0, 1)
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        assert await run_reclaim(sr_client(fake)) == (0, 1)
+    events = {log["event"] for log in logs}
+    assert "static_route_reclaim.cleanup_pending" not in events
+    assert "static_route_reclaim.proof_inconclusive" in events
     assert await tombstone_ids(device_id) == [tomb], "the carrier was consumed on an uncertifiable read"
     (reissued,) = await queued_removals(device_id)
     assert (await owners(device_id))[tomb] == reissued.id

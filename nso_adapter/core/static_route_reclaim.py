@@ -143,6 +143,9 @@ def _cleanup_pending(row: StaticRouteTombstone, proof: _DeviceProof) -> bool:
     """Whether the device is certifiably clean of this carrier's keys while the service is not."""
     if row.marking != DELETE_ORIGIN_MARKING or proof.device_status != "ok":
         return False
+    state = proof.service_state
+    if state is None or state.status != "present":
+        return False
     return not (_authorized(row) & set(proof.device_entries)) and not _service_clean(row, proof)
 
 
@@ -195,6 +198,8 @@ async def reclaim_one_device(device_id: int, *, db: AsyncSession | None = None) 
                 need_device_state=DELETE_ORIGIN_MARKING in markings,
                 need_service=bool(markings),
             )
+            if proof.service_state is None or proof.service_state.inconclusive:
+                logger.warning("static_route_reclaim.proof_inconclusive", device_id=device_id)
             if DETACH_MARKING in markings:
                 from nso_adapter.core.removal import _sr_sync_from
 
