@@ -2746,12 +2746,12 @@
             ],
             "title": "Acl"
           },
-          "secret_hash": {
-            "title": "Secret Hash",
+          "operation_id": {
+            "title": "Operation Id",
             "type": "string"
           },
-          "vault_ref": {
-            "title": "Vault Ref",
+          "secret_hash": {
+            "title": "Secret Hash",
             "type": "string"
           },
           "version": {
@@ -2760,7 +2760,7 @@
           }
         },
         "required": [
-          "vault_ref",
+          "operation_id",
           "secret_hash",
           "version",
           "access",
@@ -7532,8 +7532,8 @@
             "title": "Hashes",
             "type": "object"
           },
-          "vault_ref": {
-            "title": "Vault Ref",
+          "operation_id": {
+            "title": "Operation Id",
             "type": "string"
           },
           "version": {
@@ -7549,7 +7549,7 @@
           }
         },
         "required": [
-          "vault_ref",
+          "operation_id",
           "exists",
           "fields",
           "hashes",
@@ -7573,15 +7573,8 @@
       },
       "SecretWriteOut": {
         "properties": {
-          "hashes": {
-            "additionalProperties": {
-              "type": "string"
-            },
-            "title": "Hashes",
-            "type": "object"
-          },
-          "vault_ref": {
-            "title": "Vault Ref",
+          "operation_id": {
+            "title": "Operation Id",
             "type": "string"
           },
           "version": {
@@ -7590,9 +7583,8 @@
           }
         },
         "required": [
-          "vault_ref",
-          "version",
-          "hashes"
+          "operation_id",
+          "version"
         ],
         "title": "SecretWriteOut",
         "type": "object"
