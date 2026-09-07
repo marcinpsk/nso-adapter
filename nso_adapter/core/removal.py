@@ -754,11 +754,12 @@ async def _put_removal_document(db: AsyncSession, device, client, scope: str, co
     if body.errors:
         raise next(iter(body.errors.values()))
     if out is not None:
-        delivered = {
-            row_id: fields for row_id, fields in out.clears.items() if out.clear_keys[row_id] in body.sent_route_keys
-        }
+        if body.sent_route_keys is None:
+            raise RuntimeError("static-route removal document has no static-route section")
+        sent_keys = frozenset(body.sent_route_keys)
+        delivered = {row_id: fields for row_id, fields in out.clears.items() if out.clear_keys[row_id] in sent_keys}
         out = out._replace(
-            sent_keys=body.sent_route_keys,
+            sent_keys=sent_keys,
             clears=delivered,
             clear_keys={row_id: out.clear_keys[row_id] for row_id in delivered},
         )
