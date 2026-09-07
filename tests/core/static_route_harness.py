@@ -94,7 +94,7 @@ class RetentionHarness:
 
 
 async def retention_harness(api):
-    device_id = await seed_device(nso_device_name="retention-device", netbox_device_id=17401)
+    device_id = await seed_device(nso_device_name="retention-device", netbox_device_id=None)
     await seed_settings(device_id, auto_apply=False)
     fake = SrFake("retention-device", service=None)
     client, _ = recorded_client("retention-device", sr_fake=fake)

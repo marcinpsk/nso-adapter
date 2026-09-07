@@ -112,6 +112,8 @@ def recorded_client(
     client = MagicMock(spec=NsoClient)
     client._base = "http://nso"
     client._action_timeout = 120.0
+    client.get_device_ned_id = AsyncMock(return_value="cisco-ios-cli-3.8")
+    client.get_device_state_doc = AsyncMock(return_value={})
 
     async def _service_state(device):
         return await NsoClient.service_instance_state(client, device)
