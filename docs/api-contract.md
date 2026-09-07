@@ -869,10 +869,10 @@ retry of the same selection can promote it.
 
 For a prepared stream, `no_prepared_revision` means the selected revision has no matching
 prepared slot. It is terminal for the selected revision. Prepare a new snapshot and select
-its returned revision. `awaiting_aggregate_sender` means the section has no device sender.
-It is retryable after the aggregate sender becomes available. On this branch, `lag` and
-`switchport` always return this reason before the adapter checks their prepared revisions.
-The adapter preserves their prepared slots and creates no generation or job for them.
+its returned revision. `lag` and `switchport` resolve against their prepared slots exactly
+like the receipt lanes resolve against their receipts: a selected revision that matches the
+prepared slot promotes, and every other outcome reports `already_applied`, `superseded`,
+`already_authorized` or `no_prepared_revision`.
 
 `superseded` and `backfill_only` require a new selection. `already_applied` needs no further
 work. `already_authorized` leaves recovery to the owning generation's retry or abandon action.
@@ -966,8 +966,9 @@ and an identical retry replays it. Reasons are stable machine codes:
 The registry contains eighteen streams: sixteen endpoint receipt lanes and the out-of-protocol
 `lag` and `switchport` streams. They compose sixteen document sections. The manual-Apply
 execution boundary is `ACTION_APPLY_EXECUTABLE_SECTIONS`, which equals
-`DOCUMENT_EXECUTED_SECTIONS`. Its fourteen sections cover the sixteen receipt lanes.
-The two switching sections remain in `AWAITING_SENDER_SECTIONS` and are not executable.
+`DOCUMENT_EXECUTED_SECTIONS`. Its sixteen sections are every section of the registry, the two
+switching sections included, and no section reads live intent to decide what a generation
+executes.
 SNMP documents store Vault references verbatim. The SNMP writer reads those references from the
 hydrated rows when it builds the send body. BGP documents store the router, scope,
 address-family, peer, and peer address-family tables. The hydrator rebuilds their relationship
@@ -1004,17 +1005,22 @@ result as keep on this NSO).
 
 ### `GET /api/v1/devices/{id}/actions/apply-diff` → `200 | 404`
 
-Preview the per-scope **native device diff** the next Apply would push (NSO
+Preview the **native device diff** the next Apply would push (NSO
 `?dry-run=native&reconcile=keep-non-service-config`; nothing is committed — the
 reconcile param makes the preview match the real reconcile commit). Synchronous —
-no job. `diffs` maps
-scope → native delta; scopes already in sync yield an empty delta and are
-omitted. LAG and switchport have no preview until the aggregate document writer
-consumes their durable snapshots.
+no job. The preview is bound to the device's executable generation head, never to live
+intent, so it can only show a diff the next commit can produce.
+
+One document is one transaction, so there is ONE delta: `diffs` carries a single
+`device_intent` entry covering every family the document holds, the two switching sections
+included. An empty `diffs` means the device already holds the document. Where no preview can
+be rendered (no generation to deploy, an inconclusive dry-run, a body the adapter could not
+build), that one entry carries a `!! preview unavailable: <reason>` line instead of a delta.
+`outformat=cli` renders NSO's NED-uniform `+`/`-` tree diff instead of device-native config.
 
 ```json
-{ "device_id": 1,
-  "diffs": { "interface": "interface GigabitEthernet0/1\n description uplink\n!" } }
+{ "device_id": 1, "outformat": "native",
+  "diffs": { "device_intent": "interface GigabitEthernet0/1\n description uplink\n!" } }
 ```
 
 ### `POST /api/v1/devices/{id}/sync-notify`
@@ -1555,10 +1561,14 @@ The replace is guarded and gated:
   *inconclusive*, and the scope fails with `static_route_snapshot_inconclusive` — a
   destructive body must not be built from a read that may be hiding the entries it was
   supposed to preserve.
-- Service entries no accepted row asserts are **collateral**. The scope refuses with
-  `removal_blocked_collateral`; `error.detail.items[].orphans` names the keys and
-  `…items[].preview` carries the device delta the replace would have pushed, so the operator
-  can accept those routes into intent or flush them deliberately via
+- Service entries no accepted row asserts are **collateral**. The write refuses with
+  `removal_blocked_collateral` and sends nothing. `detail.orphans` names the orphan keys per
+  YANG list: `error.detail.orphans` on a removal job, and each stamped row's
+  `last_apply_error.detail.orphans` on an apply. The refusal carries **no device delta**: native
+  config is opaque text that can hold a resolved community or an auth key, and this payload is
+  persisted on the job and on the rows. Render the delta on demand with
+  `GET /api/v1/devices/{id}/actions/apply-diff`, which dry-runs the identical PUT. The operator
+  can then accept those routes into intent or flush them deliberately via
   `POST /api/v1/devices/{id}/actions/force-removal`.
 - Entries a queued removal still owns ride through **verbatim** — including leaves the intent
   store has no column for — so an apply never drops what a removal is about to remove.
@@ -2361,15 +2371,14 @@ Every `PUT /api/v1/devices/{id}/*-intent` endpoint below (and `vlan-intent`,
 - Storing intent **never touches the device synchronously**. If `auto_apply` is enabled in
   the device settings, an ordinary non-store-only PUT enqueues the scope's apply job.
   Otherwise the intent remains stored in the mirror.
-- Explicit `actions/apply` can execute the sixteen receipt lanes through the fourteen
-  sections in `DOCUMENT_EXECUTED_SECTIONS`. The registry also contains `lag` and `switchport`.
-  These two streams remain in `AWAITING_SENDER_SECTIONS` and return
-  `awaiting_aggregate_sender`. Resending a receipt-lane payload has two distinct meanings,
-  and `X-Push-Seq` is what separates them. To recover a lost response, replay the ORIGINAL
-  sequence with the same body and the same request modes: that is a replay, and it returns
-  the recorded response without new work. A different body or mode under that sequence is
-  `409 sequence_reuse`. Use a NEW sequence only to authorize the payload again as fresh
-  work, because a higher sequence is admitted as a new delivery.
+- Explicit `actions/apply` executes every stream through the sixteen sections in
+  `DOCUMENT_EXECUTED_SECTIONS`, the out-of-protocol `lag` and `switchport` streams included.
+  Resending a receipt-lane payload has two distinct meanings, and `X-Push-Seq` is what
+  separates them. To recover a lost response, replay the ORIGINAL sequence with the same body
+  and the same request modes: that is a replay, and it returns the recorded response without
+  new work. A different body or mode under that sequence is `409 sequence_reuse`. Use a NEW
+  sequence only to authorize the payload again as fresh work, because a higher sequence is
+  admitted as a new delivery.
 - Where dropping a row from a keyed NSO service list requires it, the adapter
   queues an async removal job (see [Removal propagation](#removal-propagation)).
 - → `200` `{ "device_id": 1, "count": <rows stored>, "removed": <rows dropped> }`.
@@ -2379,10 +2388,10 @@ Every `PUT /api/v1/devices/{id}/*-intent` endpoint below (and `vlan-intent`,
 
 ### Removal propagation
 
-A merge-PATCH apply never drops a list entry the payload omits, so deleting a row
-from the intent store would otherwise leave the config orphaned on the device. To
-revert it, the owning `*-reconciler` service instance is **PUT-replaced** with the
-full remaining accepted state, which lets NSO FASTMAP delete the dropped entries.
+Deleting a row from the intent store changes nothing on the device by itself, so the drop
+has to be authorized and then deployed. A removal job composes a generation whose document
+omits the dropped rows and **PUT-replaces** the device's one `device-intent` instance with
+it, which lets NSO FASTMAP delete what the body no longer asserts.
 
 The same rule applies to a device-effective scalar that changes from emitted state to
 omitted state. A clear with no un-own gets a networked removal job, so that admission
@@ -2427,14 +2436,15 @@ executes its one removal context's scope from then-current live state. The sweep
 and force-removal paths produce reissues. A removal job with no generation is invalid and is
 refused. Scope is carried in `Job.context.scope` (one of
 `route_policy · bfd · svi · subinterface · static_route · interface_mtu · vlan ·
-logging · l2_sap · ospf · bgp · isis · interface_config · snmp`). Job status is
-observable via `GET …/jobs` like any other job; a failed removal records
+logging · l2_sap · ospf · bgp · isis · interface_config · snmp · lag · switchport`).
+Job status is observable via `GET …/jobs` like any other job; a failed removal records
 `error.code = "removal_failed"`.
 
-`static_route` is the one scope that does **not** rebuild its body from the remaining accepted
-rows — it drops exactly what it is authorized to drop and keeps the rest of the live service
-verbatim. See
-[Static-route removals are document-relative with one live read](#static-route-removals-are-document-relative-with-one-live-read).
+`static_route` is the one scope whose body is not the document alone: its container also
+carries, **verbatim**, the live service entry for every key the frozen plan retains, so a
+removal neither rewrites a leaf the store has no column for nor drops what it was not
+authorized to drop. See
+[Static-route removals are document-relative, with one live read](#static-route-removals-are-document-relative-with-one-live-read).
 
 ---
 

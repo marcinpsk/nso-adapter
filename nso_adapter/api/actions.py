@@ -168,9 +168,10 @@ async def action_force_removal(
 ):
     """Re-run a scope's removal with the collateral guard DISABLED.
 
-    The operator override for a ``removal_blocked_collateral`` failure: after
-    reviewing the blocked job's orphan list + dry-run preview, this deliberately
-    flushes the orphaned service rows (PUT-replace with only the remaining intent).
+    The operator override for a ``removal_blocked_collateral`` failure: after reviewing the
+    blocked job's orphan keys (the refusal persists no device delta; ``actions/apply-diff``
+    renders it on demand), this deliberately flushes the orphaned service rows (PUT-replace
+    with only the remaining intent).
 
     The flush is the device's whole document with the guard off: every family keeps its
     authorized rows and the orphans the guard was blocking on are simply not in it. The
