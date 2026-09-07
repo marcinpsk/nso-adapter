@@ -324,7 +324,8 @@ class NsoClient:
             if not isinstance(entry, dict) or not entry:
                 return _inconclusive(device_name, "empty instance entry")
             if entry.get("device") != device_name:
-                return _inconclusive(device_name, f"instance echoes device {entry.get('device')!r}")
+                # The echo is the server's own value: name the mismatch, never what it sent.
+                return _inconclusive(device_name, "the instance echoes a different device")
             return ServiceInstanceState("present", entry)
 
     # ── device-state envelope (READSEM S3) — status-declared per-family reads ─────────
