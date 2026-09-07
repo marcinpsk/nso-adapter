@@ -468,3 +468,40 @@ async def test_harvest_community_unknown_device_404(vault_client):
         headers=AUTH,
     )
     assert resp.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_a_vault_failure_puts_no_reference_or_provider_text_in_the_502(vault_client, monkeypatch):
+    """The 502 names the failure TYPE and nothing the provider or the ref said.
+
+    hvac fails with the request URL in the message and a decode failure can repeat the
+    payload, and the ref itself names a Vault mount, path and key. Both went into the
+    response body, and the provider's exception stayed reachable on the raised error.
+    """
+    from nso_adapter.api.errors import ApiError
+    from nso_adapter.api.secrets import _vault_op
+    from tests._secret_discipline import assert_chain_free_of
+
+    client, _store, kv = vault_client
+    ref = "placeholder-mount/placeholder-path#placeholder-key"
+    leaked = [ref, "placeholder-mount", "placeholder-path", "placeholder-key", "placeholder-secret"]
+
+    def boom(**_kwargs):
+        raise RuntimeError(f"vault: read of {ref} failed holding placeholder-secret")
+
+    monkeypatch.setattr(kv, "read_secret_version", boom)
+
+    resp = await client.post("/api/v1/secrets/verify", json={"vault_ref": ref}, headers=AUTH)
+
+    assert resp.status_code == 502
+    for secret in leaked:
+        assert secret not in resp.text, "the 502 body repeats the reference or the provider's text"
+    message = resp.json()["error"]["message"]
+    assert resp.json()["error"]["code"] == "vault_error"
+    assert "RuntimeError" in message, "the failure type is the half the operator needs"
+
+    # The same failure through the real helper: `from None` would leave the provider's
+    # exception on __context__, where a formatted traceback still prints it.
+    with pytest.raises(ApiError) as caught:
+        await _vault_op(boom)
+    assert_chain_free_of(caught.value, leaked)
