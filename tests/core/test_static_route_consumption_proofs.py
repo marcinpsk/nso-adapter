@@ -141,7 +141,8 @@ async def test_a_well_formed_empty_route_list_still_certifies_absence():
         assert (section.status, section.routes) == ("absent", [])
 
 
-async def test_a_reclaim_never_consumes_a_carrier_on_a_malformed_service_read(adapter_client):
+@pytest.mark.parametrize("entry", [{"route": wire(A)}, {"static-route": None}, {"static-route": {"route": None}}])
+async def test_a_reclaim_never_consumes_a_carrier_on_a_malformed_service_read(adapter_client, entry):
     """A malformed service answer proves nothing, so the carrier survives the drain.
 
     Device-clean plus an uncertifiable service read is exactly the state a discarded
@@ -160,12 +161,18 @@ async def test_a_reclaim_never_consumes_a_carrier_on_a_malformed_service_read(ad
     fake = SrFake("sr-malformed-read", service=[wire(A)], device=[wire(B)])
     # A 200 whose route list is one OBJECT: the client's envelope checks pass and only the
     # section projection can tell it is not a list of entries.
-    fake.state = lambda: ServiceInstanceState("present", {"device": "sr-malformed-read", "route": wire(A)})
+    fake.state = lambda: ServiceInstanceState("present", {"device": "sr-malformed-read", **entry})
 
     assert await run_reclaim(sr_client(fake)) == (0, 1)
     assert await tombstone_ids(device_id) == [tomb], "the carrier was consumed on an uncertifiable read"
     (reissued,) = await queued_removals(device_id)
     assert (await owners(device_id))[tomb] == reissued.id
+    from tests.core.test_generation_protocol import job_row, run_head
+
+    finished = await job_row(await run_head(device_id, sr_client(fake)))
+    assert finished.status.value == "failed"
+    assert await tombstone_ids(device_id) == [tomb]
+    assert fake.writes == []
 
 
 def test_the_shared_reader_is_the_only_certified_static_route_reader():
@@ -353,3 +360,31 @@ async def test_a_reclaim_consumes_only_when_the_device_and_the_service_are_both_
     fake = SrFake("sr-both-clean", service=[wire(C)], device=[wire(C)])
     assert await run_reclaim(sr_client(fake)) == (1, 0)
     assert await tombstone_ids(device_id) == []
+
+
+@pytest.mark.parametrize("entry", [{"static-route": None}, {"static-route": {"route": None}}])
+async def test_worker_retains_carrier_when_service_members_are_null(adapter_client, entry):
+    from nso_adapter.nso.client import ServiceInstanceState
+    from tests.core.test_generation_protocol import job_row, run_head
+
+    device_id = await seed_device(nso_device_name="null-service-member", netbox_device_id=17317)
+    tomb = await seed_tomb(device_id, A, route_id=1)
+    from nso_adapter.core.removal import enqueue_removal
+
+    async with session() as db:
+        await enqueue_removal(
+            db,
+            device_id,
+            "static_route",
+            marking="delete_origin",
+            defer_retract=False,
+            promotes=("static_route",),
+            static_route_tombstone_ids=(tomb,),
+        )
+        await db.commit()
+    fake = SrFake("null-service-member", service=[], device=[])
+    fake.state = lambda: ServiceInstanceState("present", {"device": "null-service-member", **entry})
+    job = await job_row(await run_head(device_id, sr_client(fake)))
+    assert job.status.value == "failed", job.result
+    assert await tombstone_ids(device_id) == [tomb]
+    assert fake.writes == []

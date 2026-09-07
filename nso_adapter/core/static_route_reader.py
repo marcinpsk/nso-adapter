@@ -91,18 +91,18 @@ def _project(entry: dict | None) -> list[dict]:
         return []
     if not isinstance(entry, dict):
         raise _Uncertifiable(f"the instance is a {type(entry).__name__}, not an object")
-    section = entry.get("static-route")
-    if section is None:
+    if "static-route" not in entry:
         if "route" in entry:
             # A LEGACY-shaped instance answering for the aggregate's path. Reading it would
             # certify the family from a service the adapter no longer writes, so refuse.
             raise _Uncertifiable("the instance carries a top-level route list, not a static-route container")
         return []
+    section = entry["static-route"]
     if not isinstance(section, dict):
         raise _Uncertifiable(f"the static-route container is a {type(section).__name__}, not an object")
-    routes = section.get("route")
-    if routes is None:
+    if "route" not in section:
         return []
+    routes = section["route"]
     if not isinstance(routes, list):
         raise _Uncertifiable(f"the route list is a {type(routes).__name__}, not a list")
     for route in routes:
