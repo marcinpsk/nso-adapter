@@ -855,6 +855,39 @@ async def test_the_isis_section_takes_its_owner_streams_context_and_keeps_both_l
     assert [algo["algo-id"] for algo in process["flex-algo"]] == [128], "the sibling lane's rows left the wire"
 
 
+def _carrier_delete_offenders(sources):
+    import ast
+    from pathlib import Path
+
+    def qualified(node, aliases):
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            return f"{qualified(node.value, aliases)}.{node.attr}"
+        return ""
+
+    offenders: set[str] = set()
+    for path, source in sources.items():
+        if path == Path("store/tombstone_store.py"):
+            continue
+        tree = ast.parse(source)
+        aliases = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    aliases[alias.asname or alias.name.split(".")[0]] = (
+                        alias.name if alias.asname else alias.name.split(".")[0]
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and qualified(node.func, aliases).split(".")[-1] == "delete":
+                if any(qualified(arg, aliases).split(".")[-1] == "StaticRouteTombstone" for arg in node.args):
+                    offenders.add(str(path))
+    return offenders
+
+
 def test_every_consumption_path_deletes_a_carrier_through_the_one_locking_choke_point():
     """One choke point, so the projection lock cannot be forgotten on a new consumption path.
 
@@ -866,20 +899,7 @@ def test_every_consumption_path_deletes_a_carrier_through_the_one_locking_choke_
     import pathlib as _pathlib
 
     root = _pathlib.Path(__file__).resolve().parents[2] / "nso_adapter"
-    offenders: set[str] = set()
-    for path in root.rglob("*.py"):
-        if path.name == "tombstone_store.py":
-            continue
-        tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and (
-                isinstance(node.func, ast.Name)
-                and node.func.id == "delete"
-                or isinstance(node.func, ast.Attribute)
-                and node.func.attr == "delete"
-            ):
-                if any(isinstance(arg, ast.Name) and arg.id == "StaticRouteTombstone" for arg in node.args):
-                    offenders.add(str(path.relative_to(root)))
+    offenders = _carrier_delete_offenders({path.relative_to(root): path.read_text() for path in root.rglob("*.py")})
     assert offenders == set(), f"carrier deletions outside the choke point: {sorted(offenders)}"
 
     source = ast.parse((root / "store" / "tombstone_store.py").read_text())
@@ -894,6 +914,31 @@ def test_every_consumption_path_deletes_a_carrier_through_the_one_locking_choke_
         and node.func.id in {"lock_claim", "lock_projection"}
     ]
     assert awaited[:2] == ["lock_claim", "lock_projection"], f"the lock order is not claim then projection: {awaited}"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import sqlalchemy as sa; from nso_adapter.store import models; sa.delete(models.StaticRouteTombstone)",
+        "from nso_adapter.store.models import StaticRouteTombstone as Carrier; from sqlalchemy import delete; delete(Carrier)",
+        "import nso_adapter.store.models as m; import sqlalchemy as sa; sa.delete(m.StaticRouteTombstone)",
+        "import nso_adapter.store.models; import sqlalchemy; sqlalchemy.delete(nso_adapter.store.models.StaticRouteTombstone)",
+        "from nso_adapter.store import models as m; from sqlalchemy import delete as remove; remove(m.StaticRouteTombstone)",
+        "from nso_adapter.store.models import StaticRouteTombstone; from sqlalchemy import delete; delete(StaticRouteTombstone)",
+    ],
+)
+@pytest.mark.parametrize("path", ["core/consumer.py", "core/tombstone_store.py"])
+def test_carrier_delete_guard_rejects_qualified_models_and_aliases(source, path):
+    from pathlib import Path
+
+    assert _carrier_delete_offenders({Path(path): source}) == {path}
+
+
+def test_carrier_delete_guard_exempts_only_the_owning_path():
+    from pathlib import Path
+
+    source = "from sqlalchemy import delete; from nso_adapter.store.models import StaticRouteTombstone; delete(StaticRouteTombstone)"
+    assert _carrier_delete_offenders({Path("store/tombstone_store.py"): source}) == set()
 
 
 # ── the hydration half: every stored fact is checked BEFORE any device I/O ────
