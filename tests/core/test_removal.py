@@ -816,7 +816,8 @@ async def test_isis_removal_orphaned_process_blocks(adapter_client):
         assert job.error["detail"]["orphans"] == {"isis/process-config": [["OLD"]]}
 
 
-async def test_isis_removal_proceeds_when_extra_row_was_just_removed(adapter_client):
+@pytest.mark.parametrize("legacy_context", [False, True])
+async def test_isis_removal_proceeds_when_extra_row_was_just_removed(adapter_client, legacy_context):
     """The trigger threads the keys it just deleted; those are EXPECTED retractions
     (the whole point of the removal job), not collateral."""
     device_id = await _seed_device(nso_device_name="ra1-legit")
@@ -832,12 +833,19 @@ async def test_isis_removal_proceeds_when_extra_row_was_just_removed(adapter_cli
             },
         )
     )
-    # legacy pre-#90 context shape — jobs queued before the generalization must still pass
-    job_id = await _seed_removal_job(device_id, scope="isis", context_extra={"removed_interfaces": [["lag1", "ipv4"]]})
+    context = {"removed": {"interface-config": [["lag1", "ipv4"]]}}
+    if legacy_context:
+        context = {"removed_interfaces": [["lag1", "ipv4"]]}
+    job_id = await _seed_removal_job(device_id, scope="isis", context_extra=context)
     sender = _sender()
     await _run_removal_with(device_id, job_id, client, sender)
     async with session() as db:
         job = await db.get(Job, job_id)
+        if legacy_context:
+            assert job.status == JobStatus.failed
+            assert job.error["detail"]["orphans"] == {"isis/interface-config": [["lag1", "ipv4"]]}
+            assert not _commits(sender)
+            return
         assert job.status == JobStatus.succeeded
     assert _sent(sender)["isis"]["interface-config"] == [
         {"interface-name": "system", "af": "ipv4", "passive": True, "process-tag": "0"}

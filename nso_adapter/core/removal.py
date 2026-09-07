@@ -293,12 +293,8 @@ def _leaf_keys(entry: dict, guard_list: _GuardList) -> set[tuple[str, ...]]:
 
 
 def _removed_context(scope: str, context: dict) -> dict[str, list]:
-    """Return the trigger's just-removed keys per YANG list (with pre-#90 isis compat)."""
-    removed = dict(context.get("removed") or {})
-    if scope == "isis":  # legacy context shape from jobs queued before the generalization
-        removed.setdefault("interface-config", context.get("removed_interfaces", []))
-        removed.setdefault("process-config", context.get("removed_processes", []))
-    return removed
+    """Return the trigger's just-removed keys per YANG list."""
+    return dict(context.get("removed") or {})
 
 
 # Guard-list label → the network-state-export list path, for the scopes where the
