@@ -214,10 +214,23 @@ def test_the_downgrade_strips_execution_metadata_back_to_tables(pg_provisioner):
         alembic(sync_url, "upgrade", module.down_revision)
         with engine_on(sync_url) as engine, engine.begin() as connection:
             device_id = _seed_device(connection, name="mig-down", netbox_id=16634, ned_id="cisco-ios-cli-3.8")
-            stream_id = _seed_stream(connection, device_id, "vlan", _empty_tables("vlan"))
+            tables = {
+                "static_route_intent": [
+                    {
+                        "id": 31,
+                        "device_id": device_id,
+                        "route_id": 7,
+                        "vrf": "",
+                        "prefix": "198.18.0.0/24",
+                        "next_hop": "198.18.1.1",
+                    }
+                ],
+                "static_route_tombstone": [],
+            }
+            stream_id = _seed_stream(connection, device_id, "static_route", tables)
 
         alembic(sync_url, "upgrade", module.revision)
         alembic(sync_url, "downgrade", module.down_revision)
 
         with engine_on(sync_url) as engine, engine.begin() as connection:
-            assert _fragment(connection, stream_id) == _empty_tables("vlan")
+            assert _fragment(connection, stream_id) == tables
