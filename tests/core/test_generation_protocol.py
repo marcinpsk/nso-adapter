@@ -18,7 +18,6 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
-import httpx
 import pytest
 import sqlalchemy as sa
 
@@ -43,29 +42,16 @@ _SNMP_CONTAINER = "snmp"
 class _Recorder:
     """Every request the apply hands to the RESTCONF pool, in order."""
 
-    def __init__(self, device_name: str, *, fail_vlan: bool = False):
-        self.device_name = device_name
-        self.fail_vlan = fail_vlan
-        self.calls: list[dict] = []
+    def __init__(self, device_name: str, *, fail_vlan: bool = False, sr_fake=None):
+        from tests.core.test_static_route_removal import SrFake
+
+        self.fake = sr_fake if sr_fake is not None else SrFake(device_name, service=None)
+        if fail_vlan:
+            self.fake.reject_containers.add(_VLAN_CONTAINER)
+        self.calls = self.fake.calls
 
     async def _handle(self, method: str, url: str, content=None, headers=None):
-        body = json.loads(content) if content else None
-        dry = "dry-run=" in url
-        self.calls.append({"method": method, "url": url, "body": body, "dry_run": dry})
-        request = httpx.Request(method.upper(), url)
-        if dry:
-            return httpx.Response(
-                200,
-                request=request,
-                json={"dry-run-result": {"native": {"device": [{"name": self.device_name, "data": ""}]}}},
-            )
-        if self.fail_vlan and _VLAN_CONTAINER in (self._instance(body) or {}):
-            return httpx.Response(
-                400,
-                request=request,
-                json={"errors": {"error": [{"error-message": "vlan commit rejected"}]}},
-            )
-        return httpx.Response(204, request=request, text="")
+        return await self.fake.handle(method, url, content, headers)
 
     @staticmethod
     def _instance(body) -> dict | None:
@@ -95,7 +81,9 @@ class _Recorder:
         return [[entry["vlan-id"] for entry in doc[_VLAN_CONTAINER]["vlan"]] for doc in self.bodies(_VLAN_CONTAINER)]
 
 
-def recorded_client(device_name: str, *, on_sync_from=None, fail_vlan: bool = False, device_state: dict | None = None):
+def recorded_client(
+    device_name: str, *, on_sync_from=None, fail_vlan: bool = False, device_state: dict | None = None, sr_fake=None
+):
     """A spec'd NsoClient whose RESTCONF boundary is recorded.
 
     *on_sync_from* runs when the apply takes its pre-apply sync — the window between the
@@ -107,9 +95,9 @@ def recorded_client(device_name: str, *, on_sync_from=None, fail_vlan: bool = Fa
     be seen. Left out, the action answers nothing and every check classifies ``error``, which
     never fails an apply.
     """
-    from nso_adapter.nso.client import NsoClient, ServiceInstanceState
+    from nso_adapter.nso.client import NsoClient
 
-    rec = _Recorder(device_name, fail_vlan=fail_vlan)
+    rec = _Recorder(device_name, fail_vlan=fail_vlan, sr_fake=sr_fake)
     http = AsyncMock()
     for method in ("get", "put", "patch", "post", "delete"):
 
@@ -124,13 +112,17 @@ def recorded_client(device_name: str, *, on_sync_from=None, fail_vlan: bool = Fa
     client = MagicMock(spec=NsoClient)
     client._base = "http://nso"
     client._action_timeout = 120.0
-    client.service_instance_state = AsyncMock(return_value=ServiceInstanceState("absent", None))
+
+    async def _service_state(device):
+        return await NsoClient.service_instance_state(client, device)
+
+    client.service_instance_state = AsyncMock(side_effect=_service_state)
     cm = client._client.return_value
     cm.__aenter__.return_value = http
     cm.__aexit__.return_value = False
     client.get_service_config = AsyncMock(return_value=None)
     if device_state is None:
-        client.run_device_state_read = AsyncMock(return_value={})
+        client.run_device_state_read = AsyncMock(side_effect=lambda *_a, **_kw: {"static-route": rec.fake.section()})
     else:
 
         async def _state(_device_name, wires, **_kwargs):
@@ -868,7 +860,7 @@ async def test_f6_c_the_reclaimer_reissue_gives_its_job_a_generation(adapter_cli
     # section for its operation plane and creation refuses.
     await authorize_stream(device_id, "static_route")
 
-    client, _rec = recorded_client("gen-reclaim")
+    client, _rec = recorded_client("gen-reclaim", device_state={"static-route": {"status": "unsupported"}})
     with patch("nso_adapter.core.importer.get_nso_client", return_value=client):
         _consumed, reissued = await reclaim_succeeded_tombstones()
 

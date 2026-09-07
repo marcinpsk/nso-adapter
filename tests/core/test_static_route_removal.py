@@ -18,6 +18,7 @@ assertion about a call graph.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -67,6 +68,10 @@ class SrFake:
         self.section_status = section_status
         self.dry_run_status = dry_run_status
         self.calls: list[dict] = []
+        self.reads: list[dict] = []
+        self.instance = {"device": device_name}
+        self.put_outcome = "success"
+        self.reject_containers: set[str] = set()
 
     # ── reads ──
     def state(self):
@@ -76,7 +81,7 @@ class SrFake:
             return ServiceInstanceState("inconclusive", None)
         if self.service_status == "absent" or self.service is None:
             return ServiceInstanceState("absent", None)
-        entry = {"device": self.device_name, _SR_CONTAINER: {"route": [dict(e) for e in self.service]}}
+        entry = {**deepcopy(self.instance), _SR_CONTAINER: {"route": deepcopy(self.service)}}
         return ServiceInstanceState("present", entry)
 
     def section(self) -> dict:
@@ -89,8 +94,19 @@ class SrFake:
         body = json.loads(content) if content else None
         dry = "dry-run=" in url
         no_net = "no-networking" in url
-        self.calls.append({"method": method, "url": url, "body": body, "dry_run": dry, "no_networking": no_net})
         request = httpx.Request(method.upper(), url)
+        if method == "get":
+            state = (
+                self.state()
+                if request.url.path == f"/restconf/data/device-intent:device-intent={self.device_name}"
+                else None
+            )
+            self.reads.append({"url": url, "state": deepcopy(state)})
+            if state is None or state.status == "absent":
+                return httpx.Response(404, request=request, json={})
+            payload = {_SR_ROOT: [state.entry]} if state.status == "present" else {}
+            return httpx.Response(200, request=request, json=payload)
+        self.calls.append({"method": method, "url": url, "body": body, "dry_run": dry, "no_networking": no_net})
         if dry:
             if self.dry_run_status != 200:
                 return httpx.Response(self.dry_run_status, request=request, json={"errors": "boom"})
@@ -100,6 +116,11 @@ class SrFake:
                 json={"dry-run-result": {"native": {"device": [{"name": self.device_name, "data": ""}]}}},
             )
         if body and _SR_ROOT in body:
+            if self.put_outcome == "reject" or self.reject_containers.intersection(body[_SR_ROOT][0]):
+                return httpx.Response(400, request=request, json={"errors": "commit rejected"})
+            if self.put_outcome == "lost_before_commit":
+                raise httpx.ReadError("response lost before commit", request=request)
+            self.instance = deepcopy(body[_SR_ROOT][0])
             routes = [dict(e) for e in ((body[_SR_ROOT][0].get(_SR_CONTAINER) or {}).get("route") or [])]
             owned = {key_of(e) for e in (self.service or [])}
             new = {key_of(e) for e in routes}
@@ -112,6 +133,8 @@ class SrFake:
                 self.device = list(by_key.values())
             self.service = routes
             self.service_status = "present"
+            if self.put_outcome == "lost_after_commit":
+                raise httpx.ReadError("response lost after commit", request=request)
         return httpx.Response(204, request=request, text="")
 
     # ── views ──
@@ -161,7 +184,11 @@ def sr_client(fake: SrFake):
     cm = client._client.return_value
     cm.__aenter__.return_value = http
     cm.__aexit__.return_value = False
-    client.service_instance_state = AsyncMock(side_effect=lambda _device: fake.state())
+
+    async def _service_state(device):
+        return await NsoClient.service_instance_state(client, device)
+
+    client.service_instance_state = AsyncMock(side_effect=_service_state)
     # Deliberately clean-looking: a path that wrongly falls back to the UNCERTIFIED reader is
     # caught by the assertions rather than hidden by it.
     client.get_service_config = AsyncMock(return_value=None)
