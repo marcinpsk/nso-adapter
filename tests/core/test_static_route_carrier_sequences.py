@@ -116,15 +116,17 @@ async def test_a_deployed_only_claim_is_cleaned_up_rather_than_superseded(adapte
     assert harness.fake.sent_keys() == {K, S}
     await harness.drain()
 
-    # The replacement: the same route_id now renders L and remembers K. Marked delete-origin,
-    # so the predecessor is a retraction and not an un-own, which commits no-networking and
-    # would strand K on the device. Auto-applied, because an operator Apply cannot select a
-    # stream whose own push already queued the chain.
-    await _enable_auto_apply(harness.device_id)
-    await harness.push([route(L, route_id=1), route(S, route_id=2)], delete_origin=True)
+    # Manual Apply must render the successor and authorize removal of its predecessor.
+    await harness.push([route(L, route_id=1), route(S, route_id=2)])
+    replacement = (await generations(harness.device_id))[-1]
+    await harness.run()
+    assert harness.fake.sent_keys() == {L, S}, "manual replacement transmitted the predecessor instead of L"
     await harness.drain()
-    assert harness.fake.sent_keys() == {K, L, S}, "L is rendered and K is still retained by its carrier"
+    assert harness.fake.sent_keys() == {L, S}
     assert await tombstone_ids(harness.device_id) == [tomb]
+    rows = replacement.document["static_route"]["static_route_intent"]
+    assert len({row["id"] for row in rows}) == len(rows)
+    assert {row["prefix"] for row in rows} == {L[1], S[1]}
 
     # The sweeper first, so the cleanup takes the lower sequence, and the successor is frozen
     # while the carrier is still live.
@@ -132,6 +134,7 @@ async def test_a_deployed_only_claim_is_cleaned_up_rather_than_superseded(adapte
     cleanup = (await generations(harness.device_id))[-1]
     # An operator Apply is refused while a job is queued, so the successor is frozen the one
     # way that stays open: an auto-applied push, admitted behind the cleanup.
+    await _enable_auto_apply(harness.device_id)
     harness.seq += 1
     assert (await _put_vlans(harness.api, harness.device_id, [777], seq=harness.seq)).status_code == 200
     successor = (await generations(harness.device_id))[-1]
@@ -142,10 +145,13 @@ async def test_a_deployed_only_claim_is_cleaned_up_rather_than_superseded(adapte
     assert [tuple(key) for key in removal["authorized_removal_keys"]] == [K]
     assert removal["tombstone_ids"] == [tomb]
 
+    reads = len(harness.fake.reads)
     job = await harness.run()
     assert job.id == cleanup.job_id
     assert job.result["removal_branch"] == "networked", "a deployed-only claim was consumed as superseded"
-    assert job.result.get("service_clean") is not False, "consumption requires a CERTIFIED clean section"
+    proof = harness.fake.reads[reads:][-1]["state"]
+    assert proof.status == "present"
+    assert K not in {key_of(entry) for entry in proof.entry["static-route"]["route"]}
     assert harness.fake.sent_keys() == {L, S}
     assert K not in harness.fake.service_keys
     assert await tombstone_ids(harness.device_id) == []

@@ -29,11 +29,7 @@ class RetentionHarness:
     seq: int = 0
 
     async def push(self, routes, *, removed=(), store_only=False, delete_origin=False):
-        """One intent push. *delete_origin* marks a push whose SHRINK is a NetBox deletion.
-
-        A replacement (a route_id whose triple moves) shrinks no row, so it needs the mark
-        stated: unmarked, the predecessor identity is un-owned and stays on the device.
-        """
+        """Push intent and manually Apply it unless admission already created a generation."""
         self.seq += 1
         marked = bool(removed) or delete_origin
         before = len(await generations(self.device_id))

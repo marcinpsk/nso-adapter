@@ -424,6 +424,11 @@ def _fragment_deletions(
     desired_tables = fragment_tables(desired)
     for table in sorted(old_tables):
         desired_rows = rows_by_intent_identity(desired_tables, table)
+        successor_route_ids = (
+            {after["route_id"] for after in desired_rows.values() if after.get("route_id") is not None}
+            if table == "static_route_intent"
+            else set()
+        )
         for identity, row in rows_by_intent_identity(old_tables, table).items():
             if not is_intent_deletion(table, identity, desired_rows):
                 continue
@@ -435,6 +440,9 @@ def _fragment_deletions(
                 marking = explicit.get((table, "route_id", row["route_id"]), marking)
             key = (row.get("vrf") or "", row.get("prefix") or "", row.get("next_hop") or "")
             marking = explicit.get((table, "key", key), marking)
+            # A correlated successor replaces its predecessor through a networked write.
+            if row.get("route_id") in successor_route_ids:
+                marking = DELETE_ORIGIN_MARKING
             target = networked if marking == DELETE_ORIGIN_MARKING else detached
             target.setdefault(table, []).append(row)
     return networked, detached
@@ -449,8 +457,10 @@ def _retain_rows(desired: dict, retained: dict[str, list[dict]], stream: str, so
     """
     result = deepcopy(desired)
     for table, rows in retained.items():
-        result.setdefault(table, []).extend(deepcopy(rows))
-        result[table].sort(key=lambda row: row["id"])
+        combined = [*result.get(table, []), *deepcopy(rows)]
+        if len({row["id"] for row in combined}) != len(combined):
+            raise ValueError(f"{stream}/{table}: retained rows duplicate a desired row id")
+        result[table] = sorted(combined, key=lambda row: row["id"])
     execution = result.setdefault(EXECUTION_KEY, {})
     proof = retained_proof(
         stream,
