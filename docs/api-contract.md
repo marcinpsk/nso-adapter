@@ -124,8 +124,8 @@ its streams' last-authorized fragments, with the just-promoted stream's fresh sn
 overlaid.
 
 An intent push is the only thing that authorizes. `POST …/actions/force-removal` authorizes
-nothing: it re-issues a deployment of one scope, of state an earlier push already
-authorized, with the collateral guard off — so it promotes no stream and marks none applied.
+nothing: it re-issues a deployment of state an earlier push already authorized, with the
+collateral guard off — so it promotes no stream and marks none applied.
 
 **What identifies a delivery.** The sequence, the body digest AND the request mode:
 
@@ -783,9 +783,21 @@ Run the NSO connectivity test.
 
 ### `POST /api/v1/devices/{id}/actions/force-removal`
 
-Reissue one removal scope with the collateral guard disabled. The request body is
-`{ "scope": "<scope>", "interfaces": ["<name>", ...] | null }`.
-`interface_config` requires a non-empty `interfaces` list.
+Reissue a removal with the collateral guard disabled. The request body is
+`{ "scope": "<scope>", "interfaces": ["<name>", ...] | null }`. Only `scope` is validated:
+a scope outside the removal-scope set is `400 bad_request`, and so is a scope nothing has
+ever authorized on this device, because the composed document then carries no section for
+the flush to act on.
+
+**The guard is disabled for the whole document, not for `scope` alone.** One send is the
+device's entire document, so the write flushes every family's orphaned service rows, not
+only the named scope's. `scope` selects the residue check, the pending clears the job
+discharges, and (for `static_route`) the suppression of entry retention. It does not narrow
+the write. Review the orphans of every family, not just one, before issuing this.
+
+`interfaces` does not constrain the write either. It is recorded in the job context and
+nothing reads it, so an `interface_config` force-removal flushes every interface the
+document does not re-assert, whatever the list holds. No scope requires the field.
 
 Each valid request creates a distinct reissue generation and a distinct removal
 job. A repeated request for the same scope does not reuse or replace an earlier
@@ -1547,12 +1559,13 @@ the push is a full replace.
 #### Replacing a route in place: the guarded PUT
 
 Editing a route's identity in place (see *Matching* above) leaves the device carrying the
-**old** `(vrf, prefix, next_hop)` while the store holds the new one. A merge-PATCH only adds,
-so it would leave both live. The adapter records per row what it last proved deployed, and
-when that differs from the row's current triple it delivers the whole scope as a
-**PUT-replace** of the `static-route-config` service instance instead of a merge-PATCH. The
-body is then every *accepted* row of the device, not just the eligible subset — an
-eligible-only replace would retract every accepted-and-clean sibling.
+**old** `(vrf, prefix, next_hop)` while the store holds the new one. The adapter records per
+row what it last proved deployed, and when that differs from the row's current triple the
+generation records that its document **delivers a replacement**. The transport is not the
+variable: every send is one PUT of the device's whole document, so the body is always every
+*accepted* row of the device, not just the eligible subset — an eligible-only body would
+retract every accepted-and-clean sibling. What the record decides is whether the send needs
+proof.
 
 The replace is guarded and gated:
 
@@ -1572,11 +1585,14 @@ The replace is guarded and gated:
   `POST /api/v1/devices/{id}/actions/force-removal`.
 - Entries a queued removal still owns ride through **verbatim** — including leaves the intent
   store has no column for — so an apply never drops what a removal is about to remove.
-- The replace runs only while post-apply verification is enabled (`NSO_ADAPTER_VERIFY_APPLY`).
-  With it off the scope stays a merge-PATCH and records nothing as deployed: a destructive
-  replace whose proof is structurally unavailable is refused rather than run blind.
-  A queued generation whose immutable plan already records `PUT` is failed before sync-from
-  or any RESTCONF request if verification is disabled when its worker starts.
+- A recorded replacement is delivered only while post-apply verification is enabled
+  (`NSO_ADAPTER_VERIFY_APPLY`). With it off there is nothing to fall back to, so the job
+  FAILS with `static_route_put_verify_disabled` before sync-from and before any RESTCONF
+  request. A destructive replace whose proof is structurally unavailable is refused rather
+  than run blind: closing the replacement while its predecessor may still be on the device is
+  worse than not running it. The check reads the queued generation's immutable plan, so a
+  generation recorded while verification was on still refuses if it is off when its worker
+  starts.
 - `actions/apply-diff` renders the identical payload as a PUT dry-run, so the preview the
   operator approves is byte-for-byte what the apply sends.
 
@@ -2431,10 +2447,15 @@ The `PUT .../static-route-intent?backfill_only=true` path is also an exception: 
 prunes omitted uncorrelated rows but creates neither a removal job nor a tombstone.
 A worker runs each job in the background. A promoted generation hydrates its exact stored
 document and execution plan, so a retry repeats the same selected operation after a worker
-restart. A reissue generation carries no promoted revisions or stored execution plan and
-executes its one removal context's scope from then-current live state. The sweeper, reclaimer,
-and force-removal paths produce reissues. A removal job with no generation is invalid and is
-refused. Scope is carried in `Job.context.scope` (one of
+restart. A reissue generation promotes nothing: its `stream_revisions` is empty, so it
+settles nothing. It is **not** live-relative either. Its document is composed from the
+authorized fragments when the generation is created and stored with it, alongside a frozen
+removal context, so a store-only edit made after the job is enqueued cannot change what that
+job sends. The one live read at execution is the static-route section, whose body
+additionally carries the live certified entries the frozen plan retains. A `force` reissue of
+`static_route` suppresses even that, so the flush is not preserved by its own write. The
+sweeper, reclaimer, and force-removal paths produce reissues. A removal job with no
+generation is invalid and is refused. Scope is carried in `Job.context.scope` (one of
 `route_policy · bfd · svi · subinterface · static_route · interface_mtu · vlan ·
 logging · l2_sap · ospf · bgp · isis · interface_config · snmp · lag · switchport`).
 Job status is observable via `GET …/jobs` like any other job; a failed removal records
