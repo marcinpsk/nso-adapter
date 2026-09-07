@@ -90,7 +90,7 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-def _attrs_to_interface_list(data: dict | None) -> list[Interface]:
+def _attrs_to_interface_list(data: dict | None, *, device_name: str) -> list[Interface]:
     """Convert NSO package interface-attributes oper-data to domain Interface objects.
 
     Skips malformed entries (missing ``interface-name``) with a warning log.
@@ -102,7 +102,14 @@ def _attrs_to_interface_list(data: dict | None) -> list[Interface]:
     for entry in as_list(data.get("interface")):
         name = entry.get("interface-name")
         if not name:
-            logger.warning("interface-attrs: skipping malformed entry (no interface-name)", entry=entry)
+            # The entry is the device's own data and can carry any leaf the NED emits, so
+            # the record names the field that is missing and the read it came from.
+            logger.warning(
+                "interface_attributes.entry_skipped",
+                device_name=device_name,
+                family="interface-attributes",
+                missing_field="interface-name",
+            )
             continue
         result.append(
             Interface(
@@ -1034,7 +1041,7 @@ async def _consume_interface_attributes(
                 return _AttrsSyncResult(True, 0, 0, 0)
         savepoint = await db.begin_nested()
         if isinstance(outcome, Present):
-            interfaces = _attrs_to_interface_list(outcome.data)
+            interfaces = _attrs_to_interface_list(outcome.data, device_name=device.nso_device_name)
             scope_result = await db.execute(select(ManagedScope).where(ManagedScope.device_id == device_id))
             scope_attrs = [scope.attribute for scope in scope_result.scalars().all()]
 
@@ -1289,7 +1296,7 @@ async def _detect_drift_attributes(
         family_name="interface_attributes",
     )
     if isinstance(attrs_outcome, Present):
-        interfaces = _attrs_to_interface_list(attrs_outcome.data)
+        interfaces = _attrs_to_interface_list(attrs_outcome.data, device_name=device.nso_device_name)
     else:
         assert isinstance(attrs_outcome, Unavailable)
         logger.warning(
