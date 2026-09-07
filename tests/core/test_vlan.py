@@ -82,10 +82,39 @@ async def test_refresh_vlan_database_rejects_a_malformed_item_and_keeps_rows(ada
         await refresh_vlan_database_for_device(db, device, nso)
 
         sections["vlan-database"] = {"status": "ok", "vlan": [{"vlan-id": 10, "name": "MGMT"}, {"name": "NO-ID"}]}
-        with pytest.raises(ValueError, match="vlan-database item without a usable vlan id"):
+        with pytest.raises(ValueError, match="carries a vlan-id of type NoneType"):
             await refresh_vlan_database_for_device(db, device, nso)
         rows = (await db.execute(select(DeviceVlan).where(DeviceVlan.device_id == device.id))).scalars().all()
         assert {r.vlan_id for r in rows} == {10, 20}, "a malformed item must never prune its siblings"
+
+
+@pytest.mark.anyio
+async def test_a_malformed_item_is_named_by_its_FIELD_and_never_repeated_verbatim(adapter_client):
+    """The refusal interpolated the whole wire item, which is device-derived server data.
+
+    A vlan-database entry carries whatever the export put in it. Repeating it verbatim
+    carries that content into every surface that records the refusal. The field name and
+    the received type say what is wrong and carry no payload.
+    """
+    from tests._secret_discipline import assert_chain_free_of
+
+    device_id = await seed_device(nso_device_name="vsw-sink", netbox_device_id=1309)
+    async with _device_session(device_id) as (db, device):
+        nso = AsyncMock()
+        sections = _serve_sections(nso)
+        sections["vlan-database"] = {
+            "status": "ok",
+            "vlan": [{"name": "NO-ID", "description": "placeholder-server-text"}],
+        }
+        with pytest.raises(ValueError) as caught:
+            await refresh_vlan_database_for_device(db, device, nso)
+
+    message = str(caught.value)
+    for repeated in ("placeholder-server-text", "NO-ID"):
+        assert repeated not in message, "the refusal repeats the wire item verbatim"
+    assert "vlan-id" in message, "the diagnostic must still name the field"
+    assert "NoneType" in message, "the diagnostic must still name the received type"
+    assert_chain_free_of(caught.value, ["placeholder-server-text"])
 
 
 @pytest.mark.anyio
