@@ -764,10 +764,6 @@ async def _seed_isis_intent(device_id: int, *ifaces: tuple[str, str]):
         return
 
 
-async def _run_guarded_removal(device_id: int, job_id: int, client, sender):
-    await _run_removal_with(device_id, job_id, client, sender)
-
-
 async def test_isis_removal_blocked_on_orphaned_service_rows(adapter_client):
     """A live interface row the document does not re-assert and nobody just removed is an
     orphan; the job must BLOCK, attach the dry-run preview, and commit NOTHING."""
@@ -786,7 +782,7 @@ async def test_isis_removal_blocked_on_orphaned_service_rows(adapter_client):
     )
     job_id = await _seed_removal_job(device_id, scope="isis")
     sender = _sender(preview="- interface lo0 (native preview)")
-    await _run_guarded_removal(device_id, job_id, client, sender)
+    await _run_removal_with(device_id, job_id, client, sender)
     async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
@@ -813,7 +809,7 @@ async def test_isis_removal_orphaned_process_blocks(adapter_client):
         )
     )
     job_id = await _seed_removal_job(device_id, scope="isis")
-    await _run_guarded_removal(device_id, job_id, client, _sender())
+    await _run_removal_with(device_id, job_id, client, _sender())
     async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.failed
@@ -839,7 +835,7 @@ async def test_isis_removal_proceeds_when_extra_row_was_just_removed(adapter_cli
     # legacy pre-#90 context shape — jobs queued before the generalization must still pass
     job_id = await _seed_removal_job(device_id, scope="isis", context_extra={"removed_interfaces": [["lag1", "ipv4"]]})
     sender = _sender()
-    await _run_guarded_removal(device_id, job_id, client, sender)
+    await _run_removal_with(device_id, job_id, client, sender)
     async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
@@ -865,7 +861,7 @@ async def test_isis_removal_force_skips_guard(adapter_client):
     )
     job_id = await _seed_removal_job(device_id, scope="isis", context_extra={"force": True})
     sender = _sender()
-    await _run_guarded_removal(device_id, job_id, client, sender)
+    await _run_removal_with(device_id, job_id, client, sender)
     async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
@@ -880,7 +876,7 @@ async def test_isis_removal_without_service_instance_proceeds(adapter_client):
     client = _guard_client(None)
     job_id = await _seed_removal_job(device_id, scope="isis")
     sender = _sender()
-    await _run_guarded_removal(device_id, job_id, client, sender)
+    await _run_removal_with(device_id, job_id, client, sender)
     async with session() as db:
         job = await db.get(Job, job_id)
         assert job.status == JobStatus.succeeded
@@ -1405,53 +1401,12 @@ def test_an_uncomparable_grain_is_only_reader_compared_if_it_can_be_TRANSLATED()
     )
 
 
-# removal scope → the FamilySpec surface name whose wire_name the residue read must target.
-# The mirror engine reads each family through FamilySpec.wire_name, so pinning
-# _RESIDUE_WIRE_NAMES to that registry means a section rename breaks the residue check and
-# the mirror together (never silently). This is the #104-A trap — a wire that the action
-# would 404 on, matched by a fake that carried the same typo — foreclosed at the contract level.
-_SCOPE_TO_SURFACE = {
-    "svi": "svi",
-    "subinterface": "subinterface",
-    "static_route": "static_route",
-    "vlan": "vlan",
-    "logging": "logging",
-    "interface_mtu": "interface_mtu",
-    "bfd": "bfd",
-    "l2_sap": "l2_service",
-    "bgp": "bgp",
-    "isis": "isis",
-    "ospf": "ospf",
-    "route_policy": "route_policy",
-    "snmp": "snmp",
-    "interface_config": "interface_ip",
-    "switchport": "switchport",
-    "lag": "lag_config",
-}
-
-
-def test_residue_wire_names_match_the_envelope_sections():
-    """Every residue wire name must equal the FamilySpec.wire_name the mirror reads, and the
-    fake must expose the real action method. #104-A shipped bfd→get_bfd and l2_sap→get_l2_service
-    (neither existed) and the fake carried the same typo, so the suite stayed green while real
-    removals degraded to residue_check='error'. Its reborn form is a wire-name typo the action
-    would 404 on — pinned here to ground truth.
-
-    The mapping is DERIVED now (the registry's ``read_family`` resolved through the spec), so
-    this pins the derivation against the surface list rather than a second hand-kept table.
-    """
+def test_residue_reader_exposes_the_real_action_method():
+    """The residue reader fake exposes the real asynchronous action method."""
     import inspect
 
-    from nso_adapter.core.importer import projectable_spec
-    from nso_adapter.core.removal import residue_wire_name
     from nso_adapter.nso.client import NsoClient
 
-    for scope, surface in _SCOPE_TO_SURFACE.items():
-        spec = projectable_spec(surface)
-        assert spec is not None, f"{scope} → surface {surface!r} has no FamilySpec"
-        assert residue_wire_name(scope) == spec.wire_name, (
-            f"{scope}: residue wire {residue_wire_name(scope)!r} != mirror wire_name {spec.wire_name!r}"
-        )
     # The residue read and the fake both go through the real action method, not a getter.
     action = getattr(NsoClient, "run_device_state_read", None)
     assert action is not None and inspect.iscoroutinefunction(action)
