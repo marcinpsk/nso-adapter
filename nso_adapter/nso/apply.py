@@ -434,8 +434,7 @@ def build_interface_ip_entry(
 ) -> dict:
     """Shape one interface-reconciler service-instance body from a device's IP rows.
 
-    Shared by :func:`apply_interface_ips` (per-scope path) and the atomic combined path,
-    so both emit byte-identical IP bodies. ``kind``/``service``/``parent_binding``/
+    The aggregate encoder uses this body. ``kind``/``service``/``parent_binding``/
     ``encap_tag`` carry the Nokia routed-interface context (ignored by IOS/Junos).
     """
     return {
@@ -604,11 +603,9 @@ def static_route_entry_key(entry: dict) -> tuple[str, str, str]:
 def local_levels_write_enabled() -> bool:
     """Whether to emit the logging ``local-levels`` container (NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE).
 
-    Off by default — the NX-P4a deploy gate (design R2/F4): every outbound
-    local-levels write goes through apply_logging_config, so this single choke
-    point keeps the adapter from sending the container to a pre-reload
-    logging-reconciler that would reject the unknown node. Flipped on once the
-    reloaded packages are live.
+    The gate is off by default. Every outbound local-levels write passes through
+    :func:`refuse_gated_local_levels` at the send boundary. Enable the gate after
+    the reloaded packages accept the container.
     """
     return os.environ.get("NSO_ADAPTER_LOGGING_LOCAL_LEVELS_WRITE", "0").strip().lower() in ("1", "true", "yes", "on")
 
@@ -635,8 +632,7 @@ def _local_levels(row) -> dict:
 def build_subif_interfaces(subif_intent_rows: list) -> list[dict]:
     """Shape the subinterface-reconciler ``interface`` list from a device's subif rows.
 
-    Shared by :func:`apply_subinterface_config` (per-scope path) and the atomic combined
-    path so both emit byte-identical subif bodies.
+    The aggregate encoder uses this list.
     """
     interfaces = []
     for row in subif_intent_rows:

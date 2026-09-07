@@ -2433,7 +2433,7 @@ observable via `GET …/jobs` like any other job; a failed removal records
 `static_route` is the one scope that does **not** rebuild its body from the remaining accepted
 rows — it drops exactly what it is authorized to drop and keeps the rest of the live service
 verbatim. See
-[Static-route removals are live-service-relative](#static-route-removals-are-live-service-relative).
+[Static-route removals are document-relative with one live read](#static-route-removals-are-document-relative-with-one-live-read).
 
 ---
 
