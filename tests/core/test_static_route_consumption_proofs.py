@@ -124,10 +124,33 @@ async def test_the_aggregate_read_serves_both_consumers_and_no_legacy_path(adapt
     assert fake.sent_keys() == {A, B}
     assert next(e for e in fake.sent_routes() if key_of(e) == A) == rich_a
 
-    # Consumer 2, the consumption proof: the service still holds K, so nothing is consumed.
-    consumed, _ = await run_reclaim(client)
-    assert consumed == 0
+    # Device drift removes A after the sender restored it; the aggregate still owns A.
+    from nso_adapter.core.apply import _static_route_device_state
+    from nso_adapter.core.static_route_plan import hydrate_static_route_removal_plan
+    from nso_adapter.store.models import Device
+    from tests.core.test_generation_protocol import generations
+
+    fake.device = [entry for entry in fake.device if key_of(entry) != A]
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        status, entries = await _static_route_device_state(client, device)
+        assert status == "ok" and A not in entries
+        service = await certified_static_route_section(client, device)
+        assert not service.inconclusive
+        assert A in {key_of(entry) for entry in service.routes}
+
+    # Service presence alone must prevent consumption and admit authorized cleanup.
+    assert await run_reclaim(client) == (0, 1)
     assert await tombstone_ids(device_id) == [tomb]
+    cleanup = (await generations(device_id))[-1]
+    plan = hydrate_static_route_removal_plan(cleanup.document)
+    assert plan.tombstone_ids == (tomb,)
+    assert plan.authorized == {A}
+    job = (await _jobs(device_id))[cleanup.job_id]
+    assert job.context["removed"]["route"] == [list(A)]
+    await harness.run()
+    assert fake.sent_keys() == {B}
+    assert await tombstone_ids(device_id) == []
 
     assert fake.reads, "neither consumer read the service"
     assert all("device-intent:device-intent=sr-path-boundary" in read["url"] for read in fake.reads), (
