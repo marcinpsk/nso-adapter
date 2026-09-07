@@ -787,7 +787,9 @@ async def _put_removal_document(db: AsyncSession, device, client, scope: str, co
     generation = await _executing_document(db, job_id, scope)
     context = context or {}
     force = bool(context.get("force"))
-    body = await build_device_containers(client, device, generation.document, retain_static_routes=not force)
+    body = await build_device_containers(
+        client, device, generation.document, retain_static_routes=not (force and scope == "static_route")
+    )
     if body.errors:
         raise next(iter(body.errors.values()))
     return await guarded_device_write(

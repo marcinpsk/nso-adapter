@@ -320,3 +320,30 @@ async def test_the_preview_is_the_document_being_committed_not_a_live_store_esti
     assert static_route_entry_key(_RICH_A) in {static_route_entry_key(e) for e in previewed}, (
         "the preview must show the retained entry the commit will send"
     )
+
+
+@pytest.mark.parametrize("scope", ["vlan", "static_route"])
+async def test_force_removal_suppresses_only_the_selected_static_route_section(adapter_client, scope):
+    from tests.core.removal_helpers import authorize_stream
+    from tests.core.test_action_apply_promotion import AUTH, _put_vlans
+    from tests.core.test_generation_protocol import job_row, run_head
+    from tests.core.test_static_route_removal import SrFake
+    from tests.core.test_static_route_removal import sr_client as stateful_client
+
+    device_id = await seed_device(nso_device_name="force-scope", netbox_device_id=17310)
+    await seed_rows(device_id, [{"triple": B, "route_id": 2}])
+    await _carrier_for(device_id, A, route_id=1)
+    response = await _put_vlans(adapter_client, device_id, [100], seq=1, query="?apply=false")
+    assert response.status_code == 200, response.text
+    await authorize_stream(device_id, "vlan")
+    response = await adapter_client.post(
+        f"/api/v1/devices/{device_id}/actions/force-removal", json={"scope": scope}, headers=AUTH
+    )
+    assert response.status_code == 202, response.text
+    fake = SrFake("force-scope", service=[_RICH_A, wire(B)])
+    job_id = await run_head(device_id, stateful_client(fake))
+    job = await job_row(job_id)
+    assert job.status.value == "succeeded", job.error
+    assert fake.sent_keys() == ({A, B} if scope == "vlan" else {B})
+    if scope == "vlan":
+        assert _RICH_A in fake.service
