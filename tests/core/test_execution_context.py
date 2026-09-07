@@ -861,7 +861,8 @@ async def test_the_isis_section_takes_its_owner_streams_context_and_keeps_both_l
 #: The carrier the choke point owns, as the AST names it and as SQL names it.
 _CARRIER_MODEL = "StaticRouteTombstone"
 _CARRIER_TABLE = "static_route_tombstone"
-_CARRIER_SQL_DELETE = re.compile(rf"\bdelete\s+from\s+(public\.)?{_CARRIER_TABLE}\b", re.IGNORECASE)
+# Both identifiers may be quoted, together or apart, and the schema may be omitted.
+_CARRIER_SQL_DELETE = re.compile(rf'\bdelete\s+from\s+(?:"?public"?\.)?"?{_CARRIER_TABLE}\b"?', re.IGNORECASE)
 
 
 def _qualified(node, aliases) -> str:
@@ -871,6 +872,15 @@ def _qualified(node, aliases) -> str:
     if isinstance(node, ast.Attribute):
         return f"{_qualified(node.value, aliases)}.{node.attr}"
     return ""
+
+
+def _bound_name(node):
+    """The single ``Name`` target *node* binds, or ``None`` when it binds no single name."""
+    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+        return node.targets[0]
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return node.target
+    return None
 
 
 def _name_bindings(tree) -> dict[str, str]:
@@ -890,9 +900,9 @@ def _name_bindings(tree) -> dict[str, str]:
             for alias in node.names:
                 aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
     binds = [
-        (node.targets[0].id, node.value)
+        (target.id, node.value)
         for node in ast.walk(tree)
-        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+        if (target := _bound_name(node)) is not None and node.value is not None
     ]
     for _round in range(len(binds) + 1):
         grown = {
@@ -915,8 +925,10 @@ def _deletes_the_carrier(node, aliases) -> bool:
     func = _qualified(node.func, aliases).split(".")
     if func[-1] != "delete":
         return False
-    # `delete(Carrier)` and `Carrier.__table__.delete()` are the same statement.
-    return _CARRIER_MODEL in set(func) | {_qualified(arg, aliases).split(".")[-1] for arg in node.args}
+    # `delete(Carrier)`, `delete(Carrier.__table__)` and `Carrier.__table__.delete()` are the
+    # same statement, so every component of the argument counts, not just its last.
+    named = set(func).union(*(_qualified(arg, aliases).split(".") for arg in node.args), set())
+    return _CARRIER_MODEL in named
 
 
 def _carrier_delete_offenders(sources) -> set[str]:
@@ -972,8 +984,16 @@ def test_every_consumption_path_deletes_a_carrier_through_the_one_locking_choke_
         "from nso_adapter.store.models import StaticRouteTombstone; from sqlalchemy import delete; remove = delete; remove(StaticRouteTombstone)",
         # A table-bound delete takes no argument at all.
         "from nso_adapter.store.models import StaticRouteTombstone; StaticRouteTombstone.__table__.delete()",
+        # ... and the same table is also a legal ARGUMENT to the delete constructor.
+        "import sqlalchemy as sa; from nso_adapter.store.models import StaticRouteTombstone; sa.delete(StaticRouteTombstone.__table__)",
+        "import sqlalchemy as sa; from nso_adapter.store import models; sa.delete(models.StaticRouteTombstone.__table__)",
+        # An annotated assignment binds a name exactly as a plain one does.
+        "from nso_adapter.store.models import StaticRouteTombstone; from sqlalchemy import delete; Carrier: type = StaticRouteTombstone; delete(Carrier)",
         # Literal SQL bypasses every name the AST could resolve.
         "from sqlalchemy import text; text('DELETE FROM static_route_tombstone WHERE id = :id')",
+        # ... and SQL identifiers may be quoted, with or without their schema.
+        "from sqlalchemy import text; text('DELETE FROM \"static_route_tombstone\" WHERE id = :id')",
+        'from sqlalchemy import text; text(\'delete from "public"."static_route_tombstone"\')',
     ],
 )
 @pytest.mark.parametrize("path", ["core/consumer.py", "core/tombstone_store.py"])
