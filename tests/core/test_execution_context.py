@@ -280,7 +280,10 @@ async def test_scenario_1_a_reissue_carries_the_context_and_proof_its_authorizat
 # ── Scenario 2 — a consumed carrier leaves no authority behind ───────────────
 
 
-async def test_scenario_2_a_settled_carrier_is_pruned_from_the_fragment_and_every_later_document(adapter_client):
+@pytest.mark.parametrize("name_only", [False, True], ids=["no-authorization", "name-only"])
+async def test_scenario_2_a_settled_carrier_is_pruned_from_the_fragment_and_every_later_document(
+    adapter_client, name_only
+):
     """Real removal settlement consumes T; the next creation prunes it under the lock.
 
     Driven through the intent API and the REAL worker, like every other scenario: a directly
@@ -296,6 +299,7 @@ async def test_scenario_2_a_settled_carrier_is_pruned_from_the_fragment_and_ever
 
     harness = await retention_harness(adapter_client)
     device_id = harness.device_id
+    await _set_ned(device_id, _CISCO)
     await harness.push([route(K, route_id=1), route(S, route_id=2)])
     await harness.run()
     assert harness.fake.sent_keys() == {K, S}
@@ -314,12 +318,48 @@ async def test_scenario_2_a_settled_carrier_is_pruned_from_the_fragment_and_ever
     assert harness.fake.sent_keys() == {S}, "the removal transmitted the key it was retracting"
     await harness.drain()
 
-    # An unrelated authorization is the next document creation, so it prunes.
+    if name_only:
+        from tests.core.test_action_apply_promotion import _jobs
+
+        before_generations = [g.id for g in await _generations(device_id)]
+        before_jobs = [job.id for job in await _jobs(device_id)]
+        previous = await _stream(device_id, "static_route")
+        revision = previous.desired_revision + 1
+        await harness.push([{**route(S, route_id=2), "name": "renamed survivor"}], store_only=True)
+        staged = await _stream(device_id, "static_route")
+        assert (staged.desired_revision, staged.authorized_revision, staged.applied_revision) == (
+            revision,
+            previous.authorized_revision,
+            previous.applied_revision,
+        )
+        response = await _apply(adapter_client, device_id, {"static_route": harness.seq})
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "device_id": device_id,
+            "outcome": "no_op",
+            "selected": {"static_route": harness.seq},
+            "skipped": {"static_route": "already_applied"},
+            "skipped_detail": None,
+            "generations": [],
+        }
+        assert [g.id for g in await _generations(device_id)] == before_generations
+        assert [job.id for job in await _jobs(device_id)] == before_jobs
+        promoted = await _stream(device_id, "static_route")
+        assert (promoted.desired_revision, promoted.authorized_revision, promoted.applied_revision) == (
+            revision,
+            revision,
+            revision,
+        )
+        assert promoted.authorized_document["_execution"]["proof"]["apply"]["tombstone_ids"] == []
+
     later = await harness.unrelated()
     pruned = (await _stream(device_id, "static_route")).authorized_document
     assert pruned["_execution"]["proof"]["apply"]["tombstone_ids"] == []
     assert pruned["static_route_tombstone"] == []
-    assert hydrate_static_route_apply_plan(later.document).tombstone_ids == []
+    plan = hydrate_static_route_apply_plan(later.document)
+    assert plan.tombstone_ids == []
+    assert K not in plan.allowed
+    assert K not in {tuple(key) for key in pruned["_execution"]["proof"]["apply"]["allowed_removal_keys"]}
 
     stored = next(g for g in await _generations(device_id) if g.id == removal.id)
     assert (stored.document, stored.digest) == (frozen_document, frozen_digest), "an immutable document was rewritten"
@@ -328,6 +368,23 @@ async def test_scenario_2_a_settled_carrier_is_pruned_from_the_fragment_and_ever
     # claim is neither rendered nor retained.
     await harness.run()
     assert harness.fake.sent_keys() == {S}
+    await harness.drain()
+
+    assert (await _force_removal(adapter_client, device_id, "static_route")).status_code == 202
+    reissue = (await _generations(device_id))[-1]
+    assert reissue.stream_revisions == {}
+    apply_plan = hydrate_static_route_apply_plan(reissue.document)
+    removal_plan = hydrate_static_route_removal_plan(reissue.document)
+    assert apply_plan.tombstone_ids == []
+    assert K not in apply_plan.allowed
+    assert removal_plan.tombstone_ids == ()
+    assert K not in removal_plan.authorized
+    assert reissue.document["static_route"]["static_route_tombstone"] == []
+    await harness.run()
+    assert harness.fake.sent_keys() == {S}
+    assert all(entry["prefix"] != K[1] for entry in harness.fake.sent_routes())
+    stored = next(g for g in await _generations(device_id) if g.id == removal.id)
+    assert (stored.document, stored.digest) == (frozen_document, frozen_digest)
 
 
 async def test_scenario_2_an_operation_selecting_a_consumed_carrier_refuses_creation(adapter_client):
