@@ -823,3 +823,98 @@ async def test_an_authored_contract_refusal_classifies_apart_from_an_http_failur
     assert record["http_status"] is None, "nothing was refused over HTTP"
     assert record["error_type"] is None, "nothing raised"
     assert record["family"] == "static-route"
+
+
+# ── provisioning steps: the transport's own words reach no persisted detail ──
+
+#: A real NSO behind a proxy answers a redirect whose Location the proxy chose.
+_REDIRECT_LOCATION = f"https://example.invalid/{_REF}?community={_SECRET}"
+_STEP_SECRETS = [*_SECRETS, _REDIRECT_LOCATION, "example.invalid", "Denied by proxy"]
+
+
+def _host_key_client(*statuses: int):
+    """A real NsoClient whose ssh/fetch-host-keys answers *statuses* in order.
+
+    The FIRST answer carries the server-chosen reason phrase, body and redirect location;
+    later ones are plain. The last answer repeats for any further attempt.
+    """
+    answered: list[int] = []
+
+    def respond(request):
+        if "ssh/fetch-host-keys" in str(request.url):
+            index = min(len(answered), len(statuses) - 1)
+            answered.append(index)
+            if index == 0:
+                return httpx.Response(
+                    statuses[0],
+                    headers={"Location": _REDIRECT_LOCATION},
+                    json={"error": f"Denied by proxy for {_SECRET}"},
+                    extensions={"reason_phrase": b"Denied by proxy"},
+                )
+            return httpx.Response(statuses[index], json={"error": "unavailable"})
+        if request.method == "GET":
+            return httpx.Response(200, json={"tailf-ncs:device": [{"name": "host-key-http"}]})
+        return httpx.Response(200, json={})
+
+    return _client_with(httpx.MockTransport(respond))
+
+
+async def test_a_RETRIED_action_keeps_the_FIRST_failure_off_the_second_chain(adapter_client_with_nso):
+    """The retry ran INSIDE the first exception's handler, so the first stayed on __context__.
+
+    The FIRST attempt answers a redirect whose Location the server chose; the second answers
+    a plain 503 and is what propagates. Suppression is not removal, and nothing suppressed
+    even this: a formatted traceback of the 503 printed the first attempt's location.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from nso_adapter.core.onboarding import _once_with_retry
+    from tests._secret_discipline import assert_chain_free_of, exception_chain
+
+    client = _host_key_client(302, 503)
+    with patch("nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()) as slept:
+        with pytest.raises(httpx.HTTPStatusError) as caught:
+            await _once_with_retry(lambda: client.fetch_host_keys("host-key-http"))
+
+    assert slept.await_count == 1, "the backed-off second attempt must still run"
+    assert caught.value.response.status_code == 503, "the SECOND attempt's failure propagates"
+    assert exception_chain(caught.value) == [caught.value], "the first attempt is still on the chain"
+    assert_chain_free_of(caught.value, _STEP_SECRETS)
+
+
+async def test_a_REDIRECTED_host_key_fetch_records_the_STATUS_and_not_the_location(adapter_client_with_nso):
+    """`repr(exc)` on an httpx failure carries the URL and the Location the server chose.
+
+    The provisioning result persists the step detail and the API returns it, so the redirect
+    target went with it. The numeric status stays: an operator has to tell 302 from 503.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core.onboarding import provision_nso_device
+    from tests._secret_discipline import assert_records_free_of
+
+    client = _host_key_client(302)
+    with (
+        patch("nso_adapter.core.importer.get_nso_client", return_value=client),
+        patch("nso_adapter.core.onboarding.asyncio.sleep", new=AsyncMock()),
+        capture_logs() as logs,
+    ):
+        async with session() as db:
+            result = await provision_nso_device(
+                db,
+                nso_instance="nso-dev",
+                device_name="host-key-http",
+                address="10.0.0.11",
+                ned_id="cisco-ios-cli-6.114:cisco-ios-cli-6.114",
+                authgroup="network",
+            )
+
+    assert result["ok"] is False
+    step = next(entry for entry in result["steps"] if entry["step"] == "fetch_host_keys")
+    assert step["status"] == "failed"
+    assert step["detail"] == "HTTPStatusError (HTTP 302)", "the status is what tells the failures apart"
+    for secret in _STEP_SECRETS:
+        assert secret not in json.dumps(result), "the persisted step detail repeats the transport's own words"
+    assert_records_free_of(logs, _STEP_SECRETS)
