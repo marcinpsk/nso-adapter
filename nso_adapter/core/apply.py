@@ -1526,7 +1526,7 @@ async def _finalize_unsent(db, plan: _ApplyPlan, build_errors: dict, *, job_id: 
         # successor rewrote stamps none of them, and a (0, 0) outcome is a silent success.
         outcomes[key] = (0, len(apply_rows.sent))
         failures[key] = [{"error": exc.message}]
-    await _finalize_job(db, job_id, plan.device_id, True, outcomes, failures, reg=reg)
+    await _finalize_job(db, job_id, plan.device_id, True, outcomes, failures, reg=reg, document_failed=True)
 
 
 async def _commit_document(
@@ -1755,6 +1755,7 @@ async def _run_document_apply(db, device, client, device_name, job, job_id, now,
         reader_compare_unverifiable=reader_compare_unverifiable,
         static_route_results=sr_results,
         reg=reg,
+        document_failed=commit_error is not None,
     )
 
 
@@ -2071,6 +2072,7 @@ async def _finalize_job(
     reader_compare_unverifiable: dict | None = None,
     static_route_results: list | None = None,
     reg=None,
+    document_failed: bool = False,
 ) -> None:
     """Assemble job.result/status from the deployment's outcomes and commit.
 
@@ -2095,7 +2097,7 @@ async def _finalize_job(
     outcome raises :class:`BookkeepingOutcomeUnknown` instead, and recovery decides.
     """
     keys = _result_keys()
-    if not any_eligible:
+    if not any_eligible and not document_failed:
         logger.info("apply.nothing_eligible", job_id=job_id, device_id=device_id)
         empty_result = {f"{key}_count_by_outcome": {"in_sync": 0, "apply_failed": 0} for key in keys}
         if not await _write_terminal(db, job_id, JobStatus.succeeded, empty_result, None, reg):
@@ -2116,14 +2118,16 @@ async def _finalize_job(
 
     total_failed = sum(failed for _ok, failed in outcomes.values())
     error = None
-    if total_failed == 0:
+    if total_failed == 0 and not document_failed:
         status = JobStatus.succeeded
     else:
         status = JobStatus.failed
         all_failed = [{"type": key, **item} for key in keys for item in failures.get(key, [])]
         error = {
             "code": "nso_commit_failed",
-            "message": f"{total_failed} item(s) failed to apply",
+            "message": "Device document failed to apply"
+            if document_failed
+            else f"{total_failed} item(s) failed to apply",
             "detail": {"items": all_failed},
         }
     if not await _write_terminal(db, job_id, status, result, error, reg):

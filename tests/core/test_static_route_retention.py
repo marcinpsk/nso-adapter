@@ -347,3 +347,21 @@ async def test_force_removal_suppresses_only_the_selected_static_route_section(a
     assert fake.sent_keys() == ({A, B} if scope == "vlan" else {B})
     if scope == "vlan":
         assert _RICH_A in fake.service
+
+
+async def test_carrier_only_build_refusal_fails_the_document(adapter_client):
+    from tests.core.test_action_apply_promotion import _generations, _put_vlans
+    from tests.core.test_generation_protocol import job_row, run_head, seed_settings
+    from tests.core.test_static_route_removal import SrFake
+    from tests.core.test_static_route_removal import sr_client as stateful_client
+
+    device_id = await seed_device(nso_device_name="carrier-only-refusal", netbox_device_id=17311)
+    await _carrier_for(device_id, A, route_id=1)
+    await seed_settings(device_id, auto_apply=True)
+    response = await _put_vlans(adapter_client, device_id, [100], seq=1)
+    assert response.status_code == 200, response.text
+    fake = SrFake("carrier-only-refusal", service=[], service_status="inconclusive")
+    job = await job_row(await run_head(device_id, stateful_client(fake)))
+    assert job.status.value == "failed", job.result
+    assert all(g.status.value != "settled" for g in await _generations(device_id))
+    assert not any(call["method"] == "put" for call in fake.calls)
