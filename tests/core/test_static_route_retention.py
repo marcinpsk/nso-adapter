@@ -91,18 +91,28 @@ async def test_the_preview_is_the_document_being_committed_not_a_live_store_esti
 
 @pytest.mark.parametrize("scope", ["vlan", "static_route"])
 async def test_force_removal_suppresses_only_the_selected_static_route_section(adapter_client, scope):
+    """A force flush of THIS section drops the retention; an unrelated one keeps it.
+
+    The flush carries no removal authority, so retaining every carrier-claimed key would
+    preserve exactly what the operator override promises to remove. It still consumes no
+    carrier, and it discharges the pending clears of its own section's streams only.
+    """
+    from nso_adapter.store.models import StreamPendingClear
     from tests.core.removal_helpers import authorize_stream
     from tests.core.test_action_apply_promotion import AUTH, _put_vlans
     from tests.core.test_generation_protocol import job_row, run_head
-    from tests.core.test_static_route_removal import SrFake
+    from tests.core.test_static_route_removal import SrFake, tombstone_ids
     from tests.core.test_static_route_removal import sr_client as stateful_client
 
     device_id = await seed_device(nso_device_name="force-scope", netbox_device_id=17310)
     await seed_rows(device_id, [{"triple": B, "route_id": 2}])
-    await _carrier_for(device_id, A, route_id=1)
+    tomb = await _carrier_for(device_id, A, route_id=1)
     response = await _put_vlans(adapter_client, device_id, [100], seq=1, query="?apply=false")
     assert response.status_code == 200, response.text
     await authorize_stream(device_id, "vlan")
+    async with session() as db:
+        db.add(StreamPendingClear(device_id=device_id, stream="static_route", provenance="store_only", revision=1))
+        await db.commit()
     response = await adapter_client.post(
         f"/api/v1/devices/{device_id}/actions/force-removal", json={"scope": scope}, headers=AUTH
     )
@@ -112,6 +122,10 @@ async def test_force_removal_suppresses_only_the_selected_static_route_section(a
     job = await job_row(job_id)
     assert job.status.value == "succeeded", job.error
     assert fake.sent_keys() == ({A, B} if scope == "vlan" else {B})
+    assert await tombstone_ids(device_id) == [tomb], "a force flush consumes no carrier"
+    async with session() as db:
+        clears = (await db.execute(sa.select(StreamPendingClear.stream))).scalars().all()
+    assert clears == ([] if scope == "static_route" else ["static_route"])
     if scope == "vlan":
         assert _RICH_A in fake.service
 
