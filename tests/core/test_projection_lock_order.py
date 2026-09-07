@@ -339,7 +339,7 @@ async def test_document_snapshot_waits_for_a_switching_replacement(adapter_clien
         replace_lag_snapshot,
     )
     from nso_adapter.store.db import get_engine
-    from tests.core.test_projection_document import _freeze_snapshot
+    from tests.core.projection_helpers import freeze_snapshot
 
     device_id = await seed_device(nso_device_name="lock-switching-snapshot", netbox_device_id=9913)
     rival = async_sessionmaker(rival_engine, expire_on_commit=False)
@@ -362,7 +362,7 @@ async def test_document_snapshot_waits_for_a_switching_replacement(adapter_clien
 
         async def read_document():
             await lock_device_document(reader, device_id)
-            fragment = await _freeze_snapshot(reader, device_id, "lag")
+            fragment = await freeze_snapshot(reader, device_id, "lag")
             await reader.rollback()
             return encode_lag_section(
                 hydrate_section({"lag": fragment}, "lag"), {"ned_id": None, "dialect": "identity"}
@@ -540,7 +540,7 @@ async def test_removal_admission_locks_the_projection_before_selecting_the_carri
             # The rival's store-only clear lands while admission waits for the lock.
             gate.add(StreamPendingClear(device_id=device_id, stream="vlan", provenance="store_only", revision=1))
             await gate.commit()
-            await admitting
+            await asyncio.wait_for(admitting, timeout=10)
         finally:
             if not admitting.done():
                 admitting.cancel()

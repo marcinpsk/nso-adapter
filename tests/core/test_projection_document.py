@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 import pytest
 
 from tests.conftest import seed_device, session
+from tests.core.projection_helpers import freeze_snapshot
 
 pytestmark = pytest.mark.anyio
 
@@ -29,15 +30,6 @@ _INCREMENT_TWO_SECTIONS = frozenset({"snmp", "logging"})
 _INCREMENT_THREE_SECTIONS = frozenset({"bgp"})
 _INCREMENT_FOUR_SECTIONS = frozenset({"interface_config"})
 _INCREMENT_FIVE_SECTIONS = frozenset({"static_route"})
-
-
-async def _freeze_snapshot(db, device_id, stream):
-    from nso_adapter.core.projection import freeze_fragment, snapshot_stream
-    from nso_adapter.store.models import Device
-
-    return await freeze_fragment(
-        db, await db.get(Device, device_id), stream, await snapshot_stream(db, device_id, stream)
-    )
 
 
 def test_every_section_executes_from_its_document_or_names_its_blocker():
@@ -292,7 +284,7 @@ async def test_increment_one_apply_rows_come_from_the_generation_document(
         db.add(row)
         await db.flush()
         original_value = getattr(row, changed_field)
-        document = {section: await _freeze_snapshot(db, device_id, section)}
+        document = {section: await freeze_snapshot(db, device_id, section)}
         setattr(row, changed_field, successor_value)
         await db.commit()
 
@@ -324,7 +316,7 @@ async def test_snmp_apply_rows_and_vault_refs_come_from_the_generation_document(
         )
         db.add(row)
         await db.flush()
-        document = {"snmp": await _freeze_snapshot(db, device_id, "snmp")}
+        document = {"snmp": await freeze_snapshot(db, device_id, "snmp")}
         row.vault_ref = "network/snmp/communities/successor#community"
         await db.commit()
 
@@ -355,7 +347,7 @@ async def test_logging_apply_rows_come_from_the_generation_document(adapter_clie
         )
         db.add(row)
         await db.flush()
-        document = {"logging": await _freeze_snapshot(db, device_id, "logging")}
+        document = {"logging": await freeze_snapshot(db, device_id, "logging")}
         row.severity = "WARNING"
         await db.commit()
 
@@ -381,7 +373,7 @@ async def test_a_snapshot_hydrates_back_into_the_rows_it_was_taken_from(adapter_
         await db.commit()
 
     async with session() as db:
-        document = {"vlan": await _freeze_snapshot(db, device_id, "vlan")}
+        document = {"vlan": await freeze_snapshot(db, device_id, "vlan")}
 
     rows = hydrate_section(document, "vlan")[VlanIntent]
     assert [(r.vlan_id, r.name) for r in rows] == [(10, "MGMT"), (20, None)]
@@ -428,7 +420,7 @@ async def test_bgp_snapshot_hydrates_the_relationship_graph_for_the_writer(adapt
         await db.commit()
 
     async with session() as db:
-        fragment = await _freeze_snapshot(db, device_id, "bgp")
+        fragment = await freeze_snapshot(db, device_id, "bgp")
 
     assert set(rows_by_intent_identity(fragment, "bgp_peer_af_intent")) == {("64512", "", "192.0.2.1", "ipv4-unicast")}
     rows = hydrate_section({"bgp": fragment}, "bgp")

@@ -253,12 +253,12 @@ async def test_the_encoders_are_canonical_and_omit_empty_values_and_families(ada
         )
         await db.commit()
 
-    from tests.core.test_projection_document import _freeze_snapshot
+    from tests.core.projection_helpers import freeze_snapshot
 
     context = {"ned_id": "cisco-ios-cli-6.95", "dialect": "identity"}
     async with session() as db:
-        lag_document = {"lag": await _freeze_snapshot(db, device_id, "lag")}
-        switchport_document = {"switchport": await _freeze_snapshot(db, device_id, "switchport")}
+        lag_document = {"lag": await freeze_snapshot(db, device_id, "lag")}
+        switchport_document = {"switchport": await freeze_snapshot(db, device_id, "switchport")}
         counter = await db.get(DeviceGenerationCounter, device_id)
         await db.rollback()
 
