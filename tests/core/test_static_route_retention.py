@@ -21,7 +21,7 @@ import sqlalchemy as sa
 from nso_adapter.core.apply import SNAPSHOT_INCONCLUSIVE
 from nso_adapter.nso.apply import static_route_entry_key
 from tests.conftest import seed_device, session
-from tests.core.removal_helpers import authorize_static_route, seed_tomb
+from tests.core.removal_helpers import seed_tomb
 from tests.core.test_static_route_put import (
     _SR_ROOT,
     A,
@@ -42,9 +42,7 @@ _RICH_A["interface-next-hop"] = "GigabitEthernet0/3"
 
 async def _carrier_for(device_id: int, triple, **kwargs) -> int:
     """A live carrier claiming *triple*, with the fragment its deletion push authorized."""
-    tomb = await seed_tomb(device_id, triple, **kwargs)
-    await authorize_static_route(device_id)
-    return tomb
+    return await seed_tomb(device_id, triple, **kwargs)
 
 
 # ── the preview is bound to the document being committed ─────────────────────
