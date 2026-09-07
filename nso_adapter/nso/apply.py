@@ -275,14 +275,25 @@ def device_intent_instance(device_name: str, containers: Mapping[str, dict]) -> 
 
 
 def _diagnostic_message(value: object) -> str:
-    """Keep only a recognized refusal family from opaque server text."""
+    """Keep only a recognized refusal family and construct from opaque server text.
+
+    The construct is the reason redaction cannot be total: a device parser rejects an
+    unsupported route-policy or interface construct only on a real commit, so this message is
+    the single source of the capability verdict. Both kept parts are rebuilt from the
+    registry and the capability allowlist, never sliced out of the server's own text.
+    """
+    from nso_adapter.core.capability import allowlisted_rejection_fragment
     from nso_adapter.core.projection import section_registry
 
-    if isinstance(value, str):
-        match = re.search(r"device-intent:\s*refused\s*\[\s*family=([A-Za-z0-9._-]+)(?=\s|\])", value)
-        if match and match.group(1) in {entry.container for entry in section_registry().values()}:
-            return f"device-intent: refused [family={match.group(1)}]: [redacted]"
-    return "[redacted]"
+    if not isinstance(value, str):
+        return "[redacted]"
+    kept = "[redacted]"
+    match = re.search(r"device-intent:\s*refused\s*\[\s*family=([A-Za-z0-9._-]+)(?=\s|\])", value)
+    if match and match.group(1) in {entry.container for entry in section_registry().values()}:
+        kept = f"device-intent: refused [family={match.group(1)}]: [redacted]"
+    fragment = allowlisted_rejection_fragment(value)
+    # Last, and never followed by anything: parse_rejected_construct captures to end of line.
+    return f"{kept}; {fragment}" if fragment else kept
 
 
 def _sanitized_nso_error(value: object) -> object:

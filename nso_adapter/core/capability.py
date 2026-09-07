@@ -18,6 +18,7 @@ operator finding out only when it silently didn't land. Three sources feed the m
 from __future__ import annotations
 
 import re
+from functools import cache
 from typing import Any
 
 import structlog
@@ -504,3 +505,33 @@ def parse_rejected_construct(message: str):
     if "community-list" in low:
         return "community", " ".join(cmd.split()[:3])
     return None, None
+
+
+@cache
+def _rejection_command_allowlist() -> tuple[str, ...]:
+    """Every command identifier a redacted rejection may keep, longest first.
+
+    The union of what the two rejection parsers match on and what preflight can look up, so a
+    kept name always resolves to a matrix row. Longest first, because ``set extcommunity
+    color`` must win over ``set extcommunity``.
+    """
+    names = {prefix for _scope, _name, prefix in (*_REJECTION_CONSTRUCTS, *_IFACE_CMD_CONSTRUCTS)}
+    for mapping in (_SET_KEY_CONSTRUCTS, _MATCH_KEY_CONSTRUCTS):
+        names.update(name for candidates in mapping.values() for name in candidates)
+    return tuple(sorted(names, key=len, reverse=True))
+
+
+def allowlisted_rejection_fragment(message: str) -> str:
+    """Return the construct identifier *message* names, rebuilt from the allowlist, else ``""``.
+
+    A device rejection is opaque text that can carry a community or an auth key, so the error
+    sanitizer drops it. Attribution consumes only the construct, so what this returns is a
+    LITERAL from the tables above and never a slice of the server's own text. The order
+    mirrors both parsers: a message that names a command is attributed by command alone.
+    """
+    match = re.search(r"command:\s*(.+)", message or "")
+    if match:
+        cmd = match.group(1).strip().lower()
+        return next((f"command: {name}" for name in _rejection_command_allowlist() if cmd.startswith(name)), "")
+    low = (message or "").lower()
+    return next((token for _scope, _name, token in _IFACE_PATH_CONSTRUCTS if token in low), "")
