@@ -13,6 +13,7 @@ import uuid
 from contextlib import suppress
 from typing import Any
 
+import httpx
 import structlog
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -77,6 +78,23 @@ _READ_MIRROR_ROOTS = (
 )
 
 
+def _failure_detail(exc: BaseException) -> str:
+    """Classify a provisioning failure for the step record.
+
+    ``repr()`` on an httpx failure carries the reason phrase, the request URL and, on a
+    redirect, the ``Location`` the server chose; a protocol error can quote the bytes the
+    server sent. The step detail is persisted in the job result and returned by the
+    provisioning API, so only the classification travels. The numeric status stays, because
+    an operator has to tell an auth refusal from an outage. Everything else that reaches
+    these handlers is adapter-authored, so its own message is the diagnostic.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"{type(exc).__name__} (HTTP {exc.response.status_code})"
+    if isinstance(exc, httpx.HTTPError):
+        return type(exc).__name__
+    return repr(exc)
+
+
 async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str | None) -> tuple[str, dict | None]:
     """Reachability-aware initial management address.
 
@@ -96,7 +114,11 @@ async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str
         await client.set_address(device_name, oob_ip)
         await client.disconnect(device_name)
     except Exception as exc:
-        return ActiveAddress.primary.value, {"step": "failover_bootstrap", "status": "failed", "detail": repr(exc)}
+        return ActiveAddress.primary.value, {
+            "step": "failover_bootstrap",
+            "status": "failed",
+            "detail": _failure_detail(exc),
+        }
     return ActiveAddress.oob.value, {
         "step": "failover_bootstrap",
         "status": "oob",
@@ -116,12 +138,17 @@ async def _once_with_retry(action, *, backoff: float = _ONBOARD_RETRY_BACKOFF_SE
     for which ``ok(value)`` is falsy — covers both fetch-host-keys (raises) and
     sync-from (returns a bool). The second attempt's exception/result propagates.
     """
+    result = None
+    retry = False
     try:
         result = await action()
     except Exception:
-        await asyncio.sleep(backoff)
-        return await action()
-    if ok is not None and not ok(result):
+        retry = True
+    if not retry and ok is not None and not ok(result):
+        retry = True
+    # The second attempt runs AFTER the handler: inside it, a second failure keeps the FIRST
+    # exception on __context__, and an HTTP reason phrase there carries the server's text.
+    if retry:
         await asyncio.sleep(backoff)
         return await action()
     return result
@@ -552,7 +579,7 @@ async def provision_nso_device(
             await client.create_device(device_name, address, ned_id, authgroup, ned_type=device_type, port=port)
             _step("create", "ok", f"device-type={device_type}")
     except Exception as exc:
-        _step("create", "failed", repr(exc))
+        _step("create", "failed", _failure_detail(exc))
         return _result(False)
 
     # 2. admin-state unlocked — blocking. MUST precede fetch-host-keys: a newly
@@ -562,7 +589,7 @@ async def provision_nso_device(
         await client.set_admin_state(device_name, admin_state)
         _step("admin_state", "ok", admin_state)
     except Exception as exc:
-        _step("admin_state", "failed", repr(exc))
+        _step("admin_state", "failed", _failure_detail(exc))
         return _result(False)
 
     # 2b. reachability-aware address: bootstrap a fresh device over OOB if primary is
@@ -578,7 +605,7 @@ async def provision_nso_device(
         await _once_with_retry(lambda: client.fetch_host_keys(device_name))
         _step("fetch_host_keys", "ok")
     except Exception as exc:
-        _step("fetch_host_keys", "failed", repr(exc))
+        _step("fetch_host_keys", "failed", _failure_detail(exc))
         # If the bootstrap pinned NSO to the OOB address, don't strand the device: map it and
         # seed the failover row so the loop can fail it back to primary once in-band recovers.
         if active_address == ActiveAddress.oob.value:
@@ -605,7 +632,7 @@ async def provision_nso_device(
             sync_ok = bool(await _once_with_retry(lambda: client.sync_from(device_name), ok=bool))
             _step("sync_from", "ok" if sync_ok else "failed")
         except Exception as exc:
-            _step("sync_from", "failed", repr(exc))
+            _step("sync_from", "failed", _failure_detail(exc))
 
     # 5-6. adapter mapping row (so the read pipeline manages it henceforth) + failover row
     #      (IPs + bootstrapped address) so the failover loop can manage it.
@@ -677,7 +704,8 @@ async def _initial_mirror_refresh(
         raise
     except Exception as exc:  # noqa: BLE001 — never fail provisioning on a mirror-read hiccup
         await db.rollback()
-        logger.warning("device.onboard_mirror.failed", device_id=device_id, error=repr(exc))
+        # The mirror read is HTTP against NSO, so the same classification applies here.
+        logger.warning("device.onboard_mirror.failed", device_id=device_id, error=_failure_detail(exc))
 
 
 async def _map_and_seed_failover(
