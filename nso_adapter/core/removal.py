@@ -436,7 +436,8 @@ async def _interface_config_residue(client, device, context: dict) -> dict[str, 
     section = (await _live_family_sections(client, device.nso_device_name, [wire], timeout=_VERIFY_BATCH_TIMEOUT))[wire]
     status = _verifier_section_status(section)
     if status == "error":
-        raise RuntimeError(f"device-state read of {wire!r} returned status=error: {section.get('error-reason')!r}")
+        # The error-reason is the server's own text and can name a community-keyed path.
+        raise RuntimeError(f"device-state read of {wire!r} returned status=error")
     if status == "unknown":  # unsupported — no interface-ip surface on this NED
         return None
     present = {
@@ -511,7 +512,8 @@ async def _residue_after_removal(client, device, scope: str, context: dict) -> t
     section = (await _live_family_sections(client, device.nso_device_name, [wire], timeout=_VERIFY_BATCH_TIMEOUT))[wire]
     status = _verifier_section_status(section)
     if status == "error":
-        raise RuntimeError(f"device-state read of {wire!r} returned status=error: {section.get('error-reason')!r}")
+        # The error-reason is the server's own text and can name a community-keyed path.
+        raise RuntimeError(f"device-state read of {wire!r} returned status=error")
     if status == "unknown":  # unsupported — the NED does not export this section
         return None, unverifiable
     entry = section
@@ -547,7 +549,14 @@ async def _record_residue(
     try:
         residue, unverifiable = await _residue_after_removal(client, device, scope, context)
     except Exception as exc:  # noqa: BLE001 — the check must never fail the removal
-        logger.warning("removal.residue_check_error", job_id=job_id, device_id=device_id, scope=scope, error=repr(exc))
+        # Metadata only: any exception from the reader can repeat what the server said.
+        logger.warning(
+            "removal.residue_check_error",
+            job_id=job_id,
+            device_id=device_id,
+            scope=scope,
+            error_type=type(exc).__name__,
+        )
         result["residue_check"] = "error"
         return
 

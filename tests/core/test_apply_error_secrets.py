@@ -350,3 +350,72 @@ async def test_a_device_rejection_attributes_its_construct_and_keeps_no_device_t
     for surface in surfaces:
         assert _SECRET not in surface
         assert "snmp-server" not in surface, "opaque device text left the redaction boundary"
+
+
+# ── a failed device-state read: the server's own reason reaches no sink ──
+
+#: What a real `snmp-config` read failure can carry back: a path keyed by the community.
+_READ_REASON = f"read of /snmp:snmp/community[name='{_SECRET}'] failed for {_REF}"
+
+
+def _residue_error_client():
+    """Every send succeeds; the post-removal device-state read answers ``status=error``."""
+
+    def respond(request):
+        if "device-state-read/run" in str(request.url):
+            return httpx.Response(
+                200,
+                json={
+                    "network-state-export:output": {
+                        "atomic": True,
+                        "device-name": _DEVICE,
+                        "snmp-config": {"status": "error", "error-reason": _READ_REASON},
+                    }
+                },
+            )
+        if request.method == "GET":
+            return httpx.Response(404)
+        return httpx.Response(200, json={"dry-run-result": {"native": {}}})
+
+    return _client_with(httpx.MockTransport(respond))
+
+
+async def test_a_failed_residue_read_keeps_the_server_reason_out_of_the_log_and_the_chain(adapter_client):
+    """The residue sink names the scope and the failure TYPE, and nothing the server said.
+
+    A `snmp-config` read failure answers an `error-reason` the device chose, and it can name a
+    community-keyed path. Carrying it into the exception put it in the operator's log verbatim.
+    """
+    from unittest.mock import patch
+
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core import removal as removal_mod
+    from nso_adapter.store.models import Device
+    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
+    from tests.core.test_removal import _seed_removal_job
+
+    removed = {"removed": {"v3-user": [["nms"]]}}
+    device_id, _row = await _community()
+    job_id = await _seed_removal_job(device_id, scope="snmp", context_extra=removed)
+    client = _residue_error_client()
+    with capture_logs() as logs, patch("nso_adapter.core.importer.get_nso_client", return_value=client):
+        await removal_mod.run_removal(job_id, device_id)
+
+    async with session() as db:
+        job = await db.get(Job, job_id)
+        device = await db.get(Device, device_id)
+    assert job.status == JobStatus.succeeded
+    assert job.result["residue_check"] == "error"
+    reported = [record for record in logs if record["event"] == "removal.residue_check_error"]
+    assert reported, "the failed read was not reported at all"
+    assert reported[0]["scope"] == "snmp", "the scope is the half the operator needs"
+    secrets = [_SECRET, _REF, _READ_REASON, "placeholder-mount", "placeholder-path", "placeholder-key"]
+    assert_records_free_of(logs, secrets)
+    assert reported[0]["error_type"] == "RuntimeError"
+
+    # The same read again, through the same real client: the exception the sink formats must
+    # carry nothing of the server's reason on any node of its cause/context chain.
+    with pytest.raises(RuntimeError) as caught:
+        await removal_mod._residue_after_removal(client, device, "snmp", {"scope": "snmp", **removed})
+    assert_chain_free_of(caught.value, secrets)
