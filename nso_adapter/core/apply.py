@@ -782,7 +782,7 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
     to deploy reports the preview UNAVAILABLE rather than an empty one, which would read as
     "nothing to do".
     """
-    from nso_adapter.core.generation import executable_head, executing_generation
+    from nso_adapter.core.generation import executable_head, executing_generation, execution_policy
     from nso_adapter.core.importer import get_nso_client
     from nso_adapter.nso.apply import apply_device_intent
 
@@ -800,10 +800,15 @@ async def collect_apply_diff(db: AsyncSession, device_id: int, outformat: str = 
     # dry_run is bool|str down the sender: True = native, "cli" = tree diff.
     fmt: bool | str = "cli" if outformat == "cli" else True
     try:
-        body = await build_device_containers(client, device, generation.document)
+        policy = execution_policy(generation)
+        body = await build_device_containers(
+            client, device, generation.document, retain_static_routes=policy.retain_static_routes
+        )
         if body.errors:
             raise next(iter(body.errors.values()))
-        delta = await apply_device_intent(client, device.nso_device_name, body.containers, dry_run=fmt)
+        delta = await apply_device_intent(
+            client, device.nso_device_name, body.containers, dry_run=fmt, no_networking=policy.no_networking
+        )
     except Exception as exc:  # noqa: BLE001 — the preview must never fail hard
         logger.warning("apply_diff.failed", device=device.nso_device_name, error=repr(exc))
         reason = getattr(exc, "message", None) or repr(exc)

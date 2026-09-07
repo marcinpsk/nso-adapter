@@ -737,12 +737,13 @@ async def _put_removal_document(db: AsyncSession, device, client, scope: str, co
     back to live intent would transmit a store-only replacement nothing authorized.
     """
     from nso_adapter.core.apply import build_device_containers
+    from nso_adapter.core.generation import execution_policy
 
     generation = await _executing_document(db, job_id, scope)
-    context = context or {}
-    force = bool(context.get("force"))
+    policy = execution_policy(generation)
+    context = policy.context
     body = await build_device_containers(
-        client, device, generation.document, retain_static_routes=not (force and scope == "static_route")
+        client, device, generation.document, retain_static_routes=policy.retain_static_routes
     )
     if body.errors:
         raise next(iter(body.errors.values()))
@@ -753,7 +754,7 @@ async def _put_removal_document(db: AsyncSession, device, client, scope: str, co
         allowed=guard_allowed(generation, scope=scope, context=context),
         context=context,
         current=body.snapshot,
-        no_networking=bool(context.get("detach")),
+        no_networking=policy.no_networking,
     )
 
 
@@ -1748,12 +1749,19 @@ async def run_removal(job_id: int, device_id: int, reg=None) -> None:
         context = row.context or {}
         scope: str | None = None
         try:
+            from nso_adapter.core.generation import executing_generation, execution_policy
+
+            generation = await executing_generation(db, job_id)
+            if generation is None:
+                raise RuntimeError(f"removal job {job_id} carries no generation")
+            policy = execution_policy(generation)
+            context = policy.context
             scope = _removal_scope(context)
             device = await db.get(Device, device_id)
             if not device:
                 raise ValueError(f"Device {device_id} not found")
             client = get_nso_client(device.nso_instance)
-            detach = bool(context.get("detach"))
+            detach = policy.no_networking
             outcome = await _dispatch_scope(db, device, client, scope, context, job_id=job_id, reg=reg)
             if isinstance(outcome, SrRemoval) and outcome.branch != "force":
                 # R2 §4.4/§4.6: this write owns durable carriers, so its proof, its

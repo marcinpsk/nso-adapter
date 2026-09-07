@@ -1495,6 +1495,23 @@ class GenerationTampered(RuntimeError):
     """A stored generation's digest no longer matches its document. It is not executed."""
 
 
+class ExecutionPolicy(NamedTuple):
+    """Commit policy from the generation's frozen removal context."""
+
+    context: dict
+    retain_static_routes: bool
+    no_networking: bool
+
+
+def execution_policy(generation: DeploymentGeneration) -> ExecutionPolicy:
+    context = dict(generation.removal_context or {})
+    return ExecutionPolicy(
+        context,
+        not (context.get("force") and context.get("scope") == "static_route"),
+        bool(context.get("detach")),
+    )
+
+
 async def executing_generation(db: AsyncSession, job_id: int) -> DeploymentGeneration | None:
     """Return the generation a job must deploy, digest verified.
 

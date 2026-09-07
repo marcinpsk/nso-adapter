@@ -171,6 +171,7 @@ async def native_dry_run(
     method: str = "patch",
     strict: bool = False,
     outformat: str = "native",
+    no_networking: bool = False,
 ) -> str | None:
     """Issue *payload* to *url* as a dry-run and return the delta (no commit).
 
@@ -188,7 +189,7 @@ async def native_dry_run(
     an inconclusive ``None`` — a 4xx means NSO/the device would reject the intent, i.e. the
     apply did NOT land. Transport errors and ``5xx`` stay inconclusive (never block) either way.
     """
-    dry_url = _commit_url(url, dry_run="cli" if outformat == "cli" else True)
+    dry_url = _commit_url(url, dry_run="cli" if outformat == "cli" else True, no_networking=no_networking)
     try:
         async with client._client(timeout=client._action_timeout) as c:
             resp = await getattr(c, method)(
@@ -310,6 +311,7 @@ async def apply_device_intent(
             device_name,
             method="put",
             strict=strict,
+            no_networking=no_networking,
             outformat="cli" if dry_run == "cli" else "native",
         )
 
