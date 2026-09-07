@@ -217,21 +217,28 @@ async def test_adapter_reauthorization_transmits_the_current_metric(adapter_clie
 
 
 @pytest.mark.parametrize("status", ["absent", "inconclusive"])
-async def test_retention_certification_controls_transmission(adapter_client, status):
+async def test_retention_certification_controls_transmission(adapter_client, monkeypatch, status):
     from tests.core.static_route_harness import S, fixture_r
     from tests.core.test_static_route_removal import tombstone_ids
 
     harness, tomb = await fixture_r(adapter_client)
     harness.fake.service_status = status
     writes = len(harness.fake.writes)
+    from nso_adapter.core import apply as apply_module
+
+    build = apply_module.build_device_containers
+    errors = []
+
+    async def observe_build(*args, **kwargs):
+        body = await build(*args, **kwargs)
+        errors.extend(error.code for error in body.errors.values())
+        return body
+
+    monkeypatch.setattr(apply_module, "build_device_containers", observe_build)
     await harness.run(status="failed" if status == "inconclusive" else "succeeded")
     if status == "inconclusive":
         assert len(harness.fake.writes) == writes
-        from nso_adapter.store.models import StaticRouteIntent
-
-        async with session() as db:
-            row = await db.scalar(sa.select(StaticRouteIntent).where(StaticRouteIntent.device_id == harness.device_id))
-            assert row.last_apply_error["code"] == SNAPSHOT_INCONCLUSIVE
+        assert errors == [SNAPSHOT_INCONCLUSIVE]
     else:
         assert harness.fake.sent_keys() == {S}
     assert await tombstone_ids(harness.device_id) == [tomb]
