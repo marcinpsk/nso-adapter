@@ -457,6 +457,7 @@ def extend_apply_plan(desired: dict | None, source: dict, retained_rows: list[di
     by_id = {row_id: None for row_id in desired["row_ids"]}
     cas = {item["row_id"]: item for item in desired["cas"]}
     allowed = {tuple(key) for key in desired["allowed_removal_keys"]}
+    mode = desired["mode"]
     for row in retained_rows:
         row_id = row.get("id")
         if row_id in by_id:
@@ -469,9 +470,11 @@ def extend_apply_plan(desired: dict | None, source: dict, retained_rows: list[di
         deployed = as_triple(row.get("deployed_key"))
         if deployed is not None and deployed != _row_triple(row):
             allowed.add(deployed)
+            mode = "PUT"
     ordered = sorted(by_id)
     return {
         **desired,
+        "mode": mode,
         "row_ids": ordered,
         "cas": [cas[row_id] for row_id in ordered],
         "allowed_removal_keys": [list(key) for key in sorted(allowed)],

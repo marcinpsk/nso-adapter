@@ -877,3 +877,22 @@ async def test_a_frozen_removal_plan_round_trips_its_clears(adapter_client):
     hydrated = hydrate_static_route_removal_plan(document)
     assert hydrated.clears == promoted.clears
     assert [(clear.key, clear.fields) for clear in promoted.clears] == [(A, ("permanent",))]
+
+
+async def test_retaining_a_replacement_row_requires_put_verification(adapter_client):
+    from nso_adapter.core.generation import _retain_rows
+    from nso_adapter.core.projection import EXECUTION_KEY, fragment_tables
+    from nso_adapter.store.models import StaticRouteIntent
+    from tests.core.projection_helpers import freeze_snapshot
+
+    device_id = await seed_device(nso_device_name="retained-replacement")
+    await _seed_rows(device_id, [{"triple": B, "route_id": 2, "deployed_key": list(A)}])
+    async with session() as db:
+        source = await freeze_snapshot(db, device_id, "static_route")
+        await db.execute(sa.delete(StaticRouteIntent).where(StaticRouteIntent.device_id == device_id))
+        desired = await freeze_snapshot(db, device_id, "static_route")
+    assert desired[EXECUTION_KEY]["proof"]["apply"]["mode"] == "PATCH"
+    retained = _retain_rows(desired, fragment_tables(source), "static_route", source)
+    plan = retained[EXECUTION_KEY]["proof"]["apply"]
+    assert plan["allowed_removal_keys"] == [list(A)]
+    assert plan["mode"] == "PUT"
