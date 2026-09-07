@@ -12,7 +12,7 @@ import pytest
 from tests.conftest import seed_device, session
 from tests.core.test_action_apply_promotion import _apply, _put_vlans
 from tests.core.test_execution_context import _execute, _put_addresses, _put_attrs, _seed_interface
-from tests.core.test_generation_protocol import job_row, recorded_client, run_head, seed_settings
+from tests.core.test_generation_protocol import job_row, recorded_client, run_head, seed_settings, stream_row
 
 pytestmark = pytest.mark.anyio
 
@@ -209,3 +209,60 @@ async def test_automatic_attribute_removal_keeps_enabled(adapter_client):
     assert entry["interface-name"] == _IFACE
     assert entry["enabled"] is True
     assert "description" not in entry
+
+
+@pytest.mark.parametrize("reject", [False, True], ids=["success", "rejected"])
+async def test_automatic_attribute_edit_with_detach(adapter_client, reject):
+    """A positive edit lands before detach, and both links must succeed to settle."""
+    name = "attribute-auto-mixed"
+    device_id = await seed_device(nso_device_name=name, netbox_device_id=17339, attributes=["description", "enabled"])
+    await seed_settings(device_id, auto_apply=True)
+    enabled = {"interface": _IFACE, "attribute": "enabled", "intent_value": True}
+    assert (await _put_attrs(adapter_client, device_id, [*_ATTR, enabled], seq=1820)).status_code == 200
+    live = (await _execute(device_id, name)).documents[-1]
+    before = await stream_row(device_id, "interface_config")
+    assert before.applied_revision == before.desired_revision
+
+    response = await _put_attrs(
+        adapter_client, device_id, [{**enabled, "intent_value": False}], seq=1821, query="?delete_origin=false"
+    )
+    assert response.status_code == 200, response.text
+    pending = await stream_row(device_id, "interface_config")
+    assert pending.applied_revision == before.applied_revision < pending.desired_revision
+
+    async def check_unsettled():
+        current = await stream_row(device_id, "interface_config")
+        assert current.applied_revision == before.applied_revision
+
+    client, rec = recorded_client(name, on_sync_from=check_unsettled)
+    client.get_service_config.return_value = live
+    if reject:
+        rec.fake.reject_containers.add("interface")
+    job = await job_row(await run_head(device_id, client))
+    assert rec.fake.writes and not rec.fake.writes[0]["no_networking"], (
+        "the positive edit needs a networked transmission"
+    )
+    (entry,) = rec.documents[0]["interface"]["interface"]
+    assert entry["enabled"] is False
+    assert entry["description"] == "core link"
+    await check_unsettled()
+
+    if reject:
+        assert job.status.value == "failed", (job.error, job.result)
+        assert job.error["code"] == "nso_commit_failed"
+        assert await run_head(device_id, client) is None
+        assert len(rec.documents) == 1
+        await check_unsettled()
+        return
+
+    assert job.status.value == "succeeded", (job.error, job.result)
+    client.get_service_config.return_value = rec.documents[-1]
+    detach = await job_row(await run_head(device_id, client))
+    assert detach.status.value == "succeeded", (detach.error, detach.result)
+    assert len(rec.documents) == 2
+    assert rec.fake.writes[-1]["no_networking"]
+    (final,) = rec.documents[-1]["interface"]["interface"]
+    assert final["enabled"] is False
+    assert "description" not in final
+    settled = await stream_row(device_id, "interface_config")
+    assert settled.applied_revision == pending.desired_revision

@@ -225,23 +225,9 @@ async def put_intent(
     ]
     if await auto_apply_requested(db, device_id, count + len(removed_rows)):
         if removed_rows:
-            from nso_adapter.core.removal import enqueue_removal, promotion_removal_context, query_flag_marking
+            from nso_adapter.core.generation import create_automatic_apply
 
-            context = await promotion_removal_context(
-                db, device_id, "interface_config", {"interface_intent": removed_rows}
-            )
-            marks = query_flag_marking(deletes=True)
-            await enqueue_removal(
-                db,
-                device_id,
-                "interface_config",
-                marking=marks.marking,
-                defer_retract=marks.defer_retract,
-                promotes=(delivery.stream,),
-                interfaces=context.interfaces,
-                removed=context.removed,
-                shrank=True,
-            )
+            await create_automatic_apply(db, device_id, delivery.stream, delivery.push_seq)
         else:
             from nso_adapter.core.apply import enqueue_apply
 

@@ -974,7 +974,7 @@ async def _enqueue_action_removal_links(
     device_id: int,
     links: list[_RemovalLink],
     *,
-    apply_attempt_id: UUID,
+    apply_attempt_id: UUID | None,
     cohort: int | None,
     intermediate_document: dict,
     final_document: dict,
@@ -1056,7 +1056,7 @@ async def _enqueue_action_apply_job(
     device_id: int,
     streams: set[str],
     *,
-    apply_attempt_id: UUID,
+    apply_attempt_id: UUID | None,
     document: dict,
     cohort: int | None,
     removal_authority: dict[str, dict[str, list]],
@@ -1102,8 +1102,6 @@ async def create_action_apply(
     apply_attempt_id: UUID,
 ) -> ActionApplyResult:
     """Promote selected streams and compose removal work with the established runners."""
-    from nso_adapter.core.receipt import consume_promotion_provenance
-
     await lock_projection(db, device_id)
     selected_rows, skipped, skipped_detail = await _selected_promotions(db, device_id, selected)
     if not selected_rows:
@@ -1117,6 +1115,29 @@ async def create_action_apply(
     if active_job_id is not None:
         raise ApplyJobConflict(active_job_id)
 
+    result = await _create_apply_chain(db, device_id, selected_rows, apply_attempt_id)
+    return ActionApplyResult(result.generations, {**skipped, **result.skipped}, skipped_detail)
+
+
+async def create_automatic_apply(db: AsyncSession, device_id: int, stream: str, push_seq: int) -> None:
+    """Plan an admitted automatic delivery through the shared promotion chain."""
+    await lock_projection(db, device_id)
+    selected_rows, skipped, _ = await _selected_promotions(db, device_id, {stream: push_seq})
+    if skipped:
+        raise RuntimeError(f"automatic delivery for device {device_id} could not promote: {skipped}")
+    await _create_apply_chain(db, device_id, selected_rows, None)
+
+
+async def _create_apply_chain(
+    db: AsyncSession,
+    device_id: int,
+    selected_rows: dict[str, _Selection],
+    apply_attempt_id: UUID | None,
+) -> ActionApplyResult:
+    """Freeze and enqueue ordered promotion links with one settlement cohort."""
+    from nso_adapter.core.receipt import consume_promotion_provenance
+
+    skipped: dict[str, str] = {}
     if "static_route" in selected_rows:
         await _promote_static_route_clears(db, device_id)
 
@@ -1214,7 +1235,7 @@ async def create_action_apply(
         if promotion.receipt is not None:
             consume_promotion_provenance(promotion.receipt)
     await db.flush()
-    return ActionApplyResult(generations, skipped, skipped_detail)
+    return ActionApplyResult(generations, skipped, {})
 
 
 async def create_generation(
