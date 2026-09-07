@@ -1051,3 +1051,84 @@ def test_every_section_hydrator_refuses_missing_context():
     for section in section_registry():
         with pytest.raises(ValueError, match=section):
             hydrate_section({section: {}}, section)
+
+
+async def test_scenario_2_a_creation_waits_for_a_consumption_and_names_no_consumed_carrier(
+    adapter_client, rival_engine
+):
+    """The carrier lock with TWO real sessions: the creation waits, then names nothing gone.
+
+    A document composed between another session's consumption and its commit would freeze a
+    carrier id that is about to disappear, and the worker would then retain a key no carrier
+    claims. The consuming session holds the device's projection lock across its whole pass,
+    so the Apply blocks on it and composes only after the consumption has committed.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from nso_adapter.core.static_route_reclaim import reclaim_one_device
+    from nso_adapter.store.db import get_engine
+    from nso_adapter.store.models import StaticRouteTombstone
+    from tests.core.removal_helpers import authorize_static_route, seed_tomb
+    from tests.core.static_route_harness import K, S, retention_harness, route
+    from tests.core.test_action_apply_promotion import _put_vlans
+    from tests.core.test_projection_lock_order import _backend_pid, _wait_for_blocked_query
+    from tests.core.test_static_route_reclaim import seed_succeeded_owner
+    from tests.core.test_static_route_removal import sr_client, tombstone_ids
+
+    harness = await retention_harness(adapter_client)
+    device_id = harness.device_id
+    await harness.push([route(S, route_id=2)])
+    await harness.run()
+    await harness.drain()
+    owner = await seed_succeeded_owner(device_id)
+    tomb = await seed_tomb(device_id, K, job_id=owner, route_id=1)
+    await authorize_static_route(device_id)
+
+    # The push is accepted first, so the Apply below is the one step that composes.
+    harness.seq += 1
+    assert (
+        await _put_vlans(adapter_client, device_id, [909], seq=harness.seq, query="?store_only=true")
+    ).status_code == 200
+
+    rival = async_sessionmaker(rival_engine, expire_on_commit=False)
+    async with rival() as gate, rival() as consumer:
+        gate_pid = await _backend_pid(gate)
+        await gate.execute(sa.select(StaticRouteTombstone.id).where(StaticRouteTombstone.id == tomb).with_for_update())
+        with patch("nso_adapter.core.importer.get_nso_client", return_value=sr_client(harness.fake)):
+            consuming = asyncio.create_task(reclaim_one_device(device_id, db=consumer))
+            creating = None
+            try:
+                consumer_pid = await _wait_for_blocked_query(
+                    get_engine(),
+                    blocker_pid=gate_pid,
+                    relation="static_route_tombstone",
+                    fragments=("from static_route_tombstone", "for update"),
+                )
+                creating = asyncio.create_task(_apply(adapter_client, device_id, {"vlan": harness.seq}))
+                await _wait_for_blocked_query(
+                    get_engine(),
+                    blocker_pid=consumer_pid,
+                    relation="devices",
+                    fragments=("from devices", "for no key update"),
+                )
+                await gate.rollback()
+                assert await asyncio.wait_for(consuming, timeout=10) == (1, 0)
+                response = await asyncio.wait_for(creating, timeout=10)
+            finally:
+                await gate.rollback()
+                for task in (consuming, creating):
+                    if task is not None and not task.done():
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+
+    assert response.status_code == 202, response.text
+    assert await tombstone_ids(device_id) == [], "the consumption did not commit"
+    created = (await _generations(device_id))[-1]
+    assert created.document["static_route"]["static_route_tombstone"] == [], "a document named a consumed carrier"
+    assert created.document["static_route"]["_execution"]["proof"]["apply"]["tombstone_ids"] == []
+
+    await harness.run()
+    assert harness.fake.sent_keys() == {S}, "the worker retained a key no carrier claims"
