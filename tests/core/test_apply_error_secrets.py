@@ -632,3 +632,57 @@ async def test_a_refused_escalation_keeps_the_certification_text_out_of_the_refr
     assert reported[0]["detail"] == "the device-state-read action raised NsoReadContractError"
     assert_records_free_of(logs, _SECRETS)
     assert_records_free_of(await _outcome_rows(device_id), _SECRETS)
+
+
+# ── a refused device-state read: the value the server echoed reaches no sink ──
+
+
+def _action_client(output: dict):
+    """A real NsoClient whose device-state-read action answers *output*."""
+
+    def respond(request):
+        if "device-state-read/run" in str(request.url):
+            return httpx.Response(200, json={"network-state-export:output": output})
+        return httpx.Response(404)
+
+    return _client_with(httpx.MockTransport(respond))
+
+
+@pytest.mark.parametrize("rejected", ["device", "status"])
+async def test_a_refused_device_state_read_keeps_the_echoed_value_out_of_every_sink(adapter_client, rejected):
+    """Certification names the CONSTRUCT it refused, never the value the server sent back.
+
+    Both rejected values are server-chosen. The exception reaches the apply-side reader's
+    `static_route.device_state_read_failed` record, which logged its repr.
+    """
+    from structlog.testing import capture_logs
+
+    from nso_adapter.core import apply as apply_mod
+    from nso_adapter.nso.client import NsoReadContractError
+    from nso_adapter.store.models import Device
+    from tests._secret_discipline import assert_chain_free_of, assert_records_free_of
+
+    name = f"cert-{rejected}-refused"
+    device_id = await seed_device(nso_device_name=name, netbox_device_id=9423 if rejected == "device" else 9424)
+    output = (
+        {"atomic": True, "device-name": f"other-device-{_SECRET}"}
+        if rejected == "device"
+        else {"atomic": True, "device-name": name, "static-route": {"status": f"pending-{_SECRET}"}}
+    )
+    client = _action_client(output)
+    async with session() as db:
+        device = await db.get(Device, device_id)
+        with capture_logs() as logs:
+            status, entries = await apply_mod._static_route_device_state(client, device)
+
+    assert (status, entries) == ("error", {}), "a refused read must never report a clean device"
+    failed = [record for record in logs if record["event"] == "static_route.device_state_read_failed"]
+    assert failed, "the failed read was not reported at all"
+    assert_records_free_of(logs, _SECRETS)
+    assert failed[0]["error_type"] == "NsoReadContractError", "the type tells a contract breach from a blip"
+
+    # The same read again, through the same real client: the refusal itself must carry nothing
+    # of the echoed value on any node of its cause/context chain.
+    with pytest.raises(NsoReadContractError) as caught:
+        await client.run_device_state_read(name, ["static-route"])
+    assert_chain_free_of(caught.value, _SECRETS)
