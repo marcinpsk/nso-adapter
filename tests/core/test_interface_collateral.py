@@ -185,3 +185,27 @@ async def test_ip_only_put_without_attribute_changes_succeeds(adapter_client):
     assert entry["ipv4-address"][0]["prefix-length"] == 24
     assert "description" not in entry
     assert "enabled" not in entry
+
+
+async def test_automatic_attribute_removal_keeps_enabled(adapter_client):
+    """An automatic marked omission removes the description through the real worker."""
+    device_id = await seed_device(
+        nso_device_name="attribute-auto-removal", netbox_device_id=17338, attributes=["description", "enabled"]
+    )
+    await seed_settings(device_id, auto_apply=True)
+    enabled = {"interface": _IFACE, "attribute": "enabled", "intent_value": True}
+    assert (await _put_attrs(adapter_client, device_id, [*_ATTR, enabled], seq=1810)).status_code == 200
+    live = (await _execute(device_id, "attribute-auto-removal")).documents[-1]
+    assert live["interface"]["interface"][0]["description"] == "core link"
+    assert live["interface"]["interface"][0]["enabled"] is True
+
+    response = await _put_attrs(adapter_client, device_id, [enabled], seq=1811, query="?delete_origin=true")
+    assert response.status_code == 200, response.text
+    client, rec = recorded_client("attribute-auto-removal")
+    client.get_service_config.return_value = live
+    job = await job_row(await run_head(device_id, client))
+    assert job.status.value == "succeeded", (job.error, job.result)
+    (entry,) = rec.documents[-1]["interface"]["interface"]
+    assert entry["interface-name"] == _IFACE
+    assert entry["enabled"] is True
+    assert "description" not in entry

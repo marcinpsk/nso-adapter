@@ -24,6 +24,7 @@ from nso_adapter.core.request_flags import PendingClearProvenance
 from nso_adapter.store.models import (
     DbInterface,
     Device,
+    DeviceProjectionStream,
     InterfaceAttrState,
     InterfaceIntent,
     ManagedScope,
@@ -205,13 +206,46 @@ async def put_intent(
 
     await db.flush()
 
-    # If auto_apply is enabled, enqueue an apply job
     from nso_adapter.core.generation import auto_apply_requested
+    from nso_adapter.core.projection import rows_by_intent_identity, snapshot_stream
 
-    if await auto_apply_requested(db, device_id, count):
-        from nso_adapter.core.apply import enqueue_apply
+    projection = await db.scalar(
+        select(DeviceProjectionStream).where(
+            DeviceProjectionStream.device_id == device_id,
+            DeviceProjectionStream.stream == delivery.stream,
+        )
+    )
+    authorized = projection.authorized_document if projection is not None else None
+    desired = await snapshot_stream(db, device_id, delivery.stream)
+    desired_rows = rows_by_intent_identity(desired, "interface_intent")
+    removed_rows = [
+        row
+        for identity, row in rows_by_intent_identity(authorized or {}, "interface_intent").items()
+        if identity not in desired_rows
+    ]
+    if await auto_apply_requested(db, device_id, count + len(removed_rows)):
+        if removed_rows:
+            from nso_adapter.core.removal import enqueue_removal, promotion_removal_context, query_flag_marking
 
-        await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
+            context = await promotion_removal_context(
+                db, device_id, "interface_config", {"interface_intent": removed_rows}
+            )
+            marks = query_flag_marking(deletes=True)
+            await enqueue_removal(
+                db,
+                device_id,
+                "interface_config",
+                marking=marks.marking,
+                defer_retract=marks.defer_retract,
+                promotes=(delivery.stream,),
+                interfaces=context.interfaces,
+                removed=context.removed,
+                shrank=True,
+            )
+        else:
+            from nso_adapter.core.apply import enqueue_apply
+
+            await enqueue_apply(db, device_id, force=True, stream=delivery.stream)
 
     result = {
         "device_id": device_id,
