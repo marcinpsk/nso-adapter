@@ -14,7 +14,10 @@ class of bug this contract exists to prevent.
 
 from __future__ import annotations
 
+import ast
+import re
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
@@ -855,36 +858,77 @@ async def test_the_isis_section_takes_its_owner_streams_context_and_keeps_both_l
     assert [algo["algo-id"] for algo in process["flex-algo"]] == [128], "the sibling lane's rows left the wire"
 
 
-def _carrier_delete_offenders(sources):
-    import ast
-    from pathlib import Path
+#: The carrier the choke point owns, as the AST names it and as SQL names it.
+_CARRIER_MODEL = "StaticRouteTombstone"
+_CARRIER_TABLE = "static_route_tombstone"
+_CARRIER_SQL_DELETE = re.compile(rf"\bdelete\s+from\s+(public\.)?{_CARRIER_TABLE}\b", re.IGNORECASE)
 
-    def qualified(node, aliases):
-        if isinstance(node, ast.Name):
-            return aliases.get(node.id, node.id)
-        if isinstance(node, ast.Attribute):
-            return f"{qualified(node.value, aliases)}.{node.attr}"
-        return ""
 
+def _qualified(node, aliases) -> str:
+    """The dotted name *node* refers to, with every known alias resolved."""
+    if isinstance(node, ast.Name):
+        return aliases.get(node.id, node.id)
+    if isinstance(node, ast.Attribute):
+        return f"{_qualified(node.value, aliases)}.{node.attr}"
+    return ""
+
+
+def _name_bindings(tree) -> dict[str, str]:
+    """Every name an import or an assignment binds, resolved to a fixed point.
+
+    An assignment renames a model or the delete constructor as effectively as an import
+    alias does, and a rename of a rename resolves in a later round.
+    """
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                aliases[alias.asname or alias.name.split(".")[0]] = (
+                    alias.name if alias.asname else alias.name.split(".")[0]
+                )
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    binds = [
+        (node.targets[0].id, node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+    ]
+    for _round in range(len(binds) + 1):
+        grown = {
+            name: target
+            for name, value in binds
+            if (target := _qualified(value, aliases)) and aliases.get(name) != target
+        }
+        if not grown:
+            break
+        aliases.update(grown)
+    return aliases
+
+
+def _deletes_the_carrier(node, aliases) -> bool:
+    """True when *node* is a carrier DELETE, in any spelling that reaches one."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return bool(_CARRIER_SQL_DELETE.search(node.value))
+    if not isinstance(node, ast.Call):
+        return False
+    func = _qualified(node.func, aliases).split(".")
+    if func[-1] != "delete":
+        return False
+    # `delete(Carrier)` and `Carrier.__table__.delete()` are the same statement.
+    return _CARRIER_MODEL in set(func) | {_qualified(arg, aliases).split(".")[-1] for arg in node.args}
+
+
+def _carrier_delete_offenders(sources) -> set[str]:
+    """Every source that issues a carrier DELETE outside the one locking choke point."""
     offenders: set[str] = set()
     for path, source in sources.items():
         if path == Path("store/tombstone_store.py"):
             continue
         tree = ast.parse(source)
-        aliases = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    aliases[alias.asname or alias.name.split(".")[0]] = (
-                        alias.name if alias.asname else alias.name.split(".")[0]
-                    )
-            elif isinstance(node, ast.ImportFrom):
-                for alias in node.names:
-                    aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and qualified(node.func, aliases).split(".")[-1] == "delete":
-                if any(qualified(arg, aliases).split(".")[-1] == "StaticRouteTombstone" for arg in node.args):
-                    offenders.add(str(path))
+        aliases = _name_bindings(tree)
+        if any(_deletes_the_carrier(node, aliases) for node in ast.walk(tree)):
+            offenders.add(str(path))
     return offenders
 
 
@@ -895,10 +939,7 @@ def test_every_consumption_path_deletes_a_carrier_through_the_one_locking_choke_
     A second site issuing its own DELETE would consume a carrier a document creation holding
     that lock is in the middle of composing, which is the interleaving the order forbids.
     """
-    import ast
-    import pathlib as _pathlib
-
-    root = _pathlib.Path(__file__).resolve().parents[2] / "nso_adapter"
+    root = Path(__file__).resolve().parents[2] / "nso_adapter"
     offenders = _carrier_delete_offenders({path.relative_to(root): path.read_text() for path in root.rglob("*.py")})
     assert offenders == set(), f"carrier deletions outside the choke point: {sorted(offenders)}"
 
@@ -925,18 +966,22 @@ def test_every_consumption_path_deletes_a_carrier_through_the_one_locking_choke_
         "import nso_adapter.store.models; import sqlalchemy; sqlalchemy.delete(nso_adapter.store.models.StaticRouteTombstone)",
         "from nso_adapter.store import models as m; from sqlalchemy import delete as remove; remove(m.StaticRouteTombstone)",
         "from nso_adapter.store.models import StaticRouteTombstone; from sqlalchemy import delete; delete(StaticRouteTombstone)",
+        # An assignment renames the model as effectively as an import alias does.
+        "from nso_adapter.store.models import StaticRouteTombstone; from sqlalchemy import delete; Carrier = StaticRouteTombstone; delete(Carrier)",
+        # ... and it renames the delete constructor just as well.
+        "from nso_adapter.store.models import StaticRouteTombstone; from sqlalchemy import delete; remove = delete; remove(StaticRouteTombstone)",
+        # A table-bound delete takes no argument at all.
+        "from nso_adapter.store.models import StaticRouteTombstone; StaticRouteTombstone.__table__.delete()",
+        # Literal SQL bypasses every name the AST could resolve.
+        "from sqlalchemy import text; text('DELETE FROM static_route_tombstone WHERE id = :id')",
     ],
 )
 @pytest.mark.parametrize("path", ["core/consumer.py", "core/tombstone_store.py"])
 def test_carrier_delete_guard_rejects_qualified_models_and_aliases(source, path):
-    from pathlib import Path
-
     assert _carrier_delete_offenders({Path(path): source}) == {path}
 
 
 def test_carrier_delete_guard_exempts_only_the_owning_path():
-    from pathlib import Path
-
     source = "from sqlalchemy import delete; from nso_adapter.store.models import StaticRouteTombstone; delete(StaticRouteTombstone)"
     assert _carrier_delete_offenders({Path("store/tombstone_store.py"): source}) == set()
 
