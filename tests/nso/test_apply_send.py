@@ -481,12 +481,10 @@ def test_snmp_host_without_binding_omits_community_or_user():
         "network/netbox snmp#community",  # whitespace
     ],
 )
-async def test_snmp_rejects_a_malformed_vault_ref(bad_ref):
+def test_snmp_rejects_a_malformed_vault_ref(bad_ref):
     """A community that cannot produce the mandatory vault triples must fail the encode with
     a structured error (never a silent drop: an omitted family is a retracted family, so the
     community would be deleted from the device)."""
-    transport = _RecordingTransport()
-    _client_with(transport)
     communities = [SimpleNamespace(label="ro", vault_ref=bad_ref, access="RO", acl=None)]
 
     with pytest.raises(NsoApplyError, match="vault_ref"):
@@ -499,7 +497,6 @@ async def test_snmp_rejects_a_malformed_vault_ref(bad_ref):
             },
             _PLAIN,
         )
-    assert not transport.requests  # rejected before anything was sent
 
 
 async def test_logging_container_carries_the_host_list():
