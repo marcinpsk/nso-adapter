@@ -28,6 +28,10 @@
   `adapter_token` on **both** sides (plugin env `NSO_ADAPTER_TOKEN` →
   `PLUGINS_CONFIG["netbox_nso_plugin"]["adapter_token"]`; adapter config
   `api.adapter_token_ref`). Missing/invalid → `401`.
+- **API documentation:** `/docs`, `/redoc` and `/openapi.json` are off by default
+  and answer `404`; the `ENABLE_API_DOCS=1` env setting registers them and then
+  serves the schema and the two UI pages without authentication, because a browser
+  cannot send a bearer header.
 - Timestamps: ISO-8601 UTC.
 - Async operations return a **job**; the consumer polls `GET /jobs/{id}`.
 - **`X-Store-Incarnation`** is set on every `200` from `GET /api/v1/jobs`. It carries the

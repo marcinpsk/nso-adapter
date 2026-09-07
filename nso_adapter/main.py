@@ -8,11 +8,9 @@ import inspect
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import Depends, FastAPI
+from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
-from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.responses import JSONResponse
 
 from nso_adapter import __version__
 from nso_adapter.api.actions import router as actions_router
@@ -20,7 +18,6 @@ from nso_adapter.api.bfd import router as bfd_router
 from nso_adapter.api.bgp import router as bgp_router
 from nso_adapter.api.capability import router as capability_router
 from nso_adapter.api.config import router as config_router
-from nso_adapter.api.deps import verify_token
 from nso_adapter.api.devices import router as devices_router
 from nso_adapter.api.errors import (
     ApiError,
@@ -451,35 +448,17 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    # A browser cannot send a bearer header, so the documentation routes are opt-in and
+    # serve everybody once ENABLE_API_DOCS turns them on.
+    api_docs = get_env_settings().enable_api_docs
     app = FastAPI(
         title="NSO Adapter",
         version=__version__,
         lifespan=lifespan,
-        docs_url=None,
-        redoc_url=None,
-        openapi_url=None,
+        docs_url="/docs" if api_docs else None,
+        redoc_url="/redoc" if api_docs else None,
+        openapi_url="/openapi.json" if api_docs else None,
     )
-
-    @app.get("/openapi.json", dependencies=[Depends(verify_token)], include_in_schema=False)
-    async def openapi_document():
-        return JSONResponse(app.openapi())
-
-    @app.get("/docs", dependencies=[Depends(verify_token)], include_in_schema=False)
-    async def swagger_docs():
-        return get_swagger_ui_html(
-            openapi_url="/openapi.json",
-            title="NSO Adapter - Swagger UI",
-            oauth2_redirect_url="/docs/oauth2-redirect",
-        )
-
-    @app.get("/docs/oauth2-redirect", dependencies=[Depends(verify_token)], include_in_schema=False)
-    async def swagger_redirect():
-        return get_swagger_ui_oauth2_redirect_html()
-
-    @app.get("/redoc", dependencies=[Depends(verify_token)], include_in_schema=False)
-    async def redoc_docs():
-        return get_redoc_html(openapi_url="/openapi.json", title="NSO Adapter - ReDoc")
-
     app.add_exception_handler(ApiError, api_error_handler)
     app.add_exception_handler(StarletteHTTPException, framework_http_error_handler)
     app.add_exception_handler(RequestValidationError, validation_error_handler)

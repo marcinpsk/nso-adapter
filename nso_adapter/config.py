@@ -2,7 +2,7 @@
 """NSO Adapter — configuration loading.
 
 Config is split into two layers:
-- EnvSettings  — bootstrap env vars only (AppRole creds, config file path)
+- EnvSettings  — bootstrap env vars only (AppRole creds, config file path, API-docs switch)
 - AppConfig    — loaded from config.yaml; holds all non-secret settings and
                  secret *references* (never secret values).
 """
@@ -171,12 +171,15 @@ class AppConfig(BaseModel):
 class EnvSettings(BaseSettings):
     """Minimal env-only settings.
 
-    Only the AppRole secrets needed to bootstrap Vault, plus the path to the config file.
+    Only the AppRole secrets needed to bootstrap Vault, the path to the config file, and
+    the settings the app must know BEFORE that file is read.
     """
 
     config_file: str = "config.yaml"
     vault_role_id: str = ""
     vault_secret_id: str = ""
+    # Read while the FastAPI app is built, which happens before config.yaml is loaded.
+    enable_api_docs: bool = False
 
     model_config = {
         "env_file": ".env",
