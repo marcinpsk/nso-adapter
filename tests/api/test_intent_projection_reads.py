@@ -5,31 +5,51 @@ import sqlalchemy as sa
 
 from tests.conftest import seed_device
 
+#: The admission snapshot selects interface_intent through a device-scoped subquery. The
+#: full-replace read in put_intent filters on an interface-id list, so the two never collide.
+_ADMISSION_SHAPE = "FROM interfaces WHERE interfaces.device_id"
 
-async def test_disabled_auto_apply_does_not_snapshot_for_admission(adapter_client):
+
+async def _interface_intent_reads(client, device_id: int) -> list[str]:
+    """Every ``interface_intent`` SELECT one empty intent PUT emits, whitespace-normalized."""
     from nso_adapter.store.db import get_engine
     from tests.api.test_api_intent import AUTH
     from tests.conftest import push_seq
-    from tests.core.test_generation_protocol import seed_settings
 
-    device_id = await seed_device(nso_device_name="snapshot-disabled")
-    await seed_settings(device_id, auto_apply=False)
-    snapshots = []
+    reads: list[str] = []
 
     def observe(conn, cursor, statement, parameters, context, executemany):
         if statement.lstrip().upper().startswith("SELECT") and "FROM interface_intent" in statement:
-            snapshots.append(statement)
+            reads.append(" ".join(statement.split()))
 
     engine = get_engine().sync_engine
     sa.event.listen(engine, "before_cursor_execute", observe)
     try:
-        response = await adapter_client.put(
+        response = await client.put(
             f"/api/v1/devices/{device_id}/intent", json={"attributes": []}, headers=AUTH | push_seq()
         )
     finally:
         sa.event.remove(engine, "before_cursor_execute", observe)
     assert response.status_code == 200, response.text
-    assert len(snapshots) == 1, snapshots
+    return reads
+
+
+async def test_disabled_auto_apply_does_not_snapshot_for_admission(adapter_client):
+    """Auto-apply off runs the full-replace read alone; the enabled device is the control."""
+    from tests.core.test_generation_protocol import seed_settings
+
+    disabled = await seed_device(nso_device_name="snapshot-disabled", netbox_device_id=4201)
+    await seed_settings(disabled, auto_apply=False)
+    enabled = await seed_device(nso_device_name="snapshot-enabled", netbox_device_id=4202)
+    await seed_settings(enabled, auto_apply=True)
+
+    off = await _interface_intent_reads(adapter_client, disabled)
+    on = await _interface_intent_reads(adapter_client, enabled)
+
+    assert len(off) == 1, off
+    assert not [read for read in off if _ADMISSION_SHAPE in read], off
+    assert [read for read in on if _ADMISSION_SHAPE in read], on
+    assert len(off) < len(on), (off, on)
 
 
 async def _put_attrs(client, device_id: int, attributes: list[dict], *, query: str = ""):
