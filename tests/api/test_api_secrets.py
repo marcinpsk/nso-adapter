@@ -16,6 +16,7 @@ import json
 import threading
 import types
 from unittest.mock import AsyncMock, patch
+from uuid import UUID
 
 import httpx
 import pytest
@@ -637,6 +638,38 @@ async def test_a_SUCCESSFUL_harvest_echoes_no_REFERENCE_COMPONENT_anywhere(vault
     assert_records_free_of(logs, ["harvest-dev"])
     assert harvested[0]["community_hash"] == target_hash
     assert harvested[0]["operation_id"] == resp.json()["operation_id"], "the record must join to the answer"
+
+
+@pytest.mark.anyio
+async def test_the_operation_id_is_a_WHOLE_uuid_so_two_operations_cannot_share_one(vault_client):
+    """The id was minted as ``uuid4().hex[:12]``: 48 bits, ~1% collision at 2.4M operations.
+
+    The id exists only to join one answer to its own log record, so a collision joins an
+    answer to a DIFFERENT operation's record: the one thing the handle promises. Nothing
+    constrains its width (the three response schemas type it as a plain string), so the
+    whole value costs nothing.
+    """
+    from structlog.testing import capture_logs
+
+    client, _, _ = vault_client
+    seen: set[str] = set()
+    for _ in range(3):
+        with capture_logs() as logs:
+            resp = await client.post(
+                "/api/v1/secrets",
+                json={"vault_ref": _REF, "values": {_REF_KEY: "placeholder-secret"}},
+                headers=AUTH,
+            )
+        assert resp.status_code == 200
+        answered = resp.json()["operation_id"]
+        minted = UUID(answered)  # a truncated hex string does not parse
+        assert minted.version == 4, "the handle must stay a random uuid4"
+        assert answered == minted.hex, "the answer must carry the whole value, unseparated"
+        written = [record for record in logs if record["event"] == "secrets.set"]
+        assert written[0]["operation_id"] == answered, "the record must still join to the answer"
+        seen.add(answered)
+
+    assert len(seen) == 3, "every operation must get its own handle"
 
 
 @pytest.mark.anyio

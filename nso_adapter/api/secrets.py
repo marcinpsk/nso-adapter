@@ -96,9 +96,10 @@ def _operation_id() -> str:
 
     A reference names a mount, a path and a key, and the caller chooses all three, so no
     part of it may reach a log record or a response body. An operator still has to join a
-    record to the answer the caller got, and this id is that join.
+    record to the answer the caller got, and this id is that join, so it carries the whole
+    uuid4: a truncated handle collides and joins an answer to another operation's record.
     """
-    return uuid4().hex[:12]
+    return uuid4().hex
 
 
 def _vault_provider(request: Request):
