@@ -1144,6 +1144,10 @@ async def _create_apply_chain(
 ) -> ActionApplyResult:
     """Freeze and enqueue ordered promotion links with one settlement cohort."""
     from nso_adapter.core.receipt import consume_promotion_provenance
+    from nso_adapter.core.request_flags import STORE_ONLY
+
+    if STORE_ONLY.get():
+        raise RuntimeError("_create_apply_chain reached under a store-only request - store-only never promotes")
 
     skipped: dict[str, str] = {}
     if "static_route" in selected_rows:

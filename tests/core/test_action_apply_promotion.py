@@ -2044,6 +2044,30 @@ async def test_action_apply_refuses_detach_combined_with_replacement_work(adapte
     assert (await _stream(device_id, "vlan")).authorized_revision == 1
 
 
+async def test_automatic_apply_refuses_store_only_removal(adapter_client):
+    from nso_adapter.core.generation import create_automatic_apply
+    from nso_adapter.core.request_flags import STORE_ONLY
+    from nso_adapter.store.models import GenerationStatus
+
+    device_id = await seed_device(nso_device_name="store-only-removal", netbox_device_id=19968)
+    await seed_settings(device_id, auto_apply=False)
+    assert (await _put_vlans(adapter_client, device_id, [10, 20], seq=1)).status_code == 200
+    assert (await _apply(adapter_client, device_id, {"vlan": 1})).status_code == 202
+    await _settle((await _generations(device_id))[0].job_id, GenerationStatus.settled)
+    assert (await _put_vlans(adapter_client, device_id, [10], seq=2, query="?store_only=true")).status_code == 200
+
+    async with session() as db:
+        token = STORE_ONLY.set(True)
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="^_create_apply_chain reached under a store-only request - store-only never promotes$",
+            ):
+                await create_automatic_apply(db, device_id, "vlan", 2)
+        finally:
+            STORE_ONLY.reset(token)
+
+
 async def test_apply_non_static_removal_carries_guarded_keys(adapter_client):
     """Composed non-static removals retain collateral-guard authority."""
     from nso_adapter.store.models import GenerationStatus
