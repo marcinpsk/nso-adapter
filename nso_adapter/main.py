@@ -174,8 +174,10 @@ async def _init_database(cfg) -> None:
     # the row, so this takes its read path.
     from nso_adapter.store.meta import ensure_store_meta
 
-    await ensure_store_meta()
-    logger.info("db.ready", url=cfg.database_url)
+    incarnation, _born = await ensure_store_meta()
+    # The URL carries the store password. The incarnation is the adapter's own identity for
+    # the store it just bound, which is what a reader of a readiness record needs.
+    logger.info("db.ready", incarnation=incarnation)
 
 
 def _instance_credentials(provider, inst) -> tuple[str, str]:
