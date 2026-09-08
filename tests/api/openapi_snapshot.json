@@ -2772,6 +2772,7 @@
       "HarvestCommunityRequest": {
         "properties": {
           "community_hash": {
+            "pattern": "^[0-9a-f]{16}$",
             "title": "Community Hash",
             "type": "string"
           },

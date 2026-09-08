@@ -39,7 +39,13 @@ from nso_adapter.api.errors import (
 )
 from nso_adapter.core import snmp_harvest
 from nso_adapter.core.importer import get_nso_client
-from nso_adapter.secrets.refs import VaultRef, VaultRefError, parse_vault_ref, secret_fingerprint
+from nso_adapter.secrets.refs import (
+    SECRET_FINGERPRINT_PATTERN,
+    VaultRef,
+    VaultRefError,
+    parse_vault_ref,
+    secret_fingerprint,
+)
 from nso_adapter.store.models import Device
 
 logger = structlog.get_logger(__name__)
@@ -70,7 +76,10 @@ class SecretVerifyOut(BaseModel):
 
 
 class HarvestCommunityRequest(BaseModel):
-    community_hash: str  # the read mirror's sha256[:16] community identity
+    # The read mirror's sha256[:16] community identity. Validated HERE: an unconstrained
+    # field takes the community itself, and the caller then reads its own secret back out
+    # of the refusal. The 422 for a non-fingerprint repeats no part of the submitted value.
+    community_hash: str = Field(pattern=SECRET_FINGERPRINT_PATTERN)
     vault_ref: str  # "mount/path#key" target to write the plaintext to
 
 
@@ -254,10 +263,11 @@ async def harvest_community(
 
     found = snmp_harvest.find_community(ned_id, payload or {}, body.community_hash)
     if found is None:
+        # The device is the adapter's own row; the fingerprint is the caller's and it holds it.
         raise api_error(
             404,
             "community_not_found",
-            f"no community with hash {body.community_hash!r} in the config mirror of "
+            f"no community with the requested fingerprint in the config mirror of "
             f"{device.nso_device_name!r} — if the device changed out-of-band, run sync-from and refresh first",
         )
 
