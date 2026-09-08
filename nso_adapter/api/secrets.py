@@ -158,7 +158,7 @@ async def _vault_op(operation):
     responses={**RESP_401, **RESP_400, **RESP_422_VALIDATION, **RESP_501, **RESP_502},
 )
 async def set_secret(body: SecretWriteRequest, request: Request) -> SecretWriteOut:
-    """Merge-write secret fields at the ref's Vault path; return version + fingerprints."""
+    """Merge-write secret fields at the ref's Vault path; return the new KV v2 version."""
     provider = _vault_provider(request)
     ref = _parse_ref(body.vault_ref)
     if ref.key is not None and set(body.values) != {ref.key}:
