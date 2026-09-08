@@ -654,6 +654,42 @@ async def test_init_database_never_materializes_schema(monkeypatch, unmigrated_p
         await engine.dispose()
 
 
+async def test_db_ready_record_carries_no_database_credential(monkeypatch):
+    """Startup logged ``cfg.database_url`` verbatim, so a PostgreSQL URL carrying a password
+    wrote that credential into the db.ready record and into every sink that kept it.
+
+    Runs the REAL bind: create_async_engine does not connect, so the URL travels no further
+    than the record under test. The readiness fact the operator needs is the store
+    incarnation, which is the adapter's own."""
+    from structlog.testing import capture_logs
+
+    from nso_adapter.store import db as store_db
+    from nso_adapter.store import meta as store_meta
+    from tests._secret_discipline import assert_records_free_of
+
+    url = "postgresql+asyncpg://placeholder-user:placeholder-db-password@placeholder-db.internal:5432/nsoadp"
+    incarnation = "00000000-0000-0000-0000-0000000000ab"
+
+    async def _fake_ensure():
+        # The mint needs a primed session this isolated test never sets up.
+        return (incarnation, None)
+
+    monkeypatch.setattr(store_meta, "ensure_store_meta", _fake_ensure)
+    try:
+        with capture_logs() as logs:
+            await _init_database(SimpleNamespace(database_url=url))
+    finally:
+        bound = store_db.get_engine()
+        if bound is not None:
+            await bound.dispose()
+        store_db._engine = None
+        store_db._session_factory = None
+
+    assert_records_free_of(logs, ["placeholder-db-password", "placeholder-user", url])
+    record = next(r for r in logs if r["event"] == "db.ready")
+    assert record["incarnation"] == incarnation, "readiness must still say WHICH store is bound"
+
+
 # --------------------------------------------------------------------------- #
 # B3 — SSE emits notify_sync_complete per changed device (real overlay backstop)
 # --------------------------------------------------------------------------- #
