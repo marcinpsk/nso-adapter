@@ -296,20 +296,7 @@ async def test_automatic_attribute_edit_with_detach(adapter_client, reject, queu
     assert settled.applied_revision == pending.desired_revision
 
 
-@pytest.mark.parametrize(
-    "auto_apply",
-    [
-        False,
-        pytest.param(
-            True,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="store-only attribute omission under auto-apply reaches create_generation and returns HTTP 500",
-            ),
-        ),
-    ],
-    ids=["manual", "store-only-auto"],
-)
+@pytest.mark.parametrize("auto_apply", [False, True], ids=["manual", "store-only-auto"])
 async def test_manual_attribute_edit_with_detach_refuses_queued_apply(adapter_client, auto_apply):
     """Manual promotion refuses the incumbent without authorizing the prepared edit."""
     name = "attribute-manual-queued"
