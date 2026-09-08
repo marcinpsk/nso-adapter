@@ -18,7 +18,8 @@ The rule is about what RUNS while the handler is active, not about what is writt
 * ``raise X from <name>`` where the name is bound to ``None`` is ``from None`` spelled with
   an alias, and it attaches exactly the same way.
 * calling a helper that always raises is the same ``raise X`` one frame down: the interpreter
-  attaches the caught exception to whatever the helper raised.
+  attaches the caught exception to whatever the helper raised, and calling it under an alias
+  bound by ``other = helper`` is the same call under another name.
 * a function DEFINED in a handler runs its decorators and its default expressions THERE,
   and its body nowhere. Called after the handler exits, its raise attaches nothing; called
   inside it, it is the helper case above.
@@ -131,11 +132,34 @@ def _attaches_context(node: ast.Raise, none_aliases: set[str]) -> bool:
     return isinstance(cause, ast.Name) and cause.id in none_aliases
 
 
+def _helper_aliases(tree: ast.Module, helpers: set[str]) -> set[str]:
+    """*helpers* plus every name a plain ``alias = helper`` assignment binds to one of them.
+
+    The alias IS the helper: calling it in a handler runs the same raise one frame down.
+    Binding repeats to a fixed point, so a chain of aliases resolves to the same helper.
+    """
+    bindings: list[tuple[str, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+            bindings += [(target.id, node.value.id) for target in node.targets if isinstance(target, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and isinstance(node.value, ast.Name):
+            bindings.append((node.target.id, node.value.id))
+    resolved = set(helpers)
+    bound = True
+    while bound:
+        bound = False
+        for alias, source in bindings:
+            if source in resolved and alias not in resolved:
+                resolved.add(alias)
+                bound = True
+    return resolved
+
+
 def scan_source(source: str, path: str) -> list[str]:
     """Every context-attaching site that RUNS inside an except handler, as ``path:line``."""
     tree = ast.parse(source, filename=path)
     none_aliases = _none_aliases(tree)
-    helpers = _always_raising_helpers(tree, none_aliases)
+    helpers = _helper_aliases(tree, _always_raising_helpers(tree, none_aliases))
     lines: set[int] = set()
     for handler in ast.walk(tree):
         if not isinstance(handler, ast.ExceptHandler):
@@ -353,6 +377,53 @@ def test_a_returning_helper_called_in_a_handler_stays_legal() -> None:
         "    trigger()\n"
         "except ValueError:\n"
         "    err = _build()\n"
+        "if err is not None:\n"
+        "    raise err\n"
+    )
+    assert scan_source(source, "t.py") == []
+
+
+_ALIASED_RAISING_HELPER = (
+    "def _refuse():\n    raise Boom()\n\nalias = _refuse\n\ntry:\n    trigger()\nexcept ValueError:\n    alias()\n"
+)
+_CHAINED_ALIASES_OF_A_RAISING_HELPER = (
+    "def _refuse():\n"
+    "    raise Boom()\n"
+    "\n"
+    "first = _refuse\n"
+    "second = first\n"
+    "\n"
+    "try:\n"
+    "    trigger()\n"
+    "except ValueError:\n"
+    "    second()\n"
+)
+
+
+def test_flags_an_ALIAS_of_an_always_raising_helper() -> None:
+    """``alias = _refuse`` renames the helper; the call still raises inside the handler."""
+    assert isinstance(_runtime_context(_ALIASED_RAISING_HELPER), ValueError), "the interpreter kept it"
+    assert scan_source(_ALIASED_RAISING_HELPER, "t.py") == ["t.py:9"]
+
+
+def test_flags_a_CHAIN_of_aliases_of_an_always_raising_helper() -> None:
+    """Resolution repeats to a fixed point, so an alias of an alias resolves too."""
+    assert isinstance(_runtime_context(_CHAINED_ALIASES_OF_A_RAISING_HELPER), ValueError)
+    assert scan_source(_CHAINED_ALIASES_OF_A_RAISING_HELPER, "t.py") == ["t.py:10"]
+
+
+def test_an_alias_of_a_RETURNING_helper_stays_legal() -> None:
+    """Only an always-raising helper is aliased into the set; a builder still returns."""
+    source = (
+        "def _build():\n"
+        "    return Boom()\n"
+        "\n"
+        "alias = _build\n"
+        "err = None\n"
+        "try:\n"
+        "    trigger()\n"
+        "except ValueError:\n"
+        "    err = alias()\n"
         "if err is not None:\n"
         "    raise err\n"
     )

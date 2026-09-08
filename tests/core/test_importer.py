@@ -2189,7 +2189,7 @@ async def test_ned_id_read_failure_record_names_the_read_and_not_what_the_server
         username_ref="NSO_USERNAME",
         password_ref="NSO_PASSWORD",
     )
-    client = NsoClient(instance, "admin", "admin")
+    client = NsoClient(instance, "placeholder-user", "placeholder-password")
     client._client = lambda timeout=None: httpx.AsyncClient(transport=transport, base_url=instance.base_url)
 
     with capture_logs() as logs:
@@ -2243,7 +2243,7 @@ async def test_ned_id_read_failure_records_stay_distinct_across_nso_instances(db
             username_ref="NSO_USERNAME",
             password_ref="NSO_PASSWORD",
         )
-        client = NsoClient(instance, "admin", "admin")
+        client = NsoClient(instance, "placeholder-user", "placeholder-password")
         client._client = lambda timeout=None, t=transport, i=instance: httpx.AsyncClient(
             transport=t, base_url=i.base_url
         )
