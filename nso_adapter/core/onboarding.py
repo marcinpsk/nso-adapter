@@ -31,6 +31,11 @@ from nso_adapter.core.claim import (
     resolve_claim_by_token,
 )
 from nso_adapter.core.families import ALL_FAMILY_KEYS
+from nso_adapter.nso.client import (
+    NsoActionFailedError,
+    NsoExportUnavailableError,
+    NsoReadContractError,
+)
 from nso_adapter.store import outcome_store
 from nso_adapter.store.device_settle import create_counter
 from nso_adapter.store.models import (
@@ -78,21 +83,28 @@ _READ_MIRROR_ROOTS = (
 )
 
 
+#: The failures whose message the adapter WROTE: it names the failure and repeats nothing
+#: the server said. Every other exception is classified by its type alone — a decode of a
+#: malformed answer carries the server's bytes, and a store failure carries the statement.
+_AUTHORED_FAILURES = (NsoActionFailedError, NsoExportUnavailableError, NsoReadContractError)
+
+
 def _failure_detail(exc: BaseException) -> str:
     """Classify a provisioning failure for the step record.
 
     ``repr()`` on an httpx failure carries the reason phrase, the request URL and, on a
-    redirect, the ``Location`` the server chose; a protocol error can quote the bytes the
+    redirect, the ``Location`` the server chose; a decode failure quotes the bytes the
     server sent. The step detail is persisted in the job result and returned by the
     provisioning API, so only the classification travels. The numeric status stays, because
-    an operator has to tell an auth refusal from an outage. Everything else that reaches
-    these handlers is adapter-authored, so its own message is the diagnostic.
+    an operator has to tell an auth refusal from an outage, and an authored message stays,
+    because it is ours. Anything else travels as its TYPE: the step name already says which
+    part of the provision failed.
     """
     if isinstance(exc, httpx.HTTPStatusError):
         return f"{type(exc).__name__} (HTTP {exc.response.status_code})"
-    if isinstance(exc, httpx.HTTPError):
-        return type(exc).__name__
-    return repr(exc)
+    if isinstance(exc, _AUTHORED_FAILURES):
+        return repr(exc)
+    return type(exc).__name__
 
 
 async def _bootstrap_address(client, device_name: str, primary: str, oob_ip: str | None) -> tuple[str, dict | None]:
