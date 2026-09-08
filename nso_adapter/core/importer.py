@@ -33,7 +33,7 @@ from nso_adapter.core.refresh_engine import (
 from nso_adapter.core.sync_state import compute_sync_state
 from nso_adapter.domain.models import Interface, InterfaceAttr
 from nso_adapter.nso import actions as nso_actions
-from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError
+from nso_adapter.nso.client import NsoClient, NsoExportUnavailableError, failure_detail
 from nso_adapter.nso.read_outcome import (  # noqa: F401 — Present used below
     WHOLE_DEVICE,
     Present,
@@ -199,7 +199,7 @@ async def _run_surfaces(
                 "sync.surface_refresh_failed",
                 device_id=device.id,
                 surface=name,
-                error=repr(exc),
+                error=failure_detail(exc),
             )
             failed.append(name)
     return failed
@@ -483,7 +483,7 @@ async def _apply_projected(
             if not ok:
                 failed.append(name)
         except Exception as exc:  # noqa: BLE001 — one surface must not take down the rest
-            logger.warning("sync.surface_refresh_failed", device_id=device.id, surface=name, error=repr(exc))
+            logger.warning("sync.surface_refresh_failed", device_id=device.id, surface=name, error=failure_detail(exc))
             failed.append(name)
     return failed
 
